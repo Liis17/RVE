@@ -17,7 +17,7 @@ Parent: [[Index]]
 | `engine/engine-scene/src/world.rs` | `World::screen_shaders`, `World::set_screen_shader`, `SceneFrame::screen_shaders` | Состояние камеры в мире и выдача активной камеры кадру |
 | `engine/engine-scene/src/prefab.rs` | проверка override камеры | Тот же контракт для камер в префабах и их override |
 | `engine/engine-runtime/src/scene.rs` | `screen_shader_paths`, `load_screen_shader_sources`, `ScreenShaderGpu`, `upload_screen_shaders`, `PreparedRenderAssets::screen_shaders` | Чтение исходников и создание шейдеров при загрузке сцены |
-| `engine/engine-runtime/src/pipeline.rs` | `screen_shader_view`, `enabled_screen_passes`, `GpuSceneTable::screen_shaders`, `FrameSnapshot::screen_shaders` | Маппинг кадра в `ViewSettings` и освобождение при выгрузке |
+| `engine/engine-runtime/src/pipeline.rs` | `screen_shader_view`, `enabled_screen_passes`, `GpuSceneTable::screen_shaders`, `FrameSnapshot::screen_shaders` | Маппинг кадра в `ViewSettings`; освобождение при замене сцены по живым путям камер и при выгрузке |
 | `engine/rve-sdk/src/abi.rs`, `engine/rve-sdk/src/lib.rs` | `RveScreenShaderState`, `RveHost::screen_shader_count`, `get_screen_shader`, `set_screen_shader` | Script ABI 14 и гостевые методы камеры |
 | `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/transaction.rs`, `engine/engine-script/src/lite.rs` | `host_get_screen_shader`, `ScriptTransaction::set_screen_shader`, Lua `screen_shader` | Хост ABI, очередь транзакции и Lua-API |
 | `editor/src/viewport/render.rs`, `editor/src/ui/inspector.rs`, `editor/src/scene_edit.rs`, `editor/src/app.rs` | `SceneRenderer::sync_screen_shaders`, `reload_changed`, `show_screen_shaders`, `EditorScene::set_camera_screen_shaders` | Инспектор, undo, горячая перезагрузка и Game-вид |
@@ -92,7 +92,7 @@ Push constants занимают 112 байт. Вход — линейный цв
 - При загрузке сцены `load_screen_shader_sources` читает все `.glsl` камер мира, включая камеры префабов, без повторов. Вызов выполняется только в игровом клиенте до передачи мира потоку скриптов. `rve-server` (headless) шейдеры не читает и не компилирует.
 - `upload_screen_shaders` создаёт шейдеры через `ScreenShaderGpu`; ошибка пишется в лог, шейдер пропускается, сцена продолжает работать.
 - Кадр получает только включённые проходы с созданным шейдером (`screen_shader_view`), время сцены — из снимка.
-- Выгрузка сцены освобождает шейдеры через `release_scene` бэкенда.
+- Замена сцены освобождает шейдеры путей, которые не нужны ни одной камере мира после замены (`SceneSwitch`, `SceneGpuIds::screen_shaders`). Путь новой сцены пересоздаёт шейдер, прежний уходит на освобождение. Выгрузка уничтожает оставшиеся через `release_scene` бэкенда; каждый id уничтожается один раз, и освобождённые при замене из списка выгрузки вычёркиваются.
 
 Камеры в префабах с `camera` нельзя заспавнить (см. [[Engine/EngineScene]]), поэтому все камеры известны при загрузке сцены.
 

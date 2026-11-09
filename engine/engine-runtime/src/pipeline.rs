@@ -901,6 +901,14 @@ impl RenderBackend for VulkanBackend {
         }
         self.scene_skin_instances
             .retain(|skin| !ids.skins.contains(skin));
+        for shader in &ids.screen_shaders {
+            if let Err(error) = self.renderer.destroy_screen_shader(*shader) {
+                log::error!("экранный шейдер сцены не уничтожен: {error}");
+            }
+        }
+        // Шейдер, уничтоженный здесь, не должен уйти повторно при выгрузке (`release_scene`).
+        self.scene_screen_shaders
+            .retain(|shader| !ids.screen_shaders.contains(shader));
     }
 
     fn release_materials(&mut self, materials: &[MaterialId]) {
@@ -2637,7 +2645,7 @@ fn detach_material_sources(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandl
     }
 }
 
-fn detach_object_render_data(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
+pub(crate) fn detach_object_render_data(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
     detach_objects(&mut gpu_scene.by_object, handles);
     detach_material_sources(gpu_scene, handles);
 }

@@ -15,16 +15,17 @@ use std::sync::Arc;
 use engine_animation::AnimationBridge;
 use engine_assets::Assets;
 use engine_project::PhysicsSettings;
-use engine_render::{MaterialId, MeshId, SkinId};
+use engine_render::{MaterialId, MeshId, ScreenShaderId, SkinId};
 use engine_resources::ResourceHandle;
 use engine_scene::{ObjectHandle, World};
 use engine_script::{ScriptHost, ScriptTime};
 
 use crate::game_ui::{PreparedUi, UiRegistry};
-use crate::pipeline::{GpuSceneTable, SpawnPhysics};
+use crate::pipeline::{GpuSceneTable, SpawnPhysics, detach_object_render_data};
 use crate::prefabs::{ParticleRequest, PrefabLoads, RenderResourceRequest};
 use crate::scene::{
     PreparedPrefabs, PreparedRenderAssets, PreparedScene, load_scene, load_screen_shader_sources,
+    screen_shader_paths,
 };
 
 /// Загрузчик сцен проекта: читает `.rvescene` и ассеты тем же `ResourceHandle`, что и старт.
@@ -87,11 +88,12 @@ pub(crate) struct SceneGpuIds {
     pub meshes: HashSet<MeshId>,
     pub materials: HashSet<MaterialId>,
     pub skins: HashSet<SkinId>,
+    pub screen_shaders: HashSet<ScreenShaderId>,
 }
 
 impl SceneGpuIds {
-    /// Меши, материалы и скиннинг, на которые ссылаются уровни объектов, шаблоны префабов сцены
-    /// и экземпляры skinning таблицы.
+    /// Меши, материалы, скиннинг и экранные шейдеры, на которые ссылается таблица: уровни объектов,
+    /// шаблоны префабов сцены, экземпляры skinning и шейдеры камер.
     pub(crate) fn of_table(table: &GpuSceneTable) -> Self {
         let mut ids = Self::default();
         for levels in table
@@ -109,17 +111,24 @@ impl SceneGpuIds {
         for instances in table.skin_instances.values() {
             ids.skins.extend(instances.iter().copied());
         }
+        ids.screen_shaders
+            .extend(table.screen_shaders.values().copied());
         ids
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.meshes.is_empty() && self.materials.is_empty() && self.skins.is_empty()
+        self.meshes.is_empty()
+            && self.materials.is_empty()
+            && self.skins.is_empty()
+            && self.screen_shaders.is_empty()
     }
 
     fn extend(&mut self, other: &Self) {
         self.meshes.extend(other.meshes.iter().copied());
         self.materials.extend(other.materials.iter().copied());
         self.skins.extend(other.skins.iter().copied());
+        self.screen_shaders
+            .extend(other.screen_shaders.iter().copied());
     }
 
     /// Ресурсы этого набора, которых нет в `live`.
@@ -128,6 +137,7 @@ impl SceneGpuIds {
             meshes: difference(&self.meshes, &live.meshes),
             materials: difference(&self.materials, &live.materials),
             skins: difference(&self.skins, &live.skins),
+            screen_shaders: difference(&self.screen_shaders, &live.screen_shaders),
         }
     }
 
@@ -136,6 +146,7 @@ impl SceneGpuIds {
             meshes: overlap(&self.meshes, &live.meshes),
             materials: overlap(&self.materials, &live.materials),
             skins: overlap(&self.skins, &live.skins),
+            screen_shaders: overlap(&self.screen_shaders, &live.screen_shaders),
         }
     }
 }
@@ -305,6 +316,10 @@ impl SceneSwitch {
                 &pending.sources,
             )
             .map_err(|error| error.to_string())?;
+        // Столкновение id отсекается до регистрации UI, чтобы отказ не оставил документы сцены.
+        ctx.world
+            .check_scene_replacement(&pending.world)
+            .map_err(|error| error.to_string())?;
         ctx.ui_registry.register(ctx.scripts, &pending.ui)?;
 
         let scene_objects: Vec<ObjectHandle> = pending
@@ -340,6 +355,13 @@ impl SceneSwitch {
                 .expect("scene bodies were validated by the trial physics build");
         }
         let gpu = &mut *ctx.gpu_scene;
+        // Удалённые объекты: их отображение, материалы и скиннинг уходят из таблицы до расчёта живых
+        // ресурсов ниже, иначе они остались бы живыми до следующей замены.
+        detach_object_render_data(gpu, &replacement.removed);
+        for object in &replacement.removed {
+            gpu.skin_instances.remove(object);
+            gpu.joint_counts.remove(object);
+        }
         gpu.by_object.extend(rekey(&mut table.by_object, &handles));
         gpu.material_sources
             .extend(rekey(&mut table.material_sources, &handles));
@@ -347,11 +369,6 @@ impl SceneSwitch {
             .extend(rekey(&mut table.skin_instances, &handles));
         gpu.joint_counts
             .extend(rekey(&mut table.joint_counts, &handles));
-        // Удалённые объекты: их скиннинг больше не живой и уходит в освобождение ниже.
-        for object in &replacement.removed {
-            gpu.skin_instances.remove(object);
-            gpu.joint_counts.remove(object);
-        }
         for (scene_object, desc) in table.particle_descs.drain() {
             if let Some(&object) = handles.get(&scene_object) {
                 ctx.prefabs.send_particles(ParticleRequest::Create {
@@ -370,6 +387,11 @@ impl SceneSwitch {
         gpu.environments.extend(table.environments);
         gpu.animation_models.extend(table.animation_models);
         gpu.animation_clips.extend(table.animation_clips);
+        // Экранные шейдеры живут по путям камер мира: путь, который не нужен ни одной камере, уходит
+        // из таблицы. Путь новой сцены заменяет прежний шейдер; прежний освободится ниже как неживой.
+        let shader_paths = screen_shader_paths(ctx.world);
+        gpu.screen_shaders
+            .retain(|path, _| shader_paths.contains(path));
         gpu.screen_shaders.extend(table.screen_shaders);
 
         ctx.animation.replace_objects(
@@ -455,6 +477,7 @@ mod tests {
 #[cfg(test)]
 mod commit_tests {
     use super::*;
+    use engine_render::ScreenShaderId;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_script::{PrefabStatus, ScriptFrameTime, ScriptLoadOptions};
     use std::fs;
@@ -547,6 +570,14 @@ return Script
     /// Сцена с коллайдером: его тело вставляется физикой сразу при замене.
     const PHYSICS_SCENE: &str = "[[objects]]\nid = \"camera_p\"\n[objects.camera]\nactive = true\n\
 [[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n";
+    /// Сцена с камерой и экранным шейдером `fx/a`; `fx_c` объявляет тот же путь.
+    const FX_A_SCENE: &str = "[[assets]]\npath = \"fx/a.glsl\"\n[[objects]]\nid = \"camera_fa\"\n[objects.camera]\nactive = true\n[[objects.camera.screen_shaders]]\nshader = \"/fx/a.glsl\"\nstage = \"after_post\"\n";
+    const FX_B_SCENE: &str = "[[assets]]\npath = \"fx/b.glsl\"\n[[objects]]\nid = \"camera_fb\"\n[objects.camera]\nactive = true\n[[objects.camera.screen_shaders]]\nshader = \"/fx/b.glsl\"\nstage = \"after_post\"\n";
+    /// Стартовая сцена с сохраняемой камерой `lens`, чей шейдер переживает замену.
+    const FX_HUB_SCENE: &str = "[[assets]]\npath = \"fx/hub.glsl\"\n[[assets]]\npath = \"fx/lens.glsl\"\n[[objects]]\nid = \"camera_fh\"\n[objects.camera]\nactive = true\n[[objects.camera.screen_shaders]]\nshader = \"/fx/hub.glsl\"\nstage = \"after_post\"\n[[objects]]\nid = \"lens\"\nkeep_on_load = true\n[objects.camera]\nactive = false\n[[objects.camera.screen_shaders]]\nshader = \"/fx/lens.glsl\"\nstage = \"after_post\"\n";
+    /// Сцена с `.rveui`, который не разбирается: переход в неё отказывает до любых изменений.
+    const BAD_UI_SCENE: &str = "[[assets]]\npath = \"ui/bad.rveui\"\n[[objects]]\nid = \"camera_u\"\n[objects.camera]\nactive = true\n";
+
     /// Сцена с префабом `z`, чей скрипт не компилируется.
     const PREFAB_SCENE_BROKEN: &str = "[[assets]]\npath = \"prefabs/z.rveprefab\"\n\
 [[objects]]\nid = \"camera_bad\"\n[objects.camera]\nactive = true\n\
@@ -595,7 +626,7 @@ return Script
         spawn_physics: SpawnPhysics,
         physics: Option<engine_physics::PhysicsSceneSync>,
         prefabs: PrefabLoads,
-        _render_rx: flume::Receiver<RenderResourceRequest>,
+        render_rx: flume::Receiver<RenderResourceRequest>,
         animation: AnimationBridge,
         ui_registry: UiRegistry,
         switch: SceneSwitch,
@@ -621,6 +652,12 @@ return Script
             dir.write("levels/pbad.rvescene", PREFAB_SCENE_BROKEN);
             dir.write("levels/pc.rvescene", PREFAB_SCENE_C);
             dir.write("levels/pphys.rvescene", PHYSICS_SCENE);
+            dir.write("levels/fx_a.rvescene", FX_A_SCENE);
+            dir.write("levels/fx_b.rvescene", FX_B_SCENE);
+            dir.write("levels/fx_c.rvescene", FX_A_SCENE);
+            dir.write("levels/fx_hub.rvescene", FX_HUB_SCENE);
+            dir.write("levels/bad_ui.rvescene", BAD_UI_SCENE);
+            dir.write("ui/bad.rveui", "[canvas\n");
             dir.write("scripts/player.lua", PLAYER);
             dir.write("scripts/enemy.lua", ENEMY);
             dir.write("scripts/boss.lua", BOSS);
@@ -676,7 +713,7 @@ return Script
                 spawn_physics: SpawnPhysics::default(),
                 physics: Some(physics),
                 prefabs: PrefabLoads::new(loader_tx, render_tx),
-                _render_rx: render_rx,
+                render_rx,
                 animation: AnimationBridge::default(),
                 ui_registry: UiRegistry::default(),
                 switch: SceneSwitch::default(),
@@ -724,6 +761,23 @@ return Script
             })
         }
 
+        /// Подменяет GPU-таблицу и владение ею, как если бы сцена загружена render thread.
+        fn adopt_gpu(&mut self, gpu: GpuSceneTable) {
+            self.switch = SceneSwitch::new(SceneGpuIds::of_table(&gpu));
+            self.gpu = gpu;
+        }
+
+        /// Наборы, которые ушли на освобождение render thread с прошлого вызова.
+        fn released(&self) -> Vec<SceneGpuIds> {
+            self.render_rx
+                .try_iter()
+                .filter_map(|request| match request {
+                    RenderResourceRequest::ReleaseScene { ids, .. } => Some(ids),
+                    _ => None,
+                })
+                .collect()
+        }
+
         fn names(&self) -> Vec<String> {
             let mut names: Vec<String> = self
                 .world
@@ -758,6 +812,22 @@ return Script
                 .map(|event| event.message)
                 .collect()
         }
+    }
+
+    /// Фейковый GPU-id: рендерера в тестах нет, поэтому значение — обёртка над usize.
+    fn fake_mesh(value: usize) -> MeshId {
+        // SAFETY: MeshId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn fake_material(value: usize) -> MaterialId {
+        // SAFETY: MaterialId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn fake_shader(value: usize) -> ScreenShaderId {
+        // SAFETY: ScreenShaderId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
     }
 
     fn sorted(names: &[&str]) -> Vec<String> {
@@ -1024,5 +1094,147 @@ return Script
         );
         assert_eq!(rig.names(), sorted(&["a_crate", "camera_a", "hub"]));
         assert_eq!(rig.host.current_scene(), "levels/pa.rvescene");
+    }
+
+    #[test]
+    fn removed_objects_leave_the_table_before_their_resources_are_released() {
+        let mut rig = Rig::new();
+        let enemy = rig.world.handle("enemy").unwrap();
+        let player = rig.world.handle("player").unwrap();
+        let mut gpu = GpuSceneTable::default();
+        gpu.by_object
+            .insert(enemy, vec![vec![(fake_mesh(1), fake_material(1))]]);
+        gpu.by_object
+            .insert(player, vec![vec![(fake_mesh(2), fake_material(2))]]);
+        rig.adopt_gpu(gpu);
+
+        rig.load("levels/b.rvescene").unwrap();
+        assert!(rig.commit().is_empty());
+
+        assert!(
+            !rig.gpu.by_object.contains_key(&enemy),
+            "отображение удалённого объекта снято при замене, а не при следующей"
+        );
+        assert!(
+            rig.gpu.by_object.contains_key(&player),
+            "ресурсы сохраняемого объекта остаются"
+        );
+        let released = rig.released();
+        assert_eq!(released.len(), 1, "{released:?}");
+        assert_eq!(released[0].meshes, HashSet::from([fake_mesh(1)]));
+        assert_eq!(released[0].materials, HashSet::from([fake_material(1)]));
+    }
+
+    #[test]
+    fn failed_commit_releases_every_resource_of_its_upload_including_screen_shaders() {
+        let mut rig = Rig::new();
+        let mut table = GpuSceneTable::default();
+        table.prefabs.insert(
+            "prefabs/x.rveprefab".to_owned(),
+            vec![vec![vec![(fake_mesh(11), fake_material(11))]]],
+        );
+        table
+            .screen_shaders
+            .insert("fx/a.glsl".to_owned(), fake_shader(10));
+        rig.load_with_table("levels/clash.rvescene", table).unwrap();
+
+        let failures = rig.commit();
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        let released = rig.released();
+        assert_eq!(released.len(), 1, "{released:?}");
+        assert_eq!(released[0].meshes, HashSet::from([fake_mesh(11)]));
+        assert_eq!(released[0].materials, HashSet::from([fake_material(11)]));
+        assert_eq!(released[0].screen_shaders, HashSet::from([fake_shader(10)]));
+        assert!(rig.gpu.screen_shaders.is_empty());
+    }
+
+    #[test]
+    fn repeated_switches_release_each_screen_shader_once_and_keep_one_per_live_path() {
+        let mut rig = Rig::new();
+        let mut created = Vec::new();
+        for (index, target) in [
+            "levels/fx_a.rvescene",
+            "levels/fx_b.rvescene",
+            "levels/fx_a.rvescene",
+            "levels/fx_b.rvescene",
+            "levels/fx_c.rvescene",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = if target == "levels/fx_b.rvescene" {
+                "fx/b.glsl"
+            } else {
+                "fx/a.glsl"
+            };
+            let shader = fake_shader(100 + index);
+            created.push(shader);
+            let mut table = GpuSceneTable::default();
+            table.screen_shaders.insert(path.to_owned(), shader);
+            rig.load_with_table(target, table).unwrap();
+            assert!(rig.commit().is_empty(), "переход в {target}");
+        }
+
+        let live = rig.gpu.screen_shader_ids();
+        assert_eq!(live, vec![fake_shader(104)], "один шейдер на живой путь");
+        let released: Vec<ScreenShaderId> = rig
+            .released()
+            .into_iter()
+            .flat_map(|ids| ids.screen_shaders)
+            .collect();
+        let unique: HashSet<ScreenShaderId> = released.iter().copied().collect();
+        assert_eq!(unique.len(), released.len(), "каждый освобождён один раз");
+        assert_eq!(released.len() + live.len(), created.len());
+        assert!(
+            created
+                .iter()
+                .all(|id| unique.contains(id) || live.contains(id))
+        );
+    }
+
+    #[test]
+    fn screen_shader_of_a_persistent_camera_survives_a_switch() {
+        let mut rig = Rig::start("levels/fx_hub.rvescene");
+        let mut gpu = GpuSceneTable::default();
+        gpu.screen_shaders
+            .insert("fx/hub.glsl".to_owned(), fake_shader(1));
+        gpu.screen_shaders
+            .insert("fx/lens.glsl".to_owned(), fake_shader(2));
+        rig.adopt_gpu(gpu);
+
+        rig.load("levels/fx_b.rvescene").unwrap();
+        assert!(rig.commit().is_empty());
+
+        assert_eq!(
+            rig.gpu.screen_shaders.get("fx/lens.glsl"),
+            Some(&fake_shader(2)),
+            "шейдер сохраняемой камеры не освобождается"
+        );
+        let released: Vec<ScreenShaderId> = rig
+            .released()
+            .into_iter()
+            .flat_map(|ids| ids.screen_shaders)
+            .collect();
+        assert_eq!(
+            released,
+            vec![fake_shader(1)],
+            "шейдер ушедшей камеры освобождён"
+        );
+    }
+
+    #[test]
+    fn invalid_ui_document_rejects_the_switch_before_anything_changes() {
+        let mut rig = Rig::new();
+        let error = rig
+            .switch
+            .request(Some(&rig.loader), "levels/bad_ui.rvescene")
+            .err()
+            .unwrap();
+        assert!(error.contains("ui/bad.rveui"), "{error}");
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.names(), sorted(&["camera", "enemy", "player"]));
+        assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
+        assert!(rig.released().is_empty());
     }
 }
