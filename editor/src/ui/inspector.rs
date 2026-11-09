@@ -3730,6 +3730,7 @@ fn reference_matches(kind: &ParamKind, object: &SceneObject) -> bool {
         ScriptComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ScriptComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ScriptComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ScriptComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ScriptComponentKind::Script(script) => {
             object
                 .lite_scripts

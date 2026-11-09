@@ -28,6 +28,7 @@ pub enum ComponentKind {
     ParticleEmitter,
     NetworkIdentity,
     NetworkTransform,
+    UiCanvas,
     Script(String),
 }
 
@@ -53,6 +54,7 @@ impl ComponentKind {
             "particle_emitter" => Self::ParticleEmitter,
             "network_identity" => Self::NetworkIdentity,
             "network_transform" => Self::NetworkTransform,
+            "ui_canvas" => Self::UiCanvas,
             _ => return None,
         })
     }
@@ -75,6 +77,7 @@ impl ComponentKind {
             Self::ParticleEmitter => "particle_emitter".to_owned(),
             Self::NetworkIdentity => "network_identity".to_owned(),
             Self::NetworkTransform => "network_transform".to_owned(),
+            Self::UiCanvas => "ui_canvas".to_owned(),
             Self::Script(script) => format!("script:{script}"),
         }
     }
@@ -545,6 +548,7 @@ mod tests {
     #[test]
     fn references_enums_colors_and_typed_arrays_are_coerced() {
         let texture = VirtualPath::parse("textures/hero.PNG").unwrap();
+        let ui_document = VirtualPath::parse("ui/hud.rveui").unwrap();
         let schema = ParamSchema::new(vec![
             spec("target", ParamKind::Object, ParamKind::Object.zero()),
             spec(
@@ -556,6 +560,11 @@ mod tests {
                 "texture",
                 ParamKind::Asset(Some(AssetKind::Texture)),
                 ParamKind::Asset(Some(AssetKind::Texture)).zero(),
+            ),
+            spec(
+                "hud",
+                ParamKind::Asset(Some(AssetKind::Ui)),
+                ParamKind::Asset(Some(AssetKind::Ui)).zero(),
             ),
             spec(
                 "mode",
@@ -575,6 +584,7 @@ mod tests {
                 ("target", ParamValue::Object("player".into())),
                 ("body", ParamValue::Object("player".into())),
                 ("texture", ParamValue::Asset(texture.clone())),
+                ("hud", ParamValue::Asset(ui_document.clone())),
                 ("mode", ParamValue::String("run".into())),
                 ("color", vec3([0.1, 0.2, 1.0])),
                 (
@@ -584,6 +594,7 @@ mod tests {
             ]))
             .unwrap();
         assert_eq!(resolved["texture"], ParamValue::Asset(texture));
+        assert_eq!(resolved["hud"], ParamValue::Asset(ui_document));
         assert_eq!(resolved["color"], vec3([0.1, 0.2, 1.0]));
         assert_eq!(
             resolved["weights"],
@@ -596,6 +607,10 @@ mod tests {
             params(&[(
                 "texture",
                 ParamValue::Asset(VirtualPath::parse("x.fbx").unwrap()),
+            )]),
+            params(&[(
+                "hud",
+                ParamValue::Asset(VirtualPath::parse("ui/hud.png").unwrap()),
             )]),
             params(&[("target", ParamValue::String("player".into()))]),
         ] {

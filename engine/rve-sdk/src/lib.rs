@@ -517,7 +517,7 @@ pub struct CharacterMove {
 }
 
 /// Collider shape of a script collider component. Mesh shapes can be read but not written.
-/// Appended in ABI v17.
+/// Appended in ABI v18.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColliderShape {
     Box,
@@ -528,7 +528,7 @@ pub enum ColliderShape {
 }
 
 /// Collider component read or written by scripts. `size` is the full box extent; `radius` and
-/// `height` apply to spheres and capsules. Appended in ABI v17.
+/// `height` apply to spheres and capsules. Appended in ABI v18.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Collider {
     pub shape: ColliderShape,
@@ -539,7 +539,7 @@ pub struct Collider {
     pub trigger: bool,
 }
 
-/// Rigid body kind. Appended in ABI v17.
+/// Rigid body kind. Appended in ABI v18.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
     Static,
@@ -547,7 +547,7 @@ pub enum BodyKind {
     Dynamic,
 }
 
-/// Rigid body component values. Appended in ABI v17.
+/// Rigid body component values. Appended in ABI v18.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RigidBody {
     pub kind: BodyKind,
@@ -559,7 +559,7 @@ pub struct RigidBody {
 }
 
 /// Character controller component values. `jump_height` and `use_gravity` drive
-/// `Object::simple_move` and `Object::jump`. Appended in ABI v17.
+/// `Object::simple_move` and `Object::jump`. Appended in ABI v18.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CharacterController {
     pub radius: f32,
@@ -574,7 +574,7 @@ pub struct CharacterController {
     pub use_gravity: bool,
 }
 
-/// Shape of an overlap or cast query. Appended in ABI v17.
+/// Shape of an overlap or cast query. Appended in ABI v18.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum QueryShape {
     Sphere { radius: f32 },
@@ -582,7 +582,7 @@ pub enum QueryShape {
     Capsule { radius: f32, height: f32 },
 }
 
-/// Options of overlap, raycast-all and shape-cast queries. Appended in ABI v17.
+/// Options of overlap, raycast-all and shape-cast queries. Appended in ABI v18.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryOptions<'a> {
     /// Bit `n` enables collider layer `n`.
@@ -3664,9 +3664,9 @@ pub mod __private {
         command: RveCommandFn,
         collision: RveCollisionFn,
         net_event: RveNetEventFn,
+        ui_event: RveUiEventFn,
         enable: RveStartFn,
         disable: RveStartFn,
-        ui_event: RveUiEventFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -3682,9 +3682,9 @@ pub mod __private {
             command: Some(command),
             collision: Some(collision),
             net_event: Some(net_event),
+            ui_event: Some(ui_event),
             on_enable: Some(enable),
             on_disable: Some(disable),
-            ui_event: Some(ui_event),
         }
     }
 
@@ -4385,9 +4385,10 @@ macro_rules! __rve_script_descriptor {
             __rve_command,
             __rve_collision,
             __rve_net_event,
+            __rve_ui_event,
             __rve_enable,
             __rve_disable,
-            __rve_ui_event,            $crate::__rve_params!(@munch [] $($params)*),
+            $crate::__rve_params!(@munch [] $($params)*),
         )
     }};
 }

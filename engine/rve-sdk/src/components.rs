@@ -1,4 +1,4 @@
-//! Guest wrappers for scene component changes added in ABI v18: lights, mesh renderers, particle
+//! Guest wrappers for scene component changes added in ABI v19: lights, mesh renderers, particle
 //! emitters, environments, LOD groups, audio source settings and spatial clip options.
 //!
 //! Each method calls one host callback. A `false` or missing callback means the host refused the
@@ -28,7 +28,7 @@ impl LightKind {
 /// Failure of a scene component change made by a guest script.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentError {
-    /// The host predates ABI v18 and provides no such callback.
+    /// The host predates ABI v19 and provides no such callback.
     Unavailable,
     /// The host refused the change: the object lacks the component or a value is out of range.
     Rejected,

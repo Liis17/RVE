@@ -264,6 +264,19 @@ impl<'a> AbiCallContext<'a> {
             net_object_has_authority: Some(host_net_object_has_authority),
             net_object_set_owner: Some(host_net_object_set_owner),
             net_object_send: Some(host_net_object_send),
+            ui_open: Some(host_ui_open),
+            ui_close: Some(host_ui_close),
+            ui_object_canvas: Some(host_ui_object_canvas),
+            ui_focused: Some(host_ui_focused),
+            ui_pointer_over: Some(host_ui_pointer_over),
+            ui_find: Some(host_ui_find),
+            ui_get: Some(host_ui_get),
+            ui_set: Some(host_ui_set),
+            ui_get_rect: Some(host_ui_get_rect),
+            ui_set_rect: Some(host_ui_set_rect),
+            ui_set_options: Some(host_ui_set_options),
+            ui_set_image: Some(host_ui_set_image),
+            ui_focus: Some(host_ui_focus),
             object_set_active: Some(host_object_set_active),
             object_is_active: Some(host_object_is_active),
             object_active_in_hierarchy: Some(host_object_active_in_hierarchy),
@@ -352,19 +365,6 @@ impl<'a> AbiCallContext<'a> {
                 .transaction
                 .physics_attached()
                 .then_some(host_physics_shape_cast),
-            ui_open: Some(host_ui_open),
-            ui_close: Some(host_ui_close),
-            ui_object_canvas: Some(host_ui_object_canvas),
-            ui_focused: Some(host_ui_focused),
-            ui_pointer_over: Some(host_ui_pointer_over),
-            ui_find: Some(host_ui_find),
-            ui_get: Some(host_ui_get),
-            ui_set: Some(host_ui_set),
-            ui_get_rect: Some(host_ui_get_rect),
-            ui_set_rect: Some(host_ui_set_rect),
-            ui_set_options: Some(host_ui_set_options),
-            ui_set_image: Some(host_ui_set_image),
-            ui_focus: Some(host_ui_focus),
         }
     }
 
@@ -617,12 +617,12 @@ impl AbiScriptInstance {
         context.callback_result(status)
     }
 
-    /// Есть ли у дескриптора callback UI-событий (ABI v15).
+    /// Есть ли у дескриптора callback UI-событий (ABI v16).
     pub(crate) fn has_ui_event(&self) -> bool {
         self.descriptor.ui_event.is_some()
     }
 
-    /// Вызывает `on_ui_event` гостя. Без callback (модуль до v15) событие пропускается без ошибки.
+    /// Вызывает `on_ui_event` гостя. Без callback (модуль до v16) событие пропускается без ошибки.
     pub(crate) fn invoke_ui_event(
         &mut self,
         time: ScriptTime,
@@ -3587,7 +3587,7 @@ unsafe extern "C" fn host_net_object_send(
     })
 }
 
-// ---- Игровой UI (ABI v15) ----
+// ---- Игровой UI (ABI v16) ----
 //
 // Все записи идут через транзакцию вызова: откат при ошибке гостя и отложенные закрытия работают
 // так же, как у остальных callback. Хендлы в ABI — `(generation << 32) | (index + 1)` для канваса и

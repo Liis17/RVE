@@ -1801,17 +1801,16 @@ impl ScriptHost {
             let object = owner;
             let targets: Vec<usize> = (0..self.instances.len())
                 .filter(|&index| {
-                    self.instances[index]
-                        .as_ref()
-                        .is_some_and(|instance| instance.enabled && instance.handle == object)
-                        && self.has_ui_callback(index)
+                    self.instances[index].as_ref().is_some_and(|instance| {
+                        instance.enabled && instance.running && instance.handle == object
+                    }) && self.has_ui_callback(index)
                 })
                 .collect();
             for index in targets {
                 // Экземпляр мог отключиться предыдущим событием этого же кадра.
                 if !self.instances[index]
                     .as_ref()
-                    .is_some_and(|instance| instance.enabled)
+                    .is_some_and(|instance| instance.enabled && instance.running)
                 {
                     continue;
                 }
@@ -1833,7 +1832,7 @@ impl ScriptHost {
         }
     }
 
-    /// Есть ли у экземпляра callback `on_ui_event`; ABI-модули до v19 такого не имеют.
+    /// Есть ли у экземпляра callback `on_ui_event`; ABI-модули до v16 такого не имеют.
     fn has_ui_callback(&self, index: usize) -> bool {
         match self.instances[index]
             .as_ref()
@@ -3206,6 +3205,7 @@ fn has_component(object: &engine_scene::WorldObject, component: &ComponentKind) 
         ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ComponentKind::Script(name) => {
             object
                 .lite_scripts
@@ -3236,12 +3236,12 @@ pub fn lite_properties(
     })
 }
 
-/// `RVE_TRIGGER_STAY` появился в ABI v17. Модуль старше отвергает неизвестный вид события ошибкой,
+/// `RVE_TRIGGER_STAY` появился в ABI v18. Модуль старше отвергает неизвестный вид события ошибкой,
 /// поэтому ему stay не доставляется.
 fn accepts_physics_event(kind: &ScriptKind, event: ScriptPhysicsEventKind) -> bool {
     match kind {
         ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
-            !matches!(event, ScriptPhysicsEventKind::TriggerStay) || script.abi_version() >= 17
+            !matches!(event, ScriptPhysicsEventKind::TriggerStay) || script.abi_version() >= 18
         }
         _ => true,
     }

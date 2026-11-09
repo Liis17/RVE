@@ -2,7 +2,7 @@ use super::empty_ui_value;
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
     RVE_LOG_WARN, RVE_QUERY_BOX, RVE_QUERY_CAPSULE, RVE_QUERY_SPHERE, RVE_SCRIPT_ABI_VERSION,
-    RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams, RveCameraSettings,
+    RVE_TRIGGER_STAY, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams, RveCameraSettings,
     RveCharacterMoveResult, RveCursorState, RveGamepadState, RveHeader, RveHost, RveModule,
     RveParamEntry, RveParams, RvePlayAnimationParams, RveQueryOptions, RveQueryShape,
     RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveUiRect, RveUiValue,
@@ -2558,75 +2558,146 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(
-        offset_of!(crate::abi::RveScriptDescV18, on_enable),
-        size_of::<crate::abi::RveScriptDescV15>()
-    );
-    assert_eq!(
-        size_of::<crate::abi::RveScriptDescV18>(),
-        size_of::<crate::abi::RveScriptDescV15>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
-    );
     assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
 }
 
 #[test]
-fn object_hierarchy_callbacks_follow_the_v14_screen_shader_tail() {
-    use std::mem::{offset_of, size_of};
-    assert_eq!(
-        offset_of!(RveHost, object_set_active),
-        offset_of!(RveHost, set_screen_shader)
-            + size_of::<Option<crate::abi::RveSetScreenShaderFn>>()
-    );
-    assert_eq!(
-        offset_of!(RveHost, physics_get_collider),
-        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>()
-    );
-    assert_eq!(
-        offset_of!(RveHost, light_get),
-        offset_of!(RveHost, physics_shape_cast)
-            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>()
-    );
-    assert_eq!(
-        offset_of!(RveHost, audio_set_voice_position)
-            + size_of::<Option<crate::abi::RveAudioSetVoicePositionFn>>(),
-        offset_of!(RveHost, mesh_set_material_path)
-    );
-}
-
-#[test]
-fn ui_callbacks_and_descriptor_are_appended_after_the_v18_tails() {
+fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
     use std::mem::{offset_of, size_of};
     assert_eq!(
         offset_of!(RveHost, ui_open),
-        offset_of!(RveHost, mesh_set_material_path)
-            + size_of::<Option<crate::abi::RveMeshSetMaterialPathFn>>()
+        offset_of!(RveHost, set_screen_shader)
+            + size_of::<Option<crate::abi::RveSetScreenShaderFn>>()
     );
     assert_eq!(
         offset_of!(RveHost, ui_focus),
         offset_of!(RveHost, ui_set_image) + size_of::<Option<crate::abi::RveUiSetImageFn>>()
     );
     assert_eq!(
-        offset_of!(RveHost, ui_focus) + size_of::<Option<crate::abi::RveUiFocusFn>>(),
-        size_of::<RveHost>()
+        size_of::<crate::abi::RveScriptDescV16>(),
+        size_of::<crate::abi::RveScriptDescV15>() + size_of::<Option<crate::abi::RveUiEventFn>>()
     );
     assert_eq!(
-        size_of::<crate::abi::RveScriptDesc>(),
-        size_of::<crate::abi::RveScriptDescV18>() + size_of::<Option<crate::abi::RveUiEventFn>>()
+        offset_of!(crate::abi::RveScriptDescV16, ui_event),
+        size_of::<crate::abi::RveScriptDescV15>()
     );
     assert_eq!(
         offset_of!(crate::abi::RveScriptDesc, ui_event),
-        offset_of!(crate::abi::RveScriptDescV18, on_disable)
+        size_of::<crate::abi::RveScriptDescV15>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDesc, on_enable),
+        size_of::<crate::abi::RveScriptDescV16>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDesc, on_disable),
+        offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV16>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
     );
     assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
 }
 
 #[test]
-fn runtime_physics_value_types_are_c_layout_in_v17() {
+fn lifecycle_descriptor_fields_follow_the_ui_event_in_abi_v17() {
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV17, ui_event),
+        size_of::<crate::abi::RveScriptDescV15>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV17, on_enable),
+        size_of::<crate::abi::RveScriptDescV16>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV17>(),
+        size_of::<crate::abi::RveScriptDescV16>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV18>(),
+        size_of::<crate::abi::RveScriptDescV17>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV18>()
+    );
+}
+#[test]
+fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(crate::abi::RVE_COMPONENT_NAMES.last(), Some(&"ui_canvas"));
+    assert_eq!(
+        offset_of!(RveHost, object_set_active),
+        offset_of!(RveHost, ui_focus) + size_of::<Option<crate::abi::RveUiFocusFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>(),
+        offset_of!(RveHost, physics_get_collider)
+    );
+}
+
+#[test]
+fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_TRIGGER_STAY, 4);
+    assert_eq!(
+        offset_of!(RveHost, physics_get_collider),
+        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, physics_shape_cast)
+            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>(),
+        offset_of!(RveHost, light_get)
+    );
+}
+
+#[test]
+fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(
+        offset_of!(RveHost, light_get),
+        offset_of!(RveHost, physics_shape_cast)
+            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, mesh_set_visible),
+        offset_of!(RveHost, mesh_get_visible)
+            + size_of::<Option<crate::abi::RveObjectBoolQueryFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, mesh_set_material_path)
+            + size_of::<Option<crate::abi::RveMeshSetMaterialPathFn>>(),
+        size_of::<RveHost>()
+    );
+}
+#[test]
+fn v15_parameter_argument_is_an_appended_tail_after_the_legacy_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(crate::abi::RveParamDesc, argument),
+        size_of::<crate::abi::RveParamDescV13>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV15, params),
+        offset_of!(crate::abi::RveScriptDescV13, params)
+    );
+}
+
+#[test]
+fn runtime_physics_value_types_are_c_layout_in_v18() {
     use crate::abi::{
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);
@@ -3175,45 +3246,6 @@ fn pressed_inputs_list_gamepad_slots_in_order_with_concrete_names() {
     );
 }
 
-#[test]
-fn v18_component_structs_keep_their_documented_c_layout() {
-    use crate::abi::{
-        RveAudioPlayExParams, RveAudioSourceState, RveEnvironmentState, RveLightState,
-        RveMeshMaterialParams, RveProceduralSky,
-    };
-    use std::mem::{offset_of, size_of};
-
-    assert_eq!(size_of::<RveLightState>(), 52);
-    assert_eq!(offset_of!(RveLightState, ambient), 12);
-    assert_eq!(offset_of!(RveLightState, shadow_cascades), 44);
-    assert_eq!(offset_of!(RveLightState, shadows), 48);
-    assert_eq!(offset_of!(RveLightState, enabled), 49);
-
-    assert_eq!(size_of::<RveProceduralSky>(), 44);
-    assert_eq!(offset_of!(RveProceduralSky, horizon_color), 12);
-    assert_eq!(offset_of!(RveProceduralSky, sun_size_deg), 36);
-    assert_eq!(offset_of!(RveProceduralSky, sun_intensity), 40);
-
-    assert_eq!(size_of::<RveEnvironmentState>(), 52);
-    assert_eq!(offset_of!(RveEnvironmentState, has_sky), 4);
-    assert_eq!(offset_of!(RveEnvironmentState, sky), 8);
-
-    assert_eq!(size_of::<RveMeshMaterialParams>(), 36);
-    assert_eq!(offset_of!(RveMeshMaterialParams, base_color), 4);
-    assert_eq!(offset_of!(RveMeshMaterialParams, metallic), 28);
-    assert_eq!(offset_of!(RveMeshMaterialParams, roughness), 32);
-
-    assert_eq!(size_of::<RveAudioSourceState>(), 36);
-    assert_eq!(offset_of!(RveAudioSourceState, rolloff), 24);
-    assert_eq!(offset_of!(RveAudioSourceState, pitch), 28);
-    assert_eq!(offset_of!(RveAudioSourceState, force_mono), 32);
-
-    assert_eq!(size_of::<RveAudioPlayExParams>(), 48);
-    assert_eq!(offset_of!(RveAudioPlayExParams, position), 12);
-    assert_eq!(offset_of!(RveAudioPlayExParams, follow), 24);
-    assert_eq!(offset_of!(RveAudioPlayExParams, spatial_blend), 32);
-    assert_eq!(offset_of!(RveAudioPlayExParams, force_mono), 44);
-}
 const UI_CANVAS: u64 = 7;
 const UI_LABEL: u32 = 3;
 
@@ -3680,4 +3712,44 @@ fn ui_events_reach_on_ui_event_with_decoded_values_and_reject_unknown_kinds() {
         unsafe { crate::__private::drop_instance(instance) },
         RveStatus::Ok
     );
+}
+
+#[test]
+fn v19_component_structs_keep_their_documented_c_layout() {
+    use crate::abi::{
+        RveAudioPlayExParams, RveAudioSourceState, RveEnvironmentState, RveLightState,
+        RveMeshMaterialParams, RveProceduralSky,
+    };
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(size_of::<RveLightState>(), 52);
+    assert_eq!(offset_of!(RveLightState, ambient), 12);
+    assert_eq!(offset_of!(RveLightState, shadow_cascades), 44);
+    assert_eq!(offset_of!(RveLightState, shadows), 48);
+    assert_eq!(offset_of!(RveLightState, enabled), 49);
+
+    assert_eq!(size_of::<RveProceduralSky>(), 44);
+    assert_eq!(offset_of!(RveProceduralSky, horizon_color), 12);
+    assert_eq!(offset_of!(RveProceduralSky, sun_size_deg), 36);
+    assert_eq!(offset_of!(RveProceduralSky, sun_intensity), 40);
+
+    assert_eq!(size_of::<RveEnvironmentState>(), 52);
+    assert_eq!(offset_of!(RveEnvironmentState, has_sky), 4);
+    assert_eq!(offset_of!(RveEnvironmentState, sky), 8);
+
+    assert_eq!(size_of::<RveMeshMaterialParams>(), 36);
+    assert_eq!(offset_of!(RveMeshMaterialParams, base_color), 4);
+    assert_eq!(offset_of!(RveMeshMaterialParams, metallic), 28);
+    assert_eq!(offset_of!(RveMeshMaterialParams, roughness), 32);
+
+    assert_eq!(size_of::<RveAudioSourceState>(), 36);
+    assert_eq!(offset_of!(RveAudioSourceState, rolloff), 24);
+    assert_eq!(offset_of!(RveAudioSourceState, pitch), 28);
+    assert_eq!(offset_of!(RveAudioSourceState, force_mono), 32);
+
+    assert_eq!(size_of::<RveAudioPlayExParams>(), 48);
+    assert_eq!(offset_of!(RveAudioPlayExParams, position), 12);
+    assert_eq!(offset_of!(RveAudioPlayExParams, follow), 24);
+    assert_eq!(offset_of!(RveAudioPlayExParams, spatial_blend), 32);
+    assert_eq!(offset_of!(RveAudioPlayExParams, force_mono), 44);
 }
