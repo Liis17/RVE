@@ -15,11 +15,18 @@ use engine_physics::{
 };
 use engine_scene::{
     AnimationRequest, AudioRequest, CameraSettings, ComponentKind, LAYER_COUNT, LocalTransform,
-    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetMode, NetRequest,
-    NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId, PostProcessSettings, SERVER_PEER_ID,
-    World,
+    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, MAX_SCREEN_SHADER_PARAMS,
+    NetMode, NetRequest, NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId,
+    PostProcessSettings, SERVER_PEER_ID, World,
 };
 use glam::{EulerRot, Quat, Vec3};
+
+/// Состояние одного слота экранного шейдера камеры в очереди транзакции.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScreenShaderState {
+    pub(crate) enabled: bool,
+    pub(crate) params: [f32; MAX_SCREEN_SHADER_PARAMS],
+}
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -196,6 +203,8 @@ pub(crate) struct ScriptTransaction {
     pending_transforms: HashMap<ObjectHandle, LocalTransform>,
     pending_camera_settings: HashMap<ObjectHandle, CameraSettings>,
     pending_post_process: HashMap<ObjectHandle, PostProcessSettings>,
+    /// Состояние экранных шейдеров камер по (объект, слот); применяется на commit.
+    pending_screen_shaders: HashMap<(ObjectHandle, usize), ScreenShaderState>,
     pending_active_camera: Option<ObjectHandle>,
     pending_messages: Vec<PendingMessage>,
     pending_warnings: Vec<String>,
@@ -261,6 +270,7 @@ impl Default for ScriptTransaction {
             pending_transforms: HashMap::with_capacity(8),
             pending_camera_settings: HashMap::with_capacity(2),
             pending_post_process: HashMap::with_capacity(2),
+            pending_screen_shaders: HashMap::new(),
             pending_active_camera: None,
             pending_messages: Vec::with_capacity(16),
             pending_warnings: Vec::new(),
@@ -325,6 +335,7 @@ impl ScriptTransaction {
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
         self.pending_post_process.clear();
+        self.pending_screen_shaders.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_warnings.clear();
@@ -1179,6 +1190,11 @@ impl ScriptTransaction {
                 .set_post_process(*handle, *settings)
                 .map_err(|error| error.to_string())?;
         }
+        for ((handle, slot), state) in &self.pending_screen_shaders {
+            world
+                .set_screen_shader(*handle, *slot, state.enabled, &state.params)
+                .map_err(|error| error.to_string())?;
+        }
         if let Some(handle) = self.pending_active_camera {
             world
                 .set_active_camera(handle)
@@ -1417,6 +1433,61 @@ impl ScriptTransaction {
             .is_some_and(|handle| self.set_post_process(handle, settings))
     }
 
+    /// Число экранных шейдеров камеры; `None`, если объект не камера.
+    pub(crate) fn screen_shader_count(&self, handle: ObjectHandle) -> Option<usize> {
+        self.world()?.screen_shaders(handle).map(<[_]>::len)
+    }
+
+    /// Состояние слота экранного шейдера с учётом уже поставленных в очередь изменений.
+    pub(crate) fn screen_shader(
+        &self,
+        handle: ObjectHandle,
+        slot: usize,
+    ) -> Option<ScreenShaderState> {
+        if let Some(state) = self.pending_screen_shaders.get(&(handle, slot)) {
+            return Some(state.clone());
+        }
+        let shader = self.world()?.screen_shaders(handle)?.get(slot)?;
+        let mut params = [0.0; MAX_SCREEN_SHADER_PARAMS];
+        for (target, value) in params.iter_mut().zip(&shader.params) {
+            *target = *value;
+        }
+        Some(ScreenShaderState {
+            enabled: shader.enabled,
+            params,
+        })
+    }
+
+    /// Ставит состояние слота в очередь; путь и стадия не меняются. Ошибка — не камера, нет слота
+    /// или параметры не конечны.
+    pub(crate) fn set_screen_shader(
+        &mut self,
+        handle: ObjectHandle,
+        slot: usize,
+        state: ScreenShaderState,
+    ) -> bool {
+        if !self.writable
+            || self
+                .screen_shader_count(handle)
+                .is_none_or(|count| slot >= count)
+            || !state.params.iter().all(|value| value.is_finite())
+        {
+            return false;
+        }
+        self.pending_screen_shaders.insert((handle, slot), state);
+        true
+    }
+
+    pub(crate) fn set_screen_shader_from_abi(
+        &mut self,
+        handle: u64,
+        slot: usize,
+        state: ScreenShaderState,
+    ) -> bool {
+        self.object_from_abi_handle(handle)
+            .is_some_and(|handle| self.set_screen_shader(handle, slot, state))
+    }
+
     fn is_camera(&self, handle: ObjectHandle) -> bool {
         self.world()
             .and_then(|world| world.object(handle))
@@ -1632,6 +1703,14 @@ impl ScriptTransaction {
             self.discard();
             return Err("script wrote camera settings for an object without a camera".to_owned());
         }
+        if self.pending_screen_shaders.keys().any(|(handle, _)| {
+            world
+                .object(*handle)
+                .is_none_or(|object| object.camera.is_none())
+        }) {
+            self.discard();
+            return Err("script wrote screen shaders for an object without a camera".to_owned());
+        }
         if let Some(error) = self
             .pending_post_process
             .values()
@@ -1695,6 +1774,7 @@ impl ScriptTransaction {
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
         self.pending_post_process.clear();
+        self.pending_screen_shaders.clear();
         self.pending_active_camera = None;
         self.pending_edits.clear();
 
@@ -1808,6 +1888,7 @@ impl ScriptTransaction {
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
         self.pending_post_process.clear();
+        self.pending_screen_shaders.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_warnings.clear();

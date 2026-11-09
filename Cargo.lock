@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "engine-files",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -3081,12 +3081,13 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "engine-assets",
  "engine-files",
  "engine-pak",
  "engine-project",
+ "engine-render",
  "engine-resources",
  "engine-scene",
  "engine-script",
@@ -3101,7 +3102,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3146,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.9.0"
+version = "0.10.0"
 
 [[package]]
 name = "rve-server"
@@ -3174,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "engine-assets",
  "engine-core",

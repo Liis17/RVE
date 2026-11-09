@@ -550,6 +550,9 @@ fn host(state: &mut HostState) -> RveHost {
         net_object_has_authority: None,
         net_object_set_owner: None,
         net_object_send: None,
+        screen_shader_count: None,
+        get_screen_shader: None,
+        set_screen_shader: None,
         object_set_active: None,
         object_is_active: None,
         object_active_in_hierarchy: None,
@@ -2022,7 +2025,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2292,7 +2295,29 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
+}
+
+#[test]
+fn screen_shader_callbacks_are_appended_in_v14() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, screen_shader_count),
+        offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, get_screen_shader),
+        offset_of!(RveHost, screen_shader_count)
+            + size_of::<Option<crate::abi::RveScreenShaderCountFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_screen_shader),
+        offset_of!(RveHost, get_screen_shader)
+            + size_of::<Option<crate::abi::RveGetScreenShaderFn>>()
+    );
+    assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
+    assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
 }
 
 #[test]
@@ -2314,26 +2339,27 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
     );
     // v14 changed the parameter descriptor contents but not the script descriptor's shape.
     assert_eq!(
-        size_of::<crate::abi::RveScriptDescV14>(),
+        size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
     assert_eq!(
         offset_of!(RveScriptDesc, on_enable),
-        size_of::<crate::abi::RveScriptDescV14>()
+        size_of::<crate::abi::RveScriptDescV15>()
     );
     assert_eq!(
         size_of::<crate::abi::RveScriptDesc>(),
-        size_of::<crate::abi::RveScriptDescV14>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
+        size_of::<crate::abi::RveScriptDescV15>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
 }
 
 #[test]
-fn object_hierarchy_callbacks_are_appended_after_the_v14_network_tail() {
+fn object_hierarchy_callbacks_are_appended_after_the_v14_screen_shader_tail() {
     use std::mem::{offset_of, size_of};
     assert_eq!(
         offset_of!(RveHost, object_set_active),
-        offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
+        offset_of!(RveHost, set_screen_shader)
+            + size_of::<Option<crate::abi::RveSetScreenShaderFn>>()
     );
     assert_eq!(
         offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>(),

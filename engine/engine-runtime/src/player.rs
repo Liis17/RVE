@@ -855,7 +855,8 @@ impl WindowHandler for PlayerWindow<'_> {
         let backend =
             VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view)
                 .with_particle_emitters(std::mem::take(&mut gpu_scene.particles))
-                .with_scene_skin_instances(gpu_scene.skin_instance_ids());
+                .with_scene_skin_instances(gpu_scene.skin_instance_ids())
+                .with_scene_screen_shaders(gpu_scene.screen_shader_ids());
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(

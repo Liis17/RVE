@@ -6,7 +6,7 @@ use rve_sdk::abi::{
     RVE_PARAM_ENUM, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
     RVE_PARAM_OBJECT, RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule,
     RveParamDesc, RveParamDescV13, RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
-    RveScriptDescV14,
+    RveScriptDescV15,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -159,8 +159,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            15.. => std::mem::size_of::<RveScriptDesc>(),
-            14 => std::mem::size_of::<RveScriptDescV14>(),
+            16.. => std::mem::size_of::<RveScriptDesc>(),
+            14 | 15 => std::mem::size_of::<RveScriptDescV15>(),
             13 => std::mem::size_of::<RveScriptDescV13>(),
             6..=12 => std::mem::size_of::<RveScriptDescV6>(),
             4 | 5 => std::mem::size_of::<RveScriptDescV4>(),
@@ -181,13 +181,13 @@ impl ScriptLibrary {
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v15 = (header.abi_version >= 15)
+        let descriptors_v16 = (header.abi_version >= 16)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        // ABI v14 has the v14 parameter descriptor but no enable and disable callbacks.
-        let descriptors_v14 = (header.abi_version == 14).then(|| unsafe {
-            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV14>(), count)
+        // ABI v14 and v15 have no enable and disable callbacks; only v15 has the new parameter descriptor.
+        let descriptors_v15 = (14..=15).contains(&header.abi_version).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV15>(), count)
         });
-        // ABI v13 has the network tail and the pre-v14 parameter descriptor.
+        // ABI v13 has the network tail; v13 and v14 use the pre-v15 parameter descriptor.
         let descriptors_v13 = (header.abi_version == 13).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV13>(), count)
         });
@@ -209,10 +209,10 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v15 {
+            let descriptor = if let Some(descriptors) = descriptors_v16 {
                 &descriptors[index]
-            } else if let Some(descriptors) = descriptors_v14 {
-                // ABI v14 has no enable and disable callbacks; normalize them to `None`.
+            } else if let Some(descriptors) = descriptors_v15 {
+                // ABI v14 and v15 have no enable and disable callbacks; normalize them to `None`.
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
@@ -338,7 +338,7 @@ impl ScriptLibrary {
                 });
             }
             let name = name.to_owned();
-            let schema = if header.abi_version >= 14 {
+            let schema = if header.abi_version >= 15 {
                 // SAFETY: the caller guarantees the parameter table of every v3+ descriptor.
                 unsafe { read_schema(descriptor) }.map_err(|message| {
                     ScriptLibraryError::InvalidParams {
@@ -347,7 +347,7 @@ impl ScriptLibrary {
                     }
                 })?
             } else if header.abi_version >= 3 {
-                // SAFETY: versions 3 through 13 use the old descriptor layout.
+                // SAFETY: versions 3 through 14 use the old parameter descriptor layout.
                 unsafe { read_schema_v13(descriptor) }.map_err(|message| {
                     ScriptLibraryError::InvalidParams {
                         script: name.clone(),
@@ -435,7 +435,7 @@ unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>,
     }))
 }
 
-/// Reads a v3-v13 descriptor without accessing the v14 argument tail.
+/// Reads a v3-v14 descriptor without accessing the v15 argument tail.
 unsafe fn read_schema_v13(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>, String> {
     let count = descriptor.param_count;
     if count == 0 {
@@ -486,7 +486,7 @@ fn read_schema_params(
         let name = unsafe { read_abi_str(name) }
             .map_err(|error| format!("parameter {index} has an invalid name: {error:?}"))?
             .to_owned();
-        // SAFETY: v14 descriptors carry a process-lifetime argument; old descriptors provide empty.
+        // SAFETY: v15 descriptors carry a process-lifetime argument; old descriptors provide empty.
         let argument = unsafe { read_abi_str(argument) }
             .map_err(|error| format!("parameter {name:?} has an invalid argument: {error:?}"))?;
         let kind = abi_param_kind(kind_code, argument)

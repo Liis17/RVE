@@ -265,6 +265,8 @@ pub struct EditorState {
     pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
     /// Фоновый разбор FBX для `models`.
     pub model_loader: ModelLoader,
+    /// Последняя ошибка компиляции экранного шейдера по пути `.glsl`; показывается в инспекторе.
+    pub screen_shader_errors: HashMap<String, String>,
     /// Выпуклые оболочки и trimesh для рёбер коллайдеров и ошибок инспектора.
     pub collider_cache: ColliderCache,
     /// Настройки превью аниматора выбранного объекта; меняет инспектор.
@@ -345,6 +347,7 @@ impl EditorState {
             apply_prompt: None,
             lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),
+            screen_shader_errors: HashMap::new(),
             collider_cache: ColliderCache::default(),
             animation_preview: AnimationPreview::default(),
             animation_status: PreviewStatus::default(),

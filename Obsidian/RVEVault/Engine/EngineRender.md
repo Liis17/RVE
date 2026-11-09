@@ -25,9 +25,10 @@ Parent: [[Index]]
 | `engine/engine-render/shaders/shadow.vert`, `engine/engine-render/shaders/shadow.frag` | `light_view_projection`, `model`, UV и alpha-mask material descriptor | Shadow pass отбрасывает mask texels по тому же base-color alpha и cutoff; blend материалы пропускаются |
 | `engine/engine-render/shaders/overlay.vert`, `engine/engine-render/shaders/overlay.frag` | push constant `target_size` | 2D-оверлей: пиксели окна → NDC, цвет вершины с альфой |
 | `engine/engine-render/src/ui.rs`, `engine/engine-render/shaders/ui.vert`, `engine/engine-render/shaders/ui.frag` | `UiVertex`, `UiPrimitive`, `UiImage`, `RetireQueue`, `RetiredSwapchains`, UI shader | Преобразование геометрии и текстур интерфейса в triangle list и swapchain pass |
-| engine/engine-render/build.rs | SHADERS | Компиляция встроенного GLSL в SPIR-V через naga в OUT_DIR; runtime shader compilation находится в src/surface_shader.rs |
+| `engine/engine-render/build.rs` | `SHADERS` | Компиляция встроенного GLSL в SPIR-V через naga в `OUT_DIR`; renderer встраивает результат через `include_bytes!`. Runtime-компиляция Surface GLSL находится в `src/surface_shader.rs` |
+| `engine/engine-render/src/screen_shader.rs` | `compile_screen_shader`, `ScreenShaderStage`, `ScreenShaders`, `ScreenShaderPipelines`, `ScreenShaderScratch`, `record_screen_chain` | Пользовательские экранные шейдеры камеры: prelude, компиляция naga без GPU, проверка IR, push constants и проходы; см. [[Engine/EngineScreenShaders]] |
 | `engine/engine-render/Cargo.toml`, `engine/engine-render/build.rs` | feature `dlss`, `RVE_DLSS_SDK` | Windows x64 MSVC DLSS feature связывается с `nvsdk_ngx_s.lib`; runtime SDK DLL не хранится в репозитории |
-| engine/engine-render/Cargo.toml | ash, libloading, engine-platform, raw-window-handle, naga | Vulkan bindings, динамический FSR loader, platform integration, raw window handles и naga для build/runtime GLSL |
+| `engine/engine-render/Cargo.toml` | `ash`, `libloading`, `engine-platform`, `raw-window-handle`, зависимость `naga` (шейдеры renderer при сборке, Surface GLSL и пользовательские экранные шейдеры во время работы) | Vulkan bindings, динамический FSR loader, платформенная интеграция, оконные handles без зависимости от winit и сборка шейдеров |
 
 ## Публичные контракты
 
@@ -97,13 +98,14 @@ Parent: [[Index]]
 
 ## Зависимости и взаимодействия
 
-- Использует ash 0.38.0 и raw-window-handle 0.6.2; naga 30.0.1 — build-зависимость для встроенных shaders и runtime-зависимость для Surface GLSL. naga 30.0.1 не собирает `glsl-in` без `wgsl-in` или `spv-in`, поэтому в `Cargo.toml` дополнительно включена `wgsl-in`. [[Engine/EnginePlatform]] предоставляет загрузку Vulkan, требования платформы и surface через ash-window 0.13.0.
+- Использует ash 0.38.0 и raw-window-handle 0.6.2; naga 30.0.1 — build-зависимость для встроенных shaders и runtime-зависимость для Surface GLSL и пользовательских экранных шейдеров ([[Engine/EngineScreenShaders]]). naga 30.0.1 не собирает `glsl-in` без `wgsl-in` или `spv-in`, поэтому в `Cargo.toml` дополнительно включена `wgsl-in`. [[Engine/EnginePlatform]] предоставляет загрузку Vulkan, требования платформы и surface через ash-window 0.13.0.
 - Используется в [[Engine/Sandbox]] и [[Engine/RveEditor]], которые передают `Arc<Window>` из [[Engine/EngineWindow]]. Renderer получает UI-треугольники без зависимости от egui; редактор переводит egui output и управляет scene viewport-ами.
 - `engine-render` намеренно не зависит от winit; это проверяется командой `cargo tree -p engine-render`.
 
 ## Ограничения и важные детали
 
 - GPU-профайлер: `GpuPass` перечисляет проходы в порядке выполнения. На каждый вид выделяется `GpuPass::COUNT + 1` запросов (начало и граница после каждого прохода), для вывода на swapchain — два; всего до `MAX_PROFILED_VIEWS` видов за кадр. Все границы пишутся стадией `ALL_COMMANDS` вне `cmd_begin_rendering`…`cmd_end_rendering`. Пул сбрасывается при начале command buffer. Чтение — один вызов с `TYPE_64 | WITH_AVAILABILITY`; недоступная граница означает, что проход не выполнялся в кадре, и его время попадает в следующий записанный проход. `NOT_READY` не отменяет чтение остальных запросов.
+- Экранные шейдеры камеры записываются как `GpuPass::ScreenShaderBefore` (после temporal resolve, до filters) и `GpuPass::ScreenShaderAfter` (после composite). Без включённых шейдеров эти границы не пишутся, а проходы и scratch не создаются. Порядок и контракт описаны в [[Engine/EngineScreenShaders]].
 - Submit ждёт `image_available` на стадии `COLOR_ATTACHMENT_OUTPUT`, поэтому ожидание acquire может попасть в первый color-проход (обычно Opaque), а не в вывод на swapchain. Синхронизация этим решением не меняется. GPU-данные отстают от CPU-фаз на число кадров в полёте. Точность на MoltenVK и Windows (FSR/DLSS в TemporalResolve) отдельно не сверялась.
 
 ## Решения и основания
