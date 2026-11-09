@@ -409,6 +409,8 @@ pub(crate) trait ExitRequester: Send + Sync {
 pub(crate) struct ScriptThreadConfig {
     pub scene_name: String,
     pub save_path: Option<PathBuf>,
+    /// Включённые сцены проекта: только они принимаются `rve.scene.load`.
+    pub enabled_scenes: Vec<String>,
     pub sources: std::collections::BTreeMap<String, String>,
     pub input_settings: engine_project::InputSettings,
     pub scripts_library: Option<PathBuf>,
@@ -1177,6 +1179,7 @@ fn scripts_thread(
     let ScriptThreadConfig {
         scene_name,
         save_path,
+        enabled_scenes,
         sources,
         input_settings,
         scripts_library,
@@ -1245,6 +1248,12 @@ fn scripts_thread(
         && let Err(error) = scripts.load_save_file(&path)
     {
         log::warn!("save data is unavailable at {}: {error}", path.display());
+    }
+    if let Err(error) = scripts.set_enabled_scenes(&enabled_scenes) {
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(ScriptStartupError::Load(error)));
+        }
+        return;
     }
     for (path, template) in &prefabs.templates {
         if let Err(error) = scripts.register_prefab(&world, path, Arc::clone(template), &sources) {
@@ -1648,6 +1657,14 @@ fn scripts_thread(
         scripts.set_input(input_frame);
         let update_started = Instant::now();
         scripts.update_frame(&mut world, frame_time);
+        // Загрузка сцены из скрипта пока не подключена к этому пути: запрос завершается ошибкой,
+        // а текущая сцена продолжает работать.
+        if let Some(path) = scripts.take_scene_request() {
+            scripts.report_scene_failure(
+                &path,
+                "scene switching is not connected to this runtime yet",
+            );
+        }
         let rumble = scripts.take_rumble_requests();
         if accepting_input {
             gamepads.rumble_frame(
@@ -3938,6 +3955,7 @@ return Input
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "input.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
@@ -4918,6 +4936,7 @@ return Script
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "scene.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources,
@@ -6157,6 +6176,7 @@ return Script
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -6288,6 +6308,7 @@ return Clock
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("clock.lua".to_owned(), script.to_owned())]),
@@ -6400,6 +6421,7 @@ return Script
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-start.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -6523,6 +6545,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-teleport.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -6703,6 +6726,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-failure.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -6788,6 +6812,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -7108,6 +7133,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([(
@@ -7172,6 +7198,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -7232,6 +7259,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -7307,6 +7335,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -7500,6 +7529,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "spawn.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
                 save_path: None,
                 cursor: CursorControl::default(),
                 sources: sources
