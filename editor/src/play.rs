@@ -4,7 +4,7 @@ use crate::play_network::{PlayNetwork, PlayNetworkPlan};
 use crate::profile::PlayStep;
 use crate::project::read_resource_text;
 use engine_animation::{AnimationBridge, AnimationEvent};
-use engine_assets::Assets;
+use engine_assets::{Assets, Model, ModelAnimation};
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
 use engine_files::VirtualPath;
@@ -133,6 +133,8 @@ pub struct PlayPrefabs {
     /// Документ тяжёлого префаба из списка объявляет heavy-скрипт: Play нужна библиотека.
     heavy_prefabs_use_scripts: bool,
     ui: PreparedUi,
+    /// Включённые сцены проекта: только они принимаются `rve.scene.load` в Play.
+    enabled_scenes: Vec<String>,
 }
 
 impl PlayPrefabs {
@@ -279,6 +281,12 @@ impl PlayPrefabs {
     /// Задаёт ресурсы проекта, из которых фоновый поток читает тяжёлые префабы.
     pub fn with_resources(mut self, resources: ResourceHandle) -> Self {
         self.resources = Some(resources);
+        self
+    }
+
+    /// Задаёт включённые сцены проекта для `rve.scene.load`.
+    pub fn with_enabled_scenes(mut self, scenes: Vec<String>) -> Self {
+        self.enabled_scenes = scenes;
         self
     }
 
@@ -596,6 +604,73 @@ pub struct PlaySession {
     pending_ui_detach: Vec<String>,
 }
 
+/// Сцена, подготовленная к замене в Play. Всё, что может отказать (скрипты, геометрия коллайдеров,
+/// ресурсы аниматоров), читается при подготовке, до изменения сессии.
+pub struct PlayScene {
+    path: String,
+    world: World,
+    sources: BTreeMap<String, String>,
+    prefabs: PlayPrefabs,
+    model_geometry: Vec<ModelGeometry>,
+    animation_models: std::collections::HashMap<String, Result<Arc<Model>, String>>,
+    animation_clips: std::collections::HashMap<String, Result<Arc<Vec<ModelAnimation>>, String>>,
+}
+
+impl PlayScene {
+    /// Готовит сцену `world` с путём `path`. `read_source` читает lite-скрипты.
+    pub fn prepare(
+        path: &str,
+        world: World,
+        prefabs: PlayPrefabs,
+        mut read_source: impl FnMut(&str) -> Result<String, String>,
+        assets: &Assets,
+    ) -> Result<Self, String> {
+        let mut sources = BTreeMap::new();
+        for object in world.objects() {
+            for script in &object.lite_scripts {
+                let script_path = script.path.as_str();
+                if !sources.contains_key(script_path) {
+                    sources.insert(script_path.to_owned(), read_source(script_path)?);
+                }
+            }
+        }
+        for (script_path, source) in &prefabs.sources {
+            sources
+                .entry(script_path.clone())
+                .or_insert_with(|| source.clone());
+        }
+        let model_geometry = PlaySession::load_model_geometry(&world, &prefabs, assets)?;
+        let mut animation_models = std::collections::HashMap::new();
+        let mut animation_clips = std::collections::HashMap::new();
+        for object in world.objects() {
+            let (Some(animator), Some(renderer)) = (&object.animator, &object.mesh_renderer) else {
+                continue;
+            };
+            animation_models
+                .entry(renderer.model.as_str().to_owned())
+                .or_insert_with(|| {
+                    crate::viewport::animation::load_model_file(assets, renderer.model.as_str())
+                });
+            for clip in &animator.clips {
+                animation_clips
+                    .entry(clip.as_str().to_owned())
+                    .or_insert_with(|| {
+                        crate::viewport::animation::load_clip_file(assets, clip.as_str())
+                    });
+            }
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            world,
+            sources,
+            prefabs,
+            model_geometry,
+            animation_models,
+            animation_clips,
+        })
+    }
+}
+
 /// The project's `[input.gamepad]` as the gamepad backend takes it.
 pub fn gamepad_tuning(settings: &GamepadSettings) -> GamepadTuning {
     GamepadTuning {
@@ -762,6 +837,7 @@ impl PlaySession {
             mut sources,
             resources,
             heavy_prefabs_use_scripts: _,
+            enabled_scenes,
             ui,
         } = prefabs;
         for object in world.objects() {
@@ -789,6 +865,7 @@ impl PlaySession {
             },
         )
         .map_err(|error| error.to_string())?;
+        host.set_enabled_scenes(&enabled_scenes)?;
         host.set_fixed_step_config(
             physics_settings.fixed_hz,
             physics_settings.max_substeps as usize,
@@ -1118,14 +1195,17 @@ impl PlaySession {
             audio.bridge.apply(activity_requests, &self.world);
         }
         loop {
-            // Смена сцены в Play не подключена: `scene_replaced` здесь всегда пуст.
             let WorldChanges {
                 spawned,
                 despawned,
                 prefab_requests,
-                scene_replaced: _,
+                scene_replaced,
             } = self.host.drain_world_changes();
-            if spawned.is_empty() && despawned.is_empty() && prefab_requests.is_empty() {
+            if spawned.is_empty()
+                && despawned.is_empty()
+                && prefab_requests.is_empty()
+                && scene_replaced.is_none()
+            {
                 return;
             }
             if self.network.is_some() {
@@ -1136,6 +1216,9 @@ impl PlaySession {
                     }));
             }
             self.apply_spawns(spawned, &despawned);
+            if let Some(replacement) = scene_replaced {
+                self.apply_scene_added(&replacement.added);
+            }
             self.apply_prefab_requests(prefab_requests);
         }
     }
@@ -1247,6 +1330,137 @@ impl PlaySession {
                     }),
             );
         }
+        if let Some(audio) = &mut self.audio {
+            audio.bridge.apply(requests, &self.world);
+        }
+    }
+
+    /// Запрос `rve.scene.load`, принятый последним кадром. Его выполняет редактор через
+    /// [`Self::replace_scene`] после подготовки сцены.
+    pub fn take_scene_request(&mut self) -> Option<String> {
+        self.host.take_scene_request()
+    }
+
+    /// Сообщает о неудачной загрузке запрошенной сцены; текущая сцена продолжает работать.
+    pub fn report_scene_failure(&mut self, path: &str, message: &str) {
+        self.host.report_scene_failure(path, message);
+    }
+
+    /// Заменяет несохраняемую часть сессии сценой `scene`. Документ редактора не меняется.
+    /// Все отказы проверок происходят до изменения мира: при ошибке сессия остаётся прежней.
+    pub fn replace_scene(&mut self, scene: PlayScene) -> Result<(), String> {
+        if self.network.is_some() {
+            return Err("смена сцены при активной сети пока не поддерживается".to_owned());
+        }
+        let PlayScene {
+            path,
+            world,
+            sources,
+            prefabs,
+            model_geometry,
+            animation_models,
+            animation_clips,
+        } = scene;
+        // Тела новой сцены должны строиться, как при старте: иначе замена отвергается до изменений.
+        PhysicsSceneDesc::from_world(&world, &model_geometry, glam::Vec3::ZERO, 60, 8)
+            .and_then(|desc| desc.build())
+            .map_err(|error| error.to_string())?;
+        // Регистрация документов и префабов аддитивна: при отказе замены мир не меняется.
+        self.ui_registry.register(&mut self.host, &prefabs.ui)?;
+        for (prefab_path, template) in &prefabs.templates {
+            self.host
+                .register_prefab(&self.world, prefab_path, Arc::clone(template), &sources)
+                .map_err(|error| error.to_string())?;
+        }
+        let time = self.script_time();
+        let replacement = self
+            .host
+            .replace_scene(&mut self.world, world, &sources, &path, time)?;
+        self.animation.replace_objects(
+            &self.world,
+            &replacement.removed,
+            &replacement.added,
+            |model| {
+                animation_models
+                    .get(model.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| Err(format!("модель {} не загружена", model.as_str())))
+            },
+            |clip| {
+                animation_clips
+                    .get(clip.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| Err(format!("клип {} не загружен", clip.as_str())))
+            },
+        );
+        if let Some(physics) = &mut self.physics {
+            // Тела удалённых объектов снимаются сразу: результат шага, отправленного до замены,
+            // может прийти с их позами, а привязок у них уже нет.
+            physics
+                .changes
+                .extend(physics.sync.remove_objects(&replacement.removed));
+            physics.add_scene_geometry(model_geometry);
+        }
+        self.pending_ui_images
+            .push((format!("play:scene:{path}"), prefabs.ui_images().clone()));
+        self.world.recalculate_world_matrices();
+        if let Some(audio) = &mut self.audio {
+            audio.bridge.scene_replaced(&self.world);
+        }
+        Ok(())
+    }
+
+    /// Тела и звук объектов, добавленных заменой сцены. Удалённые уже обработаны в `apply_spawns`.
+    fn apply_scene_added(&mut self, added: &[ObjectHandle]) {
+        let live: Vec<ObjectHandle> = added
+            .iter()
+            .copied()
+            .filter(|&object| self.world.is_alive(object))
+            .collect();
+        if let Some(physics) = &mut self.physics {
+            let fresh = physics.sync.unbound_objects(&live);
+            match physics.sync.insert_objects(
+                &self.world,
+                &fresh,
+                &physics.geometry,
+                &mut physics.shapes,
+            ) {
+                Ok(inserted) => physics.changes.extend(inserted),
+                Err(error) => {
+                    let roots: Vec<ObjectHandle> = live
+                        .iter()
+                        .copied()
+                        .filter(|&object| {
+                            self.world
+                                .object(object)
+                                .and_then(|scene_object| scene_object.parent)
+                                .is_none_or(|parent| !live.contains(&parent))
+                        })
+                        .collect();
+                    for root in roots {
+                        self.host.revert_spawn(
+                            &mut self.world,
+                            root,
+                            &format!("физика отклонила объекты сцены: {error}"),
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+        let requests: Vec<AudioRequest> = live
+            .iter()
+            .filter(|&&object| {
+                self.world
+                    .audio_source(object)
+                    .is_some_and(|audio| audio.play_on_start)
+                    && self.world.active_in_hierarchy(object) == Some(true)
+            })
+            .map(|&object| AudioRequest::PlaySource {
+                object,
+                voice: VoiceId::allocate(),
+            })
+            .collect();
         if let Some(audio) = &mut self.audio {
             audio.bridge.apply(requests, &self.world);
         }
@@ -1522,6 +1736,15 @@ impl PlayPhysics {
 
     /// Добавляет геометрию тяжёлого префаба. Модель, которая уже есть в `geometry`, не
     /// дублируется: её ссылки считаются, но выгрузка удаляет только модели тяжёлых префабов.
+    /// Геометрия моделей замены сцены. Без счётчика ссылок: её не выгружают тяжёлые префабы.
+    fn add_scene_geometry(&mut self, models: Vec<ModelGeometry>) {
+        for model in models {
+            if !self.geometry.iter().any(|known| known.path == model.path) {
+                self.geometry.push(model);
+            }
+        }
+    }
+
     fn add_heavy_geometry(&mut self, models: Vec<ModelGeometry>) {
         for model in models {
             if let Some(users) = self.heavy_users.get_mut(&model.path) {
@@ -3068,5 +3291,183 @@ return Spawner
         session.step(0.1).unwrap();
         assert!(session.heavy.pending.contains_key(BALL));
         drop(session);
+    }
+}
+
+#[cfg(test)]
+mod scene_switch_tests {
+    use super::*;
+    use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
+    use engine_scene::SceneDocument;
+    use std::path::PathBuf;
+
+    const PLAYER: &str = "local Script = {}\nfunction Script:on_destroy()\n  rve.log(\"player destroy\")\nend\nreturn Script\n";
+    const ENEMY: &str = "local Script = {}\nfunction Script:on_destroy()\n  rve.log(\"enemy destroy\")\nend\nreturn Script\n";
+    const BOSS: &str = "local Script = {}\nreturn Script\n";
+
+    /// Стартовая сцена: сохраняемый игрок со скриптом, обычный враг и ящик с динамическим телом.
+    const START: &str = "[[assets]]
+path = \"player.lua\"
+[[assets]]
+path = \"enemy.lua\"
+[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"player\"\nkeep_on_load = true\n[[objects.lite_scripts]]\npath = \"player.lua\"\n[[objects]]\nid = \"enemy\"\n[[objects.lite_scripts]]\npath = \"enemy.lua\"\n[[objects]]\nid = \"crate\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+
+    /// Сцена замены: новый босс с телом и скриптом.
+    const NEXT: &str = "[[assets]]
+path = \"boss.lua\"
+[[objects]]\nid = \"camera_b\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"boss\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\n[objects.rigid_body]\nkind = \"dynamic\"\n[[objects.lite_scripts]]\npath = \"boss.lua\"\n";
+
+    /// Сцена с id игрока: совпадение с сохраняемым объектом должно отвергаться.
+    const CLASH: &str = "[[objects]]\nid = \"camera_x\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"player\"\n";
+
+    fn sources(path: &str) -> Result<String, String> {
+        match path {
+            "player.lua" => Ok(PLAYER.to_owned()),
+            "enemy.lua" => Ok(ENEMY.to_owned()),
+            "boss.lua" => Ok(BOSS.to_owned()),
+            other => Err(format!("нет скрипта {other}")),
+        }
+    }
+
+    /// Ассеты без файлов: геометрия и аниматоры тестовых сцен не используют диск.
+    struct EmptyAssets {
+        root: PathBuf,
+        resources: ResourceSystem,
+    }
+
+    impl EmptyAssets {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("rve-play-switch-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let resources = ResourceSystem::start(ResourceConfig {
+                root: root.clone(),
+                source_mode: SourceMode::Loose,
+                worker_count: 1,
+                ..ResourceConfig::default()
+            })
+            .unwrap();
+            Self { root, resources }
+        }
+
+        fn assets(&self) -> Assets {
+            Assets::with_resources(self.resources.handle())
+        }
+    }
+
+    impl Drop for EmptyAssets {
+        fn drop(&mut self) {
+            let _ = self.resources.shutdown();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn start_session() -> PlaySession {
+        let document = SceneDocument::parse("levels/a.rvescene", START).unwrap();
+        PlaySession::start(&document, None, sources).unwrap()
+    }
+
+    fn prepared(path: &str, text: &str, assets: &Assets) -> Result<PlayScene, String> {
+        let world = World::from_document(&SceneDocument::parse(path, text).unwrap()).unwrap();
+        PlayScene::prepare(path, world, PlayPrefabs::default(), sources, assets)
+    }
+
+    fn object_names(session: &PlaySession) -> Vec<String> {
+        let mut names: Vec<String> = session
+            .world
+            .objects()
+            .iter()
+            .map(|object| object.id.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn messages(session: &mut PlaySession) -> Vec<String> {
+        session
+            .drain_events()
+            .into_iter()
+            .map(|event| event.message)
+            .collect()
+    }
+
+    #[test]
+    fn play_switch_replaces_nonpersistent_objects_and_keeps_the_persistent_script() {
+        let files = EmptyAssets::new();
+        let assets = files.assets();
+        let mut session = start_session();
+        let player = session.world.handle("player").unwrap();
+        // Первый тик запускает экземпляры стартовой сцены: только запущенные получают on_destroy.
+        session.tick().unwrap();
+        session
+            .replace_scene(prepared("levels/b.rvescene", NEXT, &assets).unwrap())
+            .unwrap();
+        session.tick().unwrap();
+
+        assert_eq!(object_names(&session), ["boss", "camera_b", "player"]);
+        assert_eq!(session.world.handle("player"), Some(player));
+        assert_eq!(session.host.current_scene(), "levels/b.rvescene");
+        let events = messages(&mut session);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|message| *message == "enemy destroy")
+                .count(),
+            1,
+            "обычный экземпляр уничтожен один раз: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|message| message == "player destroy"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn play_switch_with_an_id_clash_is_refused_and_leaves_the_session_unchanged() {
+        let files = EmptyAssets::new();
+        let assets = files.assets();
+        let mut session = start_session();
+        let error = session
+            .replace_scene(prepared("levels/clash.rvescene", CLASH, &assets).unwrap())
+            .unwrap_err();
+        assert!(error.contains("совпадает"), "{error}");
+        assert_eq!(
+            object_names(&session),
+            ["camera", "crate", "enemy", "player"]
+        );
+        assert_eq!(session.host.current_scene(), "levels/a.rvescene");
+        assert!(
+            !messages(&mut session)
+                .iter()
+                .any(|message| message == "enemy destroy")
+        );
+    }
+
+    #[test]
+    fn play_switch_follows_physics_of_removed_and_added_bodies() {
+        let files = EmptyAssets::new();
+        let assets = files.assets();
+        let mut session = start_session();
+        let crate_object = session.world.handle("crate").unwrap();
+        let bound = |session: &PlaySession, object| {
+            session
+                .physics
+                .as_ref()
+                .unwrap()
+                .sync
+                .bindings()
+                .iter()
+                .any(|binding| binding.object == object)
+        };
+        assert!(bound(&session, crate_object));
+
+        session
+            .replace_scene(prepared("levels/b.rvescene", NEXT, &assets).unwrap())
+            .unwrap();
+        session.tick().unwrap();
+
+        let boss = session.world.handle("boss").unwrap();
+        assert!(bound(&session, boss), "тело босса вставлено в физику Play");
+        assert!(!bound(&session, crate_object), "тело ящика снято с физики");
     }
 }

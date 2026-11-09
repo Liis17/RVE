@@ -308,14 +308,17 @@ pub fn project_preview_bridge(
     Some(bridge)
 }
 
-fn load_model_file(assets: &Assets, path: &str) -> Result<Arc<Model>, String> {
+pub(crate) fn load_model_file(assets: &Assets, path: &str) -> Result<Arc<Model>, String> {
     assets
         .load_model(&format!("/{path}"))
         .map(Arc::new)
         .map_err(|error| error.to_string())
 }
 
-fn load_clip_file(assets: &Assets, path: &str) -> Result<Arc<Vec<ModelAnimation>>, String> {
+pub(crate) fn load_clip_file(
+    assets: &Assets,
+    path: &str,
+) -> Result<Arc<Vec<ModelAnimation>>, String> {
     assets
         .load_animations(&format!("/{path}"))
         .map(Arc::new)

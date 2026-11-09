@@ -5,7 +5,7 @@ use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
 use crate::mcp::{McpHost, capture};
-use crate::play::{PlayPrefabs, PlaySession, editor_gamepads, gamepad_tuning};
+use crate::play::{PlayPrefabs, PlayScene, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
@@ -67,6 +67,71 @@ fn load_project_starting_scene(project: &OpenProject) -> Result<EditorScene, Str
         let path = VirtualPath::parse(starting_scene).map_err(|error| error.to_string())?;
         EditorScene::parse(path, &text, project.prefab_loader())
     })
+}
+
+/// Включённые сцены проекта: только они принимаются `rve.scene.load` в Play.
+fn enabled_scene_paths(project: &OpenProject) -> Vec<String> {
+    project
+        .settings
+        .scenes
+        .iter()
+        .filter(|scene| scene.enabled)
+        .map(|scene| scene.path.clone())
+        .collect()
+}
+
+/// Готовит сцену для `rve.scene.load` из файлов проекта. Документ редактора не читается как
+/// цель записи: сцена собирается отдельно и попадает только в сессию Play.
+fn prepare_play_scene(
+    project: &OpenProject,
+    path: &str,
+) -> Result<(PlayScene, Vec<String>), String> {
+    let text = project.read_text(path)?;
+    let virtual_path = VirtualPath::parse(path).map_err(|error| error.to_string())?;
+    let scene = EditorScene::parse(virtual_path, &text, project.prefab_loader())?;
+    let heavy = PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME))?;
+    let (prefabs, warnings) = PlayPrefabs::load(
+        scene.view(),
+        &mut |label| project.read_text(label),
+        scene.instanced_prefabs(),
+        &heavy,
+    );
+    let mut prefabs = prefabs.with_resources(project.resource_handle());
+    let mut world = World::from_document(scene.view()).map_err(|error| error.to_string())?;
+    project.apply_camera_settings(&mut world)?;
+    project.apply_physics_materials(&mut world)?;
+    prefabs.prepare_ui(&world, &project.assets)?;
+    let scene = PlayScene::prepare(
+        path,
+        world,
+        prefabs,
+        |label| project.read_text(label),
+        &project.assets,
+    )?;
+    Ok((scene, warnings))
+}
+
+/// Выполняет запрос `rve.scene.load`, принятый в Play. Ошибка подготовки или замены не меняет
+/// сессию; текущая сцена продолжает работать.
+fn apply_play_scene_request(state: &mut EditorState) {
+    let Some(play) = state.play.as_mut() else {
+        return;
+    };
+    let Some(path) = play.take_scene_request() else {
+        return;
+    };
+    let result = match state.project.as_ref() {
+        Some(project) => prepare_play_scene(project, &path).and_then(|(scene, warnings)| {
+            for warning in warnings {
+                state.log.push(LogLevel::Warn, warning);
+            }
+            play.replace_scene(scene)
+        }),
+        None => Err("проект не открыт".to_owned()),
+    };
+    if let Err(error) = result {
+        play.report_scene_failure(&path, &error);
+    }
 }
 
 pub struct EditorApp {
@@ -1403,7 +1468,9 @@ impl EditorApp {
             play_scene.instanced_prefabs(),
             &heavy,
         );
-        let mut prefabs = prefabs.with_resources(project.resource_handle());
+        let mut prefabs = prefabs
+            .with_resources(project.resource_handle())
+            .with_enabled_scenes(enabled_scene_paths(project));
         let needs_library = prefabs.has_heavy_scripts()
             || play_scene
                 .view()
@@ -1823,6 +1890,7 @@ impl EditorApp {
             text,
         };
         let pads_accepted = ui_accepting;
+        apply_play_scene_request(&mut self.state);
         let play_error = self.state.play.as_mut().and_then(|play| {
             if let Some(gamepads) = self.state.gamepads.as_mut() {
                 play.poll_gamepads(gamepads, pads_accepted);
