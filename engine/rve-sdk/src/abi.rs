@@ -13,10 +13,11 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 12 appends post-process callbacks after the v11 gamepad tail.
 /// Version 13 appends network callbacks after the v12 post-process tail and the net event callback
 /// after the v6 collision tail of the descriptor.
-/// Version 14 adds parameter kinds and an argument string to parameter descriptors.
+/// Version 14 appends screen shader callbacks after the v13 network tail.
+/// Version 15 adds parameter kinds and an argument string to parameter descriptors.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 14;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 15;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -918,6 +919,42 @@ pub type RveSetPostProcessFn = unsafe extern "C" fn(
     settings: *const RvePostProcessSettings,
 ) -> bool;
 
+/// State of one camera screen shader slot: `enabled` is 0 or 1; `params` are `rve_param(0..16)`.
+/// Path and stage are fixed by the scene; appended in ABI v14.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveScreenShaderState {
+    pub enabled: u32,
+    pub params: [f32; 16],
+}
+
+impl Default for RveScreenShaderState {
+    fn default() -> Self {
+        Self {
+            enabled: 0,
+            params: [0.0; 16],
+        }
+    }
+}
+
+/// Writes the number of screen shader slots of one camera. Appended in ABI v14.
+pub type RveScreenShaderCountFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u32) -> bool;
+/// Copies one screen shader slot (zero-based). Appended in ABI v14.
+pub type RveGetScreenShaderFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    out: *mut RveScreenShaderState,
+) -> bool;
+/// Stages enabled flag and parameters of one screen shader slot (zero-based). Appended in ABI v14.
+pub type RveSetScreenShaderFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    state: *const RveScreenShaderState,
+) -> bool;
+
 /// Host callback that copies a guest error string for the duration of the call.
 pub type RveSetErrorFn = unsafe extern "C" fn(ctx: *mut c_void, message: RveStr);
 /// Host callback that appends a guest log event.
@@ -1447,6 +1484,10 @@ pub struct RveHost {
     pub net_object_has_authority: Option<RveNetObjectBoolFn>,
     pub net_object_set_owner: Option<RveNetObjectSetOwnerFn>,
     pub net_object_send: Option<RveNetObjectSendFn>,
+    /// Screen shader callbacks appended in ABI v14; `None` marks an unavailable callback.
+    pub screen_shader_count: Option<RveScreenShaderCountFn>,
+    pub get_screen_shader: Option<RveGetScreenShaderFn>,
+    pub set_screen_shader: Option<RveSetScreenShaderFn>,
 }
 
 /// Guest factory callback.
@@ -1617,7 +1658,7 @@ pub struct RveScriptDescV13 {
     pub net_event: Option<RveNetEventFn>,
 }
 
-/// One exported guest script implementation in ABI version 14.
+/// One exported guest script implementation in ABI version 15.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -1663,7 +1704,7 @@ pub const RVE_PARAM_HAS_MIN: u32 = 1;
 /// [`RveParamDesc::flags`] bit: `max` is set.
 pub const RVE_PARAM_HAS_MAX: u32 = 2;
 
-/// ABI v13 parameter descriptor retained for loading older modules.
+/// ABI v3–v14 parameter descriptor retained for loading older modules.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RveParamDescV13 {
@@ -1867,7 +1908,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);

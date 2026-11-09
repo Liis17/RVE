@@ -1265,3 +1265,23 @@ fn network_prefab_overrides_need_existing_components_and_valid_fields() {
     .unwrap_err();
     assert!(error.message.contains("send_rate_hz"), "{error}");
 }
+
+#[test]
+fn camera_screen_shader_overrides_are_validated_like_the_camera() {
+    let override_camera = |shaders: &str| {
+        format!(
+            "[[assets]]\npath = \"/prefabs/rig.rveprefab\"\n[[assets]]\npath = \"/fx/vhs.glsl\"\n[[instances]]\nid = \"rig\"\nprefab = \"/prefabs/rig.rveprefab\"\n[[instances.overrides]]\ntarget = \"rig\"\ncamera = {{ screen_shaders = [{shaders}] }}\n"
+        )
+    };
+    let vhs = "{ shader = \"/fx/vhs.glsl\", stage = \"after_post\" }";
+    SceneDocument::parse("scene.rvescene", &override_camera(vhs))
+        .expect("объявленный экранный шейдер принимается");
+
+    let five = [vhs; 5].join(", ");
+    let error = SceneDocument::parse("scene.rvescene", &override_camera(&five)).unwrap_err();
+    assert!(error.message.contains("экранных шейдеров"), "{error}");
+
+    let undeclared = "{ shader = \"/fx/missing.glsl\", stage = \"after_post\" }";
+    let error = SceneDocument::parse("scene.rvescene", &override_camera(undeclared)).unwrap_err();
+    assert!(error.message.contains("/fx/missing.glsl"), "{error}");
+}

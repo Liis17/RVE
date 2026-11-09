@@ -42,6 +42,7 @@ use rve_sdk::abi::{
     RVE_AO_QUALITY_HIGH, RVE_AO_QUALITY_LOW, RVE_AO_QUALITY_MEDIUM, RVE_AUDIO_GROUP_AMBIENT,
     RVE_AUDIO_GROUP_EFFECTS, RVE_AUDIO_GROUP_MASTER, RVE_AUDIO_GROUP_MUSIC, RVE_EXPOSURE_MODE_AUTO,
     RVE_EXPOSURE_MODE_MANUAL, RveAudioParams, RvePlayAnimationParams, RvePostProcessSettings,
+    RveScreenShaderState,
 };
 use rve_sdk::abi::{
     RVE_OBJECT_ALIVE, RVE_OBJECT_DEAD, RVE_OBJECT_PENDING, RVE_PREFAB_FAILED, RVE_PREFAB_LOADED,
@@ -226,6 +227,9 @@ impl<'a> AbiCallContext<'a> {
             gamepad_rumble: Some(host_gamepad_rumble),
             get_post_process: Some(host_get_post_process),
             set_post_process: Some(host_set_post_process),
+            screen_shader_count: Some(host_screen_shader_count),
+            get_screen_shader: Some(host_get_screen_shader),
+            set_screen_shader: Some(host_set_screen_shader),
             net_mode: Some(host_net_mode),
             net_local_peer: Some(host_net_local_peer),
             net_peers: Some(host_net_peers),
@@ -851,6 +855,80 @@ unsafe extern "C" fn host_set_post_process(
         context
             .transaction
             .set_post_process_from_abi(object, settings)
+    })
+}
+
+unsafe extern "C" fn host_screen_shader_count(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut u32,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(count) = context.transaction.screen_shader_count(handle) else {
+            return false;
+        };
+        let Ok(count) = u32::try_from(count) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the guest's writable slot.
+        unsafe { *out = count };
+        true
+    })
+}
+
+unsafe extern "C" fn host_get_screen_shader(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    out: *mut RveScreenShaderState,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(state) = context.transaction.screen_shader(handle, slot as usize) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the guest's writable stack slot.
+        unsafe {
+            *out = RveScreenShaderState {
+                enabled: u32::from(state.enabled),
+                params: state.params,
+            };
+        }
+        true
+    })
+}
+
+unsafe extern "C" fn host_set_screen_shader(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    state: *const RveScreenShaderState,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if !context.transaction.writable() || state.is_null() {
+            return false;
+        }
+        // SAFETY: state was checked non-null and is valid for this callback.
+        let state = unsafe { *state };
+        context.transaction.set_screen_shader_from_abi(
+            object,
+            slot as usize,
+            crate::transaction::ScreenShaderState {
+                enabled: state.enabled != 0,
+                params: state.params,
+            },
+        )
     })
 }
 
@@ -3043,6 +3121,80 @@ mod tests {
                 std::ptr::null(),
                 0,
             ));
+        }
+    }
+
+    #[test]
+    fn screen_shader_callbacks_read_and_queue_slots_and_reject_invalid_input() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[assets]]\npath = \"/fx/vhs.glsl\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects.camera.screen_shaders]]\nshader = \"/fx/vhs.glsl\"\nstage = \"after_post\"\nparams = [0.5]\n[[objects]]\nid = \"plain\"\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: Some(world.active_camera()),
+            source: "scene/camera/Probe",
+            writable: true,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            queued_audio: 0,
+            queued_animation: 0,
+            queued_rumble: 0,
+            net: Default::default(),
+            queued_net: 0,
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+            lifecycle: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::lifecycle::Lifecycle::default(),
+            )),
+            lifecycle_writes: true,
+            instance_serial: 0,
+            cursor: ScriptCursor::default(),
+        });
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+        let host = context.host(ScriptTime::default());
+        let count = host.screen_shader_count.unwrap();
+        let get = host.get_screen_shader.unwrap();
+        let set = host.set_screen_shader.unwrap();
+        let camera = 1;
+        let plain = 2;
+        let mut slots = 0_u32;
+        let mut state = rve_sdk::abi::RveScreenShaderState::default();
+        // SAFETY: output pointers and the state pointer are valid for each synchronous callback.
+        unsafe {
+            assert!(count(host.ctx, camera, &mut slots));
+            assert_eq!(slots, 1);
+            assert!(!count(host.ctx, plain, &mut slots));
+            assert!(get(host.ctx, camera, 0, &mut state));
+            assert_eq!(state.enabled, 1, "enabled по умолчанию true");
+            assert_eq!(state.params[0], 0.5);
+            assert_eq!(state.params[1], 0.0);
+            assert!(!get(host.ctx, camera, 1, &mut state), "слота 1 нет");
+            assert!(!get(host.ctx, plain, 0, &mut state));
+            assert!(!get(host.ctx, camera, 0, std::ptr::null_mut()));
+
+            let staged = rve_sdk::abi::RveScreenShaderState {
+                enabled: 0,
+                params: [0.25; 16],
+            };
+            assert!(set(host.ctx, camera, 0, &staged));
+            assert!(get(host.ctx, camera, 0, &mut state));
+            assert_eq!(state, staged, "очередь видна до commit");
+
+            let mut not_finite = staged;
+            not_finite.params[3] = f32::NAN;
+            assert!(!set(host.ctx, camera, 0, &not_finite));
+            assert!(!set(host.ctx, camera, 1, &staged));
+            assert!(!set(host.ctx, plain, 0, &staged));
+            assert!(!set(host.ctx, camera, 0, std::ptr::null()));
         }
     }
 

@@ -181,7 +181,7 @@ impl ScriptLibrary {
         // matching immutable table remains readable for process lifetime.
         let descriptors_v14 = (header.abi_version >= 14)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        // ABI v13 has the network tail and the pre-v14 parameter descriptor.
+        // ABI v13 has the network tail; v13 and v14 use the pre-v15 parameter descriptor.
         let descriptors_v13 = (header.abi_version == 13).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV13>(), count)
         });
@@ -303,7 +303,7 @@ impl ScriptLibrary {
                 });
             }
             let name = name.to_owned();
-            let schema = if header.abi_version >= 14 {
+            let schema = if header.abi_version >= 15 {
                 // SAFETY: the caller guarantees the parameter table of every v3+ descriptor.
                 unsafe { read_schema(descriptor) }.map_err(|message| {
                     ScriptLibraryError::InvalidParams {
@@ -312,7 +312,7 @@ impl ScriptLibrary {
                     }
                 })?
             } else if header.abi_version >= 3 {
-                // SAFETY: versions 3 through 13 use the old descriptor layout.
+                // SAFETY: versions 3 through 14 use the old parameter descriptor layout.
                 unsafe { read_schema_v13(descriptor) }.map_err(|message| {
                     ScriptLibraryError::InvalidParams {
                         script: name.clone(),
@@ -400,7 +400,7 @@ unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>,
     }))
 }
 
-/// Reads a v3-v13 descriptor without accessing the v14 argument tail.
+/// Reads a v3-v14 descriptor without accessing the v15 argument tail.
 unsafe fn read_schema_v13(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>, String> {
     let count = descriptor.param_count;
     if count == 0 {
@@ -451,7 +451,7 @@ fn read_schema_params(
         let name = unsafe { read_abi_str(name) }
             .map_err(|error| format!("parameter {index} has an invalid name: {error:?}"))?
             .to_owned();
-        // SAFETY: v14 descriptors carry a process-lifetime argument; old descriptors provide empty.
+        // SAFETY: v15 descriptors carry a process-lifetime argument; old descriptors provide empty.
         let argument = unsafe { read_abi_str(argument) }
             .map_err(|error| format!("parameter {name:?} has an invalid argument: {error:?}"))?;
         let kind = abi_param_kind(kind_code, argument)

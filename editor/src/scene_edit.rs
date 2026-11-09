@@ -1326,6 +1326,61 @@ impl EditorScene {
         })
     }
 
+    /// Заменяет экранные шейдеры камеры; пути объявляются в `[[assets]]`, как у `.postprocess`.
+    /// `coalesce` объединяет подряд идущие правки одного параметра в одну запись истории.
+    pub fn set_camera_screen_shaders(
+        &mut self,
+        id: &str,
+        shaders: Vec<engine_scene::ScreenShaderRef>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        if shaders.len() > engine_scene::MAX_SCREEN_SHADERS {
+            return Err(format!(
+                "у камеры не больше {} экранных шейдеров",
+                engine_scene::MAX_SCREEN_SHADERS
+            ));
+        }
+        for shader in &shaders {
+            if !shader
+                .shader
+                .as_str()
+                .to_ascii_lowercase()
+                .ends_with(".glsl")
+            {
+                return Err(format!("{}: ожидается ресурс .glsl", shader.shader));
+            }
+            if shader.params.len() > engine_scene::MAX_SCREEN_SHADER_PARAMS
+                || !shader.params.iter().all(|value| value.is_finite())
+            {
+                return Err(format!(
+                    "параметры экранного шейдера должны быть конечными и не длиннее {}",
+                    engine_scene::MAX_SCREEN_SHADER_PARAMS
+                ));
+            }
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, coalesce, |object| {
+                let camera = object
+                    .camera
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+                camera.screen_shaders = shaders;
+                Ok(())
+            });
+        }
+        self.edit(coalesce, |document| {
+            for shader in &shaders {
+                ensure_asset(document, &shader.shader);
+            }
+            let camera = find_object_mut(document, id)?
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.screen_shaders = shaders;
+            Ok(())
+        })
+    }
+
     /// Назначает файл постобработки камеры и добавляет его путь в список ресурсов сцены.
     /// Изменение входит в общий undo/redo, как и назначение `.camerasettings`.
     pub fn set_camera_post_process(
@@ -2460,6 +2515,98 @@ mod tests {
             scene
                 .set_camera_settings("camera", Some(path("/cameras/main.toml")))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn screen_shaders_are_validated_registered_and_undoable() {
+        let mut scene = scene();
+        let shader = |name: &str| engine_scene::ScreenShaderRef {
+            shader: path(name),
+            stage: engine_scene::ScreenShaderStage::AfterPost,
+            enabled: true,
+            params: vec![0.5],
+        };
+        let camera_shaders = |scene: &EditorScene| {
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .screen_shaders
+                .clone()
+        };
+        assert!(
+            scene
+                .set_camera_screen_shaders("camera", vec![shader("/fx/vhs.glsl"); 5], None)
+                .is_err(),
+            "больше четырёх шейдеров отклоняется"
+        );
+        assert!(
+            scene
+                .set_camera_screen_shaders("camera", vec![shader("/fx/look.postprocess")], None)
+                .is_err(),
+            "ожидается .glsl"
+        );
+        scene
+            .set_camera_screen_shaders("camera", vec![shader("/fx/vhs.glsl")], None)
+            .unwrap();
+        assert_eq!(camera_shaders(&scene), vec![shader("/fx/vhs.glsl")]);
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/fx/vhs.glsl"))
+        );
+        assert!(scene.undo());
+        assert!(camera_shaders(&scene).is_empty());
+    }
+
+    #[test]
+    fn screen_shader_param_edits_with_one_key_are_one_undo_step() {
+        let mut scene = scene();
+        let key = "screen-shader-camera-0-p1";
+        let with_param = |value: f32| {
+            vec![engine_scene::ScreenShaderRef {
+                shader: path("/fx/vhs.glsl"),
+                stage: engine_scene::ScreenShaderStage::AfterPost,
+                enabled: true,
+                params: vec![0.0, value],
+            }]
+        };
+        let second_param = |scene: &EditorScene| {
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .screen_shaders
+                .first()
+                .map(|shader| shader.params[1])
+        };
+        scene
+            .set_camera_screen_shaders("camera", with_param(0.1), None)
+            .unwrap();
+        for value in [0.2, 0.3, 0.4] {
+            scene
+                .set_camera_screen_shaders("camera", with_param(value), Some(key))
+                .unwrap();
+        }
+        assert_eq!(second_param(&scene), Some(0.4));
+        assert!(scene.undo());
+        assert_eq!(
+            second_param(&scene),
+            Some(0.1),
+            "все шаги перетаскивания откатываются одним undo"
+        );
+        assert!(scene.undo());
+        assert_eq!(
+            second_param(&scene),
+            None,
+            "добавление шейдера — отдельный шаг"
         );
     }
 

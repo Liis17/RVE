@@ -4,6 +4,7 @@ use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
 use engine_project::{
     BootstrapConfig, PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile, ProjectSettings,
 };
+use engine_render::{ScreenShaderStage, compile_screen_shader};
 use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
@@ -486,6 +487,24 @@ fn record_asset_recursive(
         })?;
         PostProcessSettings::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(error.to_string()))?;
+    }
+
+    if extension_is(path.as_str(), "glsl") {
+        let bytes = sources
+            .handle
+            .read_all(format!("/{path}"))
+            .and_then(|request| request.wait())
+            .map_err(|error| resource_error(&format!("экранный шейдер /{path}"), error))?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            BuildError::input(format!(
+                "экранный шейдер /{path} должен быть UTF-8: {error}"
+            ))
+        })?;
+        // Один исходник компилируется для обеих стадий, поэтому проверяются обе.
+        for stage in [ScreenShaderStage::BeforePost, ScreenShaderStage::AfterPost] {
+            compile_screen_shader(&source, stage)
+                .map_err(|error| BuildError::input(format!("экранный шейдер /{path}: {error}")))?;
+        }
     }
 
     if extension_is(path.as_str(), "rvephysmat") {

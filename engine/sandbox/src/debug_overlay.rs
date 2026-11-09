@@ -407,19 +407,42 @@ fn build_panel(out: &mut Vec<OverlayVertex>, metrics: &Metrics, cpu_name: &str, 
         y: top,
         right: gpu_left,
     };
+    // Проходы GPU делятся на два столбца: один столбец при росте числа проходов выходит за окно.
+    let gpu_split = GpuPass::COUNT.div_ceil(2);
     gpu.text("GPU passes, ms", TEXT_SCALE);
     for (pass, label) in GpuPass::ALL.iter().map(|pass| pass.label()).enumerate() {
+        if pass >= gpu_split {
+            break;
+        }
         let row = CPU_PHASE_LABELS.len() + pass;
         gpu.text(
             &profile_text(label, metrics.latest_profile[row]),
             TEXT_SCALE,
         );
     }
-    gpu.text(
+    let second_left = gpu.right + PROFILE_COLUMN_GAP;
+    let mut second = Layout {
+        out: &mut *gpu.out,
+        left: second_left,
+        y: top,
+        right: second_left,
+    };
+    for (pass, label) in GpuPass::ALL.iter().map(|pass| pass.label()).enumerate() {
+        if pass < gpu_split {
+            continue;
+        }
+        let row = CPU_PHASE_LABELS.len() + pass;
+        second.text(
+            &profile_text(label, metrics.latest_profile[row]),
+            TEXT_SCALE,
+        );
+    }
+    second.text(
         &profile_text("total", metrics.latest_profile[GPU_TOTAL_ROW]),
         TEXT_SCALE,
     );
-    let (profile_bottom, profile_right) = (cpu.y.max(gpu.y), gpu.right.max(cpu.right));
+    let profile_bottom = cpu.y.max(gpu.y).max(second.y);
+    let profile_right = second.right.max(gpu.right).max(cpu.right);
     layout.y = profile_bottom;
     layout.right = layout.right.max(profile_right);
 
