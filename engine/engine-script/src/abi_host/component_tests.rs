@@ -8,9 +8,9 @@ use crate::physics::PhysicsScriptState;
 use crate::types::{ScriptCursor, ScriptInput};
 use engine_scene::{SceneDocument, World};
 use rve_sdk::abi::{
-    RVE_AUDIO_GROUP_EFFECTS, RVE_LIGHT_POINT, RVE_LIGHT_SPOT, RVE_MAX_PARTICLE_BURST, RVE_PARTICLE_BURST,
-    RVE_PARTICLE_RESTART, RveAudioPlayExParams, RveAudioSourceState, RveEnvironmentState, RveLightState,
-    RveMeshMaterialParams, RveProceduralSky, RveStatus, RveStr,
+    RVE_AUDIO_GROUP_EFFECTS, RVE_LIGHT_POINT, RVE_LIGHT_SPOT, RVE_MAX_PARTICLE_BURST,
+    RVE_PARTICLE_BURST, RVE_PARTICLE_RESTART, RveAudioPlayExParams, RveAudioSourceState,
+    RveEnvironmentState, RveLightState, RveMeshMaterialParams, RveProceduralSky, RveStatus, RveStr,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -282,7 +282,12 @@ fn mesh_visibility_material_and_particle_state_read_back_pending_writes() {
         assert!(!get_playing(host.ctx, fire, std::ptr::null_mut()));
 
         assert!(!command(host.ctx, fire, RVE_PARTICLE_BURST, 0));
-        assert!(!command(host.ctx, fire, RVE_PARTICLE_BURST, RVE_MAX_PARTICLE_BURST + 1));
+        assert!(!command(
+            host.ctx,
+            fire,
+            RVE_PARTICLE_BURST,
+            RVE_MAX_PARTICLE_BURST + 1
+        ));
         assert!(!command(host.ctx, fire, 9, 1));
         assert!(command(host.ctx, fire, RVE_PARTICLE_RESTART, 0));
         assert!(command(host.ctx, fire, RVE_PARTICLE_BURST, 4));
@@ -359,7 +364,11 @@ fn lod_get_reports_every_level_and_writes_only_the_capacity() {
             &mut has_cull,
             &mut cull
         ));
-        assert_eq!((count, buffer), (2, [10.0, 20.0]), "отказ не меняет дистанции");
+        assert_eq!(
+            (count, buffer),
+            (2, [10.0, 20.0]),
+            "отказ не меняет дистанции"
+        );
 
         // Число уровней сохраняется: новые дистанции должны быть столько же и возрастать.
         let replaced = [5.0_f32, 15.0];
@@ -442,7 +451,10 @@ fn play_clip_ex_and_voice_position_refuse_contradictory_or_flat_voices() {
             follow: crate_abi,
             ..base
         };
-        assert_eq!(play(host.ctx, path, &both, &mut voice), RveStatus::Error as u32);
+        assert_eq!(
+            play(host.ctx, path, &both, &mut voice),
+            RveStatus::Error as u32
+        );
         assert!(
             context
                 .error
@@ -455,7 +467,10 @@ fn play_clip_ex_and_voice_position_refuse_contradictory_or_flat_voices() {
             RveStatus::Error as u32
         );
 
-        assert_eq!(play(host.ctx, path, &base, &mut voice), RveStatus::Ok as u32);
+        assert_eq!(
+            play(host.ctx, path, &base, &mut voice),
+            RveStatus::Ok as u32
+        );
         assert_eq!(
             set_position(host.ctx, voice, &position),
             RveStatus::Error as u32,
@@ -498,7 +513,15 @@ fn environment_null_pointers_are_refused() {
     let host = context.host(ScriptTime::default());
     // SAFETY: null pointers are passed on purpose; the host must refuse them without reading.
     unsafe {
-        assert!(!(host.environment_get.unwrap())(host.ctx, sky, std::ptr::null_mut()));
-        assert!(!(host.environment_set.unwrap())(host.ctx, sky, std::ptr::null()));
+        assert!(!(host.environment_get.unwrap())(
+            host.ctx,
+            sky,
+            std::ptr::null_mut()
+        ));
+        assert!(!(host.environment_set.unwrap())(
+            host.ctx,
+            sky,
+            std::ptr::null()
+        ));
     }
 }

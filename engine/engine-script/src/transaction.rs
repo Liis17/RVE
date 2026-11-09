@@ -512,14 +512,18 @@ impl ScriptTransaction {
     /// Голос известен как 2D: его последний `play` (в этом вызове или зафиксированный раньше) не
     /// пространственный. Неизвестный голос (вытесненный или чужой) не отвергается.
     fn voice_is_flat(&self, voice: engine_scene::VoiceId) -> bool {
-        let staged = self.pending_audio.iter().rev().find_map(|request| match request {
-            AudioRequest::PlayClip {
-                voice: played,
-                params,
-                ..
-            } if *played == voice => Some(!engine_scene::audio::clip_is_spatial(params)),
-            _ => None,
-        });
+        let staged = self
+            .pending_audio
+            .iter()
+            .rev()
+            .find_map(|request| match request {
+                AudioRequest::PlayClip {
+                    voice: played,
+                    params,
+                    ..
+                } if *played == voice => Some(!engine_scene::audio::clip_is_spatial(params)),
+                _ => None,
+            });
         staged.unwrap_or_else(|| self.voice_spatial.get(&voice.get()) == Some(&false))
     }
 
@@ -2956,7 +2960,9 @@ impl ScriptTransaction {
         if let Some(problem) = world.mesh_material_path_problem(&path) {
             return Err(problem);
         }
-        self.component_writes.mesh_material_path.insert(handle, path);
+        self.component_writes
+            .mesh_material_path
+            .insert(handle, path);
         Ok(())
     }
 
@@ -3046,7 +3052,8 @@ impl ScriptTransaction {
         intensity: Option<f32>,
         sky: Option<ProceduralSkyComponent>,
     ) -> Result<(), String> {
-        if let Some(problem) = intensity.and_then(engine_scene::world::environment_intensity_problem)
+        if let Some(problem) =
+            intensity.and_then(engine_scene::world::environment_intensity_problem)
         {
             return Err(problem.to_owned());
         }

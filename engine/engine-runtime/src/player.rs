@@ -836,11 +836,13 @@ impl WindowHandler for PlayerWindow<'_> {
         }
         let phase_started = Instant::now();
         let mut material_caches = MaterialUploadCaches::default();
-        let mut gpu_scene = match upload_scene(&mut renderer, &self.render_assets, &mut material_caches)
-        {
-            Ok(scene) => scene,
-            Err(error) => return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}")),
-        };
+        let mut gpu_scene =
+            match upload_scene(&mut renderer, &self.render_assets, &mut material_caches) {
+                Ok(scene) => scene,
+                Err(error) => {
+                    return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}"));
+                }
+            };
         self.startup.record("GPU upload", phase_started.elapsed());
         self.startup.publish(&self.status.profile);
         let Some(frame_rx) = self.frame_rx.take() else {

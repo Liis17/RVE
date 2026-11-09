@@ -2268,7 +2268,11 @@ id = "camera"
                 .get("materials/spare.rvemat")
                 .is_some_and(Result::is_ok),
             "{:?}",
-            prepared.render_assets.material_assets.keys().collect::<Vec<_>>()
+            prepared
+                .render_assets
+                .material_assets
+                .keys()
+                .collect::<Vec<_>>()
         );
     }
 

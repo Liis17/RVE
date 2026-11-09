@@ -7,9 +7,9 @@ use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use crate::net::{self, NetworkSession, ScriptNetwork};
 use crate::prefabs::{
-    LoadedPrefab, LoaderRequest, PREFAB_UPLOAD_BUDGET, ParticleRequest, PrefabCpu, PrefabGpu,
-    MaterialLevels, MaterialReply, MaterialRequest, PrefabLoads, PrefabReady, PrefabReply,
-    PrefabToken, RenderResourceRequest,
+    LoadedPrefab, LoaderRequest, MaterialLevels, MaterialReply, MaterialRequest,
+    PREFAB_UPLOAD_BUDGET, ParticleRequest, PrefabCpu, PrefabGpu, PrefabLoads, PrefabReady,
+    PrefabReply, PrefabToken, RenderResourceRequest,
 };
 use crate::profiling::{
     PhaseWindow, SOURCE_RENDER, SOURCE_RESOURCES, SOURCE_SCRIPTS, SOURCE_STARTUP,
@@ -1258,8 +1258,12 @@ fn scripts_thread(
             }
             #[cfg(feature = "dev-console")]
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
-            Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(ScriptReply::Prefab(reply)),
-            Ok(ScriptControl::Material(reply)) => pending_prefab.push_back(ScriptReply::Material(reply)),
+            Ok(ScriptControl::Prefab(reply)) => {
+                pending_prefab.push_back(ScriptReply::Prefab(reply))
+            }
+            Ok(ScriptControl::Material(reply)) => {
+                pending_prefab.push_back(ScriptReply::Material(reply))
+            }
         }
     };
     let Some(mut gpu_scene) = gpu_scene else {
@@ -1428,8 +1432,12 @@ fn scripts_thread(
                     }
                     Ok(ScriptControl::Latency(latency)) => frame_latency = Some(latency),
                     Ok(ScriptControl::Background(false)) | Ok(ScriptControl::Go(_)) => {}
-                    Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(ScriptReply::Prefab(reply)),
-                    Ok(ScriptControl::Material(reply)) => pending_prefab.push_back(ScriptReply::Material(reply)),
+                    Ok(ScriptControl::Prefab(reply)) => {
+                        pending_prefab.push_back(ScriptReply::Prefab(reply))
+                    }
+                    Ok(ScriptControl::Material(reply)) => {
+                        pending_prefab.push_back(ScriptReply::Material(reply))
+                    }
                     #[cfg(feature = "dev-console")]
                     Ok(ScriptControl::Console(command)) => {
                         pending_console_commands.push_back(command);
@@ -3043,8 +3051,12 @@ fn wait_background_tick(
             }
             #[cfg(feature = "dev-console")]
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
-            Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(ScriptReply::Prefab(reply)),
-            Ok(ScriptControl::Material(reply)) => pending_prefab.push_back(ScriptReply::Material(reply)),
+            Ok(ScriptControl::Prefab(reply)) => {
+                pending_prefab.push_back(ScriptReply::Prefab(reply))
+            }
+            Ok(ScriptControl::Material(reply)) => {
+                pending_prefab.push_back(ScriptReply::Material(reply))
+            }
             Ok(ScriptControl::Go(_) | ScriptControl::Latency(_))
             | Err(RecvTimeoutError::Timeout) => {}
         }
@@ -3632,10 +3644,6 @@ mod tests {
     use super::ConsoleUiFrame;
     #[cfg(feature = "dev-console")]
     use super::ConsoleUiSlot;
-    use super::{MaterialOwnership, MaterialSync, ScriptReply};
-    use crate::prefabs::{MaterialLevels, MaterialReply, MaterialRequest};
-    use engine_scene::world::MeshMaterialParams;
-    use flume::Receiver;
     #[cfg(feature = "dev-console")]
     use super::execute_console_commands;
     use super::{
@@ -3648,6 +3656,7 @@ mod tests {
         send_snapshot, sync_input_background, wait_background_tick,
     };
     use super::{FrameLatency, publish_script_cursor, set_initial_cursor};
+    use super::{MaterialOwnership, MaterialSync, ScriptReply};
     #[cfg(feature = "dev-console")]
     use super::{PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION, publish_command_catalog};
     use super::{SpawnPhysics, apply_world_changes, drain_prefab_replies};
@@ -3660,6 +3669,7 @@ mod tests {
         LoadedPrefab, LoaderRequest, PrefabCpu, PrefabLoads, PrefabReady, PrefabReply, PrefabToken,
         RenderResourceRequest,
     };
+    use crate::prefabs::{MaterialLevels, MaterialReply, MaterialRequest};
     use crate::profiling::{PhaseWindow, SOURCE_RENDER, render_groups, render_phase};
     use crate::scene::PreparedPrefabs;
     use engine_animation::AnimationBridge;
@@ -3679,6 +3689,7 @@ mod tests {
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
+    use engine_scene::world::MeshMaterialParams;
     use engine_scene::{LocalLightState, ObjectHandle, SceneDocument, World};
     use engine_script::ScriptLoadOptions;
     use engine_script::{
@@ -3686,6 +3697,7 @@ mod tests {
     };
     use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
     use engine_window::CursorState;
+    use flume::Receiver;
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
@@ -4985,16 +4997,23 @@ return Script
         frame_tx
             .send(snapshot_with_particle_commands(vec![command]))
             .unwrap();
-        frame_tx.send(snapshot_with_particle_commands(Vec::new())).unwrap();
+        frame_tx
+            .send(snapshot_with_particle_commands(Vec::new()))
+            .unwrap();
         control_tx.send(RenderControl::Occluded(false)).unwrap();
         assert!(matches!(
             script_rx.recv().unwrap(),
             ScriptControl::Background(false)
         ));
-        frame_tx.send(snapshot_with_particle_commands(Vec::new())).unwrap();
+        frame_tx
+            .send(snapshot_with_particle_commands(Vec::new()))
+            .unwrap();
         control_tx.send(RenderControl::Shutdown).unwrap();
         assert!(worker.join().unwrap().is_ok());
-        assert_eq!(applied_rx.try_iter().collect::<Vec<_>>(), vec![vec![command]]);
+        assert_eq!(
+            applied_rx.try_iter().collect::<Vec<_>>(),
+            vec![vec![command]]
+        );
     }
 
     #[cfg(feature = "dev-console")]
@@ -5033,7 +5052,9 @@ return Script
         );
         // Смена debug view перерисовывает последний снимок тем же набором команд.
         control_tx
-            .send(RenderControl::DebugView(engine_render::DebugView::Wireframe))
+            .send(RenderControl::DebugView(
+                engine_render::DebugView::Wireframe,
+            ))
             .unwrap();
         control_tx.send(RenderControl::Shutdown).unwrap();
         assert!(worker.join().unwrap().is_ok());
@@ -5054,9 +5075,7 @@ return Script
         (world, crate_handle)
     }
 
-    fn next_material_request(
-        requests: &Receiver<RenderResourceRequest>,
-    ) -> Box<MaterialRequest> {
+    fn next_material_request(requests: &Receiver<RenderResourceRequest>) -> Box<MaterialRequest> {
         match requests.try_recv() {
             Ok(RenderResourceRequest::Material(request)) => request,
             _ => panic!("ожидалась заявка материала"),
@@ -5127,9 +5146,7 @@ return Script
         let (resources_tx, resources_rx) = flume::unbounded();
         let mut sync = MaterialSync::default();
         let gold = engine_files::VirtualPath::parse("/materials/gold.rvemat").unwrap();
-        world
-            .set_mesh_material_path(crate_handle, gold)
-            .unwrap();
+        world.set_mesh_material_path(crate_handle, gold).unwrap();
 
         sync.request_changes(&mut world, &gpu_scene, &resources_tx);
         let request = next_material_request(&resources_rx);
@@ -5140,7 +5157,11 @@ return Script
             result: Err("материал не загрузился".to_owned()),
         });
         sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 3);
-        assert_eq!(gpu_scene.by_object[&crate_handle].len(), 1, "отказ не меняет уровни");
+        assert_eq!(
+            gpu_scene.by_object[&crate_handle].len(),
+            1,
+            "отказ не меняет уровни"
+        );
         sync.request_changes(&mut world, &gpu_scene, &resources_tx);
         assert!(
             resources_rx.try_recv().is_err(),

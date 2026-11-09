@@ -271,7 +271,10 @@ return Script
     let before = world.object(sky).unwrap().environment.clone();
     run_once(&mut world, &mut host);
     assert!(
-        !world.object(world.handle("crate").unwrap()).unwrap().mesh_visible,
+        !world
+            .object(world.handle("crate").unwrap())
+            .unwrap()
+            .mesh_visible,
         "вызов должен отказать, а скрипт продолжить"
     );
     let after = world.object(sky).unwrap().environment.clone();
@@ -296,7 +299,10 @@ return Script
     );
     run_once(&mut world, &mut host);
     assert!(
-        !world.object(world.handle("crate").unwrap()).unwrap().mesh_visible,
+        !world
+            .object(world.handle("crate").unwrap())
+            .unwrap()
+            .mesh_visible,
         "вызов должен отказать, а скрипт продолжить"
     );
     let lamp = world.object(world.handle("lamp").unwrap()).unwrap();

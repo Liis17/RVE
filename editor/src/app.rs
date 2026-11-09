@@ -3007,8 +3007,7 @@ function S:on_update()
 end
 return S
 "#;
-        let mut session =
-            PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap();
+        let mut session = PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap();
         session.tick().unwrap();
         let first = session.take_particle_commands();
         assert!(

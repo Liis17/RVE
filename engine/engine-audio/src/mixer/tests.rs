@@ -643,7 +643,13 @@ fn stereo_front_mixer(blend: f32) -> Mixer {
         spatial_blend: blend,
         ..request(true)
     };
-    play(&mut mixer, 1, 0, clip(RATE, 2, [1.0, 0.0].repeat(8)), request);
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 2, [1.0, 0.0].repeat(8)),
+        request,
+    );
     mixer
 }
 
@@ -679,5 +685,8 @@ fn lowpass_recovers_when_its_state_becomes_non_finite() {
     assert!(out.iter().all(|value| value.is_finite()), "{out:?}");
     let tail = render_stereo(&mut mixer, 512);
     assert!(tail.iter().all(|value| value.is_finite()));
-    assert!(tail.iter().any(|value| value.abs() > 1e-3), "голос замолчал");
+    assert!(
+        tail.iter().any(|value| value.abs() > 1e-3),
+        "голос замолчал"
+    );
 }
