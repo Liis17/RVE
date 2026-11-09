@@ -647,7 +647,16 @@ pub(crate) struct ResolvedUserTexture {
     pub(crate) color_space: TextureColorSpace,
 }
 
-struct GpuTextureCache<T> {
+/// GPU-кэши сцены, которые переживают загрузку: текстуры, шейдеры и запасной материал. Render thread
+/// забирает их, чтобы заменять материалы объектов без повторной загрузки текстур.
+#[derive(Default)]
+pub(crate) struct MaterialUploadCaches {
+    pub(crate) textures: GpuTextureCache<TextureId>,
+    pub(crate) shaders: HashMap<String, Result<ShaderId, String>>,
+    pub(crate) error_material: Option<MaterialId>,
+}
+
+pub(crate) struct GpuTextureCache<T> {
     model: HashMap<(String, usize, TextureColorSpace), T>,
     scene: HashMap<(String, TextureColorSpace), T>,
 }
@@ -1133,12 +1142,13 @@ pub(crate) fn load_screen_shader_sources(
 pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
+    caches: &mut MaterialUploadCaches,
 ) -> Result<GpuSceneTable, RenderError> {
     let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
-    let mut texture_cache = GpuTextureCache::<TextureId>::default();
-    let mut shader_cache = HashMap::<String, Result<ShaderId, String>>::new();
+    let mut texture_cache = std::mem::take(&mut caches.textures);
+    let mut shader_cache = std::mem::take(&mut caches.shaders);
     let mut material_cache = HashMap::<String, MaterialId>::new();
-    let mut error_material = None;
+    let mut error_material = caches.error_material.take();
     // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
     let animated = animated_model_paths(assets);
 
@@ -1270,6 +1280,9 @@ pub(crate) fn upload_scene(
         }
         table.particle_templates.insert(path.clone(), descs);
     }
+    caches.textures = texture_cache;
+    caches.shaders = shader_cache;
+    caches.error_material = error_material;
     Ok(table)
 }
 
@@ -1396,7 +1409,7 @@ pub(crate) fn particle_emitter_desc(
 /// Уровни LOD объекта. Без замены материала и текстуры переиспользуются меши модели; иначе для
 /// каждой части берётся материал с заменами, одинаковые материалы создаются один раз.
 #[allow(clippy::too_many_arguments)]
-fn upload_object_levels(
+pub(crate) fn upload_object_levels(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
     gpu_models: &HashMap<String, Vec<(MeshId, MaterialId)>>,

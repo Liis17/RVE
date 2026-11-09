@@ -78,6 +78,41 @@ pub(crate) enum RenderResourceRequest {
     Release { token: PrefabToken, last_seq: u64 },
     /// Эмиттеры частиц: создание для объекта или уничтожение по объектам (поддеревья удалены).
     Particle(ParticleRequest),
+    /// Скрипт сменил материал меш-рендерера объекта: render thread создаёт новые GPU-материалы.
+    Material(Box<MaterialRequest>),
+    /// Материалы, созданные по заявкам и уже не используемые scripts thread. Уничтожаются, когда
+    /// render thread принял снимки с `seq ≥ last_seq`.
+    ReleaseMaterials {
+        materials: Vec<MaterialId>,
+        last_seq: u64,
+    },
+}
+
+/// Заявка на материалы объекта: уровни LOD с текущими мешами, переопределения из компонента и
+/// путь `.rvemat`, если скрипт заменил материал целиком.
+pub(crate) struct MaterialRequest {
+    pub object: ObjectHandle,
+    /// Ревизия мира на момент заявки; ответ с ней сверяется с текущей ревизией.
+    pub revision: u64,
+    pub levels: Vec<Vec<(MeshId, MaterialId)>>,
+    pub material: Option<engine_scene::MaterialOverride>,
+    /// Путь `.rvemat` без ведущего `/`, как в `material_slots` сцены.
+    pub path: Option<String>,
+}
+
+/// Ответ render thread на [`MaterialRequest`].
+#[derive(Debug)]
+pub(crate) struct MaterialReply {
+    pub object: ObjectHandle,
+    pub revision: u64,
+    pub result: Result<MaterialLevels, String>,
+}
+
+/// Новые уровни объекта и материалы, которые render thread создал под них.
+#[derive(Debug)]
+pub(crate) struct MaterialLevels {
+    pub levels: Vec<Vec<(MeshId, MaterialId)>>,
+    pub created: Vec<MaterialId>,
 }
 
 /// Заявка на эмиттер частиц объекта. Эмиттер живёт в render thread под хендлом объекта.

@@ -14,7 +14,7 @@ use crate::prefabs::{PREFAB_LOADER_THREAD, RenderResourceRequest};
 use crate::profiling::StartupProfile;
 #[cfg(feature = "dev-console")]
 use crate::profiling::profile_command_lines;
-use crate::scene::{PreparedRenderAssets, upload_scene};
+use crate::scene::{MaterialUploadCaches, PreparedRenderAssets, upload_scene};
 #[cfg(feature = "dev-console")]
 use egui::{Context, Rect, ViewportId};
 #[cfg(feature = "dev-console")]
@@ -138,7 +138,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         dlss_application_id,
         dlss_engine_version,
         pipeline_cache,
-        render_assets,
+        render_assets: Arc::new(render_assets),
         modules,
         activation,
         cursor,
@@ -206,7 +206,7 @@ struct PlayerWindow<'a> {
     dlss_application_id: Option<u64>,
     dlss_engine_version: Option<String>,
     pipeline_cache: Vec<u8>,
-    render_assets: PreparedRenderAssets,
+    render_assets: Arc<PreparedRenderAssets>,
     modules: &'a mut ModuleHost,
     activation: PendingActivation,
     cursor: CursorControl,
@@ -835,7 +835,9 @@ impl WindowHandler for PlayerWindow<'_> {
             self.wireframe_supported = renderer.capabilities().wireframe;
         }
         let phase_started = Instant::now();
-        let mut gpu_scene = match upload_scene(&mut renderer, &self.render_assets) {
+        let mut material_caches = MaterialUploadCaches::default();
+        let mut gpu_scene = match upload_scene(&mut renderer, &self.render_assets, &mut material_caches)
+        {
             Ok(scene) => scene,
             Err(error) => return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}")),
         };
@@ -856,7 +858,8 @@ impl WindowHandler for PlayerWindow<'_> {
             VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view)
                 .with_particle_emitters(std::mem::take(&mut gpu_scene.particles))
                 .with_scene_skin_instances(gpu_scene.skin_instance_ids())
-                .with_scene_screen_shaders(gpu_scene.screen_shader_ids());
+                .with_scene_screen_shaders(gpu_scene.screen_shader_ids())
+                .with_material_uploads(Arc::clone(&self.render_assets), material_caches);
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(
