@@ -577,3 +577,63 @@ fn structural_edits_of_persistent_objects_are_refused_in_teardown_callbacks() {
         }
     }
 }
+
+#[test]
+fn scene_prefab_conflicting_with_a_heavy_project_prefab_changes_no_prefab_state() {
+    let world = old_scene("");
+    let mut catalog = PrefabCatalog::default();
+    catalog.insert(
+        "prefabs/heavy.rveprefab",
+        PrefabSpec {
+            kind: PrefabKind::Heavy,
+            max_instances: None,
+        },
+    );
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "old",
+        &sources(),
+        None,
+        ScriptLoadOptions {
+            prefabs: catalog,
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    let path = VirtualPath::parse("prefabs/fresh.rveprefab").unwrap();
+    let mut read = |_: &VirtualPath| -> Result<String, String> {
+        Ok("[[objects]]\nid = \"root\"\n".to_owned())
+    };
+    let template = Arc::new(PrefabTemplate::load(&path, &mut read).unwrap());
+    let mut scene = PrefabCatalog::default();
+    scene.insert(
+        "prefabs/fresh.rveprefab",
+        PrefabSpec {
+            kind: PrefabKind::Fast,
+            max_instances: None,
+        },
+    );
+    scene.insert(
+        "prefabs/heavy.rveprefab",
+        PrefabSpec {
+            kind: PrefabKind::Fast,
+            max_instances: None,
+        },
+    );
+    let templates = BTreeMap::from([
+        ("prefabs/fresh.rveprefab".to_owned(), Arc::clone(&template)),
+        ("prefabs/heavy.rveprefab".to_owned(), template),
+    ]);
+
+    let error = host
+        .check_scene_prefabs(&world, &scene, &templates, &sources())
+        .err()
+        .expect("a fast declaration of a heavy project prefab is refused");
+
+    assert!(error.to_string().contains("heavy"), "{error}");
+    assert_eq!(host.prefab_status("prefabs/fresh.rveprefab"), None);
+    assert_eq!(
+        host.prefab_status("prefabs/heavy.rveprefab"),
+        Some(PrefabStatus::Unloaded)
+    );
+}

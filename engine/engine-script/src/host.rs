@@ -3,8 +3,8 @@ use crate::actions::InputActions;
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lifecycle::{
     Lifecycle, MAX_SPAWNED_OBJECTS_PER_FRAME, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSlot,
-    PrefabStatus, SpawnArgs, SpawnRequest, SpawnedObject, WorldChanges, check_spawn_request,
-    prefab_display, prefab_key,
+    PrefabSpec, PrefabStatus, SpawnArgs, SpawnRequest, SpawnedObject, WorldChanges,
+    check_spawn_request, prefab_display, prefab_key,
 };
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LitePhysicsEvent,
@@ -873,6 +873,146 @@ impl ScriptHost {
                 ),
             });
         }
+        self.check_prefab_template(world, &template, sources)?;
+
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        let slot = lifecycle
+            .prefabs
+            .get_mut(&key)
+            .expect("prefab slot was checked above");
+        slot.register(template);
+        slot.status = match kind {
+            PrefabKind::Fast => PrefabStatus::Resident,
+            PrefabKind::Heavy => PrefabStatus::Loaded,
+        };
+        if kind == PrefabKind::Heavy {
+            let waiting = std::mem::take(&mut lifecycle.waiting);
+            let (ready, rest): (Vec<SpawnRequest>, Vec<SpawnRequest>) = waiting
+                .into_iter()
+                .partition(|request| request.prefab == key);
+            lifecycle.waiting = rest;
+            lifecycle.queued.extend(ready);
+            lifecycle.begin_unload_if_idle(path);
+        }
+        Ok(())
+    }
+
+    /// Проверяет быстрые префабы сцены, которую загружает `rve.scene.load`, не меняя состояние
+    /// префабов. Слоты `catalog`, которых ещё нет, попадут в список; тяжёлый слот с тем же путём
+    /// — отказ, потому что проектный список считает префаб тяжёлым. Шаблон уже резидентного
+    /// префаба пропускается: экземпляры прежней сцены живут со своим шаблоном. Классы, которые
+    /// скомпилированы для проверки, попадают в кеш; кеш не виден скриптам.
+    pub fn check_scene_prefabs(
+        &mut self,
+        world: &World,
+        catalog: &PrefabCatalog,
+        templates: &BTreeMap<String, Arc<PrefabTemplate>>,
+        sources: &BTreeMap<String, String>,
+    ) -> Result<ScenePrefabs, ScriptLoadError> {
+        let mut slots = Vec::new();
+        {
+            let lifecycle = self.lifecycle.borrow();
+            for (path, spec) in catalog.iter() {
+                let key = prefab_key(path).map_err(|message| ScriptLoadError::Prefab {
+                    path: path.to_owned(),
+                    message,
+                })?;
+                match lifecycle.prefabs.get(&key) {
+                    Some(slot) if slot.kind != PrefabKind::Fast => {
+                        return Err(ScriptLoadError::Prefab {
+                            path: prefab_display(&key),
+                            message: "the scene declares the prefab as fast, but the project lists it as heavy".to_owned(),
+                        });
+                    }
+                    Some(_) => {}
+                    None if spec.kind == PrefabKind::Fast => slots.push((key, spec)),
+                    None => {
+                        return Err(ScriptLoadError::Prefab {
+                            path: prefab_display(&key),
+                            message: "the prefab is not in the project prefab list".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        let mut registrations = Vec::new();
+        for (path, template) in templates {
+            let key = prefab_key(path).map_err(|message| ScriptLoadError::Prefab {
+                path: path.to_owned(),
+                message,
+            })?;
+            let status = {
+                let lifecycle = self.lifecycle.borrow();
+                lifecycle
+                    .prefabs
+                    .get(&key)
+                    .map(|slot| (slot.kind, slot.status))
+            };
+            let status = match status {
+                Some(status) => status,
+                None => {
+                    let planned = slots.iter().any(|(slot, _)| *slot == key);
+                    if !planned {
+                        return Err(ScriptLoadError::Prefab {
+                            path: prefab_display(&key),
+                            message: "the prefab is not in the project prefab list".to_owned(),
+                        });
+                    }
+                    (PrefabKind::Fast, PrefabStatus::Unloaded)
+                }
+            };
+            match status {
+                (PrefabKind::Fast, PrefabStatus::Resident) => continue,
+                (PrefabKind::Fast, PrefabStatus::Unloaded) => {}
+                (PrefabKind::Heavy, _) => {
+                    return Err(ScriptLoadError::Prefab {
+                        path: prefab_display(&key),
+                        message: "the scene declares the prefab as fast, but the project lists it as heavy".to_owned(),
+                    });
+                }
+                (_, other) => {
+                    return Err(ScriptLoadError::Prefab {
+                        path: prefab_display(&key),
+                        message: format!(
+                            "the prefab is {}, not waiting for registration",
+                            other.as_str()
+                        ),
+                    });
+                }
+            }
+            self.check_prefab_template(world, template, sources)?;
+            registrations.push((key, Arc::clone(template)));
+        }
+        Ok(ScenePrefabs {
+            slots,
+            templates: registrations,
+        })
+    }
+
+    /// Применяет проверенные [`ScenePrefabs`]. Отказа не бывает: проверка прошла на этом же
+    /// состоянии, а слоты не удаляются между проверкой и применением.
+    pub fn apply_scene_prefabs(&mut self, prefabs: ScenePrefabs) {
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        for (key, spec) in prefabs.slots {
+            lifecycle.prefabs.insert(key, PrefabSlot::new(spec));
+        }
+        for (key, template) in prefabs.templates {
+            let slot = lifecycle
+                .prefabs
+                .get_mut(&key)
+                .expect("prefab slot was checked before the scene switch");
+            slot.register(template);
+            slot.status = PrefabStatus::Resident;
+        }
+    }
+
+    /// Компилирует недостающие классы шаблона и проверяет его параметры и ссылки по `world`.
+    fn check_prefab_template(
+        &mut self,
+        world: &World,
+        template: &PrefabTemplate,
+        sources: &BTreeMap<String, String>,
+    ) -> Result<(), ScriptLoadError> {
         for (script_path, source) in sources {
             if self.classes.contains_key(script_path) {
                 continue;
@@ -934,26 +1074,6 @@ impl ScriptHost {
                     }
                 })?;
             }
-        }
-
-        let mut lifecycle = self.lifecycle.borrow_mut();
-        let slot = lifecycle
-            .prefabs
-            .get_mut(&key)
-            .expect("prefab slot was checked above");
-        slot.register(template);
-        slot.status = match kind {
-            PrefabKind::Fast => PrefabStatus::Resident,
-            PrefabKind::Heavy => PrefabStatus::Loaded,
-        };
-        if kind == PrefabKind::Heavy {
-            let waiting = std::mem::take(&mut lifecycle.waiting);
-            let (ready, rest): (Vec<SpawnRequest>, Vec<SpawnRequest>) = waiting
-                .into_iter()
-                .partition(|request| request.prefab == key);
-            lifecycle.waiting = rest;
-            lifecycle.queued.extend(ready);
-            lifecycle.begin_unload_if_idle(path);
         }
         Ok(())
     }
@@ -3964,6 +4084,12 @@ fn resolve_params(
         Some(schema) => schema.resolve(params),
         None => Ok(params.clone()),
     }
+}
+
+/// Быстрые префабы сцены после проверки [`ScriptHost::check_scene_prefabs`], ещё не применённые.
+pub struct ScenePrefabs {
+    slots: Vec<(String, PrefabSpec)>,
+    templates: Vec<(String, Arc<PrefabTemplate>)>,
 }
 
 fn resolve_object_refs(

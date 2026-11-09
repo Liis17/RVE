@@ -1365,17 +1365,18 @@ impl PlaySession {
         PhysicsSceneDesc::from_world(&world, &model_geometry, glam::Vec3::ZERO, 60, 8)
             .and_then(|desc| desc.build())
             .map_err(|error| error.to_string())?;
-        // Регистрация документов и префабов аддитивна: при отказе замены мир не меняется.
+        // Префабы сцены проверяются до любых изменений и применяются после замены мира, которая
+        // может отказать. Регистрация UI аддитивна и мира не меняет.
+        let scene_prefabs = self
+            .host
+            .check_scene_prefabs(&world, &prefabs.catalog, &prefabs.templates, &sources)
+            .map_err(|error| error.to_string())?;
         self.ui_registry.register(&mut self.host, &prefabs.ui)?;
-        for (prefab_path, template) in &prefabs.templates {
-            self.host
-                .register_prefab(&self.world, prefab_path, Arc::clone(template), &sources)
-                .map_err(|error| error.to_string())?;
-        }
         let time = self.script_time();
         let replacement = self
             .host
             .replace_scene(&mut self.world, world, &sources, &path, time)?;
+        self.host.apply_scene_prefabs(scene_prefabs);
         self.animation.replace_objects(
             &self.world,
             &replacement.removed,
@@ -3299,6 +3300,7 @@ mod scene_switch_tests {
     use super::*;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::SceneDocument;
+    use engine_script::PrefabStatus;
     use std::path::PathBuf;
 
     const PLAYER: &str = "local Script = {}\nfunction Script:on_destroy()\n  rve.log(\"player destroy\")\nend\nreturn Script\n";
@@ -3469,5 +3471,40 @@ path = \"boss.lua\"
         let boss = session.world.handle("boss").unwrap();
         assert!(bound(&session, boss), "тело босса вставлено в физику Play");
         assert!(!bound(&session, crate_object), "тело ящика снято с физики");
+    }
+
+    #[test]
+    fn play_switch_registers_the_fast_prefabs_of_the_target_scene_before_it_spawns_them() {
+        let files = EmptyAssets::new();
+        let assets = files.assets();
+        let mut session = start_session();
+        let path = "prefabs/y.rveprefab";
+        let mut prefabs = PlayPrefabs::default();
+        prefabs.catalog.insert(
+            path,
+            PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances: None,
+            },
+        );
+        let template = PrefabTemplate::load(&VirtualPath::parse(path).unwrap(), &mut |_| {
+            Ok("[[objects]]\nid = \"root\"\n".to_owned())
+        })
+        .unwrap();
+        prefabs
+            .templates
+            .insert(path.to_owned(), Arc::new(template));
+        let world = World::from_document(&SceneDocument::parse("levels/b.rvescene", NEXT).unwrap())
+            .unwrap();
+        let scene =
+            PlayScene::prepare("levels/b.rvescene", world, prefabs, sources, &assets).unwrap();
+
+        session.replace_scene(scene).unwrap();
+
+        assert_eq!(
+            session.host.prefab_status(path),
+            Some(PrefabStatus::Resident)
+        );
+        assert_eq!(session.host.current_scene(), "levels/b.rvescene");
     }
 }

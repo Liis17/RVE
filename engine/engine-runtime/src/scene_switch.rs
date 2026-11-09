@@ -291,19 +291,18 @@ impl SceneSwitch {
         mut table: GpuSceneTable,
     ) -> Result<(), String> {
         let new_ids = SceneGpuIds::of_table(&table);
-        // Документы, картинки и префабы регистрируются до замены: эти регистрации аддитивны, и при
-        // отказе замены мир не меняется.
+        // Префабы сцены проверяются до любых изменений и применяются только после замены мира,
+        // которая может отказать. Регистрация UI аддитивна и мира не меняет.
+        let scene_prefabs = ctx
+            .scripts
+            .check_scene_prefabs(
+                &pending.world,
+                &pending.prefabs.catalog,
+                &pending.prefabs.templates,
+                &pending.sources,
+            )
+            .map_err(|error| error.to_string())?;
         ctx.ui_registry.register(ctx.scripts, &pending.ui)?;
-        for (prefab_path, template) in &pending.prefabs.templates {
-            ctx.scripts
-                .register_prefab(
-                    ctx.world,
-                    prefab_path,
-                    Arc::clone(template),
-                    &pending.sources,
-                )
-                .map_err(|error| error.to_string())?;
-        }
 
         let scene_objects: Vec<ObjectHandle> = pending
             .world
@@ -318,6 +317,7 @@ impl SceneSwitch {
             &pending.path,
             ctx.time,
         )?;
+        ctx.scripts.apply_scene_prefabs(scene_prefabs);
 
         // Изменения ниже не имеют отказов: мир уже заменён. Удалённые объекты, физика и звук
         // добавленных обрабатываются в `apply_world_changes` по `WorldChanges`.
@@ -435,8 +435,7 @@ mod tests {
 mod commit_tests {
     use super::*;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
-    use engine_scene::SceneDocument;
-    use engine_script::ScriptFrameTime;
+    use engine_script::{PrefabStatus, ScriptFrameTime, ScriptLoadOptions};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -489,6 +488,46 @@ path = \"scripts/enemy.lua\"
 
     const CLASH_SCENE: &str = "[[objects]]\nid = \"camera_x\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"player\"\n";
 
+    /// Сохраняемый `hub` спавнит быстрые префабы сцены `pb` после перехода в неё.
+    const HUB: &str = r#"
+local Script = {}
+function Script:on_update(dt)
+  if self.done or rve.scene.current() ~= "levels/pb.rvescene" then
+    return
+  end
+  self.done = true
+  rve.spawn("prefabs/x.rveprefab", { id = "spawned_x" })
+  rve.spawn("prefabs/y.rveprefab", { id = "spawned_y" })
+end
+return Script
+"#;
+
+    const PREFAB_X: &str = "[[objects]]\nid = \"root\"\n";
+    const PREFAB_Y: &str = "[[objects]]\nid = \"root\"\n";
+    /// Префаб, чей скрипт не компилируется: переход в сцену с ним должен полностью отказать.
+    const PREFAB_Z: &str = "[[assets]]\npath = \"scripts/broken.lua\"\n[[objects]]\nid = \"root\"\n[[objects.lite_scripts]]\npath = \"scripts/broken.lua\"\n";
+
+    /// Стартовая сцена с общим префабом `x` и сохраняемым `hub`.
+    const PREFAB_SCENE_A: &str = "[[assets]]\npath = \"scripts/hub.lua\"\n[[assets]]\npath = \"prefabs/x.rveprefab\"\n\
+[[objects]]\nid = \"camera_a\"\n[objects.camera]\nactive = true\n\
+[[objects]]\nid = \"hub\"\nkeep_on_load = true\n[[objects.lite_scripts]]\npath = \"scripts/hub.lua\"\n\
+[[objects]]\nid = \"a_crate\"\n";
+
+    /// Сцена с новым префабом `y` и тем же `x`.
+    const PREFAB_SCENE_B: &str = "[[assets]]\npath = \"prefabs/x.rveprefab\"\n[[assets]]\npath = \"prefabs/y.rveprefab\"\n\
+[[objects]]\nid = \"camera_b\"\n[objects.camera]\nactive = true\n\
+[[objects]]\nid = \"b_crate\"\n";
+
+    /// Сцена без `hub`: возврат в неё после `pb` снова использует уже резидентный `x`.
+    const PREFAB_SCENE_C: &str = "[[assets]]\npath = \"prefabs/x.rveprefab\"\n\
+[[objects]]\nid = \"camera_c\"\n[objects.camera]\nactive = true\n\
+[[objects]]\nid = \"c_crate\"\n";
+
+    /// Сцена с префабом `z`, чей скрипт не компилируется.
+    const PREFAB_SCENE_BROKEN: &str = "[[assets]]\npath = \"prefabs/z.rveprefab\"\n\
+[[objects]]\nid = \"camera_bad\"\n[objects.camera]\nactive = true\n\
+[[objects]]\nid = \"bad_crate\"\n";
+
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
     /// Временный каталог с файлами сцен и скриптов; удаляется вместе с ригом.
@@ -540,15 +579,30 @@ path = \"scripts/enemy.lua\"
 
     impl Rig {
         fn new() -> Self {
+            Self::start("levels/a.rvescene")
+        }
+
+        /// Стартовая сцена поднимается как при запуске: быстрые префабы попадают в каталог хоста
+        /// и регистрируются по шаблонам сцены.
+        fn start(start: &str) -> Self {
             let dir = TempDir::new();
             dir.write("levels/a.rvescene", START_SCENE);
             dir.write("levels/b.rvescene", BOSS_SCENE);
             dir.write("levels/c.rvescene", CRATE_SCENE);
             dir.write("levels/clash.rvescene", CLASH_SCENE);
             dir.write("levels/e.rvescene", ENEMY_SCENE);
+            dir.write("levels/pa.rvescene", PREFAB_SCENE_A);
+            dir.write("levels/pb.rvescene", PREFAB_SCENE_B);
+            dir.write("levels/pbad.rvescene", PREFAB_SCENE_BROKEN);
+            dir.write("levels/pc.rvescene", PREFAB_SCENE_C);
             dir.write("scripts/player.lua", PLAYER);
             dir.write("scripts/enemy.lua", ENEMY);
             dir.write("scripts/boss.lua", BOSS);
+            dir.write("scripts/hub.lua", HUB);
+            dir.write("scripts/broken.lua", "return {");
+            dir.write("prefabs/x.rveprefab", PREFAB_X);
+            dir.write("prefabs/y.rveprefab", PREFAB_Y);
+            dir.write("prefabs/z.rveprefab", PREFAB_Z);
             let resources = ResourceSystem::start(ResourceConfig {
                 root: dir.root().to_owned(),
                 source_mode: SourceMode::Loose,
@@ -557,13 +611,28 @@ path = \"scripts/enemy.lua\"
             })
             .unwrap();
             let loader = SceneLoader::new(resources.handle(), PhysicsSettings::default(), false);
-            let document = SceneDocument::parse("levels/a.rvescene", START_SCENE).unwrap();
-            let mut world = World::from_document(&document).unwrap();
-            let sources = BTreeMap::from([
-                ("scripts/player.lua".to_owned(), PLAYER.to_owned()),
-                ("scripts/enemy.lua".to_owned(), ENEMY.to_owned()),
-            ]);
-            let mut host = ScriptHost::load(&world, "levels/a.rvescene", &sources, None).unwrap();
+            let (prepared, _) = loader.prepare(start).unwrap();
+            let PreparedScene {
+                mut world,
+                sources,
+                prefabs,
+                ..
+            } = prepared;
+            let mut host = ScriptHost::load_with_options(
+                &world,
+                start,
+                &sources,
+                None,
+                ScriptLoadOptions {
+                    prefabs: prefabs.catalog.clone(),
+                    ..ScriptLoadOptions::default()
+                },
+            )
+            .unwrap();
+            for (path, template) in &prefabs.templates {
+                host.register_prefab(&world, path, Arc::clone(template), &sources)
+                    .unwrap();
+            }
             host.start(&mut world, ScriptTime::default());
             let (loader_tx, _loader_rx) = flume::unbounded();
             let (render_tx, render_rx) = flume::unbounded();
@@ -809,5 +878,52 @@ path = \"scripts/enemy.lua\"
             !messages.iter().any(|message| message == "player destroy"),
             "{messages:?}"
         );
+    }
+
+    #[test]
+    fn new_and_shared_fast_prefabs_switch_and_persistent_hub_spawns_them_afterward() {
+        let mut rig = Rig::start("levels/pa.rvescene");
+        let x = "prefabs/x.rveprefab";
+        let y = "prefabs/y.rveprefab";
+        assert_eq!(rig.host.prefab_status(x), Some(PrefabStatus::Resident));
+        assert_eq!(rig.host.prefab_status(y), None);
+
+        rig.load("levels/pb.rvescene").unwrap();
+        let failures = rig.commit();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(rig.host.prefab_status(x), Some(PrefabStatus::Resident));
+        assert_eq!(rig.host.prefab_status(y), Some(PrefabStatus::Resident));
+
+        rig.frame_update();
+        assert_eq!(
+            rig.names(),
+            sorted(&["b_crate", "camera_b", "hub", "spawned_x", "spawned_y"])
+        );
+
+        rig.load("levels/pc.rvescene").unwrap();
+        let failures = rig.commit();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(rig.host.prefab_status(x), Some(PrefabStatus::Resident));
+        assert_eq!(rig.names(), sorted(&["c_crate", "camera_c", "hub"]));
+        assert_eq!(rig.host.current_scene(), "levels/pc.rvescene");
+    }
+
+    #[test]
+    fn a_prefab_whose_script_fails_to_compile_leaves_no_registration_behind() {
+        let mut rig = Rig::start("levels/pa.rvescene");
+        let z = "prefabs/z.rveprefab";
+
+        rig.load("levels/pbad.rvescene").unwrap();
+        let failures = rig.commit();
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].1.contains("broken"), "{failures:?}");
+        assert_eq!(
+            rig.host.prefab_status(z),
+            None,
+            "нет орфан-состояния префаба"
+        );
+        assert_eq!(rig.names(), sorted(&["a_crate", "camera_a", "hub"]));
+        assert_eq!(rig.host.current_scene(), "levels/pa.rvescene");
     }
 }
