@@ -19,6 +19,7 @@ pub struct AssetEntry {
 /// Вид ресурса, определяемый по расширению файла.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetKind {
+    Ui,
     Scene,
     Prefab,
     CameraSettings,
@@ -44,6 +45,7 @@ impl AssetKind {
             .map(|(_, extension)| extension.to_ascii_lowercase());
         match extension.as_deref() {
             Some("rvescene") => Self::Scene,
+            Some("rveui") => Self::Ui,
             Some("rveprefab") => Self::Prefab,
             Some("camerasettings") => Self::CameraSettings,
             Some("postprocess") => Self::PostProcess,

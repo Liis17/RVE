@@ -1,3 +1,4 @@
+use crate::game_ui::{PreparedUi, UiImageData, load_ui};
 use crate::pipeline::GpuSceneTable;
 use engine_assets::{
     Assets, Model, ModelAlphaMode, ModelAnimation, ModelMaterial, ModelSkin, TextureData,
@@ -58,6 +59,8 @@ pub(crate) struct PreparedRenderAssets {
     pub particles: Vec<(ObjectHandle, ParticleSource)>,
     /// Эмиттеры быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub prefab_particles: BTreeMap<String, Vec<Option<ParticleSource>>>,
+    /// Картинки UI сцены (включая быстрые префабы) для загрузки в GPU при старте.
+    pub ui_images: BTreeMap<String, Arc<UiImageData>>,
     /// Исходники `.glsl` экранных шейдеров камер по пути. Заполняются только для игрового клиента:
     /// headless-сервер шейдеры не читает.
     pub screen_shaders: BTreeMap<String, String>,
@@ -82,6 +85,8 @@ pub(crate) struct PreparedScene {
     pub sources: BTreeMap<String, String>,
     pub render_assets: PreparedRenderAssets,
     pub prefabs: PreparedPrefabs,
+    /// Документы `.rveui` сцены и быстрых префабов с их ассетами.
+    pub ui: PreparedUi,
     /// Хэш раскрытого документа сцены для проверки совместимости клиента и сервера.
     pub scene_hash: [u8; 32],
 }
@@ -128,13 +133,21 @@ pub(crate) fn load_scene(
     let mut expanded = expansion.document;
     let scene_hash = engine_network::replication::scene_hash(&expanded);
     let prefabs = load_fast_prefabs(resources, &mut expanded, &instanced)?;
+    let ui = load_ui(
+        resources,
+        assets,
+        expanded.assets.iter().map(|asset| &asset.path),
+    )?;
     let mut world = World::from_document(&expanded).map_err(|error| error.to_string())?;
     world
         .resolve_physics_materials(&mut |path: &VirtualPath| {
             read_utf8(resources, &format!("/{}", path.as_str()))
         })
         .map_err(|error| error.to_string())?;
-    prepare_scene(resources, assets, scene_path, world, prefabs, scene_hash)
+    let mut prepared = prepare_scene(resources, assets, scene_path, world, prefabs, scene_hash)?;
+    prepared.render_assets.ui_images = ui.images.clone();
+    prepared.ui = ui;
+    Ok(prepared)
 }
 
 /// Раскрывает каждый `.rveprefab` из `[[assets]]` сцены в шаблон для spawn. Ассеты шаблонов
@@ -380,6 +393,7 @@ fn prepare_scene_with_model_loader(
         world,
         name: scene_path.to_owned(),
         sources,
+        ui: PreparedUi::default(),
         scene_hash,
         render_assets: PreparedRenderAssets {
             screen_shaders: BTreeMap::new(),
@@ -393,6 +407,7 @@ fn prepare_scene_with_model_loader(
             prefabs: prefab_objects,
             particles,
             prefab_particles,
+            ui_images: BTreeMap::new(),
         },
         prefabs,
     })
@@ -925,7 +940,7 @@ pub(crate) fn surface_shader_source(shader: &ShaderAsset) -> SurfaceShaderSource
     }
 }
 
-fn read_utf8(resources: &ResourceHandle, path: &str) -> Result<String, String> {
+pub(crate) fn read_utf8(resources: &ResourceHandle, path: &str) -> Result<String, String> {
     let bytes = resources
         .read_all(path)
         .map_err(|error| format!("{path}: {error}"))?
@@ -982,6 +997,8 @@ pub(crate) struct PreparedTemplate {
     /// Эмиттеры объектов шаблона; элемент `i` относится к объекту `i`.
     pub particles: Vec<Option<ParticleSource>>,
     pub sources: BTreeMap<String, String>,
+    /// `.rveui` шаблона и их ассеты: регистрируются в скриптах и загружаются в GPU при `PrefabReady`.
+    pub ui: PreparedUi,
 }
 
 /// Заспавненные объекты пока не получают анимацию: аниматор шаблона не готовится, и предупреждение
@@ -1053,6 +1070,11 @@ pub(crate) fn prepare_template(
         }
         sources.insert(path.clone(), read_utf8(resources, &path)?);
     }
+    let ui = load_ui(
+        resources,
+        assets,
+        template.assets().iter().map(|asset| &asset.path),
+    )?;
     Ok(PreparedTemplate {
         models,
         textures,
@@ -1061,6 +1083,7 @@ pub(crate) fn prepare_template(
         levels,
         particles,
         sources,
+        ui,
     })
 }
 
@@ -1186,6 +1209,10 @@ pub(crate) fn upload_scene(
         animation_clips: assets.clips.clone(),
         ..GpuSceneTable::default()
     };
+    for (path, image) in &assets.ui_images {
+        let texture = renderer.create_ui_texture(image.size[0], image.size[1], &image.rgba)?;
+        table.ui_images.insert(path.clone(), texture);
+    }
     table.screen_shaders = upload_screen_shaders(renderer, &assets.screen_shaders);
     for path in &animated {
         // Мосту нужны скелет и клипы; вершины остаются только в GPU-таблице.
@@ -2025,6 +2052,10 @@ id = "camera"
             },
         )
         .unwrap();
+        // Канвас HUD сцены открывается скриптами: документы регистрируются, как при старте runtime.
+        crate::game_ui::UiRegistry::default()
+            .register(&mut host, &prepared.ui)
+            .unwrap();
         for (path, template) in &prepared.prefabs.templates {
             host.register_prefab(
                 &prepared.world,

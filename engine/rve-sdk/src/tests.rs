@@ -1,9 +1,10 @@
+use super::empty_ui_value;
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
     RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams,
     RveCameraSettings, RveCharacterMoveResult, RveCursorState, RveGamepadState, RveHeader, RveHost,
     RveModule, RveParamEntry, RveParams, RvePlayAnimationParams, RveRaycastHit, RveScriptDesc,
-    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RveStatus, RveStr, RveTime, RveTransform, RveUiRect, RveUiValue, RveValue, RveValueData,
 };
 use crate::{
     AntiAliasing, CameraSettings, ConsoleLevel, Context, GamepadAxis, GamepadButton, GamepadState,
@@ -184,6 +185,12 @@ mod exported {
 #[derive(Default)]
 struct HostState {
     error: Option<String>,
+    /// UI calls in guest order, with their arguments spelled out.
+    ui_calls: Vec<String>,
+    /// Status returned by every UI callback; zero is `RVE_UI_OK`.
+    ui_status: u32,
+    /// Text returned by the text property of every element.
+    ui_text: String,
     transform: RveTransform,
     logs: Vec<String>,
     log_levels: Vec<u32>,
@@ -550,6 +557,19 @@ fn host(state: &mut HostState) -> RveHost {
         net_object_has_authority: None,
         net_object_set_owner: None,
         net_object_send: None,
+        ui_open: None,
+        ui_close: None,
+        ui_object_canvas: None,
+        ui_focused: None,
+        ui_pointer_over: None,
+        ui_find: None,
+        ui_get: None,
+        ui_set: None,
+        ui_get_rect: None,
+        ui_set_rect: None,
+        ui_set_options: None,
+        ui_set_image: None,
+        ui_focus: None,
         screen_shader_count: None,
         get_screen_shader: None,
         set_screen_shader: None,
@@ -1935,7 +1955,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2205,7 +2225,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
 }
 
 #[test]
@@ -2227,7 +2247,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
 }
 
 #[test]
@@ -2244,10 +2264,33 @@ fn network_callbacks_and_descriptor_keep_the_v13_layout() {
             + size_of::<Option<crate::abi::RveNetObjectSetOwnerFn>>()
     );
     assert_eq!(
-        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV13>(),
         size_of::<crate::abi::RveScriptDescV6>() + size_of::<Option<crate::abi::RveNetEventFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+}
+
+#[test]
+fn ui_callbacks_and_descriptor_keep_the_v15_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, ui_open),
+        offset_of!(RveHost, set_screen_shader)
+            + size_of::<Option<crate::abi::RveSetScreenShaderFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, ui_focus),
+        offset_of!(RveHost, ui_set_image) + size_of::<Option<crate::abi::RveUiSetImageFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV13>() + size_of::<Option<crate::abi::RveUiEventFn>>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDesc, ui_event),
+        offset_of!(crate::abi::RveScriptDescV13, net_event)
+            + size_of::<Option<crate::abi::RveNetEventFn>>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
 }
 
 unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {
@@ -2786,5 +2829,473 @@ fn pressed_inputs_list_gamepad_slots_in_order_with_concrete_names() {
     assert_eq!(
         context.input().pressed_inputs(),
         vec!["Gamepad1.South".to_owned(), "Gamepad3.DPadUp".to_owned()]
+    );
+}
+
+const UI_CANVAS: u64 = 7;
+const UI_LABEL: u32 = 3;
+
+unsafe fn ui_state<'a>(ctx: *mut c_void) -> &'a mut HostState {
+    // SAFETY: the test host passes its live state as the call context.
+    unsafe { &mut *ctx.cast::<HostState>() }
+}
+
+unsafe extern "C" fn ui_open(ctx: *mut c_void, path: RveStr, out: *mut u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the test passes valid UTF-8 paths.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.ui_calls.push(format!("open {path}"));
+    if state.ui_status == 0 {
+        // SAFETY: the guest passes a writable output slot.
+        unsafe { *out = UI_CANVAS };
+    }
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_close(ctx: *mut c_void, canvas: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push(format!("close {canvas}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_object_canvas(ctx: *mut c_void, object: u64, out: *mut u64) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push(format!("object_canvas {object}"));
+    // SAFETY: the guest passes a writable output slot.
+    unsafe { *out = UI_CANVAS };
+    true
+}
+
+unsafe extern "C" fn ui_focused(ctx: *mut c_void, canvas: *mut u64, element: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push("focused".to_owned());
+    // SAFETY: the guest passes writable output slots.
+    unsafe {
+        *canvas = UI_CANVAS;
+        *element = UI_LABEL;
+    }
+    true
+}
+
+unsafe extern "C" fn ui_pointer_over(ctx: *mut c_void) -> bool {
+    // SAFETY: the context is live for this callback.
+    unsafe { ui_state(ctx) }
+        .ui_calls
+        .push("pointer_over".to_owned());
+    true
+}
+
+unsafe extern "C" fn ui_find(ctx: *mut c_void, canvas: u64, id: RveStr, out: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the test passes valid UTF-8 identifiers.
+    let id = unsafe { id.to_str() }.unwrap();
+    state.ui_calls.push(format!("find {canvas} {id}"));
+    if id == "label" {
+        // SAFETY: the guest passes a writable output slot.
+        unsafe { *out = UI_LABEL };
+        true
+    } else {
+        false
+    }
+}
+
+unsafe extern "C" fn ui_get(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    out: *mut RveUiValue,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state
+        .ui_calls
+        .push(format!("get {canvas} {element} {property}"));
+    if state.ui_status != 0 {
+        return state.ui_status;
+    }
+    let mut value = RveUiValue {
+        kind: crate::abi::RVE_UI_VALUE_NONE,
+        flag: false,
+        number: 0.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    };
+    match property {
+        crate::abi::RVE_UI_PROP_CANVAS_VISIBLE | crate::abi::RVE_UI_PROP_VISIBLE => {
+            value.kind = crate::abi::RVE_UI_VALUE_BOOL;
+            value.flag = true;
+        }
+        crate::abi::RVE_UI_PROP_CANVAS_LAYER => {
+            value.kind = crate::abi::RVE_UI_VALUE_INTEGER;
+            value.integer = 5;
+        }
+        crate::abi::RVE_UI_PROP_TEXT => {
+            value.kind = crate::abi::RVE_UI_VALUE_TEXT;
+            value.text = RveStr::from_str_ref(&state.ui_text);
+        }
+        crate::abi::RVE_UI_PROP_VALUE => {
+            value.kind = crate::abi::RVE_UI_VALUE_NUMBER;
+            value.number = 2.5;
+        }
+        crate::abi::RVE_UI_PROP_COLOR => {
+            value.kind = crate::abi::RVE_UI_VALUE_COLOR;
+            value.color = [1, 2, 3, 4];
+        }
+        _ => return crate::abi::RVE_UI_REJECTED,
+    }
+    // SAFETY: the guest passes a writable output slot; the text outlives this call.
+    unsafe { *out = value };
+    crate::abi::RVE_UI_OK
+}
+
+fn describe_ui_value(value: &RveUiValue) -> String {
+    match value.kind {
+        crate::abi::RVE_UI_VALUE_NUMBER => format!("number {}", value.number),
+        crate::abi::RVE_UI_VALUE_BOOL => format!("bool {}", value.flag),
+        crate::abi::RVE_UI_VALUE_INDEX => format!("index {}", value.integer),
+        crate::abi::RVE_UI_VALUE_TEXT => {
+            // SAFETY: the guest-side wrapper passes borrowed UTF-8 text for this call.
+            format!("text {}", unsafe { value.text.to_str() }.unwrap())
+        }
+        crate::abi::RVE_UI_VALUE_COLOR => format!("color {:?}", value.color),
+        _ => "none".to_owned(),
+    }
+}
+
+unsafe extern "C" fn ui_set(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    value: *const RveUiValue,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the guest passes a readable value for this call.
+    let description = describe_ui_value(unsafe { &*value });
+    state
+        .ui_calls
+        .push(format!("set {canvas} {element} {property} {description}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_get_rect(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    out: *mut RveUiRect,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    unsafe { ui_state(ctx) }
+        .ui_calls
+        .push(format!("get_rect {canvas} {element}"));
+    // SAFETY: the guest passes a writable output slot.
+    unsafe {
+        *out = RveUiRect {
+            anchor_min: [0.5, 0.5],
+            anchor_max: [0.5, 0.5],
+            pivot: [0.5, 0.5],
+            offset_min: [-10.0, -4.0],
+            offset_max: [10.0, 4.0],
+        };
+    }
+    crate::abi::RVE_UI_OK
+}
+
+unsafe extern "C" fn ui_set_rect(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    rect: *const RveUiRect,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the guest passes a readable rectangle for this call.
+    let rect = unsafe { *rect };
+    state.ui_calls.push(format!(
+        "set_rect {canvas} {element} {:?} {:?}",
+        rect.offset_min, rect.offset_max
+    ));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_set_options(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    options: *const RveStr,
+    count: usize,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the guest passes `count` readable strings for this call.
+    let options: Vec<&str> = unsafe { std::slice::from_raw_parts(options, count) }
+        .iter()
+        // SAFETY: the test passes valid UTF-8 options.
+        .map(|option| unsafe { option.to_str() }.unwrap())
+        .collect();
+    state
+        .ui_calls
+        .push(format!("set_options {canvas} {element} {options:?}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_set_image(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    path: RveStr,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the test passes valid UTF-8 paths.
+    let path = unsafe { path.to_str() }.unwrap();
+    state
+        .ui_calls
+        .push(format!("set_image {canvas} {element} {path}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_focus(ctx: *mut c_void, canvas: u64, element: u32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push(format!("focus {canvas} {element}"));
+    state.ui_status
+}
+
+fn ui_host(state: &mut HostState) -> RveHost {
+    let mut host = self::host(state);
+    host.ui_open = Some(ui_open);
+    host.ui_close = Some(ui_close);
+    host.ui_object_canvas = Some(ui_object_canvas);
+    host.ui_focused = Some(ui_focused);
+    host.ui_pointer_over = Some(ui_pointer_over);
+    host.ui_find = Some(ui_find);
+    host.ui_get = Some(ui_get);
+    host.ui_set = Some(ui_set);
+    host.ui_get_rect = Some(ui_get_rect);
+    host.ui_set_rect = Some(ui_set_rect);
+    host.ui_set_options = Some(ui_set_options);
+    host.ui_set_image = Some(ui_set_image);
+    host.ui_focus = Some(ui_focus);
+    host
+}
+
+#[test]
+fn sdk_ui_api_reads_writes_and_decodes_host_values() {
+    let mut state = HostState {
+        ui_text: "hi".to_owned(),
+        ..HostState::default()
+    };
+    let host = ui_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    let ui = context.ui();
+    let canvas = ui.open("ui/menu.rveui").unwrap();
+    let label = ui.find(canvas, "label").unwrap().unwrap();
+    assert_eq!(ui.find(canvas, "missing"), Ok(None));
+    assert_eq!(ui.text(label), Ok("hi".to_owned()));
+    ui.set_text(label, "bye").unwrap();
+    assert_eq!(ui.value(label), Ok(Some(crate::UiValue::Number(2.5))));
+    ui.set_value(label, crate::UiValue::Index(1)).unwrap();
+    assert_eq!(ui.canvas_layer(canvas), Ok(5));
+    ui.set_canvas_visible(canvas, false).unwrap();
+    assert_eq!(ui.color(label), Ok([1, 2, 3, 4]));
+    ui.set_color(label, [9, 8, 7, 6]).unwrap();
+    ui.set_options(label, &["a", "b"]).unwrap();
+    ui.set_image(label, "/ui/icon.png").unwrap();
+    let rect = ui.rect(label).unwrap();
+    assert_eq!(rect.offset_max, [10.0, 4.0]);
+    ui.set_rect(label, rect).unwrap();
+    ui.focus(label).unwrap();
+    assert_eq!(ui.focused(), Some(label));
+    assert!(ui.pointer_over());
+    assert_eq!(
+        ui.canvas_of(object).map(|canvas| canvas.raw),
+        Some(UI_CANVAS)
+    );
+    ui.close(canvas).unwrap();
+    assert_eq!(
+        state.ui_calls,
+        [
+            "open ui/menu.rveui",
+            "find 7 label",
+            "find 7 missing",
+            "get 7 3 2",
+            "set 7 3 2 text bye",
+            "get 7 3 3",
+            "set 7 3 3 index 1",
+            "get 7 0 1",
+            "set 7 0 0 bool false",
+            "get 7 3 6",
+            "set 7 3 6 color [9, 8, 7, 6]",
+            "set_options 7 3 [\"a\", \"b\"]",
+            "set_image 7 3 /ui/icon.png",
+            "get_rect 7 3",
+            "set_rect 7 3 [-10.0, -4.0] [10.0, 4.0]",
+            "focus 7 3",
+            "focused",
+            "pointer_over",
+            "object_canvas 1",
+            "close 7",
+        ]
+    );
+}
+
+#[test]
+fn sdk_ui_api_reports_missing_callbacks_and_host_refusals() {
+    let mut bare = HostState::default();
+    let bare_host = self::host(&mut bare);
+    let context = Context::new(&bare_host).unwrap();
+    let object = context.find("camera").unwrap();
+    let ui = context.ui();
+    let canvas = crate::Canvas { raw: UI_CANVAS };
+    assert_eq!(ui.open("ui/menu.rveui"), Err(crate::UiError::Unavailable));
+    assert_eq!(ui.close(canvas), Err(crate::UiError::Unavailable));
+    assert_eq!(ui.canvas_of(object), None);
+    assert_eq!(ui.focused(), None);
+    assert!(!ui.pointer_over());
+    assert_eq!(ui.find(canvas, "label"), Err(crate::UiError::Unavailable));
+
+    let mut state = HostState {
+        ui_status: crate::abi::RVE_UI_REJECTED,
+        ..HostState::default()
+    };
+    let host = ui_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let ui = context.ui();
+    assert_eq!(ui.open("ui/menu.rveui"), Err(crate::UiError::Rejected));
+    let label = crate::Element {
+        canvas,
+        index: UI_LABEL,
+    };
+    assert_eq!(ui.set_text(label, "x"), Err(crate::UiError::Rejected));
+
+    state.ui_status = crate::abi::RVE_UI_INVALID_INPUT;
+    let host = ui_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let ui = context.ui();
+    assert_eq!(
+        ui.set_value(label, crate::UiValue::Number(f64::NAN)),
+        Err(crate::UiError::InvalidInput)
+    );
+    assert_eq!(
+        ui.set_value(label, crate::UiValue::Index(usize::MAX)),
+        Err(crate::UiError::InvalidInput)
+    );
+}
+
+struct UiProbe;
+
+impl Script for UiProbe {
+    fn on_ui_event(&mut self, ctx: &mut Context<'_>, event: crate::UiEvent) {
+        ctx.log_info(format!(
+            "{:?} {} {} {:?}",
+            event.kind, event.element_id, event.element.index, event.value
+        ));
+    }
+}
+
+fn ui_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(UiProbe))
+}
+
+#[test]
+fn ui_events_reach_on_ui_event_with_decoded_values_and_reject_unknown_kinds() {
+    use crate::abi::{RVE_UI_EVENT_BLUR, RVE_UI_EVENT_VALUE_CHANGED, RveUiEvent, RveUiValue};
+    let mut state = HostState::default();
+    let host = ui_host(&mut state);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: the host and parameters remain valid for this synchronous creation call.
+    let status =
+        unsafe { crate::__private::create(&host, &params, &mut instance, ui_probe_factory) };
+    assert_eq!(status, RveStatus::Ok);
+
+    let number = RveUiValue {
+        kind: crate::abi::RVE_UI_VALUE_NUMBER,
+        flag: false,
+        number: 4.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    };
+    // SAFETY: the instance was created by this module and the event outlives the call.
+    let status = unsafe {
+        crate::__private::ui_event(
+            instance,
+            &host,
+            RveUiEvent {
+                kind: RVE_UI_EVENT_VALUE_CHANGED,
+                canvas: UI_CANVAS,
+                element: UI_LABEL,
+                element_id: RveStr::from_static("volume"),
+                value: number,
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    assert!(
+        state
+            .logs
+            .iter()
+            .any(|line| line == "ValueChanged volume 3 Some(Number(4.0))"),
+        "{:?}",
+        state.logs
+    );
+
+    // SAFETY: as above; a blur without a value has no payload.
+    let status = unsafe {
+        crate::__private::ui_event(
+            instance,
+            &host,
+            RveUiEvent {
+                kind: RVE_UI_EVENT_BLUR,
+                canvas: UI_CANVAS,
+                element: UI_LABEL,
+                element_id: RveStr::from_static("volume"),
+                value: empty_ui_value(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    assert!(state.logs.iter().any(|line| line == "Blur volume 3 None"));
+
+    // SAFETY: as above; an unknown kind is rejected by the guest without a panic.
+    let status = unsafe {
+        crate::__private::ui_event(
+            instance,
+            &host,
+            RveUiEvent {
+                kind: 99,
+                canvas: UI_CANVAS,
+                element: UI_LABEL,
+                element_id: RveStr::empty(),
+                value: empty_ui_value(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Error);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unknown ui event kind")
+    );
+    // SAFETY: the instance is dropped exactly once.
+    assert_eq!(
+        unsafe { crate::__private::drop_instance(instance) },
+        RveStatus::Ok
     );
 }
