@@ -874,8 +874,8 @@ fn check(
                 )));
             }
         }
-        check_rect(&element.rect).map_err(&fail)?;
-        check_kind(&element.kind, &kinds).map_err(&fail)?;
+        check_rect(&element.rect).map_err(fail)?;
+        check_kind(&element.kind, &kinds).map_err(fail)?;
         if let ElementKind::ScrollView(_) = element.kind {
             let count = children[ids[id]].len();
             if count != 1 {
