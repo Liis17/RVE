@@ -22,6 +22,7 @@ mod player;
 mod prefabs;
 mod profiling;
 mod scene;
+mod scene_switch;
 
 use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_or_activate};
 use cli::{PlayerArgs, SERVER_USAGE, USAGE};
@@ -443,6 +444,12 @@ fn run_from_args(
         &mut modules,
         world,
         ScriptThreadConfig {
+            scene_loader: Some(scene_switch::SceneLoader::new(
+                resource_handle.clone(),
+                project.physics.clone(),
+                !headless,
+            )),
+            gpu_render: !headless,
             scene_name: name,
             save_path: engine_platform::save_data_path(&project.name),
             enabled_scenes: project

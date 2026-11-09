@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "engine-animation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "engine-audio"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cpal",
  "engine-files",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "engine-ui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "egui",
  "engine-console",

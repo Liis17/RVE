@@ -1483,10 +1483,19 @@ pub(crate) fn load_screen_shader_sources(
     sources
 }
 
+/// Как загрузка сцены отдаёт частицы объектов: эмиттеры создаются сразу, как при старте, либо
+/// отдаются описаниями, которые замена сцены создаёт по финальному хендлу объекта.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SceneParticles {
+    Emitters,
+    Descriptions,
+}
+
 pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
     caches: &mut MaterialUploadCaches,
+    particles: SceneParticles,
 ) -> Result<GpuSceneTable, RenderError> {
     let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
     let mut texture_cache = std::mem::take(&mut caches.textures);
@@ -1628,9 +1637,16 @@ pub(crate) fn upload_scene(
     }
     for (handle, source) in &assets.particles {
         let desc = particle_desc(renderer, assets, &mut texture_cache, source)?;
-        table
-            .particles
-            .insert(*handle, renderer.create_particle_emitter(desc)?);
+        match particles {
+            SceneParticles::Emitters => {
+                table
+                    .particles
+                    .insert(*handle, renderer.create_particle_emitter(desc)?);
+            }
+            SceneParticles::Descriptions => {
+                table.particle_descs.insert(*handle, desc);
+            }
+        }
     }
     for (path, sources) in &assets.prefab_particles {
         let mut descs = Vec::with_capacity(sources.len());

@@ -90,6 +90,14 @@ pub(crate) enum RenderResourceRequest {
         materials: Vec<MaterialId>,
         last_seq: u64,
     },
+    /// Замена сцены: загрузить GPU-ресурсы новой сцены. Ответ `ScriptControl::Scene`.
+    Scene(Box<crate::scene_switch::SceneUpload>),
+    /// Ресурсы загруженной сцены, которые больше не нужны scripts thread. Освобождаются, когда
+    /// render thread принял снимки с `seq ≥ last_seq`.
+    ReleaseScene {
+        ids: crate::scene_switch::SceneGpuIds,
+        last_seq: u64,
+    },
 }
 
 /// Заявка на материалы объекта: уровни LOD с текущими мешами, переопределения из компонента и
@@ -1199,6 +1207,11 @@ impl PrefabLoads {
     /// Отправляет заявку эмиттера render thread; закрытый канал означает остановку рендера.
     pub fn send_particles(&self, request: ParticleRequest) {
         let _ = self.render.send(RenderResourceRequest::Particle(request));
+    }
+
+    /// Отправляет заявку ресурсов render thread (замена сцены); закрытый канал означает остановку рендера.
+    pub fn send_render(&self, request: RenderResourceRequest) {
+        let _ = self.render.send(request);
     }
 
     /// Запускает загрузку и возвращает ошибку, если загрузчик уже остановлен.

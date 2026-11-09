@@ -36,6 +36,14 @@ impl<O> Default for GameUi<O> {
 }
 
 impl<O: Eq + Hash + Clone> GameUi<O> {
+    /// Добавляет картинки новой сцены по путям, которых ещё нет. Уже загруженная картинка того же
+    /// пути остаётся прежней: её ссылки держат предыдущие владельцы.
+    pub fn add_scene_images(&mut self, images: HashMap<String, UiTextureId>) {
+        for (path, id) in images {
+            self.images.entry(path).or_insert((id, 1));
+        }
+    }
+
     /// Картинки сцены, созданные при загрузке: каждая имеет одну ссылку, владелец не отслеживается.
     pub fn with_scene_images(images: HashMap<String, UiTextureId>) -> Self {
         Self {

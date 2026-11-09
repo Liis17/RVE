@@ -1020,6 +1020,11 @@ impl ScriptHost {
         Ok(())
     }
 
+    /// Имя текущей сцены: путь, с которым она загружена или на который заменена.
+    pub fn current_scene(&self) -> String {
+        self.scene_state.borrow().current.clone()
+    }
+
     /// Запрос `rve.scene.load` или `ctx.load_scene`, принятый последним кадром. Его должен
     /// выполнить вызывающий код после кадра: загрузить сцену и передать её в [`Self::replace_scene`].
     pub fn take_scene_request(&mut self) -> Option<String> {
