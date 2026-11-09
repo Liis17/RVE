@@ -1173,6 +1173,15 @@ impl PlaySession {
         std::mem::take(&mut self.particle_commands)
     }
 
+    /// Возвращает забранные, но не применённые кадром команды: они идут перед накопленными.
+    pub fn restore_particle_commands(
+        &mut self,
+        commands: Vec<engine_scene::world::ParticleCommand>,
+    ) {
+        let newer = std::mem::replace(&mut self.particle_commands, commands);
+        self.particle_commands.extend(newer);
+    }
+
     /// Предупреждения звука, которые ещё не показаны: клип не загрузился, устройство недоступно.
     pub fn drain_audio_warnings(&mut self) -> Vec<String> {
         self.audio

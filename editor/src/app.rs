@@ -2151,6 +2151,10 @@ fn render_scene_frame(
         .map(PlaySession::take_particle_commands)
         .unwrap_or_default();
     let Some(parts) = state.frame_parts() else {
+        // Кадр без мира не применяет команды: они ждут следующего кадра, а не пропадают.
+        if let Some(play) = state.play.as_mut() {
+            play.restore_particle_commands(particle_commands);
+        }
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
     let capture_camera = capture_frame
@@ -2970,5 +2974,58 @@ return S
                 .entries()
                 .any(|entry| { entry.level == LogLevel::Warn && entry.message.ends_with("hello") })
         );
+    }
+
+    #[test]
+    fn particle_commands_returned_by_an_unrendered_frame_stay_ahead_of_newer_ones() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/fx.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects]]
+id = "fire"
+[objects.particle_emitter]
+[[objects.lite_scripts]]
+path = "/fx.lua"
+"#,
+        )
+        .unwrap();
+        let script = r#"
+local S = {}
+function S:on_update()
+  self.ticks = (self.ticks or 0) + 1
+  if self.ticks == 1 then
+    rve.find("fire"):particles_emit(4)
+  else
+    rve.find("fire"):particles_restart()
+  end
+end
+return S
+"#;
+        let mut session =
+            PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap();
+        session.tick().unwrap();
+        let first = session.take_particle_commands();
+        assert!(
+            matches!(
+                first.as_slice(),
+                [engine_scene::world::ParticleCommand::Burst { count: 4, .. }]
+            ),
+            "{first:?}"
+        );
+        session.tick().unwrap();
+        session.restore_particle_commands(first.clone());
+        let delivered = session.take_particle_commands();
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        assert_eq!(delivered[0], first[0], "возвращённая команда идёт первой");
+        assert!(matches!(
+            delivered[1],
+            engine_scene::world::ParticleCommand::Restart { .. }
+        ));
     }
 }
