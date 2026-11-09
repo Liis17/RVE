@@ -360,6 +360,9 @@ pub(crate) trait RenderBackend: Send {
     fn release_prefab(&mut self, token: &PrefabToken);
     /// Применяет заявку эмиттера частиц; у тестовых backend эмиттеров нет.
     fn apply_particle_request(&mut self, _request: ParticleRequest) {}
+    /// Применяет команды частиц перед отрисовкой кадра. Вызывается render thread ровно один раз
+    /// для каждой команды, даже если тот же снимок перерисовывается.
+    fn apply_particle_commands(&mut self, _commands: &[engine_scene::world::ParticleCommand]) {}
 }
 
 pub(crate) trait ExitRequester: Send + Sync {
@@ -655,6 +658,18 @@ impl RenderBackend for VulkanBackend {
         }
     }
 
+    fn apply_particle_commands(&mut self, commands: &[engine_scene::world::ParticleCommand]) {
+        for (emitter, burst) in resolve_particle_commands(&self.particle_emitters, commands) {
+            let outcome = match burst {
+                None => self.renderer.restart_particle_emitter(emitter),
+                Some(count) => self.renderer.emit_particle_burst(emitter, count),
+            };
+            if let Err(error) = outcome {
+                log::error!("команда эмиттера частиц не применена: {error}");
+            }
+        }
+    }
+
     fn apply_particle_request(&mut self, request: ParticleRequest) {
         apply_emitter_request(
             &mut self.particle_emitters,
@@ -687,17 +702,6 @@ impl RenderBackend for VulkanBackend {
         self.renderer.set_latency_frame(snapshot.sequence);
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let particle_step = particle_step(snapshot.sim_time, self.last_submitted_sim_time);
-        for (emitter, burst) in
-            resolve_particle_commands(&self.particle_emitters, &snapshot.particle_commands)
-        {
-            let outcome = match burst {
-                None => self.renderer.restart_particle_emitter(emitter),
-                Some(count) => self.renderer.emit_particle_burst(emitter, count),
-            };
-            if let Err(error) = outcome {
-                log::error!("команда эмиттера частиц не применена: {error}");
-            }
-        }
         let particles: Vec<ParticleEmitterFrame> = snapshot
             .particles
             .iter()
@@ -2878,6 +2882,9 @@ fn render_loop(
     // Номер последнего снимка, принятого из канала кадров.
     let mut taken_seq = 0_u64;
     let mut releases: Vec<PendingRelease> = Vec::new();
+    // Команды частиц принятых снимков, которые ещё не отрисованы. Снимок копирует их при приёме,
+    // поэтому перерисовка того же снимка и пауза не применяют и не теряют их.
+    let mut particle_queue: Vec<engine_scene::world::ParticleCommand> = Vec::new();
     let mut resources_open = true;
     #[cfg(feature = "dev-console")]
     let mut ui_frame = ConsoleUiFrame::default();
@@ -2984,6 +2991,7 @@ fn render_loop(
                 backend,
                 Arc::make_mut(snapshot),
                 &mut motion_history,
+                &mut particle_queue,
                 paused,
                 width,
                 height,
@@ -3052,6 +3060,7 @@ fn render_loop(
             | RenderSelection::Frame(Err(_)) => return Ok(()),
             RenderSelection::Frame(Ok(snapshot)) => {
                 taken_seq = snapshot.sequence;
+                particle_queue.extend_from_slice(&snapshot.particle_commands);
                 latest_snapshot = Some(snapshot);
                 let Some(snapshot) = latest_snapshot.as_mut() else {
                     continue;
@@ -3060,6 +3069,7 @@ fn render_loop(
                     backend,
                     Arc::make_mut(snapshot),
                     &mut motion_history,
+                    &mut particle_queue,
                     paused,
                     width,
                     height,
@@ -3136,6 +3146,7 @@ fn render_snapshot(
     backend: &mut dyn RenderBackend,
     snapshot: &mut FrameSnapshot,
     motion_history: &mut MotionHistory,
+    particle_queue: &mut Vec<engine_scene::world::ParticleCommand>,
     paused: bool,
     width: u32,
     height: u32,
@@ -3144,6 +3155,10 @@ fn render_snapshot(
 ) -> Result<Option<FrameOutcome>, String> {
     if paused {
         return Ok(None);
+    }
+    if !particle_queue.is_empty() {
+        let commands = std::mem::take(particle_queue);
+        backend.apply_particle_commands(&commands);
     }
     motion_history.prepare(snapshot);
     let started = Instant::now();
@@ -3654,6 +3669,8 @@ distance=2.0
         /// Куда сообщать о смене debug view: тест ждёт, что цикл уже обработал её.
         #[cfg(feature = "dev-console")]
         debug_views: Option<mpsc::Sender<engine_render::DebugView>>,
+        /// Пачки команд частиц, принятые `apply_particle_commands`: тест считает применения.
+        applied_particles: Option<mpsc::Sender<Vec<engine_scene::world::ParticleCommand>>>,
     }
 
     impl RenderBackend for FakeBackend {
@@ -3692,6 +3709,12 @@ distance=2.0
         fn release_prefab(&mut self, token: &PrefabToken) {
             if let Some(released) = &self.released {
                 let _ = released.send(token.clone());
+            }
+        }
+
+        fn apply_particle_commands(&mut self, commands: &[engine_scene::world::ParticleCommand]) {
+            if let Some(applied) = &self.applied_particles {
+                let _ = applied.send(commands.to_vec());
             }
         }
 
@@ -3754,6 +3777,7 @@ distance=2.0
             backend,
             snapshot,
             history,
+            &mut Vec::new(),
             paused,
             640,
             480,
@@ -4581,6 +4605,107 @@ return Script
         let _ = frame_tx;
     }
 
+    fn snapshot_with_particle_commands(
+        commands: Vec<engine_scene::world::ParticleCommand>,
+    ) -> Arc<FrameSnapshot> {
+        let mut snapshot = empty_snapshot();
+        snapshot.particle_commands = commands;
+        Arc::new(snapshot)
+    }
+
+    #[test]
+    fn particle_commands_of_a_paused_frame_are_applied_once_when_the_next_frame_renders() {
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (applied_tx, applied_rx) = mpsc::channel();
+        let mut backend = FakeBackend {
+            applied_particles: Some(applied_tx),
+            ..Default::default()
+        };
+        let command = engine_scene::world::ParticleCommand::Restart {
+            object: motion_test_handles().1,
+        };
+        let worker = std::thread::spawn(move || {
+            render_loop(
+                &mut backend,
+                640,
+                480,
+                None,
+                &frame_rx,
+                &flume::unbounded::<RenderResourceRequest>().1,
+                &control_rx,
+                &script_tx,
+                &mut render_test_window(),
+            )
+        });
+        control_tx.send(RenderControl::Occluded(true)).unwrap();
+        assert!(matches!(
+            script_rx.recv().unwrap(),
+            ScriptControl::Background(true)
+        ));
+        // Снимок с командой принят на паузе и заменён следующим: команда не должна пропасть.
+        frame_tx
+            .send(snapshot_with_particle_commands(vec![command]))
+            .unwrap();
+        frame_tx.send(snapshot_with_particle_commands(Vec::new())).unwrap();
+        control_tx.send(RenderControl::Occluded(false)).unwrap();
+        assert!(matches!(
+            script_rx.recv().unwrap(),
+            ScriptControl::Background(false)
+        ));
+        frame_tx.send(snapshot_with_particle_commands(Vec::new())).unwrap();
+        control_tx.send(RenderControl::Shutdown).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert_eq!(applied_rx.try_iter().collect::<Vec<_>>(), vec![vec![command]]);
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn particle_commands_are_not_reapplied_when_the_latest_frame_is_redrawn() {
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, _script_rx) = flume::unbounded();
+        let (applied_tx, applied_rx) = mpsc::channel();
+        let mut backend = FakeBackend {
+            applied_particles: Some(applied_tx),
+            ..Default::default()
+        };
+        let command = engine_scene::world::ParticleCommand::Restart {
+            object: motion_test_handles().1,
+        };
+        let worker = std::thread::spawn(move || {
+            render_loop(
+                &mut backend,
+                640,
+                480,
+                None,
+                &frame_rx,
+                &flume::unbounded::<RenderResourceRequest>().1,
+                &control_rx,
+                &script_tx,
+                &mut render_test_window(),
+            )
+        });
+        frame_tx
+            .send(snapshot_with_particle_commands(vec![command]))
+            .unwrap();
+        assert_eq!(
+            applied_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![command]
+        );
+        // Смена debug view перерисовывает последний снимок тем же набором команд.
+        control_tx
+            .send(RenderControl::DebugView(engine_render::DebugView::Wireframe))
+            .unwrap();
+        control_tx.send(RenderControl::Shutdown).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert!(
+            applied_rx.try_iter().next().is_none(),
+            "перерисовка не применяет команды повторно"
+        );
+    }
+
     #[test]
     fn paused_snapshot_is_dropped_without_calling_the_renderer() {
         let mut backend = FakeBackend::default();
@@ -4591,6 +4716,7 @@ return Script
                 &mut backend,
                 &mut snapshot,
                 &mut history,
+                &mut Vec::new(),
                 true,
                 0,
                 0,
