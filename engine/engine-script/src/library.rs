@@ -203,8 +203,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            21.. => std::mem::size_of::<RveScriptDesc>(),
-            20 => std::mem::size_of::<RveScriptDescV20>(),
+            22.. => std::mem::size_of::<RveScriptDesc>(),
+            20..=21 => std::mem::size_of::<RveScriptDescV20>(),
             19 => std::mem::size_of::<RveScriptDescV19>(),
             17..=18 => std::mem::size_of::<RveScriptDescV17>(),
             16 => std::mem::size_of::<RveScriptDescV16>(),
@@ -239,9 +239,9 @@ impl ScriptLibrary {
         };
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v21 = (header.abi_version >= 21)
+        let descriptors_v22 = (header.abi_version >= 22)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        let descriptors_v20 = (header.abi_version == 20).then(|| unsafe {
+        let descriptors_v20 = ((20..=21).contains(&header.abi_version)).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV20>(), count)
         });
         let descriptors_v19 = (header.abi_version == 19).then(|| unsafe {
@@ -275,7 +275,7 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v21 {
+            let descriptor = if let Some(descriptors) = descriptors_v22 {
                 &descriptors[index]
             } else if let Some(descriptors) = descriptors_v20 {
                 let descriptor = &descriptors[index];
@@ -827,7 +827,7 @@ fn abi_param_kind(kind: u32, argument: &str) -> Option<ParamKind> {
 }
 
 #[cfg(test)]
-mod abi21_compat_tests {
+mod abi22_compat_tests {
     use super::ScriptLibrary;
     use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveHeader, RveModule};
     use rve_sdk::{Params, Script};
@@ -841,21 +841,24 @@ mod abi21_compat_tests {
     }
 
     #[test]
-    fn abi20_module_layout_loads_on_abi21_host() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
+    fn abi21_and_abi20_module_layouts_load_on_abi22_host() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
         let current = rve_sdk::script_module! { "Probe" => probe };
-        let legacy = Box::leak(Box::new(RveModule {
-            header: RveHeader {
-                abi_version: 20,
-                header_size: std::mem::size_of::<RveHeader>() as u32,
-            },
-            scripts: current.scripts,
-            script_count: current.script_count,
-        }));
-        // SAFETY: the module, descriptor table, names and callbacks are process-lifetime values.
-        let library = unsafe { ScriptLibrary::from_module(std::ptr::from_ref(legacy)) }.unwrap();
-        assert_eq!(library.abi_version(), 20);
-        assert!(library.schema("Probe").is_none());
+        for abi_version in [20, 21] {
+            let legacy = Box::leak(Box::new(RveModule {
+                header: RveHeader {
+                    abi_version,
+                    header_size: std::mem::size_of::<RveHeader>() as u32,
+                },
+                scripts: current.scripts,
+                script_count: current.script_count,
+            }));
+            // SAFETY: the module, descriptor table, names and callbacks are process-lifetime values.
+            let library =
+                unsafe { ScriptLibrary::from_module(std::ptr::from_ref(legacy)) }.unwrap();
+            assert_eq!(library.abi_version(), abi_version);
+            assert!(library.schema("Probe").is_none());
+        }
     }
 }
 

@@ -23,7 +23,9 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 19 appends scene component callbacks after the physics tail.
 /// Version 20 appends clock and timer callbacks to the host and script callbacks to the descriptor.
 /// Version 21 appends transactional save callbacks after the v20 host tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 21;
+/// Version 22 appends script-reference and scene callbacks after the v21 host tail, and the
+/// nullable `set_property` callback after the v20 descriptor tail.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 22;
 
 /// Component names accepted by RveHost::object_has_component, in the order used by
 /// components() on the guest side.
@@ -1919,7 +1921,7 @@ pub struct RveHost {
     /// Reads or stages the root object's keep-on-load flag; appended in ABI v21.
     pub object_keep_on_load: Option<RveObjectBoolQueryFn>,
     pub object_set_keep_on_load: Option<RveObjectSetBoolFn>,
-    /// Finds a script instance on an object by key (virtual path or heavy name); appended in ABI v21.
+    /// Finds a script instance on an object by key (virtual path or heavy name); appended in ABI v22.
     pub object_script: Option<RveObjectScriptFn>,
     /// Reads a declared property of a script instance found by [`Self::object_script`].
     pub script_ref_get: Option<RveScriptRefGetFn>,
@@ -1931,9 +1933,9 @@ pub struct RveHost {
     pub script_ref_enabled: Option<RveObjectBoolQueryFn>,
     /// Stages the enabled flag of a script instance found by [`Self::object_script`].
     pub script_ref_set_enabled: Option<RveObjectSetBoolFn>,
-    /// Requests loading a project scene at the end of the frame; the path must be enabled in the project. Appended in ABI v21.
+    /// Requests loading a project scene at the end of the frame; the path must be enabled in the project. Appended in ABI v22.
     pub scene_load: Option<RveSceneLoadFn>,
-    /// Writes the current scene name as a call-scoped string value. Appended in ABI v21.
+    /// Writes the current scene name as a call-scoped string value. Appended in ABI v22.
     pub scene_current: Option<RveSceneCurrentFn>,
 }
 
@@ -2188,10 +2190,10 @@ pub type RveFindObjectsFn = unsafe extern "C" fn(
 pub type RveScriptSetEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, enabled: bool) -> bool;
 /// Reads the calling instance's enabled flag into `out`.
 pub type RveScriptEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut bool) -> bool;
-/// Finds a script instance on `object` by key and writes its nonzero handle into `out`. Appended in ABI v21.
+/// Finds a script instance on `object` by key and writes its nonzero handle into `out`. Appended in ABI v22.
 pub type RveObjectScriptFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, key: RveStr, out: *mut u64) -> bool;
-/// Copies a declared property of script instance `script` into a call-scoped value. Appended in ABI v21.
+/// Copies a declared property of script instance `script` into a call-scoped value. Appended in ABI v22.
 pub type RveScriptRefGetFn =
     unsafe extern "C" fn(ctx: *mut c_void, script: u64, name: RveStr, out: *mut RveValue) -> bool;
 /// Validates and stages a value for script instance `script` (property write or addressed message).
@@ -2201,7 +2203,7 @@ pub type RveScriptRefSetFn = unsafe extern "C" fn(
     name: RveStr,
     value: *const RveValue,
 ) -> bool;
-/// Requests a scene load for the end of the frame. Appended in ABI v21.
+/// Requests a scene load for the end of the frame. Appended in ABI v22.
 pub type RveSceneLoadFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
 /// Copies the current scene name into `out`; valid until the calling guest callback ends.
 pub type RveSceneCurrentFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveValue) -> bool;
@@ -2221,7 +2223,7 @@ pub type RveUpdateFn =
 /// Guest timer callback appended to the script descriptor in ABI v20.
 pub type RveTimerFn =
     unsafe extern "C" fn(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus;
-/// Guest property-write callback appended to the script descriptor in ABI v21.
+/// Guest property-write callback appended to the script descriptor in ABI v22.
 pub type RveSetPropertyFn = unsafe extern "C" fn(
     instance: *mut c_void,
     host: *const RveHost,
@@ -2476,7 +2478,7 @@ pub struct RveScriptDescV19 {
     pub on_disable: Option<RveStartFn>,
 }
 
-/// ABI v20 script descriptor, retained so v20 modules load without reading the v21 tail.
+/// ABI v20 and v21 script descriptor, retained so modules with these layouts load without reading the v22 tail.
 #[repr(C)]
 pub struct RveScriptDescV20 {
     pub name: RveStr,
@@ -2499,7 +2501,7 @@ pub struct RveScriptDescV20 {
     pub on_timer: Option<RveTimerFn>,
 }
 
-/// Current script descriptor (ABI v21): the v20 layout plus the nullable property-write callback.
+/// Current script descriptor (ABI v22): the v20 layout plus the nullable property-write callback.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -2521,7 +2523,7 @@ pub struct RveScriptDesc {
     pub on_late_update: Option<RveUpdateFn>,
     pub on_timer: Option<RveTimerFn>,
     /// Applies a declared property written by another script before this instance's next
-    /// callback. Appended in ABI v21; modules that predate it never receive writes.
+    /// callback. Appended in ABI v22; modules that predate it never receive writes.
     pub set_property: Option<RveSetPropertyFn>,
 }
 
@@ -2762,7 +2764,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2816,7 +2818,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -2843,7 +2845,7 @@ mod tests {
     fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
         use std::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(size_of::<super::RveScriptTime>(), 40);
         assert_eq!(align_of::<super::RveScriptTime>(), 8);
@@ -2912,7 +2914,7 @@ mod tests {
     fn abi21_callbacks_append_after_the_abi20_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
         assert_eq!(
             offset_of!(super::RveHost, save_set),
             offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()

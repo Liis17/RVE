@@ -5481,8 +5481,20 @@ name = "PropertyProbe"
 }
 
 #[test]
-fn abi_v20_module_loads_on_the_v21_host_and_runs_without_property_writes() {
+fn abi_v20_module_loads_on_the_v22_host_and_runs_without_property_writes() {
     let _guard = test_lock();
+    run_legacy_descriptor_module_without_property_writes(20);
+}
+
+/// ABI v21 (save callbacks, historical descriptor layout) must not be read as the wide v22
+/// descriptor: its exact-sized table would be overread otherwise.
+#[test]
+fn abi_v21_module_loads_on_the_v22_host_and_runs_without_property_writes() {
+    let _guard = test_lock();
+    run_legacy_descriptor_module_without_property_writes(21);
+}
+
+fn run_legacy_descriptor_module_without_property_writes(abi_version: u32) {
     let current = sdk_module();
     // SAFETY: the SDK macro owns an immutable descriptor table for the process lifetime.
     let current_descriptors =
@@ -5515,7 +5527,7 @@ fn abi_v20_module_loads_on_the_v21_host_and_runs_without_property_writes() {
     );
     let module = Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version: 20,
+            abi_version,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: legacy.as_ptr().cast(),
@@ -5523,7 +5535,7 @@ fn abi_v20_module_loads_on_the_v21_host_and_runs_without_property_writes() {
     }));
     // SAFETY: the module and exact-sized v20 descriptor array are leaked for the test lifetime.
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
-    assert_eq!(library.abi_version(), 20);
+    assert_eq!(library.abi_version(), abi_version);
     assert!(library.script("Probe").unwrap().set_property.is_none());
 
     let mut world = scripted_world("Probe", r#"{ label = "abi20" }"#);
@@ -5539,6 +5551,6 @@ fn abi_v20_module_loads_on_the_v21_host_and_runs_without_property_writes() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:abi20"),
-        "ABI v20 descriptors load and run on the ABI v21 host"
+        "ABI v{abi_version} descriptors load and run on the ABI v22 host"
     );
 }

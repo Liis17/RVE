@@ -560,7 +560,7 @@ impl AbiScriptInstance {
         context.callback_result(status)
     }
 
-    /// Доставляет запись объявленного свойства (ABI v21). Модули без этого callback сохраняют
+    /// Доставляет запись объявленного свойства (ABI v22). Модули без этого callback сохраняют
     /// свои параметры без изменений: их Params не получают записи, которые сделал другой скрипт.
     pub(crate) fn invoke_set_property(
         &mut self,

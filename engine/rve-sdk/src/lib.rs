@@ -4159,7 +4159,7 @@ pub mod __private {
         unsafe { with_context(instance, host, |script, ctx| script.on_late_update(ctx, dt)) }
     }
 
-    /// Delivers a declared property write to the instance (ABI v21). The default [`Script`] hook
+    /// Delivers a declared property write to the instance (ABI v22). The default [`Script`] hook
     /// stores the value in the instance's params before any override runs.
     pub unsafe fn set_property(
         instance: *mut c_void,
