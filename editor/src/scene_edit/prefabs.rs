@@ -1928,6 +1928,7 @@ mod tests {
             object.camera = Some(engine_scene::CameraComponent {
                 settings: None,
                 post_process: None,
+                screen_shaders: Vec::new(),
                 active: false,
                 cursor: Default::default(),
             });

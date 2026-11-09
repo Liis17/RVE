@@ -46,6 +46,7 @@ mod filters;
 mod particle_gpu;
 mod particles;
 mod post;
+mod screen_shader;
 
 use ambient_occlusion::{AoPipelines, AoRecord, AoTarget, record_ambient_occlusion};
 use bloom::{
@@ -79,6 +80,14 @@ mod ui;
 
 include!(concat!(env!("OUT_DIR"), "/render_constants.rs"));
 
+pub use screen_shader::{
+    SCREEN_SHADER_MAX_PASSES, SCREEN_SHADER_PARAM_COUNT, ScreenShaderError, ScreenShaderId,
+    ScreenShaderPass, ScreenShaderStage, ScreenShaders, compile_screen_shader,
+};
+use screen_shader::{
+    ScreenChainRecord, ScreenContext, ScreenShaderLayout, ScreenShaderPipelines,
+    ScreenShaderScratch, chain_record, prepare_screen_scratch, record_screen_chain,
+};
 pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -436,6 +445,8 @@ pub struct ViewSettings {
     /// Экспозиция, tonemapper и эффекты постобработки вида.
     pub post: PostProcess,
     pub anti_aliasing: AntiAliasing,
+    /// Пользовательские экранные шейдеры вида; работают только при `DebugView::Lit`.
+    pub screen_shaders: ScreenShaders,
 }
 
 impl Default for ViewSettings {
@@ -444,6 +455,7 @@ impl Default for ViewSettings {
             render_scale: 1.0,
             post: PostProcess::default(),
             anti_aliasing: AntiAliasing::Fxaa,
+            screen_shaders: ScreenShaders::default(),
         }
     }
 }
@@ -723,11 +735,13 @@ pub enum RenderError {
     InvalidMaterial(String),
     InvalidShader(String),
     InvalidEnvironment(String),
+    ScreenShader(ScreenShaderError),
 }
 
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ScreenShader(error) => write!(f, "экранный шейдер не создан: {error}"),
             Self::InvalidConfig(message) => write!(f, "неверная конфигурация рендерера: {message}"),
             Self::Loader(message) => write!(f, "не удалось загрузить Vulkan: {message}"),
             Self::Handle(error) => write!(f, "не удалось получить window handle: {error}"),
@@ -836,6 +850,8 @@ pub enum GpuPass {
     Particles,
     /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
     TemporalResolve,
+    /// Экранные шейдеры до motion blur и DoF; отсутствуют без пользовательских шейдеров.
+    ScreenShaderBefore,
     /// Motion blur и depth of field; отсутствуют, если эффекты выключены.
     Filters,
     /// Адаптация экспозиции по гистограмме; отсутствует при ручной экспозиции.
@@ -844,11 +860,13 @@ pub enum GpuPass {
     Bloom,
     /// Composite: tonemap до вывода на swapchain.
     Tonemap,
+    /// Экранные шейдеры после composite, до output-прохода; отсутствуют без пользовательских шейдеров.
+    ScreenShaderAfter,
 }
 
 impl GpuPass {
     /// Число проходов, для которых записываются границы.
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 17;
     /// Все проходы в порядке выполнения.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Clusters,
@@ -862,10 +880,12 @@ impl GpuPass {
         Self::Wireframe,
         Self::Particles,
         Self::TemporalResolve,
+        Self::ScreenShaderBefore,
         Self::Filters,
         Self::Exposure,
         Self::Bloom,
         Self::Tonemap,
+        Self::ScreenShaderAfter,
     ];
 
     /// Короткое имя для отчётов.
@@ -882,10 +902,12 @@ impl GpuPass {
             Self::Wireframe => "Wireframe",
             Self::Particles => "Particles",
             Self::TemporalResolve => "Temporal resolve",
+            Self::ScreenShaderBefore => "Screen shaders before post",
             Self::Filters => "Motion blur and DoF",
             Self::Exposure => "Exposure",
             Self::Bloom => "Bloom",
             Self::Tonemap => "Tonemap",
+            Self::ScreenShaderAfter => "Screen shaders after post",
         }
     }
 }
@@ -1107,6 +1129,10 @@ pub struct Renderer {
     tonemap_pipeline: Option<vk::Pipeline>,
     output_pipeline: Option<vk::Pipeline>,
     viewport_output_pipeline: Option<vk::Pipeline>,
+    /// Пайплайны экранных шейдеров по `ScreenShaderId`; `None` — шейдер уничтожен.
+    screen_shaders: Vec<Option<ScreenShaderPipelines>>,
+    /// Layout экранных проходов; создаётся вместе с первым шейдером.
+    screen_shader_layout: Option<ScreenShaderLayout>,
     overlay_pipeline_layout: Option<vk::PipelineLayout>,
     overlay_pipeline: Option<vk::Pipeline>,
     ui_pipeline_layout: Option<vk::PipelineLayout>,
@@ -1256,6 +1282,8 @@ impl Renderer {
             tonemap_pipeline: None,
             output_pipeline: None,
             viewport_output_pipeline: None,
+            screen_shaders: Vec::new(),
+            screen_shader_layout: None,
             overlay_pipeline_layout: None,
             overlay_pipeline: None,
             ui_pipeline_layout: None,
@@ -1978,6 +2006,62 @@ impl Renderer {
         Ok(())
     }
 
+    /// Компилирует пользовательский экранный шейдер (`vec3 rve_shade(vec2 uv)`) и создаёт его пайплайны
+    /// для стадий `before_post` и `after_post`. Ошибка компиляции не меняет состояние renderer.
+    pub fn create_screen_shader(&mut self, source: &str) -> Result<ScreenShaderId, RenderError> {
+        let before = compile_screen_shader(source, ScreenShaderStage::BeforePost)
+            .map_err(RenderError::ScreenShader)?;
+        let after = compile_screen_shader(source, ScreenShaderStage::AfterPost)
+            .map_err(RenderError::ScreenShader)?;
+        let device = self.device()?.clone();
+        let cache = self.pipeline_cache()?;
+        if self.screen_shader_layout.is_none() {
+            self.screen_shader_layout = Some(ScreenShaderLayout::new(&device)?);
+        }
+        let layout = self
+            .screen_shader_layout
+            .as_ref()
+            .map_or(vk::PipelineLayout::null(), |layout| layout.pipeline_layout);
+        let pipelines = ScreenShaderPipelines::new(
+            &device,
+            cache,
+            layout,
+            &screen_shader::spirv_bytes(&before),
+            &screen_shader::spirv_bytes(&after),
+        )?;
+        self.screen_shaders.push(Some(pipelines));
+        Ok(ScreenShaderId(self.screen_shaders.len() - 1))
+    }
+
+    /// Удаляет экранный шейдер; его пайплайны освобождаются после завершения кадров, которые могли их использовать.
+    pub fn destroy_screen_shader(&mut self, shader: ScreenShaderId) -> Result<(), RenderError> {
+        let resource = self
+            .screen_shaders
+            .get_mut(shader.0)
+            .and_then(Option::take)
+            .ok_or(RenderError::InvalidConfig("неизвестный экранный шейдер"))?;
+        self.retired
+            .retire(RetiredResource::ScreenShader(Box::new(resource)), 0);
+        Ok(())
+    }
+
+    /// Проверяет параметры экранных шейдеров вида и то, что каждый проход ссылается на живой шейдер.
+    fn validate_screen_shaders(&self, shaders: &ScreenShaders) -> Result<(), RenderError> {
+        shaders.validate().map_err(RenderError::InvalidConfig)?;
+        let known = shaders.all_known(|shader| {
+            self.screen_shaders
+                .get(shader.0)
+                .is_some_and(Option::is_some)
+        });
+        if known {
+            Ok(())
+        } else {
+            Err(RenderError::InvalidConfig(
+                "экранный шейдер не создан или уничтожен",
+            ))
+        }
+    }
+
     /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
         self.render_frame_with_outcome(frame)
@@ -2002,6 +2086,7 @@ impl Renderer {
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         self.validate_skin_draws(frame)?;
         validate_overlay(frame.overlay)?;
+        self.validate_screen_shaders(&frame.view.screen_shaders)?;
         let view = effective_view_settings(frame.view, frame.debug_view);
         self.miss_unlisted_viewports(&[]);
         let output_extent = self
@@ -2016,6 +2101,7 @@ impl Renderer {
             (output_extent.width, output_extent.height),
             frame_serial,
             camera_near_far(frame.camera.projection),
+            &view.screen_shaders,
         );
         let temporal_plan = self.screen_temporal.state.plan(
             temporal_key(
@@ -2427,6 +2513,37 @@ impl Renderer {
                 )?);
             }
         }
+        let screen_set_layout = self
+            .screen_shader_layout
+            .as_ref()
+            .map(|layout| layout.set_layout);
+        let screen_before_extent = if view.anti_aliasing.is_temporal() {
+            output_extent
+        } else {
+            render_extent
+        };
+        if let Some(target) = frame_resources.target.as_mut() {
+            prepare_screen_scratch(
+                &mut target.screen_before,
+                post_frame.screen_before.len(),
+                screen_before_extent,
+                OFFSCREEN_FORMAT,
+                &instance,
+                &device,
+                self.physical_device,
+                screen_set_layout,
+            )?;
+            prepare_screen_scratch(
+                &mut target.screen_after,
+                post_frame.screen_after.len(),
+                output_extent,
+                LDR_FORMAT,
+                &instance,
+                &device,
+                self.physical_device,
+                screen_set_layout,
+            )?;
+        }
         let target = frame_resources
             .target
             .as_ref()
@@ -2504,6 +2621,13 @@ impl Renderer {
             frame_set,
         });
         let record_started = Instant::now();
+        let screen_context = ScreenContext {
+            shaders: &self.screen_shaders,
+            layout: self
+                .screen_shader_layout
+                .as_ref()
+                .map_or(vk::PipelineLayout::null(), |layout| layout.pipeline_layout),
+        };
         let recorded = (|| {
             let shadow = ShadowPass {
                 pipeline: shadow_pipeline,
@@ -2650,6 +2774,7 @@ impl Renderer {
                 overlay.as_ref(),
                 temporal_record,
                 skin_record,
+                screen_context,
                 output_marks,
             )?;
             Ok((temporal_outcome, shadow_layout, local_shadow_layout))
@@ -2792,6 +2917,7 @@ impl Renderer {
         for (viewport, frame) in scenes {
             validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
             validate_draws(frame.draws, &self.meshes, &self.materials)?;
+            self.validate_screen_shaders(&frame.view.screen_shaders)?;
             self.validate_skin_draws(frame)?;
             self.viewports
                 .get(viewport.0)
@@ -3157,6 +3283,10 @@ impl Renderer {
         });
         let framebuffer_is_srgb = is_srgb_format(self.surface_format.format);
         let physical_device = self.physical_device;
+        let screen_shader_set_layout = self
+            .screen_shader_layout
+            .as_ref()
+            .map(|layout| layout.set_layout);
         let mut rendered = Vec::with_capacity(scenes.len());
         let ao_set_layout = self
             .ao_pipelines
@@ -3245,6 +3375,7 @@ impl Renderer {
                 (target.extent.width, target.extent.height),
                 frame_serial,
                 camera_near_far(frame.camera.projection),
+                &effective_view_settings(frame.view, frame.debug_view).screen_shaders,
             );
             if post_frame.plan.ambient_occlusion && target.scene.ao.is_none() {
                 target.scene.ao = Some(AoTarget::new(
@@ -3298,6 +3429,34 @@ impl Renderer {
                     )?);
                 }
             }
+            let screen_before_extent = if effective_view_settings(frame.view, frame.debug_view)
+                .anti_aliasing
+                .is_temporal()
+            {
+                target.extent
+            } else {
+                target.render_extent
+            };
+            prepare_screen_scratch(
+                &mut target.screen_before,
+                post_frame.screen_before.len(),
+                screen_before_extent,
+                OFFSCREEN_FORMAT,
+                &instance,
+                &device,
+                physical_device,
+                screen_shader_set_layout,
+            )?;
+            prepare_screen_scratch(
+                &mut target.screen_after,
+                post_frame.screen_after.len(),
+                target.extent,
+                LDR_FORMAT,
+                &instance,
+                &device,
+                physical_device,
+                screen_shader_set_layout,
+            )?;
             rendered.push((
                 *viewport,
                 *frame,
@@ -3523,6 +3682,13 @@ impl Renderer {
             if let Some(record) = skin_record {
                 skin::record_skin(&device, command_buffer, record);
             }
+            let screen_context = ScreenContext {
+                shaders: &self.screen_shaders,
+                layout: self
+                    .screen_shader_layout
+                    .as_ref()
+                    .map_or(vk::PipelineLayout::null(), |layout| layout.pipeline_layout),
+            };
             let mut shadow_layout = self.shadow_layout;
             let mut local_shadow_layout = self.local_shadow_layout;
             let post_sampler = target_resources.post_sampler;
@@ -3605,8 +3771,20 @@ impl Renderer {
                         view_exposure,
                     ),
                     exposure_buffer,
+                    screen_before: chain_record(
+                        target.screen_before.as_mut(),
+                        &pass.post.screen_before,
+                        screen_context,
+                        target_resources.post_sampler,
+                    ),
+                    screen_after: chain_record(
+                        target.screen_after.as_mut(),
+                        &pass.post.screen_after,
+                        screen_context,
+                        target_resources.post_sampler,
+                    ),
                 };
-                let temporal_outcome = if pass.view.anti_aliasing.is_temporal() {
+                let (temporal_outcome, tonemap_view) = if pass.view.anti_aliasing.is_temporal() {
                     let temporal = &mut entry.temporal;
                     let history = temporal
                         .history
@@ -3630,7 +3808,7 @@ impl Renderer {
                         && _upscaler_fallback_reason.is_none())
                     .then_some(temporal.dlss.as_deref_mut())
                     .flatten();
-                    Some(record_temporal_resolve_and_tonemap(
+                    let outcome = record_temporal_resolve_and_tonemap(
                         &device,
                         command_buffer,
                         &mut target.scene,
@@ -3666,10 +3844,12 @@ impl Renderer {
                             #[cfg(all(windows, feature = "dlss"))]
                             dlss,
                         },
-                    )?)
+                    )?;
+                    let view = outcome.output_view;
+                    (Some(outcome), view)
                 } else {
                     write_image_set(&device, *tonemap_set, target.scene.color.view, post_sampler);
-                    record_tonemap_pass(
+                    let view = record_tonemap_pass(
                         &device,
                         command_buffer,
                         &target.scene.color,
@@ -3685,8 +3865,14 @@ impl Renderer {
                         pass.timestamps,
                     );
                     target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-                    None
+                    (None, view)
                 };
+                write_image_set(
+                    &device,
+                    *output_set,
+                    tonemap_view,
+                    target_resources.post_sampler,
+                );
                 let output_source_extent = temporal_outcome
                     .as_ref()
                     .map_or(target.render_extent, |outcome| outcome.output_extent);
@@ -7188,6 +7374,9 @@ impl Drop for Renderer {
         self.retired.clear();
         self.environments.clear();
         self.viewports.clear();
+        // Пайплайны экранных шейдеров и их layout освобождаем до device; retired уже очищен выше.
+        self.screen_shaders.clear();
+        self.screen_shader_layout.take();
         self.screen_temporal.history.take();
         self.screen_temporal.exposure_resources.take();
         #[cfg(windows)]
@@ -8344,6 +8533,10 @@ struct FrameTarget {
     exposure: ExposureTarget,
     /// Промежуточные буферы motion blur и DoF; создаются, когда фильтр запланирован.
     filter_scratch: Option<FilterScratch>,
+    /// Экранные шейдеры до motion blur и DoF: ping-pong на физический размер входа стадии.
+    screen_before: Option<ScreenShaderScratch>,
+    /// Экранные шейдеры после composite: ping-pong на размер ldr.
+    screen_after: Option<ScreenShaderScratch>,
 }
 
 impl FrameTarget {
@@ -8382,6 +8575,8 @@ impl FrameTarget {
             bloom: None,
             exposure,
             filter_scratch: None,
+            screen_before: None,
+            screen_after: None,
             scene,
             ldr,
             ldr_layout: vk::ImageLayout::UNDEFINED,
@@ -8712,6 +8907,10 @@ struct ViewportTarget {
     exposure: ExposureTarget,
     /// Промежуточные буферы motion blur и DoF; создаются, когда фильтр запланирован.
     filter_scratch: Option<FilterScratch>,
+    /// Экранные шейдеры до motion blur и DoF; см. [`FrameTarget::screen_before`].
+    screen_before: Option<ScreenShaderScratch>,
+    /// Экранные шейдеры после composite; см. [`FrameTarget::screen_after`].
+    screen_after: Option<ScreenShaderScratch>,
 }
 
 impl ViewportTarget {
@@ -8775,6 +8974,8 @@ impl ViewportTarget {
             bloom: None,
             exposure,
             filter_scratch: None,
+            screen_before: None,
+            screen_after: None,
             ui_pool,
             set,
             _taa_pool: taa_pool,
@@ -9293,6 +9494,7 @@ enum RetiredResource {
     Environment(#[allow(dead_code)] Box<GpuEnvironment>),
     SkinInstance(#[allow(dead_code)] Box<skin::SkinInstance>),
     ParticleEmitter(#[allow(dead_code)] Box<ParticleEmitter>),
+    ScreenShader(#[allow(dead_code)] Box<ScreenShaderPipelines>),
 }
 
 struct OwnedDescriptorPool {
@@ -9842,6 +10044,8 @@ struct TemporalResolveOutcome {
     #[cfg(all(windows, feature = "dlss"))]
     dlss_error: Option<String>,
     output_extent: vk::Extent2D,
+    /// Изображение, которое читает output-проход: composite или результат экранных шейдеров после него.
+    output_view: vk::ImageView,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9969,7 +10173,7 @@ fn record_temporal_resolve_and_tonemap(
     };
     mark_pass(device, command_buffer, timestamps, GpuPass::TemporalResolve);
     write_image_set(device, tonemap_set, source.view, post_sampler);
-    record_tonemap_pass(
+    let output_view = record_tonemap_pass(
         device,
         command_buffer,
         source,
@@ -9985,6 +10189,7 @@ fn record_temporal_resolve_and_tonemap(
         timestamps,
     );
     Ok(TemporalResolveOutcome {
+        output_view,
         used_taa,
         #[cfg(windows)]
         used_fsr,
@@ -10359,6 +10564,7 @@ fn record_frame(
     overlay: Option<&OverlayPass>,
     temporal: Option<TemporalResolveRecord<'_>>,
     skin: Option<skin::SkinRecord<'_>>,
+    screen: ScreenContext<'_>,
     output_marks: Option<GpuMarks>,
 ) -> Result<Option<TemporalResolveOutcome>, RenderError> {
     begin_command_buffer(device, command_buffer, output_marks.map(|marks| marks.pool))?;
@@ -10414,9 +10620,21 @@ fn record_frame(
             exposure,
         ),
         exposure_buffer,
+        screen_before: chain_record(
+            target.screen_before.as_mut(),
+            &scene.post.screen_before,
+            screen,
+            post_sampler,
+        ),
+        screen_after: chain_record(
+            target.screen_after.as_mut(),
+            &scene.post.screen_after,
+            screen,
+            post_sampler,
+        ),
     };
-    let temporal_outcome = if let Some(resolve) = temporal {
-        Some(record_temporal_resolve_and_tonemap(
+    let (temporal_outcome, tonemap_view) = if let Some(resolve) = temporal {
+        let outcome = record_temporal_resolve_and_tonemap(
             device,
             command_buffer,
             &mut target.scene,
@@ -10433,10 +10651,12 @@ fn record_frame(
             post_pipeline_layout,
             target.taa_set,
             resolve,
-        )?)
+        )?;
+        let view = outcome.output_view;
+        (Some(outcome), view)
     } else {
         write_image_set(device, tonemap_set, target.scene.color.view, post_sampler);
-        record_tonemap_pass(
+        let view = record_tonemap_pass(
             device,
             command_buffer,
             &target.scene.color,
@@ -10452,8 +10672,9 @@ fn record_frame(
             scene.timestamps,
         );
         target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-        None
+        (None, view)
     };
+    write_image_set(device, output_set, tonemap_view, post_sampler);
     let output_source_extent = temporal_outcome
         .as_ref()
         .map_or(target.render_extent, |outcome| outcome.output_extent);
@@ -11792,6 +12013,10 @@ struct PostPasses<'a> {
     bloom: Option<BloomRecord<'a>>,
     exposure_buffer: vk::Buffer,
     sampler: vk::Sampler,
+    /// Экранные шейдеры до фильтров; `None`, если вид их не использует.
+    screen_before: Option<ScreenChainRecord<'a>>,
+    /// Экранные шейдеры после composite.
+    screen_after: Option<ScreenChainRecord<'a>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11809,15 +12034,38 @@ fn record_tonemap_pass(
     composite: post::CompositeParams,
     passes: PostPasses<'_>,
     timestamps: Option<GpuMarks>,
-) {
+) -> vk::ImageView {
     let PostPasses {
         mut filters,
         exposure,
         bloom,
         exposure_buffer,
         sampler,
+        mut screen_before,
+        mut screen_after,
     } = passes;
     let mut source_layout = source_layout;
+    // before_post идёт до motion blur и DoF: его выход становится входом всех следующих проходов.
+    let before_index = match screen_before.as_mut() {
+        Some(record) => record_screen_chain(
+            device,
+            command_buffer,
+            source,
+            &mut source_layout,
+            extent,
+            record,
+            timestamps,
+            GpuPass::ScreenShaderBefore,
+        ),
+        None => None,
+    };
+    let (source, mut source_layout) = match (before_index, screen_before.as_ref()) {
+        (Some(index), Some(record)) => (
+            record.scratch.image(index),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ),
+        _ => (source, source_layout),
+    };
     // Motion blur и DoF идут до экспозиции и bloom: им нужен цвет после resolve.
     let filtered = match filters.as_mut() {
         Some(record) => record_filters(
@@ -11954,6 +12202,25 @@ fn record_tonemap_pass(
         .subresource_range(color_subresource_range());
     pipeline_barrier(device, command_buffer, sampled);
     *output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    // after_post читает composite из `output` и пишет в scratch; output-проход получает итоговое изображение.
+    let mut output_read_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    let after_index = match screen_after.as_mut() {
+        Some(record) => record_screen_chain(
+            device,
+            command_buffer,
+            output,
+            &mut output_read_layout,
+            extent,
+            record,
+            timestamps,
+            GpuPass::ScreenShaderAfter,
+        ),
+        None => None,
+    };
+    match (after_index, screen_after.as_ref()) {
+        (Some(index), Some(record)) => record.scratch.image(index).view,
+        _ => output.view,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15195,6 +15462,7 @@ fn select_composite_alpha(
 
 #[cfg(test)]
 mod tests {
+    use super::ScreenShaders;
     use super::culling::{Frustum, LocalBounds};
     use super::{
         AcquireAction, AlphaMode, AntiAliasing, CLUSTER_BOUNDS_BUFFER_SIZE,
@@ -15359,6 +15627,7 @@ mod tests {
                 ..PostProcess::default()
             },
             anti_aliasing: AntiAliasing::Taa,
+            screen_shaders: ScreenShaders::default(),
         };
         assert_eq!(effective_view_settings(settings, DebugView::Lit), settings);
         let wireframe = effective_view_settings(settings, DebugView::Wireframe);
@@ -17776,6 +18045,7 @@ mod tests {
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 anti_aliasing: AntiAliasing::Taa,
+                screen_shaders: ScreenShaders::default(),
                 ..ViewSettings::default()
             },
             reset_history: false,
@@ -18350,7 +18620,8 @@ mod tests {
 
     #[test]
     fn view_timings_split_ticks_between_recorded_boundaries() {
-        // Начало, затем граница после каждого из пятнадцати проходов в порядке выполнения.
+        // Начало, затем граница после каждого из семнадцати проходов в порядке выполнения;
+        // экранные шейдеры не записаны и отдают пустую границу.
         let marks = [
             Some(100),
             Some(110),
@@ -18364,10 +18635,12 @@ mod tests {
             Some(180),
             Some(185),
             Some(190),
+            None,
             Some(195),
             Some(200),
             Some(205),
             Some(215),
+            None,
         ];
         let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
 
@@ -18386,10 +18659,12 @@ mod tests {
                 Some(ns(5)),
                 Some(ns(5)),
                 Some(ns(5)),
+                None,
                 Some(ns(5)),
                 Some(ns(5)),
                 Some(ns(5)),
                 Some(ns(10)),
+                None,
             ]
         );
         assert_eq!(view.total, ns(115));
@@ -18555,7 +18830,7 @@ mod tests {
 
     #[test]
     fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-        assert_eq!(TIMESTAMP_QUERY_COUNT, 66);
+        assert_eq!(TIMESTAMP_QUERY_COUNT, 74);
         let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
         let mut layout = GpuProfileLayout::default();
         for index in 0..MAX_PROFILED_VIEWS {

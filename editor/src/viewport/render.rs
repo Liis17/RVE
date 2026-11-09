@@ -23,6 +23,9 @@ use engine_render::{
     SkinVertex, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings,
     ViewportId,
 };
+use engine_render::{
+    SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage, ScreenShaders,
+};
 use engine_scene::PostProcessSettings;
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
@@ -36,6 +39,7 @@ use engine_scene::{
     ResolvedMaterialAsset, SceneFrame, ShaderAsset, ShaderColorSpace, ShaderPropertyKind,
     Tonemapper, World,
 };
+use engine_scene::{ScreenShaderRef, ScreenShaderStage as ScreenShaderStageDoc};
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -94,6 +98,10 @@ struct SkinnedObject<M = MeshId, S = SkinId> {
 pub struct SceneRenderer {
     pub viewport: ViewportId,
     pub game_viewport: ViewportId,
+    /// Экранные шейдеры камер по пути `.glsl`; `id == None` — компиляция не удалась.
+    screen_shaders: HashMap<String, EditorScreenShader>,
+    /// Начало отсчёта времени для экранных шейдеров (`rve.time`).
+    screen_shader_started: Instant,
     pub material_preview_viewport: Option<ViewportId>,
     models: HashMap<String, Option<GpuModel>>,
     model_dependencies: HashMap<String, Vec<VirtualPath>>,
@@ -338,6 +346,8 @@ impl SceneRenderer {
             particle_step: 0.0,
             particle_clock: None,
             particles_playing: None,
+            screen_shaders: HashMap::new(),
+            screen_shader_started: Instant::now(),
             playing: false,
             environment_sources: HashMap::new(),
             current_environment: None,
@@ -402,6 +412,13 @@ impl SceneRenderer {
         }
         for texture in self.textures.drain().filter_map(|(_, texture)| texture) {
             renderer.destroy_texture(texture)?;
+        }
+        for shader in self
+            .screen_shaders
+            .drain()
+            .filter_map(|(_, entry)| entry.id)
+        {
+            renderer.destroy_screen_shader(shader)?;
         }
         for mesh in self.preview_meshes.drain().map(|(_, mesh)| mesh) {
             renderer.destroy_mesh(mesh)?;
@@ -600,6 +617,68 @@ impl SceneRenderer {
         Ok(())
     }
 
+    /// Создаёт экранные шейдеры камеры, которых ещё нет в кэше. Ошибка записывается в `errors`
+    /// и не мешает кадру: проход пропускается.
+    pub fn sync_screen_shaders(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        screens: &[ScreenShaderRef],
+        errors: &mut HashMap<String, String>,
+    ) {
+        for shader in screens {
+            let path = shader.shader.as_str();
+            if self.screen_shaders.contains_key(path) {
+                continue;
+            }
+            let entry = match load_screen_shader(renderer, project, path) {
+                Ok(id) => {
+                    errors.remove(path);
+                    EditorScreenShader { id: Some(id) }
+                }
+                Err(error) => {
+                    errors.insert(path.to_owned(), error);
+                    EditorScreenShader { id: None }
+                }
+            };
+            self.screen_shaders.insert(path.to_owned(), entry);
+        }
+    }
+
+    /// Экранные шейдеры вида. Scene-вид их не применяет: искажения мешали бы редактированию.
+    fn screen_shader_view(&self, screens: &[ScreenShaderRef], with_grid: bool) -> ScreenShaders {
+        let mut view = ScreenShaders {
+            time: self.screen_shader_started.elapsed().as_secs_f32(),
+            ..ScreenShaders::default()
+        };
+        if with_grid {
+            view.time = 0.0;
+            return view;
+        }
+        let known = screens
+            .iter()
+            .filter(|shader| shader.enabled)
+            .filter_map(|shader| {
+                let id = self.screen_shaders.get(shader.shader.as_str())?.id?;
+                Some((id, shader))
+            });
+        for (slot, (shader, source)) in known.take(view.passes.len()).enumerate() {
+            let mut params = [0.0_f32; SCREEN_SHADER_PARAM_COUNT];
+            for (value, parameter) in params.iter_mut().zip(&source.params) {
+                *value = *parameter;
+            }
+            view.passes[slot] = Some(ScreenShaderPass {
+                shader,
+                stage: match source.stage {
+                    ScreenShaderStageDoc::BeforePost => ScreenShaderStage::BeforePost,
+                    ScreenShaderStageDoc::AfterPost => ScreenShaderStage::AfterPost,
+                },
+                params,
+            });
+        }
+        view
+    }
+
     pub fn ensure_material_preview_viewport(
         &mut self,
         renderer: &mut Renderer,
@@ -630,6 +709,7 @@ impl SceneRenderer {
         changes: &AssetChanges,
         loader: &mut ModelLoader,
         log: &mut ConsoleLog,
+        screen_errors: &mut HashMap<String, String>,
     ) -> Result<(), RenderError> {
         let texture_keys = self
             .textures
@@ -684,6 +764,34 @@ impl SceneRenderer {
                         };
                         log.error(message);
                     }
+                }
+            }
+        }
+
+        // Изменённый `.glsl` (при rescan — все кэшированные) перекомпилируется; ошибка оставляет
+        // прежнюю версию и текст для инспектора.
+        let changed_shaders = self
+            .screen_shaders
+            .keys()
+            .filter(|path| key_matches_changes(changes, path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in changed_shaders {
+            match load_screen_shader(renderer, project, &path) {
+                Ok(id) => {
+                    screen_errors.remove(&path);
+                    let previous = self
+                        .screen_shaders
+                        .insert(path, EditorScreenShader { id: Some(id) });
+                    if let Some(previous) = previous.and_then(|entry| entry.id) {
+                        renderer.destroy_screen_shader(previous)?;
+                    }
+                }
+                Err(error) => {
+                    log.error(format!(
+                        "экранный шейдер: {error}; сохранена прежняя версия"
+                    ));
+                    screen_errors.insert(path, error);
                 }
             }
         }
@@ -1573,6 +1681,7 @@ impl SceneRenderer {
         height: u32,
         settings: CameraSettings,
         post: PostProcessSettings,
+        screens: &[ScreenShaderRef],
         light: &LightState,
         local_lights: &'a [LocalLight],
         local_light_shadows: &'a [LocalLightShadow],
@@ -1621,6 +1730,7 @@ impl SceneRenderer {
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
                 post: render_post_process(&post, with_grid),
+                screen_shaders: self.screen_shader_view(screens, with_grid),
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -2456,6 +2566,28 @@ fn model_reload_plan<T>(
         .cloned()
         .collect();
     ModelReloadPlan { cached, pending }
+}
+
+/// Экранный шейдер камеры в кэше редактора.
+#[derive(Clone, Copy, Debug)]
+struct EditorScreenShader {
+    id: Option<ScreenShaderId>,
+}
+
+/// Читает `.glsl` из проекта и создаёт шейдер renderer; текст ошибки годится для инспектора.
+fn load_screen_shader(
+    renderer: &mut Renderer,
+    project: &OpenProject,
+    path: &str,
+) -> Result<ScreenShaderId, String> {
+    let file = project
+        .assets_dir
+        .resolve(path)
+        .map_err(|error| format!("/{path}: {error}"))?;
+    let source = std::fs::read_to_string(&file).map_err(|error| format!("/{path}: {error}"))?;
+    renderer
+        .create_screen_shader(&source)
+        .map_err(|error| format!("/{path}: {error}"))
 }
 
 fn key_matches_changes(changes: &AssetChanges, key: &str) -> bool {
