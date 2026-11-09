@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "engine-audio"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cpal",
  "engine-files",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "engine-project"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "engine-files",
  "rve-sdk",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "engine-files",
@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "rve-server"
