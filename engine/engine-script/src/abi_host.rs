@@ -1,4 +1,10 @@
 mod components;
+mod script_refs;
+
+use script_refs::{
+    host_object_script, host_script_ref_enabled, host_script_ref_get, host_script_ref_send,
+    host_script_ref_set, host_script_ref_set_enabled,
+};
 
 use crate::abi_string::read_abi_str;
 use crate::actions::ActionMutation;
@@ -392,6 +398,12 @@ impl<'a> AbiCallContext<'a> {
             save_flush: Some(host_save_flush),
             object_keep_on_load: Some(host_object_keep_on_load),
             object_set_keep_on_load: Some(host_object_set_keep_on_load),
+            object_script: Some(host_object_script),
+            script_ref_get: Some(host_script_ref_get),
+            script_ref_set: Some(host_script_ref_set),
+            script_ref_send: Some(host_script_ref_send),
+            script_ref_enabled: Some(host_script_ref_enabled),
+            script_ref_set_enabled: Some(host_script_ref_set_enabled),
         }
     }
 

@@ -1413,6 +1413,87 @@ pub struct Object {
     handle: u64,
 }
 
+/// Handle to another script instance, from [`Object::script`]. It becomes stale when that
+/// instance is removed (its object was destroyed or its scene was replaced): every method then
+/// reports failure instead of reaching a different instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptRef {
+    handle: u64,
+}
+
+impl ScriptRef {
+    /// Reads a declared property. Returns `None` for a stale handle or an undeclared name.
+    pub fn get(&self, ctx: &Context<'_>, name: &str) -> Option<Value> {
+        let callback = ctx.host.script_ref_get?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the host keeps the value's nested buffers alive until this guest callback ends.
+        if !unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &mut value,
+            )
+        } {
+            return None;
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        unsafe { value.into_owned() }.ok()
+    }
+
+    /// Stages a declared property write. The value is validated and coerced by the host when the
+    /// call is made; the write commits with the calling callback.
+    pub fn set(&self, ctx: &mut Context<'_>, name: &str, value: &Value) -> bool {
+        let Some(callback) = ctx.host.script_ref_set else {
+            return false;
+        };
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the name and recursive value buffers live through the synchronous callback.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
+    }
+
+    /// Sends a message to this instance only, not to other scripts on its object.
+    pub fn send(&self, ctx: &mut Context<'_>, name: &str, value: &Value) -> bool {
+        let Some(callback) = ctx.host.script_ref_send else {
+            return false;
+        };
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the name and recursive value buffers live through the synchronous callback.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
+    }
+
+    /// Reads the enabled flag. Returns `None` for a stale handle.
+    pub fn enabled(&self, ctx: &Context<'_>) -> Option<bool> {
+        let callback = ctx.host.script_ref_enabled?;
+        let mut enabled = false;
+        // SAFETY: the output slot lives through this synchronous host call.
+        unsafe { callback(ctx.host.ctx, self.handle, &mut enabled) }.then_some(enabled)
+    }
+
+    /// Stages the enabled flag; it takes effect at the end of the current phase.
+    pub fn set_enabled(&self, ctx: &mut Context<'_>, enabled: bool) -> bool {
+        let Some(callback) = ctx.host.script_ref_set_enabled else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, enabled) }
+    }
+}
+
 impl Object {
     /// Queues this object's subtree for removal, including a pending object from [`Context::spawn`].
     ///
@@ -3188,6 +3269,23 @@ impl Object {
         };
         // SAFETY: the host pointer remains valid during this guest callback.
         unsafe { callback(ctx.host.ctx, self.handle, keep) }
+    }
+
+    /// Finds another script instance on this object: a lite script is found by its virtual path
+    /// and a heavy script by its registered name. Returns `None` if no such instance exists.
+    pub fn script(&self, ctx: &Context<'_>, key: &str) -> Option<ScriptRef> {
+        let callback = ctx.host.object_script?;
+        let mut handle = 0;
+        // SAFETY: the key and output slot live through this synchronous host call.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(key),
+                &mut handle,
+            )
+        }
+        .then_some(ScriptRef { handle })
     }
 
     /// Returns the world position.

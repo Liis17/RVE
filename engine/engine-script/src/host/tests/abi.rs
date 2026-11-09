@@ -916,6 +916,7 @@ fn sdk_module() -> &'static RveModule {
             camera: component(camera) = None,
         },
         "ReferenceReceiver" => reference_receiver_factory,
+        "ScriptRefProbe" => script_ref_probe_factory,
     }
 }
 
@@ -5313,4 +5314,91 @@ path = \"/jump.lua\"
     };
     assert!(lua.iter().any(|message| message == "jump"), "{lua:?}");
     assert_eq!(trace(&lua), trace(&abi));
+}
+
+const SCRIPT_REF_TARGET: &str = r#"
+local Script = {}
+Script.properties = {
+  speed = { type = "float", default = 1.5, min = 0, max = 10 },
+}
+function Script:on_update(dt)
+  rve.log("target update " .. string.format("%g", self.params.speed))
+end
+function Script:on_message(sender, name, value)
+  rve.log("target got " .. name .. " " .. tostring(value))
+end
+return Script
+"#;
+
+/// Heavy probe: reads, writes, messages, and toggles a lite instance found by object and path.
+struct ScriptRefProbe;
+
+fn script_ref_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ScriptRefProbe))
+}
+
+impl Script for ScriptRefProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let target = ctx.find("target").expect("target object");
+        let reference = target
+            .script(ctx, "/target.lua")
+            .expect("lite script reference");
+        assert!(target.script(ctx, "/missing.lua").is_none());
+        assert_eq!(reference.get(ctx, "speed"), Some(Value::Float(1.5)));
+        assert!(reference.set(ctx, "speed", &Value::Int(4)));
+        assert_eq!(reference.get(ctx, "speed"), Some(Value::Float(4.0)));
+        assert!(reference.send(ctx, "ping", &Value::Int(7)));
+        assert_eq!(reference.enabled(ctx), Some(true));
+        assert!(reference.set_enabled(ctx, true));
+        assert_eq!(reference.enabled(ctx), Some(true));
+        ctx.log_info("script ref ok");
+    }
+}
+
+#[test]
+fn abi_script_reference_reads_writes_sends_and_toggles_a_lite_instance() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/target.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ScriptRefProbe"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/target.lua"
+"#,
+    );
+    let sources = BTreeMap::from([("target.lua".to_owned(), SCRIPT_REF_TARGET.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let first = host.drain_events();
+    assert!(
+        first
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{first:?}"
+    );
+    assert!(first.iter().any(|event| event.message == "script ref ok"));
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    // The start-phase message is delivered in the first update, after the probe logged its result.
+    let mut messages: Vec<String> = first.iter().map(|event| event.message.clone()).collect();
+    messages.extend(message_list(&mut host));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "target got ping 7"),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| message == "target update 4"),
+        "{messages:?}"
+    );
 }

@@ -2,7 +2,7 @@ use super::*;
 use crate::abi_host::AbiCallContext;
 use crate::lite::ScriptEventQueue;
 use crate::transaction::ScriptTransaction;
-use mlua::{Table, Value as LuaValue};
+use mlua::{ObjectLike, Table, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -76,6 +76,12 @@ enum HostCapability {
     SaveFlush,
     KeepOnLoad,
     SetKeepOnLoad,
+    ObjectScript,
+    ScriptRefGet,
+    ScriptRefSet,
+    ScriptRefSend,
+    ScriptRefEnabled,
+    ScriptRefSetEnabled,
 }
 
 // Add each script-facing capability to this shared inventory so Lua and ABI stay in parity.
@@ -135,6 +141,16 @@ const CAPABILITIES: &[(&str, &str, HostCapability)] = &[
     ("script", "enabled", HostCapability::ScriptEnabled),
     ("object", "keep_on_load", HostCapability::KeepOnLoad),
     ("object", "set_keep_on_load", HostCapability::SetKeepOnLoad),
+    ("object", "script", HostCapability::ObjectScript),
+    ("script_ref", "get", HostCapability::ScriptRefGet),
+    ("script_ref", "set", HostCapability::ScriptRefSet),
+    ("script_ref", "send", HostCapability::ScriptRefSend),
+    ("script_ref", "enabled", HostCapability::ScriptRefEnabled),
+    (
+        "script_ref",
+        "set_enabled",
+        HostCapability::ScriptRefSetEnabled,
+    ),
     ("save", "set", HostCapability::SaveSet),
     ("save", "get", HostCapability::SaveGet),
     ("save", "delete", HostCapability::SaveDelete),
@@ -231,7 +247,7 @@ path = "/api.lua"
         "scene",
         &sources(&[(
             "api.lua",
-            "return { on_start = function(self) rve.__parity_object = self.object rve.__parity_script = self.script end }",
+            "return { on_start = function(self) rve.__parity_object = self.object rve.__parity_script = self.script rve.__parity_ref = self.object:script(\"/api.lua\") end }",
         )]),
         None,
     )
@@ -261,6 +277,10 @@ path = "/api.lua"
             "timer" => rve.get::<Table>("timer").unwrap().get(*name).unwrap(),
             "time" => rve.get::<Table>("time").unwrap().get(*name).unwrap(),
             "save" => rve.get::<Table>("save").unwrap().get(*name).unwrap(),
+            "script_ref" => match rve.get::<LuaValue>("__parity_ref").unwrap() {
+                LuaValue::UserData(reference) => reference.get(*name).unwrap(),
+                other => panic!("script reference is {}", other.type_name()),
+            },
             _ => unreachable!(),
         };
         if matches!(capability, HostCapability::TimeScale) {
@@ -345,6 +365,12 @@ path = "/api.lua"
             HostCapability::SaveFlush => abi.save_flush.is_some(),
             HostCapability::KeepOnLoad => abi.object_keep_on_load.is_some(),
             HostCapability::SetKeepOnLoad => abi.object_set_keep_on_load.is_some(),
+            HostCapability::ObjectScript => abi.object_script.is_some(),
+            HostCapability::ScriptRefGet => abi.script_ref_get.is_some(),
+            HostCapability::ScriptRefSet => abi.script_ref_set.is_some(),
+            HostCapability::ScriptRefSend => abi.script_ref_send.is_some(),
+            HostCapability::ScriptRefEnabled => abi.script_ref_enabled.is_some(),
+            HostCapability::ScriptRefSetEnabled => abi.script_ref_set_enabled.is_some(),
         };
         assert!(available, "ABI callback missing for {table}.{name}");
     }

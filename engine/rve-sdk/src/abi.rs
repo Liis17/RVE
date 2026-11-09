@@ -1919,6 +1919,18 @@ pub struct RveHost {
     /// Reads or stages the root object's keep-on-load flag; appended in ABI v21.
     pub object_keep_on_load: Option<RveObjectBoolQueryFn>,
     pub object_set_keep_on_load: Option<RveObjectSetBoolFn>,
+    /// Finds a script instance on an object by key (virtual path or heavy name); appended in ABI v21.
+    pub object_script: Option<RveObjectScriptFn>,
+    /// Reads a declared property of a script instance found by [`Self::object_script`].
+    pub script_ref_get: Option<RveScriptRefGetFn>,
+    /// Validates and stages a declared property write of another script instance.
+    pub script_ref_set: Option<RveScriptRefSetFn>,
+    /// Sends a message only to the chosen script instance.
+    pub script_ref_send: Option<RveScriptRefSetFn>,
+    /// Reads the enabled flag of a script instance found by [`Self::object_script`].
+    pub script_ref_enabled: Option<RveObjectBoolQueryFn>,
+    /// Stages the enabled flag of a script instance found by [`Self::object_script`].
+    pub script_ref_set_enabled: Option<RveObjectSetBoolFn>,
 }
 
 /// Copies one save value into the output; the value is valid until the calling script callback ends.
@@ -2172,6 +2184,19 @@ pub type RveFindObjectsFn = unsafe extern "C" fn(
 pub type RveScriptSetEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, enabled: bool) -> bool;
 /// Reads the calling instance's enabled flag into `out`.
 pub type RveScriptEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut bool) -> bool;
+/// Finds a script instance on `object` by key and writes its nonzero handle into `out`. Appended in ABI v21.
+pub type RveObjectScriptFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, key: RveStr, out: *mut u64) -> bool;
+/// Copies a declared property of script instance `script` into a call-scoped value. Appended in ABI v21.
+pub type RveScriptRefGetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, script: u64, name: RveStr, out: *mut RveValue) -> bool;
+/// Validates and stages a value for script instance `script` (property write or addressed message).
+pub type RveScriptRefSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    script: u64,
+    name: RveStr,
+    value: *const RveValue,
+) -> bool;
 
 /// Guest factory callback.
 pub type RveCreateFn = unsafe extern "C" fn(
@@ -2864,8 +2889,38 @@ mod tests {
                 + size_of::<Option<super::RveObjectBoolQueryFn>>()
         );
         assert_eq!(
-            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, object_script),
             offset_of!(super::RveHost, object_set_keep_on_load)
+                + size_of::<Option<super::RveObjectSetBoolFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_get),
+            offset_of!(super::RveHost, object_script)
+                + size_of::<Option<super::RveObjectScriptFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_set),
+            offset_of!(super::RveHost, script_ref_get)
+                + size_of::<Option<super::RveScriptRefGetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_send),
+            offset_of!(super::RveHost, script_ref_set)
+                + size_of::<Option<super::RveScriptRefSetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_enabled),
+            offset_of!(super::RveHost, script_ref_send)
+                + size_of::<Option<super::RveScriptRefSetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_set_enabled),
+            offset_of!(super::RveHost, script_ref_enabled)
+                + size_of::<Option<super::RveObjectBoolQueryFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, script_ref_set_enabled)
                 + size_of::<Option<super::RveObjectSetBoolFn>>()
         );
     }

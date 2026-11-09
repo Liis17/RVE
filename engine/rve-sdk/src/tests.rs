@@ -783,6 +783,12 @@ fn host(state: &mut HostState) -> RveHost {
         save_flush: Some(save_flush),
         object_keep_on_load: None,
         object_set_keep_on_load: None,
+        object_script: None,
+        script_ref_get: None,
+        script_ref_set: None,
+        script_ref_send: None,
+        script_ref_enabled: None,
+        script_ref_set_enabled: None,
     }
 }
 

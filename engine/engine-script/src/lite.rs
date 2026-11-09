@@ -3,6 +3,7 @@ mod physics_api;
 
 use crate::actions::{ActionMutation, ActionValue};
 use crate::lifecycle::{ObjectState, PrefabRequest, SpawnArgs};
+use crate::script_refs::normalize_script_key;
 use crate::transaction::ScreenShaderState;
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
@@ -5073,8 +5074,7 @@ fn add_script_ref_api(
                 values.into_iter().next().unwrap_or(Value::Nil),
                 "object.script",
             )?;
-            // Пути принимаются с ведущим слешем и без него, как в сценах: ключ канонический.
-            let key = VirtualPath::parse(&key).map_or(key, |path| path.as_str().to_owned());
+            let key = normalize_script_key(&key);
             let serial = with_active_call(&active_call, |transaction| {
                 Ok(transaction.script_ref(handle, &key))
             })?;

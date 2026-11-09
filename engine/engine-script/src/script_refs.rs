@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use engine_files::VirtualPath;
 use engine_scene::{ObjectHandle, ParamSchema, ParamValue};
 
 /// Одна запись справочника: объявленные свойства и флаг включения экземпляра.
@@ -74,4 +75,9 @@ pub(crate) fn coerce_property(
         .and_then(|schema| schema.get(name))
         .ok_or_else(|| ScriptRefError::Undeclared(name.to_owned()))?;
     spec.coerce(value).map_err(ScriptRefError::Invalid)
+}
+
+/// Канонический ключ поиска: пути принимаются с ведущим слешем и без него, как в сценах.
+pub(crate) fn normalize_script_key(key: &str) -> String {
+    VirtualPath::parse(key).map_or_else(|_| key.to_owned(), |path| path.as_str().to_owned())
 }
