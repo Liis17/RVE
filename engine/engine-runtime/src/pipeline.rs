@@ -7913,6 +7913,109 @@ return Move
     }
 
     #[test]
+    fn headless_scene_switch_applies_physics_without_a_render_thread() {
+        const SWITCHER: &str = r#"
+local Switcher = {}
+function Switcher:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 2 then
+    rve.scene.load("levels/b.rvescene")
+  end
+end
+return Switcher
+"#;
+        const START: &str = "[[assets]]
+path = \"switcher.lua\"
+[[objects]]
+id = \"camera\"
+[objects.camera]
+active = true
+[[objects]]
+id = \"player\"
+keep_on_load = true
+[[objects.lite_scripts]]
+path = \"switcher.lua\"
+[[objects]]
+id = \"crate\"
+[objects.collider]
+shape = \"sphere\"
+radius = 0.25
+[objects.rigid_body]
+kind = \"dynamic\"
+";
+        const NEXT: &str = "[[objects]]
+id = \"camera_b\"
+[objects.camera]
+active = true
+[[objects]]
+id = \"boss\"
+[objects.collider]
+shape = \"sphere\"
+radius = 0.5
+[objects.rigid_body]
+kind = \"dynamic\"
+";
+
+        let dir = SceneDir::new("headless-switch");
+        dir.write("levels/b.rvescene", NEXT);
+        let resources = engine_resources::ResourceSystem::start(engine_resources::ResourceConfig {
+            root: dir.0.clone(),
+            source_mode: engine_resources::SourceMode::Loose,
+            worker_count: 1,
+            ..engine_resources::ResourceConfig::default()
+        })
+        .unwrap();
+        let loader = SceneLoader::new(
+            resources.handle(),
+            engine_project::PhysicsSettings::default(),
+            false,
+        );
+        let world =
+            World::from_document(&SceneDocument::parse("levels/a.rvescene", START).unwrap())
+                .unwrap();
+        let (client, initialization, steps, worker) = fake_physics(&world);
+        let scripts = start_test_scripts_wired(
+            world,
+            &[("switcher.lua", SWITCHER)],
+            PreparedPrefabs::default(),
+            Some((client, initialization)),
+            Arc::new(FakeClock::default()),
+            None,
+            false,
+            SceneWiring {
+                loader: Some(loader),
+                render_resources: None,
+                enabled_scenes: vec!["levels/b.rvescene".to_owned()],
+            },
+        );
+        scripts.thread.ready.recv().unwrap().unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(Box::default()))
+            .unwrap();
+
+        let (mut inserted, mut removed) = (0, 0);
+        for _ in 0..20 {
+            let step = next_step(&scripts, &steps);
+            for change in &step.changes {
+                match change {
+                    BodyChange::Insert { .. } => inserted += 1,
+                    BodyChange::Remove { .. } => removed += 1,
+                }
+            }
+            if inserted > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            inserted, 1,
+            "без render thread замена применяется на scripts thread"
+        );
+        assert_eq!(removed, 1, "тело старой сцены снято");
+        stop_test_scripts(scripts, worker);
+    }
+
+    #[test]
     fn scene_switch_uploads_through_render_thread_then_applies_physics_of_the_new_scene() {
         const SWITCHER: &str = r#"
 local Switcher = {}
