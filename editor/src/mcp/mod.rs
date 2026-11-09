@@ -386,7 +386,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "folder": {"type": "string"},
                     "recursive": {"type": "boolean"},
-                    "kind": {"type": "string", "enum": ["scene", "prefab", "camera_settings", "post_process", "physics_material", "model", "texture", "hdr", "audio", "script", "other"]}
+                    "kind": {"type": "string", "enum": ["scene", "prefab", "camera_settings", "post_process", "physics_material", "material", "shader", "model", "texture", "hdr", "audio", "script", "other"]}
                 },
                 "additionalProperties": false
             }),

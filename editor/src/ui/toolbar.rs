@@ -101,6 +101,7 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
 
 /// Начинает переименование выделенного объекта в Hierarchy.
 pub fn rename_selection(state: &mut EditorState) {
+    state.inspected_asset = None;
     if state.is_playing() {
         return;
     }

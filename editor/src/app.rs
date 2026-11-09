@@ -24,8 +24,9 @@ use engine_console::{
 use engine_files::VirtualPath;
 use engine_project::{BootstrapReflexMode, PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
 use engine_render::{
-    FrameStatus, LatencyHandle, LatencyMarker, LowLatencyMode, RenderError, Renderer,
-    RendererConfig, UiImage, UiPrimitive, ViewportId,
+    DebugView, DirectionalLight, Frame, FrameCamera, FrameStatus, LatencyHandle, LatencyMarker,
+    LowLatencyMode, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewSettings,
+    ViewportId,
 };
 use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
@@ -274,6 +275,11 @@ impl EditorApp {
         self.reset_project_assets();
         self.watch_project_assets();
         self.refresh_tree_only();
+        if let Some(project) = self.state.project.as_ref() {
+            self.state
+                .materials
+                .refresh_all(project, &self.state.asset_tree);
+        }
         if self.state.scripts_path.is_some() {
             self.load_manual_library();
         } else if build_scripts
@@ -518,6 +524,11 @@ impl EditorApp {
         self.state.previews.clear();
         self.state.clear_lite_schemas();
         self.state.models.clear();
+        self.state.materials = crate::materials::MaterialLibrary::default();
+        self.state.inspected_asset = None;
+        if let Some(texture) = self.state.material_preview_texture.take() {
+            self.bridge.unregister(texture);
+        }
         if let Some(assets) = self
             .state
             .project
@@ -529,7 +540,11 @@ impl EditorApp {
         if let Some(gpu) = &mut self.gpu
             && let Err(error) = gpu
                 .scene
-                .clear_cache(&mut gpu.renderer, &mut self.state.models)
+                .free_material_preview_viewport(&mut gpu.renderer)
+                .and_then(|()| {
+                    gpu.scene
+                        .clear_cache(&mut gpu.renderer, &mut self.state.models)
+                })
         {
             self.fail(&error);
         }
@@ -645,6 +660,15 @@ impl EditorApp {
             self.state.previews.refresh_all();
         } else {
             self.state.previews.refresh_paths(&changes.paths);
+        }
+        if let Some(project) = self.state.project.as_ref() {
+            if changes.rescan || changes.tree_changed {
+                self.state
+                    .materials
+                    .refresh_all(project, &self.state.asset_tree);
+            } else {
+                self.state.materials.refresh_changed(project, &changes);
+            }
         }
         self.state.refresh_lite_schemas(&changes);
 
@@ -1626,6 +1650,15 @@ impl EditorApp {
             self.state.game_viewport_texture =
                 Some(self.bridge.register_viewport(gpu.scene.game_viewport));
         }
+        // Вкладка может быть в доке, но скрытой: viewport нужен только когда панель видна.
+        if self.state.project.is_some() && self.state.material_preview.visible {
+            let viewport = gpu
+                .scene
+                .ensure_material_preview_viewport(&mut gpu.renderer)?;
+            if self.state.material_preview_texture.is_none() {
+                self.state.material_preview_texture = Some(self.bridge.register_viewport(viewport));
+            }
+        }
 
         self.latency_frame = self.latency_frame.saturating_add(1);
         let frame_id = self.latency_frame;
@@ -1741,6 +1774,13 @@ impl EditorApp {
         }
         gpu.renderer.set_latency_frame(frame_id);
         let status = render_scene_frame(gpu, &mut self.state, &ui_primitives)?;
+        if !self.state.material_preview.visible {
+            if let Some(texture) = self.state.material_preview_texture.take() {
+                self.bridge.unregister(texture);
+            }
+            gpu.scene
+                .free_material_preview_viewport(&mut gpu.renderer)?;
+        }
         let framing = framing && self.state.pending_frame.is_none();
 
         self.bridge
@@ -1941,19 +1981,33 @@ fn render_scene_frame(
     };
     let scene_size = drawable(state.scene_view);
     let game_size = drawable(state.game_view);
+    let preview_size = (state.material_preview.visible
+        && state.material_preview.size[0] > 0
+        && state.material_preview.size[1] > 0)
+        .then_some(state.material_preview.size);
     let scene_debug_view = state.scene_view.debug_view;
     let game_debug_view = state.game_view.debug_view;
     let offscreen_capture = state
         .mcp_capture
         .as_ref()
         .is_some_and(|job| job.plan.is_offscreen());
-    if !capture::needs_scene_frame(scene_size.is_some(), game_size.is_some(), offscreen_capture) {
+    if !capture::needs_scene_frame(scene_size.is_some(), game_size.is_some(), offscreen_capture)
+        && preview_size.is_none()
+    {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     }
     let capture_frame = state
         .mcp_capture
         .as_ref()
         .and_then(|job| capture::offscreen_frame(&job.plan));
+    let preview_asset = state
+        .inspected_asset
+        .clone()
+        .or_else(|| state.material_preview_asset.clone());
+    let preview_primitive = state.material_preview_primitive;
+    let preview_yaw = state.material_preview_yaw;
+    let preview_pitch = state.material_preview_pitch;
+    let preview_zoom = state.material_preview_zoom;
     let playing = state.is_playing();
     let game_camera_id = state.game_camera.clone();
     // Сетка нужна только панели Scene вне Play-режима.
@@ -2083,6 +2137,10 @@ fn render_scene_frame(
     gpu.scene.begin_motion_frame(game_camera_handle, playing);
     gpu.scene.build_draws(
         &mut gpu.renderer,
+        parts.project,
+        parts.materials,
+        parts.log,
+        preview_asset.as_deref(),
         parts.world,
         &scene_frame,
         scene_camera.position,
@@ -2133,6 +2191,27 @@ fn render_scene_frame(
         gpu.renderer
             .resize_viewport(gpu.scene.game_viewport, width, height)?;
     }
+    if let Some([width, height]) = preview_size
+        && let Some(viewport) = gpu.scene.material_preview_viewport
+    {
+        gpu.renderer.resize_viewport(viewport, width, height)?;
+    }
+    // Без выбранного ресурса проход не нужен: иначе каждый кадр рисовался бы дефолтный материал.
+    let preview_draw = if preview_size.is_some() && preview_asset.is_some() {
+        Some(gpu.scene.material_preview_frame(
+            &mut gpu.renderer,
+            parts.project,
+            parts.materials,
+            preview_asset.as_deref(),
+            preview_primitive,
+            preview_yaw,
+            preview_pitch,
+            preview_zoom,
+            parts.log,
+        )?)
+    } else {
+        None
+    };
     let joint_palettes = gpu.scene.joint_palette_refs(parts.animation);
     let scene_view = scene_size.map(|[width, height]| {
         gpu.scene.frame(
@@ -2202,7 +2281,31 @@ fn render_scene_frame(
         }
         _ => None,
     };
-    let mut scenes = Vec::with_capacity(3);
+    let preview_view = preview_draw.as_ref().map(|preview| Frame {
+        clear_color: [0.035, 0.04, 0.05, 1.0],
+        camera: FrameCamera {
+            view: preview.camera.view().to_cols_array_2d(),
+            projection: preview
+                .camera
+                .projection(preview_size.unwrap()[0], preview_size.unwrap()[1])
+                .to_cols_array_2d(),
+            position: preview.camera.position.to_array(),
+        },
+        environment: Some(preview.environment),
+        shadow_cascades: &[],
+        light: DirectionalLight::default(),
+        lights: &[],
+        local_light_shadows: &[],
+        draws: std::slice::from_ref(&preview.draw),
+        joint_palettes: &[],
+        overlay: &[],
+        debug_view: DebugView::Lit,
+        view: ViewSettings::default(),
+        reset_history: true,
+        particles: &[],
+        particle_step: 0.0,
+    });
+    let mut scenes = Vec::with_capacity(4);
     if let Some(frame) = &scene_view {
         scenes.push((gpu.scene.viewport, frame));
     }
@@ -2216,6 +2319,9 @@ fn render_scene_frame(
         .as_ref()
         .and_then(|(_, requested, _)| *requested);
     let capture_drawn = capture_view.is_some();
+    if let (Some(frame), Some(viewport)) = (&preview_view, gpu.scene.material_preview_viewport) {
+        scenes.push((viewport, frame));
+    }
     let drawn = scenes
         .iter()
         .map(|(viewport, _)| *viewport)
@@ -2447,6 +2553,9 @@ impl WindowHandler for EditorApp {
             .unwrap_or_default();
         for error in watcher_errors {
             self.state.log.push(LogLevel::Warn, error);
+        }
+        for error in self.state.external_editor.drain_errors() {
+            self.state.log.error(error);
         }
         if let Some(changes) = self.asset_changes.take_ready(now) {
             self.apply_asset_changes(changes);

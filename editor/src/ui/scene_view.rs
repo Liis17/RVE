@@ -424,6 +424,7 @@ fn pick(
         }))
     });
     if let Some(scene) = &mut state.scene {
+        state.inspected_asset = None;
         apply_click_selection(scene, selected.as_deref(), modifiers);
     }
 }

@@ -4,7 +4,9 @@ use crate::asset_watch::AssetChanges;
 use crate::assets_fs::{AssetEntry, AssetKind};
 use crate::build::{BuildJob, ScriptGeneration, ScriptsJob};
 use crate::console::ConsoleLog;
+use crate::external_editor::ExternalEditor;
 use crate::icons::IconCache;
+use crate::materials::MaterialLibrary;
 use crate::play::PlaySession;
 use crate::play_cursor::PlayCursor;
 use crate::play_network::PlayNetworkForm;
@@ -136,10 +138,25 @@ pub struct SceneViewInfo {
     pub show_colliders: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum MaterialPreviewPrimitive {
+    Plane,
+    #[default]
+    Cube,
+    Sphere,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MaterialPreviewViewInfo {
+    pub visible: bool,
+    pub size: [u32; 2],
+}
+
 /// Раздельные заимствования состояния для подготовки кадра сцены.
 pub struct FrameParts<'a> {
     pub world: &'a mut World,
     pub project: &'a OpenProject,
+    pub materials: &'a MaterialLibrary,
     pub models: &'a mut HashMap<String, Arc<Model>>,
     pub loader: &'a mut ModelLoader,
     pub log: &'a mut ConsoleLog,
@@ -196,6 +213,18 @@ pub struct EditorState {
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     /// `.rvephysmat`, открытый панелью полей Project.
     pub physics_material_edit: Option<crate::ui::project_panel::PhysicsMaterialEdit>,
+    /// `.rvemat`/`.rveshader` selected in Project for the asset inspector.
+    pub inspected_asset: Option<String>,
+    pub materials: MaterialLibrary,
+    pub external_editor: ExternalEditor,
+    pub material_preview: MaterialPreviewViewInfo,
+    pub material_preview_primitive: MaterialPreviewPrimitive,
+    pub material_preview_yaw: f32,
+    pub material_preview_pitch: f32,
+    pub material_preview_zoom: f32,
+    pub material_preview_asset: Option<String>,
+    pub preview_requested: bool,
+    pub material_preview_texture: Option<egui::TextureId>,
     pub new_project_dialog: Option<crate::new_project::NewProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
     /// Текстовому полю переименования ещё нужно передать фокус; снимается после первого запроса.
@@ -286,6 +315,17 @@ impl EditorState {
             current_folder: String::new(),
             project_dialog: None,
             physics_material_edit: None,
+            inspected_asset: None,
+            materials: MaterialLibrary::default(),
+            external_editor: ExternalEditor::default(),
+            material_preview: MaterialPreviewViewInfo::default(),
+            material_preview_primitive: MaterialPreviewPrimitive::default(),
+            material_preview_yaw: 0.5,
+            material_preview_pitch: 0.25,
+            material_preview_zoom: 4.0,
+            material_preview_asset: None,
+            preview_requested: false,
+            material_preview_texture: None,
             new_project_dialog: None,
             hierarchy_rename: None,
             hierarchy_rename_focus: false,
@@ -431,6 +471,7 @@ impl EditorState {
         Some(FrameParts {
             world,
             project: self.project.as_ref()?,
+            materials: &self.materials,
             models: &mut self.models,
             loader: &mut self.model_loader,
             log: &mut self.log,
@@ -552,12 +593,17 @@ impl EditorState {
         self.hierarchy_rename = None;
         self.game_camera = None;
         self.pending_frame = None;
+        self.inspected_asset = None;
     }
 
     /// Список тяжёлых префабов относится к проекту, который открыт сейчас: при открытии другого
     /// проекта несохранённые правки прошлого списка не переносятся.
     pub fn project_replaced(&mut self) {
         self.project_prefabs = None;
+        self.materials = MaterialLibrary::default();
+        self.inspected_asset = None;
+        self.material_preview_asset = None;
+        self.preview_requested = false;
     }
 
     /// Есть ли несохранённые правки сцены или списка тяжёлых префабов.
