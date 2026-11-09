@@ -5,7 +5,7 @@ use crate::document::{
     CanvasSettings, ChildAlign, Corner, ElementKind, GridSpec, RectSpec, ScaleMode, StackSpec,
     Tree, UiElement,
 };
-use epaint::{Rect, Vec2, pos2, vec2};
+use epaint::{Pos2, Rect, Vec2, pos2, vec2};
 
 /// Физических пикселей на единицу канваса. Нулевой или отрицательный экран считается 1 пикселем,
 /// чтобы масштаб оставался конечным; рисовать такой кадр не нужно.
@@ -29,33 +29,54 @@ pub fn canvas_size(screen_px: Vec2, scale: f32) -> Vec2 {
 }
 
 /// Прямоугольник элемента в координатах родителя по его [`RectSpec`].
+/// Pivot на результат не влияет: границы всегда `якорь + offset` на каждой оси.
 pub fn resolve_rect(spec: &RectSpec, parent: Rect) -> Rect {
     let (min_x, max_x) = resolve_axis(
         [spec.anchor_min[0], spec.anchor_max[0]],
-        spec.pivot[0],
         [spec.offset_min[0], spec.offset_max[0]],
         [parent.min.x, parent.max.x],
     );
     let (min_y, max_y) = resolve_axis(
         [spec.anchor_min[1], spec.anchor_max[1]],
-        spec.pivot[1],
         [spec.offset_min[1], spec.offset_max[1]],
         [parent.min.y, parent.max.y],
     );
     Rect::from_min_max(pos2(min_x, min_y), pos2(max_x, max_y))
 }
 
-fn resolve_axis(anchors: [f32; 2], pivot: f32, offsets: [f32; 2], parent: [f32; 2]) -> (f32, f32) {
+fn resolve_axis(anchors: [f32; 2], offsets: [f32; 2], parent: [f32; 2]) -> (f32, f32) {
     let size = parent[1] - parent[0];
-    let anchor_min = parent[0] + anchors[0] * size;
-    let anchor_max = parent[0] + anchors[1] * size;
-    if anchors[0] == anchors[1] {
-        // Точечная ось: offset_min — позиция pivot относительно якоря, offset_max — размер.
-        let width = offsets[1];
-        let min = anchor_min + offsets[0] - pivot * width;
-        (min, min + width)
-    } else {
-        (anchor_min + offsets[0], anchor_max + offsets[1])
+    (
+        parent[0] + anchors[0] * size + offsets[0],
+        parent[0] + anchors[1] * size + offsets[1],
+    )
+}
+
+fn anchor_point(parent: Rect, anchor: [f32; 2]) -> Pos2 {
+    parent.min + parent.size() * vec2(anchor[0], anchor[1])
+}
+
+/// Помощники редактора: позиция pivot и размер вместо offsets. Обратны друг другу.
+impl RectSpec {
+    /// Позиция pivot и размер прямоугольника в координатах `parent`.
+    pub fn position_size(&self, parent: Rect) -> (Pos2, Vec2) {
+        let rect = resolve_rect(self, parent);
+        (
+            rect.min + rect.size() * vec2(self.pivot[0], self.pivot[1]),
+            rect.size(),
+        )
+    }
+
+    /// Пересчитывает offsets так, чтобы pivot оказался в `pos`, а размер стал `size` (не меньше нуля).
+    /// Якоря не меняются; на растянутой оси размер задаёт отступы этой оси.
+    pub fn set_position_size(&mut self, parent: Rect, pos: Pos2, size: Vec2) {
+        let size = size.max(Vec2::ZERO);
+        let min = pos - size * vec2(self.pivot[0], self.pivot[1]);
+        let max = min + size;
+        let offset_min = min - anchor_point(parent, self.anchor_min);
+        let offset_max = max - anchor_point(parent, self.anchor_max);
+        self.offset_min = [offset_min.x, offset_min.y];
+        self.offset_max = [offset_max.x, offset_max.y];
     }
 }
 
@@ -350,29 +371,101 @@ mod tests {
     }
 
     #[test]
-    fn point_anchor_places_pivot_and_size() {
+    fn point_anchor_places_min_and_max_from_offsets() {
         let parent = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
         let centered = RectSpec {
             anchor_min: [0.5, 0.5],
             anchor_max: [0.5, 0.5],
             pivot: [0.5, 0.5],
-            offset_min: [0.0, 0.0],
-            offset_max: [40.0, 20.0],
+            offset_min: [-20.0, -10.0],
+            offset_max: [20.0, 10.0],
         };
         assert_rect(resolve_rect(&centered, parent), [80.0, 40.0], [40.0, 20.0]);
 
-        let bottom_right_pivot = RectSpec {
+        let bottom_right = RectSpec {
             anchor_min: [1.0, 1.0],
             anchor_max: [1.0, 1.0],
             pivot: [1.0, 1.0],
-            offset_min: [-10.0, -10.0],
-            offset_max: [50.0, 30.0],
+            offset_min: [-60.0, -40.0],
+            offset_max: [-10.0, -10.0],
         };
         assert_rect(
-            resolve_rect(&bottom_right_pivot, parent),
+            resolve_rect(&bottom_right, parent),
             [140.0, 60.0],
             [50.0, 30.0],
         );
+    }
+
+    #[test]
+    fn pivot_does_not_change_resolved_rect() {
+        let parent = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
+        let spec = |pivot| RectSpec {
+            anchor_min: [0.5, 0.5],
+            anchor_max: [0.5, 0.5],
+            pivot,
+            offset_min: [-20.0, -10.0],
+            offset_max: [20.0, 10.0],
+        };
+        assert_eq!(
+            resolve_rect(&spec([0.0, 0.0]), parent),
+            resolve_rect(&spec([1.0, 1.0]), parent)
+        );
+    }
+
+    #[test]
+    fn position_size_reports_pivot_point_and_size() {
+        let parent = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
+        let corner = RectSpec {
+            anchor_min: [1.0, 1.0],
+            anchor_max: [1.0, 1.0],
+            pivot: [1.0, 1.0],
+            offset_min: [-60.0, -40.0],
+            offset_max: [-10.0, -10.0],
+        };
+        let (pos, size) = corner.position_size(parent);
+        assert_eq!(pos, pos2(190.0, 90.0));
+        assert_eq!(size, vec2(50.0, 30.0));
+    }
+
+    #[test]
+    fn set_position_size_round_trips_on_point_anchor() {
+        let parent = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
+        let mut spec = RectSpec {
+            anchor_min: [0.5, 0.5],
+            anchor_max: [0.5, 0.5],
+            pivot: [0.5, 0.5],
+            offset_min: [-20.0, -10.0],
+            offset_max: [20.0, 10.0],
+        };
+        spec.set_position_size(parent, pos2(50.0, 30.0), vec2(60.0, 40.0));
+        assert_eq!(
+            spec.position_size(parent),
+            (pos2(50.0, 30.0), vec2(60.0, 40.0))
+        );
+        assert_rect(resolve_rect(&spec, parent), [20.0, 10.0], [60.0, 40.0]);
+        assert_eq!(spec.anchor_min, [0.5, 0.5]);
+
+        spec.set_position_size(parent, pos2(50.0, 30.0), vec2(-5.0, 10.0));
+        assert_eq!(spec.position_size(parent).1, vec2(0.0, 10.0));
+    }
+
+    #[test]
+    fn set_position_size_on_stretched_axis_sets_insets() {
+        let parent = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
+        let mut spec = RectSpec {
+            anchor_min: [0.0, 0.0],
+            anchor_max: [1.0, 0.0],
+            pivot: [0.0, 0.0],
+            offset_min: [10.0, 5.0],
+            offset_max: [-10.0, 25.0],
+        };
+        let (pos, size) = spec.position_size(parent);
+        assert_eq!((pos, size), (pos2(10.0, 5.0), vec2(180.0, 20.0)));
+
+        spec.set_position_size(parent, pos2(30.0, 5.0), vec2(100.0, 20.0));
+        assert_eq!(spec.offset_min, [30.0, 5.0]);
+        assert_eq!(spec.offset_max, [-70.0, 25.0]);
+        assert_rect(resolve_rect(&spec, parent), [30.0, 5.0], [100.0, 20.0]);
     }
 
     #[test]
@@ -395,8 +488,8 @@ mod tests {
             anchor_min: [0.0, 1.0],
             anchor_max: [1.0, 1.0],
             pivot: [0.0, 1.0],
-            offset_min: [10.0, -10.0],
-            offset_max: [-10.0, 30.0],
+            offset_min: [10.0, -40.0],
+            offset_max: [-10.0, -10.0],
         };
         let rect = resolve_rect(&bar, parent);
         assert_rect(rect, [10.0, 260.0], [280.0, 30.0]);
@@ -414,7 +507,7 @@ panel = {}
 id = "child"
 parent = "root"
 panel = {}
-rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_max = [10.0, 10.0], offset_min = [5.0, 5.0] }
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_max = [15.0, 15.0], offset_min = [5.0, 5.0] }
 
 [[elements]]
 id = "hidden"
@@ -640,6 +733,20 @@ rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], o
             resolve_rect(&document.elements()[content].rect, view_rect),
         );
         assert_eq!(range, vec2(0.0, 60.0));
+    }
+
+    #[test]
+    fn demo_hud_places_title_top_left_and_fire_bottom_right() {
+        let document = UiDocument::parse(
+            "hud.rveui",
+            include_str!("../../../examples/demo-game/Assets/ui/hud.rveui"),
+        )
+        .unwrap();
+        let result = run(&document, vec2(1280.0, 720.0));
+        let title = document.element_index("title").unwrap();
+        let fire = document.element_index("fire").unwrap();
+        assert_rect(result.rects[title], [24.0, 24.0], [360.0, 48.0]);
+        assert_rect(result.rects[fire], [1056.0, 640.0], [200.0, 56.0]);
     }
 
     #[test]

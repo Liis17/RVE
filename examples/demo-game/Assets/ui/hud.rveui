@@ -4,13 +4,13 @@ layer = 0
 
 [[elements]]
 id = "title"
-rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 24.0], offset_max = [360.0, 48.0] }
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 24.0], offset_max = [384.0, 72.0] }
 text = { string = "RVE Demo", size = 28.0, color = [255, 255, 255, 255] }
 
 [[elements]]
 id = "fire"
-rect = { anchor_min = [1.0, 1.0], anchor_max = [1.0, 1.0], pivot = [1.0, 1.0], offset_min = [-24.0, -24.0], offset_max = [200.0, 56.0] }
-button = {}
+rect = { anchor_min = [1.0, 1.0], anchor_max = [1.0, 1.0], pivot = [1.0, 1.0], offset_min = [-224.0, -80.0], offset_max = [-24.0, -24.0] }
+button = { tint = { normal = [40, 40, 40, 220], hover = [70, 70, 70, 230], pressed = [20, 20, 20, 255] } }
 
 [[elements]]
 id = "fire_label"

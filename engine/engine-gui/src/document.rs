@@ -127,10 +127,11 @@ pub struct UiAsset {
 
 /// Прямоугольник элемента относительно родителя (RectTransform-семантика, Y вниз).
 ///
-/// На растянутой оси (`anchor_min != anchor_max`) `offset_min`/`offset_max` — отступы
-/// от левого/верхнего и правого/нижнего якорей. На точечной оси `offset_min` — позиция
-/// pivot относительно якоря, а `offset_max` — размер ≥ 0; pivot задаёт, какая точка
-/// прямоугольника стоит на позиции.
+/// На каждой оси границы всегда `точка_якоря_min + offset_min` и `точка_якоря_max + offset_max`
+/// (как `offsetMin`/`offsetMax` в Unity). Точка якоря — доля размера родителя. Совпадающие
+/// якоря дают точку: размер на ней — `offset_max − offset_min` и должен быть ≥ 0.
+/// `pivot` на расчёт не влияет; он нужен редактору, чтобы менять размер вокруг него
+/// (см. `RectSpec::position_size`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RectSpec {
@@ -934,9 +935,10 @@ pub(crate) fn check_rect(rect: &RectSpec) -> Result<(), String> {
         if !(0.0..=1.0).contains(&rect.pivot[axis]) {
             return Err("pivot должен быть в диапазоне 0..1".to_owned());
         }
-        if min == max && rect.offset_max[axis] < 0.0 {
+        if min == max && rect.offset_max[axis] < rect.offset_min[axis] {
             return Err(
-                "размер на точечной оси (offset_max) не может быть отрицательным".to_owned(),
+                "размер на точечной оси (offset_max − offset_min) не может быть отрицательным"
+                    .to_owned(),
             );
         }
     }
@@ -1254,6 +1256,11 @@ colour = "red"
             "[[elements]]\nid = \"a\"\npanel = {}\nrect = { anchor_min = [0.5, 0.5], anchor_max = [0.5, 0.5], offset_max = [-1.0, 1.0] }\n",
         );
         assert!(size.contains("offset_max"), "{size}");
+
+        let inverted = error_of(
+            "[[elements]]\nid = \"a\"\npanel = {}\nrect = { anchor_min = [0.5, 0.5], anchor_max = [0.5, 0.5], offset_min = [10.0, 0.0], offset_max = [5.0, 1.0] }\n",
+        );
+        assert!(inverted.contains("offset_max"), "{inverted}");
 
         let scale = error_of("[canvas]\nscale = 0.0\n");
         assert!(scale.contains("scale"), "{scale}");

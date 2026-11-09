@@ -882,7 +882,7 @@ rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], o
 [[elements]]
 id = "label"
 text = { string = "Привет" }
-rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [0.0, 50.0], offset_max = [200.0, 30.0] }
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [0.0, 50.0], offset_max = [200.0, 80.0] }
 "#;
 
     #[test]
@@ -988,7 +988,7 @@ scale = 2.0
 [[elements]]
 id = "view"
 scroll_view = { vertical = true }
-rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [10.0, 10.0], offset_max = [50.0, 40.0] }
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [10.0, 10.0], offset_max = [60.0, 50.0] }
 
 [[elements]]
 id = "content"

@@ -977,7 +977,9 @@ mod tests {
     /// Фрагмент rect с точечными якорями: позиция (x, y) и размер (w, h) в единицах канваса.
     fn at(x: f32, y: f32, w: f32, h: f32) -> String {
         format!(
-            "rect = {{ anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [{x}, {y}], offset_max = [{w}, {h}] }}"
+            "rect = {{ anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [{x}, {y}], offset_max = [{}, {}] }}",
+            x + w,
+            y + h
         )
     }
 
