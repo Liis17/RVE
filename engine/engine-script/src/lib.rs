@@ -17,7 +17,10 @@ mod types;
 mod ui;
 mod ui_lua;
 
-pub use engine_gui::{document::UiDocument, events::UiEvent, system::UiSystem};
+mod ui_assets;
+mod ui_input;
+
+pub use engine_gui::{document::UiDocument, events::UiEvent, paint::UiImageData, system::UiSystem};
 pub use engine_scene::{ParamKind, ParamSchema, ParamSpec, ParamValue};
 pub use host::{
     CommandError, ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions,
@@ -32,3 +35,5 @@ pub use types::{
     MAX_RUMBLE_SECONDS, RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput,
     ScriptParams, ScriptTime, ScriptTransform,
 };
+pub use ui_assets::{PreparedUi, UiAssetSource, UiRegistry, is_ui_document, load_ui};
+pub use ui_input::{UiInputBridge, UiTick};

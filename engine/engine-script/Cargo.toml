@@ -14,6 +14,7 @@ engine-physics = { path = "../engine-physics" }
 engine-files = { path = "../engine-files" }
 engine-project = { path = "../engine-project" }
 engine-scene = { path = "../engine-scene" }
+epaint = "=0.36.2"
 glam.workspace = true
 libloading.workspace = true
 mlua.workspace = true
