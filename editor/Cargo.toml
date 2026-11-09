@@ -35,6 +35,7 @@ glam.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 flume.workspace = true
 
 [dev-dependencies]

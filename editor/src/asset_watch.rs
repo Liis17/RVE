@@ -71,6 +71,14 @@ impl AssetChanges {
         self.paths_with_extension("postprocess")
     }
 
+    pub fn material_paths(&self) -> impl Iterator<Item = &VirtualPath> {
+        self.paths_with_extension("rvemat")
+    }
+
+    pub fn shader_paths(&self) -> impl Iterator<Item = &VirtualPath> {
+        self.paths_with_extension("rveshader")
+    }
+
     /// Проверяет точное совпадение или событие каталога-родителя.
     pub fn contains_path_or_parent(&self, path: &VirtualPath) -> bool {
         self.paths.iter().any(|changed| {

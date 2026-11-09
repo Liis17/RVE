@@ -35,6 +35,8 @@ pub fn file_icon(kind: AssetKind) -> Option<&'static str> {
     match kind {
         AssetKind::CameraSettings => Some("camera-settings"),
         AssetKind::PostProcess => Some("camera-settings"),
+        AssetKind::Material => Some("material"),
+        AssetKind::Shader => Some("shader"),
         _ => None,
     }
 }
@@ -164,6 +166,7 @@ mod tests {
             model: VirtualPath::parse("/models/cube.fbx").unwrap(),
             texture: None,
             material: None,
+            materials: Vec::new(),
         }
     }
 
@@ -223,6 +226,8 @@ mod tests {
             Some("camera-settings")
         );
         assert_eq!(file_icon(AssetKind::Scene), None);
+        assert_eq!(file_icon(AssetKind::Material), Some("material"));
+        assert_eq!(file_icon(AssetKind::Shader), Some("shader"));
         let components = [
             ComponentKind::Transform,
             ComponentKind::Camera,
@@ -243,6 +248,8 @@ mod tests {
             .into_iter()
             .filter_map(component_icon)
             .chain(file_icon(AssetKind::CameraSettings))
+            .chain(file_icon(AssetKind::Material))
+            .chain(file_icon(AssetKind::Shader))
             .chain(object_icon(&SceneObject {
                 mesh_renderer: Some(mesh_renderer()),
                 ..SceneObject::default()

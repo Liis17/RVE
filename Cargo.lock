@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.6.0"
+version = "0.7.1"
 dependencies = [
  "ash",
  "engine-platform",
@@ -3081,7 +3081,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -3132,6 +3132,7 @@ dependencies = [
  "rve-sdk",
  "serde",
  "serde_json",
+ "toml",
  "windows-sys 0.61.2",
  "winit",
 ]
@@ -3173,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-assets",
  "engine-core",

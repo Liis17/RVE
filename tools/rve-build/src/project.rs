@@ -8,11 +8,12 @@ use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
 use engine_scene::{
-    CameraSettings, ComponentKind, ParamKind, PhysicsMaterialSettings, PostProcessSettings,
+    CameraSettings, ComponentKind, MaterialAsset, ParamKind, PhysicsMaterialSettings,
+    PostProcessSettings,
 };
 use engine_scene::{
     ParamSchema, ParamValue, PrefabTemplate, SceneAsset, SceneDocument, SceneError, SceneObject,
-    expand,
+    ShaderAsset, ShaderPropertyDefault, expand,
 };
 use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
@@ -427,16 +428,37 @@ fn record_asset(
     owner: &Owner,
     list_archive: Option<&str>,
 ) -> Result<(), BuildError> {
+    record_asset_recursive(
+        usages,
+        sources,
+        path,
+        owner,
+        list_archive,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn record_asset_recursive(
+    usages: &mut BTreeMap<VirtualPath, AssetUsage>,
+    sources: &AssetSources<'_>,
+    path: &VirtualPath,
+    owner: &Owner,
+    list_archive: Option<&str>,
+    visited: &mut BTreeSet<VirtualPath>,
+) -> Result<(), BuildError> {
     usages.entry(path.clone()).or_default().add_owner(owner);
+    if let Some(archive) = list_archive {
+        add_explicit_archive(usages, path, owner, archive.to_owned());
+    }
+    if !visited.insert(path.clone()) {
+        return Ok(());
+    }
     sources
         .handle
         .stat(format!("/{path}"))
         .and_then(|request| request.wait())
         .map_err(|error| resource_error(&format!("ресурс /{path}"), error))?;
     require_asset_file(sources.assets_dir, path)?;
-    if let Some(archive) = list_archive {
-        add_explicit_archive(usages, path, owner, archive.to_owned());
-    }
 
     if extension_is(path.as_str(), "camerasettings") {
         let bytes = sources
@@ -481,6 +503,26 @@ fn record_asset(
             .map_err(|error| BuildError::input(error.to_string()))?;
     }
 
+    if extension_is(path.as_str(), "rvemat") {
+        let source = read_asset_text(sources, path, "материал")?;
+        let material = MaterialAsset::parse(format!("/{path}"), &source)
+            .map_err(|error| BuildError::input(error.to_string()))?;
+        for dependency in material.dependencies() {
+            record_asset_recursive(usages, sources, &dependency, owner, list_archive, visited)?;
+        }
+    }
+
+    if extension_is(path.as_str(), "rveshader") {
+        let source = read_asset_text(sources, path, "шейдер")?;
+        let shader = ShaderAsset::parse(format!("/{path}"), &source)
+            .map_err(|error| BuildError::input(error.to_string()))?;
+        for property in shader.properties {
+            if let ShaderPropertyDefault::Texture(Some(dependency)) = property.default {
+                record_asset_recursive(usages, sources, &dependency, owner, list_archive, visited)?;
+            }
+        }
+    }
+
     if extension_is(path.as_str(), "fbx") {
         let dependencies = sources
             .assets
@@ -490,22 +532,24 @@ fn record_asset(
             let dependency = VirtualPath::parse(&dependency).map_err(|error| {
                 BuildError::input(format!("модель /{path} вернула неверную текстуру: {error}"))
             })?;
-            sources
-                .handle
-                .stat(format!("/{dependency}"))
-                .and_then(|request| request.wait())
-                .map_err(|error| resource_error(&format!("текстура /{dependency}"), error))?;
-            require_asset_file(sources.assets_dir, &dependency)?;
-            usages
-                .entry(dependency.clone())
-                .or_default()
-                .add_owner(owner);
-            if let Some(archive) = list_archive {
-                add_explicit_archive(usages, &dependency, owner, archive.to_owned());
-            }
+            record_asset_recursive(usages, sources, &dependency, owner, list_archive, visited)?;
         }
     }
     Ok(())
+}
+
+fn read_asset_text(
+    sources: &AssetSources<'_>,
+    path: &VirtualPath,
+    label: &str,
+) -> Result<String, BuildError> {
+    let bytes = sources
+        .handle
+        .read_all(format!("/{path}"))
+        .and_then(|request| request.wait())
+        .map_err(|error| resource_error(&format!("{label} /{path}"), error))?;
+    String::from_utf8(bytes)
+        .map_err(|error| BuildError::input(format!("{label} /{path} должен быть UTF-8: {error}")))
 }
 
 fn add_explicit_archive(
@@ -1859,5 +1903,97 @@ mod demo_game_tests {
             "shared"
         );
         assert!(build.files.contains_key(&path("/prefabs/tower.rveprefab")));
+    }
+}
+
+#[cfg(test)]
+mod material_asset_tests {
+    use super::prepare_project;
+    use crate::temporary::TempDir;
+    use engine_files::VirtualPath;
+    use std::fs;
+    use std::path::Path;
+
+    fn path(value: &str) -> VirtualPath {
+        VirtualPath::parse(value).unwrap()
+    }
+
+    fn write(root: &Path, path: &str, contents: &str) {
+        let path = root.join("Assets").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn project(root: &Path, material: &str) {
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        write(
+            root,
+            "scenes/main.rvescene",
+            &format!(
+                "[[assets]]\npath = \"/materials/main.rvemat\"\n{material}[[objects]]\nid = \"camera\"\n[objects.camera]\n"
+            ),
+        );
+    }
+
+    const MATERIAL: &str = "shader = \"/shaders/surface.rveshader\"\n[properties]\ntint = [0.8, 0.7, 0.6]\nalbedo = \"/textures/checker.png\"\n";
+    const SHADER: &str = "[shader]\nlighting = \"lit\"\n[[properties]]\nname = \"tint\"\ntype = \"color\"\ndefault = [1.0, 1.0, 1.0]\n[[properties]]\nname = \"albedo\"\ntype = \"texture\"\ndefault = \"/textures/fallback.png\"\ncolor_space = \"srgb\"\n---\nvoid surface(inout Surface s) { s.albedo = sample_albedo(s.uv).rgb * tint; }\n";
+
+    #[test]
+    fn material_packs_its_shader_and_texture_as_scene_dependencies() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-material").unwrap();
+        project(root.path(), "");
+        write(root.path(), "materials/main.rvemat", MATERIAL);
+        write(root.path(), "shaders/surface.rveshader", SHADER);
+        write(root.path(), "textures/checker.png", "packed texture bytes");
+        write(
+            root.path(),
+            "textures/fallback.png",
+            "fallback texture bytes",
+        );
+
+        let build = prepare_project(root.path()).unwrap();
+        for asset in [
+            "/materials/main.rvemat",
+            "/shaders/surface.rveshader",
+            "/textures/checker.png",
+            "/textures/fallback.png",
+        ] {
+            assert!(build.files.contains_key(&path(asset)), "{asset}");
+            assert_eq!(build.assignments[&path(asset)], "scene-main", "{asset}");
+        }
+    }
+
+    #[test]
+    fn missing_material_shader_is_a_project_error() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-material").unwrap();
+        project(root.path(), "");
+        write(root.path(), "materials/main.rvemat", MATERIAL);
+        write(root.path(), "textures/checker.png", "packed texture bytes");
+
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error.to_string().contains("shaders/surface.rveshader"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn invalid_material_is_a_project_error() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-material").unwrap();
+        project(root.path(), "");
+        write(root.path(), "materials/main.rvemat", "shader = [\n");
+
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error.to_string().contains("materials/main.rvemat"),
+            "{error}"
+        );
     }
 }
