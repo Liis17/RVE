@@ -11,6 +11,8 @@ path = "/driver.lua"
 path = "/audio/hum.wav"
 [[assets]]
 path = "/models/crate.fbx"
+[[assets]]
+path = "/materials/gold.rvemat"
 
 [[objects]]
 id = "camera"
@@ -327,4 +329,46 @@ return Script
         "команда неактивному эмиттеру отклоняется вызовом"
     );
     assert!(host.drain_particle_commands().is_empty());
+}
+
+#[test]
+fn set_material_applies_a_declared_rvemat_once_the_call_commits() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  rve.find("crate"):set_material("/materials/gold.rvemat")
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    let raised = errors(&mut host);
+    assert!(raised.is_empty(), "{raised:?}");
+    let crate_handle = world.handle("crate").unwrap();
+    assert_eq!(
+        world
+            .mesh_material_path(crate_handle)
+            .map(|path| path.as_str()),
+        Some("materials/gold.rvemat")
+    );
+    assert_eq!(world.take_mesh_material_changes(), vec![crate_handle]);
+}
+
+#[test]
+fn set_material_refuses_undeclared_wrong_extension_and_objects_without_a_mesh() {
+    for body in [
+        r#"rve.find("crate"):set_material("/materials/silver.rvemat")"#,
+        r#"rve.find("crate"):set_material("/materials/gold.toml")"#,
+        r#"rve.find("lamp"):set_material("/materials/gold.rvemat")"#,
+    ] {
+        let (mut world, mut host) = load(&format!(
+            "local Script = {{}}\nfunction Script:on_update()\n  {body}\nend\nreturn Script\n"
+        ));
+        run_once(&mut world, &mut host);
+        assert!(!errors(&mut host).is_empty(), "ожидалась ошибка: {body}");
+        let crate_handle = world.handle("crate").unwrap();
+        assert!(world.mesh_material_path(crate_handle).is_none(), "{body}");
+        assert!(world.take_mesh_material_changes().is_empty(), "{body}");
+    }
 }

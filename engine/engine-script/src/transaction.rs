@@ -1784,6 +1784,11 @@ impl ScriptTransaction {
                 .set_mesh_material_params(*handle, *params)
                 .map_err(|error| error.to_string())?;
         }
+        for (handle, path) in &writes.mesh_material_path {
+            world
+                .set_mesh_material_path(*handle, path.clone())
+                .map_err(|error| error.to_string())?;
+        }
         for (handle, playing) in &writes.particles_playing {
             world
                 .set_particles_playing(*handle, *playing)
@@ -1844,6 +1849,7 @@ impl ScriptTransaction {
                 .mesh_visible
                 .keys()
                 .chain(writes.mesh_material.keys())
+                .chain(writes.mesh_material_path.keys())
                 .all(|handle| has(handle, |object| object.mesh_renderer.is_some()))
             && writes
                 .particles_playing
@@ -2932,6 +2938,25 @@ impl ScriptTransaction {
         if params.roughness.is_some() {
             merged.roughness = params.roughness;
         }
+        Ok(())
+    }
+
+    /// Ставит материал всех частей меш-рендерера по пути `.rvemat`. Путь проверяется при вызове:
+    /// он должен быть объявлен в `[[assets]]` сцены.
+    pub(crate) fn stage_mesh_material_path(
+        &mut self,
+        handle: ObjectHandle,
+        path: engine_files::VirtualPath,
+    ) -> Result<(), String> {
+        self.require_writable("material changes")?;
+        if self.mesh_visible(handle).is_none() {
+            return Err("object has no mesh_renderer".to_owned());
+        }
+        let world = self.world().ok_or("material changes need a live world")?;
+        if let Some(problem) = world.mesh_material_path_problem(&path) {
+            return Err(problem);
+        }
+        self.component_writes.mesh_material_path.insert(handle, path);
         Ok(())
     }
 

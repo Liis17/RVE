@@ -187,6 +187,26 @@ pub(super) unsafe extern "C" fn host_mesh_set_material_params(
     })
 }
 
+pub(super) unsafe extern "C" fn host_mesh_set_material_path(
+    ctx: *mut c_void,
+    object: u64,
+    path: RveStr,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = live_object(context, object, "set_material") else {
+            return false;
+        };
+        // SAFETY: the guest keeps the path string alive for this synchronous callback.
+        let staged = unsafe { read_abi_str(path) }
+            .map_err(|_| "set_material received an invalid path".to_owned())
+            .and_then(|path| {
+                VirtualPath::parse(path).map_err(|error| format!("set_material: {error}"))
+            })
+            .and_then(|path| context.transaction.stage_mesh_material_path(handle, path));
+        component_result(context, staged)
+    })
+}
+
 pub(super) unsafe extern "C" fn host_mesh_set_visible(
     ctx: *mut c_void,
     object: u64,

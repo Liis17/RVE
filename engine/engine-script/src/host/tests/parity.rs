@@ -52,6 +52,7 @@ enum HostCapability {
     MeshGetVisible,
     MeshSetVisible,
     MeshSetMaterialParams,
+    MeshSetMaterialPath,
     ParticlesGetPlaying,
     ParticlesSetPlaying,
     ParticlesCommand,
@@ -145,6 +146,11 @@ const CAPABILITIES: &[(&str, &str, HostCapability)] = &[
         "object",
         "set_material_params",
         HostCapability::MeshSetMaterialParams,
+    ),
+    (
+        "object",
+        "set_material",
+        HostCapability::MeshSetMaterialPath,
     ),
     (
         "object",
@@ -280,6 +286,7 @@ path = "/api.lua"
             HostCapability::MeshGetVisible => abi.mesh_get_visible.is_some(),
             HostCapability::MeshSetVisible => abi.mesh_set_visible.is_some(),
             HostCapability::MeshSetMaterialParams => abi.mesh_set_material_params.is_some(),
+            HostCapability::MeshSetMaterialPath => abi.mesh_set_material_path.is_some(),
             HostCapability::ParticlesGetPlaying => abi.particles_get_playing.is_some(),
             HostCapability::ParticlesSetPlaying => abi.particles_set_playing.is_some(),
             HostCapability::ParticlesCommand => abi.particles_command.is_some(),

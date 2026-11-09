@@ -319,6 +319,7 @@ impl<'a> AbiCallContext<'a> {
             mesh_get_visible: Some(components::host_mesh_get_visible),
             mesh_set_visible: Some(components::host_mesh_set_visible),
             mesh_set_material_params: Some(components::host_mesh_set_material_params),
+            mesh_set_material_path: Some(components::host_mesh_set_material_path),
             particles_get_playing: Some(components::host_particles_get_playing),
             particles_set_playing: Some(components::host_particles_set_playing),
             particles_command: Some(components::host_particles_command),

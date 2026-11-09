@@ -10,6 +10,7 @@ use super::{
     with_active_call,
 };
 use crate::transaction::ScriptTransaction;
+use engine_files::VirtualPath;
 use engine_scene::audio::{AudioRolloff, AudioSourceComponent};
 use engine_scene::world::{MAX_PARTICLE_BURST, MeshMaterialParams, ParticleCommand};
 use engine_scene::{
@@ -162,6 +163,24 @@ fn add_mesh_methods(
             with_active_call(&material_active, |transaction| {
                 transaction
                     .stage_mesh_material(handle, params)
+                    .map_err(LuaError::runtime)?;
+                Ok(true)
+            })
+        })?,
+    )?;
+
+    let material_path_active = active_call.clone();
+    object.set(
+        "set_material",
+        lua.create_function(move |_, (_self, path): (Value, String)| {
+            let path = VirtualPath::parse(&path)
+                .map_err(|error| LuaError::runtime(format!("object.set_material: {error}")))?;
+            if !object_alive(&material_path_active, handle)? {
+                return Ok(false);
+            }
+            with_active_call(&material_path_active, |transaction| {
+                transaction
+                    .stage_mesh_material_path(handle, path)
                     .map_err(LuaError::runtime)?;
                 Ok(true)
             })

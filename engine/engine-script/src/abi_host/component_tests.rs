@@ -7,7 +7,7 @@ use crate::lifecycle::Lifecycle;
 use crate::physics::PhysicsScriptState;
 use crate::types::{ScriptCursor, ScriptInput};
 use engine_scene::{SceneDocument, World};
-use rve_sdk::abi::{RveEnvironmentState, RveProceduralSky};
+use rve_sdk::abi::{RveEnvironmentState, RveProceduralSky, RveStr};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -112,5 +112,50 @@ fn environment_set_with_a_valid_sky_is_visible_before_commit() {
         assert!(get(host.ctx, sky, &mut after));
         assert_eq!(after.intensity, 2.5);
         assert_eq!(after.sky.sun_intensity, 4.0);
+    }
+}
+
+const MATERIAL_SCENE: &str = r#"
+[[assets]]
+path = "/models/crate.fbx"
+[[assets]]
+path = "/materials/gold.rvemat"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "crate"
+[objects.mesh_renderer]
+model = "/models/crate.fbx"
+"#;
+
+#[test]
+fn mesh_set_material_path_accepts_a_declared_rvemat_and_reports_refusals() {
+    let world = world(MATERIAL_SCENE);
+    let crate_abi = world.handle("crate").unwrap().to_abi().unwrap();
+    let events = EventQueue::default();
+    let mut transaction = writable_transaction(&world);
+    let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+    let host = context.host(ScriptTime::default());
+    let set = host.mesh_set_material_path.unwrap();
+    // SAFETY: the path strings are valid for each synchronous callback.
+    unsafe {
+        assert!(!set(
+            host.ctx,
+            crate_abi,
+            RveStr::from_static("/materials/silver.rvemat")
+        ));
+        let message = context.error.clone().unwrap_or_default();
+        assert!(message.contains("не объявлен"), "{message}");
+        assert!(set(
+            host.ctx,
+            crate_abi,
+            RveStr::from_static("/materials/gold.rvemat")
+        ));
+        assert!(!set(
+            host.ctx,
+            0,
+            RveStr::from_static("/materials/gold.rvemat")
+        ));
     }
 }
