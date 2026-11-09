@@ -1128,7 +1128,8 @@ fn console_command_registration_reports_unavailable_optional_host_callbacks() {
     let mut host = host(&mut state);
     host.register_command = None;
     host.unregister_command = None;
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert!(context.console.register("sdk.cmd", None).is_err());
     assert!(context.console.unregister("sdk.cmd").is_err());
 }
@@ -1137,7 +1138,8 @@ fn console_command_registration_reports_unavailable_optional_host_callbacks() {
 fn sdk_save_api_round_trips_values_and_reports_optional_callbacks() {
     let mut state = HostState::default();
     let host_table = host(&mut state);
-    let context = Context::new(&host_table).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host_table, &mut properties).unwrap();
     let save = context.save();
 
     save.set("score", &Value::Int(12)).unwrap();
@@ -1152,7 +1154,8 @@ fn sdk_save_api_round_trips_values_and_reports_optional_callbacks() {
 
     let mut unavailable = host(&mut state);
     unavailable.save_set = None;
-    let context = Context::new(&unavailable).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&unavailable, &mut properties).unwrap();
     assert_eq!(
         context.save().set("score", &Value::Int(1)),
         Err(crate::SaveError::Unavailable)
@@ -1167,7 +1170,8 @@ fn sdk_physics_api_wraps_queries_commands_and_character_state() {
         ..HostState::default()
     };
     let host = physics_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
 
     let hit = context
@@ -1201,7 +1205,8 @@ fn sdk_physics_api_wraps_queries_commands_and_character_state() {
 fn sdk_physics_api_reports_absent_optional_callbacks() {
     let mut state = HostState::default();
     let host = host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     assert_eq!(
         context.physics().raycast([0.0; 3], [1.0, 0.0, 0.0], 1.0),
@@ -1217,7 +1222,8 @@ fn sdk_physics_api_reports_absent_optional_callbacks() {
 fn sdk_named_shape_queries_forward_the_requested_shapes_and_filters() {
     let mut state = HostState::default();
     let host = physics_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let ignored = [context.find("camera").unwrap()];
     let options = QueryOptions {
         layer_mask: 1 << 3,
@@ -1376,7 +1382,8 @@ fn sdk_audio_api_forwards_options_and_returns_the_voice_id() {
         ..HostState::default()
     };
     let host = audio_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     object.play_sound(&mut context).unwrap();
     object.set_sound_volume(&mut context, 0.5).unwrap();
@@ -1415,7 +1422,8 @@ fn sdk_audio_api_reports_rejections_missing_callbacks_and_invalid_input() {
         ..HostState::default()
     };
     let host = audio_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     assert_eq!(
         object.play_sound(&mut context),
@@ -1453,7 +1461,8 @@ fn sdk_audio_api_reports_rejections_missing_callbacks_and_invalid_input() {
 
     let mut plain = HostState::default();
     let plain_host = self::host(&mut plain);
-    let mut context = Context::new(&plain_host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&plain_host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     assert_eq!(
         object.stop_sound(&mut context),
@@ -1586,7 +1595,8 @@ fn sdk_spawn_api_forwards_present_fields_and_returns_the_pending_object() {
         ..HostState::default()
     };
     let host = lifecycle_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let camera = context.find("camera").unwrap();
     let options = crate::SpawnOptions::new()
         .position([1.0, 2.0, 3.0])
@@ -1620,7 +1630,8 @@ fn sdk_spawn_api_forwards_present_fields_and_returns_the_pending_object() {
 fn sdk_spawn_api_returns_none_for_refusals_and_non_finite_options() {
     let mut state = HostState::default();
     let host = lifecycle_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     assert!(
         context
             .spawn("prefabs/bolt.rveprefab", &crate::SpawnOptions::new())
@@ -1651,7 +1662,8 @@ fn sdk_object_lifecycle_api_forwards_destroy_and_state_codes() {
         ..HostState::default()
     };
     let host = lifecycle_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     assert!(object.destroy(&mut context, 1.5));
     assert!(object.is_alive(&context));
@@ -1687,7 +1699,8 @@ fn sdk_prefab_api_forwards_requests_and_maps_every_state_code() {
         ..HostState::default()
     };
     let host = lifecycle_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let prefabs = context.prefabs();
     assert!(prefabs.load("prefabs/heavy.rveprefab"));
     assert!(prefabs.unload("prefabs/heavy.rveprefab"));
@@ -1736,7 +1749,8 @@ fn sdk_prefab_api_forwards_requests_and_maps_every_state_code() {
 fn sdk_lifecycle_api_reports_missing_callbacks_without_calling_the_host() {
     let mut state = HostState::default();
     let host = self::host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     assert!(
         context
@@ -1869,7 +1883,8 @@ fn guest_input_wrapper_reads_states_and_pointer_vectors() {
         ..HostState::default()
     };
     let host = host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let input = context.input();
 
     assert!(input.key_down(Key::W));
@@ -1887,7 +1902,8 @@ fn guest_input_wrapper_reads_states_and_pointer_vectors() {
 fn guest_clock_and_timer_context_api_uses_the_appended_host_tail() {
     let mut state = HostState::default();
     let host = host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
 
     let time = context.script_time();
     assert_eq!(time.dt, 0.25);
@@ -1914,7 +1930,8 @@ fn guest_camera_wrappers_read_write_and_switch_cameras() {
         ..HostState::default()
     };
     let host = host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let camera = context.find("camera").unwrap();
     assert_eq!(context.active_camera(), Some(camera));
     assert_eq!(
@@ -1951,7 +1968,8 @@ fn guest_camera_wrappers_report_when_callbacks_are_unavailable() {
     host.set_camera_settings = None;
     host.active_camera = None;
     host.set_active_camera = None;
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let camera = context.find("camera").unwrap();
 
     assert_eq!(context.active_camera(), None);
@@ -2216,7 +2234,8 @@ fn borrowed_abi_values_and_params_become_owned_values() {
 fn context_object_returns_its_own_handle() {
     let mut state = HostState::default();
     let host = host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(context.object(), Object { handle: 1 });
 }
 
@@ -2525,7 +2544,8 @@ fn sdk_cursor_api_reads_applied_state_and_stages_changes() {
         ..HostState::default()
     };
     let host = host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(context.input().cursor_visible(), Some(false));
     assert_eq!(context.input().cursor_locked(), Some(true));
     assert!(context.set_cursor_visible(true));
@@ -2541,7 +2561,8 @@ fn sdk_cursor_api_reports_unavailable_callbacks_before_abi_v8() {
     host.cursor_state = None;
     host.set_cursor_visible = None;
     host.set_cursor_locked = None;
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(context.input().cursor_visible(), None);
     assert_eq!(context.input().cursor_locked(), None);
     assert!(!context.set_cursor_visible(false));
@@ -2633,7 +2654,8 @@ fn animation_host(state: &mut HostState) -> RveHost {
 fn sdk_animation_api_forwards_options_and_reports_host_refusals() {
     let mut state = HostState::default();
     let host = animation_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     object
         .play_animation(
@@ -2670,7 +2692,8 @@ fn sdk_animation_api_forwards_options_and_reports_host_refusals() {
 fn sdk_animation_api_checks_inputs_before_calling_the_host() {
     let mut state = HostState::default();
     let host = animation_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     assert_eq!(
         object.play_animation(
@@ -2703,7 +2726,8 @@ fn sdk_animation_api_checks_inputs_before_calling_the_host() {
 fn sdk_animation_api_is_unavailable_for_hosts_without_v9_callbacks() {
     let mut state = HostState::default();
     let host = host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     assert_eq!(
         object.stop_animation(&mut context),
@@ -3162,7 +3186,8 @@ fn sdk_net_api_reports_mode_peers_and_copies_the_full_peer_list() {
         ..HostState::default()
     };
     let host = net_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let net = context.net();
     assert_eq!(net.mode(), Ok(crate::NetMode::Client));
     assert_eq!(net.is_server(), Ok(false));
@@ -3173,7 +3198,8 @@ fn sdk_net_api_reports_mode_peers_and_copies_the_full_peer_list() {
     state.net_mode = crate::abi::RVE_NET_MODE_HOST;
     state.net_peers = vec![4; 70];
     let host = net_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let net = context.net();
     assert_eq!(net.mode(), Ok(crate::NetMode::Host));
     assert_eq!(net.is_server(), Ok(true));
@@ -3188,7 +3214,8 @@ fn sdk_net_send_encodes_targets_and_maps_host_statuses() {
         ..HostState::default()
     };
     let host = net_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let net = context.net();
     assert_eq!(
         net.send(crate::NetTarget::Server, "a", &Value::Int(1), true),
@@ -3213,7 +3240,8 @@ fn sdk_net_send_encodes_targets_and_maps_host_statuses() {
 
     state.net_status = crate::abi::RVE_NET_INVALID_INPUT;
     let host = net_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(
         context
             .net()
@@ -3222,7 +3250,8 @@ fn sdk_net_send_encodes_targets_and_maps_host_statuses() {
     );
     state.net_status = crate::abi::RVE_NET_REJECTED;
     let host = net_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(
         context
             .net()
@@ -3238,7 +3267,8 @@ fn sdk_net_object_api_forwards_handles_and_reports_unavailable_hosts() {
         ..HostState::default()
     };
     let host = net_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let object = crate::Object { handle: 7 };
     assert_eq!(object.net_id(&context), Ok(Some(77)));
     assert_eq!(object.net_owner(&context), Ok(Some(3)));
@@ -3269,7 +3299,8 @@ fn sdk_net_object_api_forwards_handles_and_reports_unavailable_hosts() {
 
     state.net_status = crate::abi::RVE_NET_REJECTED;
     let host = net_host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(
         object.set_net_owner(&mut context, 4),
         Err(crate::NetError::Rejected)
@@ -3277,7 +3308,8 @@ fn sdk_net_object_api_forwards_handles_and_reports_unavailable_hosts() {
 
     let mut bare = HostState::default();
     let bare_host = self::host(&mut bare);
-    let mut context = Context::new(&bare_host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&bare_host, &mut properties).unwrap();
     let net = context.net();
     assert_eq!(net.mode(), Err(crate::NetError::Unavailable));
     assert_eq!(net.peers(), Err(crate::NetError::Unavailable));
@@ -3398,7 +3430,8 @@ fn guest_gamepad_wrapper_reads_slot_and_aggregate_snapshots() {
         axes: [0.5, -0.25, 0.0, 0.0, 0.75, 0.0],
     };
     let host = gamepad_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let input = context.input();
 
     let pad = input.gamepad(2);
@@ -3421,13 +3454,15 @@ fn guest_gamepad_rumble_forwards_requests_and_reports_host_refusal() {
         ..HostState::default()
     };
     let host = gamepad_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert!(context.input().rumble(0, 0.5, 1.0, 0.25));
     assert_eq!(state.rumble_calls, vec![(0, 0.5, 1.0, 0.25)]);
 
     state.rumble_accepts = false;
     let host = gamepad_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert!(!context.input().rumble(3, 1.0, 1.0, 1.0));
     assert_eq!(state.rumble_calls.last(), Some(&(3, 1.0, 1.0, 1.0)));
 }
@@ -3439,7 +3474,8 @@ fn guest_gamepad_api_is_unavailable_for_hosts_without_v11_callbacks() {
         ..HostState::default()
     };
     let host = host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(context.input().gamepad(1), GamepadState::default());
     assert!(!context.input().rumble(1, 1.0, 1.0, 1.0));
     assert!(context.input().pressed_inputs().is_empty());
@@ -3453,7 +3489,8 @@ fn pressed_inputs_list_gamepad_slots_in_order_with_concrete_names() {
     state.gamepads[3].connected = 1;
     state.gamepads[3].pressed = 1 << GamepadButton::DPadUp as u32;
     let host = gamepad_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert_eq!(
         context.input().pressed_inputs(),
         vec!["Gamepad1.South".to_owned(), "Gamepad3.DPadUp".to_owned()]
@@ -3723,7 +3760,8 @@ fn sdk_ui_api_reads_writes_and_decodes_host_values() {
         ..HostState::default()
     };
     let host = ui_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     let ui = context.ui();
     let canvas = ui.open("ui/menu.rveui").unwrap();
@@ -3781,7 +3819,8 @@ fn sdk_ui_api_reads_writes_and_decodes_host_values() {
 fn sdk_ui_api_reports_missing_callbacks_and_host_refusals() {
     let mut bare = HostState::default();
     let bare_host = self::host(&mut bare);
-    let context = Context::new(&bare_host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&bare_host, &mut properties).unwrap();
     let object = context.find("camera").unwrap();
     let ui = context.ui();
     let canvas = crate::Canvas { raw: UI_CANVAS };
@@ -3797,7 +3836,8 @@ fn sdk_ui_api_reports_missing_callbacks_and_host_refusals() {
         ..HostState::default()
     };
     let host = ui_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let ui = context.ui();
     assert_eq!(ui.open("ui/menu.rveui"), Err(crate::UiError::Rejected));
     let label = crate::Element {
@@ -3808,7 +3848,8 @@ fn sdk_ui_api_reports_missing_callbacks_and_host_refusals() {
 
     state.ui_status = crate::abi::RVE_UI_INVALID_INPUT;
     let host = ui_host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let ui = context.ui();
     assert_eq!(
         ui.set_value(label, crate::UiValue::Number(f64::NAN)),

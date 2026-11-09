@@ -45,7 +45,7 @@ use engine_scene::{
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use rve_sdk::abi::RveScriptDesc;
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -1105,10 +1105,16 @@ impl ScriptHost {
             .collect();
         self.retire_bodies(world, &doomed);
         self.call_destroy_instances(world, &doomed, time);
+        // Проверка и план выполнены выше на копии с теми же слотами: отказ здесь означает ошибку
+        // в инварианте, а не в данных сцены. Экземпляры новой сцены уже созданы, поэтому
+        // отказ не оставляет полуприменённого состояния и должен остановить процесс.
         let replacement = world
             .replace_nonpersistent(scene)
-            .map_err(|error| error.to_string())?;
-        debug_assert_eq!(replacement.added, planned.added);
+            .expect("scene replacement was validated on a copy of the world before teardown");
+        assert_eq!(
+            replacement.added, planned.added,
+            "scene replacement must assign the handles planned on the copy"
+        );
         self.cancel_requests_of(world, &previous_name, &doomed, &doomed_ids);
         self.forget_despawned(&replacement.removed);
         self.rename_script_sources(&previous_name, scene_name);
@@ -2737,13 +2743,25 @@ impl ScriptHost {
                         return CallOutcome::Failed(error.to_string());
                     }
                 };
+                // Только свойства, записанные другим скриптом: собственные записи `self.params`
+                // Lua-таблица хранит сама и не должна откатываться к значению зеркала.
                 let pending_params = {
                     let mut refs = script_refs.borrow_mut();
                     refs.iter_mut()
-                        .find(|entry| entry.serial == instance.serial && entry.params_dirty)
+                        .find(|entry| {
+                            entry.serial == instance.serial && !entry.dirty_properties.is_empty()
+                        })
                         .map(|entry| {
-                            entry.params_dirty = false;
-                            entry.properties.clone()
+                            let dirty = std::mem::take(&mut entry.dirty_properties);
+                            dirty
+                                .iter()
+                                .filter_map(|name| {
+                                    entry
+                                        .properties
+                                        .get(name)
+                                        .map(|value| (name.clone(), value.clone()))
+                                })
+                                .collect::<BTreeMap<_, _>>()
                         })
                 };
                 if let Some(properties) = pending_params
@@ -2909,6 +2927,45 @@ impl ScriptHost {
                         "object handle cannot be represented by the script ABI".to_owned(),
                     );
                 };
+                // Записи свойств другого скрипта доходят модулю до его следующего callback.
+                let writes = {
+                    let mut refs = script_refs.borrow_mut();
+                    refs.iter_mut()
+                        .find(|entry| {
+                            entry.serial == instance.serial && !entry.dirty_properties.is_empty()
+                        })
+                        .map(|entry| {
+                            let dirty = std::mem::take(&mut entry.dirty_properties);
+                            dirty
+                                .iter()
+                                .filter_map(|name| {
+                                    entry
+                                        .properties
+                                        .get(name)
+                                        .map(|value| (name.clone(), value.clone()))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                for (name, value) in &writes {
+                    let call = AbiScriptCall {
+                        self_object,
+                        // SAFETY: the transaction is owned by this call until it commits or discards.
+                        transaction: unsafe { &mut *transaction_ptr },
+                        events,
+                        source: &instance.source,
+                        commands,
+                        commands_generation,
+                        command_owner: index,
+                        commands_allowed: true,
+                    };
+                    if let Err(message) = script.invoke_set_property(time, name, value, call) {
+                        // SAFETY: the synchronous delivery returned, so no call-scoped borrow remains.
+                        unsafe { (*transaction_ptr).discard() };
+                        return CallOutcome::Failed(message);
+                    }
+                }
                 let call = AbiScriptCall {
                     self_object,
                     // SAFETY: this is the only transaction borrow for the synchronous ABI call.
@@ -3694,7 +3751,7 @@ impl ScriptHost {
             schema: schema.cloned().map(Rc::new),
             properties: properties.clone(),
             enabled,
-            params_dirty: false,
+            dirty_properties: BTreeSet::new(),
         });
     }
 

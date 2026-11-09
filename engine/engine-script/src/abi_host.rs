@@ -560,6 +560,42 @@ impl AbiScriptInstance {
         context.callback_result(status)
     }
 
+    /// Доставляет запись объявленного свойства (ABI v21). Модули без этого callback сохраняют
+    /// свои параметры без изменений: их Params не получают записи, которые сделал другой скрипт.
+    pub(crate) fn invoke_set_property(
+        &mut self,
+        time: ScriptTime,
+        name: &str,
+        value: &ParamValue,
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let Some(set_property) = self.descriptor.set_property else {
+            return Ok(());
+        };
+        let object_refs = message_object_refs(value, call.transaction);
+        let value = OwnedAbiValue::new(value, &object_refs);
+        let name = RveStr::from_str_ref(name);
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let status = {
+            let host = context.host(time);
+            // SAFETY: the value, name, instance, and host remain live throughout the callback.
+            unsafe { set_property(self.instance, &host, name, &value.value) }
+        };
+        context.callback_result(status)
+    }
+
     pub(crate) fn invoke_message(
         &mut self,
         time: ScriptTime,

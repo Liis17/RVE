@@ -6,7 +6,7 @@
 //! удалении и коммите; транзакции читают его и ставят заявки.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use engine_files::VirtualPath;
@@ -22,8 +22,8 @@ pub(crate) struct ScriptRefEntry {
     /// Текущие значения объявленных свойств; источник для чтения через `get`.
     pub(crate) properties: BTreeMap<String, ParamValue>,
     pub(crate) enabled: bool,
-    /// Записи пришли из другого скрипта: Lua-таблица `params` экземпляра обновится перед вызовом.
-    pub(crate) params_dirty: bool,
+    /// Имена свойств, записанных другим скриптом после последнего вызова: только они попадают в Lua.
+    pub(crate) dirty_properties: BTreeSet<String>,
 }
 
 pub(crate) type ScriptRefs = Rc<RefCell<Vec<ScriptRefEntry>>>;

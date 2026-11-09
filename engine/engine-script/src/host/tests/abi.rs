@@ -19,8 +19,8 @@ use rve_sdk::abi::{
     RVE_SPAWN_HAS_PARENT, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCreateFn, RveHeader, RveHost,
     RveModule, RveParamDescV13, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3,
     RveScriptDescV4, RveScriptDescV6, RveScriptDescV13, RveScriptDescV15, RveScriptDescV16,
-    RveScriptDescV17, RveScriptDescV19, RveSpawnOptions, RveStatus, RveStr, RveTransform,
-    RveUpdateFn, RveValue,
+    RveScriptDescV17, RveScriptDescV19, RveScriptDescV20, RveSpawnOptions, RveStatus, RveStr,
+    RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
@@ -917,6 +917,9 @@ fn sdk_module() -> &'static RveModule {
         },
         "ReferenceReceiver" => reference_receiver_factory,
         "ScriptRefProbe" => script_ref_probe_factory,
+        "PropertyProbe" => property_probe_factory {
+            speed: f32 = 1.5 (0.0..=10.0),
+        },
     }
 }
 
@@ -2703,6 +2706,7 @@ fn null_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2731,6 +2735,7 @@ fn null_name_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2760,6 +2765,7 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3169,6 +3175,7 @@ fn error_message_module() -> &'static RveModule {
             on_fixed_update: None,
             on_late_update: None,
             on_timer: None,
+            set_property: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -3189,6 +3196,7 @@ fn error_message_module() -> &'static RveModule {
             on_fixed_update: None,
             on_late_update: None,
             on_timer: None,
+            set_property: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -3225,6 +3233,7 @@ fn set_local_during_create_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3250,6 +3259,7 @@ fn poisoned_create_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3904,6 +3914,7 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }]));
     RveModule::new(scripts)
 }
@@ -3989,6 +4000,7 @@ fn malformed_parameter_tables_are_rejected() {
             on_fixed_update: None,
             on_late_update: None,
             on_timer: None,
+            set_property: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -4231,6 +4243,7 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }]));
     Box::leak(Box::new(RveModule::new(scripts)))
 }
@@ -5408,5 +5421,124 @@ path = "/target.lua"
     assert!(
         messages.iter().any(|message| message == "target update 4"),
         "{messages:?}"
+    );
+}
+
+/// Heavy probe with one declared property; logs the value its callbacks observe.
+struct PropertyProbe;
+
+fn property_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PropertyProbe))
+}
+
+impl Script for PropertyProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        let speed = match self.get_property(ctx, "speed") {
+            Some(Value::Float(speed)) => speed,
+            other => panic!("speed is not a float: {other:?}"),
+        };
+        ctx.log_info(format!("probe speed {speed}"));
+    }
+}
+
+const PROPERTY_DRIVER: &str = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("camera"):script("PropertyProbe"):set("speed", 4)
+end
+return Script
+"#;
+
+#[test]
+fn abi_property_write_reaches_the_heavy_instance_before_its_next_callback() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+"#,
+    );
+    let sources = BTreeMap::from([("driver.lua".to_owned(), PROPERTY_DRIVER.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let messages = message_list(&mut host);
+    assert!(
+        messages.iter().any(|message| message == "probe speed 4"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn abi_v20_module_loads_on_the_v21_host_and_runs_without_property_writes() {
+    let _guard = test_lock();
+    let current = sdk_module();
+    // SAFETY: the SDK macro owns an immutable descriptor table for the process lifetime.
+    let current_descriptors =
+        unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV20] = Box::leak(
+        current_descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV20 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+                on_fixed_update: descriptor.on_fixed_update,
+                on_late_update: descriptor.on_late_update,
+                on_timer: descriptor.on_timer,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 20,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }));
+    // SAFETY: the module and exact-sized v20 descriptor array are leaked for the test lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert_eq!(library.abi_version(), 20);
+    assert!(library.script("Probe").unwrap().set_property.is_none());
+
+    let mut world = scripted_world("Probe", r#"{ label = "abi20" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:abi20"),
+        "ABI v20 descriptors load and run on the ABI v21 host"
     );
 }

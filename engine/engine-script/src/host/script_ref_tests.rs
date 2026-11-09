@@ -274,3 +274,47 @@ return Script
         "{stale}"
     );
 }
+
+#[test]
+fn cross_write_does_not_revert_a_property_the_owner_wrote_itself() {
+    const SELF_WRITER: &str = r#"
+local Script = {}
+Script.properties = {
+  speed = { type = "float", default = 1.5, min = 0, max = 10 },
+  count = { type = "int", default = 2 },
+}
+local frame = 0
+function Script:on_update(dt)
+  frame = frame + 1
+  if frame == 1 then
+    self.params.speed = 9
+  end
+  rve.log("target " .. string.format("%g", self.params.speed) .. " " .. string.format("%g", self.params.count))
+end
+return Script
+"#;
+    let driver = format!(
+        r#"
+local Script = {{}}
+local frames = 0
+function Script:on_update()
+  frames = frames + 1
+  if frames == 2 then
+    rve.find("target"):script("{TARGET}"):set("count", 5)
+  end
+end
+return Script
+"#
+    );
+    let mut world = world();
+    let sources = BTreeMap::from([
+        ("driver.lua".to_owned(), driver),
+        ("target.lua".to_owned(), SELF_WRITER.to_owned()),
+        ("other.lua".to_owned(), OTHER_SOURCE.to_owned()),
+    ]);
+    let mut host = ScriptHost::load(&world, "refs", &sources, None).unwrap();
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let second = logs(&mut host);
+    assert!(second.contains(&"target 9 5".to_owned()), "{second:?}");
+}

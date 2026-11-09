@@ -3324,7 +3324,7 @@ impl ScriptTransaction {
                     entry
                         .properties
                         .insert(write.name.clone(), write.value.clone());
-                    entry.params_dirty = true;
+                    entry.dirty_properties.insert(write.name.clone());
                 }
             }
         }

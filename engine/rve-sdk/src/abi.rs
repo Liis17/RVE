@@ -2221,6 +2221,13 @@ pub type RveUpdateFn =
 /// Guest timer callback appended to the script descriptor in ABI v20.
 pub type RveTimerFn =
     unsafe extern "C" fn(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus;
+/// Guest property-write callback appended to the script descriptor in ABI v21.
+pub type RveSetPropertyFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    name: RveStr,
+    value: *const RveValue,
+) -> RveStatus;
 /// Changes the transactional time scale for the current script callback.
 pub type RveSetTimeScaleFn = unsafe extern "C" fn(ctx: *mut c_void, scale: f32) -> bool;
 /// Schedules a script-owned timer. A zero repeat interval denotes a one-shot timer.
@@ -2469,8 +2476,30 @@ pub struct RveScriptDescV19 {
     pub on_disable: Option<RveStartFn>,
 }
 
-/// Current script descriptor; fixed, late, and timer callbacks append to the v19 tail.
-/// ABI v21 uses the same descriptor layout; its new callbacks are host-table additions only.
+/// ABI v20 script descriptor, retained so v20 modules load without reading the v21 tail.
+#[repr(C)]
+pub struct RveScriptDescV20 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+    pub on_fixed_update: Option<RveUpdateFn>,
+    pub on_late_update: Option<RveUpdateFn>,
+    pub on_timer: Option<RveTimerFn>,
+}
+
+/// Current script descriptor (ABI v21): the v20 layout plus the nullable property-write callback.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -2491,7 +2520,11 @@ pub struct RveScriptDesc {
     pub on_fixed_update: Option<RveUpdateFn>,
     pub on_late_update: Option<RveUpdateFn>,
     pub on_timer: Option<RveTimerFn>,
+    /// Applies a declared property written by another script before this instance's next
+    /// callback. Appended in ABI v21; modules that predate it never receive writes.
+    pub set_property: Option<RveSetPropertyFn>,
 }
+
 /// Parameter kind: boolean.
 pub const RVE_PARAM_BOOL: u32 = 0;
 /// Parameter kind: signed 64-bit integer.
@@ -2861,8 +2894,17 @@ mod tests {
                 + size_of::<Option<super::RveUpdateFn>>()
         );
         assert_eq!(
-            size_of::<super::RveScriptDesc>(),
+            offset_of!(super::RveScriptDesc, set_property),
             offset_of!(super::RveScriptDesc, on_timer) + size_of::<Option<super::RveTimerFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveScriptDesc>(),
+            offset_of!(super::RveScriptDesc, set_property)
+                + size_of::<Option<super::RveSetPropertyFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveScriptDescV20>(),
+            offset_of!(super::RveScriptDescV20, on_timer) + size_of::<Option<super::RveTimerFn>>()
         );
     }
 

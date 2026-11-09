@@ -383,6 +383,17 @@ pub trait Script: 'static {
     fn on_late_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
     /// Called when a timer scheduled by this instance expires.
     fn on_timer(&mut self, _ctx: &mut Context<'_>, _tag: &str) {}
+    /// Reads a declared property of this instance. The default returns the value held in the
+    /// instance's params: the creation value, or the latest write the host delivered.
+    fn get_property(&self, ctx: &Context<'_>, name: &str) -> Option<Value> {
+        ctx.properties.get(name).cloned()
+    }
+    /// Applies a property write made by another script, or by the editor, before this instance's
+    /// next callback. The default stores the value in the instance's params, so `get_property`
+    /// returns it afterwards. Overrides that keep their own state should still call the default.
+    fn set_property(&mut self, ctx: &mut Context<'_>, name: &str, value: Value) {
+        ctx.properties.insert(name.to_owned(), value);
+    }
     /// Called when a message is delivered to this script.
     fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
     /// Called when this object begins touching another collider.
@@ -432,6 +443,8 @@ pub struct Context<'a> {
     pub transform: Transform,
     /// Console logging and command registration for this script instance.
     pub console: Console<'a>,
+    /// Declared property values of this instance; see [`Script::get_property`].
+    properties: &'a mut Params,
     _not_send_or_sync: PhantomData<*const ()>,
 }
 
@@ -1413,9 +1426,11 @@ pub struct Object {
     handle: u64,
 }
 
-/// Handle to another script instance, from [`Object::script`]. It becomes stale when that
-/// instance is removed (its object was destroyed or its scene was replaced): every method then
-/// reports failure instead of reaching a different instance.
+/// Handle to another script instance, from [`Object::script`]. It becomes stale when that instance
+/// is removed (its object was destroyed or its scene was replaced). Stale handles never reach a
+/// different instance. Refused calls (stale handle, undeclared name, out-of-range value, or a call
+/// outside update callbacks) return `None` or `false` and do not fail the calling callback; a
+/// malformed value does fail it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScriptRef {
     handle: u64,
@@ -1543,7 +1558,7 @@ impl<'a> Context<'a> {
         Save { host: self.host }
     }
 
-    fn new(host: &'a RveHost) -> Result<Self, String> {
+    fn new(host: &'a RveHost, properties: &'a mut Params) -> Result<Self, String> {
         let mut transform = RveTransform::default();
         // SAFETY: the host object is valid for this callback and owns this output slot.
         let ok = unsafe { (host.get_local)(host.ctx, host.self_object, &mut transform) };
@@ -1556,6 +1571,7 @@ impl<'a> Context<'a> {
             initial_transform,
             transform: initial_transform,
             console: Console { host },
+            properties,
             _not_send_or_sync: PhantomData,
         })
     }
@@ -1716,7 +1732,8 @@ impl<'a> Context<'a> {
 
     /// Requests loading a project scene. The request is checked against the project's enabled
     /// scenes now and runs after this frame; the current scene changes only if that load succeeds.
-    /// Returns `false` for an undeclared path or a call that cannot request scenes.
+    /// Returns `false` for an undeclared path or a call outside update callbacks, without failing
+    /// the calling callback.
     pub fn load_scene(&mut self, path: &str) -> bool {
         let Some(callback) = self.host.scene_load else {
             return false;
@@ -3980,14 +3997,19 @@ pub mod __private {
         RVE_NET_EVENT_PEER_CONNECTED, RVE_NET_EVENT_PEER_DISCONNECTED, RVE_PARAM_HAS_MAX,
         RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RVE_TRIGGER_STAY,
         RveCollisionEvent, RveCollisionFn, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
-        RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveStartFn, RveStatus,
-        RveStr, RveTimerFn, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
+        RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveSetPropertyFn,
+        RveStartFn, RveStatus, RveStr, RveTimerFn, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    struct GuestInstance(Box<dyn Script>);
+    /// Guest state of one script instance. `properties` holds its declared values: creation values,
+    /// then writes the host delivers through [`Script::set_property`].
+    struct GuestInstance {
+        script: Box<dyn Script>,
+        properties: Params,
+    }
 
     // Mirrors the fields of `RveScriptDesc`, which the macro fills in one call.
     #[allow(clippy::too_many_arguments)]
@@ -4008,6 +4030,7 @@ pub mod __private {
         ui_event: RveUiEventFn,
         enable: RveStartFn,
         disable: RveStartFn,
+        set_property: RveSetPropertyFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -4029,6 +4052,7 @@ pub mod __private {
             on_fixed_update: Some(fixed_update),
             on_late_update: Some(late_update),
             on_timer: Some(timer),
+            set_property: Some(set_property),
         }
     }
 
@@ -4100,11 +4124,12 @@ pub mod __private {
             }
             // SAFETY: params is valid for the callback per the ABI contract.
             let params = unsafe { (*params).into_owned() }.map_err(|error| error.to_string())?;
-            factory(&params)
+            let script = factory(&params)?;
+            Ok((script, params))
         }));
         match result {
-            Ok(Ok(instance)) => {
-                let instance = Box::new(GuestInstance(instance));
+            Ok(Ok((script, properties))) => {
+                let instance = Box::new(GuestInstance { script, properties });
                 // SAFETY: out was checked above and stores the unique guest allocation.
                 unsafe { *out = Box::into_raw(instance).cast() };
                 RveStatus::Ok
@@ -4134,6 +4159,32 @@ pub mod __private {
         unsafe { with_context(instance, host, |script, ctx| script.on_late_update(ctx, dt)) }
     }
 
+    /// Delivers a declared property write to the instance (ABI v21). The default [`Script`] hook
+    /// stores the value in the instance's params before any override runs.
+    pub unsafe fn set_property(
+        instance: *mut c_void,
+        host: *const RveHost,
+        name: RveStr,
+        value: *const crate::abi::RveValue,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() || value.is_null() {
+            return report(host, "null property callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: pointers are valid for this ABI callback.
+            let name = unsafe { name.to_str() }.map_err(|error| error.to_string())?;
+            // SAFETY: pointers are valid for this ABI callback.
+            let value =
+                unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
+            // SAFETY: instance and host are valid for this callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
+            instance.script.set_property(&mut context, name, value);
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
     pub unsafe fn timer(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus {
         if instance.is_null() || host.is_null() {
             return report(host, "null timer callback argument", RveStatus::Error);
@@ -4143,8 +4194,8 @@ pub mod __private {
             let tag = unsafe { tag.to_str() }.map_err(|error| error.to_string())?;
             // SAFETY: pointers are valid for this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_timer(&mut context, tag);
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
+            instance.script.on_timer(&mut context, tag);
             context.commit()
         }));
         status_from_result(host, result)
@@ -4170,8 +4221,10 @@ pub mod __private {
                 unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
             // SAFETY: instance and host are valid for this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_message(&mut context, sender, name, &value);
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
+            instance
+                .script
+                .on_message(&mut context, sender, name, &value);
             context.commit()
         }));
         status_from_result(host, result)
@@ -4192,12 +4245,12 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: instance and host are valid for this synchronous ABI callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
             let other = Object {
                 handle: event.other,
             };
             match event.kind {
-                RVE_COLLISION_ENTER => instance.0.on_collision_enter(
+                RVE_COLLISION_ENTER => instance.script.on_collision_enter(
                     &mut context,
                     other,
                     CollisionContact {
@@ -4205,10 +4258,10 @@ pub mod __private {
                         normal: event.normal,
                     },
                 ),
-                RVE_COLLISION_EXIT => instance.0.on_collision_exit(&mut context, other),
-                RVE_TRIGGER_ENTER => instance.0.on_trigger_enter(&mut context, other),
-                RVE_TRIGGER_EXIT => instance.0.on_trigger_exit(&mut context, other),
-                RVE_TRIGGER_STAY => instance.0.on_trigger_stay(&mut context, other),
+                RVE_COLLISION_EXIT => instance.script.on_collision_exit(&mut context, other),
+                RVE_TRIGGER_ENTER => instance.script.on_trigger_enter(&mut context, other),
+                RVE_TRIGGER_EXIT => instance.script.on_trigger_exit(&mut context, other),
+                RVE_TRIGGER_STAY => instance.script.on_trigger_stay(&mut context, other),
                 _ => return Err("unknown collision event kind".to_owned()),
             }
             context.commit()
@@ -4244,8 +4297,8 @@ pub mod __private {
                 .collect::<Result<Vec<_>, _>>()?;
             // SAFETY: instance and host are valid for the duration of this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_command(&mut context, name, &args);
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
+            instance.script.on_command(&mut context, name, &args);
             context.commit()
         }));
         status_from_result(host, result)
@@ -4262,7 +4315,7 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: instance and host are valid for this synchronous ABI callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
             match event.kind {
                 RVE_NET_EVENT_MESSAGE => {
                     if event.value.is_null() {
@@ -4274,18 +4327,18 @@ pub mod __private {
                     let value = unsafe { (*event.value).into_owned() }
                         .map_err(|error: ValueError| error.to_string())?;
                     instance
-                        .0
+                        .script
                         .on_net_message(&mut context, event.peer, name, &value);
                 }
                 RVE_NET_EVENT_PEER_CONNECTED => {
-                    instance.0.on_peer_connected(&mut context, event.peer);
+                    instance.script.on_peer_connected(&mut context, event.peer);
                 }
                 RVE_NET_EVENT_PEER_DISCONNECTED => {
                     // SAFETY: the host keeps the reason readable for this callback.
                     let reason =
                         unsafe { event.reason.to_str() }.map_err(|error| error.to_string())?;
                     instance
-                        .0
+                        .script
                         .on_peer_disconnected(&mut context, event.peer, reason);
                 }
                 _ => return Err("unknown net event kind".to_owned()),
@@ -4306,7 +4359,7 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: instance and host are valid for this synchronous ABI callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
             let kind =
                 ui_event_kind(event.kind).ok_or_else(|| "unknown ui event kind".to_owned())?;
             // SAFETY: the host keeps the identifier and value readable for this callback.
@@ -4314,7 +4367,7 @@ pub mod __private {
                 unsafe { event.element_id.to_str() }.map_err(|error| error.to_string())?;
             let value =
                 unsafe { ui_value_from_abi(event.value) }.map_err(|error| error.to_string())?;
-            instance.0.on_ui_event(
+            instance.script.on_ui_event(
                 &mut context,
                 UiEvent {
                     kind,
@@ -4368,8 +4421,8 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: the host supplies valid call-scoped pointers.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            callback(instance.0.as_mut(), &mut context);
+            let mut context = Context::new(unsafe { &*host }, &mut instance.properties)?;
+            callback(instance.script.as_mut(), &mut context);
             context.commit()
         }));
         status_from_result(host, result)
@@ -4764,6 +4817,15 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped host pointer.
             unsafe { $crate::__private::disable(instance, host) }
         }
+        unsafe extern "C" fn __rve_set_property(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            name: $crate::abi::RveStr,
+            value: *const $crate::abi::RveValue,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped name and value pointers.
+            unsafe { $crate::__private::set_property(instance, host, name, value) }
+        }
         unsafe extern "C" fn __rve_drop_instance(
             instance: *mut ::std::ffi::c_void,
         ) -> $crate::abi::RveStatus {
@@ -4787,6 +4849,7 @@ macro_rules! __rve_script_descriptor {
             __rve_ui_event,
             __rve_enable,
             __rve_disable,
+            __rve_set_property,
             $crate::__rve_params!(@munch [] $($params)*),
         )
     }};

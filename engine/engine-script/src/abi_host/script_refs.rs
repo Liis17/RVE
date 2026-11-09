@@ -53,8 +53,7 @@ pub(super) unsafe extern "C" fn host_script_ref_get(
         };
         let value = match context.transaction.script_get(script, &name) {
             Ok(value) => value,
-            Err(error) => {
-                context.error = Some(error.message());
+            Err(_) => {
                 return false;
             }
         };
@@ -114,10 +113,7 @@ pub(super) unsafe extern "C" fn host_script_ref_set(
         };
         match context.transaction.script_set(script, &name, &value) {
             Ok(()) => true,
-            Err(error) => {
-                context.error = Some(error.message());
-                false
-            }
+            Err(_) => false,
         }
     })
 }
@@ -186,10 +182,7 @@ pub(super) unsafe extern "C" fn host_script_ref_enabled(
                 unsafe { *out = enabled };
                 true
             }
-            Err(error) => {
-                context.error = Some(error.message());
-                false
-            }
+            Err(_) => false,
         }
     })
 }
@@ -202,10 +195,7 @@ pub(super) unsafe extern "C" fn host_script_ref_set_enabled(
     guarded(ctx, false, |context| {
         match context.transaction.set_script_enabled_of(script, enabled) {
             Ok(()) => true,
-            Err(error) => {
-                context.error = Some(error.message());
-                false
-            }
+            Err(_) => false,
         }
     })
 }

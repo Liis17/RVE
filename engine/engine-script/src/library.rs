@@ -6,7 +6,8 @@ use rve_sdk::abi::{
     RVE_PARAM_ENUM, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
     RVE_PARAM_OBJECT, RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule,
     RveParamDesc, RveParamDescV13, RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
-    RveScriptDescV15, RveScriptDescV16, RveScriptDescV17, RveScriptDescV19, RveStr, RveUiEventFn,
+    RveScriptDescV15, RveScriptDescV16, RveScriptDescV17, RveScriptDescV19, RveScriptDescV20,
+    RveStr, RveUiEventFn,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -202,7 +203,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            20.. => std::mem::size_of::<RveScriptDesc>(),
+            21.. => std::mem::size_of::<RveScriptDesc>(),
+            20 => std::mem::size_of::<RveScriptDescV20>(),
             19 => std::mem::size_of::<RveScriptDescV19>(),
             17..=18 => std::mem::size_of::<RveScriptDescV17>(),
             16 => std::mem::size_of::<RveScriptDescV16>(),
@@ -237,8 +239,11 @@ impl ScriptLibrary {
         };
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v20 = (header.abi_version >= 20)
+        let descriptors_v21 = (header.abi_version >= 21)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
+        let descriptors_v20 = (header.abi_version == 20).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV20>(), count)
+        });
         let descriptors_v19 = (header.abi_version == 19).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV19>(), count)
         });
@@ -270,8 +275,31 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v20 {
+            let descriptor = if let Some(descriptors) = descriptors_v21 {
                 &descriptors[index]
+            } else if let Some(descriptors) = descriptors_v20 {
+                let descriptor = &descriptors[index];
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    ui_event: descriptor.ui_event,
+                    on_enable: descriptor.on_enable,
+                    on_disable: descriptor.on_disable,
+                    on_fixed_update: descriptor.on_fixed_update,
+                    on_late_update: descriptor.on_late_update,
+                    on_timer: descriptor.on_timer,
+                    set_property: None,
+                }))
             } else if let Some(descriptors) = descriptors_v19 {
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
@@ -293,6 +321,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v17 {
                 let descriptor = &descriptors[index];
@@ -315,6 +344,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v16 {
                 let descriptor = &descriptors[index];
@@ -337,6 +367,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(stride) = descriptors_v15 {
                 // SAFETY: the selected stride matches the module's ABI v15 branch; the module
@@ -366,6 +397,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v13 {
                 let descriptor = &descriptors[index];
@@ -388,6 +420,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v6 {
                 // ABI v6 through v12 have no network callback; normalize it to `None`.
@@ -411,6 +444,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v4 {
                 // ABI v4 and v5 have no collision pointer; normalize it to `None`.
@@ -434,6 +468,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v3 {
                 let descriptor = &descriptors[index];
@@ -457,6 +492,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else {
                 let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
@@ -481,6 +517,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.

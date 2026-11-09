@@ -13,10 +13,7 @@ pub(super) unsafe extern "C" fn host_scene_load(ctx: *mut c_void, path: RveStr) 
         };
         match context.transaction.request_scene_load(&path) {
             Ok(()) => true,
-            Err(message) => {
-                context.error = Some(message);
-                false
-            }
+            Err(_) => false,
         }
     })
 }
