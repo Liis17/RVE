@@ -188,6 +188,7 @@ Sandbox, runtime и редактор создают меши с локально
 - LOD определяется евклидовым расстоянием от камеры до мирового origin объекта; object scale, проекционный размер и hysteresis на выбор уровня не влияют. `cull_distance` удаляет object draws до renderer, а frustum culling renderer использует per-pass camera/light matrices. Instancing не реализован.
 - При отсутствии `VK_LAYER_KHRONOS_validation` debug renderer сообщает об этом и продолжает без слоя. Vulkan SDK для текущего пути не нужен; macOS требует отдельно установленного Vulkan loader и MoltenVK либо окружения SDK.
 - Базовый teardown renderer вызывает `device_wait_idle`, но это не доказывает завершение всех операций presentation engine. Maintenance extensions для этого сейчас не включены.
+- Замена сцены из скрипта (`ScriptHost::replace_scene`) меняет только состояние скриптов и CPU-мир. Пересборка GPU-таблицы сцены на render thread, физики и UI новой сцены в runtime и редакторе пока не подключена; запросы отвечают ошибкой ([[Engine/EngineScript]], [[Engine/EngineRuntime]]).
 - GPU-ресурсы выгруженного тяжёлого префаба освобождаются на render thread, когда он принял или отбросил снимок с `seq ≥ last_seq` (последний снимок, отправленный до выгрузки), либо когда такой снимок уже не придёт. Ресурсы сцены и быстрых префабов живут до конца сцены; модели тяжёлых префабов, общие между загрузками, подсчитываются ссылками.
 
 ## Решения и основания

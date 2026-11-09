@@ -180,6 +180,8 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 
 Перед продвижением часов первого незапаузенного шага `PlaySession::step` обновляет ввод и вызывает `ScriptHost::start` после получения physics и network state. Поэтому `on_start` видит подготовленные bindings и режим сети, получает нулевые время и frame и может задать scale для первого кадра; lifecycle запускается один раз. Затем `PlaySession::step` использует `ScriptFrameTime::advance` с теми же 0.25-секундным unscaled clamp, проектными `fixed_hz`/`max_substeps` и текущим `ScriptHost::time_scale`, что и runtime. Scaled `dt` двигает ScriptHost, physics, `AnimationBridge` и накопленное время GPU-частиц; unscaled elapsed сохраняется отдельно. Pause не вызывает callbacks или physics Step, а tick продолжает обновлять `last_tick`, поэтому resume не включает паузу в delta. При time scale 0 Play продолжает frame callbacks с `dt = 0`, при этом physics substeps, анимация, частицы и time-based timers стоят; frame waits продолжают идти. Детали Lua/Rust timer policy: [[Engine/EngineScript#Время, фазы и расписания (ABI v20)]].
 
+Play не передаёт хосту список включённых сцен проекта, поэтому `rve.scene.load` здесь отклоняется как неподключённая сцена; смена сцены в Play пока не реализована ([[Engine/EngineScript]]).
+
 ## Сеть в Play
 
 - Компоненты `network_identity` и `network_transform` добавляются и удаляются в Inspector (значки `network-identity` и `network-transform`). Правки идут тем же путём, что у остальных компонентов: проверка `SceneDocument::validate`, undo и prefab overrides. Удаление `network_identity` уносит и `network_transform`.
