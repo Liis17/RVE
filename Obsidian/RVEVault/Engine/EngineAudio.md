@@ -62,7 +62,7 @@
 
 - Неактивный объект не начинает воспроизведение: ни `play_on_start` при загрузке, ни `PlaySource` от скрипта. Источник, который уже играет, останавливается, когда объект становится неактивным (`take_activity_changes` в runtime и редакторе Play).
 - `rve.audio.play(path, { follow = obj })` ведёт излучатель голоса по мировой позиции объекта на каждом `sync_positions`. Если объект удалён или стал неактивным, голос останавливается. Клип с `follow` на неактивном объекте отклоняется при вызове. `rve.audio.set_voice_position(id, pos)` фиксирует излучатель и снимает слежение.
-- Параметры клипа: `spatial_blend`, `min_distance`, `max_distance`, `force_mono`. Без позиции и `follow` клип 2D, даже при заданном `spatial_blend`.
+- Параметры клипа: `spatial_blend`, `min_distance`, `max_distance`, `force_mono`. Без позиции и `follow` клип 2D, даже при заданном `spatial_blend`. `position` вместе с `follow` — ошибка вызова (`clip_spatial_problem`). Дистанции проверяются только при `spatial_blend > 0`: у 2D-клипа они не используются. `set_voice_position` отвергает 2D-голос при вызове (см. [[Engine/EngineScript]]).
 
 ## Интеграция
 
