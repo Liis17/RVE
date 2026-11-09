@@ -677,6 +677,7 @@ impl PhysicsWorld {
             colliders,
             trigger_pairs,
             self.gravity,
+            self.collision_matrix,
         )?))
     }
 
@@ -1064,6 +1065,12 @@ impl PhysicsWorld {
                 };
                 let (inverse_mass, center_of_mass_local, inverse_inertia_local) =
                     mass_terms(body.kind, &collider, body.mass, body.lock_rotation)?;
+                // Пара тел строит AABB на каждом шаге; отказ здесь иначе остановил бы весь шаг.
+                let candidate_pose = Pose {
+                    position: body.pose.position + body.pose.rotation * collider.offset,
+                    rotation: body.pose.rotation,
+                };
+                collider.shape.aabb(candidate_pose)?;
                 self.wake_neighbors(handle);
                 self.wake_body(handle);
                 let body = self.bodies.get_mut(&handle).expect("body was checked");
@@ -1252,6 +1259,8 @@ pub struct StepResult {
     pub events: Vec<PhysicsEvent>,
     /// Pairs whose narrowphase hit a numeric limit during this step and were kept unresolved.
     pub skipped_pairs: usize,
+    /// Collider and body-property commands the solver rejected; their bodies kept old values.
+    pub skipped_commands: usize,
 }
 
 pub struct StepDriver {
@@ -1306,6 +1315,7 @@ impl StepDriver {
                 .collect(),
             events: Vec::new(),
             skipped_pairs: 0,
+            skipped_commands: 0,
         }
     }
 
@@ -1341,11 +1351,18 @@ impl StepDriver {
                 },
             }
         }
+        let mut skipped_commands = 0;
         for command in commands {
+            let rejectable = matches!(
+                command,
+                PhysicsCommand::SetCollider { .. } | PhysicsCommand::SetBodyProperties { .. }
+            );
             match self.world.apply_command(command, dt) {
                 Ok(()) => {}
                 // Тело могло быть удалено в этом же шаге (деактивация или уничтожение) раньше команды.
                 Err(PhysicsWorldError::UnknownBody(_)) => {}
+                // Отказ формы или свойств не должен останавливать симуляцию: тело остаётся прежним.
+                Err(_) if rejectable => skipped_commands += 1,
                 Err(error) => return Err(error),
             }
         }
@@ -1374,6 +1391,7 @@ impl StepDriver {
             poses,
             events,
             skipped_pairs: self.world.skipped_pairs,
+            skipped_commands,
         })
     }
 }
@@ -3534,6 +3552,77 @@ mod script_physics_tests {
     }
 
     #[test]
+    fn degenerate_collider_command_is_skipped_and_keeps_body() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let ball = world.insert_body(ball_at(0.0, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        let before = driver.world().bodies[&ball].collider.clone();
+
+        driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetCollider {
+                    body: ball,
+                    shape: PrimitiveShape::Box {
+                        half_extents: Vec3::splat(1.0e-20),
+                    },
+                    offset: Vec3::ZERO,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(driver.world().bodies[&ball].collider, before);
+        assert!(driver.advance_step(1.0 / 60.0, []).is_ok());
+    }
+
+    #[test]
+    fn huge_collider_command_does_not_fail_the_step() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let ball = world.insert_body(ball_at(0.0, 0.5, 0)).unwrap();
+        world.insert_body(wall_at(3.0, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetCollider {
+                    body: ball,
+                    shape: PrimitiveShape::Box {
+                        half_extents: Vec3::splat(1.0e30),
+                    },
+                    offset: Vec3::ZERO,
+                }],
+            )
+            .unwrap();
+        assert!(driver.advance_step(1.0 / 60.0, []).is_ok());
+    }
+
+    #[test]
+    fn subnormal_mass_command_is_skipped_and_keeps_body_mass() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let ball = world.insert_body(ball_at(0.0, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetBodyProperties {
+                    body: ball,
+                    kind: BodyKind::Dynamic,
+                    mass: 1.0e-39,
+                    linear_damping: 0.0,
+                    angular_damping: 0.0,
+                    gravity_scale: 1.0,
+                    lock_rotation: false,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(driver.world().bodies[&ball].mass, 1.0);
+        assert!(driver.advance_step(1.0 / 60.0, []).is_ok());
+    }
+
+    #[test]
     fn collision_matrix_disables_pairs_and_set_layer_restores_them() {
         let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
         let mut masks = [u32::MAX; PHYSICS_LAYER_COUNT];
@@ -3734,10 +3823,16 @@ mod script_physics_tests {
         assert_eq!(state.body_kind, BodyKind::Static);
         assert_eq!(state.mass, 0.0);
 
-        assert!(
-            driver
-                .advance_step(0.0, [dynamic_props(BodyKind::Dynamic, 0.0)])
-                .is_err()
-        );
+        let rejected = driver
+            .advance_step(0.0, [dynamic_props(BodyKind::Dynamic, 0.0)])
+            .unwrap();
+        assert_eq!(rejected.skipped_commands, 1);
+        let state = driver
+            .world()
+            .query_snapshot()
+            .unwrap()
+            .body_state(ball)
+            .unwrap();
+        assert_eq!(state.body_kind, BodyKind::Static);
     }
 }

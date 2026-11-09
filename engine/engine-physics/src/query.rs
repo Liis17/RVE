@@ -5,7 +5,7 @@ use glam::Vec3;
 use crate::broad::MAX_BROADPHASE_ITEMS;
 use crate::narrow::{MAX_MESH_CANDIDATES, collide, convex_triangle_distance};
 use crate::ray::{Ray, RayHit, raycast};
-use crate::world::{BodyHandle, BodyKind};
+use crate::world::{BodyHandle, BodyKind, PHYSICS_LAYER_COUNT, layers_collide};
 use crate::{Aabb, DistanceResult, GeometryError, NarrowphaseError, Pose, Shape, TriMesh};
 
 pub const MAX_QUERY_CANDIDATES: usize = MAX_BROADPHASE_ITEMS;
@@ -117,6 +117,7 @@ pub struct QuerySnapshot {
     /// Активные пары триггера с хотя бы одним trigger-коллайдером; порядок по хендлам.
     trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
     gravity: Vec3,
+    collision_matrix: [u32; PHYSICS_LAYER_COUNT],
 }
 
 #[derive(Clone)]
@@ -204,6 +205,7 @@ impl QuerySnapshot {
         colliders: Vec<QueryCollider>,
         trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
         gravity: Vec3,
+        collision_matrix: [u32; PHYSICS_LAYER_COUNT],
     ) -> Result<Self, QueryError> {
         if colliders.len() > MAX_QUERY_CANDIDATES {
             return Err(QueryError::CandidateLimit);
@@ -222,7 +224,24 @@ impl QuerySnapshot {
             x_order,
             trigger_pairs,
             gravity,
+            collision_matrix,
         })
+    }
+
+    /// Маска слоёв, с которыми тело `body` сталкивается по матрице мира. Пара фильтруется в обе
+    /// стороны, как в шаге физики. Тело вне снимка не ограничивает запрос.
+    pub(crate) fn collision_layer_mask(&self, body: BodyHandle) -> u32 {
+        let Some(layer) = self
+            .colliders
+            .iter()
+            .find(|collider| collider.body == body)
+            .map(|collider| collider.layer)
+        else {
+            return u32::MAX;
+        };
+        (0..PHYSICS_LAYER_COUNT as u32)
+            .filter(|&other| layers_collide(&self.collision_matrix, layer, other))
+            .fold(0, |mask, other| mask | (1 << other))
     }
 
     /// Активные trigger-пары на момент снимка, по возрастанию ключа пары.
