@@ -2965,6 +2965,14 @@ impl ScriptTransaction {
         world
             .particle_command_target(command)
             .map_err(|error| error.to_string())?;
+        // Команда неактивному эмиттеру не применяется ни в runtime, ни в редакторе: отказ здесь
+        // делает поведение одинаковым для обоих потребителей.
+        let object = match command {
+            ParticleCommand::Restart { object } | ParticleCommand::Burst { object, .. } => object,
+        };
+        if self.active_in_hierarchy(object) != Some(true) {
+            return Err("particle commands need an active object".to_owned());
+        }
         self.component_writes.particle_commands.push(command);
         Ok(())
     }

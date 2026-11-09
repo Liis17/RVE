@@ -301,3 +301,30 @@ return Script
     assert_eq!(lamp.point_light.unwrap().intensity, 1.0);
     assert!(lamp.light_enabled);
 }
+
+#[test]
+fn particle_commands_are_refused_for_an_inactive_emitter() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  if self.hidden then
+    rve.find("fire"):particles_restart()
+    rve.find("fire"):particles_emit(4)
+  else
+    self.hidden = true
+    rve.find("fire"):set_active(false)
+  end
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    run_once(&mut world, &mut host);
+    assert!(
+        !errors(&mut host).is_empty(),
+        "команда неактивному эмиттеру отклоняется вызовом"
+    );
+    assert!(host.drain_particle_commands().is_empty());
+}
