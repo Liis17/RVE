@@ -352,6 +352,9 @@ pub(crate) fn mask_frame(
     }
     if let Some(index) = pad {
         masked.hide_pad_buttons(index, pad_mask);
+        if claims.focused {
+            masked.hide_pad_left_stick(index);
+        }
     }
     if claims.wheel {
         masked.hide_wheel();
@@ -904,6 +907,26 @@ mod tests {
         assert_eq!(masked.gamepad_state(1).unwrap().pressed, 0);
         let free = mask_frame(&mut capture, &input, &UiClaims::default(), Some(0));
         assert_eq!(free.gamepad_state(1).unwrap().pressed, 1 << PAD_DPAD_DOWN);
+    }
+
+    #[test]
+    fn left_stick_is_hidden_from_game_only_while_ui_has_focus_on_the_ui_pad() {
+        let mut capture = InputCapture::default();
+        let mut input = ScriptInput::default();
+        // Порядок осей: LeftX, LeftY, RightX, RightY, LeftTrigger, RightTrigger.
+        input.set_pad(0, true, 0, [0.8, -0.6, 0.3, 0.4, 0.0, 0.0]);
+        let focused = UiClaims {
+            focused: true,
+            ..UiClaims::default()
+        };
+        let masked = mask_frame(&mut capture, &input, &focused, Some(0));
+        let state = masked.gamepad_state(1).unwrap();
+        assert_eq!(state.axes[..2], [0.0, 0.0], "левый стик скрыт");
+        assert_eq!(state.axes[2..4], [0.3, 0.4], "правый стик не трогаем");
+        let free = mask_frame(&mut capture, &input, &UiClaims::default(), Some(0));
+        assert_eq!(free.gamepad_state(1).unwrap().axes[..2], [0.8, -0.6]);
+        let other_pad = mask_frame(&mut capture, &input, &focused, None);
+        assert_eq!(other_pad.gamepad_state(1).unwrap().axes[..2], [0.8, -0.6]);
     }
 
     #[test]

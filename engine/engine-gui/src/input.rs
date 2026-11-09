@@ -87,6 +87,8 @@ pub struct UiClaims {
     pub actions: Vec<UiAction>,
     /// Фокус на InputField: новые нажатия клавиатуры скрыты от скриптов.
     pub text_focused: bool,
+    /// Фокус стоит на элементе: навигация UI владеет левым стиком, он скрыт от скриптов.
+    pub focused: bool,
     /// Колесо обработано над ScrollView или списком.
     pub wheel: bool,
 }
@@ -190,6 +192,7 @@ impl UiSystem {
         self.refresh_layouts(false);
         self.sanitize(&mut events);
         claims.text_focused = self.focused_is_input_field();
+        claims.focused = self.focus.is_some();
         // Тесселяция нужна только при изменении видимого состояния: события, ввод или повтор.
         let touched = !events.is_empty()
             || input.primary_pressed

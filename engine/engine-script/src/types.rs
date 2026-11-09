@@ -340,6 +340,14 @@ impl ScriptInput {
         }
     }
 
+    /// Hides the left stick of the pad at zero-based `index` in this frame: its axes read as zero.
+    pub fn hide_pad_left_stick(&mut self, index: usize) {
+        if let Some(pad) = self.pads.get_mut(index) {
+            pad.axes[GamepadAxis::LeftX as usize] = 0.0;
+            pad.axes[GamepadAxis::LeftY as usize] = 0.0;
+        }
+    }
+
     /// Hides the wheel delta of this frame.
     pub fn hide_wheel(&mut self) {
         self.wheel = [0.0; 2];
@@ -512,6 +520,21 @@ mod tests {
         assert_eq!(pad_flags(&input, 0, GamepadButton::South), RVE_INPUT_DOWN);
         assert_eq!(input.pad(0).axis(GamepadAxis::LeftX), 0.5);
         assert_eq!(input.pad(0).axis(GamepadAxis::LeftTrigger), 0.75);
+    }
+
+    #[test]
+    fn hiding_left_stick_zeroes_only_that_sticks_axes_of_one_pad() {
+        let mut input = ScriptInput::default();
+        input.set_pad(0, true, 0, [0.5, -0.25, 0.75, 0.125, 0.25, 0.0]);
+        input.set_pad(1, true, 0, [0.1, 0.2, 0.0, 0.0, 0.0, 0.0]);
+        input.hide_pad_left_stick(0);
+
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftX), 0.0);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftY), 0.0);
+        assert_eq!(input.pad(0).axis(GamepadAxis::RightX), 0.75);
+        assert_eq!(input.pad(0).axis(GamepadAxis::RightY), 0.125);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftTrigger), 0.25);
+        assert_eq!(input.pad(1).axis(GamepadAxis::LeftX), 0.1);
     }
 
     #[test]
