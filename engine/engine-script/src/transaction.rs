@@ -1121,7 +1121,11 @@ impl ScriptTransaction {
         component: CharacterControllerComponent,
     ) -> Result<(), String> {
         self.require_writable("character controller changes")?;
-        self.controller_component(object)?;
+        // Тот же компонент не перестраивает капсулу: синхронизация пересчитывает её только при смене компонента,
+        // поэтому повторная запись с новым масштабом иначе разошлась бы с привязкой.
+        if self.controller_component(object)? == component {
+            return Ok(());
+        }
         let binding = self.physics.borrow().optional_binding(object);
         let world = self.world().ok_or("controller changes need a live world")?;
         let scale = object_world_transform(world, object)

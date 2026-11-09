@@ -1049,6 +1049,46 @@ return Script
 }
 
 #[test]
+fn repeated_same_controller_write_after_a_scale_change_keeps_the_body_capsule() {
+    let script = r#"
+local Script = {}
+function Script:on_update()
+  local player = rve.find("player")
+  assert(player:set_controller(player:get_controller()))
+end
+return Script
+"#;
+    let mut scene = Loop::new(PLAYER_SCENE, &[("player.lua", script)]);
+    scene.step();
+    let player = scene.handle("player");
+    let transform = *scene.world.local_transform(player).unwrap();
+    scene
+        .world
+        .set_local_transform(
+            player,
+            LocalTransform {
+                scale: Vec3::splat(2.0),
+                ..transform
+            },
+        )
+        .unwrap();
+    scene.step();
+
+    let binding = scene
+        .sync
+        .bindings()
+        .iter()
+        .find(|binding| binding.object == player)
+        .unwrap();
+    assert_eq!(binding.character_controller.unwrap().radius, 0.3);
+    let center = scene.world.world_matrix(player).unwrap().w_axis.truncate();
+    assert!(
+        !scene.overlaps_sphere(center + Vec3::X * 0.45, 0.05),
+        "the body keeps the capsule of the binding; a same-value write does not rebake it"
+    );
+}
+
+#[test]
 fn controller_scaled_flat_or_to_zero_mid_play_keeps_the_frame_loop_running() {
     let script = r#"
 local Script = {}
