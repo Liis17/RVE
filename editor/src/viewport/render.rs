@@ -1756,6 +1756,7 @@ impl SceneRenderer {
                 &self.game_draws
             },
             overlay: &[],
+            ui: &[],
             debug_view,
             reset_history: self.motion_history.reset_pending,
             // Симулирует вид, который показывает игру: Scene в редактировании, Game во время Play.

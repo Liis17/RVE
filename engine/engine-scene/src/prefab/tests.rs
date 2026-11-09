@@ -897,6 +897,47 @@ fn documents_without_instances_validate_as_before() {
 }
 
 #[test]
+fn ui_canvas_prefab_override_replaces_the_whole_component_and_checks_its_document() {
+    let prefab = "[[assets]]\npath = \"/ui/hud.rveui\"\n[[objects]]\nid = \"hud\"\n[objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\nlayer = 3\n";
+    let library = Library::new(&[("prefabs/hud.rveprefab", prefab)]);
+    let assets = "[[assets]]\npath = \"/prefabs/hud.rveprefab\"\n[[assets]]\npath = \"/ui/hud.rveui\"\n[[assets]]\npath = \"/ui/menu.rveui\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"ui\"\nprefab = \"/prefabs/hud.rveprefab\"\n[[instances.overrides]]\ntarget = \"hud\"\nui_canvas = {{ document = \"/ui/menu.rveui\", visible = false }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let canvas = object(&expanded, "ui").ui_canvas.clone().unwrap();
+    assert_eq!(canvas.document.as_str(), "ui/menu.rveui");
+    assert!(!canvas.visible);
+    assert_eq!(
+        canvas.layer, None,
+        "replacement must not keep inherited fields"
+    );
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"ui\"\nprefab = \"/prefabs/hud.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "ui").ui_canvas.as_ref().unwrap().layer,
+        Some(3)
+    );
+
+    let undeclared = format!(
+        "{CAMERA}[[assets]]\npath = \"/prefabs/hud.rveprefab\"\n[[instances]]\nid = \"ui\"\nprefab = \"/prefabs/hud.rveprefab\"\n[[instances.overrides]]\ntarget = \"hud\"\nui_canvas = {{ document = \"/ui/menu.rveui\" }}\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &undeclared).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\nui_canvas = {{ document = \"/ui/hud.rveui\" }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("ui_canvas"), "{error}");
+}
+
+#[test]
 fn audio_source_prefab_override_replaces_the_whole_component_and_checks_its_clip() {
     let prefab = "[[assets]]\npath = \"/audio/hum.wav\"\n[[objects]]\nid = \"speaker\"\n[objects.audio_source]\nclip = \"/audio/hum.wav\"\nvolume = 0.4\nlooping = true\n";
     let library = Library::new(&[("prefabs/speaker.rveprefab", prefab)]);

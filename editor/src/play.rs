@@ -8,6 +8,7 @@ use engine_assets::Assets;
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
 use engine_files::VirtualPath;
+use engine_gui::paint::{UiImageData, UiPaint};
 use engine_input::{GamepadSnapshot, GamepadTuning, GilrsBackend, PadGate};
 use engine_network::SpawnedRoot;
 use engine_physics::{
@@ -24,9 +25,9 @@ use engine_scene::{
     activity_audio_requests,
 };
 use engine_script::{
-    CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, RumbleRequest,
+    CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, PreparedUi, RumbleRequest,
     ScriptCursor, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
-    ScriptLoadOptions, ScriptTime, SpawnedObject, WorldChanges,
+    ScriptLoadOptions, ScriptTime, SpawnedObject, UiInputBridge, UiRegistry, UiTick, WorldChanges,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -132,9 +133,44 @@ pub struct PlayPrefabs {
     resources: Option<ResourceHandle>,
     /// Документ тяжёлого префаба из списка объявляет heavy-скрипт: Play нужна библиотека.
     heavy_prefabs_use_scripts: bool,
+    ui: PreparedUi,
 }
 
 impl PlayPrefabs {
+    /// Загружает `.rveui` из компонентов мира и быстрых префабов до загрузки скриптов.
+    pub fn prepare_ui(&mut self, world: &World, assets: &Assets) -> Result<(), String> {
+        let paths = world
+            .objects()
+            .iter()
+            .filter_map(|object| {
+                object
+                    .ui_canvas
+                    .as_ref()
+                    .map(|canvas| canvas.document.clone())
+            })
+            .chain(self.templates.values().flat_map(|template| {
+                template.objects().iter().filter_map(|object| {
+                    object
+                        .ui_canvas
+                        .as_ref()
+                        .map(|canvas| canvas.document.clone())
+                })
+            }))
+            .collect::<BTreeSet<_>>();
+        let Some(resources) = self.resources.as_ref() else {
+            if paths.is_empty() {
+                return Ok(());
+            }
+            return Err("ресурсы проекта недоступны для UI Canvas".to_owned());
+        };
+        self.ui = engine_script::load_ui(&ProjectUiAssets { resources, assets }, paths.iter())?;
+        Ok(())
+    }
+
+    pub fn ui_images(&self) -> &BTreeMap<String, Arc<UiImageData>> {
+        &self.ui.images
+    }
+
     /// Раскрывает каждый `.rveprefab` из `[[assets]]` документа. Префаб, который не читается,
     /// не разбирается или не может быть заспавнен, пропускается: его путь не попадает в
     /// каталог, и `spawn` по нему ошибку не даст. Причина возвращается предупреждением для лога
@@ -260,6 +296,38 @@ impl PlayPrefabs {
     }
 }
 
+struct ProjectUiAssets<'a> {
+    resources: &'a ResourceHandle,
+    assets: &'a Assets,
+}
+
+impl engine_script::UiAssetSource for ProjectUiAssets<'_> {
+    fn read_text(&self, label: &str) -> Result<String, String> {
+        read_resource_text(self.resources, label)
+    }
+
+    fn read_bytes(&self, label: &str) -> Result<Vec<u8>, String> {
+        self.resources
+            .read_all(label)
+            .map_err(|error| format!("{label}: {error}"))?
+            .wait()
+            .map_err(|error| format!("{label}: {error}"))
+    }
+
+    fn read_image(&self, label: &str) -> Result<UiImageData, String> {
+        let path =
+            VirtualPath::parse(label.trim_start_matches('/')).map_err(|error| error.to_string())?;
+        let texture = self
+            .assets
+            .load_texture(path.as_str())
+            .map_err(|error| format!("{label}: {error}"))?;
+        Ok(UiImageData::premultiplied(
+            [texture.width, texture.height],
+            texture.rgba,
+        ))
+    }
+}
+
 fn is_prefab_path(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -326,6 +394,7 @@ struct HeavyPrefab {
     template: Arc<PrefabTemplate>,
     sources: BTreeMap<String, String>,
     geometry: Vec<ModelGeometry>,
+    ui: PreparedUi,
 }
 
 /// Ответ фонового потока. `load_id` отличает ответ текущей загрузки от устаревшей.
@@ -463,10 +532,28 @@ fn load_heavy_prefab(
         }
         geometry.push(collider_geometry(&assets, model)?);
     }
+    let ui_paths = template
+        .objects()
+        .iter()
+        .filter_map(|object| {
+            object
+                .ui_canvas
+                .as_ref()
+                .map(|canvas| canvas.document.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let ui = engine_script::load_ui(
+        &ProjectUiAssets {
+            resources,
+            assets: &assets,
+        },
+        ui_paths.iter(),
+    )?;
     Ok(HeavyPrefab {
         template: Arc::new(template),
         sources,
         geometry,
+        ui,
     })
 }
 
@@ -498,9 +585,14 @@ pub struct PlaySession {
     particle_commands: Vec<engine_scene::world::ParticleCommand>,
     heavy: HeavyLoads,
     last_step: PlayStep,
-    /// Ошибки, которые не относятся к скриптам и ждут `drain_events`: например, отказ физики
-    /// при создании тела активированного объекта.
+    /// Errors not associated with scripts wait for drain_events, such as physics rejecting a body.
     pending_events: Vec<ScriptEvent>,
+    ui_input: UiInputBridge,
+    ui_text_focus: Arc<AtomicBool>,
+    pending_input: Option<ScriptInput>,
+    ui_registry: UiRegistry,
+    pending_ui_images: Vec<(String, BTreeMap<String, Arc<UiImageData>>)>,
+    pending_ui_detach: Vec<String>,
 }
 
 /// The project's `[input.gamepad]` as the gamepad backend takes it.
@@ -669,6 +761,7 @@ impl PlaySession {
             mut sources,
             resources,
             heavy_prefabs_use_scripts: _,
+            ui,
         } = prefabs;
         for object in world.objects() {
             for script in &object.lite_scripts {
@@ -695,6 +788,10 @@ impl PlaySession {
             },
         )
         .map_err(|error| error.to_string())?;
+        let ui_text_focus = Arc::new(AtomicBool::new(false));
+        let ui_input = UiInputBridge::new(Arc::clone(&ui_text_focus));
+        let mut ui_registry = UiRegistry::default();
+        ui_registry.register(&mut host, &ui)?;
         // Регистрация компилирует Lua шаблонов: зависший top-level chunk прерывает watchdog.
         for (path, template) in templates {
             host.register_prefab(&world, &path, template, &sources)
@@ -735,6 +832,12 @@ impl PlaySession {
             last_tick: Instant::now(),
             last_step: PlayStep::default(),
             pending_events: Vec::new(),
+            ui_input,
+            ui_text_focus,
+            pending_input: None,
+            ui_registry,
+            pending_ui_images: Vec::new(),
+            pending_ui_detach: Vec::new(),
             input: ScriptInput::default(),
             pad_gate: PadGate::default(),
             rumble: Vec::new(),
@@ -787,6 +890,32 @@ impl PlaySession {
     /// Вводит состояние кнопок и клавиш для следующего обновления.
     pub fn input_mut(&mut self) -> &mut ScriptInput {
         &mut self.input
+    }
+
+    /// Обновляет игровой UI до скриптов и возвращает кадр ввода с удалёнными UI-событиями.
+    pub fn update_ui_input(&mut self, tick: UiTick) -> ScriptInput {
+        let input = self.input.take_frame();
+        let masked = self
+            .ui_input
+            .tick(&mut self.host, input, tick, self.elapsed);
+        self.pending_input = Some(masked);
+        masked
+    }
+
+    pub fn ui_text_focused(&self) -> bool {
+        self.ui_text_focus.load(Ordering::Acquire)
+    }
+
+    pub fn ui_paint(&mut self) -> UiPaint {
+        self.host.ui_mut().paint()
+    }
+
+    pub fn drain_ui_images(&mut self) -> Vec<(String, BTreeMap<String, Arc<UiImageData>>)> {
+        std::mem::take(&mut self.pending_ui_images)
+    }
+
+    pub fn drain_ui_detach(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_ui_detach)
     }
 
     /// Reads the gamepads for the next update and delivers the rumble of the last update. Pads
@@ -865,7 +994,11 @@ impl PlaySession {
         }
         self.elapsed += f64::from(dt);
         self.frame += 1;
-        self.host.set_input(self.input.take_frame());
+        self.host.set_input(
+            self.pending_input
+                .take()
+                .unwrap_or_else(|| self.input.take_frame()),
+        );
         let time = self.script_time();
         self.watchdog
             .set_deadline(Some(Instant::now() + self.time_limit));
@@ -1096,6 +1229,7 @@ impl PlaySession {
                 }
                 PrefabRequest::Unload(path) => {
                     let models = self.heavy.forget(&path);
+                    self.pending_ui_detach.push(format!("heavy:{path}"));
                     if let Some(physics) = &mut self.physics {
                         physics.remove_heavy_geometry(&models);
                     }
@@ -1129,6 +1263,7 @@ impl PlaySession {
             template,
             sources,
             geometry,
+            ui,
         } = match result {
             Ok(prefab) => prefab,
             Err(error) => {
@@ -1140,13 +1275,22 @@ impl PlaySession {
         self.watchdog
             .set_deadline(Some(Instant::now() + self.time_limit));
         let registered = self
-            .host
-            .register_prefab(&self.world, &path, template, &sources);
+            .ui_registry
+            .register(&mut self.host, &ui)
+            .and_then(|()| {
+                self.host
+                    .register_prefab(&self.world, &path, template, &sources)
+                    .map_err(|error| error.to_string())
+            });
         self.watchdog.set_deadline(None);
         if let Err(error) = registered {
             self.host
                 .prefab_failed(&self.world, &path, &error.to_string());
             return;
+        }
+        if !ui.images.is_empty() {
+            self.pending_ui_images
+                .push((format!("heavy:{path}"), ui.images));
         }
         let models = geometry.iter().map(|model| model.path.clone()).collect();
         if let Some(physics) = &mut self.physics {
@@ -2587,6 +2731,36 @@ return Spawner
 
         session.step(0.1).unwrap();
         assert!(has_message(&mut session, "ball start"));
+        session.stop();
+    }
+
+    #[test]
+    fn heavy_prefab_ui_is_registered_before_its_canvas_is_spawned() {
+        let prefab = "[[assets]]\npath = \"/ui/hud.rveui\"\n[[objects]]\nid = \"hud\"\n[objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\n";
+        let ui = "[[elements]]\nid = \"label\"\ntext = { string = \"HUD\" }\nrect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], offset_max = [100.0, 30.0] }\n";
+        let assets = TempAssets::new(&[
+            ("spawner.lua", SPAWN_ONCE),
+            ("prefabs/ball.rveprefab", prefab),
+            ("ui/hud.rveui", ui),
+        ]);
+        let mut session = start_heavy(
+            HEAVY_SCENE,
+            &assets,
+            &heavy_catalog(&["/prefabs/ball.rveprefab"]),
+        );
+        session.step(0.1).unwrap();
+        finish_heavy_load(&mut session);
+        session.step(0.1).unwrap();
+        assert!(spawned_ball(&mut session).is_some());
+        session.update_ui_input(UiTick {
+            screen_px: [640, 480],
+            ..UiTick::default()
+        });
+        let paint = session.ui_paint();
+        assert!(
+            !paint.draw_list.vertices.is_empty(),
+            "spawned heavy canvas paints its registered document"
+        );
         session.stop();
     }
 

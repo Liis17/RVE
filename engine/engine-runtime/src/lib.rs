@@ -10,6 +10,7 @@ mod console;
 mod cursor;
 #[cfg(any(feature = "dev-console", test))]
 mod dev_overlays;
+mod game_ui;
 mod hardware;
 mod headless;
 mod input;
@@ -399,6 +400,7 @@ fn run_from_args(
         sources,
         render_assets,
         prefabs,
+        ui,
         ..
     } = prepared;
     let mut render_assets = render_assets;
@@ -406,6 +408,7 @@ fn run_from_args(
         // Исходники экранных шейдеров читает только игровой клиент; headless их не открывает.
         render_assets.screen_shaders = scene::load_screen_shader_sources(&resource_handle, &world);
     }
+    let ui_text_focus = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (script_tx, script_rx) = flume::unbounded();
     let (frame_tx, frame_rx) = flume::bounded(1);
     let (render_tx, render_rx) = flume::unbounded();
@@ -466,6 +469,8 @@ fn run_from_args(
             audio: Some(audio_handle),
             prefabs,
             physics_geometry,
+            ui,
+            ui_text_focus: Arc::clone(&ui_text_focus),
             prefab_loader: prefab_loader_tx,
             render_resources: resource_tx.clone(),
             network: network_session,
@@ -556,6 +561,7 @@ fn run_from_args(
                 resource_stats: resource_handle.clone(),
                 startup,
                 input,
+                text_focus: ui_text_focus,
                 #[cfg(feature = "dev-console")]
                 console_buffer,
                 #[cfg(feature = "dev-console")]

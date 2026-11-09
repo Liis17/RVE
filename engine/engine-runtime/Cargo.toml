@@ -1,6 +1,6 @@
 [package]
 name = "engine-runtime"
-version = "0.17.1"
+version = "0.18.0"
 edition.workspace = true
 license.workspace = true
 
@@ -8,7 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [features]
-dev-console = ["dep:egui", "dep:egui-winit", "dep:engine-ui", "dep:winit"]
+dev-console = ["dep:egui", "dep:egui-winit", "dep:winit", "engine-ui/egui"]
 dlss = ["engine-render/dlss"]
 
 [dependencies]
@@ -18,8 +18,9 @@ engine-input = { path = "../engine-input" }
 egui = { workspace = true, optional = true }
 egui-winit = { workspace = true, optional = true }
 engine-assets = { path = "../engine-assets" }
-engine-ui = { path = "../engine-ui", optional = true }
+engine-ui = { path = "../engine-ui", default-features = false }
 engine-files = { path = "../engine-files" }
+engine-gui = { path = "../engine-gui" }
 engine-audio = { path = "../engine-audio" }
 engine-animation = { path = "../engine-animation" }
 engine-neural = { path = "../engine-neural" }
@@ -32,6 +33,7 @@ engine-resources = { path = "../engine-resources" }
 engine-scene = { path = "../engine-scene" }
 engine-script = { path = "../engine-script" }
 engine-window = { path = "../engine-window" }
+epaint = "=0.36.2"
 flume.workspace = true
 glam.workspace = true
 log.workspace = true

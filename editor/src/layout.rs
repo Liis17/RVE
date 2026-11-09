@@ -20,11 +20,12 @@ pub enum Tab {
     /// Подокно тегов и слоёв `[tags]` и `[layers]` в `project.rveproject`.
     ProjectSettings,
     Profiler,
+    UiEditor,
     MaterialPreview,
 }
 
 impl Tab {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
@@ -35,6 +36,7 @@ impl Tab {
         Self::ProjectPrefabs,
         Self::ProjectSettings,
         Self::Profiler,
+        Self::UiEditor,
         Self::MaterialPreview,
     ];
 
@@ -50,6 +52,7 @@ impl Tab {
             Self::ProjectPrefabs => "Project Prefabs",
             Self::ProjectSettings => "Project Settings",
             Self::Profiler => "Profiler",
+            Self::UiEditor => "UI Editor",
             Self::MaterialPreview => "Material Preview",
         }
     }
@@ -79,7 +82,17 @@ impl TabViewer for EditorTabs<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        if *tab == Tab::UiEditor
+            && self
+                .state
+                .ui_document
+                .as_ref()
+                .is_some_and(crate::ui_editor::CanvasEditor::is_dirty)
+        {
+            "UI Editor *".into()
+        } else {
+            tab.title().into()
+        }
     }
 
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
@@ -90,7 +103,13 @@ impl TabViewer for EditorTabs<'_> {
         match tab {
             Tab::Scene => ui::scene_view::show(ui, self.state),
             Tab::Game => ui::game_view::show(ui, self.state),
+            Tab::Hierarchy if self.state.ui_authoring => {
+                crate::ui_editor::show_hierarchy(ui, self.state)
+            }
             Tab::Hierarchy => ui::hierarchy::show(ui, self.state),
+            Tab::Inspector if self.state.ui_authoring => {
+                crate::ui_editor::show_inspector(ui, self.state)
+            }
             Tab::Inspector => ui::inspector::show(ui, self.state),
             Tab::Project => ui::project_panel::show(ui, self.state),
             Tab::Console => ui::console::show(ui, self.state),
@@ -98,6 +117,10 @@ impl TabViewer for EditorTabs<'_> {
             Tab::ProjectPrefabs => ui::project_prefabs::show(ui, self.state),
             Tab::ProjectSettings => ui::project_tags::show(ui, self.state),
             Tab::Profiler => ui::profiler::show(ui, self.state),
+            Tab::UiEditor => {
+                self.state.ui_editor_rect = Some(ui.max_rect());
+                crate::ui_editor::show(ui, self.state);
+            }
             Tab::MaterialPreview => ui::material_preview::show(ui, self.state),
         }
     }
@@ -125,10 +148,10 @@ mod tests {
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
                 .count();
-            // Подокна Scene Assets, Project Prefabs и Project Settings открываются из меню Window.
+            // Scene Assets, Project Prefabs, Project Settings and UI Editor open from menus.
             let optional = matches!(
                 tab,
-                Tab::SceneAssets | Tab::ProjectPrefabs | Tab::ProjectSettings
+                Tab::SceneAssets | Tab::ProjectPrefabs | Tab::ProjectSettings | Tab::UiEditor
             );
             let expected = usize::from(!optional);
             assert_eq!(count, expected, "{tab:?}");

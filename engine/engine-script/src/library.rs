@@ -6,7 +6,7 @@ use rve_sdk::abi::{
     RVE_PARAM_ENUM, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
     RVE_PARAM_OBJECT, RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule,
     RveParamDesc, RveParamDescV13, RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
-    RveScriptDescV15,
+    RveScriptDescV15, RveScriptDescV18,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -161,7 +161,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            16.. => std::mem::size_of::<RveScriptDesc>(),
+            19.. => std::mem::size_of::<RveScriptDesc>(),
+            16..=18 => std::mem::size_of::<RveScriptDescV18>(),
             14 | 15 => std::mem::size_of::<RveScriptDescV15>(),
             13 => std::mem::size_of::<RveScriptDescV13>(),
             6..=12 => std::mem::size_of::<RveScriptDescV6>(),
@@ -184,38 +185,53 @@ impl ScriptLibrary {
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v16 = (header.abi_version >= 16)
+        let descriptors_v19 = (header.abi_version >= 19)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        // ABI v14 and v15 have no enable and disable callbacks; only v15 has the new parameter descriptor.
+        let descriptors_v18 = (16..=18).contains(&header.abi_version).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV18>(), count)
+        });
         let descriptors_v15 = (14..=15).contains(&header.abi_version).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV15>(), count)
         });
-        // ABI v13 has the network tail; v13 and v14 use the pre-v15 parameter descriptor.
         let descriptors_v13 = (header.abi_version == 13).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV13>(), count)
         });
-        // SAFETY: versions 6 through 12 share the descriptor layout without network callbacks.
         let descriptors_v6 = (6..=12).contains(&header.abi_version).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV6>(), count)
         });
-        // SAFETY: versions 4 and 5 share the command-callback descriptor without collision.
         let descriptors_v4 = (4..=5).contains(&header.abi_version).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV4>(), count)
         });
-        // SAFETY: version 3 has the parameter fields but no appended command callback.
         let descriptors_v3 = (header.abi_version == 3).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV3>(), count)
         });
-        // SAFETY: versions 1 and 2 share the original descriptor layout.
         let descriptors_v1 = (header.abi_version < 3).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV1>(), count)
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v16 {
+            let descriptor = if let Some(descriptors) = descriptors_v19 {
                 &descriptors[index]
+            } else if let Some(descriptors) = descriptors_v18 {
+                let descriptor = &descriptors[index];
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    on_enable: descriptor.on_enable,
+                    on_disable: descriptor.on_disable,
+                    ui_event: None,
+                }))
             } else if let Some(descriptors) = descriptors_v15 {
-                // ABI v14 and v15 have no enable and disable callbacks; normalize them to `None`.
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
@@ -232,6 +248,7 @@ impl ScriptLibrary {
                     net_event: descriptor.net_event,
                     on_enable: None,
                     on_disable: None,
+                    ui_event: None,
                 }))
             } else if let Some(descriptors) = descriptors_v13 {
                 let descriptor = &descriptors[index];
@@ -250,9 +267,9 @@ impl ScriptLibrary {
                     net_event: descriptor.net_event,
                     on_enable: None,
                     on_disable: None,
+                    ui_event: None,
                 }))
             } else if let Some(descriptors) = descriptors_v6 {
-                // ABI v6 through v12 have no network callback; normalize it to `None`.
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
@@ -269,9 +286,9 @@ impl ScriptLibrary {
                     net_event: None,
                     on_enable: None,
                     on_disable: None,
+                    ui_event: None,
                 }))
             } else if let Some(descriptors) = descriptors_v4 {
-                // ABI v4 and v5 have no collision pointer; normalize it to `None`.
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
@@ -288,10 +305,10 @@ impl ScriptLibrary {
                     net_event: None,
                     on_enable: None,
                     on_disable: None,
+                    ui_event: None,
                 }))
             } else if let Some(descriptors) = descriptors_v3 {
                 let descriptor = &descriptors[index];
-                // ABI v3 has no command pointer; normalize the stable prefix and schema.
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
                     create: descriptor.create,
@@ -307,11 +324,10 @@ impl ScriptLibrary {
                     net_event: None,
                     on_enable: None,
                     on_disable: None,
+                    ui_event: None,
                 }))
             } else {
                 let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
-                // Older ABI versions have no parameter fields. Normalize their stable callback
-                // prefix so instances can keep using the same descriptor representation.
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
                     create: descriptor.create,
@@ -327,6 +343,7 @@ impl ScriptLibrary {
                     net_event: None,
                     on_enable: None,
                     on_disable: None,
+                    ui_event: None,
                 }))
             };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.

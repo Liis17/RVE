@@ -120,6 +120,7 @@ mod tests {
                 load_id: 7,
             },
             cpu: PrefabCpu {
+                ui: Default::default(),
                 template: Arc::new(template),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),

@@ -11,20 +11,16 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 10 appends animation callbacks after the v9 prefab tail.
 /// Version 11 appends gamepad state and rumble callbacks after the v10 animation tail.
 /// Version 12 appends post-process callbacks after the v11 gamepad tail.
-/// Version 13 appends network callbacks after the v12 post-process tail and the net event callback
-/// after the v6 collision tail of the descriptor.
-/// Version 14 appends screen shader callbacks after the v13 network tail.
-/// Version 15 adds parameter kinds and an argument string to parameter descriptors.
-/// Version 16 appends hierarchy, activity, tag, layer and script-enable callbacks after the v14
-/// screen shader tail, and the `on_enable` and `on_disable` callbacks after the v15 descriptor fields.
-/// Version 17 appends runtime physics component, character, overlap and cast callbacks after the
-/// v16 tail, and the `RVE_TRIGGER_STAY` event kind for `on_trigger_stay`.
-/// Version 18 appends light, mesh renderer, particle, environment, LOD, audio source and voice
-/// position callbacks after the v17 physics tail, and the audio play-ex callback that takes
-/// follow, distance, blend and mono options without changing `RveAudioParams`.
+/// Version 13 appends network callbacks and `net_event`.
+/// Version 14 appends camera screen shader callbacks after the v13 net tail.
+/// Version 15 adds typed parameter kinds and an argument string to parameter descriptors.
+/// Version 16 appends object hierarchy/activity callbacks and lifecycle callbacks.
+/// Version 17 appends runtime physics callbacks after the v16 tail.
+/// Version 18 appends scene component callbacks after the v17 physics tail.
+/// Version 19 appends UI callbacks after the v18 host tail and `ui_event` after the v16 descriptor tail.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 18;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 19;
 
 /// Component names accepted by `RveHost::object_has_component`, in the order used by
 /// `components()` on the guest side.
@@ -46,7 +42,6 @@ pub const RVE_COMPONENT_NAMES: [&str; 16] = [
     "network_identity",
     "network_transform",
 ];
-
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
@@ -1541,6 +1536,153 @@ pub type RveNetObjectSendFn = unsafe extern "C" fn(
     reliable: bool,
 ) -> u32;
 
+/// Результат UI-вызова хоста: `RVE_UI_OK`, `RVE_UI_REJECTED` или `RVE_UI_INVALID_INPUT`.
+pub const RVE_UI_OK: u32 = 0;
+/// Хост отказал: устаревший хендл, неподдерживаемое свойство или запись запрещена в этой фазе.
+pub const RVE_UI_REJECTED: u32 = 1;
+/// Значение не подходит: не конечное число, неверный индекс, объявленная картинка не найдена.
+pub const RVE_UI_INVALID_INPUT: u32 = 2;
+
+/// Свойства канваса; передаются в `ui_get`/`ui_set` с элементом `0`.
+pub const RVE_UI_PROP_CANVAS_VISIBLE: u32 = 0;
+/// Слой канваса (`i64` в значении, хост проверяет диапазон `i32`).
+pub const RVE_UI_PROP_CANVAS_LAYER: u32 = 1;
+/// Текст `Text` или `InputField`.
+pub const RVE_UI_PROP_TEXT: u32 = 2;
+/// Значение элемента: число, флаг, индекс выпадающего списка (с нуля) или текст.
+pub const RVE_UI_PROP_VALUE: u32 = 3;
+pub const RVE_UI_PROP_VISIBLE: u32 = 4;
+pub const RVE_UI_PROP_INTERACTABLE: u32 = 5;
+/// Цвет элемента в `RveUiValue::color`.
+pub const RVE_UI_PROP_COLOR: u32 = 6;
+
+/// Вид значения в [`RveUiValue::kind`]; `NONE` означает отсутствие значения в событии.
+pub const RVE_UI_VALUE_NONE: u32 = 0;
+pub const RVE_UI_VALUE_NUMBER: u32 = 1;
+pub const RVE_UI_VALUE_BOOL: u32 = 2;
+pub const RVE_UI_VALUE_INDEX: u32 = 3;
+pub const RVE_UI_VALUE_TEXT: u32 = 4;
+pub const RVE_UI_VALUE_COLOR: u32 = 5;
+/// Integer payload for the canvas layer.
+pub const RVE_UI_VALUE_INTEGER: u32 = 6;
+
+/// Вид события UI в [`RveUiEvent::kind`].
+pub const RVE_UI_EVENT_CLICK: u32 = 0;
+pub const RVE_UI_EVENT_VALUE_CHANGED: u32 = 1;
+pub const RVE_UI_EVENT_SUBMIT: u32 = 2;
+pub const RVE_UI_EVENT_CANCEL: u32 = 3;
+pub const RVE_UI_EVENT_FOCUS: u32 = 4;
+pub const RVE_UI_EVENT_BLUR: u32 = 5;
+pub const RVE_UI_EVENT_HOVER_ENTER: u32 = 6;
+pub const RVE_UI_EVENT_HOVER_EXIT: u32 = 7;
+
+/// Значение элемента или свойства канваса. Индекс выпадающего списка считается с нуля.
+/// Строка заимствована: хост или гость владеют её памятью только на время вызова.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveUiValue {
+    /// One of the `RVE_UI_VALUE_*` kinds.
+    pub kind: u32,
+    /// Boolean payload for `RVE_UI_VALUE_BOOL`.
+    pub flag: bool,
+    /// Number payload for `RVE_UI_VALUE_NUMBER`.
+    pub number: f64,
+    /// Index payload for `RVE_UI_VALUE_INDEX`, and integer payload for `RVE_UI_VALUE_INTEGER`.
+    pub integer: i64,
+    /// Text payload for `RVE_UI_VALUE_TEXT`.
+    pub text: RveStr,
+    /// Color payload for `RVE_UI_VALUE_COLOR`, as sRGB bytes.
+    pub color: [u8; 4],
+}
+
+/// Прямоугольник элемента: якоря, pivot и смещения в единицах канваса.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveUiRect {
+    pub anchor_min: [f32; 2],
+    pub anchor_max: [f32; 2],
+    pub pivot: [f32; 2],
+    pub offset_min: [f32; 2],
+    pub offset_max: [f32; 2],
+}
+
+/// Событие UI, доставляемое `on_ui_event`. Строки и значение действительны только для callback.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveUiEvent {
+    /// One of the `RVE_UI_EVENT_*` kinds.
+    pub kind: u32,
+    /// Canvas handle as returned by `ui_open`.
+    pub canvas: u64,
+    /// Element index in the canvas document.
+    pub element: u32,
+    /// Element identifier from the document.
+    pub element_id: RveStr,
+    /// Event value; `kind` is `RVE_UI_VALUE_NONE` when the event carries none.
+    pub value: RveUiValue,
+}
+
+/// Opens a preloaded `.rveui` document owned by the calling object; `out` receives the canvas.
+pub type RveUiOpenFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr, out: *mut u64) -> u32;
+/// Closes a canvas at commit; returns `RVE_UI_*`.
+pub type RveUiCloseFn = unsafe extern "C" fn(ctx: *mut c_void, canvas: u64) -> u32;
+/// Writes the canvas of an object's `ui_canvas` component; false when there is none.
+pub type RveUiObjectCanvasFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u64) -> bool;
+/// Writes the focused element; false when nothing has focus.
+pub type RveUiFocusedFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: *mut u64, element: *mut u32) -> bool;
+/// Whether the pointer was over interactive UI on the last update.
+pub type RveUiPointerOverFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
+/// Writes the element index with this identifier; false when the canvas has no such element.
+pub type RveUiFindFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, id: RveStr, out: *mut u32) -> bool;
+/// Reads a canvas or element property into `out`.
+pub type RveUiGetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    out: *mut RveUiValue,
+) -> u32;
+/// Writes a canvas or element property from `value`.
+pub type RveUiSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    value: *const RveUiValue,
+) -> u32;
+/// Reads an element rectangle into `out`.
+pub type RveUiGetRectFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32, out: *mut RveUiRect) -> u32;
+/// Writes an element rectangle.
+pub type RveUiSetRectFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    rect: *const RveUiRect,
+) -> u32;
+/// Replaces the options of a dropdown; `options` holds `count` borrowed strings.
+pub type RveUiSetOptionsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    options: *const RveStr,
+    count: usize,
+) -> u32;
+/// Sets the image of an `Image` or `Button` element to a declared `.png` path.
+pub type RveUiSetImageFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32, path: RveStr) -> u32;
+/// Moves focus to a focusable element.
+pub type RveUiFocusFn = unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32) -> u32;
+/// Guest `on_ui_event` callback.
+pub type RveUiEventFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    event: RveUiEvent,
+) -> RveStatus;
+
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
 pub struct RveHost {
@@ -1723,6 +1865,20 @@ pub struct RveHost {
     /// Replaces the material of every mesh part with a `.rvemat` declared in the scene; appended
     /// in v18 after the audio callbacks.
     pub mesh_set_material_path: Option<RveMeshSetMaterialPathFn>,
+    /// Game UI callbacks appended in ABI v19; `None` marks an unavailable callback.
+    pub ui_open: Option<RveUiOpenFn>,
+    pub ui_close: Option<RveUiCloseFn>,
+    pub ui_object_canvas: Option<RveUiObjectCanvasFn>,
+    pub ui_focused: Option<RveUiFocusedFn>,
+    pub ui_pointer_over: Option<RveUiPointerOverFn>,
+    pub ui_find: Option<RveUiFindFn>,
+    pub ui_get: Option<RveUiGetFn>,
+    pub ui_set: Option<RveUiSetFn>,
+    pub ui_get_rect: Option<RveUiGetRectFn>,
+    pub ui_set_rect: Option<RveUiSetRectFn>,
+    pub ui_set_options: Option<RveUiSetOptionsFn>,
+    pub ui_set_image: Option<RveUiSetImageFn>,
+    pub ui_focus: Option<RveUiFocusFn>,
 }
 
 /// Sets a boolean on an object (`mesh_set_visible`, `particles_set_playing`); appended in v18.
@@ -2110,7 +2266,9 @@ pub struct RveScriptDescV6 {
     pub collision: Option<RveCollisionFn>,
 }
 
-/// One exported guest script implementation in ABI version 13.
+/// One exported guest script implementation in ABI version 13, kept for modules built against v13.
+///
+/// The host normalizes it to [`RveScriptDesc`] with `ui_event` set to `None`.
 #[repr(C)]
 pub struct RveScriptDescV13 {
     pub name: RveStr,
@@ -2145,7 +2303,26 @@ pub struct RveScriptDescV15 {
     pub net_event: Option<RveNetEventFn>,
 }
 
-/// One exported guest script implementation in ABI version 16.
+/// One exported guest script implementation in ABI versions 16 through 18.
+#[repr(C)]
+pub struct RveScriptDescV18 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+}
+
+/// One exported guest script implementation in ABI version 19.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -2159,12 +2336,10 @@ pub struct RveScriptDesc {
     pub param_count: usize,
     pub command: Option<RveCommandFn>,
     pub collision: Option<RveCollisionFn>,
-    /// Optional network event callback appended in ABI v13.
     pub net_event: Option<RveNetEventFn>,
-    /// Optional callback run when the instance starts running; appended in ABI v16.
     pub on_enable: Option<RveStartFn>,
-    /// Optional callback run when a running instance stops; appended in ABI v16.
     pub on_disable: Option<RveStartFn>,
+    pub ui_event: Option<RveUiEventFn>,
 }
 
 /// Parameter kind: boolean.
@@ -2400,7 +2575,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2451,10 +2626,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_physics_callbacks_append_after_the_v15_host_tail() {
+    fn runtime_physics_callbacks_append_after_the_v16_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -2468,7 +2643,7 @@ mod tests {
         assert_eq!(
             offset_of!(RveHost, mesh_set_material_path)
                 + size_of::<Option<super::RveMeshSetMaterialPathFn>>(),
-            size_of::<RveHost>()
+            offset_of!(RveHost, ui_open)
         );
     }
 

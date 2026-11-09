@@ -29,6 +29,7 @@ mod scene_edit;
 mod settings;
 mod state;
 mod ui;
+mod ui_editor;
 mod viewport;
 
 use engine_project::{BootstrapReflexMode, ProjectSettings};

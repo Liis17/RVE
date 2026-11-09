@@ -54,6 +54,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineWindow]] — цикл окна на winit.
 - [[Engine/EnginePlatform]] — общий интерфейс и отдельные адаптеры Windows/macOS.
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
+- [[Engine/EngineGui]] — ядро игрового UI без зависимости от окна, egui и renderer; ресурсы и ввод подключает `engine-script`.
 - [[Engine/EngineMaterials]] — форматы .rvemat/.rveshader, shader schema и связь материал-слот-renderer.
 - [[Engine/EngineFiles]] — канонические virtual paths, Windows filesystem path normalization и `ReadAt` для позиционного чтения.
 - [[Engine/EngineProject]] — общие форматы настроек проекта и bootstrap для приложений и инструментов.
