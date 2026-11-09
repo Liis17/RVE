@@ -1,6 +1,6 @@
 //! Мост между выводом egui и UI pass в `engine-render`.
 
-use crate::game::UiTextures;
+pub use crate::game::UiTextures;
 use egui::epaint::{ClippedPrimitive, Primitive, Vertex};
 use egui::{ImageData, Rect, TextureId, TexturesDelta};
 use engine_render::{RenderError, UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
