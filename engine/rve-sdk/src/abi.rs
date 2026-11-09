@@ -19,9 +19,10 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// callback after the v13 net event callback of the descriptor.
 /// Version 17 appends hierarchy, activity, tag, layer and script-enable callbacks after the UI tail,
 /// and appends on_enable and on_disable after the v16 descriptor tail.
-/// Each version is a new number because hosts of the previous version already accept modules
+/// Version 18 appends physics component, character, overlap and cast callbacks after the v17 host
+/// tail, and adds the RVE_TRIGGER_STAY event kind for on_trigger_stay./// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 17;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 18;
 
 /// Component names accepted by RveHost::object_has_component, in the order used by
 /// components() on the guest side.
@@ -1078,6 +1079,8 @@ pub const RVE_COLLISION_ENTER: u32 = 0;
 pub const RVE_COLLISION_EXIT: u32 = 1;
 pub const RVE_TRIGGER_ENTER: u32 = 2;
 pub const RVE_TRIGGER_EXIT: u32 = 3;
+/// Событие каждого кадра обновления, пока пара триггера активна; появилось в ABI v18.
+pub const RVE_TRIGGER_STAY: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1094,6 +1097,94 @@ pub struct RveCharacterMoveResult {
     pub translation: [f32; 3],
     pub grounded: bool,
     pub collided: bool,
+}
+
+/// Collider shape codes for [`RveColliderValue::shape`]. Appended in ABI v18.
+pub const RVE_COLLIDER_BOX: u32 = 0;
+/// Collider shape code; see [`RVE_COLLIDER_BOX`].
+pub const RVE_COLLIDER_SPHERE: u32 = 1;
+/// Collider shape code; see [`RVE_COLLIDER_BOX`]. Mesh shapes are read-only from scripts.
+pub const RVE_COLLIDER_CAPSULE: u32 = 2;
+/// Collider shape code for a convex mesh; read-only, see [`RVE_COLLIDER_BOX`].
+pub const RVE_COLLIDER_CONVEX_MESH: u32 = 3;
+/// Collider shape code for a triangle mesh; read-only, see [`RVE_COLLIDER_BOX`].
+pub const RVE_COLLIDER_TRIANGLE_MESH: u32 = 4;
+
+/// Body kind codes for [`RveRigidBodyValue::kind`]. Appended in ABI v18.
+pub const RVE_BODY_STATIC: u32 = 0;
+/// Body kind code; see [`RVE_BODY_STATIC`].
+pub const RVE_BODY_KINEMATIC: u32 = 1;
+/// Body kind code; see [`RVE_BODY_STATIC`].
+pub const RVE_BODY_DYNAMIC: u32 = 2;
+
+/// Collider component values. `size` is the full box extent; `radius` and `height` apply to
+/// spheres and capsules. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveColliderValue {
+    pub shape: u32,
+    pub trigger: bool,
+    pub size: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub offset: [f32; 3],
+}
+
+/// Rigid body component values. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveRigidBodyValue {
+    pub kind: u32,
+    pub mass: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub gravity_scale: f32,
+    pub lock_rotation: bool,
+}
+
+/// Character controller component values. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveControllerValue {
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+    pub max_slope_deg: f32,
+    pub snap_distance: f32,
+    pub skin: f32,
+    pub push_strength: f32,
+    pub jump_height: f32,
+    pub gravity_scale: f32,
+    pub use_gravity: bool,
+}
+
+/// Query shape codes for [`RveQueryShape::kind`]: sphere, box or capsule. Appended in ABI v18.
+pub const RVE_QUERY_SPHERE: u32 = 0;
+/// Query shape code; see [`RVE_QUERY_SPHERE`].
+pub const RVE_QUERY_BOX: u32 = 1;
+/// Query shape code; see [`RVE_QUERY_SPHERE`].
+pub const RVE_QUERY_CAPSULE: u32 = 2;
+
+/// Convex query shape for overlap and cast callbacks. `size` is the full box extent. Appended in
+/// ABI v17.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveQueryShape {
+    pub kind: u32,
+    pub size: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+}
+
+/// Overlap and cast options. `ignore` points at `ignore_count` object handles and may be null
+/// when the count is zero. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveQueryOptions {
+    pub layer_mask: u32,
+    pub include_triggers: bool,
+    pub ignore: *const u64,
+    pub ignore_count: usize,
 }
 
 #[repr(C)]
@@ -1129,6 +1220,66 @@ pub type RvePhysicsBoolFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut bool) -> bool;
 pub type RvePhysicsSetBoolFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: bool) -> bool;
+
+/// Reads a collider component; appended in ABI v18.
+pub type RvePhysicsGetColliderFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveColliderValue) -> bool;
+/// Stages a collider component; appended in ABI v18.
+pub type RvePhysicsSetColliderFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveColliderValue) -> bool;
+/// Reads a rigid body component; appended in ABI v18.
+pub type RvePhysicsGetRigidBodyFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveRigidBodyValue) -> bool;
+/// Stages a rigid body component; appended in ABI v18.
+pub type RvePhysicsSetRigidBodyFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveRigidBodyValue) -> bool;
+/// Reads a character controller component; appended in ABI v18.
+pub type RvePhysicsGetControllerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveControllerValue) -> bool;
+/// Stages a character controller component; appended in ABI v18.
+pub type RvePhysicsSetControllerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveControllerValue) -> bool;
+/// Gravity-aware horizontal move; appended in ABI v18.
+pub type RvePhysicsSimpleMoveFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    velocity: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool;
+/// Reads one `f32` physics value; appended in ABI v18.
+pub type RvePhysicsFloatFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut f32) -> bool;
+/// Lists the bodies overlapping a query shape; appended in ABI v18.
+pub type RvePhysicsOverlapFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    options: *const RveQueryOptions,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Lists every raycast hit in distance order; appended in ABI v18.
+pub type RvePhysicsRaycastAllFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Shape-casts and writes the first hit; `object` is zero when nothing is hit. Appended in ABI v18.
+pub type RvePhysicsShapeCastFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    displacement: *const [f32; 3],
+    skin: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+) -> bool;
 
 /// Audio group code for [`RveAudioParams::group`] and `audio_set_group_volume`. Appended in ABI v7.
 pub const RVE_AUDIO_GROUP_MASTER: u32 = 0;
@@ -1696,6 +1847,21 @@ pub struct RveHost {
     pub find_objects_by_tag: Option<RveFindObjectsFn>,
     pub script_set_enabled: Option<RveScriptSetEnabledFn>,
     pub script_enabled: Option<RveScriptEnabledFn>,
+    /// Runtime physics component, character, overlap and cast callbacks appended in ABI v18;
+    /// `None` marks an unavailable callback.
+    pub physics_get_collider: Option<RvePhysicsGetColliderFn>,
+    pub physics_set_collider: Option<RvePhysicsSetColliderFn>,
+    pub physics_get_rigid_body: Option<RvePhysicsGetRigidBodyFn>,
+    pub physics_set_rigid_body: Option<RvePhysicsSetRigidBodyFn>,
+    pub physics_get_controller: Option<RvePhysicsGetControllerFn>,
+    pub physics_set_controller: Option<RvePhysicsSetControllerFn>,
+    pub physics_simple_move: Option<RvePhysicsSimpleMoveFn>,
+    pub physics_jump: Option<RvePhysicsBoolFn>,
+    pub physics_vertical_velocity: Option<RvePhysicsFloatFn>,
+    pub physics_overlaps: Option<RveObjectListFn>,
+    pub physics_overlap: Option<RvePhysicsOverlapFn>,
+    pub physics_raycast_all: Option<RvePhysicsRaycastAllFn>,
+    pub physics_shape_cast: Option<RvePhysicsShapeCastFn>,
 }
 
 /// Sets an object's own active flag. Returns `false` for a dead object or a refused write.
@@ -1955,7 +2121,7 @@ pub struct RveScriptDescV16 {
     pub ui_event: Option<RveUiEventFn>,
 }
 
-/// Current exported guest script implementation in ABI version 17.
+/// Current exported guest script implementation in ABI version 18.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -2090,9 +2256,10 @@ mod tests {
         Key, MouseButton, PhysicalInput, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR,
         RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_AO_QUALITY_HIGH,
         RVE_EXPOSURE_MODE_AUTO, RVE_EXPOSURE_MODE_MANUAL, RVE_SCRIPT_ABI_VERSION,
-        RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RveAnimationStopFn,
-        RveCameraSettings, RveGamepadRumbleFn, RveGamepadStateFn, RveGetCameraSettingsFn,
-        RveGetPostProcessFn, RveHost, RvePostProcessSettings,
+        RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_TRIGGER_STAY,
+        RveAnimationStopFn, RveCameraSettings, RveGamepadRumbleFn, RveGamepadStateFn,
+        RveGetCameraSettingsFn, RveGetPostProcessFn, RveHost, RvePhysicsShapeCastFn,
+        RvePostProcessSettings, RveScriptEnabledFn,
     };
 
     #[test]
@@ -2211,7 +2378,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 17);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2259,5 +2426,21 @@ mod tests {
         assert_eq!(defaults.tonemapper, RVE_TONEMAPPER_ACES);
         assert_eq!(defaults.bloom_enabled, 0);
         assert_eq!(defaults.motion_samples, 12);
+    }
+
+    #[test]
+    fn runtime_physics_callbacks_append_after_the_v15_host_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
+        assert_eq!(RVE_TRIGGER_STAY, 4);
+        assert_eq!(
+            offset_of!(RveHost, physics_get_collider),
+            offset_of!(RveHost, script_enabled) + size_of::<Option<RveScriptEnabledFn>>()
+        );
+        assert_eq!(
+            offset_of!(RveHost, physics_shape_cast) + size_of::<Option<RvePhysicsShapeCastFn>>(),
+            size_of::<RveHost>()
+        );
     }
 }

@@ -199,11 +199,13 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 ## Инспектор, Hierarchy и Project Settings
 
 - Inspector: галочка `Active` (неактивный объект и его поддерево серые в Hierarchy и не рисуются в видовом экране), `Tag` и `Layer` из списков проекта. У каждого Lua- и Rust-скрипта есть галочка `Enabled` — начальный флаг `script:set_enabled`. Правки проходят через общий undo.
+- Inspector: `Character Controller` редактирует `Gravity Scale`, `Jump Height` и `Use Gravity`. Вкладка `Project Settings` дополнительно показывает матрицу `Collision Matrix` для именованных слоёв: пара отмечается симметрично и сохраняется вместе со списками тем же атомарным путём.
 - Вкладка `Project Settings` (меню Window) редактирует `[tags]` и `[layers]` проекта. `Save` пишет `project.rveproject` через временный файл и переименование, но отказывается, если файл на диске расходится с настройками редактора (правка вне редактора, в том числе до открытия вкладки). Слои — фиксированные слоты: ✕ очищает имя и оставляет индекс занятым, поэтому `layer` объектов не сдвигается. Удаление тега пишет предупреждение в консоль: объекты с ним сохраняют тег, но он больше не записан в `[tags]`.
 
 ## Физика
 
 - Инспектор редактирует `collider`, `rigid_body` и `character_controller` через общий undo. Формы коллайдера: Box, Sphere, Capsule, Convex Mesh и Triangle Mesh; hull и trimesh берут геометрию базовой модели `mesh_renderer`, ошибка hull показывается в инспекторе.
+- Поле `Layer` объекта в Inspector задаёт слой его collider/body; оно использует индекс слота `[layers]` и отображает имя слоя, если оно задано.
 - Add Component предлагает `Collider` и `Character Controller`, если у объекта нет конфликтующего компонента, и `Rigid Body` только при наличии коллайдера.
 - Префаб переопределяет `collider`, `rigid_body` и `character_controller` целиком, как и `point_light`.
 - Флажок `Colliders` во вьюпорте Scene рисует рёбра коллайдеров всех объектов; без него рисуются только выделенные. Геометрия строится функциями `engine-physics` в `editor/src/viewport/colliders.rs`. Trimesh с более чем `MAX_MESH_WIRE_EDGES` = 4096 рёбрами рисуется своим AABB.

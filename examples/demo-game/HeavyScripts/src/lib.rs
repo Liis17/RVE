@@ -27,6 +27,46 @@ impl Script for Bobber {
     }
 }
 
+struct PhysicsProbe {
+    reported: bool,
+}
+
+impl Script for PhysicsProbe {
+    fn on_start(&mut self, context: &mut Context<'_>) {
+        if let Ok(controller) = context.object().get_controller(context) {
+            context.log_info(format!(
+                "PhysicsProbe controller radius {:.2}, gravity {}",
+                controller.radius, controller.use_gravity
+            ));
+        }
+        if let Some(crate_a) = context.find("crate-a")
+            && let (Ok(collider), Ok(body)) = (
+                crate_a.get_collider(context),
+                crate_a.get_rigid_body(context),
+            )
+        {
+            context.log_info(format!(
+                "PhysicsProbe crate {:?} {:?}",
+                collider.shape, body.kind
+            ));
+        }
+    }
+
+    fn on_update(&mut self, context: &mut Context<'_>, _: f32) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        if let Ok(objects) = context.physics().overlap_sphere(
+            context.transform.position,
+            2.0,
+            rve_sdk::QueryOptions::default(),
+        ) {
+            context.log_info(format!("PhysicsProbe overlap count {}", objects.len()));
+        }
+    }
+}
+
 /// The host has already checked parameters against the schema below and filled defaults.
 fn float(params: &Params, name: &str) -> f32 {
     match params.get(name) {
@@ -43,9 +83,14 @@ fn create_bobber(params: &Params) -> Result<Box<dyn Script>, String> {
     }))
 }
 
+fn create_physics_probe(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PhysicsProbe { reported: false }))
+}
+
 rve_sdk::export_scripts! {
     "Bobber" => create_bobber {
         amplitude: f32 = 0.15 (0.0..=10.0) "Amplitude",
         speed: f32 = 1.4 (0.0..=20.0) "Speed",
-    }
+    },
+    "PhysicsProbe" => create_physics_probe,
 }

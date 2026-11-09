@@ -11,8 +11,8 @@ use glam::{Mat3, Vec3};
 use crate::character::{CharacterController, CharacterError};
 use crate::hull::Hull;
 use crate::world::{
-    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsWorld,
-    PhysicsWorldError, StepDriver,
+    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PHYSICS_LAYER_COUNT, PhysicsCommand,
+    PhysicsWorld, PhysicsWorldError, StepDriver,
 };
 use crate::{CombineMode, GeometryError, PhysicsMaterial, Pose, Shape, TriMesh};
 
@@ -44,6 +44,8 @@ pub struct PhysicsSceneDesc {
     pub fixed_hz: u32,
     pub max_substeps: usize,
     pub bodies: Vec<PhysicsSceneBody>,
+    /// Маски слоёв из настроек проекта; по умолчанию все пары слоёв разрешены.
+    pub collision_matrix: [u32; PHYSICS_LAYER_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -163,11 +165,13 @@ impl PhysicsSceneDesc {
             fixed_hz,
             max_substeps,
             bodies,
+            collision_matrix: [u32::MAX; PHYSICS_LAYER_COUNT],
         })
     }
 
     pub fn build(self) -> Result<(StepDriver, Vec<PhysicsSceneBinding>), PhysicsSceneError> {
         let mut world = PhysicsWorld::new(self.gravity)?;
+        world.set_collision_matrix(self.collision_matrix);
         let mut bindings = Vec::with_capacity(self.bodies.len());
         for scene_body in self.bodies {
             let kind = scene_body.desc.kind;
@@ -234,6 +238,10 @@ pub struct PhysicsSceneSync {
     removed_bodies: HashMap<BodyHandle, ObjectHandle>,
     /// Тела, удалённые до предыдущего результата шага: их `*_exit` ещё может прийти.
     retired_bodies: HashMap<BodyHandle, ObjectHandle>,
+    /// Компонент контроллера, по которому запечена капсула привязки. Капсула пересчитывается только при его смене.
+    controller_sources: HashMap<BodyHandle, CharacterControllerComponent>,
+    /// Ошибки пересчёта привязок, которые ещё не забрал `take_warnings`.
+    warnings: Vec<PhysicsSceneSyncError>,
 }
 
 impl PhysicsSceneSync {
@@ -255,6 +263,13 @@ impl PhysicsSceneSync {
             .map(|binding| binding.body.0)
             .max()
             .map_or(1, |max| max.saturating_add(1));
+        let controller_sources = bindings
+            .iter()
+            .filter_map(|binding| {
+                let controller = world.object(binding.object)?.character_controller?;
+                Some((binding.body, controller))
+            })
+            .collect();
         Ok(Self {
             bindings,
             binding_indices,
@@ -262,11 +277,19 @@ impl PhysicsSceneSync {
             next_body,
             removed_bodies: HashMap::new(),
             retired_bodies: HashMap::new(),
+            controller_sources,
+            warnings: Vec::new(),
         })
     }
 
     pub fn bindings(&self) -> &[PhysicsSceneBinding] {
         &self.bindings
+    }
+
+    /// Забирает ошибки пересчёта привязок с прошлого вызова. Привязка в этом случае сохраняет
+    /// прежние параметры контроллера.
+    pub fn take_warnings(&mut self) -> Vec<PhysicsSceneSyncError> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Объекты из `objects`, которые ещё не привязаны к телу. Привязанные пропускаются: например,
@@ -338,6 +361,9 @@ impl PhysicsSceneSync {
                 character_controller,
             } = body;
             let handle = BodyHandle(first + offset as u64);
+            if let Some(controller) = world.object(object).and_then(|o| o.character_controller) {
+                self.controller_sources.insert(handle, controller);
+            }
             self.binding_indices.insert(handle, self.bindings.len());
             self.bindings.push(PhysicsSceneBinding {
                 object,
@@ -361,6 +387,7 @@ impl PhysicsSceneSync {
         let last_synced = std::mem::take(&mut self.last_synced);
         for (binding, pose) in bindings.into_iter().zip(last_synced) {
             if doomed.contains(&binding.object) {
+                self.controller_sources.remove(&binding.body);
                 self.removed_bodies.insert(binding.body, binding.object);
                 changes.push(BodyChange::Remove {
                     handle: binding.body,
@@ -409,6 +436,11 @@ impl PhysicsSceneSync {
         world: &mut World,
     ) -> Result<Vec<PhysicsCommand>, PhysicsSceneSyncError> {
         world.recalculate_world_matrices();
+        for binding in &mut self.bindings {
+            if let Err(error) = reconcile_binding(world, binding, &mut self.controller_sources) {
+                self.warnings.push(PhysicsSceneSyncError::Scene(error));
+            }
+        }
         let mut commands = Vec::new();
         for (index, binding) in self.bindings.iter().enumerate() {
             let current = world_pose(world, binding.object)?;
@@ -431,6 +463,39 @@ impl PhysicsSceneSync {
         }
         Ok(commands)
     }
+}
+
+/// Тип тела и контроллер привязки берутся из компонентов мира. Скрипты меняют их в World при коммите,
+/// а копия в `PhysicsScriptState` не доходит до синхронизации: без этого привязка хранила бы старый
+/// тип и слала команды, которые тело отвергает.
+/// Капсула контроллера пересчитывается только при смене его компонента, по текущему масштабу, как в
+/// `set_controller_component`. Масштаб сам по себе тело не перестраивает, поэтому капсула привязки и тела
+/// не расходятся. Ошибка пересчёта не останавливает синхронизацию: компонент запоминается, чтобы та же
+/// смена не повторялась каждый кадр, а привязка сохраняет прежние параметры.
+fn reconcile_binding(
+    world: &World,
+    binding: &mut PhysicsSceneBinding,
+    controller_sources: &mut HashMap<BodyHandle, CharacterControllerComponent>,
+) -> Result<(), PhysicsSceneError> {
+    let Some(object) = world.object(binding.object) else {
+        return Ok(());
+    };
+    if object.collider.is_some() {
+        binding.kind = object.rigid_body.map_or(BodyKind::Static, body_kind);
+        return Ok(());
+    }
+    let Some(settings) = object.character_controller else {
+        return Ok(());
+    };
+    if controller_sources.get(&binding.body) == Some(&settings) {
+        return Ok(());
+    }
+    controller_sources.insert(binding.body, settings);
+    let transform = object_world_transform(world, binding.object)?;
+    let radial_scale = transform.scale.x.abs().max(transform.scale.z.abs());
+    binding.kind = BodyKind::Kinematic;
+    binding.character_controller = Some(scale_character(settings, radial_scale, transform.scale)?);
+    Ok(())
 }
 
 /// Мировая поза объекта и знаковый масштаб, которым физика запекает его коллайдеры.
@@ -541,6 +606,16 @@ pub fn primitive_collider_shape(
     }
 }
 
+/// Параметры character controller с размерами, запечёнными по масштабу объекта. Тот же расчёт,
+/// что у тела при загрузке сцены, поэтому смена параметров скриптом совпадает с построением.
+pub fn character_controller_scaled(
+    component: CharacterControllerComponent,
+    scale: Vec3,
+) -> Result<CharacterController, PhysicsSceneError> {
+    let radial_scale = scale.x.abs().max(scale.z.abs());
+    Ok(scale_character(component, radial_scale, scale)?)
+}
+
 /// Капсула character controller с размерами, запечёнными по масштабу объекта.
 pub fn character_capsule_shape(
     component: CharacterControllerComponent,
@@ -634,6 +709,7 @@ fn scene_body(
             ColliderDesc::new(shape),
         );
         desc.character_controller = true;
+        desc.layer = u32::from(object.layer);
         return Ok(Some(PhysicsSceneBody {
             object: object.handle,
             desc,
@@ -663,6 +739,7 @@ fn scene_body(
     collider_desc.trigger = collider.trigger;
     collider_desc.material = material;
     let mut desc = BodyDesc::new(kind, transform.pose, collider_desc);
+    desc.layer = u32::from(object.layer);
     apply_rigid_body(&mut desc, rigid_body);
     Ok(Some(PhysicsSceneBody {
         object: object.handle,
@@ -821,14 +898,14 @@ mod tests {
         ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync, PhysicsSceneSyncError,
         ShapeCache, character_capsule_shape, primitive_collider_shape,
     };
-    use crate::world::{BodyChange, BodyHandle, BodyKind, PhysicsCommand};
+    use crate::world::{BodyChange, BodyHandle, BodyKind, PhysicsCommand, StepDriver};
     use crate::{
         CombineMode, GeometryError, PhysicsMaterial, PhysicsSceneError, Pose, Ray, Shape, raycast,
     };
     use engine_files::VirtualPath;
     use engine_scene::{
         ColliderComponent, ColliderShape, LocalTransform, ObjectHandle, PrefabTemplate,
-        SceneDocument, SpawnOptions, World,
+        RigidBodyComponent, RigidBodyKind, SceneDocument, SpawnOptions, World,
     };
     use glam::{Quat, Vec3};
     use std::sync::Arc;
@@ -1109,6 +1186,123 @@ mod tests {
         );
         assert!(sync.sync_world_commands(&mut scene).unwrap().is_empty());
         assert_eq!(driver.world().body_pose(body).unwrap().position, Vec3::ZERO);
+    }
+
+    /// Сцена с одним коробом заданного типа тела. Скрипт меняет тип через World, а команду
+    /// `SetBodyProperties` в том же кадре шлёт перед командами синхронизации, как рантайм.
+    fn boxed_body_scene(kind: &str) -> (World, PhysicsSceneSync, StepDriver) {
+        let scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='box'\n\
+             [objects.collider]\nshape='box'\n\
+             [objects.rigid_body]\nkind='{kind}'\n"
+        ));
+        let (driver, bindings) =
+            PhysicsSceneDesc::from_world(&scene, &[], Vec3::new(0.0, -9.81, 0.0), 60, 8)
+                .unwrap()
+                .build()
+                .unwrap();
+        let sync = PhysicsSceneSync::new(&scene, bindings).unwrap();
+        (scene, sync, driver)
+    }
+
+    fn script_kind_command(body: BodyHandle, kind: BodyKind) -> PhysicsCommand {
+        PhysicsCommand::SetBodyProperties {
+            body,
+            kind,
+            mass: 1.0,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            gravity_scale: 1.0,
+            lock_rotation: false,
+        }
+    }
+
+    fn set_rigid_kind(scene: &mut World, object: ObjectHandle, kind: RigidBodyKind) {
+        scene
+            .set_rigid_body(
+                object,
+                RigidBodyComponent {
+                    kind,
+                    ..RigidBodyComponent::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn kinematic_to_dynamic_script_change_moves_body_with_physics() {
+        let (mut scene, mut sync, mut driver) = boxed_body_scene("kinematic");
+        let object = scene.handle("box").unwrap();
+        let body = sync.bindings()[0].body;
+        set_rigid_kind(&mut scene, object, RigidBodyKind::Dynamic);
+
+        let mut frame = vec![script_kind_command(body, BodyKind::Dynamic)];
+        frame.extend(sync.sync_world_commands(&mut scene).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, frame).unwrap();
+        sync.apply_physics_poses(&mut scene, &result.poses).unwrap();
+        for _ in 0..30 {
+            let result = driver.advance_step(1.0 / 60.0, []).unwrap();
+            sync.apply_physics_poses(&mut scene, &result.poses).unwrap();
+        }
+
+        assert!(scene.world_matrix(object).unwrap().w_axis.y < 0.0);
+    }
+
+    #[test]
+    fn kinematic_to_static_then_move_teleports_without_kinematic_target() {
+        let (mut scene, mut sync, mut driver) = boxed_body_scene("kinematic");
+        let object = scene.handle("box").unwrap();
+        let body = sync.bindings()[0].body;
+        set_rigid_kind(&mut scene, object, RigidBodyKind::Static);
+        scene
+            .set_local_transform(
+                object,
+                LocalTransform {
+                    position: Vec3::new(2.0, 0.0, 0.0),
+                    ..*scene.local_transform(object).unwrap()
+                },
+            )
+            .unwrap();
+
+        let commands = sync.sync_world_commands(&mut scene).unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [PhysicsCommand::Teleport { body: moved, .. }] if *moved == body
+        ));
+        let mut frame = vec![script_kind_command(body, BodyKind::Static)];
+        frame.extend(commands);
+        driver.advance_step(1.0 / 60.0, frame).unwrap();
+
+        assert_eq!(
+            driver.world().body_pose(body).unwrap().position,
+            Vec3::new(2.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn dynamic_to_kinematic_move_uses_kinematic_target() {
+        let (mut scene, mut sync, mut driver) = boxed_body_scene("dynamic");
+        let object = scene.handle("box").unwrap();
+        let body = sync.bindings()[0].body;
+        set_rigid_kind(&mut scene, object, RigidBodyKind::Kinematic);
+        scene
+            .set_local_transform(
+                object,
+                LocalTransform {
+                    position: Vec3::new(2.0, 0.0, 0.0),
+                    ..*scene.local_transform(object).unwrap()
+                },
+            )
+            .unwrap();
+
+        let commands = sync.sync_world_commands(&mut scene).unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [PhysicsCommand::KinematicTarget { body: moved, .. }] if *moved == body
+        ));
+        let mut frame = vec![script_kind_command(body, BodyKind::Kinematic)];
+        frame.extend(commands);
+        driver.advance_step(1.0 / 60.0, frame).unwrap();
     }
 
     #[test]
@@ -1544,5 +1738,84 @@ mod tests {
         assert_eq!(desc.collider.material.static_friction, 0.8);
         assert_eq!(desc.collider.material.dynamic_friction, 0.6);
         assert_eq!(desc.collider.material.bounciness, 0.7);
+    }
+
+    fn controller_scene() -> (World, PhysicsSceneSync, StepDriver) {
+        let scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='player'\n[objects.transform]\nposition=[0,1,0]\n\
+             [objects.character_controller]\nradius=0.3\nheight=1.0\n"
+        ));
+        let (driver, bindings) = desc(&scene, &[]).build().unwrap();
+        let sync = PhysicsSceneSync::new(&scene, bindings).unwrap();
+        (scene, sync, driver)
+    }
+
+    fn set_scale(scene: &mut World, object: ObjectHandle, scale: Vec3) {
+        scene
+            .set_local_transform(
+                object,
+                LocalTransform {
+                    scale,
+                    ..*scene.local_transform(object).unwrap()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn controller_scaled_flat_or_to_zero_during_play_does_not_fail_the_sync() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        for scale in [Vec3::new(1.0, 0.0, 1.0), Vec3::ZERO] {
+            set_scale(&mut scene, player, scale);
+            assert!(
+                sync.sync_world_commands(&mut scene).is_ok(),
+                "scale {scale:?} must not be fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_scale_change_alone_keeps_the_binding_capsule() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        let before = sync.bindings()[0].character_controller;
+        assert!(before.is_some());
+        set_scale(&mut scene, player, Vec3::splat(2.0));
+        sync.sync_world_commands(&mut scene).unwrap();
+        assert_eq!(sync.bindings()[0].character_controller, before);
+    }
+
+    #[test]
+    fn controller_component_change_rebakes_the_capsule_with_the_current_scale() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        set_scale(&mut scene, player, Vec3::splat(2.0));
+        let mut controller = scene.object(player).unwrap().character_controller.unwrap();
+        controller.radius = 0.5;
+        scene.set_character_controller(player, controller).unwrap();
+        sync.sync_world_commands(&mut scene).unwrap();
+        let radius = sync.bindings()[0].character_controller.unwrap().radius;
+        assert!((radius - 1.0).abs() < 1.0e-6, "radius {radius}");
+    }
+
+    #[test]
+    fn failed_controller_rebake_keeps_the_previous_binding_and_warns_once() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        let before = sync.bindings()[0].character_controller;
+        set_scale(&mut scene, player, Vec3::new(1.0, 0.0, 1.0));
+        let mut controller = scene.object(player).unwrap().character_controller.unwrap();
+        controller.radius = 0.5;
+        scene.set_character_controller(player, controller).unwrap();
+
+        assert!(sync.sync_world_commands(&mut scene).is_ok());
+        assert_eq!(sync.bindings()[0].character_controller, before);
+        assert_eq!(sync.take_warnings().len(), 1);
+        assert!(sync.sync_world_commands(&mut scene).is_ok());
+        assert!(
+            sync.take_warnings().is_empty(),
+            "the same component change is not reported again"
+        );
     }
 }

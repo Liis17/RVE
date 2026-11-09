@@ -5,11 +5,12 @@ use crate::lite::{
     CommandGeneration, EventQueue, LuaCommands, MAX_LOG_MESSAGE_BYTES, RegisteredCommandCallback,
     RegisteredLuaCommand,
 };
+use crate::physics::ColliderValues;
 #[cfg(test)]
 use crate::transaction::ScriptTransactionInit;
 use crate::transaction::{
     AbiObject, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget,
-    QueueMessageError, ScriptObjectRef, ScriptTransaction,
+    QueueMessageError, ScriptObjectRef, ScriptQueryFilter, ScriptTransaction,
 };
 use crate::types::{RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use crate::ui::UiDelivery;
@@ -22,25 +23,29 @@ use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
     AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AudioGroup, AudioRequest,
-    CameraColorSettings, CameraRenderSettings, CameraSettings, ClipParams, ComponentKind,
-    ExposureMode, NetEvent, NetMode, NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId,
-    PostProcessSettings, ProjectionSettings, Tonemapper, VoiceId,
+    CameraColorSettings, CameraRenderSettings, CameraSettings, CharacterControllerComponent,
+    ClipParams, ComponentKind, ExposureMode, NetEvent, NetMode, NetTarget, ObjectEdit,
+    ObjectHandle, ParamValue, PeerId, PostProcessSettings, ProjectionSettings, RigidBodyComponent,
+    RigidBodyKind, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use rve_sdk::PhysicalInput;
 use rve_sdk::abi::{
     RVE_ACTION_AXIS, RVE_ACTION_BUTTON, RVE_ACTION_VECTOR2, RVE_ANTI_ALIASING_DLSS,
     RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA,
-    RVE_INPUT_DOWN, RVE_INPUT_MAX_BINDINGS, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR,
-    RVE_LOG_INFO, RVE_LOG_WARN, RVE_NET_EVENT_MESSAGE, RVE_NET_EVENT_PEER_CONNECTED,
+    RVE_BODY_DYNAMIC, RVE_BODY_KINEMATIC, RVE_BODY_STATIC, RVE_COLLIDER_BOX, RVE_COLLIDER_CAPSULE,
+    RVE_COLLIDER_CONVEX_MESH, RVE_COLLIDER_SPHERE, RVE_COLLIDER_TRIANGLE_MESH, RVE_INPUT_DOWN,
+    RVE_INPUT_MAX_BINDINGS, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
+    RVE_LOG_WARN, RVE_NET_EVENT_MESSAGE, RVE_NET_EVENT_PEER_CONNECTED,
     RVE_NET_EVENT_PEER_DISCONNECTED, RVE_NET_INVALID_INPUT, RVE_NET_MODE_CLIENT, RVE_NET_MODE_HOST,
     RVE_NET_MODE_OFFLINE, RVE_NET_MODE_SERVER, RVE_NET_OK, RVE_NET_REJECTED, RVE_NET_TARGET_ALL,
-    RVE_NET_TARGET_PEER, RVE_NET_TARGET_SERVER, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
-    RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_ASSET, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
-    RVE_VALUE_INT, RVE_VALUE_OBJECT, RVE_VALUE_STR, RveArray, RveCameraSettings,
-    RveCharacterMoveResult, RveCollisionEvent, RveCursorState, RveGamepadState, RveHost,
-    RveNetEvent, RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr,
-    RveTime, RveTransform, RveValue, RveValueData,
+    RVE_NET_TARGET_PEER, RVE_NET_TARGET_SERVER, RVE_QUERY_BOX, RVE_QUERY_CAPSULE, RVE_QUERY_SPHERE,
+    RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY,
+    RVE_VALUE_ASSET, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_OBJECT,
+    RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult, RveColliderValue,
+    RveCollisionEvent, RveControllerValue, RveCursorState, RveGamepadState, RveHost, RveNetEvent,
+    RveParamEntry, RveParams, RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue,
+    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use rve_sdk::abi::{
     RVE_AO_QUALITY_HIGH, RVE_AO_QUALITY_LOW, RVE_AO_QUALITY_MEDIUM, RVE_AUDIO_GROUP_AMBIENT,
@@ -289,6 +294,58 @@ impl<'a> AbiCallContext<'a> {
             find_objects_by_tag: Some(host_find_objects_by_tag),
             script_set_enabled: Some(host_script_set_enabled),
             script_enabled: Some(host_script_enabled),
+            physics_get_collider: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_get_collider),
+            physics_set_collider: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_set_collider),
+            physics_get_rigid_body: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_get_rigid_body),
+            physics_set_rigid_body: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_set_rigid_body),
+            physics_get_controller: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_get_controller),
+            physics_set_controller: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_set_controller),
+            physics_simple_move: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_simple_move),
+            physics_jump: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_jump),
+            physics_vertical_velocity: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_vertical_velocity),
+            physics_overlaps: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_overlaps),
+            physics_overlap: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_overlap),
+            physics_raycast_all: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_raycast_all),
+            physics_shape_cast: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_shape_cast),
         }
     }
 
@@ -330,13 +387,20 @@ impl<'a> AbiCallContext<'a> {
 pub(crate) struct AbiScriptInstance {
     instance: *mut c_void,
     descriptor: &'static RveScriptDesc,
+    /// ABI версия модуля; старые модули не понимают `RVE_TRIGGER_STAY`.
+    abi_version: u32,
     events: EventQueue,
     source: String,
 }
 
 impl AbiScriptInstance {
+    pub(crate) fn abi_version(&self) -> u32 {
+        self.abi_version
+    }
+
     pub(crate) fn create(
         descriptor: &'static RveScriptDesc,
+        abi_version: u32,
         params: &BTreeMap<String, ParamValue>,
         object_refs: &std::collections::HashMap<String, ScriptObjectRef>,
         call: AbiScriptCall<'_>,
@@ -358,6 +422,7 @@ impl AbiScriptInstance {
                 drop(Self {
                     instance,
                     descriptor,
+                    abi_version,
                     events: call.events.clone(),
                     source: call.source.to_owned(),
                 });
@@ -377,6 +442,7 @@ impl AbiScriptInstance {
         Ok(Self {
             instance,
             descriptor,
+            abi_version,
             events: call.events.clone(),
             source: call.source.to_owned(),
         })
@@ -1907,6 +1973,592 @@ unsafe extern "C" fn host_object_set_parent(
 }
 
 /// Копирует список хендлов в буфер гостя: пишет общее число и не больше `capacity` значений.
+unsafe extern "C" fn host_physics_get_collider(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut RveColliderValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            context.error = Some("get_collider received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(object) = live_object(context, object, "get_collider") else {
+            return false;
+        };
+        let component = match context.transaction.collider_component(object) {
+            Ok(component) => component,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        // SAFETY: out was checked non-null and is writable for this synchronous callback.
+        unsafe { *out = collider_abi(&ColliderValues::from_component(&component)) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_physics_set_collider(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const RveColliderValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("set_collider received a null value pointer".to_owned());
+            return false;
+        }
+        // SAFETY: value was checked non-null and is readable for this synchronous callback.
+        let values = match collider_values_from_abi(unsafe { *value }) {
+            Ok(values) => values,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        let Some(object) = live_object(context, object, "set_collider") else {
+            return false;
+        };
+        let result = context
+            .transaction
+            .collider_component(object)
+            .and_then(|current| {
+                context
+                    .transaction
+                    .set_collider_component(object, values.apply_to(&current))
+            });
+        finish_staged(context, result)
+    })
+}
+
+unsafe extern "C" fn host_physics_get_rigid_body(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut RveRigidBodyValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            context.error = Some("get_rigid_body received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(object) = live_object(context, object, "get_rigid_body") else {
+            return false;
+        };
+        let component = match context.transaction.rigid_body_component(object) {
+            Ok(component) => component,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        // SAFETY: out was checked non-null and is writable for this synchronous callback.
+        unsafe { *out = rigid_body_abi(component) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_physics_set_rigid_body(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const RveRigidBodyValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("set_rigid_body received a null value pointer".to_owned());
+            return false;
+        }
+        // SAFETY: value was checked non-null and is readable for this synchronous callback.
+        let component = rigid_body_from_abi(unsafe { *value });
+        let Some(object) = live_object(context, object, "set_rigid_body") else {
+            return false;
+        };
+        let result = component.and_then(|component| {
+            context
+                .transaction
+                .set_rigid_body_component(object, component)
+        });
+        finish_staged(context, result)
+    })
+}
+
+unsafe extern "C" fn host_physics_get_controller(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut RveControllerValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            context.error = Some("get_controller received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(object) = live_object(context, object, "get_controller") else {
+            return false;
+        };
+        let component = match context.transaction.controller_component(object) {
+            Ok(component) => component,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        // SAFETY: out was checked non-null and is writable for this synchronous callback.
+        unsafe { *out = controller_abi(component) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_physics_set_controller(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const RveControllerValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("set_controller received a null value pointer".to_owned());
+            return false;
+        }
+        // SAFETY: value was checked non-null and is readable for this synchronous callback.
+        let component = controller_from_abi(unsafe { *value });
+        let Some(object) = live_object(context, object, "set_controller") else {
+            return false;
+        };
+        let result = context
+            .transaction
+            .set_controller_component(object, component);
+        finish_staged(context, result)
+    })
+}
+
+unsafe extern "C" fn host_physics_simple_move(
+    ctx: *mut c_void,
+    object: u64,
+    velocity: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if velocity.is_null() || out.is_null() {
+            context.error = Some("simple_move received a null vector or output pointer".to_owned());
+            return false;
+        }
+        // SAFETY: velocity is readable for this synchronous callback.
+        let velocity = Vec3::from_array(unsafe { *velocity });
+        let Some(object) = live_object(context, object, "simple_move") else {
+            return false;
+        };
+        match context.transaction.simple_move(object, velocity) {
+            Ok(movement) => {
+                // SAFETY: out was checked non-null and is writable for this synchronous callback.
+                unsafe { *out = move_abi(&movement) };
+                true
+            }
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_physics_jump(ctx: *mut c_void, object: u64, value: *mut bool) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("jump received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(object) = live_object(context, object, "jump") else {
+            return false;
+        };
+        match context.transaction.jump(object) {
+            Ok(jumped) => {
+                // SAFETY: value was checked non-null and is writable for this synchronous callback.
+                unsafe { *value = jumped };
+                true
+            }
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_physics_vertical_velocity(
+    ctx: *mut c_void,
+    object: u64,
+    value: *mut f32,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("vertical_velocity received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(object) = live_object(context, object, "vertical_velocity") else {
+            return false;
+        };
+        match context.transaction.vertical_velocity(object) {
+            Ok(velocity) => {
+                // SAFETY: value was checked non-null and is writable for this synchronous callback.
+                unsafe { *value = velocity };
+                true
+            }
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_physics_overlaps(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(object) = live_object(context, object, "overlaps") else {
+            return false;
+        };
+        let objects = match context.transaction.overlaps(object) {
+            Ok(objects) => objects,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        let handles = objects
+            .into_iter()
+            .filter_map(|object| context.transaction.abi_handle(object))
+            .collect::<Vec<_>>();
+        write_handles(out, capacity, count, &handles)
+    })
+}
+
+unsafe extern "C" fn host_physics_overlap(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    options: *const RveQueryOptions,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if shape.is_null() || center.is_null() || options.is_null() {
+            context.error =
+                Some("overlap received a null shape, center or options pointer".to_owned());
+            return false;
+        }
+        // SAFETY: the three pointers were checked non-null and are readable during this call.
+        let (shape, center, options) = unsafe { (*shape, *center, *options) };
+        let result = (|| {
+            let shape = query_shape(shape)?;
+            let pose = query_pose(center)?;
+            let filter = query_filter(context, options)?;
+            let objects = context.transaction.overlap_shape(&shape, pose, &filter)?;
+            Ok(objects
+                .into_iter()
+                .filter_map(|object| context.transaction.abi_handle(object))
+                .collect::<Vec<_>>())
+        })();
+        match result {
+            Ok(handles) => write_handles(out, capacity, count, &handles),
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_physics_raycast_all(
+    ctx: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if origin.is_null() || direction.is_null() || options.is_null() || count.is_null() {
+            context.error = Some("raycast_all received a null pointer".to_owned());
+            return false;
+        }
+        // SAFETY: the pointers were checked non-null and are readable during this call.
+        let (origin, direction, options) = unsafe { (*origin, *direction, *options) };
+        let result = (|| {
+            let ray = Ray::new(
+                Vec3::from_array(origin),
+                Vec3::from_array(direction),
+                max_distance,
+            )
+            .map_err(|error| error.to_string())?;
+            let filter = query_filter(context, options)?;
+            let hits = context.transaction.raycast_all(ray, &filter)?;
+            Ok(hits
+                .into_iter()
+                .filter_map(|hit| query_hit_abi(context, hit))
+                .collect::<Vec<_>>())
+        })();
+        match result {
+            Ok(hits) => write_raycast_hits(out, capacity, count, &hits),
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_physics_shape_cast(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    displacement: *const [f32; 3],
+    skin: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if shape.is_null()
+            || center.is_null()
+            || displacement.is_null()
+            || options.is_null()
+            || out.is_null()
+        {
+            context.error = Some("shape_cast received a null pointer".to_owned());
+            return false;
+        }
+        // SAFETY: the pointers were checked non-null and are readable during this call.
+        let (shape, center, displacement, options) =
+            unsafe { (*shape, *center, *displacement, *options) };
+        let result = (|| {
+            let shape = query_shape(shape)?;
+            let pose = query_pose(center)?;
+            let filter = query_filter(context, options)?;
+            let hit = context.transaction.shape_cast(
+                &shape,
+                pose,
+                Vec3::from_array(displacement),
+                skin,
+                &filter,
+            )?;
+            Ok(hit.and_then(|hit| query_hit_abi(context, hit)))
+        })();
+        match result {
+            Ok(hit) => {
+                // SAFETY: out was checked non-null and is writable for this synchronous callback.
+                unsafe { *out = hit.unwrap_or_default() };
+                true
+            }
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+/// Полная проверка и запись заявки: успех даёт `true`, ошибка уходит в `context.error`.
+fn finish_staged(context: &mut AbiCallContext<'_>, result: Result<(), String>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            context.error = Some(error);
+            false
+        }
+    }
+}
+
+fn collider_shape_abi(shape: engine_scene::ColliderShape) -> u32 {
+    match shape {
+        engine_scene::ColliderShape::Box => RVE_COLLIDER_BOX,
+        engine_scene::ColliderShape::Sphere => RVE_COLLIDER_SPHERE,
+        engine_scene::ColliderShape::Capsule => RVE_COLLIDER_CAPSULE,
+        engine_scene::ColliderShape::ConvexMesh => RVE_COLLIDER_CONVEX_MESH,
+        engine_scene::ColliderShape::TriangleMesh => RVE_COLLIDER_TRIANGLE_MESH,
+    }
+}
+
+fn collider_abi(values: &ColliderValues) -> RveColliderValue {
+    RveColliderValue {
+        shape: collider_shape_abi(values.shape),
+        trigger: values.trigger,
+        size: values.size,
+        radius: values.radius,
+        height: values.height,
+        offset: values.offset,
+    }
+}
+
+/// Значения коллайдера из ABI. Mesh-формы читаются, но не записываются: их строит загрузка сцены.
+fn collider_values_from_abi(value: RveColliderValue) -> Result<ColliderValues, String> {
+    let shape = match value.shape {
+        RVE_COLLIDER_BOX => engine_scene::ColliderShape::Box,
+        RVE_COLLIDER_SPHERE => engine_scene::ColliderShape::Sphere,
+        RVE_COLLIDER_CAPSULE => engine_scene::ColliderShape::Capsule,
+        _ => return Err("collider shape must be box, sphere or capsule".to_owned()),
+    };
+    Ok(ColliderValues {
+        shape,
+        size: value.size,
+        radius: value.radius,
+        height: value.height,
+        offset: value.offset,
+        trigger: value.trigger,
+    })
+}
+
+fn rigid_body_abi(component: RigidBodyComponent) -> RveRigidBodyValue {
+    RveRigidBodyValue {
+        kind: match component.kind {
+            RigidBodyKind::Static => RVE_BODY_STATIC,
+            RigidBodyKind::Kinematic => RVE_BODY_KINEMATIC,
+            RigidBodyKind::Dynamic => RVE_BODY_DYNAMIC,
+        },
+        mass: component.mass,
+        linear_damping: component.linear_damping,
+        angular_damping: component.angular_damping,
+        gravity_scale: component.gravity_scale,
+        lock_rotation: component.lock_rotation,
+    }
+}
+
+fn rigid_body_from_abi(value: RveRigidBodyValue) -> Result<RigidBodyComponent, String> {
+    let kind = match value.kind {
+        RVE_BODY_STATIC => RigidBodyKind::Static,
+        RVE_BODY_KINEMATIC => RigidBodyKind::Kinematic,
+        RVE_BODY_DYNAMIC => RigidBodyKind::Dynamic,
+        _ => return Err("rigid body kind is unknown".to_owned()),
+    };
+    Ok(RigidBodyComponent {
+        kind,
+        mass: value.mass,
+        linear_damping: value.linear_damping,
+        angular_damping: value.angular_damping,
+        gravity_scale: value.gravity_scale,
+        lock_rotation: value.lock_rotation,
+    })
+}
+
+fn controller_abi(component: CharacterControllerComponent) -> RveControllerValue {
+    RveControllerValue {
+        radius: component.radius,
+        height: component.height,
+        step_height: component.step_height,
+        max_slope_deg: component.max_slope_deg,
+        snap_distance: component.snap_distance,
+        skin: component.skin,
+        push_strength: component.push_strength,
+        jump_height: component.jump_height,
+        gravity_scale: component.gravity_scale,
+        use_gravity: component.use_gravity,
+    }
+}
+
+fn controller_from_abi(value: RveControllerValue) -> CharacterControllerComponent {
+    CharacterControllerComponent {
+        radius: value.radius,
+        height: value.height,
+        step_height: value.step_height,
+        max_slope_deg: value.max_slope_deg,
+        snap_distance: value.snap_distance,
+        skin: value.skin,
+        push_strength: value.push_strength,
+        jump_height: value.jump_height,
+        gravity_scale: value.gravity_scale,
+        use_gravity: value.use_gravity,
+    }
+}
+
+fn move_abi(movement: &engine_physics::CharacterMoveResult) -> RveCharacterMoveResult {
+    RveCharacterMoveResult {
+        translation: movement.translation.to_array(),
+        grounded: movement.grounded,
+        collided: !movement.hits.is_empty(),
+    }
+}
+
+/// Форма запроса из ABI: `size` — полный размер box, `radius` и `height` — капсула и сфера.
+fn query_shape(shape: RveQueryShape) -> Result<engine_physics::Shape, String> {
+    let shape = match shape.kind {
+        RVE_QUERY_SPHERE => engine_physics::Shape::sphere(shape.radius),
+        RVE_QUERY_BOX => engine_physics::Shape::cuboid(Vec3::from_array(shape.size) * 0.5),
+        RVE_QUERY_CAPSULE => engine_physics::Shape::capsule(shape.radius, shape.height),
+        _ => return Err("query shape kind is unknown".to_owned()),
+    };
+    shape.map_err(|error| error.to_string())
+}
+
+fn query_pose(center: [f32; 3]) -> Result<engine_physics::Pose, String> {
+    engine_physics::Pose::new(Vec3::from_array(center), glam::Quat::IDENTITY)
+        .map_err(|error| error.to_string())
+}
+
+/// Фильтр запроса из ABI. Неизвестный объект в `ignore` — ошибка; мёртвый объект пропускается.
+fn query_filter(
+    context: &mut AbiCallContext<'_>,
+    options: RveQueryOptions,
+) -> Result<ScriptQueryFilter, String> {
+    let mut ignore = Vec::new();
+    if options.ignore_count > 0 {
+        if options.ignore.is_null() {
+            return Err("query ignore list is null".to_owned());
+        }
+        // SAFETY: the guest keeps `ignore_count` readable handles for this synchronous callback.
+        let handles = unsafe { std::slice::from_raw_parts(options.ignore, options.ignore_count) };
+        for handle in handles {
+            match context.transaction.abi_object(*handle) {
+                AbiObject::Alive(object) => ignore.push(object),
+                AbiObject::Unavailable => {}
+                AbiObject::Malformed => return Err("query ignore handle is unknown".to_owned()),
+            }
+        }
+    }
+    Ok(ScriptQueryFilter {
+        layer_mask: options.layer_mask,
+        include_triggers: options.include_triggers,
+        ignore,
+    })
+}
+
+/// Hit в ABI; `None`, если тело не принадлежит объекту, который можно передать скрипту.
+fn query_hit_abi(
+    context: &AbiCallContext<'_>,
+    hit: engine_physics::QueryHit,
+) -> Option<RveRaycastHit> {
+    let object = context.transaction.physics_object(hit.body)?;
+    Some(RveRaycastHit {
+        object: context.transaction.abi_handle(object)?,
+        point: hit.point.to_array(),
+        normal: hit.normal.to_array(),
+        distance: hit.distance,
+    })
+}
+
+/// Записывает попадания с тем же протоколом размера, что и списки дескрипторов.
+fn write_raycast_hits(
+    out: *mut RveRaycastHit,
+    capacity: usize,
+    count: *mut usize,
+    hits: &[RveRaycastHit],
+) -> bool {
+    if count.is_null() || (capacity > 0 && out.is_null()) {
+        return false;
+    }
+    // SAFETY: the guest passes a writable count slot, checked above.
+    unsafe { *count = hits.len() };
+    for (index, hit) in hits.iter().take(capacity).enumerate() {
+        // SAFETY: `index` is below `capacity`, and the guest allocated `capacity` entries.
+        unsafe { *out.add(index) = *hit };
+    }
+    true
+}
+
 fn write_handles(out: *mut u64, capacity: usize, count: *mut usize, handles: &[u64]) -> bool {
     if count.is_null() || (capacity > 0 && out.is_null()) {
         return false;

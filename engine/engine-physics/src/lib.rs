@@ -43,7 +43,8 @@ pub use ray::{Ray, RayHit, raycast};
 pub use scene::{
     ModelGeometry, ModelMesh, ObjectWorldTransform, PhysicsSceneBinding, PhysicsSceneBody,
     PhysicsSceneDesc, PhysicsSceneError, PhysicsSceneSync, PhysicsSceneSyncError, ShapeCache,
-    character_capsule_shape, object_world_transform, primitive_collider_shape,
+    character_capsule_shape, character_controller_scaled, object_world_transform,
+    primitive_collider_shape,
 };
 pub use shape::{Aabb, MassProperties, Pose, Shape};
 pub use thread::{
@@ -51,6 +52,6 @@ pub use thread::{
     PhysicsRequest, PhysicsServer, PhysicsServerError, PhysicsStepResult,
 };
 pub use world::{
-    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent,
-    PhysicsWorld, PhysicsWorldError, StepDriver, StepResult,
+    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PHYSICS_LAYER_COUNT, PhysicsCommand,
+    PhysicsEvent, PhysicsWorld, PhysicsWorldError, PrimitiveShape, StepDriver, StepResult,
 };

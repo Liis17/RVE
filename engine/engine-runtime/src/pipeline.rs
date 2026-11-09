@@ -1491,7 +1491,12 @@ fn scripts_thread(
         if let (Some(client), Some(sync)) = (&mut physics_client, &mut physics_sync) {
             let mut commands = scripts.drain_physics_commands();
             match sync.sync_world_commands(&mut world) {
-                Ok(world_commands) => commands.extend(world_commands),
+                Ok(world_commands) => {
+                    commands.extend(world_commands);
+                    for warning in sync.take_warnings() {
+                        log::warn!("[physics] привязка не обновлена: {warning}");
+                    }
+                }
                 Err(error) => {
                     status.record_failure(format!("ошибка синхронизации сцены с физикой: {error}"));
                     let _ = render_tx.send(RenderControl::Shutdown);
@@ -1635,6 +1640,12 @@ fn apply_physics_step(
     sync: &mut PhysicsSceneSync,
     result: PhysicsStepResult,
 ) -> Result<(), String> {
+    if result.skipped_commands > 0 {
+        log::warn!(
+            "[physics] отклонено команд коллайдера или тела: {}",
+            result.skipped_commands
+        );
+    }
     sync.apply_physics_poses(world, &result.poses)
         .map_err(|error| error.to_string())?;
     scripts.set_physics_snapshot(result.snapshot, sync.bindings());
@@ -4953,6 +4964,7 @@ return Script
             .unwrap();
         let initialization = PhysicsInitialization {
             result: PhysicsStepResult {
+                skipped_commands: 0,
                 sequence: 0,
                 substeps: 0,
                 poses: Vec::new(),
@@ -5047,6 +5059,7 @@ return Script
             .unwrap();
         let initialization = PhysicsInitialization {
             result: PhysicsStepResult {
+                skipped_commands: 0,
                 sequence: 0,
                 substeps: 0,
                 poses: Vec::new(),
@@ -5067,6 +5080,7 @@ return Script
                         // Как настоящий сервер: скрипты могут завершиться, не дождавшись
                         // ответа на последний шаг, и закрыть канал ответов.
                         let reply = PhysicsReply::Step(PhysicsStepResult {
+                            skipped_commands: 0,
                             sequence,
                             substeps: 0,
                             poses: Vec::new(),
@@ -5298,6 +5312,7 @@ return Move
                         let step = driver.advance_step(dt, commands).unwrap();
                         let snapshot = driver.world().query_snapshot().unwrap();
                         let _ = physics_reply_tx.send(PhysicsReply::Step(PhysicsStepResult {
+                            skipped_commands: 0,
                             sequence,
                             substeps: step.substeps,
                             poses: step.poses,
@@ -5397,6 +5412,7 @@ return Move
             &mut world,
             &mut sync,
             PhysicsStepResult {
+                skipped_commands: 0,
                 sequence: 1,
                 substeps: 0,
                 poses: vec![(
@@ -5467,6 +5483,7 @@ return Move
             .unwrap();
         let initialization = PhysicsInitialization {
             result: PhysicsStepResult {
+                skipped_commands: 0,
                 sequence: 0,
                 substeps: 0,
                 poses: Vec::new(),
@@ -6204,6 +6221,7 @@ return Move
                             .expect("fake physics step");
                         let snapshot = driver.world().query_snapshot().unwrap();
                         let _ = reply_tx.send(PhysicsReply::Step(PhysicsStepResult {
+                            skipped_commands: 0,
                             sequence,
                             substeps: step.substeps,
                             poses: step.poses,

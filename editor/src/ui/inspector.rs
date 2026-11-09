@@ -2729,7 +2729,7 @@ fn show_character_controller(
                 .show(ui, |ui| {
                     let mut value = controller;
                     let mut combined: Option<egui::Response> = None;
-                    let fields: [(&str, &mut f32, f64, std::ops::RangeInclusive<f32>); 7] = [
+                    let fields: [(&str, &mut f32, f64, std::ops::RangeInclusive<f32>); 9] = [
                         (
                             "Radius",
                             &mut value.radius,
@@ -2757,11 +2757,22 @@ fn show_character_controller(
                             0.05,
                             0.0..=f32::MAX,
                         ),
+                        (
+                            "Gravity Scale",
+                            &mut value.gravity_scale,
+                            0.01,
+                            0.0..=f32::MAX,
+                        ),
+                        ("Jump Height", &mut value.jump_height, 0.05, 0.0..=f32::MAX),
                     ];
                     for (label, field, speed, range) in fields {
                         let response = drag_row(ui, label, field, speed, range);
                         merge_response(&mut combined, response);
                     }
+                    ui.label("Use Gravity");
+                    let use_gravity = ui.checkbox(&mut value.use_gravity, "");
+                    ui.end_row();
+                    merge_response(&mut combined, use_gravity);
                     if let Some(response) = combined {
                         commit(state, id, "character_controller", &response, |object| {
                             object.character_controller = Some(value);

@@ -11,12 +11,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use abi::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
 use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
-    RVE_ANTI_ALIASING_TAA, RVE_NET_INVALID_INPUT, RVE_NET_MODE_CLIENT, RVE_NET_MODE_HOST,
+    RVE_ANTI_ALIASING_TAA, RVE_BODY_DYNAMIC, RVE_BODY_KINEMATIC, RVE_BODY_STATIC, RVE_COLLIDER_BOX,
+    RVE_COLLIDER_CAPSULE, RVE_COLLIDER_CONVEX_MESH, RVE_COLLIDER_SPHERE,
+    RVE_COLLIDER_TRIANGLE_MESH, RVE_NET_INVALID_INPUT, RVE_NET_MODE_CLIENT, RVE_NET_MODE_HOST,
     RVE_NET_MODE_SERVER, RVE_NET_OK, RVE_NET_TARGET_ALL, RVE_NET_TARGET_PEER,
-    RVE_NET_TARGET_SERVER, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
-    RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveCharacterMoveResult, RveHost, RveParams, RvePostProcessSettings,
-    RveRaycastHit, RveScreenShaderState, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_NET_TARGET_SERVER, RVE_QUERY_BOX, RVE_QUERY_CAPSULE, RVE_QUERY_SPHERE, RVE_TONEMAPPER_ACES,
+    RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
+    RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult,
+    RveColliderValue, RveControllerValue, RveHost, RveParams, RvePostProcessSettings,
+    RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue, RveScreenShaderState, RveStr,
+    RveTime, RveTransform, RveValue, RveValueData,
 };
 use abi::{
     RVE_UI_EVENT_BLUR, RVE_UI_EVENT_CANCEL, RVE_UI_EVENT_CLICK, RVE_UI_EVENT_FOCUS,
@@ -384,6 +388,9 @@ pub trait Script: 'static {
     fn on_trigger_enter(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
     /// Called when this object stops overlapping a trigger.
     fn on_trigger_exit(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called once per update frame while this object overlaps a trigger pair. Runs on every frame
+    /// of an active pair, including the frame it begins, and not per physics substep.
+    fn on_trigger_stay(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
     /// Called when this instance starts running: it was enabled and its object is active.
     /// Runs right before `on_start` on the first run.
     fn on_enable(&mut self, _ctx: &mut Context<'_>) {}
@@ -505,6 +512,223 @@ pub struct CharacterMove {
     pub translation: [f32; 3],
     pub grounded: bool,
     pub collided: bool,
+}
+
+/// Collider shape of a script collider component. Mesh shapes can be read but not written.
+/// Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColliderShape {
+    Box,
+    Sphere,
+    Capsule,
+    ConvexMesh,
+    TriangleMesh,
+}
+
+/// Collider component read or written by scripts. `size` is the full box extent; `radius` and
+/// `height` apply to spheres and capsules. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Collider {
+    pub shape: ColliderShape,
+    pub size: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub offset: [f32; 3],
+    pub trigger: bool,
+}
+
+/// Rigid body kind. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyKind {
+    Static,
+    Kinematic,
+    Dynamic,
+}
+
+/// Rigid body component values. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RigidBody {
+    pub kind: BodyKind,
+    pub mass: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub gravity_scale: f32,
+    pub lock_rotation: bool,
+}
+
+/// Character controller component values. `jump_height` and `use_gravity` drive
+/// `Object::simple_move` and `Object::jump`. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharacterController {
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+    pub max_slope_deg: f32,
+    pub snap_distance: f32,
+    pub skin: f32,
+    pub push_strength: f32,
+    pub jump_height: f32,
+    pub gravity_scale: f32,
+    pub use_gravity: bool,
+}
+
+/// Shape of an overlap or cast query. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum QueryShape {
+    Sphere { radius: f32 },
+    Box { size: [f32; 3] },
+    Capsule { radius: f32, height: f32 },
+}
+
+/// Options of overlap, raycast-all and shape-cast queries. Appended in ABI v18.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryOptions<'a> {
+    /// Bit `n` enables collider layer `n`.
+    pub layer_mask: u32,
+    pub include_triggers: bool,
+    /// Objects whose bodies are skipped by the query.
+    pub ignore: &'a [Object],
+}
+
+impl Default for QueryOptions<'_> {
+    fn default() -> Self {
+        Self {
+            layer_mask: u32::MAX,
+            include_triggers: false,
+            ignore: &[],
+        }
+    }
+}
+
+fn collider_to_abi(value: Collider) -> RveColliderValue {
+    RveColliderValue {
+        shape: match value.shape {
+            ColliderShape::Box => RVE_COLLIDER_BOX,
+            ColliderShape::Sphere => RVE_COLLIDER_SPHERE,
+            ColliderShape::Capsule => RVE_COLLIDER_CAPSULE,
+            ColliderShape::ConvexMesh => RVE_COLLIDER_CONVEX_MESH,
+            ColliderShape::TriangleMesh => RVE_COLLIDER_TRIANGLE_MESH,
+        },
+        trigger: value.trigger,
+        size: value.size,
+        radius: value.radius,
+        height: value.height,
+        offset: value.offset,
+    }
+}
+
+fn collider_from_abi(value: RveColliderValue) -> Result<Collider, PhysicsError> {
+    let shape = match value.shape {
+        RVE_COLLIDER_BOX => ColliderShape::Box,
+        RVE_COLLIDER_SPHERE => ColliderShape::Sphere,
+        RVE_COLLIDER_CAPSULE => ColliderShape::Capsule,
+        RVE_COLLIDER_CONVEX_MESH => ColliderShape::ConvexMesh,
+        RVE_COLLIDER_TRIANGLE_MESH => ColliderShape::TriangleMesh,
+        _ => return Err(PhysicsError::InvalidInput),
+    };
+    Ok(Collider {
+        shape,
+        size: value.size,
+        radius: value.radius,
+        height: value.height,
+        offset: value.offset,
+        trigger: value.trigger,
+    })
+}
+
+fn rigid_body_to_abi(value: RigidBody) -> RveRigidBodyValue {
+    RveRigidBodyValue {
+        kind: match value.kind {
+            BodyKind::Static => RVE_BODY_STATIC,
+            BodyKind::Kinematic => RVE_BODY_KINEMATIC,
+            BodyKind::Dynamic => RVE_BODY_DYNAMIC,
+        },
+        mass: value.mass,
+        linear_damping: value.linear_damping,
+        angular_damping: value.angular_damping,
+        gravity_scale: value.gravity_scale,
+        lock_rotation: value.lock_rotation,
+    }
+}
+
+fn rigid_body_from_abi(value: RveRigidBodyValue) -> Result<RigidBody, PhysicsError> {
+    let kind = match value.kind {
+        RVE_BODY_STATIC => BodyKind::Static,
+        RVE_BODY_KINEMATIC => BodyKind::Kinematic,
+        RVE_BODY_DYNAMIC => BodyKind::Dynamic,
+        _ => return Err(PhysicsError::InvalidInput),
+    };
+    Ok(RigidBody {
+        kind,
+        mass: value.mass,
+        linear_damping: value.linear_damping,
+        angular_damping: value.angular_damping,
+        gravity_scale: value.gravity_scale,
+        lock_rotation: value.lock_rotation,
+    })
+}
+
+fn controller_to_abi(value: CharacterController) -> RveControllerValue {
+    RveControllerValue {
+        radius: value.radius,
+        height: value.height,
+        step_height: value.step_height,
+        max_slope_deg: value.max_slope_deg,
+        snap_distance: value.snap_distance,
+        skin: value.skin,
+        push_strength: value.push_strength,
+        jump_height: value.jump_height,
+        gravity_scale: value.gravity_scale,
+        use_gravity: value.use_gravity,
+    }
+}
+
+fn controller_from_abi(value: RveControllerValue) -> CharacterController {
+    CharacterController {
+        radius: value.radius,
+        height: value.height,
+        step_height: value.step_height,
+        max_slope_deg: value.max_slope_deg,
+        snap_distance: value.snap_distance,
+        skin: value.skin,
+        push_strength: value.push_strength,
+        jump_height: value.jump_height,
+        gravity_scale: value.gravity_scale,
+        use_gravity: value.use_gravity,
+    }
+}
+
+fn query_shape_to_abi(shape: QueryShape) -> Result<RveQueryShape, PhysicsError> {
+    let value = match shape {
+        QueryShape::Sphere { radius } => RveQueryShape {
+            kind: RVE_QUERY_SPHERE,
+            size: [0.0; 3],
+            radius,
+            height: 0.0,
+        },
+        QueryShape::Box { size } => RveQueryShape {
+            kind: RVE_QUERY_BOX,
+            size,
+            radius: 0.0,
+            height: 0.0,
+        },
+        QueryShape::Capsule { radius, height } => RveQueryShape {
+            kind: RVE_QUERY_CAPSULE,
+            size: [0.0; 3],
+            radius,
+            height,
+        },
+    };
+    let finite = value
+        .size
+        .into_iter()
+        .chain([value.radius, value.height])
+        .all(f32::is_finite);
+    if finite {
+        Ok(value)
+    } else {
+        Err(PhysicsError::InvalidInput)
+    }
 }
 
 /// Contact data for collision-enter callbacks.
@@ -1948,6 +2172,437 @@ impl Physics<'_> {
     }
 }
 
+impl Object {
+    /// Reads the collider component, including writes earlier in this callback.
+    pub fn collider(&self, ctx: &Context<'_>) -> Result<Collider, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_get_collider
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut value = RveColliderValue::default();
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        collider_from_abi(value)
+    }
+
+    /// Reads the collider component. This name mirrors Lua's `get_collider` method.
+    pub fn get_collider(&self, ctx: &Context<'_>) -> Result<Collider, PhysicsError> {
+        self.collider(ctx)
+    }
+
+    /// Stages a replacement collider component; applied when the callback commits.
+    pub fn set_collider(
+        &self,
+        ctx: &mut Context<'_>,
+        collider: Collider,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_set_collider
+            .ok_or(PhysicsError::Unavailable)?;
+        let value = collider_to_abi(collider);
+        // SAFETY: callback and input storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the rigid body component, including writes earlier in this callback.
+    pub fn rigid_body(&self, ctx: &Context<'_>) -> Result<RigidBody, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_get_rigid_body
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut value = RveRigidBodyValue::default();
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        rigid_body_from_abi(value)
+    }
+
+    /// Reads the rigid body component. This name mirrors Lua's `get_rigid_body` method.
+    pub fn get_rigid_body(&self, ctx: &Context<'_>) -> Result<RigidBody, PhysicsError> {
+        self.rigid_body(ctx)
+    }
+
+    /// Stages a replacement rigid body component.
+    pub fn set_rigid_body(
+        &self,
+        ctx: &mut Context<'_>,
+        body: RigidBody,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_set_rigid_body
+            .ok_or(PhysicsError::Unavailable)?;
+        let value = rigid_body_to_abi(body);
+        // SAFETY: callback and input storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the character controller component, including writes earlier in this callback.
+    pub fn controller(&self, ctx: &Context<'_>) -> Result<CharacterController, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_get_controller
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut value = RveControllerValue::default();
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        Ok(controller_from_abi(value))
+    }
+
+    /// Reads the character controller component. This name mirrors Lua's `get_controller` method.
+    pub fn get_controller(&self, ctx: &Context<'_>) -> Result<CharacterController, PhysicsError> {
+        self.controller(ctx)
+    }
+
+    /// Stages a replacement character controller component.
+    pub fn set_controller(
+        &self,
+        ctx: &mut Context<'_>,
+        controller: CharacterController,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_set_controller
+            .ok_or(PhysicsError::Unavailable)?;
+        let value = controller_to_abi(controller);
+        // SAFETY: callback and input storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Moves a character horizontally by `velocity.x/z` per second plus gravity. `velocity.y` is
+    /// ignored. Only valid during update.
+    pub fn simple_move(
+        &self,
+        ctx: &mut Context<'_>,
+        velocity: [f32; 3],
+    ) -> Result<CharacterMove, PhysicsError> {
+        if !finite_vector(velocity) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = ctx
+            .host
+            .physics_simple_move
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut result = RveCharacterMoveResult::default();
+        // SAFETY: callback and input/output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &velocity, &mut result) } {
+            return Err(PhysicsError::Rejected);
+        }
+        Ok(result.into())
+    }
+
+    /// Starts a jump when the character is grounded; `Ok(false)` if it is airborne.
+    pub fn jump(&self, ctx: &mut Context<'_>) -> Result<bool, PhysicsError> {
+        let callback = ctx.host.physics_jump.ok_or(PhysicsError::Unavailable)?;
+        let mut jumped = false;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut jumped) } {
+            Ok(jumped)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the character's vertical velocity, including writes earlier in this callback.
+    pub fn vertical_velocity(&self, ctx: &Context<'_>) -> Result<f32, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_vertical_velocity
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut velocity = 0.0f32;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut velocity) } {
+            Ok(velocity)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Objects whose colliders overlap this object's body through an active trigger pair.
+    pub fn overlaps(&self, ctx: &Context<'_>) -> Result<Vec<Object>, PhysicsError> {
+        let callback = ctx.host.physics_overlaps.ok_or(PhysicsError::Unavailable)?;
+        // SAFETY: the host writes at most `capacity` handles into the buffer for this call.
+        Ok(host_handles(|out, capacity, count| unsafe {
+            callback(ctx.host.ctx, self.handle, out, capacity, count)
+        }))
+    }
+
+    /// Lists the objects in active trigger pairs with this object. Mirrors Lua's `get_overlaps`.
+    pub fn get_overlaps(&self, ctx: &Context<'_>) -> Result<Vec<Object>, PhysicsError> {
+        self.overlaps(ctx)
+    }
+}
+
+impl Physics<'_> {
+    /// Objects whose colliders intersect a convex shape at `center`.
+    pub fn overlap(
+        &self,
+        shape: QueryShape,
+        center: [f32; 3],
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        if !finite_vector(center) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let shape = query_shape_to_abi(shape)?;
+        let callback = self.host.physics_overlap.ok_or(PhysicsError::Unavailable)?;
+        let ignore = options
+            .ignore
+            .iter()
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let query = query_options_to_abi(options, &ignore);
+        // SAFETY: shape, center, options and the ignore buffer remain valid through this call.
+        Ok(host_handles(|out, capacity, count| unsafe {
+            callback(self.host.ctx, &shape, &center, &query, out, capacity, count)
+        }))
+    }
+
+    /// Objects intersecting a sphere centered at `center`.
+    pub fn overlap_sphere(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        self.overlap(QueryShape::Sphere { radius }, center, options)
+    }
+
+    /// Objects intersecting an axis-aligned box with full extents `size`.
+    pub fn overlap_box(
+        &self,
+        center: [f32; 3],
+        size: [f32; 3],
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        self.overlap(QueryShape::Box { size }, center, options)
+    }
+
+    /// Objects intersecting an upright capsule centered at `center`.
+    pub fn overlap_capsule(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        height: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        self.overlap(QueryShape::Capsule { radius, height }, center, options)
+    }
+
+    /// Every ray hit, nearest first. Triggers and layers follow `options`.
+    pub fn raycast_all(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<PhysicsRaycastHit>, PhysicsError> {
+        if !finite_vector(origin)
+            || !finite_vector(direction)
+            || direction.iter().all(|component| *component == 0.0)
+            || !max_distance.is_finite()
+            || max_distance < 0.0
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = self
+            .host
+            .physics_raycast_all
+            .ok_or(PhysicsError::Unavailable)?;
+        let ignore = options
+            .ignore
+            .iter()
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let query = query_options_to_abi(options, &ignore);
+        let mut count = 0usize;
+        // SAFETY: a null buffer with zero capacity asks only for the hit count.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &origin,
+                &direction,
+                max_distance,
+                &query,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        let mut hits = vec![RveRaycastHit::default(); count];
+        let mut written = 0usize;
+        // SAFETY: `hits` has `count` writable entries; the host writes at most that many.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &origin,
+                &direction,
+                max_distance,
+                &query,
+                hits.as_mut_ptr(),
+                count,
+                &mut written,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        hits.truncate(written.min(count));
+        hits.into_iter()
+            .filter(|hit| hit.object != 0)
+            .map(hit_from_abi)
+            .collect()
+    }
+
+    /// Sweeps a convex shape from `center` along `displacement` and returns the first hit.
+    pub fn shape_cast(
+        &self,
+        shape: QueryShape,
+        center: [f32; 3],
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        if !finite_vector(center) || !finite_vector(displacement) || !skin.is_finite() || skin < 0.0
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let shape = query_shape_to_abi(shape)?;
+        let callback = self
+            .host
+            .physics_shape_cast
+            .ok_or(PhysicsError::Unavailable)?;
+        let ignore = options
+            .ignore
+            .iter()
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let query = query_options_to_abi(options, &ignore);
+        let mut result = RveRaycastHit::default();
+        // SAFETY: shape, vectors, options and the ignore buffer remain valid through this call.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &shape,
+                &center,
+                &displacement,
+                skin,
+                &query,
+                &mut result,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        if result.object == 0 {
+            return Ok(None);
+        }
+        hit_from_abi(result).map(Some)
+    }
+
+    /// Sweeps a sphere from `center` along `displacement` and returns the first hit.
+    pub fn sphere_cast(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.shape_cast(
+            QueryShape::Sphere { radius },
+            center,
+            displacement,
+            skin,
+            options,
+        )
+    }
+
+    /// Sweeps an axis-aligned box with full extents `size` and returns the first hit.
+    pub fn box_cast(
+        &self,
+        center: [f32; 3],
+        size: [f32; 3],
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.shape_cast(
+            QueryShape::Box { size },
+            center,
+            displacement,
+            skin,
+            options,
+        )
+    }
+
+    /// Sweeps an upright capsule from `center` and returns the first hit.
+    pub fn capsule_cast(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        height: f32,
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.shape_cast(
+            QueryShape::Capsule { radius, height },
+            center,
+            displacement,
+            skin,
+            options,
+        )
+    }
+}
+
+/// Builds the ABI options over `ignore`, which must outlive the returned value's use.
+fn query_options_to_abi(options: QueryOptions<'_>, ignore: &[u64]) -> RveQueryOptions {
+    RveQueryOptions {
+        layer_mask: options.layer_mask,
+        include_triggers: options.include_triggers,
+        ignore: if ignore.is_empty() {
+            std::ptr::null()
+        } else {
+            ignore.as_ptr()
+        },
+        ignore_count: ignore.len(),
+    }
+}
+
+fn hit_from_abi(result: RveRaycastHit) -> Result<PhysicsRaycastHit, PhysicsError> {
+    if !finite_vector(result.point) || !finite_vector(result.normal) || !result.distance.is_finite()
+    {
+        return Err(PhysicsError::InvalidInput);
+    }
+    Ok(PhysicsRaycastHit {
+        object: Object {
+            handle: result.object,
+        },
+        point: result.point,
+        normal: result.normal,
+        distance: result.distance,
+    })
+}
+
 impl From<RveCharacterMoveResult> for CharacterMove {
     fn from(value: RveCharacterMoveResult) -> Self {
         Self {
@@ -2983,10 +3638,10 @@ pub mod __private {
     use crate::abi::{
         RVE_COLLISION_ENTER, RVE_COLLISION_EXIT, RVE_NET_EVENT_MESSAGE,
         RVE_NET_EVENT_PEER_CONNECTED, RVE_NET_EVENT_PEER_DISCONNECTED, RVE_PARAM_HAS_MAX,
-        RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCollisionFn,
-        RveCommandFn, RveCreateFn, RveDropFn, RveHost, RveMessageFn, RveNetEvent, RveNetEventFn,
-        RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUiEvent, RveUiEventFn,
-        RveUpdateFn, RveValue,
+        RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RVE_TRIGGER_STAY,
+        RveCollisionEvent, RveCollisionFn, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
+        RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveStartFn, RveStatus,
+        RveStr, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -3179,6 +3834,7 @@ pub mod __private {
                 RVE_COLLISION_EXIT => instance.0.on_collision_exit(&mut context, other),
                 RVE_TRIGGER_ENTER => instance.0.on_trigger_enter(&mut context, other),
                 RVE_TRIGGER_EXIT => instance.0.on_trigger_exit(&mut context, other),
+                RVE_TRIGGER_STAY => instance.0.on_trigger_stay(&mut context, other),
                 _ => return Err("unknown collision event kind".to_owned()),
             }
             context.commit()

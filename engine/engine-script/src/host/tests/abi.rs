@@ -8,6 +8,7 @@ use crate::ui::owner_key;
 use engine_files::VirtualPath;
 use engine_gui::document::UiDocument;
 use engine_gui::system::UiCanvasHandle;
+use engine_physics::{PhysicsSceneDesc, PhysicsSceneSync};
 use engine_project::{InputAction, InputSettings};
 use engine_scene::{
     AudioRequest, MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
@@ -15,10 +16,10 @@ use engine_scene::{
 };
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
-    RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParamDescV13, RveParams,
-    RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6,
-    RveScriptDescV13, RveScriptDescV15, RveScriptDescV16, RveSpawnOptions, RveStatus, RveStr,
-    RveTransform, RveUpdateFn, RveValue,
+    RVE_SPAWN_HAS_PARENT, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCreateFn, RveHeader, RveHost,
+    RveModule, RveParamDescV13, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3,
+    RveScriptDescV4, RveScriptDescV6, RveScriptDescV13, RveScriptDescV15, RveScriptDescV16,
+    RveSpawnOptions, RveStatus, RveStr, RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
@@ -840,6 +841,7 @@ fn sdk_module() -> &'static RveModule {
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
         "PhysicsProbe" => physics_probe_factory,
+        "JumpProbe" => jump_probe_factory,
         "AudioProbe" => audio_probe_factory,
         "AudioRejected" => audio_rejected_factory,
         "RumbleProbe" => rumble_probe_factory,
@@ -1574,7 +1576,7 @@ fn v15_module() -> &'static RveModule {
 }
 
 #[test]
-fn abi_v15_modules_load_on_the_v17_host_without_enable_callbacks() {
+fn abi_v15_modules_load_on_the_v18_host_without_enable_callbacks() {
     let _lock = test_lock();
     let module = v15_module();
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1592,7 +1594,7 @@ fn abi_v15_modules_load_on_the_v17_host_without_enable_callbacks() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v15"),
-        "guest ABI v15 runs on the v17 host"
+        "guest ABI v15 runs on the v18 host"
     );
 }
 
@@ -1717,7 +1719,7 @@ fn v16_ui_module() -> &'static RveModule {
 }
 
 #[test]
-fn abi_v16_ui_modules_load_on_v17_host_and_keep_ui_callbacks() {
+fn abi_v16_ui_modules_load_on_v18_host_and_keep_ui_callbacks() {
     let _lock = test_lock();
     let library =
         unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v16_ui_module())) }.unwrap();
@@ -1939,7 +1941,7 @@ fn abi_v13_modules_load_on_the_v16_host() {
 }
 
 #[test]
-fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v17_host() {
+fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v18_host() {
     let _lock = test_lock();
     let module = v13_module(14);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1957,7 +1959,7 @@ fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v17_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v14"),
-        "guest ABI v14 runs on the v17 host and its parameters use the pre-v15 layout"
+        "guest ABI v14 runs on the v18 host and its parameters use the pre-v15 layout"
     );
 }
 
@@ -4759,4 +4761,272 @@ fn abi_v14_screen_shader_layout_keeps_legacy_descriptors_without_ui() {
             .all(|event| event.level != ScriptEventLevel::Error),
         "{events:?}"
     );
+}
+
+/// ABI v17 guests predate trigger-stay events and must not receive that new event kind.
+static LEGACY_STAYS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn legacy_collision(
+    _instance: *mut c_void,
+    _host: *const RveHost,
+    event: RveCollisionEvent,
+) -> RveStatus {
+    if event.kind > RVE_TRIGGER_EXIT {
+        LEGACY_STAYS.fetch_add(1, Ordering::SeqCst);
+        return RveStatus::Error;
+    }
+    RveStatus::Ok
+}
+
+fn v17_legacy_collision_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDesc] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDesc {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: Some(legacy_collision),
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 17,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr(),
+        script_count: legacy.len(),
+    }))
+}
+
+#[test]
+fn abi_v17_modules_get_no_trigger_stay_and_keep_running() {
+    let _lock = test_lock();
+    LEGACY_STAYS.store(0, Ordering::SeqCst);
+    let module = v17_legacy_collision_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[objects.collider]
+shape = "sphere"
+radius = 1.0
+trigger = true
+[[objects.heavy_scripts]]
+name = "Probe"
+params = { label = "v17" }
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.5, 0.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+"#,
+    );
+    let (mut driver, bindings) = PhysicsSceneDesc::from_world(&world, &[], glam::Vec3::ZERO, 60, 8)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v17"),
+        "ABI v17 modules still load on the v18 host"
+    );
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    for frame in 1..=5_u64 {
+        host.update(
+            &mut world,
+            1.0 / 60.0,
+            ScriptTime {
+                elapsed: frame as f64 / 60.0,
+                frame,
+            },
+        );
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+        host.queue_physics_events(result.events);
+    }
+    assert_eq!(LEGACY_STAYS.load(Ordering::SeqCst), 0);
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "ABI v17 instance must keep running"
+    );
+}
+
+/// Прыжок и вертикальная скорость через ABI; та же последовательность, что у Lua-скрипта
+/// `JUMP_LUA` в паритете прыжка.
+struct JumpProbe {
+    jumped: bool,
+}
+
+fn jump_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(JumpProbe { jumped: false }))
+}
+
+impl Script for JumpProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let player = ctx.find("player").expect("player exists");
+        if !self.jumped && player.is_grounded(ctx).unwrap() {
+            assert!(player.jump(ctx).unwrap());
+            self.jumped = true;
+            ctx.log_info("jump");
+        }
+        let vertical = player.vertical_velocity(ctx).unwrap();
+        ctx.log_info(format!("v {vertical:.4}"));
+        player.simple_move(ctx, [0.0; 3]).unwrap();
+    }
+}
+
+const JUMP_LUA: &str = r#"
+local Script = {}
+local jumped = false
+function Script:on_update()
+  local player = rve.find("player")
+  if not jumped and player:is_grounded() then
+    assert(player:jump())
+    jumped = true
+    rve.log("jump")
+  end
+  rve.log(string.format("v %.4f", player:vertical_velocity()))
+  player:simple_move({x=0, y=0, z=0})
+end
+return Script
+"#;
+
+fn jump_parity_scene(assets: &str, attach: &str) -> String {
+    format!(
+        r#"
+{assets}[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "floor"
+[objects.transform]
+position = [0.0, -0.5, 0.0]
+[objects.collider]
+shape = "box"
+half_extents = [10.0, 0.5, 10.0]
+[[objects]]
+id = "player"
+[objects.transform]
+position = [0.0, 0.8, 0.0]
+[objects.character_controller]
+radius = 0.3
+height = 1.0
+step_height = 0.0
+use_gravity = true
+jump_height = 1.0
+{attach}
+"#
+    )
+}
+
+fn run_jump_parity(
+    scene: &str,
+    lua: &[(&str, &str)],
+    library: Option<&crate::ScriptLibrary>,
+) -> Vec<String> {
+    let mut world = world(scene);
+    let (mut driver, bindings) =
+        PhysicsSceneDesc::from_world(&world, &[], glam::Vec3::new(0.0, -9.81, 0.0), 60, 8)
+            .unwrap()
+            .build()
+            .unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host = ScriptHost::load(&world, "scene", &sources(lua), library).unwrap();
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 0,
+        },
+    );
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    let mut messages = Vec::new();
+    for frame in 1..=240_u64 {
+        let time = ScriptTime {
+            elapsed: frame as f64 / 60.0,
+            frame,
+        };
+        host.update(&mut world, 1.0 / 60.0, time);
+        messages.extend(message_list(&mut host));
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+        host.queue_physics_events(result.events);
+    }
+    messages
+}
+
+#[test]
+fn lua_and_abi_jump_and_vertical_velocity_follow_the_same_trace() {
+    let _lock = test_lock();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(sdk_module())) }.unwrap();
+    let lua = run_jump_parity(
+        &jump_parity_scene(
+            "[[assets]]
+path = \"/jump.lua\"
+",
+            "[[objects.lite_scripts]]\npath = \"/jump.lua\"",
+        ),
+        &[("jump.lua", JUMP_LUA)],
+        None,
+    );
+    let abi = run_jump_parity(
+        &jump_parity_scene(
+            "",
+            "[[objects.heavy_scripts]]\nname = \"JumpProbe\"\nparams = {}",
+        ),
+        &[],
+        Some(&library),
+    );
+    let trace = |messages: &[String]| {
+        messages
+            .iter()
+            .filter(|message| *message == "jump" || message.starts_with("v "))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(lua.iter().any(|message| message == "jump"), "{lua:?}");
+    assert_eq!(trace(&lua), trace(&abi));
 }

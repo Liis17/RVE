@@ -165,6 +165,28 @@ pub struct PhysicsSettings {
     pub gravity: [f32; 3],
     pub fixed_hz: u32,
     pub max_substeps: u32,
+    /// Матрица слоёв: `[physics.collision_matrix] masks = [32 чисел]`. Значения по умолчанию
+    /// не сериализуются, поэтому проекты без таблицы сталкиваются все со всеми.
+    #[serde(default, skip_serializing_if = "is_default_collision_matrix")]
+    pub collision_matrix: CollisionMatrixSettings,
+}
+
+/// Маски слоёв для столкновений. Слой `a` и слой `b` сталкиваются, только если бит `b` есть в
+/// маске `a` и бит `a` есть в маске `b`; поэтому маски задаются симметрично.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollisionMatrixSettings {
+    /// Ровно [`MAX_LAYERS`] значений; индекс массива — индекс слоя из `[layers]`.
+    #[serde(default = "default_collision_masks")]
+    pub masks: [u32; MAX_LAYERS],
+}
+
+impl Default for CollisionMatrixSettings {
+    fn default() -> Self {
+        Self {
+            masks: default_collision_masks(),
+        }
+    }
 }
 
 impl PartialEq for PhysicsSettings {
@@ -178,6 +200,7 @@ impl PartialEq for PhysicsSettings {
             })
             && self.fixed_hz == other.fixed_hz
             && self.max_substeps == other.max_substeps
+            && self.collision_matrix == other.collision_matrix
     }
 }
 
@@ -189,8 +212,17 @@ impl Default for PhysicsSettings {
             gravity: [0.0, -9.81, 0.0],
             fixed_hz: 60,
             max_substeps: 8,
+            collision_matrix: CollisionMatrixSettings::default(),
         }
     }
+}
+
+fn default_collision_masks() -> [u32; MAX_LAYERS] {
+    [u32::MAX; MAX_LAYERS]
+}
+
+fn is_default_collision_matrix(matrix: &CollisionMatrixSettings) -> bool {
+    *matrix == CollisionMatrixSettings::default()
 }
 
 /// Сетевые настройки проекта: `[network]`. Пароль и ключ сервера в проект не записываются.
@@ -579,6 +611,7 @@ mod tests {
                 gravity: [0.0, -4.0, 0.0],
                 fixed_hz: 120,
                 max_substeps: 6,
+                collision_matrix: Default::default(),
             }
         );
     }
@@ -602,6 +635,50 @@ mod tests {
         assert_eq!(settings.runtime.dlss_engine_version, None);
         assert_eq!(settings.physics, PhysicsSettings::default());
         assert_eq!(settings.starting_scene(), Some("scenes/start.rvescene"));
+    }
+
+    #[test]
+    fn collision_matrix_defaults_to_all_pairs_and_stays_out_of_default_files() {
+        let settings =
+            ProjectSettings::parse(&project("[[scenes]]\npath = \"scene.rvescene\"\n")).unwrap();
+
+        assert_eq!(
+            settings.physics.collision_matrix.masks,
+            [u32::MAX; super::MAX_LAYERS]
+        );
+        assert!(!settings.to_toml().unwrap().contains("collision_matrix"));
+    }
+
+    #[test]
+    fn collision_matrix_parses_and_round_trips() {
+        let mut masks = [u32::MAX; super::MAX_LAYERS];
+        masks[0] = 0b01;
+        masks[1] = 0b10;
+        let list = masks
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let contents = format!(
+            "{}\n[physics.collision_matrix]\nmasks = [{list}]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        );
+
+        let settings = ProjectSettings::parse(&contents).unwrap();
+        assert_eq!(settings.physics.collision_matrix.masks, masks);
+        let reparsed = ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap();
+        assert_eq!(reparsed.physics, settings.physics);
+    }
+
+    #[test]
+    fn collision_matrix_requires_exactly_one_mask_per_layer() {
+        let contents = format!(
+            "{}\n[physics.collision_matrix]\nmasks = [1, 2]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        );
+
+        let error = ProjectSettings::parse(&contents).unwrap_err();
+        assert!(error.contains("array of length 32"), "{error}");
     }
 
     #[test]

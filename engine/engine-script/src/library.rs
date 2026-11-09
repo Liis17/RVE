@@ -22,6 +22,8 @@ pub(crate) type SharedLibrary = Arc<libloading::Library>;
 pub struct ScriptLibrary {
     scripts: HashMap<String, (&'static RveScriptDesc, Option<ParamSchema>)>,
     library: Option<SharedLibrary>,
+    /// ABI версия заголовка модуля: от неё зависят callbacks, которые понимает гость.
+    abi_version: u32,
 }
 
 /// Failure while opening or validating an ABI script module.
@@ -222,6 +224,7 @@ impl ScriptLibrary {
             return Ok(Self {
                 scripts: HashMap::new(),
                 library: None,
+                abi_version: header.abi_version,
             });
         }
         let descriptors_v15 = if header.abi_version == 15 {
@@ -454,11 +457,16 @@ impl ScriptLibrary {
         Ok(Self {
             scripts,
             library: None,
+            abi_version: header.abi_version,
         })
     }
 
     pub(crate) fn script(&self, name: &str) -> Option<&'static RveScriptDesc> {
         self.scripts.get(name).map(|(descriptor, _)| *descriptor)
+    }
+
+    pub(crate) fn abi_version(&self) -> u32 {
+        self.abi_version
     }
 
     pub(crate) fn shared_library(&self) -> Option<SharedLibrary> {
@@ -718,6 +726,7 @@ mod ownership_tests {
         let library = ScriptLibrary {
             scripts: HashMap::new(),
             library: Some(module),
+            abi_version: 0,
         };
         let scene = engine_scene::SceneDocument::parse(
             "empty",

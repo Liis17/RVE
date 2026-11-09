@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "engine-physics"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "engine-files",
  "engine-scene",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "engine-project"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "engine-files",
  "rve-sdk",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "engine-files",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -3155,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "rve-server"

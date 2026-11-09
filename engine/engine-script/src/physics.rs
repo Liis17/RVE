@@ -1,7 +1,8 @@
 use engine_physics::{
-    BodyHandle, PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot,
+    BodyHandle, BodyKind, CharacterController, PhysicsCommand, PhysicsEvent, PhysicsSceneBinding,
+    QuerySnapshot,
 };
-use engine_scene::ObjectHandle;
+use engine_scene::{ColliderComponent, ColliderShape, ObjectHandle};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -11,10 +12,19 @@ pub(crate) struct PhysicsScriptState {
     bindings: HashMap<ObjectHandle, PhysicsSceneBinding>,
     objects: HashMap<BodyHandle, ObjectHandle>,
     grounded: HashMap<ObjectHandle, bool>,
+    /// Вертикальная скорость контроллера, которую ведут `simple_move` и `jump`.
+    vertical: HashMap<ObjectHandle, f32>,
     enabled_overrides: HashMap<BodyHandle, bool>,
     degraded_reported: HashSet<ObjectHandle>,
     commands: Vec<PhysicsCommand>,
     events: Vec<PhysicsEvent>,
+}
+
+/// Изменения привязки объекта, зафиксированные вызовом: тип тела и параметры контроллера.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BindingUpdate {
+    pub(crate) kind: Option<BodyKind>,
+    pub(crate) controller: Option<CharacterController>,
 }
 
 impl PhysicsScriptState {
@@ -45,7 +55,28 @@ impl PhysicsScriptState {
         }
         self.grounded
             .retain(|object, _| self.bindings.contains_key(object));
+        self.vertical
+            .retain(|object, _| self.bindings.contains_key(object));
         self.snapshot = Some(snapshot);
+    }
+
+    /// Вертикальная скорость контроллера; `0`, пока `simple_move` и `jump` её не задавали.
+    pub(crate) fn vertical_velocity(&self, object: ObjectHandle) -> f32 {
+        self.vertical.get(&object).copied().unwrap_or(0.0)
+    }
+
+    /// Применяет изменения привязок, зафиксированные вызовом: тип тела и параметры контроллера.
+    pub(crate) fn apply_binding_updates(&mut self, updates: HashMap<ObjectHandle, BindingUpdate>) {
+        for (object, update) in updates {
+            if let Some(binding) = self.bindings.get_mut(&object) {
+                if let Some(kind) = update.kind {
+                    binding.kind = kind;
+                }
+                if let Some(controller) = update.controller {
+                    binding.character_controller = Some(controller);
+                }
+            }
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Result<&QuerySnapshot, String> {
@@ -117,9 +148,52 @@ impl PhysicsScriptState {
         commands: impl IntoIterator<Item = PhysicsCommand>,
         grounded: impl IntoIterator<Item = (ObjectHandle, bool)>,
         enabled: impl IntoIterator<Item = (BodyHandle, bool)>,
+        vertical: impl IntoIterator<Item = (ObjectHandle, f32)>,
     ) {
         self.commands.extend(commands);
         self.grounded.extend(grounded);
         self.enabled_overrides.extend(enabled);
+        self.vertical.extend(vertical);
+    }
+}
+
+/// Значения коллайдера в форме скриптов: полный размер box, радиус и высота, как в ABI v16.
+/// Общие для Lua и ABI, чтобы оба пути читали и писали компонент одинаково.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ColliderValues {
+    pub(crate) shape: ColliderShape,
+    pub(crate) size: [f32; 3],
+    pub(crate) radius: f32,
+    pub(crate) height: f32,
+    pub(crate) offset: [f32; 3],
+    pub(crate) trigger: bool,
+}
+
+impl ColliderValues {
+    pub(crate) fn from_component(component: &ColliderComponent) -> Self {
+        Self {
+            shape: component.shape,
+            size: component.half_extents.map(|extent| extent * 2.0),
+            radius: component.radius,
+            height: component.height,
+            offset: component.offset,
+            trigger: component.trigger,
+        }
+    }
+
+    /// Компонент с этими значениями; материал текущего компонента сохраняется.
+    pub(crate) fn apply_to(self, current: &ColliderComponent) -> ColliderComponent {
+        ColliderComponent {
+            shape: self.shape,
+            half_extents: self.size.map(|size| size * 0.5),
+            radius: self.radius,
+            height: self.height,
+            offset: self.offset,
+            trigger: self.trigger,
+            friction: current.friction,
+            restitution: current.restitution,
+            material: current.material.clone(),
+            resolved_material: current.resolved_material,
+        }
     }
 }

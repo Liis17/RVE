@@ -34,11 +34,23 @@ function Shooter:fire(camera)
   end
   -- world_matrix приходит по столбцам: третий столбец — локальная ось Z камеры, а камера смотрит по -Z.
   local fx, fy, fz = -matrix[9], -matrix[10], -matrix[11]
+  local origin = { x = matrix[13], y = matrix[14], z = matrix[15] }
+  local displacement = {
+    x = fx * MUZZLE_DISTANCE,
+    y = fy * MUZZLE_DISTANCE,
+    z = fz * MUZZLE_DISTANCE,
+  }
+  local obstruction = rve.physics.sphere_cast(origin, 0.05, displacement, {
+    ignore = rve.find("player"),
+  })
+  if obstruction ~= nil then
+    return
+  end
   rve.spawn(BULLET, {
     position = {
-      x = matrix[13] + fx * MUZZLE_DISTANCE,
-      y = matrix[14] + fy * MUZZLE_DISTANCE,
-      z = matrix[15] + fz * MUZZLE_DISTANCE,
+      x = origin.x + displacement.x,
+      y = origin.y + displacement.y,
+      z = origin.z + displacement.z,
     },
     velocity = { x = fx * BULLET_SPEED, y = fy * BULLET_SPEED, z = fz * BULLET_SPEED },
   })

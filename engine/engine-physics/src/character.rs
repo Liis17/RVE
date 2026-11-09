@@ -289,6 +289,7 @@ impl CharacterController {
         let filter = QueryFilter {
             ignore: Some(body),
             include_triggers: false,
+            layer_mask: snapshot.collision_layer_mask(body),
         };
 
         for _ in 0..CHARACTER_MOVE_ITERATIONS {
@@ -348,6 +349,7 @@ impl CharacterController {
         let filter = QueryFilter {
             ignore: Some(body),
             include_triggers: false,
+            layer_mask: snapshot.collision_layer_mask(body),
         };
         let up = Vec3::Y * self.step_height;
         if snapshot
@@ -429,6 +431,7 @@ impl CharacterController {
         let filter = QueryFilter {
             ignore: Some(body),
             include_triggers: false,
+            layer_mask: snapshot.collision_layer_mask(body),
         };
         let Some(hit) =
             snapshot.shape_cast_with_overrides(shape, pose, down, self.skin, filter, overrides)?
@@ -587,6 +590,49 @@ mod tests {
             .unwrap();
         assert!(descending.grounded, "{descending:?}");
         assert!(descending.translation.y < -0.03, "{descending:?}");
+    }
+
+    /// Контроллер на слое 1 идёт в стену на слое 0. Матрица либо разрешает пару, либо нет.
+    fn walk_into_wall(pair_enabled: bool) -> super::CharacterMoveResult {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut masks = [u32::MAX; crate::world::PHYSICS_LAYER_COUNT];
+        if !pair_enabled {
+            masks[1] &= !1;
+        }
+        world.set_collision_matrix(masks);
+        let walker_controller = controller(0.0, 45.0, 0.0);
+        let mut walker = BodyDesc::new(
+            BodyKind::Kinematic,
+            Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+            crate::world::ColliderDesc::new(walker_controller.capsule().unwrap()),
+        );
+        walker.character_controller = true;
+        walker.layer = 1;
+        let walker = world.insert_body(walker).unwrap();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.5, 2.0, 2.0)).unwrap(),
+                Pose::new(Vec3::new(1.5, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        walker_controller
+            .move_capsule(
+                &snapshot,
+                walker,
+                Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+                Vec3::X * 3.0,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn collision_matrix_decides_whether_controller_sweeps_hit_a_wall() {
+        let blocked = walk_into_wall(true);
+        assert!(blocked.translation.x < 1.0, "{blocked:?}");
+
+        let passes = walk_into_wall(false);
+        assert!(passes.translation.x > 2.9, "{passes:?}");
     }
 
     fn move_over_step(step_height: f32) -> super::CharacterMoveResult {

@@ -190,6 +190,8 @@ pub struct ScriptHost {
     classes: HashMap<String, (Table, Option<ParamSchema>)>,
     /// Heavy-скрипты библиотеки по имени: дескриптор и схема параметров.
     heavy: HashMap<String, (&'static RveScriptDesc, Option<ParamSchema>)>,
+    /// ABI версия библиотеки `heavy`; определяет, какие виды событий модуль может получить.
+    heavy_abi_version: u32,
     lifecycle: Rc<RefCell<Lifecycle>>,
     /// Spawn-объектов, уже созданных в текущем кадре; сбрасывается в начале update.
     frame_spawned: usize,
@@ -296,6 +298,7 @@ enum ScriptPhysicsEventKind {
     CollisionExit,
     TriggerEnter,
     TriggerExit,
+    TriggerStay,
 }
 
 impl ScriptPhysicsEventKind {
@@ -305,6 +308,7 @@ impl ScriptPhysicsEventKind {
             Self::CollisionExit => "on_collision_exit",
             Self::TriggerEnter => "on_trigger_enter",
             Self::TriggerExit => "on_trigger_exit",
+            Self::TriggerStay => "on_trigger_stay",
         }
     }
 
@@ -314,6 +318,7 @@ impl ScriptPhysicsEventKind {
             Self::CollisionExit => rve_sdk::abi::RVE_COLLISION_EXIT,
             Self::TriggerEnter => rve_sdk::abi::RVE_TRIGGER_ENTER,
             Self::TriggerExit => rve_sdk::abi::RVE_TRIGGER_EXIT,
+            Self::TriggerStay => rve_sdk::abi::RVE_TRIGGER_STAY,
         }
     }
 }
@@ -416,6 +421,7 @@ impl ScriptHost {
         let base_environment = lua_state.base_environment;
         let loaded_library = library.and_then(ScriptLibrary::shared_library);
         let heavy = library.map(heavy_scripts).unwrap_or_default();
+        let heavy_abi_version = library.map_or(0, ScriptLibrary::abi_version);
         let mut host = Self {
             lua,
             base_environment,
@@ -424,6 +430,7 @@ impl ScriptHost {
             next_serial: 0,
             classes: HashMap::new(),
             heavy,
+            heavy_abi_version,
             lifecycle: Rc::new(RefCell::new(lifecycle)),
             frame_spawned: 0,
             _loaded_library: loaded_library,
@@ -615,6 +622,7 @@ impl ScriptHost {
                     });
                     let result = AbiScriptInstance::create(
                         descriptor,
+                        host.heavy_abi_version,
                         &params,
                         &object_refs,
                         AbiScriptCall {
@@ -1435,6 +1443,7 @@ impl ScriptHost {
             profile.messages = started.elapsed();
             let started = Instant::now();
             self.deliver_physics_events(world, time);
+            self.deliver_trigger_stays(world, time);
             profile.physics_events = started.elapsed();
             self.deliver_ui_events(world, time);
             self.deliver_net_events(world, time);
@@ -1966,6 +1975,48 @@ impl ScriptHost {
         }
     }
 
+    /// `on_trigger_stay` для каждой активной пары триггера на кадре обновления. Вызов идёт по
+    /// снимку текущего шага, поэтому кадр входа тоже получает stay, а кадр выхода — нет. В отличие
+    /// от Unity, это по кадру, а не по подшагу физики.
+    fn deliver_trigger_stays(&mut self, world: &mut World, time: ScriptTime) {
+        let Ok(snapshot) = self.physics.borrow().shared_snapshot() else {
+            return;
+        };
+        for &(first, second) in snapshot.trigger_pairs() {
+            let (Some(first_object), Some(second_object)) = (
+                self.live_body_object(world, first),
+                self.live_body_object(world, second),
+            ) else {
+                continue;
+            };
+            for (object, other) in [(first_object, second_object), (second_object, first_object)] {
+                self.deliver_physics_event(
+                    world,
+                    time,
+                    object,
+                    ScriptPhysicsEvent {
+                        kind: ScriptPhysicsEventKind::TriggerStay,
+                        other,
+                        point: glam::Vec3::ZERO,
+                        normal: glam::Vec3::ZERO,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Объект тела для `on_trigger_stay`: только живой и активный в иерархии. Удалённые и неактивные
+    /// партнёры остаются в снимке до следующего шага, но стой им не доставляется.
+    fn live_body_object(
+        &self,
+        world: &World,
+        body: engine_physics::BodyHandle,
+    ) -> Option<ObjectHandle> {
+        let object = self.physics.borrow().object(body)?;
+        (world.is_alive(object) && world.active_in_hierarchy(object) == Some(true))
+            .then_some(object)
+    }
+
     /// Объект тела, если он ещё известен: живой или удалённый, но в окне удаления. Для объекта вне
     /// этих двух состояний `other` не имеет идентичности, и пара пропускается.
     fn body_object(&self, world: &World, body: engine_physics::BodyHandle) -> Option<ObjectHandle> {
@@ -1993,7 +2044,10 @@ impl ScriptHost {
                 instance
                     .as_ref()
                     .filter(|instance| {
-                        instance.enabled && instance.running && instance.handle == object
+                        instance.enabled
+                            && instance.running
+                            && instance.handle == object
+                            && accepts_physics_event(&instance.kind, event.kind)
                     })
                     .map(|_| index)
             })
@@ -2616,6 +2670,7 @@ impl ScriptHost {
                 });
                 let result = AbiScriptInstance::create(
                     descriptor,
+                    self.heavy_abi_version,
                     &params,
                     &object_refs,
                     AbiScriptCall {
@@ -3170,6 +3225,17 @@ pub fn lite_properties(
             message,
         }
     })
+}
+
+/// `RVE_TRIGGER_STAY` появился в ABI v18. Модуль старше отвергает неизвестный вид события ошибкой,
+/// поэтому ему stay не доставляется.
+fn accepts_physics_event(kind: &ScriptKind, event: ScriptPhysicsEventKind) -> bool {
+    match kind {
+        ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
+            !matches!(event, ScriptPhysicsEventKind::TriggerStay) || script.abi_version() >= 18
+        }
+        _ => true,
+    }
 }
 
 /// Heavy-скрипты библиотеки: дескриптор и схема по имени.

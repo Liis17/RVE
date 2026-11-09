@@ -798,7 +798,7 @@ impl PlaySession {
         }
         watchdog.set_deadline(None);
         host.set_cursor(ScriptCursor::from(world.active_camera_cursor()));
-        let desc = PhysicsSceneDesc::from_world(
+        let mut desc = PhysicsSceneDesc::from_world(
             &world,
             &model_geometry,
             glam::Vec3::from_array(physics_settings.gravity),
@@ -806,6 +806,7 @@ impl PlaySession {
             physics_settings.max_substeps as usize,
         )
         .map_err(|error| error.to_string())?;
+        desc.collision_matrix = physics_settings.collision_matrix.masks;
         let (driver, bindings) = desc.build().map_err(|error| error.to_string())?;
         let (physics, initial_snapshot) =
             PlayPhysics::start(&world, driver, bindings, model_geometry)?;
@@ -1022,12 +1023,18 @@ impl PlaySession {
         let mut physics_step = Duration::ZERO;
         if let Some(physics) = &mut self.physics {
             let mut commands = self.host.drain_physics_commands();
-            commands.extend(
+            let synced = physics
+                .sync
+                .sync_world_commands(&mut self.world)
+                .map_err(|error| error.to_string())?;
+            physics.warnings.extend(
                 physics
                     .sync
-                    .sync_world_commands(&mut self.world)
-                    .map_err(|error| error.to_string())?,
+                    .take_warnings()
+                    .into_iter()
+                    .map(|error| format!("физика: привязка не обновлена: {error}")),
             );
+            commands.extend(synced);
             commands.append(&mut physics.velocities);
             let changes = std::mem::take(&mut physics.changes);
             physics
@@ -1313,6 +1320,13 @@ impl PlaySession {
         self.animation.take_warnings()
     }
 
+    /// Предупреждения физики, которые ещё не показаны в журнале.
+    pub fn drain_physics_warnings(&mut self) -> Vec<String> {
+        self.physics
+            .as_mut()
+            .map_or_else(Vec::new, |physics| std::mem::take(&mut physics.warnings))
+    }
+
     /// Завершает скрипты вызовом `on_destroy` и возвращает последние события.
     pub fn stop(mut self) -> Vec<ScriptEvent> {
         let time = self.script_time();
@@ -1396,6 +1410,8 @@ struct PlayPhysics {
     changes: Vec<BodyChange>,
     /// Скорости корней spawn-объектов; применяются сразу после вставки тела в том же шаге.
     velocities: Vec<PhysicsCommand>,
+    /// Предупреждения физики, которые ещё не показаны в журнале редактора.
+    warnings: Vec<String>,
     _control_tx: flume::Sender<()>,
     control_rx: flume::Receiver<()>,
     worker: Option<JoinHandle<Result<(), PhysicsServerError>>>,
@@ -1431,6 +1447,7 @@ impl PlayPhysics {
                 shapes: ShapeCache::default(),
                 changes: Vec::new(),
                 velocities: Vec::new(),
+                warnings: Vec::new(),
                 _control_tx: control_tx,
                 control_rx,
                 worker: Some(worker),
@@ -1479,6 +1496,12 @@ impl PlayPhysics {
         {
             None => Ok(()),
             Some(PhysicsReceive::Step(result)) => {
+                if result.skipped_commands > 0 {
+                    self.warnings.push(format!(
+                        "физика отклонила команд коллайдера или тела: {}",
+                        result.skipped_commands
+                    ));
+                }
                 self.sync
                     .apply_physics_poses(world, &result.poses)
                     .map_err(|error| error.to_string())?;
