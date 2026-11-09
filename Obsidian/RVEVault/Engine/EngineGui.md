@@ -28,6 +28,8 @@ API скрипта доступен только внутри вызова ск�
 
 Paint собирается в batches по текстуре и clip rect; изображения используют заявленные PNG, текст — общий glyph atlas. Вершины имеют экранные координаты в физических пикселях. Пока UI не менялся, `paint()` возвращает те же `Arc` draw list и atlas без повторной тесселяции. Atlas имеет версию, возрастающую при изменении пикселей; GPU-адаптер загружает только новую версию и повторно конвертирует вершины только для нового draw list. UI рисуется в output pass конкретного вида после scene/post-process вывода, вне HDR scene target и temporal обработки. Он виден только в тех кадрах, которым передали его primitives. Подробности прохода — [[Engine/EngineRender]].
 
+Картинки UI живут в `GameUi` по пути с числом ссылок. Владельцы (префабы и сессии Play) держат картинки через `attach`/`detach`. Сцена через `adopt_scene_images` закрепляет свои пути до `release_all`: повторная картинка того же пути освобождает только свой новый id, а уже загруженная текстура остаётся. `release_all` вызывается при выходе runtime (`RenderBackend::release_scene`) и при остановке сессии Play в редакторе; каждая текстура уничтожается ровно один раз.
+
 ## Источники
 
 Схема/layout/state/input/paint: `engine/engine-gui/src/{document,layout,system,input,capture,events,paint}.rs`. Загрузка, транзакции и Lua/ABI bridge: `engine/engine-script/src/{ui_assets,ui,ui_input,ui_lua,abi_host,library}.rs`. GPU-кэш: `engine/engine-ui/src/game.rs`; runtime кадр: `engine/engine-runtime/src/{game_ui,pipeline}.rs`. Сценовая ссылка — [[Engine/EngineScene]], редактор — [[RveEditor]], ABI — [[RveSdk]].

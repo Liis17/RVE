@@ -865,11 +865,12 @@ impl RenderBackend for VulkanBackend {
             &mut self.material_caches,
             SceneParticles::Descriptions,
         ) {
-            Ok(table) => {
+            Ok(mut table) => {
                 self.material_caches.pin_scene_resources();
                 self.scene_skin_instances.extend(table.skin_instance_ids());
                 self.scene_screen_shaders.extend(table.screen_shader_ids());
-                self.game_ui.add_scene_images(table.ui_images.clone());
+                self.game_ui
+                    .adopt_scene_images(&mut self.renderer, std::mem::take(&mut table.ui_images));
                 self.material_assets = Some(assets);
                 Ok(Box::new(table))
             }

@@ -2,7 +2,8 @@
 //!
 //! Модуль не зависит от egui: снимок `engine-gui` переводится в `UiPrimitive` и рисуется в
 //! `Frame.ui`. Атлас загружается только при новой версии, картинки считаются по владельцам
-//! (сцена, префаб, сессия Play): общая картинка живёт, пока её держит хотя бы один владелец.
+//! (префаб, сессия Play) и по путям сцен: общая картинка живёт, пока её держит хотя бы один
+//! владелец или загрузившая её сцена.
 
 use engine_gui::paint::{UiDrawList, UiImageData, UiPaint, UiTexture};
 use engine_render::{RenderError, Renderer, UiImage, UiPrimitive, UiTextureId, UiVertex};
@@ -10,12 +11,49 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
+/// Операции с UI-текстурами; отделены от `Renderer`, чтобы проверять учёт без GPU.
+pub trait UiTextures {
+    type Id: Copy;
+
+    fn create(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Self::Id, RenderError>;
+    fn update(
+        &mut self,
+        texture: Self::Id,
+        region: [u32; 4],
+        rgba: &[u8],
+    ) -> Result<(), RenderError>;
+    fn free(&mut self, texture: Self::Id) -> Result<(), RenderError>;
+}
+
+impl UiTextures for Renderer {
+    type Id = UiTextureId;
+
+    fn create(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<UiTextureId, RenderError> {
+        self.create_ui_texture(width, height, rgba)
+    }
+
+    fn update(
+        &mut self,
+        texture: UiTextureId,
+        region: [u32; 4],
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        self.update_ui_texture(texture, region, rgba)
+    }
+
+    fn free(&mut self, texture: UiTextureId) -> Result<(), RenderError> {
+        self.free_ui_texture(texture)
+    }
+}
+
 /// GPU-ресурсы игрового UI: атлас шрифтов по версии, картинки по пути с числом ссылок и буфер
 /// вершин, пересобираемый только при новом draw list. `O` — владелец картинок (префаб, сессия).
 pub struct GameUi<O> {
     /// Загруженная версия атласа и её текстура; `None` — атлас пустой.
     atlas: Option<(u64, Option<UiTextureId>)>,
     images: HashMap<String, (UiTextureId, usize)>,
+    /// Пути, которые держит хотя бы одна сцена: её ссылка не снимается до `release_all`.
+    scene_paths: HashSet<String>,
     owned: HashMap<O, Vec<String>>,
     vertices: Vec<UiVertex>,
     converted: Option<Arc<UiDrawList>>,
@@ -27,6 +65,7 @@ impl<O> Default for GameUi<O> {
         Self {
             atlas: None,
             images: HashMap::new(),
+            scene_paths: HashSet::new(),
             owned: HashMap::new(),
             vertices: Vec::new(),
             converted: None,
@@ -36,17 +75,35 @@ impl<O> Default for GameUi<O> {
 }
 
 impl<O: Eq + Hash + Clone> GameUi<O> {
-    /// Добавляет картинки новой сцены по путям, которых ещё нет. Уже загруженная картинка того же
-    /// пути остаётся прежней: её ссылки держат предыдущие владельцы.
-    pub fn add_scene_images(&mut self, images: HashMap<String, UiTextureId>) {
+    /// Принимает картинки сцены по путям. Путь, который уже держит сцена, не меняется, а новый
+    /// id этого пути освобождается сразу: он не попал ни в один снимок. Путь, уже загруженный
+    /// префабом, получает ссылку сцены; текстура живёт, пока держит хотя бы один владелец.
+    pub fn adopt_scene_images<G: UiTextures<Id = UiTextureId>>(
+        &mut self,
+        gpu: &mut G,
+        images: HashMap<String, UiTextureId>,
+    ) {
         for (path, id) in images {
-            self.images.entry(path).or_insert((id, 1));
+            if !self.scene_paths.insert(path.clone()) {
+                free_texture(gpu, id);
+                continue;
+            }
+            match self.images.get_mut(&path) {
+                Some((_, users)) => {
+                    *users += 1;
+                    free_texture(gpu, id);
+                }
+                None => {
+                    self.images.insert(path, (id, 1));
+                }
+            }
         }
     }
 
-    /// Картинки сцены, созданные при загрузке: каждая имеет одну ссылку, владелец не отслеживается.
+    /// Картинки сцены, созданные при загрузке: каждая держится сценой до `release_all`.
     pub fn with_scene_images(images: HashMap<String, UiTextureId>) -> Self {
         Self {
+            scene_paths: images.keys().cloned().collect(),
             images: images
                 .into_iter()
                 .map(|(path, id)| (path, (id, 1)))
@@ -57,17 +114,17 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
 
     /// Загружает картинки владельца или добавляет ссылку к уже загруженным. Ошибка создания
     /// откатывает уже добавленные картинки этого вызова.
-    pub fn attach(
+    pub fn attach<G: UiTextures<Id = UiTextureId>>(
         &mut self,
-        renderer: &mut Renderer,
+        gpu: &mut G,
         owner: O,
         images: &BTreeMap<String, Arc<UiImageData>>,
     ) -> Result<(), RenderError> {
         let mut attached: Vec<String> = Vec::with_capacity(images.len());
         for (path, image) in images {
-            if let Err(error) = self.add_image(renderer, path, image) {
+            if let Err(error) = self.add_image(gpu, path, image) {
                 for path in &attached {
-                    self.release_image(renderer, path);
+                    self.release_image(gpu, path);
                 }
                 return Err(error);
             }
@@ -75,27 +132,28 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
         }
         if let Some(previous) = self.owned.insert(owner, attached) {
             for path in previous {
-                self.release_image(renderer, &path);
+                self.release_image(gpu, &path);
             }
         }
         Ok(())
     }
 
     /// Снимает ссылки владельца; картинка без ссылок освобождается.
-    pub fn detach(&mut self, renderer: &mut Renderer, owner: &O) {
+    pub fn detach<G: UiTextures<Id = UiTextureId>>(&mut self, gpu: &mut G, owner: &O) {
         for path in self.owned.remove(owner).unwrap_or_default() {
-            self.release_image(renderer, &path);
+            self.release_image(gpu, &path);
         }
     }
 
     /// Освобождает все UI-текстуры: атлас, картинки и буфер; вызывается до уничтожения renderer.
-    pub fn release_all(&mut self, renderer: &mut Renderer) {
+    pub fn release_all<G: UiTextures<Id = UiTextureId>>(&mut self, gpu: &mut G) {
         if let Some((_, Some(atlas))) = self.atlas.take() {
-            free_texture(renderer, atlas);
+            free_texture(gpu, atlas);
         }
         for (_, (id, _)) in self.images.drain() {
-            free_texture(renderer, id);
+            free_texture(gpu, id);
         }
+        self.scene_paths.clear();
         self.owned.clear();
         self.vertices.clear();
         self.converted = None;
@@ -104,24 +162,24 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
 
     /// Готовит кадр к `primitives`: загружает атлас новой версии и переводит вершины нового draw
     /// list. Картинку батча, которой нет среди загруженных, предупреждает один раз на путь.
-    pub fn sync(&mut self, renderer: &mut Renderer, paint: &UiPaint) -> Result<(), RenderError> {
+    pub fn sync<G: UiTextures<Id = UiTextureId>>(
+        &mut self,
+        gpu: &mut G,
+        paint: &UiPaint,
+    ) -> Result<(), RenderError> {
         let loaded = self.atlas.map(|(version, _)| version);
         if atlas_upload_needed(loaded, paint.atlas.version) {
             let atlas = &paint.atlas;
             let texture = if atlas.size[0] > 0 && atlas.size[1] > 0 && !atlas.pixels.is_empty() {
                 let rgba: Vec<u8> = atlas.pixels.iter().flatten().copied().collect();
-                Some(renderer.create_ui_texture(
-                    atlas.size[0] as u32,
-                    atlas.size[1] as u32,
-                    &rgba,
-                )?)
+                Some(gpu.create(atlas.size[0] as u32, atlas.size[1] as u32, &rgba)?)
             } else {
                 None
             };
             // Старая текстура освобождается только после создания новой; при ошибке выше прежний
             // атлас остаётся, и следующий кадр повторит загрузку.
             if let Some((_, Some(old))) = self.atlas.replace((paint.atlas.version, texture)) {
-                free_texture(renderer, old);
+                free_texture(gpu, old);
             }
         }
         self.convert(&paint.draw_list);
@@ -154,9 +212,9 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
         primitives
     }
 
-    fn add_image(
+    fn add_image<G: UiTextures<Id = UiTextureId>>(
         &mut self,
-        renderer: &mut Renderer,
+        gpu: &mut G,
         path: &str,
         image: &UiImageData,
     ) -> Result<(), RenderError> {
@@ -164,12 +222,12 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
             *users += 1;
             return Ok(());
         }
-        let id = renderer.create_ui_texture(image.size[0], image.size[1], &image.rgba)?;
+        let id = gpu.create(image.size[0], image.size[1], &image.rgba)?;
         self.images.insert(path.to_owned(), (id, 1));
         Ok(())
     }
 
-    fn release_image(&mut self, renderer: &mut Renderer, path: &str) {
+    fn release_image<G: UiTextures<Id = UiTextureId>>(&mut self, gpu: &mut G, path: &str) {
         let Some((_, users)) = self.images.get_mut(path) else {
             return;
         };
@@ -177,7 +235,7 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
         if *users == 0
             && let Some((id, _)) = self.images.remove(path)
         {
-            free_texture(renderer, id);
+            free_texture(gpu, id);
         }
     }
 
@@ -232,8 +290,8 @@ fn batch_texture(
     }
 }
 
-fn free_texture(renderer: &mut Renderer, texture: UiTextureId) {
-    if let Err(error) = renderer.free_ui_texture(texture) {
+fn free_texture<G: UiTextures<Id = UiTextureId>>(gpu: &mut G, texture: UiTextureId) {
+    if let Err(error) = gpu.free(texture) {
         log::error!("UI-текстура не освобождена: {error}");
     }
 }
@@ -301,6 +359,102 @@ mod tests {
             ui.primitives(&other).is_empty(),
             "чужой draw list не рисуется"
         );
+    }
+
+    /// Фейковые UI-текстуры: id — обёртка над usize, освобождения записываются.
+    #[derive(Default)]
+    struct FakeTextures {
+        created: usize,
+        freed: Vec<UiTextureId>,
+    }
+
+    impl UiTextures for FakeTextures {
+        type Id = UiTextureId;
+
+        fn create(
+            &mut self,
+            _width: u32,
+            _height: u32,
+            _rgba: &[u8],
+        ) -> Result<UiTextureId, RenderError> {
+            self.created += 1;
+            Ok(fake_texture(self.created))
+        }
+
+        fn update(
+            &mut self,
+            _texture: UiTextureId,
+            _region: [u32; 4],
+            _rgba: &[u8],
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn free(&mut self, texture: UiTextureId) -> Result<(), RenderError> {
+            self.freed.push(texture);
+            Ok(())
+        }
+    }
+
+    fn fake_texture(value: usize) -> UiTextureId {
+        // SAFETY: UiTextureId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn owned_image(path: &str) -> BTreeMap<String, Arc<UiImageData>> {
+        BTreeMap::from([(
+            path.to_owned(),
+            Arc::new(UiImageData::premultiplied([1, 1], vec![0; 4])),
+        )])
+    }
+
+    #[test]
+    fn scene_image_keeps_a_loaded_path_after_its_owner_leaves_and_frees_duplicate_ids_once() {
+        let mut gpu = FakeTextures::default();
+        let mut ui = GameUi::<u8>::default();
+        ui.attach(&mut gpu, 1, &owned_image("ui/p.png")).unwrap();
+        assert_eq!(gpu.created, 1);
+
+        ui.adopt_scene_images(
+            &mut gpu,
+            HashMap::from([("ui/p.png".to_owned(), fake_texture(90))]),
+        );
+        assert_eq!(
+            gpu.freed,
+            vec![fake_texture(90)],
+            "дубликат освобождён сразу"
+        );
+
+        ui.detach(&mut gpu, &1);
+        assert_eq!(gpu.freed.len(), 1, "сцена держит путь: текстура жива");
+
+        ui.release_all(&mut gpu);
+        assert_eq!(
+            gpu.freed,
+            vec![fake_texture(90), fake_texture(1)],
+            "каждая текстура освобождена ровно один раз"
+        );
+    }
+
+    #[test]
+    fn repeated_scene_adoptions_of_one_path_keep_one_texture_and_free_the_rest_once() {
+        let mut gpu = FakeTextures::default();
+        let mut ui = GameUi::<u8>::default();
+        for id in 10..14 {
+            ui.adopt_scene_images(
+                &mut gpu,
+                HashMap::from([("ui/p.png".to_owned(), fake_texture(id))]),
+            );
+        }
+        assert_eq!(
+            gpu.freed,
+            vec![fake_texture(11), fake_texture(12), fake_texture(13)],
+            "каждый повтор пути освобождает только свой новый id"
+        );
+
+        ui.release_all(&mut gpu);
+        assert_eq!(gpu.freed.len(), 4);
+        assert_eq!(gpu.freed.last(), Some(&fake_texture(10)));
     }
 
     #[test]
