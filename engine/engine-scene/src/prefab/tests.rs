@@ -130,6 +130,117 @@ fn one_level_instance_gets_mapped_ids_parents_and_instance_fields() {
 }
 
 #[test]
+fn prefab_object_references_are_local_and_are_mapped_for_instances_and_spawns() {
+    let prefab = r#"
+[[assets]]
+path = "/scripts/ref.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/ref.lua"
+params = { target = { object = "child" } }
+[[objects]]
+id = "child"
+parent = "root"
+"#;
+    let library = Library::new(&[("prefabs/ref.rveprefab", prefab)]);
+    let prefab_document = SceneDocument::parse_prefab("/prefabs/ref.rveprefab", prefab).unwrap();
+    let expanded = library
+        .expand(&scene(
+            &format!("{CAMERA}[[assets]]\npath=\"/prefabs/ref.rveprefab\"\n[[instances]]\nid=\"door\"\nprefab=\"/prefabs/ref.rveprefab\"\n"),
+        ))
+        .unwrap();
+    assert_eq!(
+        object(&expanded.document, "door").lite_scripts[0].params["target"],
+        ParamValue::Object("door.child".into())
+    );
+
+    let template = load_template(&library, "prefabs/ref.rveprefab").unwrap();
+    let document = scene(CAMERA);
+    let mut world = World::from_document(&document).unwrap();
+    let reserved = (0..template.objects().len())
+        .map(|_| world.reserve_object())
+        .collect();
+    world
+        .spawn(
+            reserved,
+            &template,
+            crate::SpawnOptions {
+                id: Some("spawned".into()),
+                ..crate::SpawnOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        world.object_by_id("spawned").unwrap().lite_scripts[0].params["target"],
+        ParamValue::Object("spawned.child".into())
+    );
+
+    let outside = prefab.replace("object = \"child\"", "object = \"outside\"");
+    let error = SceneDocument::parse_prefab("/prefabs/ref.rveprefab", &outside).unwrap_err();
+    assert!(
+        error.message.contains("outside the prefab") || error.message.contains("пределы префаба")
+    );
+    assert!(prefab_document.is_prefab());
+}
+
+#[test]
+fn prefab_object_reference_override_keeps_a_colliding_scene_object_id() {
+    let prefab = r#"
+[[assets]]
+path = "/scripts/ref.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/ref.lua"
+params = { target = { object = "player" } }
+[[objects]]
+id = "player"
+parent = "root"
+"#;
+    let library = Library::new(&[("prefabs/ref.rveprefab", prefab)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/prefabs/ref.rveprefab\"\n{CAMERA}[[objects]]\nid = \"player\"\n[[instances]]\nid = \"inst\"\nprefab = \"/prefabs/ref.rveprefab\"\n[[instances.overrides]]\ntarget = \"root\"\nlite_params = [{{ path = \"/scripts/ref.lua\", params = {{ target = {{ object = \"player\" }} }} }}]\n"
+    ));
+
+    let expanded = library.expand(&document).unwrap().document;
+
+    assert_eq!(
+        object(&expanded, "inst").lite_scripts[0].params["target"],
+        ParamValue::Object("player".into())
+    );
+}
+
+#[test]
+fn prefab_object_reference_override_accepts_a_full_instance_path() {
+    let prefab = r#"
+[[assets]]
+path = "/scripts/ref.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/ref.lua"
+params = { target = { object = "child" } }
+[[objects]]
+id = "child"
+parent = "root"
+"#;
+    let library = Library::new(&[("prefabs/ref.rveprefab", prefab)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/prefabs/ref.rveprefab\"\n{CAMERA}[[instances]]\nid = \"inst\"\nprefab = \"/prefabs/ref.rveprefab\"\n[[instances.overrides]]\ntarget = \"root\"\nlite_params = [{{ path = \"/scripts/ref.lua\", params = {{ target = {{ object = \"inst.child\" }} }} }}]\n"
+    ));
+
+    let expanded = library.expand(&document).unwrap().document;
+    let world = World::from_document(&expanded).unwrap();
+
+    assert!(world.handle("inst.child").is_some());
+    assert_eq!(
+        object(&expanded, "inst").lite_scripts[0].params["target"],
+        ParamValue::Object("inst.child".into())
+    );
+}
+
+#[test]
 fn nested_prefabs_produce_dotted_ids_and_outer_overrides_win() {
     let lock = "[[assets]]\npath = \"/models/door.fbx\"\n[[objects]]\nid = \"body\"\n[[objects]]\nid = \"bolt\"\nparent = \"body\"\nname = \"Bolt\"\n[objects.mesh_renderer]\nmodel = \"/models/door.fbx\"\n";
     let door = "[[assets]]\npath = \"/prefabs/lock.rveprefab\"\n[[objects]]\nid = \"frame\"\n[[instances]]\nid = \"lock\"\nparent = \"frame\"\nprefab = \"/prefabs/lock.rveprefab\"\n[[instances.overrides]]\ntarget = \"bolt\"\nname = \"Inner\"\ntransform = { position = [1.0, 2.0, 3.0] }\n";

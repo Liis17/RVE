@@ -1146,10 +1146,24 @@ impl World {
         ids: Vec<String>,
     ) {
         let base = self.objects.len();
+        let spawned_refs = template
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(local, object)| {
+                let source = if local == template.root {
+                    "__template".to_owned()
+                } else {
+                    format!("__template.{}", object.id)
+                };
+                (source, ids[local].clone())
+            })
+            .collect::<HashMap<_, _>>();
         for (local, object) in template.objects.iter().enumerate() {
             let handle = reserved[local];
             let mut scene_object = object.clone();
             scene_object.id = ids[local].clone();
+            remap_script_object_refs(&mut scene_object, &spawned_refs);
             let parent = match template.parents[local] {
                 Some(parent) => Some(reserved[parent]),
                 None => options.parent,
@@ -1282,6 +1296,38 @@ impl World {
             .collect();
         self.topological_order = order;
         Ok(removed_handles)
+    }
+}
+
+fn remap_script_object_refs(object: &mut SceneObject, mapped: &HashMap<String, String>) {
+    fn remap_params(
+        params: &mut std::collections::BTreeMap<String, crate::ParamValue>,
+        mapped: &HashMap<String, String>,
+    ) {
+        fn visit(value: &mut crate::ParamValue, mapped: &HashMap<String, String>) {
+            match value {
+                crate::ParamValue::Object(id) if !id.is_empty() => {
+                    if let Some(mapped) = mapped.get(id) {
+                        *id = mapped.clone();
+                    }
+                }
+                crate::ParamValue::Array(values) => {
+                    for value in values {
+                        visit(value, mapped);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for value in params.values_mut() {
+            visit(value, mapped);
+        }
+    }
+    for script in &mut object.lite_scripts {
+        remap_params(&mut script.params, mapped);
+    }
+    for script in &mut object.heavy_scripts {
+        remap_params(&mut script.params, mapped);
     }
 }
 

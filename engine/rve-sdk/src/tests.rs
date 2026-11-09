@@ -8,7 +8,7 @@ use crate::abi::{
 };
 use crate::{
     AntiAliasing, CameraSettings, ConsoleLevel, Context, GamepadAxis, GamepadButton, GamepadState,
-    GamepadStick, Key, MouseButton, Params, PhysicalInput, Script, Tonemapper, Value,
+    GamepadStick, Key, MouseButton, Object, Params, PhysicalInput, Script, Tonemapper, Value,
 };
 use std::ffi::c_void;
 
@@ -1750,6 +1750,14 @@ fn borrowed_abi_values_and_params_become_owned_values() {
             key: RveStr::from_static("nested"),
             value: RveValue::array(&nested),
         },
+        RveParamEntry {
+            key: RveStr::from_static("object"),
+            value: RveValue::object(9),
+        },
+        RveParamEntry {
+            key: RveStr::from_static("asset"),
+            value: RveValue::asset("models/tree.fbx"),
+        },
     ];
     let params = RveParams {
         entries: entries.as_ptr(),
@@ -1766,6 +1774,16 @@ fn borrowed_abi_values_and_params_become_owned_values() {
             Value::String("value".to_owned())
         ])])
     );
+    assert_eq!(owned["object"], Value::Object(Object { handle: 9 }));
+    assert_eq!(owned["asset"], Value::Asset("models/tree.fbx".to_owned()));
+}
+
+#[test]
+fn context_object_returns_its_own_handle() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let context = Context::new(&host).unwrap();
+    assert_eq!(context.object(), Object { handle: 1 });
 }
 
 #[test]
@@ -1855,8 +1873,55 @@ mod with_params {
                 axis: [f32; 3] = [0.0, 1, -0.5],
             },
             "Plain" => factory,
+            "Refs" => factory {
+                target: Option<Object> = None,
+                body: component(rigid_body) = None,
+                source: Asset = "",
+                mode: enum("idle", "run"),
+                tint: Color = [0.1, 0.2, 0.3],
+                weights: Vec<f32> = [],
+            },
         }
     }
+}
+
+#[test]
+fn script_module_macro_exports_reference_and_collection_parameter_kinds() {
+    use crate::abi::{
+        RVE_PARAM_ARRAY, RVE_PARAM_ASSET, RVE_PARAM_COLOR, RVE_PARAM_COMPONENT, RVE_PARAM_ENUM,
+        RVE_PARAM_OBJECT, RveParamDesc,
+    };
+    let module = with_params::module();
+    let descriptor = descriptor(module, "Refs");
+    let params: &[RveParamDesc] =
+        unsafe { std::slice::from_raw_parts(descriptor.params, descriptor.param_count) };
+    let strings = params
+        .iter()
+        .map(|param| unsafe { param.argument.to_str() }.unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        params.iter().map(|param| param.kind).collect::<Vec<_>>(),
+        [
+            RVE_PARAM_OBJECT,
+            RVE_PARAM_COMPONENT,
+            RVE_PARAM_ASSET,
+            RVE_PARAM_ENUM,
+            RVE_PARAM_COLOR,
+            RVE_PARAM_ARRAY,
+        ]
+    );
+    assert_eq!(strings, ["", "rigid_body", "", "idle\0run\0", "", "float"]);
+    assert_eq!(unsafe { params[0].default.data.object }, 0);
+    assert_eq!(unsafe { params[1].default.data.object }, 0);
+    assert_eq!(
+        unsafe { params[2].default.data.string.to_str() }.unwrap(),
+        ""
+    );
+    assert_eq!(
+        unsafe { params[3].default.data.string.to_str() }.unwrap(),
+        "idle"
+    );
+    assert_eq!(unsafe { params[5].default.data.array.len }, 0);
 }
 
 #[test]
@@ -1925,11 +1990,17 @@ fn script_module_macro_exports_typed_parameter_tables() {
 
 #[test]
 fn param_descriptor_layout_is_c_compatible() {
-    use crate::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveParamDesc, RveScriptDescV3, RveScriptDescV4};
+    use crate::abi::{
+        RVE_SCRIPT_ABI_MIN_VERSION, RveParamDesc, RveParamDescV13, RveScriptDescV3, RveScriptDescV4,
+    };
     use std::mem::{align_of, offset_of, size_of};
     let pointer = size_of::<usize>();
     assert_eq!(offset_of!(RveParamDesc, name), 0);
     assert_eq!(offset_of!(RveParamDesc, kind), 2 * pointer);
+    assert_eq!(
+        offset_of!(RveParamDesc, argument),
+        size_of::<RveParamDescV13>()
+    );
     assert_eq!(
         offset_of!(RveParamDesc, default) % align_of::<RveValue>(),
         0
@@ -1955,7 +2026,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2225,7 +2296,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
 }
 
 #[test]
@@ -2247,11 +2318,11 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
 }
 
 #[test]
-fn network_callbacks_and_descriptor_keep_the_v13_layout() {
+fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
     use std::mem::{offset_of, size_of};
     assert_eq!(
         offset_of!(RveHost, net_mode),
@@ -2270,7 +2341,7 @@ fn network_callbacks_and_descriptor_keep_the_v13_layout() {
 }
 
 #[test]
-fn ui_callbacks_and_descriptor_keep_the_v15_layout() {
+fn ui_callbacks_are_appended_after_the_v15_host_and_descriptor_tails() {
     use std::mem::{offset_of, size_of};
     assert_eq!(
         offset_of!(RveHost, ui_open),
@@ -2282,15 +2353,32 @@ fn ui_callbacks_and_descriptor_keep_the_v15_layout() {
         offset_of!(RveHost, ui_set_image) + size_of::<Option<crate::abi::RveUiSetImageFn>>()
     );
     assert_eq!(
+        size_of::<crate::abi::RveScriptDescV15>(),
+        size_of::<crate::abi::RveScriptDescV13>()
+    );
+    assert_eq!(
         size_of::<crate::abi::RveScriptDesc>(),
-        size_of::<crate::abi::RveScriptDescV13>() + size_of::<Option<crate::abi::RveUiEventFn>>()
+        size_of::<crate::abi::RveScriptDescV15>() + size_of::<Option<crate::abi::RveUiEventFn>>()
     );
     assert_eq!(
         offset_of!(crate::abi::RveScriptDesc, ui_event),
-        offset_of!(crate::abi::RveScriptDescV13, net_event)
+        offset_of!(crate::abi::RveScriptDescV15, net_event)
             + size_of::<Option<crate::abi::RveNetEventFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
+}
+
+#[test]
+fn v15_parameter_argument_is_an_appended_tail_after_the_legacy_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(crate::abi::RveParamDesc, argument),
+        size_of::<crate::abi::RveParamDescV13>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV15, params),
+        offset_of!(crate::abi::RveScriptDescV13, params)
+    );
 }
 
 unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {

@@ -8,7 +8,7 @@ use crate::lifecycle::{
 };
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LitePhysicsEvent,
-    LuaCommands, LuaInstance, RegisteredCommandCallback, ScriptEventQueue,
+    LuaCommands, LuaInstance, LuaInstanceInit, RegisteredCommandCallback, ScriptEventQueue,
 };
 use crate::net::{
     InboundBudget, MAX_INBOUND_MESSAGES_PER_PEER, NetErrorLog, NetObjectState, NetScriptState,
@@ -17,7 +17,7 @@ use crate::net::{
 use crate::physics::PhysicsScriptState;
 use crate::transaction::{
     MAX_MESSAGE_BYTES_PER_FRAME, MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage,
-    ScriptTransaction, ScriptTransactionInit,
+    ScriptObjectRef, ScriptTransaction, ScriptTransactionInit,
 };
 use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams,
@@ -32,9 +32,9 @@ use engine_gui::system::UiSystem;
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
 use engine_project::InputSettings;
 use engine_scene::{
-    AnimationRequest, AudioRequest, LocalTransform, NetEvent, NetId, NetMode, NetRequest,
-    ObjectHandle, ParamSchema, ParamValue, PeerId, PrefabTemplate, RigidBodyKind, SpawnOptions,
-    World,
+    AnimationRequest, AudioRequest, ComponentKind, LocalTransform, NetEvent, NetId, NetMode,
+    NetRequest, ObjectHandle, ParamKind, ParamSchema, ParamValue, PeerId, PrefabTemplate,
+    RigidBodyKind, SpawnOptions, World,
 };
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use rve_sdk::abi::RveScriptDesc;
@@ -511,14 +511,25 @@ impl ScriptHost {
                             message: format!("object {:?}: {message}", object.id),
                         }
                     })?;
+                let object_refs =
+                    resolve_object_refs(schema.as_ref(), &params, world).map_err(|message| {
+                        ScriptLoadError::Lite {
+                            path: path.to_owned(),
+                            message: format!("object {:?}: {message}", object.id),
+                        }
+                    })?;
                 let instance = LuaInstance::new(
                     &host.lua,
                     class,
-                    object.handle,
-                    &object.id,
-                    &object.name,
-                    &params,
-                    transform,
+                    LuaInstanceInit {
+                        object_id: &object.id,
+                        object_name: &object.name,
+                        params: &params,
+                        transform,
+                        object_refs: &object_refs,
+                        object_handle: object.handle,
+                    },
+                    host.active_call.clone(),
                 )
                 .map_err(|error| ScriptLoadError::Lite {
                     path: path.to_owned(),
@@ -560,6 +571,12 @@ impl ScriptHost {
                                 message,
                             }
                         })?;
+                    let object_refs = resolve_object_refs(schema.as_ref(), &params, world)
+                        .map_err(|message| ScriptLoadError::Heavy {
+                            object_id: object.id.clone(),
+                            name: script.name.clone(),
+                            message,
+                        })?;
                     let source = event_source(scene_name, &object.id, &script.name);
                     let owner = host.allocate_slot();
                     let serial = host.next_serial();
@@ -585,6 +602,7 @@ impl ScriptHost {
                     let result = AbiScriptInstance::create(
                         descriptor,
                         &params,
+                        &object_refs,
                         AbiScriptCall {
                             self_object,
                             transaction: &mut host.transaction,
@@ -735,7 +753,14 @@ impl ScriptHost {
                             path: script_path.to_owned(),
                             message: "source was not provided".to_owned(),
                         })?;
-                resolve_params(schema.as_ref(), &script.params).map_err(|message| {
+                let params =
+                    resolve_params(schema.as_ref(), &script.params).map_err(|message| {
+                        ScriptLoadError::Lite {
+                            path: script_path.to_owned(),
+                            message: format!("object {:?}: {message}", object.id),
+                        }
+                    })?;
+                resolve_object_refs(schema.as_ref(), &params, world).map_err(|message| {
                     ScriptLoadError::Lite {
                         path: script_path.to_owned(),
                         message: format!("object {:?}: {message}", object.id),
@@ -751,7 +776,15 @@ impl ScriptHost {
                             name: script.name.clone(),
                             message: "the script library does not register this name".to_owned(),
                         })?;
-                resolve_params(schema.as_ref(), &script.params).map_err(|message| {
+                let params =
+                    resolve_params(schema.as_ref(), &script.params).map_err(|message| {
+                        ScriptLoadError::Heavy {
+                            object_id: object.id.clone(),
+                            name: script.name.clone(),
+                            message,
+                        }
+                    })?;
+                resolve_object_refs(schema.as_ref(), &params, world).map_err(|message| {
                     ScriptLoadError::Heavy {
                         object_id: object.id.clone(),
                         name: script.name.clone(),
@@ -1682,7 +1715,7 @@ impl ScriptHost {
         }
     }
 
-    /// Есть ли у экземпляра callback `on_ui_event`; ABI-модули до v15 такого не имеют.
+    /// Есть ли у экземпляра callback `on_ui_event`; ABI-модули до v16 такого не имеют.
     fn has_ui_callback(&self, index: usize) -> bool {
         match self.instances[index]
             .as_ref()
@@ -2392,9 +2425,22 @@ impl ScriptHost {
                     .ok_or_else(|| format!("lite script {path:?} has no compiled class"))?;
                 let params = resolve_params(schema.as_ref(), &script.params)
                     .map_err(|message| format!("object {id:?}: {message}"))?;
-                let instance =
-                    LuaInstance::new(&self.lua, class, handle, &id, &name, &params, transform)
-                        .map_err(|error| error.to_string())?;
+                let object_refs = resolve_object_refs(schema.as_ref(), &params, world)
+                    .map_err(|message| format!("object {id:?}: {message}"))?;
+                let instance = LuaInstance::new(
+                    &self.lua,
+                    class,
+                    LuaInstanceInit {
+                        object_id: &id,
+                        object_name: &name,
+                        params: &params,
+                        transform,
+                        object_refs: &object_refs,
+                        object_handle: handle,
+                    },
+                    self.active_call.clone(),
+                )
+                .map_err(|error| error.to_string())?;
                 let serial = self.next_serial();
                 let index = self.insert_instance(ScriptInstance {
                     handle,
@@ -2413,6 +2459,8 @@ impl ScriptHost {
                     .map(|(descriptor, schema)| (*descriptor, schema.clone()))
                     .ok_or_else(|| format!("heavy script {:?} is not registered", script.name))?;
                 let params = resolve_params(schema.as_ref(), &script.params)
+                    .map_err(|message| format!("object {id:?}: {message}"))?;
+                let object_refs = resolve_object_refs(schema.as_ref(), &params, world)
                     .map_err(|message| format!("object {id:?}: {message}"))?;
                 let self_object = abi_object_handle(handle).ok_or_else(|| {
                     "object handle cannot be represented by the script ABI".to_owned()
@@ -2442,6 +2490,7 @@ impl ScriptHost {
                 let result = AbiScriptInstance::create(
                     descriptor,
                     &params,
+                    &object_refs,
                     AbiScriptCall {
                         self_object,
                         transaction: &mut self.transaction,
@@ -2894,6 +2943,101 @@ fn resolve_params(
     match schema {
         Some(schema) => schema.resolve(params),
         None => Ok(params.clone()),
+    }
+}
+
+fn resolve_object_refs(
+    schema: Option<&ParamSchema>,
+    params: &ScriptParams,
+    world: &World,
+) -> Result<HashMap<String, ScriptObjectRef>, String> {
+    fn visit(
+        value: &ParamValue,
+        kind: Option<&ParamKind>,
+        world: &World,
+        references: &mut HashMap<String, ScriptObjectRef>,
+    ) -> Result<(), String> {
+        match value {
+            ParamValue::Object(id) if !id.is_empty() => {
+                let handle = world
+                    .handle(id)
+                    .ok_or_else(|| format!("object reference {id:?} does not exist"))?;
+                let object = world
+                    .object(handle)
+                    .ok_or_else(|| format!("object reference {id:?} does not exist"))?;
+                if let Some(ParamKind::Component(component)) = kind
+                    && !has_component(object, component)
+                {
+                    return Err(format!(
+                        "object reference {id:?} does not have component {:?}",
+                        component.name()
+                    ));
+                }
+                references.insert(
+                    id.clone(),
+                    ScriptObjectRef {
+                        handle,
+                        name: object.name.clone(),
+                    },
+                );
+            }
+            ParamValue::Array(values) => {
+                let element = match kind {
+                    Some(ParamKind::Array(element)) => Some(element.as_ref()),
+                    _ => None,
+                };
+                for value in values {
+                    visit(value, element, world, references)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut references = HashMap::new();
+    if let Some(schema) = schema {
+        for spec in schema.specs() {
+            if let Some(value) = params.get(&spec.name) {
+                visit(value, Some(&spec.kind), world, &mut references)?;
+            }
+        }
+    } else {
+        for value in params.values() {
+            visit(value, None, world, &mut references)?;
+        }
+    }
+    Ok(references)
+}
+
+fn has_component(object: &engine_scene::WorldObject, component: &ComponentKind) -> bool {
+    match component {
+        ComponentKind::Transform => true,
+        ComponentKind::Camera => object.camera.is_some(),
+        ComponentKind::MeshRenderer => object.mesh_renderer.is_some(),
+        ComponentKind::LodGroup => object.lod_group.is_some(),
+        ComponentKind::DirectionalLight => object.directional_light.is_some(),
+        ComponentKind::PointLight => object.point_light.is_some(),
+        ComponentKind::SpotLight => object.spot_light.is_some(),
+        ComponentKind::Environment => object.environment.is_some(),
+        ComponentKind::Collider => object.collider.is_some(),
+        ComponentKind::RigidBody => object.rigid_body.is_some(),
+        ComponentKind::CharacterController => object.character_controller.is_some(),
+        ComponentKind::AudioSource => object.audio_source.is_some(),
+        ComponentKind::Animator => object.animator.is_some(),
+        ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
+        ComponentKind::NetworkIdentity => object.network_identity.is_some(),
+        ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::Script(name) => {
+            object
+                .lite_scripts
+                .iter()
+                .any(|script| script.path.as_str() == name)
+                || object
+                    .heavy_scripts
+                    .iter()
+                    .any(|script| script.name == *name)
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use super::*;
 use crate::layout::default_layout;
 use crate::project::OpenProject;
 use crate::scene_edit::{EditorScene, NewObject};
-use crate::state::{AssetDrag, ViewCommand};
+use crate::state::{AssetDrag, ObjectDrag, ViewCommand};
 use crate::viewport::camera::{EditorCamera, View, project_point};
 use crate::viewport::gizmo::GizmoTool;
 use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
@@ -1114,6 +1114,167 @@ fn script_params(harness: &Harness) -> BTreeMap<String, engine_scene::ParamValue
     harness.scene().object("camera").unwrap().lite_scripts[0]
         .params
         .clone()
+}
+
+fn reference_schema() -> engine_scene::ParamSchema {
+    engine_scene::ParamSchema::new(vec![
+        engine_scene::ParamSpec {
+            name: "target".to_owned(),
+            kind: engine_scene::ParamKind::Object,
+            default: engine_scene::ParamValue::Object(String::new()),
+            min: None,
+            max: None,
+            label: Some("Target".to_owned()),
+        },
+        engine_scene::ParamSpec {
+            name: "model".to_owned(),
+            kind: engine_scene::ParamKind::Asset(Some(engine_scene::AssetKind::Model)),
+            default: engine_scene::ParamValue::String(String::new()),
+            min: None,
+            max: None,
+            label: Some("Model".to_owned()),
+        },
+    ])
+    .unwrap()
+}
+
+fn reference_fields(texts: &[(String, Pos2)]) -> Vec<Pos2> {
+    texts
+        .iter()
+        .filter(|(text, _)| text == "◉ None" || text == "▧ None")
+        .map(|(_, at)| *at)
+        .collect()
+}
+
+fn drop_payload<T: Clone + Send + Sync + 'static>(harness: &mut Harness, at: Pos2, payload: T) {
+    inspector_frame(harness, vec![Event::PointerMoved(at)]);
+    egui::DragAndDrop::set_payload(&harness.ctx, payload);
+    inspector_frame(harness, vec![button(at, PointerButton::Primary, false)]);
+}
+
+#[test]
+fn inspector_reference_fields_accept_object_and_asset_drops_and_register_assets() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let target = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness
+        .scene_mut()
+        .edit_object(&target, None, |object| {
+            object.name = Some("Reference Target".to_owned());
+            Ok(())
+        })
+        .unwrap();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.asset_tree = vec![crate::assets_fs::AssetEntry {
+        name: "models".to_owned(),
+        path: "models".to_owned(),
+        is_dir: true,
+        children: vec![crate::assets_fs::AssetEntry {
+            name: "target.fbx".to_owned(),
+            path: "models/target.fbx".to_owned(),
+            is_dir: false,
+            children: Vec::new(),
+        }],
+    }];
+
+    let fields = reference_fields(&inspector_frame(&mut harness, Vec::new()));
+    assert_eq!(fields.len(), 2);
+    drop_payload(&mut harness, fields[0], ObjectDrag(target.clone()));
+    drop_payload(
+        &mut harness,
+        fields[1],
+        AssetDrag("models/target.fbx".to_owned()),
+    );
+
+    let params = script_params(&harness);
+    assert_eq!(params["target"], engine_scene::ParamValue::Object(target));
+    assert_eq!(
+        params["model"],
+        engine_scene::ParamValue::Asset(VirtualPath::parse("models/target.fbx").unwrap())
+    );
+    assert!(
+        harness
+            .scene()
+            .document()
+            .assets
+            .iter()
+            .any(|asset| asset.path.as_str() == "models/target.fbx")
+    );
+    assert_eq!(harness.state.current_folder, "models");
+    assert_eq!(
+        harness.state.project_selection.as_deref(),
+        Some("models/target.fbx")
+    );
+}
+
+#[test]
+fn inspector_reference_field_rejects_wrong_payload_types() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let fields = reference_fields(&inspector_frame(&mut harness, Vec::new()));
+    drop_payload(
+        &mut harness,
+        fields[0],
+        AssetDrag("models/target.fbx".to_owned()),
+    );
+    drop_payload(&mut harness, fields[1], ObjectDrag("camera".to_owned()));
+    assert!(script_params(&harness).is_empty());
+}
+
+#[test]
+fn inspector_clears_empty_reference_by_removing_its_parameter_key() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let target = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness.scene_mut().select(Some("camera"));
+    let fields = reference_fields(&inspector_frame(&mut harness, Vec::new()));
+    drop_payload(&mut harness, fields[0], ObjectDrag(target));
+    assert!(script_params(&harness).contains_key("target"));
+
+    let frame = inspector_frame(&mut harness, Vec::new());
+    inspector_click(&mut harness, position_of(&frame, "✕"));
+
+    assert!(!script_params(&harness).contains_key("target"));
+}
+
+#[test]
+fn inspector_reference_picker_selects_and_id_changes_rewrite_the_reference() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let target = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness
+        .scene_mut()
+        .edit_object(&target, None, |object| {
+            object.name = Some("Picker Target".to_owned());
+            Ok(())
+        })
+        .unwrap();
+    harness.scene_mut().select(Some("camera"));
+    let frame = inspector_frame(&mut harness, Vec::new());
+    let fields = reference_fields(&frame);
+    let picker = position_of(&frame, "⊙");
+    inspector_click(&mut harness, picker);
+    let menu = inspector_frame(&mut harness, Vec::new());
+    inspector_click(&mut harness, position_of(&menu, "Picker Target"));
+    assert_eq!(
+        script_params(&harness)["target"],
+        engine_scene::ParamValue::Object(target.clone())
+    );
+    assert_eq!(fields.len(), 2);
+
+    harness
+        .scene_mut()
+        .change_id(&target, "renamed_target")
+        .unwrap();
+    assert_eq!(
+        script_params(&harness)["target"],
+        engine_scene::ParamValue::Object("renamed_target".to_owned())
+    );
 }
 
 fn position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {

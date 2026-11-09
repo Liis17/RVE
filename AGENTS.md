@@ -72,7 +72,7 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
   - engine-audio (потребители engine-runtime и rve-editor): engine-resources, engine-scene, cpal, lewton, flume, rtrb, log.
   - engine-animation (потребители engine-runtime и rve-editor): engine-assets, engine-files, engine-scene, glam.
   - engine-network (потребители engine-runtime и rve-editor): engine-scene, blake3, chacha20poly1305, ed25519-dalek,
-    x25519-dalek, getrandom, zeroize, flume, glam, log. От скриптов, runtime, renderer и окна не зависит.
+    x25519-dalek, getrandom, zeroize, engine-files, flume, glam, log. От скриптов, runtime, renderer и окна не зависит.
   - engine-input (потребители engine-runtime и rve-editor): gilrs, log, rve-sdk.
   - engine-mcp (потребитель rve-editor): tiny_http, base64, getrandom, flume, serde_json.
   - rve-player: engine-runtime.

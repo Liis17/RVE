@@ -9,7 +9,10 @@ use engine_render::{ScreenShaderStage, compile_screen_shader};
 use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
-use engine_scene::{CameraSettings, MaterialAsset, PhysicsMaterialSettings, PostProcessSettings};
+use engine_scene::{
+    CameraSettings, ComponentKind, MaterialAsset, ParamKind, PhysicsMaterialSettings,
+    PostProcessSettings,
+};
 use engine_scene::{
     ParamSchema, ParamValue, PrefabTemplate, SceneAsset, SceneDocument, SceneError, SceneObject,
     ShaderAsset, ShaderPropertyDefault, expand,
@@ -18,6 +21,7 @@ use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -45,6 +49,14 @@ pub(crate) struct HeavyScriptUse {
     pub(crate) object: String,
     pub(crate) name: String,
     pub(crate) params: BTreeMap<String, ParamValue>,
+    /// Objects and declared assets visible to this script instance.
+    pub(crate) references: Arc<ScriptReferenceContext>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScriptReferenceContext {
+    pub(crate) objects: Vec<SceneObject>,
+    pub(crate) assets: BTreeSet<VirtualPath>,
 }
 
 /// Владелец ассета: включённая сцена или тяжёлый префаб из `prefabs.rveprefabs`.
@@ -190,16 +202,27 @@ fn prepare_with_resources(
         let document = expansion.document;
         validate_lite_params(
             &document.objects,
+            &document.objects,
+            &document.assets,
             &format!("сцена /{path}"),
             &handle,
             &mut lite_schemas,
         )?;
+        let references = Arc::new(ScriptReferenceContext {
+            objects: document.objects.clone(),
+            assets: document
+                .assets
+                .iter()
+                .map(|asset| asset.path.clone())
+                .collect(),
+        });
         heavy_scripts.extend(document.objects.iter().flat_map(|object| {
             object.heavy_scripts.iter().map(|script| HeavyScriptUse {
                 owner: format!("сцена /{path}"),
                 object: object.id.clone(),
                 name: script.name.clone(),
                 params: script.params.clone(),
+                references: references.clone(),
             })
         }));
         let mut scene_assets = document.assets.clone();
@@ -356,18 +379,42 @@ fn load_spawn_template(
         read_prefab_text(handle, child)
     })
     .map_err(|error| BuildError::input(format!("ошибка префаба /{path}: {error}")))?;
+    let reference_objects = template
+        .objects()
+        .iter()
+        .cloned()
+        .map(|mut object| {
+            object.id = if object.id.is_empty() {
+                "__template".to_owned()
+            } else {
+                format!("__template.{}", object.id)
+            };
+            object
+        })
+        .collect::<Vec<_>>();
     validate_lite_params(
         template.objects(),
+        &reference_objects,
+        template.assets(),
         &format!("префаб /{path}"),
         handle,
         schemas,
     )?;
+    let references = Arc::new(ScriptReferenceContext {
+        objects: reference_objects,
+        assets: template
+            .assets()
+            .iter()
+            .map(|asset| asset.path.clone())
+            .collect(),
+    });
     heavy_scripts.extend(template.objects().iter().flat_map(|object| {
         object.heavy_scripts.iter().map(|script| HeavyScriptUse {
             owner: owner.to_owned(),
             object: object.id.clone(),
             name: script.name.clone(),
             params: script.params.clone(),
+            references: references.clone(),
         })
     }));
     Ok(template)
@@ -576,10 +623,16 @@ fn add_explicit_archive(
 /// `properties` их классов; схемы кэшируются по пути скрипта для всех документов.
 fn validate_lite_params(
     objects: &[SceneObject],
+    reference_objects: &[SceneObject],
+    declared_assets: &[SceneAsset],
     owner: &str,
     handle: &ResourceHandle,
     schemas: &mut BTreeMap<VirtualPath, Option<ParamSchema>>,
 ) -> Result<(), BuildError> {
+    let assets = declared_assets
+        .iter()
+        .map(|asset| asset.path.clone())
+        .collect::<BTreeSet<_>>();
     for object in objects {
         for script in &object.lite_scripts {
             if !schemas.contains_key(&script.path) {
@@ -597,16 +650,110 @@ fn validate_lite_params(
                 schemas.insert(script.path.clone(), schema);
             }
             if let Some(schema) = &schemas[&script.path] {
-                schema.resolve(&script.params).map_err(|error| {
+                let resolved = schema.resolve(&script.params).map_err(|error| {
                     BuildError::input(format!(
                         "{owner}, объект {:?}, скрипт /{}: {error}",
                         object.id, script.path
                     ))
                 })?;
+                validate_script_references(schema, &resolved, reference_objects, &assets).map_err(
+                    |error| {
+                        BuildError::input(format!(
+                            "{owner}, объект {:?}, скрипт /{}: {error}",
+                            object.id, script.path
+                        ))
+                    },
+                )?;
             }
         }
     }
     Ok(())
+}
+
+/// Checks resolved reference parameters against the complete document that owns a script.
+pub(crate) fn validate_script_references(
+    schema: &ParamSchema,
+    params: &BTreeMap<String, ParamValue>,
+    objects: &[SceneObject],
+    assets: &BTreeSet<VirtualPath>,
+) -> Result<(), String> {
+    fn visit(
+        kind: &ParamKind,
+        value: &ParamValue,
+        objects: &[SceneObject],
+        assets: &BTreeSet<VirtualPath>,
+    ) -> Result<(), String> {
+        match (kind, value) {
+            (ParamKind::Object, ParamValue::Object(id)) if !id.is_empty() => {
+                if !objects.iter().any(|object| object.id == *id) {
+                    return Err(format!("ссылка на отсутствующий объект {id:?}"));
+                }
+            }
+            (ParamKind::Component(component), ParamValue::Object(id)) if !id.is_empty() => {
+                let object = objects
+                    .iter()
+                    .find(|object| object.id == *id)
+                    .ok_or_else(|| format!("ссылка на отсутствующий объект {id:?}"))?;
+                if !has_component(object, component) {
+                    return Err(format!(
+                        "объект {id:?} не содержит компонент {}",
+                        component.name()
+                    ));
+                }
+            }
+            (ParamKind::Asset(_), ParamValue::Asset(path)) => {
+                if !assets.contains(path) {
+                    return Err(format!(
+                        "ссылка на ресурс /{} отсутствует в [[assets]]",
+                        path.as_str()
+                    ));
+                }
+            }
+            (ParamKind::Array(element), ParamValue::Array(values)) => {
+                for value in values {
+                    visit(element, value, objects, assets)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    for spec in schema.specs() {
+        if let Some(value) = params.get(&spec.name) {
+            visit(&spec.kind, value, objects, assets)
+                .map_err(|error| format!("параметр {:?}: {error}", spec.name))?;
+        }
+    }
+    Ok(())
+}
+
+fn has_component(object: &SceneObject, component: &ComponentKind) -> bool {
+    match component {
+        ComponentKind::Transform => true,
+        ComponentKind::Camera => object.camera.is_some(),
+        ComponentKind::MeshRenderer => object.mesh_renderer.is_some(),
+        ComponentKind::LodGroup => object.lod_group.is_some(),
+        ComponentKind::DirectionalLight => object.directional_light.is_some(),
+        ComponentKind::PointLight => object.point_light.is_some(),
+        ComponentKind::SpotLight => object.spot_light.is_some(),
+        ComponentKind::Environment => object.environment.is_some(),
+        ComponentKind::Collider => object.collider.is_some(),
+        ComponentKind::RigidBody => object.rigid_body.is_some(),
+        ComponentKind::CharacterController => object.character_controller.is_some(),
+        ComponentKind::AudioSource => object.audio_source.is_some(),
+        ComponentKind::Animator => object.animator.is_some(),
+        ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
+        ComponentKind::NetworkIdentity => object.network_identity.is_some(),
+        ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::Script(script) => {
+            object
+                .lite_scripts
+                .iter()
+                .any(|item| item.path.as_str() == script)
+                || object.heavy_scripts.iter().any(|item| item.name == *script)
+        }
+    }
 }
 
 fn read_lite_properties_with_timeout(
@@ -903,12 +1050,13 @@ fn extension_is(path: &str, extension: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetUsage, EnabledScene, HeavyScriptUse, Owner, assign_archives,
+        AssetUsage, EnabledScene, HeavyScriptUse, Owner, ScriptReferenceContext, assign_archives,
         validate_heavy_scripts_configured,
     };
     use engine_files::VirtualPath;
     use engine_project::ProjectSettings;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     fn path(value: &str) -> VirtualPath {
         VirtualPath::parse(value).unwrap()
@@ -927,6 +1075,7 @@ mod tests {
                 object: "mesh".to_owned(),
                 name: "Bobber".to_owned(),
                 params: BTreeMap::new(),
+                references: Arc::new(ScriptReferenceContext::default()),
             }],
         )
         .unwrap_err();
@@ -1090,6 +1239,50 @@ mod lite_params_tests {
         .unwrap();
     }
 
+    fn reference_project(
+        root: &Path,
+        target: &str,
+        target_has_camera: bool,
+        model: &str,
+        declare_model: bool,
+    ) {
+        let assets = root.join("Assets");
+        fs::create_dir_all(assets.join("scripts")).unwrap();
+        fs::create_dir_all(assets.join("scripts")).unwrap();
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        fs::write(
+            assets.join("scripts/rotate.lua"),
+            r#"return { properties = {
+                target = { type = "component", component = "camera" },
+                model = { type = "asset", asset = "script" },
+            } }"#,
+        )
+        .unwrap();
+        fs::write(assets.join("scripts/extra.lua"), "return {}\n").unwrap();
+        let target_camera = if target_has_camera {
+            "[objects.camera]\n"
+        } else {
+            ""
+        };
+        let model_asset = if declare_model {
+            "[[assets]]\npath = \"/scripts/extra.lua\"\n"
+        } else {
+            ""
+        };
+        fs::write(
+            assets.join("main.rvescene"),
+            format!(
+                "[[assets]]\npath = \"/scripts/rotate.lua\"\n{model_asset}[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\nparams = {{ target = {{ object = {target:?} }}, model = {{ asset = {model:?} }} }}\n[[objects]]\nid = \"target\"\n{target_camera}"
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn lite_params_are_checked_against_the_script_schema() {
         let root = TempDir::create(&std::env::temp_dir(), "rve-build-params").unwrap();
@@ -1101,6 +1294,24 @@ mod lite_params_tests {
             assert_eq!(error.exit_code(), 2, "{params}: {error}");
             assert!(error.to_string().contains("\"camera\""), "{error}");
             assert!(error.to_string().contains("/scripts/rotate.lua"), "{error}");
+        }
+    }
+
+    #[test]
+    fn lite_reference_params_require_targets_components_and_declared_assets() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-refs").unwrap();
+        reference_project(root.path(), "target", true, "/scripts/extra.lua", true);
+        prepare_project(root.path()).unwrap();
+
+        for (target, has_camera, model, declare_model, expected) in [
+            ("missing", true, "/scripts/extra.lua", true, "missing"),
+            ("target", false, "/scripts/extra.lua", true, "camera"),
+            ("target", true, "/scripts/missing.lua", false, "[[assets]]"),
+        ] {
+            reference_project(root.path(), target, has_camera, model, declare_model);
+            let error = prepare_project(root.path()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 
@@ -1412,6 +1623,7 @@ mod heavy_prefab_tests {
     const SPIN_SCRIPT: &str =
         "return { properties = { speed = { type = \"float\", default = 1 } } }\n";
     const TOWER_BODY: &str = "[[assets]]\npath = \"/scripts/spin.lua\"\n[[assets]]\npath = \"/textures/tower.png\"\n[[objects]]\nid = \"tower\"\n[[objects.lite_scripts]]\npath = \"/scripts/spin.lua\"\nparams = { speed = 2 }\n";
+    const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
 
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join("Assets").join(path);
@@ -1443,6 +1655,45 @@ mod heavy_prefab_tests {
         write(root, "scripts/spin.lua", SPIN_SCRIPT);
         write(root, "textures/tower.png", "texture");
         write(root, "prefabs/tower.rveprefab", TOWER_BODY);
+    }
+
+    fn script_reference_project(root: &Path, target: &str) {
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        write(
+            root,
+            "scenes/main.rvescene",
+            &format!("[[assets]]\npath = \"/prefabs/spawn.rveprefab\"\n{CAMERA}"),
+        );
+        write(
+            root,
+            "scripts/ref.lua",
+            "return { properties = { target = { type = \"object\" } } }\n",
+        );
+        write(
+            root,
+            "prefabs/spawn.rveprefab",
+            &format!(
+                "[[assets]]\npath = \"/scripts/ref.lua\"\n[[objects]]\nid = \"root\"\n[[objects.lite_scripts]]\npath = \"/scripts/ref.lua\"\nparams = {{ target = {{ object = {target:?} }} }}\n[[objects]]\nid = \"child\"\nparent = \"root\"\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn spawn_prefab_script_references_use_template_object_ids() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab-refs").unwrap();
+        script_reference_project(root.path(), "child");
+        prepare_project(root.path()).unwrap();
+
+        script_reference_project(root.path(), "ghost");
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(error.to_string().contains("ghost"), "{error}");
+        assert!(error.to_string().contains("пределы префаба"), "{error}");
     }
 
     #[test]

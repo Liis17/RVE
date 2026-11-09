@@ -19,6 +19,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[path = "tests/parity.rs"]
+mod parity;
+
 fn world(source: &str) -> World {
     let source = if source.contains("[objects.camera]") {
         source.to_owned()
@@ -227,6 +230,126 @@ fn load_with_input(
         },
     )
     .unwrap()
+}
+
+#[test]
+fn lua_reference_params_and_self_object_are_full_object_tables() {
+    let source = r#"
+return {
+    properties = {
+        target = { type = "component", component = "camera" },
+        model = { type = "asset", asset = "model" },
+    },
+    on_start = function(self)
+        assert(self.object.id == "camera")
+        assert(self.object.name == "Camera object")
+        assert(self.object.get_transform() ~= nil)
+        assert(self.params.target.id == "target")
+        assert(self.params.target.name == "Target camera")
+        assert(self.params.target.get_transform() ~= nil)
+        assert(self.params.model == "models/target.fbx", tostring(self.params.model))
+    end,
+}
+"#;
+    let scene = r#"
+[[assets]]
+path = "/refs.lua"
+[[assets]]
+path = "/models/target.fbx"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/refs.lua"
+params = { target = { object = "target" }, model = { asset = "/models/target.fbx" } }
+[[objects]]
+id = "target"
+name = "Target camera"
+[objects.camera]
+"#;
+    let mut world = world(scene);
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("refs.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn lua_reference_load_rejects_missing_objects_and_required_components() {
+    let source =
+        r#"return { properties = { target = { type = "component", component = "camera" } } }"#;
+    let base = r#"
+[[assets]]
+path = "/refs.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.lite_scripts]]
+path = "/refs.lua"
+params = { target = { object = "TARGET" } }
+"#;
+    let plain = r#"
+[[objects]]
+id = "plain"
+"#;
+    for (target, extra, expected) in [
+        ("missing", "", "missing"),
+        ("plain", plain, "does not have component"),
+    ] {
+        let document = format!("{}{}", base.replace("TARGET", target), extra);
+        let world = world(&document);
+        let error = ScriptHost::load(&world, "scene", &sources(&[("refs.lua", source)]), None)
+            .err()
+            .unwrap();
+        let ScriptLoadError::Lite { message, .. } = error else {
+            panic!("expected lite load error, got {error}");
+        };
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[test]
+fn lua_array_property_schema_rejects_recursive_types_with_a_load_error() {
+    let world = world(
+        r#"
+[[assets]]
+path = "/recursive.lua"
+[[objects]]
+id = "object"
+[[objects.lite_scripts]]
+path = "/recursive.lua"
+"#,
+    );
+    let source = r#"
+local recursive = { type = "array" }
+recursive.of = recursive
+return { properties = { items = recursive } }
+"#;
+
+    let error = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("recursive.lua", source)]),
+        None,
+    )
+    .err()
+    .unwrap();
+
+    let ScriptLoadError::Lite { message, .. } = error else {
+        panic!("expected a lite script load error, got {error}");
+    };
+    assert!(
+        message.contains("array property nesting exceeds maximum depth of 4"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -3624,6 +3747,48 @@ return Script
             "observer:update",
         ]
     );
+}
+
+#[test]
+fn lua_messages_can_carry_object_references() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/messages.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "sender" }
+[[objects]]
+id = "receiver"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "receiver" }
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_start()
+  if self.params.role == "sender" then
+    rve.send("receiver", "object", self.object)
+  end
+end
+function Script:on_message(_, name, value)
+  if name == "object" then
+    assert(value.id == "sender" and value.name == "sender")
+    assert(type(value.get_transform) == "function")
+    rve.log_info("object message received")
+  end
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("messages.lua", source)]), None).unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert_eq!(event_messages(&mut host), ["object message received"]);
 }
 
 #[test]

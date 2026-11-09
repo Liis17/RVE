@@ -43,6 +43,10 @@ pub enum Value {
     String(String),
     /// Ordered array of values.
     Array(Vec<Value>),
+    /// A reference to a world object.
+    Object(Object),
+    /// A virtual asset path.
+    Asset(String),
 }
 
 /// Owned script parameters in deterministic key order.
@@ -109,7 +113,10 @@ impl RveParams {
 }
 
 unsafe fn owned_value(value: RveValue) -> Result<Value, ValueError> {
-    use abi::{RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR};
+    use abi::{
+        RVE_VALUE_ARRAY, RVE_VALUE_ASSET, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT,
+        RVE_VALUE_OBJECT, RVE_VALUE_STR,
+    };
     match value.tag {
         RVE_VALUE_BOOL => {
             // SAFETY: the tag selects the bool union field.
@@ -123,13 +130,23 @@ unsafe fn owned_value(value: RveValue) -> Result<Value, ValueError> {
             // SAFETY: the tag selects the f64 union field.
             Ok(Value::Float(unsafe { value.data.float }))
         }
-        RVE_VALUE_STR => {
+        RVE_VALUE_STR | RVE_VALUE_ASSET => {
             // SAFETY: the tag selects the borrowed string union field.
             let string = unsafe { value.data.string };
             // SAFETY: forwarded from the caller's contract.
             let string = unsafe { string.to_str() }
                 .map_err(|error| ValueError(format!("value string is not UTF-8: {error}")))?;
-            Ok(Value::String(string.to_owned()))
+            if value.tag == RVE_VALUE_ASSET {
+                Ok(Value::Asset(string.to_owned()))
+            } else {
+                Ok(Value::String(string.to_owned()))
+            }
+        }
+        RVE_VALUE_OBJECT => {
+            // SAFETY: the tag selects the object-handle union field.
+            Ok(Value::Object(Object {
+                handle: unsafe { value.data.object },
+            }))
         }
         RVE_VALUE_ARRAY => {
             // SAFETY: the tag selects the borrowed array union field.
@@ -1088,6 +1105,13 @@ impl Object {
 }
 
 impl<'a> Context<'a> {
+    /// Returns the object this script instance is attached to.
+    pub fn object(&self) -> Object {
+        Object {
+            handle: self.host.self_object,
+        }
+    }
+
     fn new(host: &'a RveHost) -> Result<Self, String> {
         let mut transform = RveTransform::default();
         // SAFETY: the host object is valid for this callback and owns this output slot.
@@ -1961,6 +1985,13 @@ impl<'a> BorrowedAbiValue<'a> {
                     string: RveStr::from_str_ref(value),
                 },
             }),
+            Value::Asset(value) => Self::leaf(RveValue {
+                tag: abi::RVE_VALUE_ASSET,
+                data: RveValueData {
+                    string: RveStr::from_str_ref(value),
+                },
+            }),
+            Value::Object(value) => Self::leaf(RveValue::object(value.handle)),
             Value::Array(values) => {
                 let children = values.iter().map(Self::new).collect::<Vec<_>>();
                 let array = children.iter().map(|child| child.value).collect::<Vec<_>>();
@@ -2780,7 +2811,20 @@ pub mod __private {
                 Some(label) => RveStr::from_static(label),
                 None => RveStr::empty(),
             },
+            argument: RveStr::empty(),
         }
+    }
+
+    pub const fn param_argument(
+        name: &'static str,
+        kind: u32,
+        default: RveValue,
+        argument: &'static str,
+        label: Option<&'static str>,
+    ) -> RveParamDesc {
+        let mut descriptor = param(name, kind, default, None, None, label);
+        descriptor.argument = RveStr::from_static(argument);
+        descriptor
     }
 
     pub unsafe fn create(
@@ -3101,8 +3145,10 @@ macro_rules! script_module {
 /// }
 /// ```
 ///
-/// Supported types are `bool`, `i64`, `f32`/`f64` (float), `&str` and `[f32; 3]`. Defaults are
-/// literals; numeric types accept an inclusive `(min..=max)` range, and every parameter accepts a
+/// Supported types are `bool`, `i64`, `f32`/`f64` (float), `&str`, `[f32; 3]`, `Option<Object>`,
+/// `component(name)`, `Asset`, `enum(...)`, `Color` and `Vec<T>`. Object and component defaults are
+/// `None`; asset defaults are path literals, enum uses its first value, and `Vec<T>` defaults to
+/// empty. Numeric types accept an inclusive `(min..=max)` range, and every parameter accepts a
 /// trailing label literal for editors. A script without a block declares no schema and receives
 /// scene parameters unchecked.
 #[macro_export]
@@ -3188,6 +3234,102 @@ macro_rules! __rve_params {
             None,
             $crate::__rve_label!($($label)?),
         ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : Option<Object> = None
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_OBJECT,
+            $crate::abi::RveValue::object(0),
+            "",
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : component($component:ident) = None
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_COMPONENT,
+            $crate::abi::RveValue::object(0),
+            stringify!($component),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : Asset = $default:literal
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_ASSET,
+            $crate::abi::RveValue::static_asset($default),
+            "",
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : enum($first:literal $(, $other:literal)*)
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_ENUM,
+            $crate::abi::RveValue::static_string($first),
+            concat!($first, "\0" $(, $other, "\0")*),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : Color = [$r:literal, $g:literal, $b:literal]
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_COLOR,
+            {
+                static VALUES: [$crate::abi::RveValue; 3] = [
+                    $crate::abi::RveValue::float($r as f64),
+                    $crate::abi::RveValue::float($g as f64),
+                    $crate::abi::RveValue::float($b as f64),
+                ];
+                $crate::abi::RveValue::array(&VALUES)
+            },
+            "",
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : Vec<$element:ident> = []
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_ARRAY,
+            $crate::abi::RveValue::array(&[]),
+            $crate::__rve_element_kind!($element),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rve_element_kind {
+    (bool) => {
+        "bool"
+    };
+    (i64) => {
+        "int"
+    };
+    (f32) => {
+        "float"
+    };
+    (f64) => {
+        "float"
+    };
+    (String) => {
+        "string"
+    };
+    (&str) => {
+        "string"
+    };
+    (Object) => {
+        "object"
+    };
+    (Asset) => {
+        "asset"
     };
 }
 

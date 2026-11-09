@@ -1,10 +1,12 @@
 use crate::abi_host::read_message_value;
 use crate::abi_string::{AbiStringError, read_abi_str};
-use engine_scene::{ParamKind, ParamSchema, ParamSpec};
+use engine_scene::{AssetKind, ComponentKind, ParamKind, ParamSchema, ParamSpec, ParamValue};
 use rve_sdk::abi::{
-    RVE_PARAM_BOOL, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
-    RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule, RveParamDesc,
-    RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
+    RVE_PARAM_ARRAY, RVE_PARAM_ASSET, RVE_PARAM_BOOL, RVE_PARAM_COLOR, RVE_PARAM_COMPONENT,
+    RVE_PARAM_ENUM, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
+    RVE_PARAM_OBJECT, RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule,
+    RveParamDesc, RveParamDescV13, RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
+    RveScriptDescV15,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -157,7 +159,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            15.. => std::mem::size_of::<RveScriptDesc>(),
+            16.. => std::mem::size_of::<RveScriptDesc>(),
+            15 => std::mem::size_of::<RveScriptDescV15>(),
             13..=14 => std::mem::size_of::<RveScriptDescV13>(),
             6..=12 => std::mem::size_of::<RveScriptDescV6>(),
             4 | 5 => std::mem::size_of::<RveScriptDescV4>(),
@@ -178,9 +181,12 @@ impl ScriptLibrary {
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v15 = (header.abi_version >= 15)
+        let descriptors_v16 = (header.abi_version >= 16)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        // SAFETY: versions 13 and 14 have the net event tail but no UI callback.
+        let descriptors_v15 = (header.abi_version == 15).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV15>(), count)
+        });
+        // SAFETY: versions 13 and 14 have the net event tail and pre-v15 parameter descriptors.
         let descriptors_v13 = ((13..=14).contains(&header.abi_version)).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV13>(), count)
         });
@@ -202,10 +208,9 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v15 {
+            let descriptor = if let Some(descriptors) = descriptors_v16 {
                 &descriptors[index]
-            } else if let Some(descriptors) = descriptors_v13 {
-                // ABI v13 has no UI callback; normalize it to `None`.
+            } else if let Some(descriptors) = descriptors_v15 {
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
@@ -216,6 +221,23 @@ impl ScriptLibrary {
                     destroy: descriptor.destroy,
                     drop: descriptor.drop,
                     params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    ui_event: None,
+                }))
+            } else if let Some(descriptors) = descriptors_v13 {
+                let descriptor = &descriptors[index];
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params.cast(),
                     param_count: descriptor.param_count,
                     command: descriptor.command,
                     collision: descriptor.collision,
@@ -233,7 +255,7 @@ impl ScriptLibrary {
                     message: descriptor.message,
                     destroy: descriptor.destroy,
                     drop: descriptor.drop,
-                    params: descriptor.params,
+                    params: descriptor.params.cast(),
                     param_count: descriptor.param_count,
                     command: descriptor.command,
                     collision: descriptor.collision,
@@ -251,7 +273,7 @@ impl ScriptLibrary {
                     message: descriptor.message,
                     destroy: descriptor.destroy,
                     drop: descriptor.drop,
-                    params: descriptor.params,
+                    params: descriptor.params.cast(),
                     param_count: descriptor.param_count,
                     command: descriptor.command,
                     collision: None,
@@ -269,7 +291,7 @@ impl ScriptLibrary {
                     message: descriptor.message,
                     destroy: descriptor.destroy,
                     drop: descriptor.drop,
-                    params: descriptor.params,
+                    params: descriptor.params.cast(),
                     param_count: descriptor.param_count,
                     command: None,
                     collision: None,
@@ -308,9 +330,26 @@ impl ScriptLibrary {
                 });
             }
             let name = name.to_owned();
-            let schema = if header.abi_version >= 3 {
+            let schema = if header.abi_version >= 16 {
                 // SAFETY: the caller guarantees the parameter table of every v3+ descriptor.
                 unsafe { read_schema(descriptor) }.map_err(|message| {
+                    ScriptLibraryError::InvalidParams {
+                        script: name.clone(),
+                        message,
+                    }
+                })?
+            } else if header.abi_version == 15 {
+                // ABI v15 was used by both the typed-reference and UI branches. Its parameter
+                // table layout is selected from the shared prefix without reading either tail.
+                unsafe { read_schema_v15(descriptor) }.map_err(|message| {
+                    ScriptLibraryError::InvalidParams {
+                        script: name.clone(),
+                        message,
+                    }
+                })?
+            } else if header.abi_version >= 3 {
+                // SAFETY: versions 3 through 14 use the old parameter descriptor layout.
+                unsafe { read_schema_v13(descriptor) }.map_err(|message| {
                     ScriptLibraryError::InvalidParams {
                         script: name.clone(),
                         message,
@@ -383,31 +422,156 @@ unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>,
     }
     // SAFETY: guaranteed by this function's contract and checked above.
     let params = unsafe { std::slice::from_raw_parts(descriptor.params, count) };
-    let mut specs = Vec::with_capacity(count);
-    for (index, param) in params.iter().enumerate() {
+    read_schema_params(params.iter().map(|param| {
+        (
+            param.name,
+            param.kind,
+            param.default,
+            param.min,
+            param.max,
+            param.flags,
+            param.label,
+            param.argument,
+        )
+    }))
+}
+
+/// Reads a v3-v14 descriptor without accessing the v15 argument tail.
+unsafe fn read_schema_v13(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>, String> {
+    let count = descriptor.param_count;
+    if count == 0 {
+        return Ok(None);
+    }
+    if descriptor.params.is_null() {
+        return Err("null parameter table".to_owned());
+    }
+    if count > isize::MAX as usize / mem::size_of::<RveParamDescV13>() {
+        return Err("parameter table size overflows address space".to_owned());
+    }
+    // SAFETY: the old ABI stores the prefix-compatible v13 descriptors at this pointer.
+    let params =
+        unsafe { std::slice::from_raw_parts(descriptor.params.cast::<RveParamDescV13>(), count) };
+    read_schema_params(params.iter().map(|param| {
+        (
+            param.name,
+            param.kind,
+            param.default,
+            param.min,
+            param.max,
+            param.flags,
+            param.label,
+            rve_sdk::abi::RveStr::empty(),
+        )
+    }))
+}
+
+/// ABI v15 was independently assigned to two layouts. The reference branch appended `argument`
+/// to each parameter, while the UI branch kept the v13 parameter layout. New kinds identify the
+/// reference layout directly; for old kinds, the next name length and the appended empty argument
+/// distinguish arrays with multiple parameters. A single old-kind parameter has the same readable
+/// prefix in both layouts and does not need `argument`.
+///
+/// # Safety
+/// The caller guarantees that the module uses one of those ABI v15 layouts and that its declared
+/// parameter table is readable for the selected layout.
+unsafe fn read_schema_v15(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>, String> {
+    let count = descriptor.param_count;
+    if count == 0 {
+        return Ok(None);
+    }
+    if descriptor.params.is_null() {
+        return Err("null parameter table".to_owned());
+    }
+
+    // SAFETY: both ABI v15 parameter descriptors share this prefix.
+    let first = unsafe { descriptor.params.cast::<RveParamDescV13>().read() };
+    if matches!(
+        first.kind,
+        RVE_PARAM_OBJECT
+            | RVE_PARAM_COMPONENT
+            | RVE_PARAM_ASSET
+            | RVE_PARAM_ENUM
+            | RVE_PARAM_COLOR
+            | RVE_PARAM_ARRAY
+    ) {
+        // SAFETY: these kinds only exist in the reference layout, which appended `argument`.
+        return unsafe { read_schema(descriptor) };
+    }
+    if first.kind > RVE_PARAM_VEC3 {
+        return unsafe { read_schema_v13(descriptor) };
+    }
+    if count == 1 {
+        // SAFETY: the old descriptor prefix contains all fields required by these kinds.
+        return unsafe { read_schema_v13(descriptor) };
+    }
+
+    // SAFETY: with two or more parameters this word is either the first reference-layout
+    // argument length or the second legacy parameter's name length, both within their tables.
+    let next_len = unsafe {
+        descriptor
+            .params
+            .cast::<u8>()
+            .add(
+                std::mem::size_of::<RveParamDescV13>()
+                    + std::mem::offset_of!(rve_sdk::abi::RveStr, len),
+            )
+            .cast::<usize>()
+            .read()
+    };
+    if next_len == 0 {
+        // SAFETY: the reference layout provides a complete typed table.
+        unsafe { read_schema(descriptor) }
+    } else if next_len <= 64 {
+        // SAFETY: the legacy layout provides a complete v13 parameter table.
+        unsafe { read_schema_v13(descriptor) }
+    } else {
+        Err("invalid ABI v15 parameter layout".to_owned())
+    }
+}
+
+fn read_schema_params(
+    params: impl Iterator<
+        Item = (
+            rve_sdk::abi::RveStr,
+            u32,
+            rve_sdk::abi::RveValue,
+            f64,
+            f64,
+            u32,
+            rve_sdk::abi::RveStr,
+            rve_sdk::abi::RveStr,
+        ),
+    >,
+) -> Result<Option<ParamSchema>, String> {
+    let mut specs = Vec::new();
+    for (index, (name, kind_code, default_value, min, max, flags, label, argument)) in
+        params.enumerate()
+    {
         // SAFETY: the caller guarantees readable process-lifetime strings.
-        let name = unsafe { read_abi_str(param.name) }
+        let name = unsafe { read_abi_str(name) }
             .map_err(|error| format!("parameter {index} has an invalid name: {error:?}"))?
             .to_owned();
-        let kind = match param.kind {
-            RVE_PARAM_BOOL => ParamKind::Bool,
-            RVE_PARAM_INT => ParamKind::Int,
-            RVE_PARAM_FLOAT => ParamKind::Float,
-            RVE_PARAM_STRING => ParamKind::String,
-            RVE_PARAM_VEC3 => ParamKind::Vec3,
-            kind => return Err(format!("parameter {name:?} has unknown kind {kind}")),
-        };
-        if param.flags & !(RVE_PARAM_HAS_MIN | RVE_PARAM_HAS_MAX) != 0 {
-            return Err(format!(
-                "parameter {name:?} has unknown flags {:#x}",
-                param.flags
-            ));
+        // SAFETY: v15 descriptors carry a process-lifetime argument; old descriptors provide empty.
+        let argument = unsafe { read_abi_str(argument) }
+            .map_err(|error| format!("parameter {name:?} has an invalid argument: {error:?}"))?;
+        let kind = abi_param_kind(kind_code, argument)
+            .ok_or_else(|| format!("parameter {name:?} has unknown or invalid kind {kind_code}"))?;
+        if flags & !(RVE_PARAM_HAS_MIN | RVE_PARAM_HAS_MAX) != 0 {
+            return Err(format!("parameter {name:?} has unknown flags {flags:#x}"));
         }
-        // SAFETY: the caller guarantees a readable default value.
-        let (default, _) = unsafe { read_message_value(&param.default) }
-            .map_err(|error| format!("parameter {name:?} has an invalid default: {error}"))?;
+        let default = if matches!(kind, ParamKind::Object | ParamKind::Component(_))
+            && default_value.tag == rve_sdk::abi::RVE_VALUE_OBJECT
+            && unsafe { default_value.data.object } == 0
+        {
+            ParamValue::Object(String::new())
+        } else {
+            // SAFETY: the caller guarantees readable default values.
+            unsafe { read_message_value(&default_value) }
+                .map_err(|error| format!("parameter {name:?} has an invalid default: {error}"))?
+                .0
+        };
         // SAFETY: the caller guarantees readable process-lifetime strings.
-        let label = match unsafe { read_abi_str(param.label) } {
+        let label = match unsafe { read_abi_str(label) } {
             Ok("") | Err(AbiStringError::Null) => None,
             Ok(label) => Some(label.to_owned()),
             Err(error) => {
@@ -417,8 +581,8 @@ unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>,
             }
         };
         specs.push(ParamSpec {
-            min: (param.flags & RVE_PARAM_HAS_MIN != 0).then_some(param.min),
-            max: (param.flags & RVE_PARAM_HAS_MAX != 0).then_some(param.max),
+            min: (flags & RVE_PARAM_HAS_MIN != 0).then_some(min),
+            max: (flags & RVE_PARAM_HAS_MAX != 0).then_some(max),
             name,
             kind,
             default,
@@ -426,6 +590,33 @@ unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>,
         });
     }
     ParamSchema::new(specs).map(Some)
+}
+
+fn abi_param_kind(kind: u32, argument: &str) -> Option<ParamKind> {
+    Some(match kind {
+        RVE_PARAM_BOOL => ParamKind::Bool,
+        RVE_PARAM_INT => ParamKind::Int,
+        RVE_PARAM_FLOAT => ParamKind::Float,
+        RVE_PARAM_STRING => ParamKind::String,
+        RVE_PARAM_VEC3 => ParamKind::Vec3,
+        RVE_PARAM_OBJECT => ParamKind::Object,
+        RVE_PARAM_COMPONENT => ParamKind::Component(ComponentKind::parse(argument)?),
+        RVE_PARAM_ASSET => ParamKind::Asset(if argument.is_empty() {
+            None
+        } else {
+            Some(AssetKind::parse(argument)?)
+        }),
+        RVE_PARAM_ENUM => ParamKind::Enum(
+            argument
+                .split('\0')
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+        RVE_PARAM_COLOR => ParamKind::Color,
+        RVE_PARAM_ARRAY => ParamKind::Array(Box::new(ParamKind::parse(argument)?)),
+        _ => return None,
+    })
 }
 
 #[cfg(all(test, windows))]

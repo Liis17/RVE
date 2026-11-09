@@ -1,6 +1,7 @@
 //! Формат сцен `.rvescene`, runtime-граф `World` и математика камеры, трансформаций и света.
 
 pub mod animation;
+pub mod asset_kind;
 pub mod audio;
 pub mod camera;
 pub mod camera_settings;
@@ -25,6 +26,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use animation::{
     AnimationRequest, AnimatorComponent, BlendTree, BlendTreePoint, MAX_BLEND_TREE_POINTS,
 };
+pub use asset_kind::AssetKind;
 pub use audio::{
     AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
 };
@@ -63,7 +65,7 @@ pub use document::{
     RigidBodyComponent, RigidBodyKind, SceneAsset, SceneDocument, SceneError, SceneObject,
     SceneTransform, ScreenShaderRef, ScreenShaderStage, SpotLightComponent,
 };
-pub use params::{ParamKind, ParamSchema, ParamSpec};
+pub use params::{ComponentKind, ParamKind, ParamSchema, ParamSpec};
 pub use post_process::{
     AmbientOcclusionQuality, AmbientOcclusionSettings, BloomSettings, ChromaticAberrationSettings,
     ColorGradingSettings, DepthOfFieldSettings, ExposureMode, ExposureSettings, FilmGrainSettings,

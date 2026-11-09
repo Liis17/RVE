@@ -71,10 +71,13 @@ directional_light, environment) сборщик для них не проверя
 `engine_script::lite_properties` и проверяет `params` объекта через
 `ParamSchema::resolve` (см. [[Engine/EngineScript]]). Ошибка схемы или параметра —
 ошибка проекта с кодом 2: сцена, id объекта и путь скрипта указываются в сообщении.
+Object/component refs проверяются на существующую цель и требуемый компонент; asset refs
+должны присутствовать в `[[assets]]` сцены или префаба.
 Выполнение верхнего Lua chunk для чтения схемы ограничено пятью секундами. По истечении
 срока chunk прерывается и сборка завершается ошибкой проекта.
 После сборки cdylib так же проверяются `params` heavy-скриптов по
-`ScriptLibrary::schema`, вместе с проверкой имён.
+`ScriptLibrary::schema`, вместе с проверкой имён; object/component refs должны разрешаться в
+объекты с требуемым компонентом, а asset refs — в пути из `[[assets]]`.
 
 `build_project_archives` сериализует `ProjectSettings::to_toml`, `PrefabCatalogFile::to_toml`
 и `ArchiveSetRegistry::to_toml` во временный каталог, передаёт generated files вместе

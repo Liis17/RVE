@@ -6,11 +6,12 @@ use engine_scene::{
     AnimatorComponent, AudioSourceComponent, CameraComponent, CameraCursor,
     CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
     EnvironmentComponent, Expansion, LodGroup, MeshRenderer, NetworkIdentityComponent,
-    NetworkTransformComponent, ObjectOrigin, ParticleEmitterComponent, PointLightComponent,
-    PrefabInstance, PrefabOverride, ProceduralSkyComponent, RigidBodyComponent, SceneAsset,
-    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
+    NetworkTransformComponent, ObjectOrigin, ParamValue, ParticleEmitterComponent,
+    PointLightComponent, PrefabInstance, PrefabOverride, ProceduralSkyComponent,
+    RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
+    SpotLightComponent,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 mod prefabs;
@@ -566,6 +567,68 @@ impl EditorScene {
         Err(format!("объект {id:?} не найден"))
     }
 
+    /// Updates Lua parameters and registers any asset references in the same scene edit.
+    pub fn set_lite_script_params(
+        &mut self,
+        id: &str,
+        index: usize,
+        params: BTreeMap<String, ParamValue>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        if self.document.objects.iter().any(|object| object.id == id) {
+            let assets = params.values().cloned().collect::<Vec<_>>();
+            self.edit(coalesce, |document| {
+                let script = find_object_mut(document, id)?
+                    .lite_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Lua-скрипт {index} не найден"))?;
+                script.params = params;
+                ensure_param_assets(document, assets);
+                Ok(())
+            })
+        } else {
+            self.edit_object(id, coalesce, |object| {
+                object
+                    .lite_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Lua-скрипт {index} не найден"))?
+                    .params = params;
+                Ok(())
+            })
+        }
+    }
+
+    /// Updates Rust parameters and registers any asset references in the same scene edit.
+    pub fn set_heavy_script_params(
+        &mut self,
+        id: &str,
+        index: usize,
+        params: BTreeMap<String, ParamValue>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        if self.document.objects.iter().any(|object| object.id == id) {
+            let assets = params.values().cloned().collect::<Vec<_>>();
+            self.edit(coalesce, |document| {
+                let script = find_object_mut(document, id)?
+                    .heavy_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Rust-скрипт {index} не найден"))?;
+                script.params = params;
+                ensure_param_assets(document, assets);
+                Ok(())
+            })
+        } else {
+            self.edit_object(id, coalesce, |object| {
+                object
+                    .heavy_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Rust-скрипт {index} не найден"))?
+                    .params = params;
+                Ok(())
+            })
+        }
+    }
+
     pub fn create_object(
         &mut self,
         kind: &NewObject,
@@ -757,6 +820,9 @@ impl EditorScene {
                 .cloned()
                 .map(|mut object| {
                     object.parent = remap(object.parent);
+                    remap_object_script_refs(&mut object, |reference| {
+                        rename_reference(&renamed, reference.to_owned())
+                    });
                     object.id = renamed[&object.id].clone();
                     if let Some(camera) = &mut object.camera {
                         camera.active = false;
@@ -771,6 +837,9 @@ impl EditorScene {
                 .cloned()
                 .map(|mut instance| {
                     instance.parent = remap(instance.parent);
+                    remap_instance_script_refs(&mut instance, |reference| {
+                        rename_reference(&renamed, reference.to_owned())
+                    });
                     instance.id = renamed[&instance.id].clone();
                     instance
                 })
@@ -885,6 +954,9 @@ impl EditorScene {
                     _ => None,
                 };
                 object.id = renamed[&object.id].clone();
+                remap_object_script_refs(&mut object, |reference| {
+                    rename_reference(&renamed, reference.to_owned())
+                });
                 if let Some(camera) = &mut object.camera {
                     camera.active = false;
                 }
@@ -1058,6 +1130,9 @@ impl EditorScene {
                     .take()
                     .map(|parent| rename_reference(&renamed, parent));
             }
+            remap_document_script_refs(document, |reference| {
+                rename_reference(&renamed, reference.to_owned())
+            });
             Ok(())
         })?;
         for selected in &mut self.selection {
@@ -1702,6 +1777,79 @@ fn rename_reference(renamed: &std::collections::HashMap<String, String>, id: Str
     id
 }
 
+pub(super) fn remap_object_script_refs(
+    object: &mut SceneObject,
+    mut remap: impl FnMut(&str) -> String,
+) {
+    fn remap_params(
+        params: &mut BTreeMap<String, ParamValue>,
+        remap: &mut impl FnMut(&str) -> String,
+    ) {
+        fn visit(value: &mut ParamValue, remap: &mut impl FnMut(&str) -> String) {
+            match value {
+                ParamValue::Object(id) if !id.is_empty() => *id = remap(id),
+                ParamValue::Array(values) => {
+                    for value in values {
+                        visit(value, remap);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for value in params.values_mut() {
+            visit(value, remap);
+        }
+    }
+    for script in &mut object.lite_scripts {
+        remap_params(&mut script.params, &mut remap);
+    }
+    for script in &mut object.heavy_scripts {
+        remap_params(&mut script.params, &mut remap);
+    }
+}
+
+pub(super) fn remap_document_script_refs(
+    document: &mut SceneDocument,
+    mut remap: impl FnMut(&str) -> String,
+) {
+    for object in &mut document.objects {
+        remap_object_script_refs(object, &mut remap);
+    }
+    for instance in &mut document.instances {
+        remap_instance_script_refs(instance, &mut remap);
+    }
+}
+
+fn remap_instance_script_refs(
+    instance: &mut PrefabInstance,
+    mut remap: impl FnMut(&str) -> String,
+) {
+    for change in &mut instance.overrides {
+        for params in &mut change.lite_params {
+            for value in params.params.values_mut() {
+                remap_param_value(value, &mut remap);
+            }
+        }
+        for params in &mut change.heavy_params {
+            for value in params.params.values_mut() {
+                remap_param_value(value, &mut remap);
+            }
+        }
+    }
+}
+
+fn remap_param_value(value: &mut ParamValue, remap: &mut impl FnMut(&str) -> String) {
+    match value {
+        ParamValue::Object(id) if !id.is_empty() => *id = remap(id),
+        ParamValue::Array(values) => {
+            for value in values {
+                remap_param_value(value, remap);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Светлая настройка по умолчанию для нового directional light.
 pub fn default_light() -> DirectionalLightComponent {
     DirectionalLightComponent {
@@ -1873,6 +2021,27 @@ fn find_object<'a>(document: &'a SceneDocument, id: &str) -> Result<&'a SceneObj
         .iter()
         .find(|object| object.id == id)
         .ok_or_else(|| format!("объект {id:?} не найден"))
+}
+
+fn ensure_param_assets(document: &mut SceneDocument, params: impl IntoIterator<Item = ParamValue>) {
+    fn collect(value: &ParamValue, paths: &mut Vec<VirtualPath>) {
+        match value {
+            ParamValue::Asset(path) => paths.push(path.clone()),
+            ParamValue::Array(values) => {
+                for value in values {
+                    collect(value, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    for value in params {
+        collect(&value, &mut paths);
+    }
+    for path in paths {
+        ensure_asset(document, &path);
+    }
 }
 
 fn ensure_asset(document: &mut SceneDocument, path: &VirtualPath) {

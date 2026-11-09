@@ -1,4 +1,4 @@
-use super::world;
+use super::{sources, world};
 use crate::ScriptTime;
 use crate::host::{ScriptHost, ScriptLoadError};
 use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec};
@@ -15,13 +15,14 @@ use engine_scene::{
 };
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
-    RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParams, RveScriptDesc,
-    RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6, RveScriptDescV13,
-    RveSpawnOptions, RveStatus, RveStr, RveTransform, RveUpdateFn, RveValue,
+    RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParamDescV13, RveParams,
+    RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6,
+    RveScriptDescV13, RveScriptDescV15, RveSpawnOptions, RveStatus, RveStr, RveTransform,
+    RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
-    NetTarget, Params, PhysicalInput, Script, Tonemapper, UiEvent, Value,
+    NetTarget, Object, Params, PhysicalInput, Script, Tonemapper, UiEvent, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -53,6 +54,11 @@ struct Probe {
 struct InputProbe;
 struct PhysicsProbe;
 struct InputActionsProbe(u8);
+struct ReferenceProbe {
+    target: Object,
+    camera: Object,
+}
+struct ReferenceReceiver;
 
 struct CameraControl {
     panic_update: bool,
@@ -68,6 +74,53 @@ fn camera_control_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(CameraControl {
         panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
     }))
+}
+
+fn reference_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let Some(Value::Object(target)) = params.get("target") else {
+        return Err("target parameter is not an object handle".to_owned());
+    };
+    let Some(Value::Object(camera)) = params.get("camera") else {
+        return Err("camera parameter is not an object handle".to_owned());
+    };
+    Ok(Box::new(ReferenceProbe {
+        target: *target,
+        camera: *camera,
+    }))
+}
+
+fn reference_receiver_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ReferenceReceiver))
+}
+
+impl Script for ReferenceProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        assert_eq!(self.target.id(ctx).as_deref(), Some("target"));
+        assert_eq!(self.target.name(ctx).as_deref(), Some("Target Camera"));
+        assert_eq!(self.camera.id(ctx).as_deref(), Some("target"));
+        assert_eq!(ctx.object().id(ctx).as_deref(), Some("camera"));
+        assert!(ctx.send("target", "object", &Value::Object(ctx.object())));
+    }
+}
+
+impl Script for ReferenceReceiver {
+    fn on_message(&mut self, ctx: &mut rve_sdk::Context<'_>, _: &str, name: &str, value: &Value) {
+        if name == "dead_ref" {
+            let Value::Object(object) = value else {
+                panic!("ABI object message was not decoded as an object handle");
+            };
+            assert_eq!(object.id(ctx), None);
+            ctx.log_info("ABI missing object message became null");
+            return;
+        }
+        if name == "object" {
+            let Value::Object(object) = value else {
+                panic!("object message was not decoded as a handle");
+            };
+            assert_eq!(object.id(ctx).as_deref(), Some("camera"));
+            ctx.log_info("ABI object message received");
+        }
+    }
 }
 
 impl Script for CameraControl {
@@ -778,6 +831,11 @@ fn sdk_module() -> &'static RveModule {
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
         "AbiConsoleForeign" => abi_console_foreign_factory,
+        "ReferenceProbe" => reference_probe_factory {
+            target: Option<Object> = None,
+            camera: component(camera) = None,
+        },
+        "ReferenceReceiver" => reference_receiver_factory,
     }
 }
 
@@ -978,7 +1036,7 @@ fn command_probe_module(abi_version: u32) -> &'static RveModule {
         message: probe.message,
         destroy: probe.destroy,
         drop: probe.drop,
-        params: probe.params,
+        params: probe.params.cast(),
         param_count: probe.param_count,
         command: probe.command,
     };
@@ -1347,7 +1405,43 @@ name = "AudioRejected"
     assert_eq!(host.drain_audio_requests().len(), 1);
 }
 
-/// Таблица версий 6–12 в layout `RveScriptDescV6`, построенная из дескрипторов `sdk_module`.
+/// Copies the pre-v15 parameter prefix into a process-lifetime table.
+///
+/// Scripts that declare v15-only parameter kinds are omitted from legacy fixtures.
+fn legacy_params(descriptor: &RveScriptDesc) -> Option<(*const RveParamDescV13, usize)> {
+    if descriptor.param_count == 0 {
+        return Some((std::ptr::null(), 0));
+    }
+    if descriptor.params.is_null() {
+        return None;
+    }
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor and parameter table.
+    let current = unsafe { std::slice::from_raw_parts(descriptor.params, descriptor.param_count) };
+    if current
+        .iter()
+        .any(|param| param.kind > rve_sdk::abi::RVE_PARAM_VEC3)
+    {
+        return None;
+    }
+    let legacy = Box::leak(
+        current
+            .iter()
+            .map(|param| RveParamDescV13 {
+                name: param.name,
+                kind: param.kind,
+                default: param.default,
+                min: param.min,
+                max: param.max,
+                flags: param.flags,
+                label: param.label,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Some((legacy.as_ptr(), legacy.len()))
+}
+
+/// Table for ABI versions 6–12 in the `RveScriptDescV6` layout.
 fn v6_module(abi_version: u32) -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
@@ -1355,7 +1449,82 @@ fn v6_module(abi_version: u32) -> &'static RveModule {
     let legacy: &'static [RveScriptDescV6] = Box::leak(
         descriptors
             .iter()
-            .map(|descriptor| RveScriptDescV6 {
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some(RveScriptDescV6 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params,
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+/// Table for ABI v13 or v14: the v13 script descriptor layout with pre-v15 parameter descriptors.
+fn v13_module(abi_version: u32) -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV13] = Box::leak(
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some(RveScriptDescV13 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: params.cast(),
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+/// Table for ABI v15: the typed parameter descriptor and net event, without the UI callback tail.
+fn v15_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV15] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV15 {
                 name: descriptor.name,
                 create: descriptor.create,
                 start: descriptor.start,
@@ -1367,13 +1536,93 @@ fn v6_module(abi_version: u32) -> &'static RveModule {
                 param_count: descriptor.param_count,
                 command: descriptor.command,
                 collision: descriptor.collision,
+                net_event: descriptor.net_event,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     );
     Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version,
+            abi_version: 15,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+/// The UI branch temporarily used ABI v15 with the old parameter prefix and a descriptor UI tail.
+#[repr(C)]
+struct RveScriptDescV15Ui {
+    descriptor: RveScriptDescV15,
+    ui_event: Option<rve_sdk::abi::RveUiEventFn>,
+}
+
+unsafe extern "C" fn unused_v15_ui_event(
+    _: *mut c_void,
+    _: *const RveHost,
+    _: rve_sdk::abi::RveUiEvent,
+) -> RveStatus {
+    RveStatus::Ok
+}
+
+fn v15_ui_module() -> &'static RveModule {
+    let params: &'static [RveParamDescV13] = Box::leak(
+        vec![
+            RveParamDescV13 {
+                name: RveStr::from_static("enabled"),
+                kind: rve_sdk::abi::RVE_PARAM_BOOL,
+                default: RveValue::boolean(true),
+                min: 0.0,
+                max: 0.0,
+                flags: 0,
+                label: RveStr::empty(),
+            },
+            RveParamDescV13 {
+                name: RveStr::from_static("amount"),
+                kind: rve_sdk::abi::RVE_PARAM_INT,
+                default: RveValue::integer(2),
+                min: 0.0,
+                max: 0.0,
+                flags: 0,
+                label: RveStr::empty(),
+            },
+        ]
+        .into_boxed_slice(),
+    );
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let scripts = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let probe = scripts
+        .iter()
+        .find(|descriptor| unsafe {
+            std::slice::from_raw_parts(descriptor.name.ptr, descriptor.name.len) == b"Probe"
+        })
+        .expect("Probe descriptor");
+    let descriptor = RveScriptDescV15 {
+        name: probe.name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+        params: params.as_ptr().cast(),
+        param_count: params.len(),
+        command: probe.command,
+        collision: probe.collision,
+        net_event: probe.net_event,
+    };
+    let legacy: &'static [RveScriptDescV15Ui] = Box::leak(
+        vec![RveScriptDescV15Ui {
+            descriptor,
+            ui_event: Some(unused_v15_ui_event),
+        }]
+        .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 15,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: legacy.as_ptr().cast(),
@@ -1506,7 +1755,7 @@ fn abi_v6_to_v12_modules_load_without_net_callbacks_and_skip_net_events() {
 }
 
 #[test]
-fn abi_v10_modules_load_on_the_v13_host() {
+fn abi_v10_modules_load_on_the_v16_host() {
     let _lock = test_lock();
     let module = v6_module(10);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1524,12 +1773,12 @@ fn abi_v10_modules_load_on_the_v13_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v10"),
-        "guest ABI v10 runs on the v13 host"
+        "guest ABI v10 runs on the v16 host"
     );
 }
 
 #[test]
-fn abi_v11_modules_load_on_the_v13_host() {
+fn abi_v11_modules_load_on_the_v16_host() {
     let _lock = test_lock();
     let module = v6_module(11);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1547,7 +1796,131 @@ fn abi_v11_modules_load_on_the_v13_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v11"),
-        "guest ABI v11 runs on the v13 host"
+        "guest ABI v11 runs on the v16 host"
+    );
+}
+
+#[test]
+fn abi_v13_modules_load_on_the_v16_host() {
+    let _lock = test_lock();
+    let module = v13_module(13);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v13" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v13"),
+        "guest ABI v13 runs on the v16 host"
+    );
+}
+
+#[test]
+fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v16_host() {
+    let _lock = test_lock();
+    let module = v13_module(14);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v14" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v14"),
+        "guest ABI v14 runs on the v16 host and its parameters use the pre-v15 layout"
+    );
+}
+
+#[test]
+fn abi_v15_modules_keep_typed_reference_params_without_ui_callbacks() {
+    let _lock = test_lock();
+    let module = v15_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let schema = library.schema("ReferenceProbe").unwrap();
+    assert_eq!(
+        schema.get("target").unwrap().kind,
+        engine_scene::ParamKind::Object
+    );
+    assert!(matches!(
+        schema.get("camera").unwrap().kind,
+        engine_scene::ParamKind::Component(_)
+    ));
+
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ReferenceProbe"
+params = { target = { object = "target" }, camera = { object = "target" } }
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+"#,
+    );
+    let mut host = load_host(&world, &library);
+    assert_eq!(abi_ui_callbacks(&host), [false, false]);
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+}
+
+#[test]
+fn abi_v15_ui_descriptor_keeps_legacy_parameter_layout() {
+    let _lock = test_lock();
+    let module = v15_ui_module();
+    // SAFETY: the module and both descriptor tables live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let schema = library.schema("Probe").unwrap();
+    assert_eq!(
+        schema.get("enabled").unwrap().kind,
+        engine_scene::ParamKind::Bool
+    );
+    assert_eq!(
+        schema.get("amount").unwrap().kind,
+        engine_scene::ParamKind::Int
+    );
+
+    let mut world = scripted_world("Probe", r#"{ enabled = true, amount = 2 }"#);
+    let mut host = load_host(&world, &library);
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|event| event == "start:default")
     );
 }
 
@@ -1566,7 +1939,7 @@ fn v3_probe_module() -> &'static RveModule {
         message: probe.message,
         destroy: probe.destroy,
         drop: probe.drop,
-        params: probe.params,
+        params: probe.params.cast(),
         param_count: probe.param_count,
     }]));
     Box::leak(Box::new(RveModule {
@@ -1596,7 +1969,7 @@ fn v4_sdk_module() -> &'static RveModule {
         message: command.message,
         destroy: command.destroy,
         drop: command.drop,
-        params: command.params,
+        params: command.params.cast(),
         param_count: command.param_count,
         command: command.command,
     }]));
@@ -3079,6 +3452,126 @@ fn heavy_defaults_are_filled_and_scene_values_coerced_before_create() {
 }
 
 #[test]
+fn abi_object_and_component_params_are_resolved_to_handles_before_create() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "ReferenceProbe"
+params = { target = { object = "target" }, camera = { object = "target" } }
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+"#,
+    );
+    let library = library();
+    let mut host = load_host(&world, &library);
+
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+    assert!(events.iter().any(|event| {
+        event.message == "ABI object message received" && event.level == ScriptEventLevel::Info
+    }));
+}
+
+#[test]
+fn missing_object_message_references_are_nil_for_lua_and_abi_receivers() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/refs.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/refs.lua"
+[[objects]]
+id = "lua_receiver"
+[[objects.lite_scripts]]
+path = "/refs.lua"
+[[objects]]
+id = "abi_receiver"
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let lua = r#"
+local Script = {}
+function Script:on_start()
+  if self.object.id == "sender" then
+    local victim = rve.find("victim")
+    rve.send("lua_receiver", "dead_ref", victim)
+    rve.send("abi_receiver", "dead_ref", victim)
+    assert(rve.destroy("victim"))
+  end
+end
+function Script:on_message(_, name, value)
+  if name == "dead_ref" then
+    assert(value == nil)
+    rve.log_info("Lua missing object message became nil")
+  end
+end
+return Script
+"#;
+    let library = library();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("refs.lua", lua)]),
+        Some(&library),
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    assert!(world.handle("victim").is_none());
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+
+    let events = host.drain_events();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message.clone())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert!(
+        infos.contains(&"Lua missing object message became nil"),
+        "{infos:?}"
+    );
+    assert!(
+        infos.contains(&"ABI missing object message became null"),
+        "{infos:?}"
+    );
+}
+
+#[test]
 fn heavy_params_that_violate_the_schema_fail_loading() {
     let library = typed_library();
     for params in ["{ speed = 11.0 }", "{ enabled = 1 }", "{ unknown = 1 }"] {
@@ -3126,6 +3619,7 @@ fn malformed_parameter_tables_are_rejected() {
             max: 0.0,
             flags,
             label: RveStr::empty(),
+            argument: RveStr::empty(),
         }
     }
     static BAD_UTF8: [u8; 1] = [0xff];
@@ -3585,6 +4079,14 @@ impl Script for NetGuest {
         if name == "fail" {
             panic!("net callback exploded");
         }
+        if name == "missing_ref" {
+            let Value::Object(object) = value else {
+                panic!("missing network reference was not decoded as an object handle");
+            };
+            assert_eq!(object.id(ctx), None);
+            ctx.log_info("missing network object became null");
+            return;
+        }
         ctx.log_info(format!("message {peer} {name} {value:?}"));
     }
 
@@ -3742,6 +4244,12 @@ fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
                 name: "ok".to_owned(),
                 value: engine_scene::ParamValue::String("x".to_owned()),
             },
+            engine_scene::NetEvent::Message {
+                peer: 4,
+                object: None,
+                name: "missing_ref".to_owned(),
+                value: engine_scene::ParamValue::Object("unknown_from_peer".to_owned()),
+            },
             engine_scene::NetEvent::PeerConnected { peer: 8 },
             engine_scene::NetEvent::PeerDisconnected {
                 peer: 8,
@@ -3774,6 +4282,7 @@ fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
         infos,
         [
             "message 3 ok String(\"x\")",
+            "missing network object became null",
             "connected 8",
             "disconnected 8 timeout",
         ]
@@ -3849,7 +4358,11 @@ fn v13_net_module() -> &'static RveModule {
     let legacy: &'static [RveScriptDescV13] = Box::leak(
         descriptors
             .iter()
-            .flat_map(|descriptor| {
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some((descriptor, params, param_count))
+            })
+            .flat_map(|(descriptor, params, param_count)| {
                 let alias = RveScriptDescV13 {
                     name: RveStr::from_static("NetAlias"),
                     create: descriptor.create,
@@ -3858,8 +4371,8 @@ fn v13_net_module() -> &'static RveModule {
                     message: descriptor.message,
                     destroy: descriptor.destroy,
                     drop: descriptor.drop,
-                    params: descriptor.params,
-                    param_count: descriptor.param_count,
+                    params,
+                    param_count,
                     command: descriptor.command,
                     collision: descriptor.collision,
                     net_event: descriptor.net_event,
@@ -3873,8 +4386,8 @@ fn v13_net_module() -> &'static RveModule {
                         message: descriptor.message,
                         destroy: descriptor.destroy,
                         drop: descriptor.drop,
-                        params: descriptor.params,
-                        param_count: descriptor.param_count,
+                        params,
+                        param_count,
                         command: descriptor.command,
                         collision: descriptor.collision,
                         net_event: descriptor.net_event,

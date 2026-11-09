@@ -3,7 +3,7 @@ use crate::error::BuildError;
 #[cfg(windows)]
 use crate::ico::png_to_ico;
 use crate::platform;
-use crate::project::{HeavyScriptUse, ProjectBuild, prepare_project};
+use crate::project::{HeavyScriptUse, ProjectBuild, prepare_project, validate_script_references};
 use crate::sdk::{self, PlayerLocation};
 use crate::temporary::TempDir;
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
@@ -392,7 +392,19 @@ fn validate_heavy_scripts(
             )));
         }
         if let Some(schema) = library.schema(&script.name) {
-            schema.resolve(&script.params).map_err(|error| {
+            let resolved = schema.resolve(&script.params).map_err(|error| {
+                BuildError::input(format!(
+                    "{}, объект {:?}, heavy-скрипт {:?}: {error}",
+                    script.owner, script.object, script.name
+                ))
+            })?;
+            validate_script_references(
+                schema,
+                &resolved,
+                &script.references.objects,
+                &script.references.assets,
+            )
+            .map_err(|error| {
                 BuildError::input(format!(
                     "{}, объект {:?}, heavy-скрипт {:?}: {error}",
                     script.owner, script.object, script.name
@@ -1082,10 +1094,11 @@ mod tests {
         validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
-    use crate::project::{HeavyScriptUse, ProjectBuild};
+    use crate::project::{HeavyScriptUse, ProjectBuild, ScriptReferenceContext};
     use crate::temporary::TempDir;
-    use engine_files::strip_windows_verbatim_prefix;
+    use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
     use engine_project::ProjectSettings;
+    use engine_scene::{ParamValue, SceneDocument};
     use engine_script::ScriptLibrary;
     use rve_sdk::{Params, Script};
     use std::collections::BTreeMap;
@@ -1104,6 +1117,11 @@ mod tests {
         let module = rve_sdk::script_module! {
             "Bobber" => test_factory { speed: f32 = 1.4 (0.0..=10.0) },
             "Spinner" => test_factory,
+            "Reference" => test_factory {
+                target: Option<Object> = None,
+                camera: component(camera) = None,
+                model: Asset = "",
+            },
         };
         // SAFETY: script_module! stores the descriptors and names in static storage.
         unsafe { ScriptLibrary::from_module(module) }.unwrap()
@@ -1575,6 +1593,7 @@ mod tests {
             object: "mesh".to_owned(),
             name: name.to_owned(),
             params: wrapper.params,
+            references: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -1590,6 +1609,63 @@ mod tests {
             assert_eq!(error.exit_code(), 2, "{params}: {error}");
             assert!(error.to_string().contains("\"mesh\""), "{error}");
             assert!(error.to_string().contains("Bobber"), "{error}");
+        }
+    }
+
+    #[test]
+    fn heavy_script_references_require_targets_components_and_declared_assets() {
+        let library = test_library();
+        let document = SceneDocument::parse(
+            "references.rvescene",
+            r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+[[objects]]
+id = "plain"
+"#,
+        )
+        .unwrap();
+        let assets =
+            std::collections::BTreeSet::from([VirtualPath::parse("models/ship.fbx").unwrap()]);
+        let make_use = |target: &str, camera: &str, model: &str| {
+            let params: BTreeMap<String, ParamValue> = toml::from_str(&format!(
+                "target = {{ object = {target:?} }}\ncamera = {{ object = {camera:?} }}\nmodel = {{ asset = {model:?} }}"
+            ))
+            .unwrap();
+            HeavyScriptUse {
+                owner: "scene /references.rvescene".to_owned(),
+                object: "camera".to_owned(),
+                name: "Reference".to_owned(),
+                params,
+                references: std::sync::Arc::new(ScriptReferenceContext {
+                    objects: document.objects.clone(),
+                    assets: assets.clone(),
+                }),
+            }
+        };
+
+        assert!(
+            validate_heavy_scripts(&library, &[make_use("target", "target", "models/ship.fbx")])
+                .is_ok()
+        );
+
+        for (usage, expected) in [
+            (make_use("missing", "target", "models/ship.fbx"), "missing"),
+            (make_use("target", "plain", "models/ship.fbx"), "camera"),
+            (
+                make_use("target", "target", "models/missing.fbx"),
+                "[[assets]]",
+            ),
+        ] {
+            let error = validate_heavy_scripts(&library, &[usage]).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 

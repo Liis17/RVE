@@ -5,14 +5,15 @@ use crate::icons;
 use crate::scene_edit::{
     Component, ComponentKind, OverrideField, default_environment, default_light,
 };
-use crate::state::{Action, AssetDrag, EditorState};
+use crate::state::{Action, AssetDrag, EditorState, ObjectDrag};
 use engine_files::VirtualPath;
+use engine_scene::ComponentKind as ScriptComponentKind;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
     AntiAliasing, AudioGroup, AudioSourceComponent, CameraComponent, CharacterControllerComponent,
     ColliderComponent, ColliderShape, EnvironmentComponent, HeavyScript, LodGroup, LodLevel,
     MAX_LOD_LEVELS, MaterialAlphaMode, NetAuthority, NetworkIdentityComponent,
-    NetworkTransformComponent, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
+    NetworkTransformComponent, ParamKind, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
     ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform,
     SpotLightComponent,
 };
@@ -75,6 +76,28 @@ fn commit(
                 change(object);
                 Ok(())
             })
+        });
+    }
+    finish_edit(state, response);
+}
+
+fn commit_script_params(
+    state: &mut EditorState,
+    id: &str,
+    field: &str,
+    response: &egui::Response,
+    index: usize,
+    params: BTreeMap<String, ParamValue>,
+    lite: bool,
+) {
+    if response.changed() {
+        let key = format!("{id}/{field}");
+        state.edit_scene(|scene| {
+            if lite {
+                scene.set_lite_script_params(id, index, params, Some(&key))
+            } else {
+                scene.set_heavy_script_params(id, index, params, Some(&key))
+            }
         });
     }
     finish_edit(state, response);
@@ -2871,8 +2894,15 @@ fn show_lite_script(
         true,
         |ui| match &schema {
             Ok(Some(schema)) => {
-                params_response =
-                    schema_params_ui(ui, ("lite", id, index), schema, &mut params, &mut reset);
+                params_response = schema_params_ui(
+                    ui,
+                    state,
+                    id,
+                    ("lite", id, index),
+                    schema,
+                    &mut params,
+                    &mut reset,
+                );
             }
             Ok(None) => params_response = params_ui(ui, ("lite", id, index), &mut params),
             Err(_) => {
@@ -2895,9 +2925,7 @@ fn show_lite_script(
     }
     if let Some(response) = &params_response {
         let key = format!("lite-{index}");
-        commit(state, id, &key, response, |object| {
-            object.lite_scripts[index].params = params;
-        });
+        commit_script_params(state, id, &key, response, index, params, true);
     }
     if action == HeaderAction::Revert {
         revert(state, id, field);
@@ -2939,8 +2967,15 @@ fn show_heavy_script(
         true,
         |ui| match &schema {
             Some(schema) => {
-                params_response =
-                    schema_params_ui(ui, ("heavy", id, index), schema, &mut params, &mut reset);
+                params_response = schema_params_ui(
+                    ui,
+                    state,
+                    id,
+                    ("heavy", id, index),
+                    schema,
+                    &mut params,
+                    &mut reset,
+                );
             }
             None => params_response = params_ui(ui, ("heavy", id, index), &mut params),
         },
@@ -2956,9 +2991,7 @@ fn show_heavy_script(
     }
     if let Some(response) = &params_response {
         let key = format!("heavy-{index}");
-        commit(state, id, &key, response, |object| {
-            object.heavy_scripts[index].params = params;
-        });
+        commit_script_params(state, id, &key, response, index, params, false);
     }
     if action == HeaderAction::Revert {
         revert(state, id, field);
@@ -2993,6 +3026,8 @@ fn params_ui(
                     ParamValue::Float(value) => ui.add(egui::DragValue::new(value).speed(0.05)),
                     ParamValue::String(value) => ui.text_edit_singleline(value),
                     ParamValue::Array(values) => ui.label(format!("[{} значений]", values.len())),
+                    ParamValue::Object(id) => ui.label(id.as_str()),
+                    ParamValue::Asset(path) => ui.label(path.as_str()),
                 };
                 combined = Some(match combined.take() {
                     Some(previous) => previous | response,
@@ -3057,6 +3092,8 @@ fn params_ui(
 
 fn schema_params_ui(
     ui: &mut egui::Ui,
+    state: &mut EditorState,
+    owner: &str,
     salt: impl std::hash::Hash + std::fmt::Debug,
     schema: &ParamSchema,
     params: &mut BTreeMap<String, ParamValue>,
@@ -3079,9 +3116,23 @@ fn schema_params_ui(
                     Some(Ok(value)) => value.clone(),
                     Some(Err(_)) | None => spec.default.clone(),
                 };
-                let response = param_widget(ui, spec, &mut value);
+                let response = param_widget(ui, state, owner, spec, &mut value);
                 if response.changed() {
-                    params.insert(spec.name.clone(), value);
+                    let empty_reference = matches!(
+                        (&spec.kind, &value),
+                        (
+                            ParamKind::Object | ParamKind::Component(_),
+                            ParamValue::Object(id)
+                        ) if id.is_empty()
+                    ) || matches!(
+                        (&spec.kind, &value),
+                        (ParamKind::Asset(_), ParamValue::String(path)) if path.is_empty()
+                    );
+                    if empty_reference {
+                        params.remove(&spec.name);
+                    } else {
+                        params.insert(spec.name.clone(), value);
+                    }
                 }
                 merge_response(&mut combined, response);
                 ui.horizontal(|ui| {
@@ -3169,7 +3220,117 @@ fn integer_bounds(min: f64, max: f64) -> Option<std::ops::RangeInclusive<i64>> {
     (lower <= upper).then_some(lower..=upper)
 }
 
-fn param_widget(ui: &mut egui::Ui, spec: &ParamSpec, value: &mut ParamValue) -> egui::Response {
+fn param_widget(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    owner: &str,
+    spec: &ParamSpec,
+    value: &mut ParamValue,
+) -> egui::Response {
+    match &spec.kind {
+        ParamKind::Object | ParamKind::Component(_) | ParamKind::Asset(_) => {
+            return ref_field(ui, state, owner, spec, value);
+        }
+        ParamKind::Enum(values) => {
+            let ParamValue::String(current) = value else {
+                return ui.label("некорректное enum значение");
+            };
+            let mut changed = false;
+            let mut response = egui::ComboBox::from_id_salt((owner, &spec.name, "enum"))
+                .selected_text(current.as_str())
+                .show_ui(ui, |ui| {
+                    for option in values {
+                        if ui.selectable_label(option == current, option).clicked() {
+                            *current = option.clone();
+                            changed = true;
+                        }
+                    }
+                })
+                .response;
+            if changed {
+                response.mark_changed();
+            }
+            return response;
+        }
+        ParamKind::Color => {
+            let ParamValue::Array(values) = value else {
+                return ui.label("некорректный цвет");
+            };
+            if values.len() != 3 {
+                *values = vec![ParamValue::Float(0.0); 3];
+            }
+            let mut rgb = std::array::from_fn(|index| match &values[index] {
+                ParamValue::Float(value) => *value as f32,
+                ParamValue::Int(value) => *value as f32,
+                _ => 0.0,
+            });
+            let mut combined = None;
+            let picked = ui.color_edit_button_rgb(&mut rgb).changed();
+            if picked {
+                for (target, channel) in values.iter_mut().zip(rgb) {
+                    *target = ParamValue::Float(channel as f64);
+                }
+            }
+            for (index, channel) in rgb.iter_mut().enumerate() {
+                let response = ui.add(egui::DragValue::new(channel).speed(0.01).range(0.0..=1.0));
+                if response.changed() {
+                    values[index] = ParamValue::Float(*channel as f64);
+                }
+                merge_response(&mut combined, response);
+            }
+            let mut response = combined.unwrap_or_else(|| ui.label(""));
+            if picked {
+                response.mark_changed();
+            }
+            return response;
+        }
+        ParamKind::Array(element) => {
+            let ParamValue::Array(values) = value else {
+                return ui.label("некорректный массив");
+            };
+            let mut combined = None;
+            let mut remove = None;
+            ui.vertical(|ui| {
+                for (index, value) in values.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let element_spec = ParamSpec {
+                            name: format!("{}[{index}]", spec.name),
+                            kind: (**element).clone(),
+                            default: element.zero(),
+                            min: None,
+                            max: None,
+                            label: None,
+                        };
+                        merge_response(
+                            &mut combined,
+                            param_widget(ui, state, owner, &element_spec, value),
+                        );
+                        if ui.small_button("−").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    let mut add = ui.small_button("+").on_hover_text("Добавить элемент");
+                    if add.clicked() {
+                        values.push(element.zero());
+                    }
+                    if add.clicked() || remove.is_some() {
+                        add.mark_changed();
+                    }
+                    merge_response(&mut combined, add);
+                });
+            });
+            if let Some(index) = remove {
+                values.remove(index);
+                if let Some(response) = &mut combined {
+                    response.mark_changed();
+                }
+            }
+            return combined.unwrap_or_else(|| ui.label(""));
+        }
+        _ => {}
+    }
     let min = spec.min.unwrap_or(f64::NEG_INFINITY);
     let max = spec.max.unwrap_or(f64::INFINITY);
     match value {
@@ -3197,7 +3358,243 @@ fn param_widget(ui: &mut egui::Ui, spec: &ParamSpec, value: &mut ParamValue) -> 
             })
             .inner
         }
+        ParamValue::Object(id) => ui.label(id.as_str()),
+        ParamValue::Asset(path) => ui.label(path.as_str()),
     }
+}
+
+fn ref_field(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    owner: &str,
+    spec: &ParamSpec,
+    value: &mut ParamValue,
+) -> egui::Response {
+    let (current, icon, mut missing) = match (&spec.kind, &*value) {
+        (ParamKind::Object | ParamKind::Component(_), ParamValue::Object(id)) => {
+            let target = (!id.is_empty())
+                .then(|| state.scene.as_ref()?.object(id))
+                .flatten();
+            let valid = target.is_some_and(|object| reference_matches(&spec.kind, object));
+            (Some(id.clone()), "◉", !id.is_empty() && !valid)
+        }
+        (ParamKind::Asset(_), ParamValue::Asset(path)) => {
+            (Some(path.as_str().to_owned()), "▧", false)
+        }
+        (ParamKind::Asset(_), ParamValue::String(path)) => (Some(path.clone()), "▧", false),
+        _ => (None, "?", true),
+    };
+    let asset_kind = match &spec.kind {
+        ParamKind::Asset(kind) => *kind,
+        _ => None,
+    };
+    if matches!(&spec.kind, ParamKind::Asset(_))
+        && let Some(path) = current.as_deref().filter(|path| !path.is_empty())
+    {
+        missing = !all_assets(&state.asset_tree)
+            .iter()
+            .any(|asset| asset == path);
+    }
+    let target_text = match &spec.kind {
+        ParamKind::Object | ParamKind::Component(_) => current
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| state.scene.as_ref()?.object(id))
+            .map(|object| object.display_name().to_owned())
+            .unwrap_or_else(|| {
+                current
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map_or_else(|| "None".to_owned(), str::to_owned)
+            }),
+        ParamKind::Asset(_) => current
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .map_or_else(|| "None".to_owned(), str::to_owned),
+        _ => String::new(),
+    };
+    let target_text = if missing {
+        format!("Missing: {target_text}")
+    } else {
+        target_text
+    };
+    let button_text = if missing {
+        egui::RichText::new(format!("{icon} {target_text}")).color(ui.visuals().error_fg_color)
+    } else {
+        egui::RichText::new(format!("{icon} {target_text}"))
+    };
+    let field = ui.add_sized(
+        [
+            ui.available_width().min(180.0),
+            ui.spacing().interact_size.y,
+        ],
+        egui::Button::new(button_text).sense(egui::Sense::click_and_drag()),
+    );
+    if field.clicked() {
+        match &spec.kind {
+            ParamKind::Object | ParamKind::Component(_) => {
+                if let Some(id) = current.as_deref().filter(|id| !id.is_empty())
+                    && let Some(scene) = &mut state.scene
+                {
+                    scene.select(Some(id));
+                }
+            }
+            ParamKind::Asset(_) => {
+                if let Some(path) = current.as_deref().filter(|path| !path.is_empty()) {
+                    navigate_asset(state, path);
+                }
+            }
+            _ => {}
+        }
+    }
+    let object_payload = field.dnd_hover_payload::<ObjectDrag>().map(|payload| {
+        let valid = matches!(&spec.kind, ParamKind::Object | ParamKind::Component(_))
+            && state
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.object(&payload.0))
+                .is_some_and(|object| reference_matches(&spec.kind, object));
+        (payload.0.clone(), valid)
+    });
+    let asset_payload = field.dnd_hover_payload::<AssetDrag>().map(|payload| {
+        let valid = matches!(&spec.kind, ParamKind::Asset(_))
+            && asset_kind.is_none_or(|kind| AssetKind::of(&payload.0) == kind);
+        (payload.0.clone(), valid)
+    });
+    if let Some((_, valid)) = object_payload.as_ref().or(asset_payload.as_ref()) {
+        ui.painter().rect_stroke(
+            field.rect,
+            3.0,
+            egui::Stroke::new(
+                1.5,
+                if *valid {
+                    ui.visuals().selection.stroke.color
+                } else {
+                    ui.visuals().error_fg_color
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let mut selected = None;
+    ui.push_id((owner, &spec.name), |ui| {
+        ui.menu_button("⊙", |ui| match &spec.kind {
+            ParamKind::Object | ParamKind::Component(_) => {
+                let objects = state
+                    .scene
+                    .as_ref()
+                    .map(|scene| scene.view().objects.clone())
+                    .unwrap_or_default();
+                for object in objects
+                    .iter()
+                    .filter(|object| reference_matches(&spec.kind, object))
+                {
+                    if ui
+                        .selectable_label(
+                            current.as_deref() == Some(object.id.as_str()),
+                            object.display_name(),
+                        )
+                        .on_hover_text(&object.id)
+                        .clicked()
+                    {
+                        selected = Some(ParamValue::Object(object.id.clone()));
+                    }
+                }
+            }
+            ParamKind::Asset(_) => {
+                let assets = asset_kind.map_or_else(
+                    || all_assets(&state.asset_tree),
+                    |kind| state.assets_of_kind(kind),
+                );
+                for path in assets {
+                    if ui
+                        .selectable_label(current.as_deref() == Some(path.as_str()), &path)
+                        .clicked()
+                    {
+                        selected = VirtualPath::parse(&path).ok().map(ParamValue::Asset);
+                    }
+                }
+            }
+            _ => {}
+        })
+    });
+    let clear = ui.small_button("✕").on_hover_text("Очистить ссылку");
+    if clear.clicked() {
+        selected = Some(match &spec.kind {
+            ParamKind::Asset(_) => ParamValue::String(String::new()),
+            _ => ParamValue::Object(String::new()),
+        });
+    }
+    if let Some((path, true)) = asset_payload {
+        selected = VirtualPath::parse(&path).ok().map(ParamValue::Asset);
+    }
+    if let Some((id, true)) = object_payload {
+        selected = Some(ParamValue::Object(id));
+    }
+    let mut response = field | clear;
+    if let Some(selected) = selected {
+        if let ParamValue::Asset(path) = &selected {
+            navigate_asset(state, path.as_str());
+        }
+        *value = selected;
+        response.mark_changed();
+    }
+    response
+}
+
+fn reference_matches(kind: &ParamKind, object: &SceneObject) -> bool {
+    let Some(component) = (match kind {
+        ParamKind::Object => return true,
+        ParamKind::Component(component) => Some(component),
+        _ => None,
+    }) else {
+        return false;
+    };
+    match component {
+        ScriptComponentKind::Transform => true,
+        ScriptComponentKind::Camera => object.camera.is_some(),
+        ScriptComponentKind::MeshRenderer => object.mesh_renderer.is_some(),
+        ScriptComponentKind::LodGroup => object.lod_group.is_some(),
+        ScriptComponentKind::DirectionalLight => object.directional_light.is_some(),
+        ScriptComponentKind::PointLight => object.point_light.is_some(),
+        ScriptComponentKind::SpotLight => object.spot_light.is_some(),
+        ScriptComponentKind::Environment => object.environment.is_some(),
+        ScriptComponentKind::Collider => object.collider.is_some(),
+        ScriptComponentKind::RigidBody => object.rigid_body.is_some(),
+        ScriptComponentKind::CharacterController => object.character_controller.is_some(),
+        ScriptComponentKind::AudioSource => object.audio_source.is_some(),
+        ScriptComponentKind::Animator => object.animator.is_some(),
+        ScriptComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
+        ScriptComponentKind::NetworkIdentity => object.network_identity.is_some(),
+        ScriptComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ScriptComponentKind::Script(script) => {
+            object
+                .lite_scripts
+                .iter()
+                .any(|item| item.path.as_str() == script)
+                || object.heavy_scripts.iter().any(|item| item.name == *script)
+        }
+    }
+}
+
+fn all_assets(entries: &[crate::assets_fs::AssetEntry]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        if entry.is_dir {
+            paths.extend(all_assets(&entry.children));
+        } else {
+            paths.push(entry.path.clone());
+        }
+    }
+    paths
+}
+
+fn navigate_asset(state: &mut EditorState, path: &str) {
+    state.project_selection = Some(path.to_owned());
+    state.current_folder = path
+        .rsplit_once('/')
+        .map_or_else(String::new, |(folder, _)| folder.to_owned());
 }
 
 fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {

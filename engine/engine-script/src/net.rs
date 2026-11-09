@@ -178,6 +178,8 @@ fn check_value(
             Err("message value contains a non-finite number")
         }
         ParamValue::String(text) => budget.add_string(text.len()),
+        ParamValue::Asset(path) => budget.add_string(path.as_str().len()),
+        ParamValue::Object(id) => budget.add_string(id.len()),
         ParamValue::Array(values) => {
             for value in values {
                 check_value(value, depth + 1, budget)?;

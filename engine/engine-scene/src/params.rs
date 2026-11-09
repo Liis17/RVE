@@ -1,20 +1,99 @@
 //! Схема параметров скрипта: объявленные имена, типы, значения по умолчанию и диапазоны.
 
+use crate::asset_kind::AssetKind;
 use crate::document::ParamValue;
+use engine_files::VirtualPath;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Наибольшая длина имени параметра в байтах.
 pub const MAX_PARAM_NAME_BYTES: usize = 64;
 
-/// Тип объявленного параметра. `Vec3` хранится в сцене как массив из трёх чисел.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+/// A scene component that can be required by a script reference parameter.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ComponentKind {
+    Transform,
+    Camera,
+    MeshRenderer,
+    LodGroup,
+    DirectionalLight,
+    PointLight,
+    SpotLight,
+    Environment,
+    Collider,
+    RigidBody,
+    CharacterController,
+    AudioSource,
+    Animator,
+    ParticleEmitter,
+    NetworkIdentity,
+    NetworkTransform,
+    Script(String),
+}
+
+impl ComponentKind {
+    pub fn parse(name: &str) -> Option<Self> {
+        if let Some(script) = name.strip_prefix("script:") {
+            return (!script.is_empty()).then(|| Self::Script(script.to_owned()));
+        }
+        Some(match name {
+            "transform" => Self::Transform,
+            "camera" => Self::Camera,
+            "mesh_renderer" => Self::MeshRenderer,
+            "lod_group" => Self::LodGroup,
+            "directional_light" => Self::DirectionalLight,
+            "point_light" => Self::PointLight,
+            "spot_light" => Self::SpotLight,
+            "environment" => Self::Environment,
+            "collider" => Self::Collider,
+            "rigid_body" => Self::RigidBody,
+            "character_controller" => Self::CharacterController,
+            "audio_source" => Self::AudioSource,
+            "animator" => Self::Animator,
+            "particle_emitter" => Self::ParticleEmitter,
+            "network_identity" => Self::NetworkIdentity,
+            "network_transform" => Self::NetworkTransform,
+            _ => return None,
+        })
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Self::Transform => "transform".to_owned(),
+            Self::Camera => "camera".to_owned(),
+            Self::MeshRenderer => "mesh_renderer".to_owned(),
+            Self::LodGroup => "lod_group".to_owned(),
+            Self::DirectionalLight => "directional_light".to_owned(),
+            Self::PointLight => "point_light".to_owned(),
+            Self::SpotLight => "spot_light".to_owned(),
+            Self::Environment => "environment".to_owned(),
+            Self::Collider => "collider".to_owned(),
+            Self::RigidBody => "rigid_body".to_owned(),
+            Self::CharacterController => "character_controller".to_owned(),
+            Self::AudioSource => "audio_source".to_owned(),
+            Self::Animator => "animator".to_owned(),
+            Self::ParticleEmitter => "particle_emitter".to_owned(),
+            Self::NetworkIdentity => "network_identity".to_owned(),
+            Self::NetworkTransform => "network_transform".to_owned(),
+            Self::Script(script) => format!("script:{script}"),
+        }
+    }
+}
+
+/// Declared script parameter kind. `Vec3` and `Color` use three numeric array entries.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ParamKind {
     Bool,
     Int,
     Float,
     String,
     Vec3,
+    Object,
+    Component(ComponentKind),
+    Asset(Option<AssetKind>),
+    Enum(Vec<String>),
+    Color,
+    Array(Box<ParamKind>),
 }
 
 impl ParamKind {
@@ -26,40 +105,56 @@ impl ParamKind {
             "float" => Self::Float,
             "string" => Self::String,
             "vec3" => Self::Vec3,
+            "object" => Self::Object,
+            "color" => Self::Color,
+            "asset" => Self::Asset(None),
             _ => return None,
         })
     }
 
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Self::Bool => "bool",
-            Self::Int => "int",
-            Self::Float => "float",
-            Self::String => "string",
-            Self::Vec3 => "vec3",
+            Self::Bool => "bool".to_owned(),
+            Self::Int => "int".to_owned(),
+            Self::Float => "float".to_owned(),
+            Self::String => "string".to_owned(),
+            Self::Vec3 => "vec3".to_owned(),
+            Self::Object => "object".to_owned(),
+            Self::Component(component) => format!("component ({})", component.name()),
+            Self::Asset(Some(kind)) => format!("asset ({})", kind.name()),
+            Self::Asset(None) => "asset".to_owned(),
+            Self::Enum(_) => "enum".to_owned(),
+            Self::Color => "color".to_owned(),
+            Self::Array(kind) => format!("array of {}", kind.name()),
         }
     }
 
     /// Допускает ли тип границы `min`/`max`.
-    pub fn is_numeric(self) -> bool {
+    pub fn is_numeric(&self) -> bool {
         matches!(self, Self::Int | Self::Float)
     }
 
     /// Значение по умолчанию, когда схема его не задаёт.
-    pub fn zero(self) -> ParamValue {
+    pub fn zero(&self) -> ParamValue {
         match self {
             Self::Bool => ParamValue::Bool(false),
             Self::Int => ParamValue::Int(0),
             Self::Float => ParamValue::Float(0.0),
             Self::String => ParamValue::String(String::new()),
             Self::Vec3 => ParamValue::Array(vec![ParamValue::Float(0.0); 3]),
+            Self::Object | Self::Component(_) => ParamValue::Object(String::new()),
+            // An empty string is the schema's `None` default for optional asset references.
+            Self::Asset(_) => ParamValue::String(String::new()),
+            Self::Enum(values) => ParamValue::String(values.first().cloned().unwrap_or_default()),
+            Self::Color => ParamValue::Array(vec![ParamValue::Float(0.0); 3]),
+            Self::Array(_) => ParamValue::Array(Vec::new()),
         }
     }
 }
 
 impl fmt::Display for ParamKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
+        formatter.write_str(&self.name())
     }
 }
 
@@ -76,28 +171,9 @@ pub struct ParamSpec {
 }
 
 impl ParamSpec {
-    /// Проверяет значение по типу и диапазону и приводит его к каноническому виду:
-    /// целое число для `Float` и компонент `Vec3` становится вещественным.
+    /// Проверяет значение по типу и диапазону и приводит числа массивов к каноническому виду.
     pub fn coerce(&self, value: &ParamValue) -> Result<ParamValue, String> {
-        let value = match (self.kind, value) {
-            (ParamKind::Bool, ParamValue::Bool(_))
-            | (ParamKind::Int, ParamValue::Int(_))
-            | (ParamKind::Float, ParamValue::Float(_))
-            | (ParamKind::String, ParamValue::String(_)) => value.clone(),
-            (ParamKind::Float, ParamValue::Int(value)) => ParamValue::Float(*value as f64),
-            (ParamKind::Vec3, ParamValue::Array(values)) if values.len() == 3 => {
-                let mut components = Vec::with_capacity(3);
-                for value in values {
-                    components.push(ParamValue::Float(match value {
-                        ParamValue::Int(value) => *value as f64,
-                        ParamValue::Float(value) => *value,
-                        _ => return Err(self.mismatch()),
-                    }));
-                }
-                ParamValue::Array(components)
-            }
-            _ => return Err(self.mismatch()),
-        };
+        let value = coerce_kind(&self.name, &self.kind, value).map_err(|()| self.mismatch())?;
         let number = match value {
             ParamValue::Int(value) => Some(value as f64),
             ParamValue::Float(value) => Some(value),
@@ -122,6 +198,62 @@ impl ParamSpec {
 
     fn mismatch(&self) -> String {
         format!("параметр {:?} должен иметь тип {}", self.name, self.kind)
+    }
+}
+
+fn coerce_kind(name: &str, kind: &ParamKind, value: &ParamValue) -> Result<ParamValue, ()> {
+    match (kind, value) {
+        (ParamKind::Bool, ParamValue::Bool(_))
+        | (ParamKind::Int, ParamValue::Int(_))
+        | (ParamKind::String, ParamValue::String(_))
+        | (ParamKind::Object, ParamValue::Object(_))
+        | (ParamKind::Component(_), ParamValue::Object(_)) => Ok(value.clone()),
+        (ParamKind::Float, ParamValue::Float(_)) => Ok(value.clone()),
+        (ParamKind::Float, ParamValue::Int(value)) => Ok(ParamValue::Float(*value as f64)),
+        (ParamKind::Asset(_), ParamValue::String(value)) if value.is_empty() => {
+            Ok(ParamValue::String(value.clone()))
+        }
+        (ParamKind::Asset(expected), ParamValue::String(value)) => {
+            let path = VirtualPath::parse(value).map_err(|_| ())?;
+            if expected.is_some_and(|expected| AssetKind::of(path.as_str()) != expected) {
+                return Err(());
+            }
+            Ok(ParamValue::Asset(path))
+        }
+        (ParamKind::Asset(expected), ParamValue::Asset(path))
+            if expected.is_none_or(|expected| AssetKind::of(path.as_str()) == expected) =>
+        {
+            Ok(value.clone())
+        }
+        (ParamKind::Enum(values), ParamValue::String(value)) if values.contains(value) => {
+            Ok(ParamValue::String(value.clone()))
+        }
+        (ParamKind::Vec3 | ParamKind::Color, ParamValue::Array(values)) if values.len() == 3 => {
+            let mut components = Vec::with_capacity(3);
+            for value in values {
+                let number = match value {
+                    ParamValue::Int(value) => *value as f64,
+                    ParamValue::Float(value) => *value,
+                    _ => return Err(()),
+                };
+                if !number.is_finite()
+                    || matches!(kind, ParamKind::Color) && !(0.0..=1.0).contains(&number)
+                {
+                    return Err(());
+                }
+                components.push(ParamValue::Float(number));
+            }
+            Ok(ParamValue::Array(components))
+        }
+        (ParamKind::Array(element), ParamValue::Array(values)) => values
+            .iter()
+            .map(|value| coerce_kind(name, element, value))
+            .collect::<Result<Vec<_>, _>>()
+            .map(ParamValue::Array),
+        _ => {
+            let _ = name;
+            Err(())
+        }
     }
 }
 
@@ -159,6 +291,7 @@ impl ParamSchema {
             {
                 return Err(format!("у параметра {:?} min больше max", spec.name));
             }
+            validate_kind(&spec.kind, &spec.name)?;
             spec.default = spec
                 .coerce(&spec.default)
                 .map_err(|error| format!("значение по умолчанию: {error}"))?;
@@ -199,6 +332,25 @@ impl ParamSchema {
             })
             .collect()
     }
+}
+
+fn validate_kind(kind: &ParamKind, name: &str) -> Result<(), String> {
+    match kind {
+        ParamKind::Enum(values) => {
+            let unique = values.iter().collect::<BTreeSet<_>>();
+            if values.is_empty()
+                || unique.len() != values.len()
+                || values.iter().any(String::is_empty)
+            {
+                return Err(format!(
+                    "enum параметра {name:?} должен содержать непустые уникальные значения"
+                ));
+            }
+        }
+        ParamKind::Array(element) => validate_kind(element, name)?,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Имя параметра — идентификатор `[A-Za-z_][A-Za-z0-9_]*` не длиннее 64 байт.
@@ -383,10 +535,83 @@ mod tests {
             ParamKind::String,
             ParamKind::Vec3,
         ] {
-            assert_eq!(ParamKind::parse(kind.name()), Some(kind));
+            assert_eq!(ParamKind::parse(&kind.name()), Some(kind.clone()));
             let zero = kind.zero();
             assert_eq!(spec("value", kind, zero.clone()).coerce(&zero), Ok(zero));
         }
         assert_eq!(ParamKind::parse("double"), None);
+    }
+
+    #[test]
+    fn references_enums_colors_and_typed_arrays_are_coerced() {
+        let texture = VirtualPath::parse("textures/hero.PNG").unwrap();
+        let ui_document = VirtualPath::parse("ui/hud.rveui").unwrap();
+        let schema = ParamSchema::new(vec![
+            spec("target", ParamKind::Object, ParamKind::Object.zero()),
+            spec(
+                "body",
+                ParamKind::Component(ComponentKind::RigidBody),
+                ParamKind::Component(ComponentKind::RigidBody).zero(),
+            ),
+            spec(
+                "texture",
+                ParamKind::Asset(Some(AssetKind::Texture)),
+                ParamKind::Asset(Some(AssetKind::Texture)).zero(),
+            ),
+            spec(
+                "hud",
+                ParamKind::Asset(Some(AssetKind::Ui)),
+                ParamKind::Asset(Some(AssetKind::Ui)).zero(),
+            ),
+            spec(
+                "mode",
+                ParamKind::Enum(vec!["walk".into(), "run".into()]),
+                ParamValue::String("walk".into()),
+            ),
+            spec("color", ParamKind::Color, ParamKind::Color.zero()),
+            spec(
+                "weights",
+                ParamKind::Array(Box::new(ParamKind::Float)),
+                ParamValue::Array(vec![]),
+            ),
+        ])
+        .unwrap();
+        let resolved = schema
+            .resolve(&params(&[
+                ("target", ParamValue::Object("player".into())),
+                ("body", ParamValue::Object("player".into())),
+                ("texture", ParamValue::Asset(texture.clone())),
+                ("hud", ParamValue::Asset(ui_document.clone())),
+                ("mode", ParamValue::String("run".into())),
+                ("color", vec3([0.1, 0.2, 1.0])),
+                (
+                    "weights",
+                    ParamValue::Array(vec![ParamValue::Int(1), ParamValue::Float(2.5)]),
+                ),
+            ]))
+            .unwrap();
+        assert_eq!(resolved["texture"], ParamValue::Asset(texture));
+        assert_eq!(resolved["hud"], ParamValue::Asset(ui_document));
+        assert_eq!(resolved["color"], vec3([0.1, 0.2, 1.0]));
+        assert_eq!(
+            resolved["weights"],
+            ParamValue::Array(vec![ParamValue::Float(1.0), ParamValue::Float(2.5)])
+        );
+        for wrong in [
+            params(&[("mode", ParamValue::String("fly".into()))]),
+            params(&[("color", vec3([0.1, 1.01, 0.0]))]),
+            params(&[("weights", ParamValue::Array(vec![ParamValue::Bool(true)]))]),
+            params(&[(
+                "texture",
+                ParamValue::Asset(VirtualPath::parse("x.fbx").unwrap()),
+            )]),
+            params(&[(
+                "hud",
+                ParamValue::Asset(VirtualPath::parse("ui/hud.png").unwrap()),
+            )]),
+            params(&[("target", ParamValue::String("player".into()))]),
+        ] {
+            assert!(schema.resolve(&wrong).is_err(), "{wrong:?}");
+        }
     }
 }
