@@ -1,0 +1,19 @@
+# Демо-HUD: заголовок в левом верхнем углу и кнопка в правом нижнем.
+[canvas]
+layer = 0
+
+[[elements]]
+id = "title"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 24.0], offset_max = [360.0, 48.0] }
+text = { string = "RVE Demo", size = 28.0, color = [255, 255, 255, 255] }
+
+[[elements]]
+id = "fire"
+rect = { anchor_min = [1.0, 1.0], anchor_max = [1.0, 1.0], pivot = [1.0, 1.0], offset_min = [-24.0, -24.0], offset_max = [200.0, 56.0] }
+button = {}
+
+[[elements]]
+id = "fire_label"
+parent = "fire"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [1.0, 1.0], pivot = [0.5, 0.5], offset_min = [0.0, 0.0], offset_max = [0.0, 0.0] }
+text = { string = "Огонь", size = 22.0, color = [255, 255, 255, 255], h_align = "center", v_align = "middle" }
