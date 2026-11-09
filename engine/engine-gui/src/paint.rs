@@ -1092,6 +1092,20 @@ rect = { anchor_min = [0.0, 0.0], anchor_max = [1.0, 0.0], pivot = [0.0, 0.0], o
     }
 
     #[test]
+    fn held_input_without_a_visual_change_keeps_cached_geometry() {
+        let (mut system, _) = system_with(PANEL_IMAGE_TEXT);
+        let first = system.paint();
+        let input = UiInput {
+            primary_down: true,
+            held: Some(crate::input::UiAction::Down),
+            ..Default::default()
+        };
+        system.update(&input, 0.1, screen());
+        let second = system.paint();
+        assert!(Arc::ptr_eq(&first.draw_list, &second.draw_list));
+        assert!(Arc::ptr_eq(&first.atlas, &second.atlas));
+    }
+    #[test]
     fn same_text_rebuilds_draw_list_but_keeps_atlas() {
         let (mut system, canvas) = system_with(PANEL_IMAGE_TEXT);
         let label = system.find(canvas, "label").unwrap();

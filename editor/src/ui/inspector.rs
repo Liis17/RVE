@@ -168,6 +168,9 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     if let Some(transform) = object.network_transform {
         show_network_transform(ui, state, id, transform);
     }
+    if let Some(canvas) = &object.ui_canvas {
+        show_ui_canvas(ui, state, id, canvas);
+    }
     for index in 0..object.lite_scripts.len() {
         show_lite_script(ui, state, object, index);
     }
@@ -1745,6 +1748,72 @@ fn show_network_transform(
     run_menu_action(state, id, ComponentKind::NetworkTransform, action);
 }
 
+fn show_ui_canvas(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    canvas: &engine_scene::UiCanvasComponent,
+) {
+    let action = component_header(
+        ui,
+        HeaderTitle {
+            text: "UI Canvas",
+            icon: component_icon(state, ComponentKind::UiCanvas),
+        },
+        id,
+        mark(state, id, OverrideField::UiCanvas),
+        Some(component_menu(state, id, ComponentKind::UiCanvas)),
+        true,
+        |ui| {
+            let mut value = canvas.clone();
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Document");
+                let selected = value.document.as_str().to_owned();
+                egui::ComboBox::from_id_salt(("ui_canvas_document", id))
+                    .selected_text(&selected)
+                    .show_ui(ui, |ui| {
+                        for path in state.assets_of_kind(AssetKind::Ui) {
+                            if let Some(document) = parse_path(state, &path)
+                                && ui
+                                    .selectable_value(&mut value.document, document, &path)
+                                    .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            changed |= ui.checkbox(&mut value.visible, "Visible").changed();
+            ui.horizontal(|ui| {
+                ui.label("Layer");
+                let mut layer = value.layer.unwrap_or(0);
+                if ui.add(egui::DragValue::new(&mut layer)).changed() {
+                    value.layer = Some(layer);
+                    changed = true;
+                }
+            });
+            if changed {
+                state.edit_scene(|scene| {
+                    scene.edit_object(id, Some(&format!("{id}/ui_canvas")), |object| {
+                        object.ui_canvas = Some(value);
+                        Ok(())
+                    })
+                });
+            }
+        },
+    );
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, None, |object| {
+                object.ui_canvas = None;
+                Ok(())
+            })
+        });
+    }
+    run_menu_action(state, id, ComponentKind::UiCanvas, action);
+}
+
 fn net_authority_label(authority: NetAuthority) -> &'static str {
     match authority {
         NetAuthority::Server => "Server",
@@ -3193,6 +3262,30 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                     )
                 });
             }
+        }
+        if object.ui_canvas.is_none() {
+            ui.menu_button("UI Canvas", |ui| {
+                let paths = state.assets_of_kind(AssetKind::Ui);
+                if paths.is_empty() {
+                    ui.label("Нет .rveui в проекте");
+                }
+                for path in paths {
+                    if ui.button(&path).clicked()
+                        && let Some(document) = parse_path(state, &path)
+                    {
+                        state.edit_scene(|scene| {
+                            scene.set_component(
+                                id,
+                                Component::UiCanvas(engine_scene::UiCanvasComponent {
+                                    document,
+                                    visible: true,
+                                    layer: None,
+                                }),
+                            )
+                        });
+                    }
+                }
+            });
         }
         if object.mesh_renderer.is_some()
             && object.animator.is_none()

@@ -196,12 +196,10 @@ impl UiSystem {
         // Тесселяция нужна только при изменении видимого состояния: события, ввод или повтор.
         let touched = !events.is_empty()
             || input.primary_pressed
-            || input.primary_down
             || input.primary_released
             || input.wheel != Vec2::ZERO
             || !input.actions.is_empty()
-            || !input.text.is_empty()
-            || input.held.is_some();
+            || !input.text.is_empty();
         if touched {
             self.paint_dirty = true;
         }

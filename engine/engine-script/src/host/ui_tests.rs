@@ -558,3 +558,48 @@ fn close_in_callback_delivers_blur_to_owner_on_next_update() {
         "blur от закрытия доставляется владельцу: {events:?}"
     );
 }
+
+#[test]
+fn demo_hud_script_updates_progress_and_status_from_ui_events() {
+    let mut world = scene(&canvas_object("hud", "hud.lua"), &["hud.lua"]);
+    let script = include_str!("../../../../examples/demo-game/Assets/scripts/hud.lua");
+    let doc = include_str!("../../../../examples/demo-game/Assets/ui/hud.rveui");
+    let mut host =
+        ScriptHost::load(&world, "demo", &sources(&[("hud.lua", script)]), None).unwrap();
+    host.register_ui_document(
+        VirtualPath::parse("ui/menu.rveui").unwrap(),
+        Arc::new(UiDocument::parse("hud", doc).unwrap()),
+    );
+    host.start(&mut world, ScriptTime::default());
+    let canvas = component(&host, &world, "hud");
+    let charge = element(&host, canvas, "charge");
+    let fire = element(&host, canvas, "fire");
+    host.queue_ui_events([
+        UiEvent {
+            canvas,
+            element: charge,
+            kind: UiEventKind::ValueChanged,
+            value: Some(UiValue::Number(0.75)),
+        },
+        UiEvent {
+            canvas,
+            element: fire,
+            kind: UiEventKind::Click,
+            value: None,
+        },
+    ]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert_eq!(
+        host.ui().value(element(&host, canvas, "progress")).unwrap(),
+        Some(UiValue::Number(0.75))
+    );
+    assert_eq!(
+        host.ui().text(element(&host, canvas, "status")).unwrap(),
+        "Charge: 75%"
+    );
+    assert!(
+        messages(&mut host)
+            .iter()
+            .any(|m| m == "HUD: fire button clicked")
+    );
+}

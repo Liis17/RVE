@@ -1,11 +1,41 @@
-# Демо-HUD: заголовок в левом верхнем углу и кнопка в правом нижнем.
+# Небольшой HUD: статус и контролы закреплены в левом верхнем углу, кнопка — справа снизу.
 [canvas]
 layer = 0
+
+[[elements]]
+id = "hud_panel"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [12.0, 12.0], offset_max = [364.0, 260.0] }
+panel = { color = [18, 24, 34, 220], corner_radius = 10.0, border_width = 1.0, border_color = [82, 102, 128, 230] }
 
 [[elements]]
 id = "title"
 rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 24.0], offset_max = [384.0, 72.0] }
 text = { string = "RVE Demo", size = 28.0, color = [255, 255, 255, 255] }
+
+[[elements]]
+id = "status"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 82.0], offset_max = [340.0, 108.0] }
+text = { string = "Charge: 35%", size = 15.0, color = [200, 218, 242, 255] }
+
+[[elements]]
+id = "charge"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 116.0], offset_max = [340.0, 146.0] }
+slider = { min = 0.0, max = 1.0, value = 0.35, track_color = [54, 66, 82, 255], fill_color = [62, 160, 244, 255], handle_color = [235, 246, 255, 255] }
+
+[[elements]]
+id = "progress"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 154.0], offset_max = [340.0, 166.0] }
+progress_bar = { value = 0.35, background_color = [48, 55, 68, 255], fill_color = [78, 195, 138, 255] }
+
+[[elements]]
+id = "name_bg"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 180.0], offset_max = [340.0, 220.0] }
+panel = { color = [36, 44, 56, 255], corner_radius = 5.0 }
+
+[[elements]]
+id = "name"
+rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], offset_min = [24.0, 180.0], offset_max = [340.0, 220.0] }
+input_field = { text = "", placeholder = "Player name", max_length = 24, size = 16.0, color = [255, 255, 255, 255], placeholder_color = [155, 169, 187, 255] }
 
 [[elements]]
 id = "fire"

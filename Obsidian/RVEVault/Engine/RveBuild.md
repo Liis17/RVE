@@ -275,3 +275,7 @@ MoltenVK (Apache-2.0).
 `RUSTC_BOOTSTRAP=1` и gated `gnu-lld`; при обновлении Rust нужна повторная smoke-проверка,
 в том числе зависимостей с proc-macro и build.rs. Сторонние native зависимости могут
 требовать дополнительных инструментов.
+
+## UI assets
+
+`.rveui`-документы и указанные ими PNG/TTF/OTF assets являются обычными объявленными ресурсами проекта: release pak собирает их из manifest-списков assets/scenes так же, как остальные ресурсы. Игровой UI формат описан в [[Engine/EngineGui]].

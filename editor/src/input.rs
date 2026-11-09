@@ -1,7 +1,45 @@
 //! Перевод ввода окна в ввод скриптов Play-режима.
 
+use engine_gui::input::TextInputEvent;
 use engine_script as script;
 use engine_window as window;
+
+/// Text-edit events for the game UI. The editor only forwards them while Game owns keyboard focus.
+pub fn ui_text_events(events: &[egui::Event], accepting: bool) -> Vec<TextInputEvent> {
+    if !accepting {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            egui::Event::Text(text) if !text.is_empty() => {
+                // egui integrations may expose a committed IME string through both event forms.
+                let duplicated_commit = events.get(index + 1).is_some_and(|next| matches!(next, egui::Event::Ime(egui::ImeEvent::Commit(commit)) if commit == text))
+                    || (index > 0 && matches!(&events[index - 1], egui::Event::Ime(egui::ImeEvent::Commit(commit)) if commit == text));
+                if !duplicated_commit {
+                    out.push(TextInputEvent::Text(text.clone()));
+                }
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
+                out.push(TextInputEvent::Text(text.clone()));
+            }
+            egui::Event::Key {
+                key, pressed: true, ..
+            } => match key {
+                egui::Key::Backspace => out.push(TextInputEvent::Backspace),
+                egui::Key::Delete => out.push(TextInputEvent::Delete),
+                egui::Key::ArrowLeft => out.push(TextInputEvent::Left),
+                egui::Key::ArrowRight => out.push(TextInputEvent::Right),
+                egui::Key::Home => out.push(TextInputEvent::Home),
+                egui::Key::End => out.push(TextInputEvent::End),
+                egui::Key::Enter => out.push(TextInputEvent::Enter),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    out
+}
 
 macro_rules! map_enum {
     ($function:ident, $window:ty, $script:ty, [$($variant:ident),* $(,)?]) => {
@@ -114,5 +152,28 @@ mod tests {
     fn mouse_buttons_map_to_the_same_abi_code() {
         assert_eq!(map_mouse_button(window::MouseButton::Left) as u32, 0);
         assert_eq!(map_mouse_button(window::MouseButton::Forward) as u32, 4);
+    }
+
+    #[test]
+    fn game_text_events_are_focus_gated_and_ime_commit_is_not_duplicated() {
+        let events = vec![
+            egui::Event::Text("é".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit("é".into())),
+            egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        assert!(ui_text_events(&events, false).is_empty());
+        assert_eq!(
+            ui_text_events(&events, true),
+            [
+                engine_gui::input::TextInputEvent::Text("é".into()),
+                engine_gui::input::TextInputEvent::Backspace,
+            ]
+        );
     }
 }

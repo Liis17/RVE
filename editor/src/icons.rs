@@ -52,6 +52,7 @@ pub fn component_icon(kind: ComponentKind) -> Option<&'static str> {
         ComponentKind::AudioSource => Some("audio-component"),
         ComponentKind::NetworkIdentity => Some("network-identity"),
         ComponentKind::NetworkTransform => Some("network-transform"),
+        ComponentKind::UiCanvas => None,
         _ => None,
     }
 }
@@ -237,6 +238,7 @@ mod tests {
             ComponentKind::AudioSource,
             ComponentKind::NetworkIdentity,
             ComponentKind::NetworkTransform,
+            ComponentKind::UiCanvas,
         ];
         let icons = components
             .into_iter()

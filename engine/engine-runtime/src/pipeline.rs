@@ -3,7 +3,7 @@ use crate::console::ConsoleUiSlot;
 #[cfg(feature = "dev-console")]
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::cursor::CursorControl;
-use crate::game_ui::{GameUi, PreparedUi, UiInputBridge, UiRegistry, empty_paint};
+use crate::game_ui::{GameUi, PreparedUi, UiInputBridge, UiRegistry, UiTick, empty_paint};
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use crate::net::{self, NetworkSession, ScriptNetwork};
@@ -601,16 +601,19 @@ impl RenderBackend for VulkanBackend {
         let token = prefab.token.clone();
         if let Err(error) =
             self.game_ui
-                .attach_prefab(&mut self.renderer, &token, &prefab.cpu.ui.images)
+                .attach(&mut self.renderer, token.clone(), &prefab.cpu.ui.images)
         {
-            return Some(PrefabReply::Failed { token, error });
+            return Some(PrefabReply::Failed {
+                token,
+                error: error.to_string(),
+            });
         }
         let particles = std::mem::take(&mut prefab.particles);
         let created =
             match create_prefab_particles(&mut self.renderer, &prefab.textures, &particles) {
                 Ok(created) => created,
                 Err(error) => {
-                    self.game_ui.detach_prefab(&mut self.renderer, &token);
+                    self.game_ui.detach(&mut self.renderer, &token);
                     return Some(PrefabReply::Failed {
                         token,
                         error: error.to_string(),
@@ -620,7 +623,7 @@ impl RenderBackend for VulkanBackend {
         let reply = self.prefabs.submit(prefab);
         if reply.is_some() {
             release_prefab_particles(&mut self.renderer, created.textures);
-            self.game_ui.detach_prefab(&mut self.renderer, &token);
+            self.game_ui.detach(&mut self.renderer, &token);
         } else {
             self.prefab_particles.insert(token, created);
         }
@@ -637,7 +640,7 @@ impl RenderBackend for VulkanBackend {
                     }
                 }
                 PrefabReply::Failed { token, .. } => {
-                    self.game_ui.detach_prefab(&mut self.renderer, token);
+                    self.game_ui.detach(&mut self.renderer, token);
                     if let Some(entry) = self.prefab_particles.remove(token) {
                         release_prefab_particles(&mut self.renderer, entry.textures);
                     }
@@ -653,7 +656,7 @@ impl RenderBackend for VulkanBackend {
 
     fn release_prefab(&mut self, token: &PrefabToken) {
         self.prefabs.release(&mut self.renderer, token);
-        self.game_ui.detach_prefab(&mut self.renderer, token);
+        self.game_ui.detach(&mut self.renderer, token);
         if let Some(entry) = self.prefab_particles.remove(token) {
             release_prefab_particles(&mut self.renderer, entry.textures);
         }
@@ -704,7 +707,7 @@ impl RenderBackend for VulkanBackend {
             .collect();
         let joint_palettes = palette_refs(snapshot);
         self.game_ui
-            .sync_atlas(&mut self.renderer, &snapshot.ui.atlas)
+            .sync(&mut self.renderer, &snapshot.ui)
             .map_err(|error| error.to_string())?;
         let ui_primitives = self.game_ui.primitives(&snapshot.ui);
         let frame = Frame {
@@ -828,7 +831,7 @@ impl RenderBackend for VulkanBackend {
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let joint_palettes = palette_refs(snapshot);
         self.game_ui
-            .sync_atlas(&mut self.renderer, &snapshot.ui.atlas)
+            .sync(&mut self.renderer, &snapshot.ui)
             .map_err(|error| error.to_string())?;
         let game_ui = self.game_ui.primitives(&snapshot.ui);
         let scene = Frame {
@@ -1390,12 +1393,16 @@ fn scripts_thread(
             gamepads.stop_rumble();
         }
         let ui_started = Instant::now();
+        let pointer = Some(input_frame.cursor());
         let input_frame = ui_input.tick(
             &mut scripts,
             input_frame,
-            accepting_input,
-            text,
-            screen,
+            UiTick {
+                accepting: accepting_input,
+                pointer,
+                screen_px: screen,
+                text,
+            },
             time.elapsed,
         );
         timings.record(script_phase::LOOP, script_phase::UI, ui_started.elapsed());

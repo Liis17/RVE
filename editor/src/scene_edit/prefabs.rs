@@ -533,6 +533,9 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.network_transform.is_some() {
         base.network_transform = outer.network_transform;
     }
+    if outer.ui_canvas.is_some() {
+        base.ui_canvas = outer.ui_canvas.clone();
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -572,6 +575,7 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.particle_emitter.is_none()
         && change.network_identity.is_none()
         && change.network_transform.is_none()
+        && change.ui_canvas.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -697,6 +701,11 @@ pub(crate) fn object_override(
     match (base.network_transform, edited.network_transform) {
         (None, None) => {}
         (Some(from), Some(to)) => change.network_transform = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.ui_canvas, &edited.ui_canvas) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.ui_canvas = (to != from).then(|| to.clone()),
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -848,6 +857,7 @@ pub enum OverrideField {
     ParticleEmitter,
     NetworkIdentity,
     NetworkTransform,
+    UiCanvas,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -883,6 +893,7 @@ impl EditorScene {
             OverrideField::ParticleEmitter => change.particle_emitter.is_some(),
             OverrideField::NetworkIdentity => change.network_identity.is_some(),
             OverrideField::NetworkTransform => change.network_transform.is_some(),
+            OverrideField::UiCanvas => change.ui_canvas.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -930,6 +941,7 @@ impl EditorScene {
                     OverrideField::ParticleEmitter => change.particle_emitter = None,
                     OverrideField::NetworkIdentity => change.network_identity = None,
                     OverrideField::NetworkTransform => change.network_transform = None,
+                    OverrideField::UiCanvas => change.ui_canvas = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }

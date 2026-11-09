@@ -181,3 +181,7 @@ Parent: [[Index]]
 - Atomic-free кольцевой пул с CPU-учётом слотов: naga 30 GLSL frontend не поддерживает atomics. Живые частицы не перезаписываются: слот освобождается, когда его batch гарантированно умер (`retire_time = конец шага + max lifetime`). Draw range — непрерывный кольцевой отрезок, поэтому instance count известен без readback.
 - GLSL `barrier()` в naga лоуэрится с subgroup-барьером, который валидируется только при subgroup-capabilities. `build.rs` снимает бит `SUB_GROUP` до валидации. Раньше барьеров в шейдерах не было, поэтому обход не затрагивает существующие проходы.
 - Шейдеры остаются GLSL → naga в `build.rs` (проектное решение «без Vulkan SDK»). Частицы используют `DEPTH_STENCIL_READ_ONLY_OPTIMAL`, а не `DEPTH_READ_ONLY_OPTIMAL`, потому что `separateDepthStencilLayouts` не включён.
+
+## Игровой UI
+
+`Frame.ui` принимает готовые `UiPrimitive` с UI-текстурами и рисует их внутри output pass данного вида после scene/post-process output. Путь не зависит от egui; runtime готовит игровые UI primitives в `engine-ui::game`, editor/developer UI использует отдельный адаптер egui. Полный поток — [[Engine/EngineGui]]. UI не проходит через HDR scene target и temporal processing.

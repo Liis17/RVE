@@ -30,7 +30,9 @@ pub trait UiAssetSource {
 }
 
 pub fn is_ui_document(path: &VirtualPath) -> bool {
-    path.as_str().ends_with(".rveui")
+    path.as_str()
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("rveui"))
 }
 
 /// Загружает документы из путей и все их ассеты. Ошибка разбора, отсутствующий или нечитаемый
@@ -97,25 +99,28 @@ impl UiRegistry {
     /// Регистрирует документы для `open` и канвасов компонентов, шрифты и размеры картинок.
     pub fn register(&mut self, scripts: &mut ScriptHost, ui: &PreparedUi) -> Result<(), String> {
         for (path, document) in &ui.documents {
-            if self.documents.insert(path.clone()) {
-                let path = VirtualPath::parse(path)
+            if !self.documents.contains(path) {
+                let parsed = VirtualPath::parse(path)
                     .map_err(|error| format!("UI-документ {path}: {error}"))?;
-                scripts.register_ui_document(path, Arc::clone(document));
+                scripts.register_ui_document(parsed, Arc::clone(document));
+                self.documents.insert(path.clone());
             }
         }
         let mut system = scripts.ui_mut();
         for (path, bytes) in &ui.fonts {
-            if self.fonts.insert(path.clone()) {
+            if !self.fonts.contains(path) {
                 system
                     .register_font(path, bytes.to_vec())
                     .map_err(|error| error.to_string())?;
+                self.fonts.insert(path.clone());
             }
         }
         for (path, image) in &ui.images {
-            if self.images.insert(path.clone()) {
+            if !self.images.contains(path) {
                 system
                     .register_image(path, image.size)
                     .map_err(|error| error.to_string())?;
+                self.images.insert(path.clone());
             }
         }
         Ok(())
@@ -209,5 +214,53 @@ mod tests {
         };
         let error = load_ui(&source, [&path("ui/panel.rveui")]).unwrap_err();
         assert!(error.contains("/ui/icon.png"), "{error}");
+    }
+    #[test]
+    fn document_extension_matches_scene_validation_case_insensitively() {
+        let mut source = Memory::default();
+        source.texts.insert("/ui/HUD.RVEUI".into(), HUD.into());
+        let ui = load_ui(&source, [&path("ui/HUD.RVEUI")]).unwrap();
+        assert_eq!(ui.documents.len(), 1);
+        assert!(ui.documents.contains_key("ui/HUD.RVEUI"));
+    }
+    #[test]
+    fn failed_registration_is_retried_until_the_asset_is_repaired() {
+        let doc = engine_scene::SceneDocument::parse(
+            "scene",
+            "[[objects]]\nid=\"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let world = engine_scene::World::from_document(&doc).unwrap();
+        let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), None).unwrap();
+        let mut registry = UiRegistry::default();
+        let mut prepared = PreparedUi::default();
+        prepared.images.insert(
+            "ui/icon.png".into(),
+            Arc::new(UiImageData {
+                size: [0, 0],
+                rgba: Vec::new(),
+            }),
+        );
+        assert!(registry.register(&mut host, &prepared).is_err());
+        assert!(
+            registry.register(&mut host, &prepared).is_err(),
+            "failed image must not be marked registered"
+        );
+        prepared.images.insert(
+            "ui/icon.png".into(),
+            Arc::new(UiImageData {
+                size: [1, 1],
+                rgba: vec![255; 4],
+            }),
+        );
+        registry.register(&mut host, &prepared).unwrap();
+        prepared
+            .fonts
+            .insert("ui/font.ttf".into(), Arc::new(vec![0; 8]));
+        assert!(registry.register(&mut host, &prepared).is_err());
+        assert!(
+            registry.register(&mut host, &prepared).is_err(),
+            "failed font must not be marked registered"
+        );
     }
 }

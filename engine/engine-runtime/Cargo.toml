@@ -8,7 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [features]
-dev-console = ["dep:egui", "dep:egui-winit", "dep:engine-ui", "dep:winit"]
+dev-console = ["dep:egui", "dep:egui-winit", "dep:winit", "engine-ui/egui"]
 dlss = ["engine-render/dlss"]
 
 [dependencies]
@@ -18,7 +18,7 @@ engine-input = { path = "../engine-input" }
 egui = { workspace = true, optional = true }
 egui-winit = { workspace = true, optional = true }
 engine-assets = { path = "../engine-assets" }
-engine-ui = { path = "../engine-ui", optional = true }
+engine-ui = { path = "../engine-ui", default-features = false }
 engine-files = { path = "../engine-files" }
 engine-gui = { path = "../engine-gui" }
 engine-audio = { path = "../engine-audio" }

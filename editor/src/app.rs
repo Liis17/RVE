@@ -27,6 +27,7 @@ use engine_render::{
 };
 use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
+use engine_script::UiTick;
 use engine_ui::console::ConsoleOverlay;
 use engine_ui::render::{ConvertedMesh, UiBridge};
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler, WindowProxy};
@@ -88,6 +89,7 @@ pub struct EditorApp {
 struct GpuState {
     renderer: Renderer,
     scene: SceneRenderer,
+    game_ui: engine_ui::game::GameUi<String>,
 }
 
 impl EditorApp {
@@ -343,6 +345,9 @@ impl EditorApp {
     }
 
     fn apply_asset_changes(&mut self, changes: AssetChanges) {
+        if let (Some(editor), Some(project)) = (&mut self.state.ui_document, &self.state.project) {
+            editor.refresh_external(project, &changes);
+        }
         if changes.tree_changed || changes.rescan {
             self.refresh_tree_only();
         }
@@ -850,6 +855,14 @@ impl EditorApp {
     }
 
     fn save(&mut self, choose_path: bool) -> bool {
+        if let Err(error) = self.state.save_project_prefabs() {
+            self.state.log.error(error);
+            return false;
+        }
+        if self.state.scene.is_none() {
+            self.state.log.info("Сохранено");
+            return true;
+        }
         let existing = self
             .state
             .scene
@@ -969,7 +982,7 @@ impl EditorApp {
             scene.instanced_prefabs(),
             &heavy,
         );
-        let prefabs = prefabs.with_resources(project.resource_handle());
+        let mut prefabs = prefabs.with_resources(project.resource_handle());
         let needs_library = prefabs.has_heavy_scripts()
             || scene
                 .view()
@@ -1008,11 +1021,14 @@ impl EditorApp {
         let network_summary = network.as_ref().map(|plan| plan.summary.clone());
         let tuning = gamepad_tuning(&project.settings.input.gamepad);
         editor_gamepads(&mut self.state.gamepads, tuning).begin_session(tuning);
+        let mut ui_images = None;
         let result: Result<PlaySession, String> = (|| {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
             project.apply_physics_materials(&mut world)?;
+            prefabs.prepare_ui(&world, &project.assets)?;
+            ui_images = Some(prefabs.ui_images().clone());
             let model_geometry =
                 PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
             let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
@@ -1038,6 +1054,16 @@ impl EditorApp {
         })();
         match result {
             Ok(session) => {
+                if let (Some(gpu), Some(images)) = (&mut self.gpu, ui_images.as_ref())
+                    && let Err(error) =
+                        gpu.game_ui
+                            .attach(&mut gpu.renderer, "play:base".to_owned(), images)
+                {
+                    self.state
+                        .log
+                        .error(format!("не удалось загрузить игровой UI: {error}"));
+                    return;
+                }
                 self.state.enter_play(session);
                 self.state.play_cursor.reset();
                 play_cursor::focus_game_tab(&mut self.dock);
@@ -1074,6 +1100,9 @@ impl EditorApp {
     fn stop_play(&mut self) {
         self.state.pending_play = false;
         if let Some(session) = self.state.play.take() {
+            if let Some(gpu) = &mut self.gpu {
+                gpu.game_ui.release_all(&mut gpu.renderer);
+            }
             self.state.end_play_gamepads();
             let events = session.stop();
             self.state.log.push_script_events(events);
@@ -1251,6 +1280,7 @@ impl EditorApp {
         if cfg!(target_os = "macos") {
             crate::gestures::remap_control_click(&mut raw_input.events, &mut self.control_click);
         }
+        let egui_events = raw_input.events.clone();
         let console_lines = if self.state.console_open {
             snapshot_console_lines(&self.state)
         } else {
@@ -1306,13 +1336,47 @@ impl EditorApp {
         if let Some(latency) = self.latency.as_ref() {
             latency.marker(frame_id, LatencyMarker::InputSample);
         }
-        let pads_accepted = self.window_focused && !self.state.console_open;
+        let game_focused = self
+            .dock
+            .find_active_focused()
+            .is_some_and(|(_, tab)| *tab == Tab::Game);
+        let egui_text_focused = self.egui_ctx.egui_wants_keyboard_input();
+        let ui_accepting = self.window_focused
+            && game_focused
+            && !self.state.console_open
+            && self
+                .state
+                .play
+                .as_ref()
+                .is_some_and(|play| !play.is_paused());
+        let text_accepting = ui_accepting && !egui_text_focused;
+        let pointer = self
+            .egui_ctx
+            .input(|input| input.pointer.hover_pos())
+            .and_then(|pos| {
+                game_view_pointer(&self.state.game_view, pos, self.egui_ctx.pixels_per_point())
+            });
+        let text = crate::input::ui_text_events(&egui_events, text_accepting);
+        let ui_tick = UiTick {
+            accepting: ui_accepting,
+            pointer,
+            screen_px: self.state.game_view.size,
+            text,
+        };
+        let pads_accepted = ui_accepting;
         let play_error = self.state.play.as_mut().and_then(|play| {
             if let Some(gamepads) = self.state.gamepads.as_mut() {
                 play.poll_gamepads(gamepads, pads_accepted);
             }
+            play.update_ui_input(ui_tick);
             play.tick().err()
         });
+        let game_ime = self
+            .state
+            .play
+            .as_ref()
+            .is_some_and(|play| ui_accepting && play.ui_text_focused());
+        window.set_ime_allowed(egui_state.allow_ime() || game_ime);
         if play_error.is_none()
             && let Some(play) = self.state.play.as_ref()
             && !play.is_paused()
@@ -1322,6 +1386,7 @@ impl EditorApp {
         if let Some(error) = play_error {
             self.state.log.error(error);
             if let Some(session) = self.state.play.take() {
+                gpu.game_ui.release_all(&mut gpu.renderer);
                 self.state.end_play_gamepads();
                 self.state.log.push_script_events(session.stop());
                 self.state.log.info("Stop");
@@ -1337,6 +1402,14 @@ impl EditorApp {
                 self.state.log.push(LogLevel::Warn, warning);
             }
         }
+        if let Some(play) = &mut self.state.play {
+            for owner in play.drain_ui_detach() {
+                gpu.game_ui.detach(&mut gpu.renderer, &owner);
+            }
+            for (owner, images) in play.drain_ui_images() {
+                gpu.game_ui.attach(&mut gpu.renderer, owner, &images)?;
+            }
+        }
 
         // Камера могла сместиться к новой модели: гизмо и маркеры нужно перестроить.
         // Пока модель загружается, кадр запросит готовность загрузки, а не этот флаг.
@@ -1345,7 +1418,27 @@ impl EditorApp {
             latency.marker(frame_id, LatencyMarker::SimulationEnd);
         }
         gpu.renderer.set_latency_frame(frame_id);
-        let status = render_scene_frame(gpu, &mut self.state, &ui_primitives)?;
+        let game_paint = self
+            .state
+            .play
+            .as_mut()
+            .map(PlaySession::ui_paint)
+            .unwrap_or_else(|| engine_gui::paint::UiPaint {
+                draw_list: Arc::default(),
+                atlas: Arc::default(),
+            });
+        gpu.game_ui.sync(&mut gpu.renderer, &game_paint)?;
+        let game_ui_primitives = gpu.game_ui.primitives(&game_paint);
+        let GpuState {
+            renderer, scene, ..
+        } = gpu;
+        let status = render_scene_frame(
+            renderer,
+            scene,
+            &mut self.state,
+            &ui_primitives,
+            &game_ui_primitives,
+        )?;
         let framing = framing && self.state.pending_frame.is_none();
 
         self.bridge
@@ -1486,15 +1579,15 @@ fn editor_log_buffer() -> Arc<Mutex<ConsoleBuffer>> {
 /// синхронизирует экземпляры скиннинга. В режиме редактирования мост ведёт превью выбранного
 /// объекта: оно не меняет документ и не запускает скрипты.
 fn sync_animation_frame(
-    gpu: &mut GpuState,
+    renderer: &mut Renderer,
+    scene: &mut SceneRenderer,
     parts: &mut crate::state::FrameParts<'_>,
     playing: bool,
 ) -> Result<(), RenderError> {
     if playing {
-        gpu.scene.sync_skins(&mut gpu.renderer, parts.world)?;
+        scene.sync_skins(renderer, parts.world)?;
         let mut warnings = Vec::new();
-        gpu.scene
-            .report_palette_mismatches(parts.animation, &mut warnings);
+        scene.report_palette_mismatches(parts.animation, &mut warnings);
         for warning in warnings {
             parts.log.push(LogLevel::Warn, warning);
         }
@@ -1512,8 +1605,8 @@ fn sync_animation_frame(
         });
     let mut warnings = Vec::new();
     let preview = object.map(|handle| (handle, &mut *parts.animation_preview));
-    gpu.scene.sync_animation(
-        &mut gpu.renderer,
+    scene.sync_animation(
+        renderer,
         &parts.project.assets,
         &*parts.models,
         &*parts.world,
@@ -1526,7 +1619,7 @@ fn sync_animation_frame(
     *parts.animation_status = match object {
         Some(handle) => {
             let motion = parts.animation_preview.motion.as_deref();
-            let mut status = gpu.scene.preview_status(handle, motion);
+            let mut status = scene.preview_status(handle, motion);
             status.object = parts.selected.map(str::to_owned);
             status
         }
@@ -1537,9 +1630,11 @@ fn sync_animation_frame(
 
 /// Кадр с видимыми панелями Scene и Game. Без мира сцены рисуется только интерфейс.
 fn render_scene_frame(
-    gpu: &mut GpuState,
+    renderer: &mut Renderer,
+    scene: &mut SceneRenderer,
     state: &mut EditorState,
     ui: &[UiPrimitive<'_>],
+    game_ui: &[UiPrimitive<'_>],
 ) -> Result<FrameStatus, RenderError> {
     let drawable = |view: crate::state::SceneViewInfo| {
         (view.visible && view.size[0] > 0 && view.size[1] > 0).then_some(view.size)
@@ -1549,7 +1644,7 @@ fn render_scene_frame(
     let scene_debug_view = state.scene_view.debug_view;
     let game_debug_view = state.game_view.debug_view;
     if scene_size.is_none() && game_size.is_none() {
-        return render_ui_only(&mut gpu.renderer, ui, &[]);
+        return render_ui_only(renderer, ui, &[]);
     }
     let playing = state.is_playing();
     let game_camera_id = state.game_camera.clone();
@@ -1570,17 +1665,17 @@ fn render_scene_frame(
         frame_target,
     ) = {
         let Some(mut parts) = state.frame_parts() else {
-            return render_ui_only(&mut gpu.renderer, ui, &[]);
+            return render_ui_only(renderer, ui, &[]);
         };
-        gpu.scene.sync_assets(
-            &mut gpu.renderer,
+        scene.sync_assets(
+            renderer,
             parts.project,
             parts.world,
             parts.models,
             parts.loader,
             parts.log,
         )?;
-        sync_animation_frame(gpu, &mut parts, playing)?;
+        sync_animation_frame(renderer, scene, &mut parts, playing)?;
         let (scene_frame, warnings) = parts.world.build_frame();
         for warning in warnings {
             parts.log.push(
@@ -1657,12 +1752,12 @@ fn render_scene_frame(
         engine_scene::PostProcessSettings::default()
     };
     let Some(parts) = state.frame_parts() else {
-        return render_ui_only(&mut gpu.renderer, ui, &[]);
+        return render_ui_only(renderer, ui, &[]);
     };
     let (local_lights, local_light_shadows) = render_local_lights(&scene_frame.local_lights);
-    gpu.scene.begin_motion_frame(game_camera_handle, playing);
-    gpu.scene.build_draws(
-        &mut gpu.renderer,
+    scene.begin_motion_frame(game_camera_handle, playing);
+    scene.build_draws(
+        renderer,
         parts.world,
         &scene_frame,
         scene_camera.position,
@@ -1670,11 +1765,7 @@ fn render_scene_frame(
         grid_camera_distance,
         parts.animation,
     )?;
-    gpu.scene.sync_environment(
-        &mut gpu.renderer,
-        scene_frame.environment.as_ref(),
-        parts.log,
-    )?;
+    scene.sync_environment(renderer, scene_frame.environment.as_ref(), parts.log)?;
     let scene_shadow_cascades = scene_size.map_or_else(Vec::new, |[width, height]| {
         SceneRenderer::shadow_cascades(scene_camera, width, height, &scene_frame.light, has_light)
     });
@@ -1682,16 +1773,14 @@ fn render_scene_frame(
         SceneRenderer::shadow_cascades(game_camera, width, height, &scene_frame.light, has_light)
     });
     if let Some([width, height]) = scene_size {
-        gpu.renderer
-            .resize_viewport(gpu.scene.viewport, width, height)?;
+        renderer.resize_viewport(scene.viewport, width, height)?;
     }
     if let Some([width, height]) = game_size {
-        gpu.renderer
-            .resize_viewport(gpu.scene.game_viewport, width, height)?;
+        renderer.resize_viewport(scene.game_viewport, width, height)?;
     }
-    let joint_palettes = gpu.scene.joint_palette_refs(parts.animation);
+    let joint_palettes = scene.joint_palette_refs(parts.animation);
     let scene_view = scene_size.map(|[width, height]| {
-        gpu.scene.frame(
+        scene.frame(
             scene_camera,
             width,
             height,
@@ -1708,8 +1797,8 @@ fn render_scene_frame(
             scene_debug_view,
         )
     });
-    let game_view = game_size.map(|[width, height]| {
-        gpu.scene.frame(
+    let mut game_view = game_size.map(|[width, height]| {
+        scene.frame(
             game_camera,
             width,
             height,
@@ -1726,28 +1815,29 @@ fn render_scene_frame(
             game_debug_view,
         )
     });
+    if let Some(frame) = &mut game_view {
+        frame.ui = game_ui;
+    }
     let mut scenes = Vec::with_capacity(2);
     if let Some(frame) = &scene_view {
-        scenes.push((gpu.scene.viewport, frame));
+        scenes.push((scene.viewport, frame));
     }
     if let Some(frame) = &game_view {
-        scenes.push((gpu.scene.game_viewport, frame));
+        scenes.push((scene.game_viewport, frame));
     }
     let drawn = scenes
         .iter()
         .map(|(viewport, _)| *viewport)
         .collect::<Vec<_>>();
     let primitives = visible_primitives(ui, &drawn);
-    let result = gpu
-        .renderer
-        .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR);
+    let result = renderer.render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR);
     if result.is_ok() {
-        gpu.scene.commit_motion_history();
+        scene.commit_motion_history();
     }
-    if let Some(profile) = gpu.renderer.take_frame_profile() {
+    if let Some(profile) = renderer.take_frame_profile() {
         state
             .profile
-            .record_frame(&profile, gpu.scene.viewport, gpu.scene.game_viewport);
+            .record_frame(&profile, scene.viewport, scene.game_viewport);
     }
     if let Some(project) = state.project.as_ref() {
         state
@@ -1770,6 +1860,21 @@ fn visible_primitives<'a>(
         })
         .copied()
         .collect()
+}
+
+fn game_view_pointer(
+    view: &crate::state::SceneViewInfo,
+    pointer: egui::Pos2,
+    pixels_per_point: f32,
+) -> Option<[f32; 2]> {
+    let rect = view.rect?;
+    if !rect.contains(pointer) {
+        return None;
+    }
+    Some([
+        ((pointer.x - rect.min.x) * pixels_per_point).clamp(0.0, view.size[0] as f32),
+        ((pointer.y - rect.min.y) * pixels_per_point).clamp(0.0, view.size[1] as f32),
+    ])
 }
 
 /// Кадр без сцены.
@@ -1828,7 +1933,11 @@ impl WindowHandler for EditorApp {
             Some(renderer.max_texture_size() as usize),
         ));
         self.latency = renderer.latency_handle();
-        self.gpu = Some(GpuState { renderer, scene });
+        self.gpu = Some(GpuState {
+            renderer,
+            scene,
+            game_ui: engine_ui::game::GameUi::default(),
+        });
         self.window = Some(Arc::clone(&window));
         self.state
             .log
@@ -2013,6 +2122,9 @@ impl WindowHandler for EditorApp {
                 LogLevel::Warn,
                 format!("освобождение скиннинга при закрытии: {error}"),
             );
+        }
+        if let Some(gpu) = &mut self.gpu {
+            gpu.game_ui.release_all(&mut gpu.renderer);
         }
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;

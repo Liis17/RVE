@@ -14,6 +14,7 @@ Obsidian/RVEVault/Engine/EngineProject.md — Форматы bootstrap.rves и p
 Obsidian/RVEVault/Engine/EngineWindow.md — Окно и цикл событий
 Obsidian/RVEVault/Engine/EnginePlatform.md — Платформенные адаптеры Windows/macOS
 Obsidian/RVEVault/Engine/EngineRender.md — Vulkan renderer
+Obsidian/RVEVault/Engine/EngineGui.md — Игровой overlay UI: документы, layout, ввод, paint и интеграции
 Obsidian/RVEVault/Engine/EngineScene.md — Формат .rvescene, runtime-мир, камеры, трансформации и свет
 Obsidian/RVEVault/Engine/EngineFiles.md — Канонические пути и позиционное чтение
 Obsidian/RVEVault/Engine/EnginePak.md — RVEPAK, builder и реестр архивов
@@ -59,12 +60,14 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
   потребителях engine-runtime/rve-player и rve-build, если они используют
   изменённый крейт. Прямые workspace-зависимости:
   - engine-runtime: engine-animation, engine-assets, engine-files, engine-audio,
-    engine-neural, engine-network, engine-input, engine-physics, engine-platform,
+    engine-neural, engine-network, engine-input, engine-gui, engine-physics, engine-platform,
     engine-project, engine-render, engine-resources, engine-scene,
     engine-script, engine-window, engine-console, engine-ui.
   - rve-build: engine-assets, engine-files, engine-pak, engine-project,
-    engine-resources, engine-scene, engine-script, rve-sdk.
-  - engine-script (потребители engine-runtime и rve-editor): engine-console, engine-files, engine-physics, engine-scene, rve-sdk.
+    engine-resources, engine-scene, engine-script, engine-gui, rve-sdk.
+  - engine-script (потребители engine-runtime и rve-editor): engine-console, engine-files, engine-gui, engine-physics, engine-scene, rve-sdk.
+  - engine-gui (потребители engine-script, engine-ui, engine-runtime, rve-editor и rve-build): engine-files, epaint, serde, toml, skrifa.
+  - engine-ui (потребители engine-runtime и rve-editor): engine-gui, engine-render, engine-core, engine-console; egui-мост включается feature `egui`.
   - engine-audio (потребители engine-runtime и rve-editor): engine-resources, engine-scene, cpal, lewton, flume, rtrb, log.
   - engine-animation (потребители engine-runtime и rve-editor): engine-assets, engine-files, engine-scene, glam.
   - engine-network (потребители engine-runtime и rve-editor): engine-scene, blake3, chacha20poly1305, ed25519-dalek,
@@ -72,7 +75,7 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
   - engine-input (потребители engine-runtime и rve-editor): gilrs, log, rve-sdk.
   - rve-player: engine-runtime.
   - rve-server: engine-runtime (headless-путь без окна и renderer).
-  - rve-editor: engine-animation, engine-assets, engine-files, engine-input, engine-network, engine-physics, engine-project, engine-render,
+  - rve-editor: engine-animation, engine-assets, engine-files, engine-gui, engine-input, engine-network, engine-physics, engine-project, engine-render,
     engine-audio, engine-resources, engine-scene, engine-script, engine-window,
     engine-console, engine-ui.
 - При изменении engine-platform проверяй общий интерфейс, адаптеры engine-platform-windows и engine-platform-macos и вызовы из renderer.

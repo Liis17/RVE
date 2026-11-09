@@ -398,3 +398,9 @@ path = "/ui/hud.rveui"
 id = "hud"
 [objects.ui_canvas]
 document = "/ui/hud.rveui"
+
+[[objects.lite_scripts]]
+path = "/scripts/hud.lua"
+
+[[assets]]
+path = "/scripts/hud.lua"
