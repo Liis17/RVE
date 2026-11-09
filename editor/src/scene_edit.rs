@@ -91,6 +91,7 @@ pub enum ComponentKind {
     ParticleEmitter,
     NetworkIdentity,
     NetworkTransform,
+    UiCanvas,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -112,6 +113,7 @@ pub enum Component {
     ParticleEmitter(ParticleEmitterComponent),
     NetworkIdentity(NetworkIdentityComponent),
     NetworkTransform(NetworkTransformComponent),
+    UiCanvas(engine_scene::UiCanvasComponent),
 }
 
 impl Component {
@@ -133,6 +135,7 @@ impl Component {
             Self::ParticleEmitter(_) => ComponentKind::ParticleEmitter,
             Self::NetworkIdentity(_) => ComponentKind::NetworkIdentity,
             Self::NetworkTransform(_) => ComponentKind::NetworkTransform,
+            Self::UiCanvas(_) => ComponentKind::UiCanvas,
         }
     }
 
@@ -159,6 +162,7 @@ impl Component {
             }
             ComponentKind::NetworkIdentity => Self::NetworkIdentity(object.network_identity?),
             ComponentKind::NetworkTransform => Self::NetworkTransform(object.network_transform?),
+            ComponentKind::UiCanvas => Self::UiCanvas(object.ui_canvas.clone()?),
         })
     }
 
@@ -207,6 +211,7 @@ impl Component {
             ComponentKind::NetworkTransform => {
                 Self::NetworkTransform(NetworkTransformComponent::default())
             }
+            ComponentKind::UiCanvas => Self::UiCanvas(object.ui_canvas.clone()?),
         })
     }
 
@@ -232,6 +237,7 @@ impl Component {
             Self::ParticleEmitter(value) => object.particle_emitter = Some(value),
             Self::NetworkIdentity(value) => object.network_identity = Some(value),
             Self::NetworkTransform(value) => object.network_transform = Some(value),
+            Self::UiCanvas(value) => object.ui_canvas = Some(value),
         }
     }
 }
@@ -1961,6 +1967,9 @@ fn register_object_assets(
     {
         ensure_asset(document, hdr);
     }
+    if let Some(canvas) = &object.ui_canvas {
+        ensure_asset(document, &canvas.document);
+    }
     Ok(())
 }
 
@@ -2133,6 +2142,32 @@ mod tests {
 
     fn scene() -> EditorScene {
         EditorScene::new_untitled().unwrap()
+    }
+
+    #[test]
+    fn ui_canvas_component_is_undoable_and_registers_its_document() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let canvas = engine_scene::UiCanvasComponent {
+            document: path("ui/hud.rveui"),
+            visible: false,
+            layer: Some(4),
+        };
+        scene
+            .set_component(&id, Component::UiCanvas(canvas.clone()))
+            .unwrap();
+        assert_eq!(scene.object(&id).unwrap().ui_canvas, Some(canvas.clone()));
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == canvas.document)
+        );
+        assert!(scene.undo());
+        assert!(scene.object(&id).unwrap().ui_canvas.is_none());
+        assert!(scene.redo());
+        assert_eq!(scene.object(&id).unwrap().ui_canvas, Some(canvas));
     }
 
     fn path(value: &str) -> VirtualPath {

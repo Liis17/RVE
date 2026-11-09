@@ -365,6 +365,7 @@ fn runtime_component_kinds(object: &engine_scene::WorldObject) -> Vec<&'static s
             (object.particle_emitter.is_some(), "particle_emitter"),
             (object.network_identity.is_some(), "network_identity"),
             (object.network_transform.is_some(), "network_transform"),
+            (object.ui_canvas.is_some(), "ui_canvas"),
         ]
         .into_iter()
         .filter_map(|(present, name)| present.then_some(name)),
@@ -399,6 +400,7 @@ fn runtime_object_value(world: &engine_scene::World, object: &engine_scene::Worl
         "particle_emitter": object.particle_emitter,
         "network_identity": object.network_identity,
         "network_transform": object.network_transform,
+        "ui_canvas": object.ui_canvas,
         "lite_scripts": object.lite_scripts,
         "heavy_scripts": object.heavy_scripts,
     })
@@ -466,6 +468,11 @@ fn component_sample() -> SceneObject {
         particle_emitter: Some(ParticleEmitterComponent::default()),
         network_identity: Some(NetworkIdentityComponent::default()),
         network_transform: Some(NetworkTransformComponent::default()),
+        ui_canvas: Some(engine_scene::UiCanvasComponent {
+            document: virtual_path("ui/example.rveui"),
+            visible: true,
+            layer: None,
+        }),
         ..SceneObject::default()
     }
 }
@@ -477,7 +484,7 @@ fn component_kinds(object: &SceneObject) -> Vec<&'static str> {
         .collect()
 }
 
-fn component_kind_list() -> [(ComponentKind, &'static str); 16] {
+fn component_kind_list() -> [(ComponentKind, &'static str); 17] {
     [
         (ComponentKind::Transform, "transform"),
         (ComponentKind::Camera, "camera"),
@@ -495,6 +502,7 @@ fn component_kind_list() -> [(ComponentKind, &'static str); 16] {
         (ComponentKind::ParticleEmitter, "particle_emitter"),
         (ComponentKind::NetworkIdentity, "network_identity"),
         (ComponentKind::NetworkTransform, "network_transform"),
+        (ComponentKind::UiCanvas, "ui_canvas"),
     ]
 }
 
@@ -516,6 +524,7 @@ pub(super) fn component_value(component: Component) -> Result<Value, String> {
         Component::ParticleEmitter(value) => serde_json::to_value(value),
         Component::NetworkIdentity(value) => serde_json::to_value(value),
         Component::NetworkTransform(value) => serde_json::to_value(value),
+        Component::UiCanvas(value) => serde_json::to_value(value),
     }
     .map_err(|error| error.to_string())
 }
@@ -716,6 +725,7 @@ fn asset_kind_name(kind: AssetKind) -> &'static str {
         AssetKind::Audio => "audio",
         AssetKind::Script => "script",
         AssetKind::Other => "other",
+        AssetKind::Ui => "ui",
     }
 }
 
@@ -945,7 +955,7 @@ mod tests {
         assert_eq!(component["value"]["active"], false);
 
         let described = call("describe_components", &json!({}), &mut state, permissions).unwrap();
-        assert_eq!(described["components"].as_array().unwrap().len(), 16);
+        assert_eq!(described["components"].as_array().unwrap().len(), 17);
 
         let settings = call(
             "get_asset_settings",

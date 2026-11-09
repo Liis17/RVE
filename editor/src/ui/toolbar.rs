@@ -31,6 +31,9 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
     {
         return;
     }
+    if crate::ui_editor::shortcuts(ctx, state) {
+        return;
+    }
     if ctx.input_mut(|input| input.consume_shortcut(&SAVE)) {
         state.action(Action::Save);
     }

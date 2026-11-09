@@ -947,6 +947,7 @@ impl WindowHandler for Sandbox {
             local_light_shadows: &local_light_shadows,
             draws: &draws,
             overlay,
+            ui: &[],
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
