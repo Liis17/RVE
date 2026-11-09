@@ -101,6 +101,7 @@ mod tests {
     use crate::prefabs::{
         LoadedPrefab, PrefabCpu, PrefabReply, PrefabToken, RenderResourceRequest,
     };
+    use crate::scene::PreparedMaterialAssets;
     use engine_files::VirtualPath;
     use engine_scene::PrefabTemplate;
     use std::collections::BTreeMap;
@@ -122,11 +123,9 @@ mod tests {
                 template: Arc::new(template),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
-            models: Default::default(),
-            textures: Default::default(),
-            material_assets: Default::default(),
-            shader_assets: Default::default(),
+            material_assets: Arc::new(PreparedMaterialAssets::default()),
             levels: Vec::new(),
             particles: Vec::new(),
         }

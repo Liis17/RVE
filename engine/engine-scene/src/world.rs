@@ -22,6 +22,7 @@ use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 mod components;
 mod hierarchy;
@@ -384,6 +385,8 @@ pub struct SpawnOptions {
 pub struct World {
     source_label: String,
     asset_paths: Vec<VirtualPath>,
+    /// Material assets declared by each spawned prefab instance, shared by its objects.
+    spawned_material_paths: HashMap<ObjectHandle, Arc<[VirtualPath]>>,
     /// Слоты и поколения. Резервирование меняет их через `&self`.
     slots: RefCell<SlotTable>,
     objects: Vec<WorldObject>,
@@ -492,6 +495,7 @@ impl World {
                 .iter()
                 .map(|asset| asset.path.clone())
                 .collect(),
+            spawned_material_paths: HashMap::new(),
             world_matrices,
             world_rotations,
             active_camera: objects[active_index].handle,
@@ -1361,6 +1365,19 @@ impl World {
         ids: Vec<String>,
     ) {
         let base = self.objects.len();
+        let material_paths: Arc<[VirtualPath]> = template
+            .assets()
+            .iter()
+            .filter(|asset| {
+                asset
+                    .path
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .ends_with(".rvemat")
+            })
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>()
+            .into();
         let spawned_refs = template
             .objects
             .iter()
@@ -1376,6 +1393,8 @@ impl World {
             .collect::<HashMap<_, _>>();
         for (local, object) in template.objects.iter().enumerate() {
             let handle = reserved[local];
+            self.spawned_material_paths
+                .insert(handle, Arc::clone(&material_paths));
             let mut scene_object = object.clone();
             scene_object.id = ids[local].clone();
             remap_script_object_refs(&mut scene_object, &spawned_refs);
@@ -1472,6 +1491,9 @@ impl World {
             .filter(|&&index| removed[index])
             .map(|&index| self.objects[index].handle)
             .collect::<Vec<_>>();
+        for handle in &removed_handles {
+            self.spawned_material_paths.remove(handle);
+        }
         let mut new_index = vec![usize::MAX; removed.len()];
         let mut kept = 0;
         {

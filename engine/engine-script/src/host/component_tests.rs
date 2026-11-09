@@ -1,8 +1,11 @@
 use super::ScriptHost;
-use crate::{ScriptEventLevel, ScriptTime};
+use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabSpec};
+use crate::{ScriptEventLevel, ScriptLoadOptions, ScriptTime};
+use engine_files::VirtualPath;
 use engine_scene::world::ParticleCommand;
-use engine_scene::{AudioRequest, AudioRolloff, SceneDocument, World};
+use engine_scene::{AudioRequest, AudioRolloff, PrefabTemplate, SceneDocument, World};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const SCENE: &str = r#"
 [[assets]]
@@ -359,6 +362,88 @@ return Script
         Some("materials/gold.rvemat")
     );
     assert_eq!(world.take_mesh_material_changes(), vec![crate_handle]);
+}
+
+#[test]
+fn spawned_prefab_accepts_its_material_and_params_and_scene_materials() {
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 1 then
+    rve.spawn("prefabs/material.rveprefab", { id = "spawned" })
+  elseif self.frames == 2 then
+    local object = rve.find("spawned")
+    object:set_material("/materials/prefab.rvemat")
+    object:set_material_params({ roughness = 0.25 })
+  elseif self.frames == 3 then
+    rve.find("spawned"):set_material("/materials/gold.rvemat")
+  end
+end
+return Script
+"#;
+    let document = SceneDocument::parse("test.rvescene", SCENE).unwrap();
+    let mut world = World::from_document(&document).unwrap();
+    let path = "prefabs/material.rveprefab";
+    let mut prefabs = PrefabCatalog::default();
+    prefabs.insert(
+        path,
+        PrefabSpec {
+            kind: PrefabKind::Fast,
+            max_instances: None,
+        },
+    );
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &BTreeMap::from([("driver.lua".to_owned(), source.to_owned())]),
+        None,
+        ScriptLoadOptions {
+            prefabs,
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    let prefab_path = VirtualPath::parse(path).unwrap();
+    let template = Arc::new(
+        PrefabTemplate::load(&prefab_path, &mut |_| {
+            Ok("[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/prefab.rvemat\"\n[[objects]]\nid = \"root\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n".to_owned())
+        })
+        .unwrap(),
+    );
+    host.register_prefab(&world, path, template, &BTreeMap::new())
+        .unwrap();
+
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    let spawned = world.handle("spawned").unwrap();
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    assert_eq!(
+        world.mesh_material_path(spawned).map(VirtualPath::as_str),
+        Some("materials/prefab.rvemat")
+    );
+    assert_eq!(
+        world
+            .object(spawned)
+            .unwrap()
+            .mesh_renderer
+            .as_ref()
+            .unwrap()
+            .material
+            .as_ref()
+            .unwrap()
+            .roughness,
+        Some(0.25)
+    );
+    assert_eq!(world.take_mesh_material_changes(), [spawned]);
+
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    assert_eq!(
+        world.mesh_material_path(spawned).map(VirtualPath::as_str),
+        Some("materials/gold.rvemat")
+    );
 }
 
 #[test]

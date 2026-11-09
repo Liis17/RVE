@@ -32,6 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Ресурсы одного объекта с мешом: уровни LOD (модель и текстура) и замена материала.
+#[derive(Clone, Debug)]
 pub(crate) struct ObjectModel {
     pub levels: Vec<(String, Option<String>)>,
     pub material: Option<MaterialOverride>,
@@ -61,6 +62,74 @@ pub(crate) struct PreparedRenderAssets {
     /// Исходники `.glsl` экранных шейдеров камер по пути. Заполняются только для игрового клиента:
     /// headless-сервер шейдеры не читает.
     pub screen_shaders: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedMaterialAssets {
+    pub models: HashMap<String, Model>,
+    pub textures: HashMap<String, TextureData>,
+    pub material_assets: HashMap<String, Result<MaterialAsset, String>>,
+    pub shader_assets: HashMap<String, Result<ShaderAsset, String>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MaterialAssetView<'a> {
+    pub models: &'a HashMap<String, Model>,
+    pub textures: &'a HashMap<String, TextureData>,
+    pub material_assets: &'a HashMap<String, Result<MaterialAsset, String>>,
+    pub shader_assets: &'a HashMap<String, Result<ShaderAsset, String>>,
+    fallback: Option<&'a PreparedRenderAssets>,
+}
+
+impl<'a> MaterialAssetView<'a> {
+    pub(crate) fn from_scene(assets: &'a PreparedRenderAssets) -> Self {
+        Self {
+            models: &assets.models,
+            textures: &assets.textures,
+            material_assets: &assets.material_assets,
+            shader_assets: &assets.shader_assets,
+            fallback: None,
+        }
+    }
+
+    pub(crate) fn from_prefab(
+        assets: &'a PreparedMaterialAssets,
+        fallback: Option<&'a PreparedRenderAssets>,
+    ) -> Self {
+        Self {
+            models: &assets.models,
+            textures: &assets.textures,
+            material_assets: &assets.material_assets,
+            shader_assets: &assets.shader_assets,
+            fallback,
+        }
+    }
+
+    fn model(&self, path: &str) -> Option<&'a Model> {
+        self.models
+            .get(path)
+            .or_else(|| self.fallback.and_then(|assets| assets.models.get(path)))
+    }
+
+    fn texture(&self, path: &str) -> Option<&'a TextureData> {
+        self.textures
+            .get(path)
+            .or_else(|| self.fallback.and_then(|assets| assets.textures.get(path)))
+    }
+
+    fn material_asset(&self, path: &str) -> Option<&'a Result<MaterialAsset, String>> {
+        self.material_assets.get(path).or_else(|| {
+            self.fallback
+                .and_then(|assets| assets.material_assets.get(path))
+        })
+    }
+
+    fn shader_asset(&self, path: &str) -> Option<&'a Result<ShaderAsset, String>> {
+        self.shader_assets.get(path).or_else(|| {
+            self.fallback
+                .and_then(|assets| assets.shader_assets.get(path))
+        })
+    }
 }
 
 /// Эмиттер частиц объекта: параметры сцены и путь текстуры, уже загруженной в `textures`.
@@ -1054,6 +1123,16 @@ pub(crate) fn prepare_template(
     if stop() {
         return Err(STOPPED.to_owned());
     }
+    for asset in template.assets() {
+        if asset
+            .path
+            .as_str()
+            .to_ascii_lowercase()
+            .ends_with(".rvemat")
+        {
+            set.material_paths.insert(asset.path.as_str().to_owned());
+        }
+    }
     set.load_surface_assets(resources, assets, label);
     let RenderAssetSet {
         models,
@@ -1155,6 +1234,7 @@ pub(crate) fn upload_scene(
     let mut shader_cache = std::mem::take(&mut caches.shaders);
     let mut material_cache = HashMap::<String, MaterialId>::new();
     let mut error_material = caches.error_material.take();
+    let material_assets = MaterialAssetView::from_scene(assets);
     // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
     let animated = animated_model_paths(assets);
 
@@ -1191,7 +1271,7 @@ pub(crate) fn upload_scene(
                 &resolved,
                 path,
                 model,
-                &assets.textures,
+                material_assets,
                 &mut texture_cache,
                 &mut material_cache,
                 None,
@@ -1204,6 +1284,16 @@ pub(crate) fn upload_scene(
     let mut table = GpuSceneTable {
         environments: assets.environments.clone(),
         animation_clips: assets.clips.clone(),
+        material_sources: assets
+            .objects
+            .iter()
+            .map(|(handle, object)| (*handle, object.clone()))
+            .collect(),
+        material_templates: assets
+            .prefabs
+            .iter()
+            .map(|(path, models)| (path.clone(), models.clone()))
+            .collect(),
         ..GpuSceneTable::default()
     };
     table.screen_shaders = upload_screen_shaders(renderer, &assets.screen_shaders);
@@ -1224,7 +1314,7 @@ pub(crate) fn upload_scene(
     for (handle, object) in &assets.objects {
         let levels = upload_object_levels(
             renderer,
-            assets,
+            material_assets,
             &gpu_models,
             &mut texture_cache,
             &mut shader_cache,
@@ -1257,7 +1347,7 @@ pub(crate) fn upload_scene(
             templates.push(match object {
                 Some(object) => upload_object_levels(
                     renderer,
-                    assets,
+                    material_assets,
                     &gpu_models,
                     &mut texture_cache,
                     &mut shader_cache,
@@ -1417,7 +1507,7 @@ pub(crate) fn particle_emitter_desc(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upload_object_levels(
     renderer: &mut Renderer,
-    assets: &PreparedRenderAssets,
+    assets: MaterialAssetView<'_>,
     gpu_models: &HashMap<String, Vec<(MeshId, MaterialId)>>,
     texture_cache: &mut GpuTextureCache<TextureId>,
     shader_cache: &mut HashMap<String, Result<ShaderId, String>>,
@@ -1437,7 +1527,7 @@ pub(crate) fn upload_object_levels(
             levels.push(model_meshes.clone());
             continue;
         }
-        let model = assets.models.get(model_path).ok_or({
+        let model = assets.model(model_path).ok_or({
             RenderError::InvalidState("CPU-модель отсутствует в таблице подготовленных ресурсов")
         })?;
         let mut draws = Vec::with_capacity(model_meshes.len());
@@ -1478,7 +1568,7 @@ pub(crate) fn upload_object_levels(
                         &resolved,
                         model_path,
                         model,
-                        &assets.textures,
+                        assets,
                         texture_cache,
                         material_cache,
                         None,
@@ -1500,7 +1590,7 @@ fn upload_resolved_material(
     resolved: &ResolvedMaterial,
     model_path: &str,
     model: &Model,
-    scene_texture_data: &HashMap<String, TextureData>,
+    assets: MaterialAssetView<'_>,
     texture_cache: &mut GpuTextureCache<TextureId>,
     material_cache: &mut HashMap<String, MaterialId>,
     shader: Option<ShaderId>,
@@ -1515,7 +1605,7 @@ fn upload_resolved_material(
         TextureColorSpace::Srgb,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let metallic_roughness_texture = upload_material_texture(
@@ -1524,7 +1614,7 @@ fn upload_resolved_material(
         TextureColorSpace::Linear,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let normal_texture = upload_material_texture(
@@ -1533,7 +1623,7 @@ fn upload_resolved_material(
         TextureColorSpace::Linear,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let emissive_texture = upload_material_texture(
@@ -1542,7 +1632,7 @@ fn upload_resolved_material(
         TextureColorSpace::Srgb,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let occlusion_texture = upload_material_texture(
@@ -1551,14 +1641,14 @@ fn upload_resolved_material(
         TextureColorSpace::Linear,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let mut user_textures = [None; 8];
     for (slot, source) in resolved.user_texture_sources.iter().enumerate() {
         let Some(source) = source else { continue };
         let key = (source.path.clone(), source.color_space);
-        let data = scene_texture_data.get(&source.path).ok_or_else(|| {
+        let data = assets.texture(&source.path).ok_or_else(|| {
             RenderError::InvalidTexture(format!(
                 "ресурсная текстура /{} отсутствует или не загружена",
                 source.path
@@ -1610,7 +1700,7 @@ fn material_cache_key(model_path: &str, resolved: &ResolvedMaterial) -> String {
 #[allow(clippy::too_many_arguments)]
 fn upload_material_slot(
     renderer: &mut Renderer,
-    assets: &PreparedRenderAssets,
+    assets: MaterialAssetView<'_>,
     path: &str,
     model_material: &ModelMaterial,
     replacement_texture: Option<&str>,
@@ -1623,8 +1713,7 @@ fn upload_material_slot(
     error_material: &mut Option<MaterialId>,
 ) -> Result<MaterialId, RenderError> {
     let resolved = assets
-        .material_assets
-        .get(path)
+        .material_asset(path)
         .ok_or_else(|| format!("материал /{path} не был подготовлен"))
         .and_then(|result| result.as_ref().map_err(Clone::clone))
         .and_then(|material| {
@@ -1633,8 +1722,7 @@ fn upload_material_slot(
                 .as_ref()
                 .map(|shader_path| {
                     assets
-                        .shader_assets
-                        .get(shader_path.as_str())
+                        .shader_asset(shader_path.as_str())
                         .ok_or_else(|| format!("шейдер /{} не был подготовлен", shader_path))?
                         .as_ref()
                         .map_err(Clone::clone)
@@ -1681,7 +1769,7 @@ fn upload_material_slot(
         &resolved,
         model_path,
         model,
-        &assets.textures,
+        assets,
         texture_cache,
         material_cache,
         shader,
@@ -1715,7 +1803,7 @@ fn upload_material_texture(
     color_space: TextureColorSpace,
     model_path: &str,
     model: &Model,
-    scene_texture_data: &HashMap<String, TextureData>,
+    assets: MaterialAssetView<'_>,
     texture_cache: &mut GpuTextureCache<TextureId>,
 ) -> Result<Option<TextureId>, RenderError> {
     let Some(source) = source else {
@@ -1740,7 +1828,7 @@ fn upload_material_texture(
         }
         MaterialTextureSource::Scene(path) => {
             let key = (path.clone(), color_space);
-            let texture = scene_texture_data.get(path).ok_or({
+            let texture = assets.texture(path).ok_or({
                 RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
             })?;
             get_or_insert_gpu(&mut texture_cache.scene, key, || {
@@ -1759,10 +1847,10 @@ fn upload_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, ScreenShaderGpu,
-        get_or_insert_gpu, load_scene, load_screen_shader_sources, material_cache_key,
-        prepare_scene_with_model_loader, resolve_material, resolve_material_asset,
-        screen_shader_paths, upload_screen_shaders,
+        GpuTextureCache, MaterialAssetView, MaterialTextureSource, PreparedMaterialAssets,
+        PreparedPrefabs, ScreenShaderGpu, get_or_insert_gpu, load_scene,
+        load_screen_shader_sources, material_cache_key, prepare_scene_with_model_loader,
+        resolve_material, resolve_material_asset, screen_shader_paths, upload_screen_shaders,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
@@ -2273,6 +2361,30 @@ id = "camera"
                 .material_assets
                 .keys()
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prefab_material_view_resolves_scene_declared_materials() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!("[[assets]]\npath = \"/materials/gold.rvemat\"\n{CAMERA_SCENE}").as_bytes(),
+        );
+        project.write("materials/gold.rvemat", b"");
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let prefab_assets = PreparedMaterialAssets::default();
+        let view = MaterialAssetView::from_prefab(&prefab_assets, Some(&prepared.render_assets));
+
+        assert!(
+            view.material_asset("materials/gold.rvemat")
+                .is_some_and(Result::is_ok)
         );
     }
 

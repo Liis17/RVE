@@ -9,8 +9,9 @@
 use crate::module_host::ModuleHost;
 use crate::pipeline::ScriptControl;
 use crate::scene::{
-    MaterialTextureSource, ObjectModel, ParticleSource, ResolvedMaterial, load_prefab_template,
-    model_geometry, prepare_template, resolve_material, resolve_material_asset,
+    MaterialTextureSource, ObjectModel, ParticleSource, PreparedMaterialAssets, ResolvedMaterial,
+    load_prefab_template, model_geometry, prepare_template, resolve_material,
+    resolve_material_asset,
 };
 use engine_assets::{Assets, Model, ModelMaterial, TextureData};
 use engine_files::VirtualPath;
@@ -20,7 +21,8 @@ use engine_render::{
     TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
-use engine_scene::{MaterialAsset, ObjectHandle, PrefabTemplate, ShaderAsset};
+use engine_scene::ObjectHandle;
+use engine_scene::PrefabTemplate;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
@@ -54,16 +56,15 @@ pub(crate) struct PrefabCpu {
     pub template: Arc<PrefabTemplate>,
     pub sources: BTreeMap<String, String>,
     pub geometry: Vec<ModelGeometry>,
+    /// CPU material sources by template object index, retained for runtime replacements.
+    pub material_models: Vec<Option<ObjectModel>>,
 }
 
 /// Результат CPU-загрузки. Модели и текстуры нужны только render thread для GPU.
 pub(crate) struct LoadedPrefab {
     pub token: PrefabToken,
     pub cpu: PrefabCpu,
-    pub models: HashMap<String, Model>,
-    pub textures: HashMap<String, TextureData>,
-    pub material_assets: HashMap<String, Result<MaterialAsset, String>>,
-    pub shader_assets: HashMap<String, Result<ShaderAsset, String>>,
+    pub material_assets: Arc<PreparedMaterialAssets>,
     pub levels: Vec<Option<ObjectModel>>,
     /// Эмиттеры объектов шаблона; элемент `i` относится к объекту `i`.
     pub particles: Vec<Option<ParticleSource>>,
@@ -95,9 +96,10 @@ pub(crate) struct MaterialRequest {
     /// Ревизия мира на момент заявки; ответ с ней сверяется с текущей ревизией.
     pub revision: u64,
     pub levels: Vec<Vec<(MeshId, MaterialId)>>,
-    pub material: Option<engine_scene::MaterialOverride>,
-    /// Путь `.rvemat` без ведущего `/`, как в `material_slots` сцены.
-    pub path: Option<String>,
+    /// CPU model and current component values for the object.
+    pub model: ObjectModel,
+    /// Set for spawned objects whose material assets belong to a heavy prefab token.
+    pub prefab_token: Option<PrefabToken>,
 }
 
 /// Ответ render thread на [`MaterialRequest`].
@@ -476,7 +478,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 if !seen.insert(model_path.as_str()) {
                     continue;
                 }
-                let Some(model) = prefab.models.get(model_path) else {
+                let Some(model) = prefab.material_assets.models.get(model_path) else {
                     return Err(format!("CPU-модель {model_path:?} отсутствует"));
                 };
                 token.models.push(model_path.clone());
@@ -504,7 +506,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 if !needs_override(object, replacement) {
                     continue;
                 }
-                let count = prefab.models[model_path].meshes.len();
+                let count = prefab.material_assets.models[model_path].meshes.len();
                 steps.extend((0..count).filter_map(|mesh| {
                     needs_mesh_override(object, replacement, mesh).then_some(UploadStep::Override {
                         object: object_index,
@@ -526,9 +528,14 @@ impl<G: GpuResources> PrefabGpu<G> {
         match step {
             UploadStep::Mesh { model, index } => {
                 let prefab = &job.prefab;
-                let model_cpu = prefab.models.get(&model).ok_or(RenderError::InvalidState(
-                    "CPU-модель отсутствует в таблице подготовленных ресурсов",
-                ))?;
+                let model_cpu =
+                    prefab
+                        .material_assets
+                        .models
+                        .get(&model)
+                        .ok_or(RenderError::InvalidState(
+                            "CPU-модель отсутствует в таблице подготовленных ресурсов",
+                        ))?;
                 let mesh = &model_cpu.meshes[index];
                 let vertices = gpu_vertices(mesh);
                 let mesh_id = gpu.create_mesh(&vertices, &mesh.indices)?;
@@ -536,7 +543,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 let sources = TextureSources {
                     model_path: &model,
                     model: model_cpu,
-                    scene: &prefab.textures,
+                    scene: &prefab.material_assets.textures,
                 };
                 let mut keys = Vec::new();
                 match self.build_material(gpu, &resolved, &sources, &mut job.token, &mut keys) {
@@ -571,12 +578,11 @@ impl<G: GpuResources> PrefabGpu<G> {
                             "уровень объекта без меша в шаблоне префаба",
                         ))?;
                 let (model_path, replacement) = &object_model.levels[level];
-                let model_cpu = prefab
-                    .models
-                    .get(model_path)
-                    .ok_or(RenderError::InvalidState(
+                let model_cpu = prefab.material_assets.models.get(model_path).ok_or(
+                    RenderError::InvalidState(
                         "CPU-модель отсутствует в таблице подготовленных ресурсов",
-                    ))?;
+                    ),
+                )?;
                 let source = &model_cpu.meshes[mesh];
                 let mesh_id = self
                     .models
@@ -610,7 +616,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 let sources = TextureSources {
                     model_path,
                     model: model_cpu,
-                    scene: &prefab.textures,
+                    scene: &prefab.material_assets.textures,
                 };
                 let mut keys = Vec::new();
                 let built = resolved
@@ -885,11 +891,13 @@ impl<G: GpuResources> PrefabGpu<G> {
         }
         let token_key = prefab.token.clone();
         self.tokens.insert(token_key.clone(), token);
+        let mut cpu = prefab.cpu;
+        cpu.material_models = prefab.levels;
         PrefabReplyOf::Ready(Box::new(PrefabReadyOf {
             token: token_key,
             gpu: gpu_objects,
             particles: Vec::new(),
-            cpu: prefab.cpu,
+            cpu,
         }))
     }
 
@@ -973,6 +981,7 @@ fn resolve_prefab_material(
 ) -> Result<ResolvedMaterial, String> {
     let material = prefab
         .material_assets
+        .material_assets
         .get(path)
         .ok_or_else(|| format!("материал /{path} не был подготовлен"))?
         .as_ref()
@@ -982,6 +991,7 @@ fn resolve_prefab_material(
         .as_ref()
         .map(|shader_path| {
             prefab
+                .material_assets
                 .shader_assets
                 .get(shader_path.as_str())
                 .ok_or_else(|| format!("шейдер /{} не был подготовлен", shader_path))?
@@ -1077,11 +1087,14 @@ pub(crate) fn load_prefab(
             template: Arc::new(template),
             sources: prepared.sources,
             geometry,
+            material_models: Vec::new(),
         },
-        models: prepared.models,
-        textures: prepared.textures,
-        material_assets: prepared.material_assets,
-        shader_assets: prepared.shader_assets,
+        material_assets: Arc::new(PreparedMaterialAssets {
+            models: prepared.models,
+            textures: prepared.textures,
+            material_assets: prepared.material_assets,
+            shader_assets: prepared.shader_assets,
+        }),
         levels: prepared.levels,
         particles: prepared.particles,
     })
@@ -1395,21 +1408,24 @@ mod tests {
                 template: Arc::new(template),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
-            models: models
-                .iter()
-                .map(|(path, model)| ((*path).to_owned(), model.clone()))
-                .collect(),
-            textures: HashMap::from([(
-                "tex.png".to_owned(),
-                TextureData {
-                    width: 1,
-                    height: 1,
-                    rgba: vec![255; 4],
-                },
-            )]),
-            material_assets: HashMap::new(),
-            shader_assets: HashMap::new(),
+            material_assets: Arc::new(PreparedMaterialAssets {
+                models: models
+                    .iter()
+                    .map(|(path, model)| ((*path).to_owned(), model.clone()))
+                    .collect(),
+                textures: HashMap::from([(
+                    "tex.png".to_owned(),
+                    TextureData {
+                        width: 1,
+                        height: 1,
+                        rgba: vec![255; 4],
+                    },
+                )]),
+                material_assets: HashMap::new(),
+                shader_assets: HashMap::new(),
+            }),
             levels,
             particles: Vec::new(),
         }
@@ -1527,10 +1543,13 @@ mod tests {
         let mut loaded = prefab(load.clone(), &[("m.fbx", model(1))], false);
         loaded.levels[0].as_mut().unwrap().material_slots =
             vec![Some("materials/broken.rvemat".to_owned())];
-        loaded.material_assets.insert(
-            "materials/broken.rvemat".to_owned(),
-            Err("разбор материала завершился ошибкой".to_owned()),
-        );
+        Arc::get_mut(&mut loaded.material_assets)
+            .unwrap()
+            .material_assets
+            .insert(
+                "materials/broken.rvemat".to_owned(),
+                Err("разбор материала завершился ошибкой".to_owned()),
+            );
         state.submit(loaded);
 
         let replies = run_to_completion(&mut state, &mut gpu);
@@ -1595,6 +1614,13 @@ mod tests {
         let [PrefabReplyOf::Ready(ready)] = replies.as_slice() else {
             panic!("ожидался один готовый префаб");
         };
+        let [Some(material_source)] = ready.cpu.material_models.as_slice() else {
+            panic!("CPU-описание меша должно пережить загрузку GPU префаба");
+        };
+        assert_eq!(
+            material_source.levels,
+            [("m.fbx".to_owned(), Some("tex.png".to_owned()))]
+        );
         let [levels] = ready.gpu.as_slice() else {
             panic!("один объект");
         };

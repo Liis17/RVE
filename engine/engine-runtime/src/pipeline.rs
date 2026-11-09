@@ -17,8 +17,8 @@ use crate::profiling::{
     script_phase, scripts_groups,
 };
 use crate::scene::{
-    MaterialUploadCaches, ObjectModel, ParticleSource, PreparedPrefabs, PreparedRenderAssets,
-    particle_emitter_desc, upload_object_levels,
+    MaterialAssetView, MaterialUploadCaches, ObjectModel, ParticleSource, PreparedMaterialAssets,
+    PreparedPrefabs, PreparedRenderAssets, particle_emitter_desc, upload_object_levels,
 };
 use engine_animation::{AnimationBridge, AnimationEvent};
 use engine_assets::{Model, ModelAnimation, TextureData};
@@ -152,6 +152,13 @@ type GpuLevels = Vec<Vec<(MeshId, MaterialId)>>;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, GpuLevels>,
+    /// CPU material sources for scene objects and objects spawned from prefab templates.
+    pub material_sources: HashMap<ObjectHandle, ObjectModel>,
+    /// CPU material sources by object index for fast and loaded heavy prefabs.
+    pub material_templates: HashMap<String, Vec<Option<ObjectModel>>>,
+    /// Current heavy load generation by path and by spawned object.
+    pub prefab_tokens: HashMap<String, PrefabToken>,
+    pub material_tokens: HashMap<ObjectHandle, PrefabToken>,
     /// Уровни шаблонов быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub prefabs: HashMap<String, Vec<GpuLevels>>,
     /// Эмиттеры частиц объектов сцены; создаются при загрузке и передаются render thread.
@@ -494,8 +501,8 @@ pub(crate) struct VulkanBackend {
     scene_screen_shaders: Vec<engine_render::ScreenShaderId>,
     /// Подготовленные ресурсы сцены для замены материалов объектов; нет у тестовых сцен без GPU.
     material_assets: Option<Arc<PreparedRenderAssets>>,
-    /// Индекс объектов `material_assets` по хендлу.
-    material_objects: HashMap<ObjectHandle, usize>,
+    /// CPU material sources for heavy prefabs, retained until that token's delayed release.
+    prefab_material_assets: HashMap<PrefabToken, Arc<PreparedMaterialAssets>>,
     /// Текстуры, шейдеры и запасной материал сцены, которые переиспользуют замены материалов.
     material_caches: MaterialUploadCaches,
 }
@@ -529,7 +536,7 @@ impl VulkanBackend {
             scene_skin_instances: Vec::new(),
             scene_screen_shaders: Vec::new(),
             material_assets: None,
-            material_objects: HashMap::new(),
+            prefab_material_assets: HashMap::new(),
             material_caches: MaterialUploadCaches::default(),
         }
     }
@@ -541,12 +548,6 @@ impl VulkanBackend {
         assets: Arc<PreparedRenderAssets>,
         caches: MaterialUploadCaches,
     ) -> Self {
-        self.material_objects = assets
-            .objects
-            .iter()
-            .enumerate()
-            .map(|(index, (handle, _))| (*handle, index))
-            .collect();
         self.material_assets = Some(assets);
         self.material_caches = caches;
         self
@@ -556,30 +557,28 @@ impl VulkanBackend {
     /// материалы принадлежат только этому ответу, и при ошибке созданные уничтожаются.
     fn upload_object_materials(
         &mut self,
-        object: ObjectHandle,
-        levels: Vec<Vec<(MeshId, MaterialId)>>,
-        material: Option<engine_scene::MaterialOverride>,
-        path: Option<String>,
+        request: MaterialRequest,
     ) -> Result<MaterialLevels, String> {
-        let assets = self
-            .material_assets
-            .clone()
-            .ok_or("ресурсы сцены не переданы render thread")?;
-        let index = *self.material_objects.get(&object).ok_or(
-            "объект без CPU-модели сцены (префаб или созданный скриптом): материал не заменён",
-        )?;
-        let source = &assets.objects[index].1;
-        let part_count = levels.first().map_or(0, Vec::len);
-        let model = ObjectModel {
-            levels: source.levels.clone(),
-            material,
-            material_slots: match path {
-                Some(path) => vec![Some(path); part_count],
-                None => source.material_slots.clone(),
-            },
-            animated: source.animated,
+        let MaterialRequest {
+            levels,
+            model,
+            prefab_token,
+            ..
+        } = request;
+        let assets = match prefab_token.as_ref() {
+            Some(token) => MaterialAssetView::from_prefab(
+                self.prefab_material_assets
+                    .get(token)
+                    .ok_or("CPU-ресурсы токена префаба уже освобождены")?,
+                self.material_assets.as_deref(),
+            ),
+            None => MaterialAssetView::from_scene(
+                self.material_assets
+                    .as_deref()
+                    .ok_or("ресурсы сцены не переданы render thread")?,
+            ),
         };
-        let gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = source
+        let gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = model
             .levels
             .iter()
             .zip(&levels)
@@ -588,7 +587,7 @@ impl VulkanBackend {
         let mut material_cache = HashMap::new();
         let uploaded = upload_object_levels(
             &mut self.renderer,
-            &assets,
+            assets,
             &gpu_models,
             &mut self.material_caches.textures,
             &mut self.material_caches.shaders,
@@ -719,22 +718,27 @@ impl RenderBackend for VulkanBackend {
 
     fn submit_prefab(&mut self, mut prefab: LoadedPrefab) -> Option<PrefabReply> {
         let token = prefab.token.clone();
+        let material_assets = Arc::clone(&prefab.material_assets);
         let particles = std::mem::take(&mut prefab.particles);
-        let created =
-            match create_prefab_particles(&mut self.renderer, &prefab.textures, &particles) {
-                Ok(created) => created,
-                Err(error) => {
-                    return Some(PrefabReply::Failed {
-                        token,
-                        error: error.to_string(),
-                    });
-                }
-            };
+        let created = match create_prefab_particles(
+            &mut self.renderer,
+            &prefab.material_assets.textures,
+            &particles,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                return Some(PrefabReply::Failed {
+                    token,
+                    error: error.to_string(),
+                });
+            }
+        };
         let reply = self.prefabs.submit(prefab);
         if reply.is_some() {
             release_prefab_particles(&mut self.renderer, created.textures);
         } else {
-            self.prefab_particles.insert(token, created);
+            self.prefab_particles.insert(token.clone(), created);
+            self.prefab_material_assets.insert(token, material_assets);
         }
         reply
     }
@@ -752,6 +756,7 @@ impl RenderBackend for VulkanBackend {
                     if let Some(entry) = self.prefab_particles.remove(token) {
                         release_prefab_particles(&mut self.renderer, entry.textures);
                     }
+                    self.prefab_material_assets.remove(token);
                 }
             }
         }
@@ -764,20 +769,16 @@ impl RenderBackend for VulkanBackend {
 
     fn release_prefab(&mut self, token: &PrefabToken) {
         self.prefabs.release(&mut self.renderer, token);
+        self.prefab_material_assets.remove(token);
         if let Some(entry) = self.prefab_particles.remove(token) {
             release_prefab_particles(&mut self.renderer, entry.textures);
         }
     }
 
     fn submit_material(&mut self, request: MaterialRequest) -> MaterialReply {
-        let MaterialRequest {
-            object,
-            revision,
-            levels,
-            material,
-            path,
-        } = request;
-        let result = self.upload_object_materials(object, levels, material, path);
+        let object = request.object;
+        let revision = request.revision;
+        let result = self.upload_object_materials(request);
         MaterialReply {
             object,
             revision,
@@ -1932,8 +1933,9 @@ fn apply_changes(
         if let Some(templates) = gpu_scene.prefabs.get(&spawned.prefab) {
             attach_prefab_levels(&mut gpu_scene.by_object, templates, spawned);
         }
+        attach_prefab_material_sources(gpu_scene, spawned);
     }
-    detach_objects(&mut gpu_scene.by_object, &changes.despawned);
+    detach_object_render_data(gpu_scene, &changes.despawned);
     if !changes.despawned.is_empty() {
         prefabs.send_particles(ParticleRequest::Destroy(changes.despawned.clone()));
     }
@@ -1981,7 +1983,7 @@ fn apply_changes(
                         &format!("физика отклонила объект {:?}: {error}", spawned.prefab),
                     );
                     print_script_events(scripts.drain_events());
-                    detach_objects(&mut gpu_scene.by_object, &spawned.objects);
+                    detach_object_render_data(gpu_scene, &spawned.objects);
                     continue;
                 }
             }
@@ -2039,6 +2041,8 @@ fn apply_prefab_requests(
             PrefabRequest::Unload(path) => {
                 gpu_scene.prefabs.remove(path);
                 gpu_scene.particle_templates.remove(path);
+                gpu_scene.material_templates.remove(path);
+                gpu_scene.prefab_tokens.remove(path);
                 if let Some(slot) = prefabs.forget(path) {
                     if let Some(geometry) = slot.geometry {
                         spawn_physics.remove_heavy_geometry(&geometry);
@@ -2097,14 +2101,24 @@ impl MaterialSync {
             let Some(mesh) = object.mesh_renderer.as_ref() else {
                 continue;
             };
+            let Some(mut model) = gpu_scene.material_sources.get(&handle).cloned() else {
+                log::warn!(
+                    "[material] объект {}: CPU-описание модели для замены материала отсутствует",
+                    object.id
+                );
+                continue;
+            };
+            model.material = mesh.material.clone();
+            if let Some(path) = world.mesh_material_path(handle) {
+                let part_count = levels.iter().map(Vec::len).max().unwrap_or(0);
+                model.material_slots = vec![Some(path.as_str().to_owned()); part_count];
+            }
             let request = MaterialRequest {
                 object: handle,
                 revision,
                 levels: levels.clone(),
-                material: mesh.material.clone(),
-                path: world
-                    .mesh_material_path(handle)
-                    .map(|path| path.as_str().to_owned()),
+                model,
+                prefab_token: gpu_scene.material_tokens.get(&handle).cloned(),
             };
             if resources
                 .send(RenderResourceRequest::Material(Box::new(request)))
@@ -2129,6 +2143,7 @@ impl MaterialSync {
             match reply.result {
                 Ok(MaterialLevels { levels, created })
                     if world.is_alive(reply.object)
+                        && world.mesh_material_revision(reply.object) == Some(reply.revision)
                         && gpu_scene.by_object.contains_key(&reply.object) =>
                 {
                     gpu_scene.by_object.insert(reply.object, levels);
@@ -2241,6 +2256,7 @@ fn drain_prefab_replies(
                     template,
                     sources,
                     geometry,
+                    material_models,
                 } = cpu;
                 if let Err(error) = scripts.register_prefab(world, &token.path, template, &sources)
                 {
@@ -2255,6 +2271,12 @@ fn drain_prefab_replies(
                 gpu_scene
                     .particle_templates
                     .insert(token.path.clone(), particles);
+                gpu_scene
+                    .material_templates
+                    .insert(token.path.clone(), material_models);
+                gpu_scene
+                    .prefab_tokens
+                    .insert(token.path.clone(), token.clone());
                 prefabs.mark_ready(&token, geometry_paths);
             }
             PrefabReply::Failed { token, error } => {
@@ -2279,6 +2301,33 @@ fn attach_prefab_levels<T: Clone>(
             by_object.insert(*object, levels.clone());
         }
     }
+}
+
+fn attach_prefab_material_sources(gpu_scene: &mut GpuSceneTable, spawned: &SpawnedObject) {
+    let Some(templates) = gpu_scene.material_templates.get(&spawned.prefab) else {
+        return;
+    };
+    let token = gpu_scene.prefab_tokens.get(&spawned.prefab).cloned();
+    for (object, source) in spawned.objects.iter().zip(templates) {
+        if let Some(source) = source {
+            gpu_scene.material_sources.insert(*object, source.clone());
+            if let Some(token) = &token {
+                gpu_scene.material_tokens.insert(*object, token.clone());
+            }
+        }
+    }
+}
+
+fn detach_material_sources(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
+    for handle in handles {
+        gpu_scene.material_sources.remove(handle);
+        gpu_scene.material_tokens.remove(handle);
+    }
+}
+
+fn detach_object_render_data(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
+    detach_objects(&mut gpu_scene.by_object, handles);
+    detach_material_sources(gpu_scene, handles);
 }
 
 fn detach_objects<T>(by_object: &mut HashMap<ObjectHandle, Vec<Vec<T>>>, handles: &[ObjectHandle]) {
@@ -3656,11 +3705,14 @@ mod tests {
         send_snapshot, sync_input_background, wait_background_tick,
     };
     use super::{FrameLatency, publish_script_cursor, set_initial_cursor};
-    use super::{MaterialOwnership, MaterialSync, ScriptReply};
+    use super::{MaterialSync, ScriptReply};
     #[cfg(feature = "dev-console")]
     use super::{PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION, publish_command_catalog};
     use super::{SpawnPhysics, apply_world_changes, drain_prefab_replies};
-    use super::{attach_prefab_levels, detach_objects};
+    use super::{
+        attach_prefab_levels, attach_prefab_material_sources, detach_object_render_data,
+        detach_objects,
+    };
     use crate::cursor::{CursorControl, RecordingCursorSink};
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
@@ -3671,7 +3723,7 @@ mod tests {
     };
     use crate::prefabs::{MaterialLevels, MaterialReply, MaterialRequest};
     use crate::profiling::{PhaseWindow, SOURCE_RENDER, render_groups, render_phase};
-    use crate::scene::PreparedPrefabs;
+    use crate::scene::{ObjectModel, PreparedMaterialAssets, PreparedPrefabs};
     use engine_animation::AnimationBridge;
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
@@ -3684,16 +3736,19 @@ mod tests {
         PhysicsWorld, Pose,
     };
     use engine_project::{InputAction, InputSettings};
-    use engine_render::{DrawCommand, FrameOutcome, FrameStatus, LatencyMarker, LocalLight};
+    use engine_render::{
+        DrawCommand, FrameOutcome, FrameStatus, LatencyMarker, LocalLight, MaterialId, MeshId,
+    };
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
     use engine_scene::world::MeshMaterialParams;
-    use engine_scene::{LocalLightState, ObjectHandle, SceneDocument, World};
+    use engine_scene::{LocalLightState, ObjectHandle, SceneDocument, SpawnOptions, World};
     use engine_script::ScriptLoadOptions;
     use engine_script::{
         Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
+        SpawnedObject,
     };
     use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
     use engine_window::CursorState;
@@ -5066,6 +5121,10 @@ return Script
 
     const MATERIAL_SCENE: &str = "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n";
 
+    const MATERIAL_LOD_SCENE: &str = "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/models/crate_lod.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n[objects.lod_group]\n[[objects.lod_group.levels]]\nmodel = \"/models/crate_lod.fbx\"\ndistance = 10.0\n";
+
+    const MATERIAL_PREFAB: &str = "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n";
+
     fn material_test_world() -> (World, ObjectHandle) {
         let world = World::from_document(
             &SceneDocument::parse("materials.rvescene", MATERIAL_SCENE).unwrap(),
@@ -5082,11 +5141,62 @@ return Script
         }
     }
 
+    fn material_source() -> ObjectModel {
+        ObjectModel {
+            levels: vec![("models/crate.fbx".to_owned(), None)],
+            material: None,
+            material_slots: vec![None, None],
+            animated: false,
+        }
+    }
+
+    fn fake_mesh_id(value: usize) -> MeshId {
+        // SAFETY: MeshId is a single usize wrapper; every usize is a valid test-only id.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn fake_material_id(value: usize) -> MaterialId {
+        // SAFETY: MaterialId is a single usize wrapper; every usize is a valid test-only id.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn material_levels(seed: usize) -> Vec<Vec<(MeshId, MaterialId)>> {
+        vec![vec![
+            (fake_mesh_id(seed), fake_material_id(seed + 1)),
+            (fake_mesh_id(seed + 2), fake_material_id(seed + 3)),
+        ]]
+    }
+
+    fn snapshot_materials(
+        world: &mut World,
+        gpu_scene: &GpuSceneTable,
+        object: ObjectHandle,
+    ) -> Vec<MaterialId> {
+        let (frame, warnings) = world.build_frame();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let snapshot = make_snapshot(frame, world, gpu_scene, &AnimationBridge::default()).unwrap();
+        let range = snapshot
+            .object_motion
+            .get(&object)
+            .expect("object has snapshot draws")
+            .draw_range
+            .clone();
+        snapshot.draws[range]
+            .iter()
+            .map(|draw| draw.material.unwrap())
+            .collect()
+    }
+
     #[test]
     fn material_changes_request_one_upload_per_object_and_a_reply_swaps_its_levels() {
         let (mut world, crate_handle) = material_test_world();
         let mut gpu_scene = GpuSceneTable::default();
-        gpu_scene.by_object.insert(crate_handle, Vec::new());
+        gpu_scene
+            .by_object
+            .insert(crate_handle, material_levels(10));
+        gpu_scene
+            .material_sources
+            .insert(crate_handle, material_source());
         let (resources_tx, resources_rx) = flume::unbounded();
         let mut sync = MaterialSync::default();
 
@@ -5102,9 +5212,12 @@ return Script
         sync.request_changes(&mut world, &gpu_scene, &resources_tx);
         let first = next_material_request(&resources_rx);
         assert_eq!((first.object, first.revision), (crate_handle, 1));
-        assert!(first.levels.is_empty());
-        assert_eq!(first.material.as_ref().and_then(|m| m.roughness), Some(0.5));
-        assert_eq!(first.path, None);
+        assert_eq!(first.levels, material_levels(10));
+        assert_eq!(
+            first.model.material.as_ref().and_then(|m| m.roughness),
+            Some(0.5)
+        );
+        assert_eq!(first.model.material_slots, vec![None, None]);
 
         // Вторая замена ждёт ответа на первую: заявка на тот же объект не уходит.
         world
@@ -5119,30 +5232,73 @@ return Script
         sync.request_changes(&mut world, &gpu_scene, &resources_tx);
         assert!(resources_rx.try_recv().is_err());
 
-        // Ответ на первую ревизию меняет уровни; вторая ревизия уходит следующей заявкой.
+        // Устаревший ответ не меняет уровни; его материалы освобождаются сразу, затем уходит
+        // заявка с последней ревизией.
         sync.accept(MaterialReply {
             object: crate_handle,
             revision: first.revision,
             result: Ok(MaterialLevels {
-                levels: vec![Vec::new()],
-                created: Vec::new(),
+                levels: material_levels(20),
+                created: vec![fake_material_id(21), fake_material_id(23)],
             }),
         });
         sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 5);
-        assert_eq!(gpu_scene.by_object[&crate_handle].len(), 1);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(11), fake_material_id(13)],
+            "stale reply must not change the next frame snapshot"
+        );
+        match resources_rx.try_recv().unwrap() {
+            RenderResourceRequest::ReleaseMaterials {
+                materials,
+                last_seq,
+            } => {
+                assert_eq!(materials, [fake_material_id(21), fake_material_id(23)]);
+                assert_eq!(last_seq, 0, "stale materials never entered a snapshot");
+            }
+            _ => panic!("stale reply materials must be released immediately"),
+        }
         sync.request_changes(&mut world, &gpu_scene, &resources_tx);
         let second = next_material_request(&resources_rx);
         assert_eq!(second.revision, 2);
-        let material = second.material.as_ref().expect("переопределения переданы");
+        assert_eq!(second.levels, material_levels(10));
+        let material = second
+            .model
+            .material
+            .as_ref()
+            .expect("переопределения переданы");
         assert_eq!(material.roughness, Some(0.5), "прежние поля сохраняются");
         assert_eq!(material.base_color, Some([1.0, 0.0, 0.0]));
+
+        sync.accept(MaterialReply {
+            object: crate_handle,
+            revision: second.revision,
+            result: Ok(MaterialLevels {
+                levels: material_levels(30),
+                created: vec![fake_material_id(31), fake_material_id(33)],
+            }),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 7);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(31), fake_material_id(33)]
+        );
+        assert!(
+            resources_rx.try_recv().is_err(),
+            "the accepted second reply has no previous owned materials"
+        );
     }
 
     #[test]
     fn set_material_path_reaches_the_request_and_a_refused_reply_keeps_the_levels() {
         let (mut world, crate_handle) = material_test_world();
         let mut gpu_scene = GpuSceneTable::default();
-        gpu_scene.by_object.insert(crate_handle, vec![Vec::new()]);
+        gpu_scene
+            .by_object
+            .insert(crate_handle, material_levels(40));
+        gpu_scene
+            .material_sources
+            .insert(crate_handle, material_source());
         let (resources_tx, resources_rx) = flume::unbounded();
         let mut sync = MaterialSync::default();
         let gold = engine_files::VirtualPath::parse("/materials/gold.rvemat").unwrap();
@@ -5150,7 +5306,13 @@ return Script
 
         sync.request_changes(&mut world, &gpu_scene, &resources_tx);
         let request = next_material_request(&resources_rx);
-        assert_eq!(request.path.as_deref(), Some("materials/gold.rvemat"));
+        assert_eq!(
+            request.model.material_slots,
+            vec![
+                Some("materials/gold.rvemat".to_owned()),
+                Some("materials/gold.rvemat".to_owned())
+            ]
+        );
         sync.accept(MaterialReply {
             object: crate_handle,
             revision: request.revision,
@@ -5158,8 +5320,8 @@ return Script
         });
         sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 3);
         assert_eq!(
-            gpu_scene.by_object[&crate_handle].len(),
-            1,
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(41), fake_material_id(43)],
             "отказ не меняет уровни"
         );
         sync.request_changes(&mut world, &gpu_scene, &resources_tx);
@@ -5170,33 +5332,327 @@ return Script
     }
 
     #[test]
-    fn reply_for_an_object_that_left_the_gpu_table_does_not_bring_its_levels_back() {
-        let (world, crate_handle) = material_test_world();
+    fn set_material_path_covers_parts_from_every_lod_level() {
+        let document = SceneDocument::parse("materials.rvescene", MATERIAL_LOD_SCENE).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let crate_handle = world.handle("crate").unwrap();
+        let first_level = material_levels(170).remove(0);
+        let second_level = vec![
+            (fake_mesh_id(180), fake_material_id(181)),
+            (fake_mesh_id(182), fake_material_id(183)),
+            (fake_mesh_id(184), fake_material_id(185)),
+        ];
         let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .by_object
+            .insert(crate_handle, vec![first_level, second_level]);
+        gpu_scene.material_sources.insert(
+            crate_handle,
+            ObjectModel {
+                levels: vec![
+                    ("models/crate.fbx".to_owned(), None),
+                    ("models/crate_lod.fbx".to_owned(), None),
+                ],
+                material: None,
+                material_slots: vec![None; 2],
+                animated: false,
+            },
+        );
+        world
+            .set_mesh_material_path(
+                crate_handle,
+                engine_files::VirtualPath::parse("/materials/gold.rvemat").unwrap(),
+            )
+            .unwrap();
         let (resources_tx, resources_rx) = flume::unbounded();
-        let mut sync = MaterialSync::default();
-        sync.accept(MaterialReply {
-            object: crate_handle,
-            revision: 0,
-            result: Ok(MaterialLevels {
-                levels: vec![Vec::new()],
-                created: Vec::new(),
-            }),
-        });
-        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 1);
-        assert!(!gpu_scene.by_object.contains_key(&crate_handle));
-        assert!(resources_rx.try_recv().is_err());
+        MaterialSync::default().request_changes(&mut world, &gpu_scene, &resources_tx);
+
+        let request = next_material_request(&resources_rx);
+        assert_eq!(
+            request.model.material_slots,
+            vec![Some("materials/gold.rvemat".to_owned()); 3]
+        );
     }
 
     #[test]
-    fn replaced_materials_are_returned_and_dead_objects_give_up_all_of_theirs() {
-        let (a, b, _, _) = motion_test_handles();
-        let mut owned = MaterialOwnership::<u32>::default();
-        assert!(owned.replace(a, vec![1, 2]).is_empty());
-        assert_eq!(owned.replace(a, vec![3]), vec![1, 2]);
-        assert!(owned.replace(b, vec![4]).is_empty());
-        assert_eq!(owned.take_dead(|handle| handle == b), vec![3]);
-        assert_eq!(owned.take_dead(|_| false), vec![4]);
+    fn spawned_fast_and_heavy_prefabs_send_material_sources_and_swap_snapshot_levels() {
+        let world_document = SceneDocument::parse(
+            "materials.rvescene",
+            "[[assets]]\npath = \"/materials/scene.rvemat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&world_document).unwrap();
+        let fast_path = "prefabs/fast.rveprefab";
+        let heavy_path = "prefabs/heavy.rveprefab";
+        let fast_template = prefab_template(fast_path, MATERIAL_PREFAB);
+        let heavy_template = prefab_template(heavy_path, MATERIAL_PREFAB);
+        let fast_handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &fast_template,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let heavy_handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &heavy_template,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let fast = SpawnedObject {
+            handle: fast_handles[0],
+            objects: fast_handles,
+            prefab: fast_path.to_owned(),
+            template_index: 0,
+            initial_velocity: None,
+        };
+        let heavy = SpawnedObject {
+            handle: heavy_handles[0],
+            objects: heavy_handles,
+            prefab: heavy_path.to_owned(),
+            template_index: 0,
+            initial_velocity: None,
+        };
+        let token = PrefabToken {
+            path: heavy_path.to_owned(),
+            load_id: 4,
+        };
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .prefabs
+            .insert(fast_path.to_owned(), vec![material_levels(50)]);
+        gpu_scene
+            .prefabs
+            .insert(heavy_path.to_owned(), vec![material_levels(60)]);
+        gpu_scene
+            .material_templates
+            .insert(fast_path.to_owned(), vec![Some(material_source())]);
+        gpu_scene
+            .material_templates
+            .insert(heavy_path.to_owned(), vec![Some(material_source())]);
+        gpu_scene
+            .prefab_tokens
+            .insert(heavy_path.to_owned(), token.clone());
+        attach_prefab_levels(
+            &mut gpu_scene.by_object,
+            &gpu_scene.prefabs[fast_path],
+            &fast,
+        );
+        attach_prefab_material_sources(&mut gpu_scene, &fast);
+        attach_prefab_levels(
+            &mut gpu_scene.by_object,
+            &gpu_scene.prefabs[heavy_path],
+            &heavy,
+        );
+        attach_prefab_material_sources(&mut gpu_scene, &heavy);
+
+        let gold = engine_files::VirtualPath::parse("/materials/gold.rvemat").unwrap();
+        world
+            .set_mesh_material_path(fast.handle, gold.clone())
+            .unwrap();
+        let scene_material = engine_files::VirtualPath::parse("/materials/scene.rvemat").unwrap();
+        world
+            .set_mesh_material_path(heavy.handle, scene_material)
+            .unwrap();
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let requests = [
+            next_material_request(&resources_rx),
+            next_material_request(&resources_rx),
+        ];
+        let fast_request = requests
+            .iter()
+            .find(|request| request.object == fast.handle)
+            .unwrap();
+        let heavy_request = requests
+            .iter()
+            .find(|request| request.object == heavy.handle)
+            .unwrap();
+        assert!(fast_request.prefab_token.is_none());
+        assert_eq!(heavy_request.prefab_token.as_ref(), Some(&token));
+        assert!(
+            fast_request
+                .model
+                .material_slots
+                .iter()
+                .all(Option::is_some)
+        );
+        assert!(
+            heavy_request
+                .model
+                .material_slots
+                .iter()
+                .all(Option::is_some)
+        );
+        assert_eq!(
+            fast_request.model.material_slots[0].as_deref(),
+            Some("materials/gold.rvemat")
+        );
+        assert_eq!(
+            heavy_request.model.material_slots[0].as_deref(),
+            Some("materials/scene.rvemat")
+        );
+
+        for (request, seed) in [(fast_request, 80), (heavy_request, 100)] {
+            sync.accept(MaterialReply {
+                object: request.object,
+                revision: request.revision,
+                result: Ok(MaterialLevels {
+                    levels: material_levels(seed),
+                    created: vec![fake_material_id(seed + 1), fake_material_id(seed + 3)],
+                }),
+            });
+        }
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 3);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, fast.handle),
+            [fake_material_id(81), fake_material_id(83)]
+        );
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, heavy.handle),
+            [fake_material_id(101), fake_material_id(103)]
+        );
+    }
+
+    #[test]
+    fn deleted_prefab_object_releases_an_outdated_material_reply_immediately() {
+        let world_document = SceneDocument::parse(
+            "materials.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&world_document).unwrap();
+        let prefab_path = "prefabs/heavy.rveprefab";
+        let template = prefab_template(prefab_path, MATERIAL_PREFAB);
+        let handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &template,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let spawned = SpawnedObject {
+            handle: handles[0],
+            objects: handles.clone(),
+            prefab: prefab_path.to_owned(),
+            template_index: 0,
+            initial_velocity: None,
+        };
+        let token = PrefabToken {
+            path: prefab_path.to_owned(),
+            load_id: 8,
+        };
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .prefabs
+            .insert(prefab_path.to_owned(), vec![material_levels(120)]);
+        gpu_scene
+            .material_templates
+            .insert(prefab_path.to_owned(), vec![Some(material_source())]);
+        gpu_scene
+            .prefab_tokens
+            .insert(prefab_path.to_owned(), token);
+        attach_prefab_levels(
+            &mut gpu_scene.by_object,
+            &gpu_scene.prefabs[prefab_path],
+            &spawned,
+        );
+        attach_prefab_material_sources(&mut gpu_scene, &spawned);
+        world
+            .set_mesh_material_params(
+                spawned.handle,
+                MeshMaterialParams {
+                    roughness: Some(0.25),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let request = next_material_request(&resources_rx);
+
+        world.despawn_many(&[spawned.handle]).unwrap();
+        detach_object_render_data(&mut gpu_scene, &handles);
+        assert!(!gpu_scene.material_sources.contains_key(&spawned.handle));
+        assert!(!gpu_scene.material_tokens.contains_key(&spawned.handle));
+        sync.accept(MaterialReply {
+            object: request.object,
+            revision: request.revision,
+            result: Ok(MaterialLevels {
+                levels: material_levels(140),
+                created: vec![fake_material_id(141), fake_material_id(143)],
+            }),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 9);
+        assert!(!gpu_scene.by_object.contains_key(&spawned.handle));
+        match resources_rx.try_recv().unwrap() {
+            RenderResourceRequest::ReleaseMaterials {
+                materials,
+                last_seq,
+            } => {
+                assert_eq!(materials, [fake_material_id(141), fake_material_id(143)]);
+                assert_eq!(
+                    last_seq, 0,
+                    "the object never appeared in a submitted snapshot"
+                );
+            }
+            _ => panic!("unused reply materials must be released immediately"),
+        }
+    }
+
+    #[test]
+    fn despawn_releases_accepted_materials_after_the_last_snapshot() {
+        let (mut world, crate_handle) = material_test_world();
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .by_object
+            .insert(crate_handle, material_levels(150));
+        gpu_scene
+            .material_sources
+            .insert(crate_handle, material_source());
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+        world
+            .set_mesh_material_params(
+                crate_handle,
+                MeshMaterialParams {
+                    roughness: Some(0.75),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let request = next_material_request(&resources_rx);
+        sync.accept(MaterialReply {
+            object: crate_handle,
+            revision: request.revision,
+            result: Ok(MaterialLevels {
+                levels: material_levels(160),
+                created: vec![fake_material_id(161), fake_material_id(163)],
+            }),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 6);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(161), fake_material_id(163)]
+        );
+
+        world.despawn_many(&[crate_handle]).unwrap();
+        detach_object_render_data(&mut gpu_scene, &[crate_handle]);
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 12);
+        match resources_rx.try_recv().unwrap() {
+            RenderResourceRequest::ReleaseMaterials {
+                materials,
+                last_seq,
+            } => {
+                assert_eq!(materials, [fake_material_id(161), fake_material_id(163)]);
+                assert_eq!(last_seq, 12);
+            }
+            _ => panic!("despawned object's materials must be retired after submitted snapshots"),
+        }
     }
 
     #[test]
@@ -5318,11 +5774,9 @@ return Script
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
-            models: HashMap::new(),
-            textures: HashMap::new(),
-            material_assets: HashMap::new(),
-            shader_assets: HashMap::new(),
+            material_assets: Arc::new(PreparedMaterialAssets::default()),
             levels: Vec::new(),
             particles: Vec::new(),
         };
@@ -7227,6 +7681,7 @@ return Gun
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
         }))
     }
@@ -7632,11 +8087,9 @@ return Gun
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
-            models: HashMap::new(),
-            textures: HashMap::new(),
-            material_assets: HashMap::new(),
-            shader_assets: HashMap::new(),
+            material_assets: Arc::new(PreparedMaterialAssets::default()),
             levels: Vec::new(),
             particles: Vec::new(),
         };

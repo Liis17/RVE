@@ -2957,7 +2957,7 @@ impl ScriptTransaction {
             return Err("object has no mesh_renderer".to_owned());
         }
         let world = self.world().ok_or("material changes need a live world")?;
-        if let Some(problem) = world.mesh_material_path_problem(&path) {
+        if let Some(problem) = world.mesh_material_path_problem_for(handle, &path) {
             return Err(problem);
         }
         self.component_writes

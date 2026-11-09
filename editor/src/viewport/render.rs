@@ -1453,26 +1453,7 @@ impl SceneRenderer {
         play_bridge: Option<&AnimationBridge>,
         capture_eye: Option<Vec3>,
     ) -> Result<(), RenderError> {
-        let mut active_asset_paths = world
-            .objects()
-            .iter()
-            .filter_map(|object| object.mesh_renderer.as_ref())
-            .flat_map(|mesh| mesh.materials.iter().flatten())
-            .map(|path| path.as_str().to_owned())
-            .collect::<HashSet<_>>();
-        // Все объявленные `.rvemat` готовятся, а не только слоты: скрипт назначает их через set_material.
-        active_asset_paths.extend(
-            world
-                .asset_paths()
-                .iter()
-                .filter(|path| path.as_str().to_ascii_lowercase().ends_with(".rvemat"))
-                .map(|path| path.as_str().to_owned()),
-        );
-        if let Some(path) = preview_asset
-            && path.to_ascii_lowercase().ends_with(".rvemat")
-        {
-            active_asset_paths.insert(path.to_owned());
-        }
+        let active_asset_paths = active_material_paths(world, preview_asset);
         let preview_shader_path =
             preview_asset.filter(|path| path.to_ascii_lowercase().ends_with(".rveshader"));
         let asset_materials = self.prepare_asset_materials(
@@ -3286,6 +3267,37 @@ fn materials_using_shader(
     paths
 }
 
+fn active_material_paths(world: &World, preview_asset: Option<&str>) -> HashSet<String> {
+    let mut paths = world
+        .objects()
+        .iter()
+        .filter_map(|object| object.mesh_renderer.as_ref())
+        .flat_map(|mesh| mesh.materials.iter().flatten())
+        .map(|path| path.as_str().to_owned())
+        .collect::<HashSet<_>>();
+    // Все объявленные `.rvemat` готовятся, а не только слоты: скрипт назначает их через set_material.
+    paths.extend(
+        world
+            .asset_paths()
+            .iter()
+            .filter(|path| path.as_str().to_ascii_lowercase().ends_with(".rvemat"))
+            .map(|path| path.as_str().to_owned()),
+    );
+    paths.extend(
+        world
+            .objects()
+            .iter()
+            .filter_map(|object| world.mesh_material_path(object.handle))
+            .map(|path| path.as_str().to_owned()),
+    );
+    if let Some(path) = preview_asset
+        && path.to_ascii_lowercase().ends_with(".rvemat")
+    {
+        paths.insert(path.to_owned());
+    }
+    paths
+}
+
 /// Шейдеры без ссылок из материалов. Шейдер превью исключается: его материал создаётся позже
 /// в том же кадре, и уничтожение заставило бы компилировать шейдер заново.
 fn unused_surface_shaders<T: Copy + Eq + Hash>(
@@ -3303,7 +3315,9 @@ fn unused_surface_shaders<T: Copy + Eq + Hash>(
 mod tests {
     use super::*;
     use engine_files::VirtualPath;
-    use engine_scene::{EnvironmentComponent, LodLevel, ProceduralSkyComponent};
+    use engine_scene::{
+        EnvironmentComponent, LodLevel, PrefabTemplate, ProceduralSkyComponent, SpawnOptions,
+    };
 
     #[test]
     fn hot_reload_rebuilds_only_new_revisions_that_have_not_failed() {
@@ -3348,6 +3362,32 @@ mod tests {
         let referenced = HashSet::from([3_usize]);
         let retired = unused_surface_shaders(loaded, &referenced, Some("/s/preview.rveshader"));
         assert_eq!(retired, [("/s/unused.rveshader".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn spawned_prefab_material_is_active_for_play_rendering() {
+        let document = engine_scene::SceneDocument::parse(
+            "materials.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let prefab_path = VirtualPath::parse("prefabs/crate.rveprefab").unwrap();
+        let prefab = PrefabTemplate::load(&prefab_path, &mut |_| {
+            Ok("[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n".to_owned())
+        })
+        .unwrap();
+        let handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &prefab,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let material = VirtualPath::parse("/materials/gold.rvemat").unwrap();
+        world.set_mesh_material_path(handles[0], material).unwrap();
+
+        assert!(active_material_paths(&world, None).contains("materials/gold.rvemat"));
     }
 
     fn camera() -> Camera {

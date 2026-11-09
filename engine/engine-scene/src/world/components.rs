@@ -290,14 +290,14 @@ impl World {
         Ok(())
     }
 
-    /// Заменяет материал всех частей меш-рендерера на `.rvemat` из `[[assets]]` сцены. Путь
-    /// проверяется здесь, поэтому отказ не меняет мир.
+    /// Заменяет материал всех частей меш-рендерера на объявленный `.rvemat` сцены или prefab.
+    /// Путь проверяется здесь, поэтому отказ не меняет мир.
     pub fn set_mesh_material_path(
         &mut self,
         handle: ObjectHandle,
         path: VirtualPath,
     ) -> Result<(), SceneError> {
-        if let Some(problem) = self.mesh_material_path_problem(&path) {
+        if let Some(problem) = self.mesh_material_path_problem_for(handle, &path) {
             return Err(self.handle_error(handle, problem));
         }
         let index = self.live_index_or_error(handle)?;
@@ -309,10 +309,28 @@ impl World {
         Ok(())
     }
 
-    /// Причина отказа для пути материала скрипта: файл должен быть объявлен в `[[assets]]` сцены
-    /// и иметь расширение `.rvemat`, как слот материала в сцене.
+    /// Причина отказа для пути материала скрипта, объявленного в `[[assets]]` сцены.
     pub fn mesh_material_path_problem(&self, path: &VirtualPath) -> Option<String> {
-        if !self.asset_paths.contains(path) {
+        self.material_path_problem(path, self.asset_paths.contains(path))
+    }
+
+    /// Причина отказа для пути материала объекта: учитывает общие ассеты сцены и ассеты prefab,
+    /// которому принадлежит объект.
+    pub fn mesh_material_path_problem_for(
+        &self,
+        handle: ObjectHandle,
+        path: &VirtualPath,
+    ) -> Option<String> {
+        let declared = self.asset_paths.contains(path)
+            || self
+                .spawned_material_paths
+                .get(&handle)
+                .is_some_and(|paths| paths.contains(path));
+        self.material_path_problem(path, declared)
+    }
+
+    fn material_path_problem(&self, path: &VirtualPath, declared: bool) -> Option<String> {
+        if !declared {
             return Some(format!(
                 "материал /{} не объявлен в [[assets]]",
                 path.as_str()
