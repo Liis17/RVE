@@ -685,12 +685,12 @@ impl World {
         Ok(())
     }
 
-    /// Проверяет и заменяет коллайдер существующего объекта. Только примитивы: mesh-формы
+    /// Проверяет коллайдер существующего объекта без записи. Только примитивы: mesh-формы
     /// строятся из модели при загрузке сцены и не задаются из скрипта.
-    pub fn set_collider(
-        &mut self,
+    pub fn check_collider(
+        &self,
         handle: ObjectHandle,
-        collider: ColliderComponent,
+        collider: &ColliderComponent,
     ) -> Result<(), SceneError> {
         let index = self.live_index_or_error(handle)?;
         if self.objects[index].collider.is_none() {
@@ -723,15 +723,27 @@ impl World {
                 "collider требует конечные размеры > 0 у box/sphere/capsule, трение >= 0 и restitution в [0, 1]",
             ));
         }
+        Ok(())
+    }
+
+    /// Проверяет и заменяет коллайдер существующего объекта.
+    pub fn set_collider(
+        &mut self,
+        handle: ObjectHandle,
+        collider: ColliderComponent,
+    ) -> Result<(), SceneError> {
+        self.check_collider(handle, &collider)?;
+        let index = self.live_index_or_error(handle)?;
         self.objects[index].collider = Some(collider);
         Ok(())
     }
 
-    /// Проверяет и заменяет rigid body существующего объекта с коллайдером.
-    pub fn set_rigid_body(
-        &mut self,
+    /// Проверяет rigid body существующего объекта с коллайдером без записи. Dynamic проверяется
+    /// по текущему родителю, поэтому заявка `SetParent` в том же вызове должна идти через копию мира.
+    pub fn check_rigid_body(
+        &self,
         handle: ObjectHandle,
-        body: RigidBodyComponent,
+        body: &RigidBodyComponent,
     ) -> Result<(), SceneError> {
         let index = self.live_index_or_error(handle)?;
         if self.objects[index].rigid_body.is_none() {
@@ -760,15 +772,26 @@ impl World {
                 self.component_error(index, "dynamic rigid body должен быть корневым объектом")
             );
         }
+        Ok(())
+    }
+
+    /// Проверяет и заменяет rigid body существующего объекта с коллайдером.
+    pub fn set_rigid_body(
+        &mut self,
+        handle: ObjectHandle,
+        body: RigidBodyComponent,
+    ) -> Result<(), SceneError> {
+        self.check_rigid_body(handle, &body)?;
+        let index = self.live_index_or_error(handle)?;
         self.objects[index].rigid_body = Some(body);
         Ok(())
     }
 
-    /// Проверяет и заменяет character controller существующего объекта.
-    pub fn set_character_controller(
-        &mut self,
+    /// Проверяет character controller существующего объекта без записи.
+    pub fn check_character_controller(
+        &self,
         handle: ObjectHandle,
-        controller: CharacterControllerComponent,
+        controller: &CharacterControllerComponent,
     ) -> Result<(), SceneError> {
         let index = self.live_index_or_error(handle)?;
         if self.objects[index].character_controller.is_none() {
@@ -803,6 +826,17 @@ impl World {
                 "character_controller требует положительные radius/height, slope в (0, 90) и остальные значения >= 0",
             ));
         }
+        Ok(())
+    }
+
+    /// Проверяет и заменяет character controller существующего объекта.
+    pub fn set_character_controller(
+        &mut self,
+        handle: ObjectHandle,
+        controller: CharacterControllerComponent,
+    ) -> Result<(), SceneError> {
+        self.check_character_controller(handle, &controller)?;
+        let index = self.live_index_or_error(handle)?;
         self.objects[index].character_controller = Some(controller);
         Ok(())
     }

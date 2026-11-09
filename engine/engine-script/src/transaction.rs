@@ -1565,8 +1565,8 @@ impl ScriptTransaction {
 
     /// Проверяет заявки до записи в мир: любая отказавшая заявка отбрасывает весь вызов.
     ///
-    /// Тег, слой и мировая поза проверяются на текущем мире без копии, если вызов не меняет
-    /// активность и родителя и каждая проверка видит тех же предков, что и запись (см.
+    /// Тег, слой, мировая поза и компоненты проверяются на текущем мире без копии, если вызов не
+    /// меняет активность и родителя и каждая проверка видит тех же предков, что и запись (см.
     /// `pose_edits_are_local`). Во всех остальных случаях заявки применяются к копии мира в том же
     /// порядке, что и коммит. Собственные трансформы объектов от этого не зависят. Смена активной
     /// камеры конфликтует только с активностью и родителем, поэтому сама копию не требует.
@@ -1574,18 +1574,32 @@ impl ScriptTransaction {
         if self.pending_edits.is_empty() && !self.has_component_writes() {
             return Ok(());
         }
-        // Компоненты проверяет мир при записи, поэтому их заявки идут через копию мира.
-        let local_only = !self.has_component_writes()
-            && self.pending_edits.iter().all(|edit| {
-                !matches!(
-                    edit,
-                    ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
-                )
-            })
-            && self.pose_edits_are_local(world);
+        // Компонентные проверки зависят только от объекта и его родителя, поэтому без смены активности
+        // и родителя проверяются на текущем мире, как и позы.
+        let local_only = self.pending_edits.iter().all(|edit| {
+            !matches!(
+                edit,
+                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
+            )
+        }) && self.pose_edits_are_local(world);
         if !local_only {
             let mut probe = world.clone();
             return self.apply_world_writes(&mut probe);
+        }
+        for (handle, collider) in &self.pending_colliders {
+            world
+                .check_collider(*handle, collider)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, body) in &self.pending_rigid_bodies {
+            world
+                .check_rigid_body(*handle, body)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, controller) in &self.pending_controllers {
+            world
+                .check_character_controller(*handle, controller)
+                .map_err(|error| error.to_string())?;
         }
         for edit in &self.pending_edits {
             match edit {

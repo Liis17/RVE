@@ -838,6 +838,7 @@ fn sdk_module() -> &'static RveModule {
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
         "PhysicsProbe" => physics_probe_factory,
+        "JumpProbe" => jump_probe_factory,
         "AudioProbe" => audio_probe_factory,
         "AudioRejected" => audio_rejected_factory,
         "RumbleProbe" => rumble_probe_factory,
@@ -4371,4 +4372,146 @@ radius = 0.5
             .all(|event| event.level != ScriptEventLevel::Error),
         "v16 instance must keep running"
     );
+}
+
+/// Прыжок и вертикальная скорость через ABI; та же последовательность, что у Lua-скрипта
+/// `JUMP_LUA` в паритете прыжка.
+struct JumpProbe {
+    jumped: bool,
+}
+
+fn jump_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(JumpProbe { jumped: false }))
+}
+
+impl Script for JumpProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let player = ctx.find("player").expect("player exists");
+        if !self.jumped && player.is_grounded(ctx).unwrap() {
+            assert!(player.jump(ctx).unwrap());
+            self.jumped = true;
+            ctx.log_info("jump");
+        }
+        let vertical = player.vertical_velocity(ctx).unwrap();
+        ctx.log_info(format!("v {vertical:.4}"));
+        player.simple_move(ctx, [0.0; 3]).unwrap();
+    }
+}
+
+const JUMP_LUA: &str = r#"
+local Script = {}
+local jumped = false
+function Script:on_update()
+  local player = rve.find("player")
+  if not jumped and player:is_grounded() then
+    assert(player:jump())
+    jumped = true
+    rve.log("jump")
+  end
+  rve.log(string.format("v %.4f", player:vertical_velocity()))
+  player:simple_move({x=0, y=0, z=0})
+end
+return Script
+"#;
+
+fn jump_parity_scene(assets: &str, attach: &str) -> String {
+    format!(
+        r#"
+{assets}[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "floor"
+[objects.transform]
+position = [0.0, -0.5, 0.0]
+[objects.collider]
+shape = "box"
+half_extents = [10.0, 0.5, 10.0]
+[[objects]]
+id = "player"
+[objects.transform]
+position = [0.0, 0.8, 0.0]
+[objects.character_controller]
+radius = 0.3
+height = 1.0
+step_height = 0.0
+use_gravity = true
+jump_height = 1.0
+{attach}
+"#
+    )
+}
+
+fn run_jump_parity(
+    scene: &str,
+    lua: &[(&str, &str)],
+    library: Option<&crate::ScriptLibrary>,
+) -> Vec<String> {
+    let mut world = world(scene);
+    let (mut driver, bindings) =
+        PhysicsSceneDesc::from_world(&world, &[], glam::Vec3::new(0.0, -9.81, 0.0), 60, 8)
+            .unwrap()
+            .build()
+            .unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host = ScriptHost::load(&world, "scene", &sources(lua), library).unwrap();
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 0,
+        },
+    );
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    let mut messages = Vec::new();
+    for frame in 1..=240_u64 {
+        let time = ScriptTime {
+            elapsed: frame as f64 / 60.0,
+            frame,
+        };
+        host.update(&mut world, 1.0 / 60.0, time);
+        messages.extend(message_list(&mut host));
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+        host.queue_physics_events(result.events);
+    }
+    messages
+}
+
+#[test]
+fn lua_and_abi_jump_and_vertical_velocity_follow_the_same_trace() {
+    let _lock = test_lock();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(sdk_module())) }.unwrap();
+    let lua = run_jump_parity(
+        &jump_parity_scene(
+            "[[assets]]
+path = \"/jump.lua\"
+",
+            "[[objects.lite_scripts]]\npath = \"/jump.lua\"",
+        ),
+        &[("jump.lua", JUMP_LUA)],
+        None,
+    );
+    let abi = run_jump_parity(
+        &jump_parity_scene(
+            "",
+            "[[objects.heavy_scripts]]\nname = \"JumpProbe\"\nparams = {}",
+        ),
+        &[],
+        Some(&library),
+    );
+    let trace = |messages: &[String]| {
+        messages
+            .iter()
+            .filter(|message| *message == "jump" || message.starts_with("v "))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(lua.iter().any(|message| message == "jump"), "{lua:?}");
+    assert_eq!(trace(&lua), trace(&abi));
 }

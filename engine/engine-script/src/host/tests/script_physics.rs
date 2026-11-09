@@ -769,3 +769,159 @@ fn trigger_stay_skips_partners_deactivated_or_destroyed_while_the_snapshot_is_st
         "destroyed partner must not get on_trigger_stay"
     );
 }
+
+const ROLLBACK_BODY_SCENE: &str = r#"
+[[assets]]
+path = "/rollback_body.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "crate"
+[objects.collider]
+shape = "box"
+half_extents = [0.5, 0.5, 0.5]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+[[objects.lite_scripts]]
+path = "/rollback_body.lua"
+[[objects]]
+id = "player"
+[objects.transform]
+position = [3.0, 0.0, 0.0]
+[objects.character_controller]
+radius = 0.3
+height = 1.0
+use_gravity = false
+"#;
+
+#[test]
+fn failed_callback_discards_rigid_body_and_controller_writes() {
+    let script = r#"
+local Script = {}
+function Script:on_update()
+  assert(rve.find("crate"):set_rigid_body({kind="kinematic", mass=3.0}))
+  assert(rve.find("player"):set_controller({radius=0.5}))
+  error("rollback body mutation")
+end
+return Script
+"#;
+    let mut scene = Loop::new(ROLLBACK_BODY_SCENE, &[("rollback_body.lua", script)]);
+    let messages = scene.step();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("rollback body mutation")),
+        "{messages:?}"
+    );
+
+    let crate_handle = scene.handle("crate");
+    let crate_object = scene.world.object(crate_handle).unwrap();
+    assert_eq!(
+        crate_object.rigid_body.unwrap().kind,
+        engine_scene::RigidBodyKind::Dynamic
+    );
+    assert_eq!(crate_object.rigid_body.unwrap().mass, 1.0);
+    let player = scene.world.object(scene.handle("player")).unwrap();
+    assert_eq!(player.character_controller.unwrap().radius, 0.3);
+    let body = scene
+        .sync
+        .bindings()
+        .iter()
+        .find(|binding| binding.object == crate_handle)
+        .unwrap()
+        .body;
+    let state = scene
+        .driver
+        .world()
+        .query_snapshot()
+        .unwrap()
+        .body_state(body)
+        .unwrap();
+    assert_eq!(state.body_kind, engine_physics::BodyKind::Dynamic);
+}
+
+const INACTIVE_LAYER_SCENE: &str = r#"
+[[assets]]
+path = "/inactive_layer.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "crate"
+active = false
+[objects.transform]
+position = [0.0, 5.0, 0.0]
+[objects.collider]
+shape = "box"
+half_extents = [0.5, 0.5, 0.5]
+[objects.rigid_body]
+kind = "dynamic"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/inactive_layer.lua"
+"#;
+
+#[test]
+fn reactivated_object_takes_layer_and_shape_written_while_inactive() {
+    let script = r#"
+local Script = {}
+local done = false
+function Script:on_update()
+  if done then return end
+  done = true
+  local crate = rve.find("crate")
+  rve.log("layer " .. tostring(crate:set_layer(2)))
+  rve.log("shape " .. tostring(crate:set_collider({shape="sphere", radius=0.25})))
+end
+return Script
+"#;
+    let mut scene = Loop::new(INACTIVE_LAYER_SCENE, &[("inactive_layer.lua", script)]);
+    assert_eq!(scene.step(), ["layer true", "shape true"]);
+
+    let crate_handle = scene.handle("crate");
+    scene
+        .world
+        .apply_edit(&ObjectEdit::SetActive {
+            object: crate_handle,
+            active: true,
+        })
+        .unwrap();
+    let changes = scene
+        .sync
+        .insert_objects(
+            &scene.world,
+            &[crate_handle],
+            &[],
+            &mut ShapeCache::default(),
+        )
+        .unwrap();
+    scene
+        .driver
+        .advance_step_with_changes(DT, changes, [])
+        .unwrap();
+
+    let probe = |layer_mask: u32, x: f32| {
+        let snapshot = scene.driver.world().query_snapshot().unwrap();
+        !snapshot
+            .overlap(
+                &Shape::sphere(0.05).unwrap(),
+                Pose::new(Vec3::new(x, 5.0, 0.0), Quat::IDENTITY).unwrap(),
+                QueryFilter {
+                    layer_mask,
+                    ..QueryFilter::default()
+                },
+                QueryOverrides::default(),
+            )
+            .unwrap()
+            .is_empty()
+    };
+    assert!(probe(1 << 2, 0.2), "the body moved to layer 2");
+    assert!(!probe(1 << 0, 0.2), "the body is not on layer 0 anymore");
+    assert!(
+        !probe(1 << 2, 0.4),
+        "the sphere written while inactive replaces the box"
+    );
+}
