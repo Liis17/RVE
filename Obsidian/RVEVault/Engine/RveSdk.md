@@ -120,6 +120,6 @@ Cursor — физические пиксели окна; до первого `Cu
 
 `engine/rve-sdk/Cargo.toml`, `engine/rve-sdk/src/abi.rs`, `engine/rve-sdk/src/lib.rs`.
 
-## UI callback ABI v15
+## UI callback ABI v19
 
-ABI v15 добавляет nullable UI host-callbacks после screen-shader хвоста `RveHost` и nullable `ui_event` в конец `RveScriptDesc`; ABI v13 и v14 читаются как `RveScriptDescV13`, без UI callback. Host без UI оставляет UI callbacks null. В payload события есть canvas/element handle, id, код вида события и tagged value; его строки и указатели действуют только во время callback. Версия определяется `RVE_SCRIPT_ABI_VERSION` в `engine/rve-sdk/src/abi.rs`; `rve-sdk.toml` — marker переносимого SDK, обновляемый `rve-build sdk`. Высокоуровневый контракт — [[Engine/EngineGui]] и [[Engine/EngineScript]].
+ABI v19 добавляет nullable UI host-callbacks в хвост `RveHost` и nullable `ui_event` в конец `RveScriptDesc`. Модули ABI v3–v18 продолжают загружаться без UI callback; для ABI v16–v18 загрузчик использует прежний дескриптор `RveScriptDescV18`. Host без UI оставляет UI callbacks null. В payload события есть canvas/element handle, id, код вида события и tagged value; его строки и указатели действуют только во время callback. Версия определяется `RVE_SCRIPT_ABI_VERSION` в `engine/rve-sdk/src/abi.rs`; `rve-sdk.toml` — marker переносимого SDK, обновляемый `rve-build sdk`. Высокоуровневый контракт — [[Engine/EngineGui]] и [[Engine/EngineScript]].
