@@ -342,3 +342,77 @@ fn particle_playing_flag_reaches_the_frame_and_commands_are_checked() {
             .is_err()
     );
 }
+
+const MATERIAL_SCENE: &str = "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[assets]]\npath = \"/materials/gold.toml\"\n\
+[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n\
+[[objects]]\nid = \"marker\"\n";
+
+fn material_world() -> World {
+    World::from_document(&SceneDocument::parse("material.rvescene", MATERIAL_SCENE).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn material_path_must_be_a_declared_rvemat_asset_and_marks_the_object_for_upload() {
+    use engine_files::VirtualPath;
+    let mut world = material_world();
+    let crate_handle = handle(&world, "crate");
+    assert_eq!(world.mesh_material_revision(crate_handle), Some(0));
+
+    let gold = VirtualPath::parse("/materials/gold.rvemat").unwrap();
+    world
+        .set_mesh_material_path(crate_handle, gold.clone())
+        .unwrap();
+    assert_eq!(world.mesh_material_path(crate_handle), Some(&gold));
+    assert_eq!(world.mesh_material_revision(crate_handle), Some(1));
+    assert_eq!(world.take_mesh_material_changes(), vec![crate_handle]);
+    assert!(world.take_mesh_material_changes().is_empty());
+
+    let undeclared = VirtualPath::parse("/materials/silver.rvemat").unwrap();
+    let error = world
+        .set_mesh_material_path(crate_handle, undeclared)
+        .unwrap_err();
+    assert!(error.to_string().contains("не объявлен"), "{error}");
+    let wrong_extension = VirtualPath::parse("/materials/gold.toml").unwrap();
+    let error = world
+        .set_mesh_material_path(crate_handle, wrong_extension)
+        .unwrap_err();
+    assert!(error.to_string().contains(".rvemat"), "{error}");
+    assert_eq!(world.mesh_material_path(crate_handle), Some(&gold));
+    assert_eq!(world.mesh_material_revision(crate_handle), Some(1));
+    assert!(world.take_mesh_material_changes().is_empty());
+}
+
+#[test]
+fn material_params_and_path_need_a_mesh_renderer_and_bump_the_revision_per_change() {
+    use super::MeshMaterialParams;
+    use engine_files::VirtualPath;
+    let mut world = material_world();
+    let crate_handle = handle(&world, "crate");
+    let marker = handle(&world, "marker");
+    let gold = VirtualPath::parse("/materials/gold.rvemat").unwrap();
+    assert!(world.set_mesh_material_path(marker, gold).is_err());
+    assert!(
+        world
+            .set_mesh_material_params(marker, MeshMaterialParams::default())
+            .is_err()
+    );
+    assert_eq!(world.mesh_material_revision(marker), Some(0));
+    assert!(world.take_mesh_material_changes().is_empty());
+
+    for roughness in [0.25, 0.5] {
+        world
+            .set_mesh_material_params(
+                crate_handle,
+                MeshMaterialParams {
+                    roughness: Some(roughness),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(world.mesh_material_revision(crate_handle), Some(2));
+    // Два изменения одного объекта дают одну запись: загрузка идёт по текущему состоянию.
+    assert_eq!(world.take_mesh_material_changes(), vec![crate_handle]);
+}

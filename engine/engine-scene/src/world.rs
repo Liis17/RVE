@@ -257,6 +257,11 @@ pub struct WorldObject {
     pub mesh_visible: bool,
     pub light_enabled: bool,
     pub particles_playing: bool,
+    /// Путь `.rvemat`, которым скрипт заменил материал всех частей меш-рендерера; `None` — материал
+    /// сцены.
+    pub mesh_material_path: Option<VirtualPath>,
+    /// Ревизия материала меш-рендерера: растёт при каждом изменении, которое надо загрузить в GPU.
+    pub mesh_material_revision: u64,
 }
 
 /// Параметры света для потребителя кадра.
@@ -397,6 +402,8 @@ pub struct World {
     spawn_serial: u64,
     /// Объекты, у которых действующая активность изменилась; см. [`World::take_activity_changes`].
     activity_changes: Vec<ObjectHandle>,
+    /// Объекты, у которых сменились материалы меш-рендерера; см. [`World::take_mesh_material_changes`].
+    mesh_material_changes: Vec<ObjectHandle>,
 }
 
 impl World {
@@ -499,6 +506,7 @@ impl World {
             last_valid_environment: None,
             spawn_serial: 0,
             activity_changes: Vec::new(),
+            mesh_material_changes: Vec::new(),
         };
         let _ = world.build_frame();
         Ok(world)
@@ -1602,6 +1610,8 @@ fn world_object(
         mesh_visible: true,
         light_enabled: true,
         particles_playing: true,
+        mesh_material_path: None,
+        mesh_material_revision: 0,
     }
 }
 

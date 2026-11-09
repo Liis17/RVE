@@ -11,6 +11,8 @@ use crate::document::{
     DirectionalLightComponent, PointLightComponent, ProceduralSkyComponent, SpotLightComponent,
 };
 use crate::{SceneError, light::MAX_SHADOW_CASCADES};
+use engine_files::VirtualPath;
+use std::collections::HashSet;
 
 /// Наибольший одноразовый выброс частиц за вызов.
 pub const MAX_PARTICLE_BURST: u32 = 4096;
@@ -285,7 +287,74 @@ impl World {
         if params.roughness.is_some() {
             material.roughness = params.roughness;
         }
+        self.mark_mesh_material_changed(handle);
         Ok(())
+    }
+
+    /// Заменяет материал всех частей меш-рендерера на `.rvemat` из `[[assets]]` сцены. Путь
+    /// проверяется здесь, поэтому отказ не меняет мир.
+    pub fn set_mesh_material_path(
+        &mut self,
+        handle: ObjectHandle,
+        path: VirtualPath,
+    ) -> Result<(), SceneError> {
+        if let Some(problem) = self.mesh_material_path_problem(&path) {
+            return Err(self.handle_error(handle, problem));
+        }
+        let index = self.live_index_or_error(handle)?;
+        if self.objects[index].mesh_renderer.is_none() {
+            return Err(self.handle_error(handle, "у объекта нет mesh_renderer"));
+        }
+        self.objects[index].mesh_material_path = Some(path);
+        self.mark_mesh_material_changed(handle);
+        Ok(())
+    }
+
+    /// Причина отказа для пути материала скрипта: файл должен быть объявлен в `[[assets]]` сцены
+    /// и иметь расширение `.rvemat`, как слот материала в сцене.
+    pub fn mesh_material_path_problem(&self, path: &VirtualPath) -> Option<String> {
+        if !self.asset_paths.contains(path) {
+            return Some(format!(
+                "материал /{} не объявлен в [[assets]]",
+                path.as_str()
+            ));
+        }
+        if !path.as_str().to_ascii_lowercase().ends_with(".rvemat") {
+            return Some(format!(
+                "материал /{} должен иметь расширение .rvemat",
+                path.as_str()
+            ));
+        }
+        None
+    }
+
+    /// Путь материала, которым скрипт заменил меш-рендерер объекта; `None` — материал сцены.
+    pub fn mesh_material_path(&self, handle: ObjectHandle) -> Option<&VirtualPath> {
+        self.object(handle)?.mesh_material_path.as_ref()
+    }
+
+    /// Ревизия материала меш-рендерера; растёт при каждом изменении, которое нужно загрузить в GPU.
+    pub fn mesh_material_revision(&self, handle: ObjectHandle) -> Option<u64> {
+        Some(self.object(handle)?.mesh_material_revision)
+    }
+
+    /// Объекты, у которых материал меш-рендерера изменился с последнего вызова. Мёртвые хендлы
+    /// и повторы пропускаются.
+    pub fn take_mesh_material_changes(&mut self) -> Vec<ObjectHandle> {
+        let changes = std::mem::take(&mut self.mesh_material_changes);
+        let mut seen = HashSet::with_capacity(changes.len());
+        changes
+            .into_iter()
+            .filter(|&handle| self.is_alive(handle) && seen.insert(handle))
+            .collect()
+    }
+
+    fn mark_mesh_material_changed(&mut self, handle: ObjectHandle) {
+        if let Some(index) = self.dense(handle) {
+            let object = &mut self.objects[index];
+            object.mesh_material_revision += 1;
+            self.mesh_material_changes.push(handle);
+        }
     }
 
     /// Запускает или останавливает рождение частиц. Симуляция живых частиц продолжается.
