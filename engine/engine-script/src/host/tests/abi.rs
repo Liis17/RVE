@@ -1,10 +1,10 @@
 use super::{sources, world};
-use crate::ScriptTime;
 use crate::host::{ScriptHost, ScriptLoadError};
 use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec};
 use crate::transaction::{MAX_MESSAGE_NAME_BYTES, MAX_MESSAGES_PER_FRAME};
 use crate::types::ScriptEventLevel;
 use crate::ui::owner_key;
+use crate::{ScriptFrameTime, ScriptTime};
 use engine_files::VirtualPath;
 use engine_gui::document::UiDocument;
 use engine_gui::system::UiCanvasHandle;
@@ -19,7 +19,8 @@ use rve_sdk::abi::{
     RVE_SPAWN_HAS_PARENT, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCreateFn, RveHeader, RveHost,
     RveModule, RveParamDescV13, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3,
     RveScriptDescV4, RveScriptDescV6, RveScriptDescV13, RveScriptDescV15, RveScriptDescV16,
-    RveSpawnOptions, RveStatus, RveStr, RveTransform, RveUpdateFn, RveValue,
+    RveScriptDescV17, RveScriptDescV19, RveSpawnOptions, RveStatus, RveStr, RveTransform,
+    RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
@@ -817,6 +818,7 @@ impl Script for TeardownProbe {
 
 /// Reads prefab states and requests from `on_start`.
 struct PrefabProbe;
+struct ClockProbe;
 
 fn prefab_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(PrefabProbe))
@@ -833,6 +835,54 @@ impl Script for PrefabProbe {
         ctx.log_info(format!(
             "resident={resident:?} unknown={unknown:?} heavy={heavy:?} load={loaded} rejected={rejected}"
         ));
+    }
+}
+
+fn clock_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ClockProbe))
+}
+
+impl Script for ClockProbe {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let time = ctx.script_time();
+        assert_eq!(time.dt, 0.25);
+        assert_eq!(time.unscaled_dt, 0.25);
+        assert_eq!(time.elapsed, 0.25);
+        assert_eq!(time.unscaled_elapsed, 0.25);
+        assert_eq!(time.fixed_dt, 0.1);
+        assert_eq!(time.scale, 1.0);
+        assert_eq!(time.frame, 1);
+        assert!(ctx.send("runner", "snapshot", &Value::Bool(true)));
+        ctx.schedule(0.0, None, "pulse").unwrap();
+    }
+
+    fn on_fixed_update(&mut self, ctx: &mut Context<'_>, dt: f32) {
+        assert_eq!(dt, 0.1);
+        assert_eq!(ctx.script_time().dt, dt);
+        ctx.log_info("fixed");
+    }
+
+    fn on_update(&mut self, ctx: &mut Context<'_>, dt: f32) {
+        assert_eq!(dt, 0.25);
+        assert_eq!(ctx.script_time().dt, dt);
+        ctx.log_info("update");
+        ctx.set_time_scale(0.0).unwrap();
+    }
+
+    fn on_message(&mut self, ctx: &mut Context<'_>, _: &str, name: &str, _: &Value) {
+        assert_eq!(name, "snapshot");
+        ctx.log_info("message");
+    }
+
+    fn on_timer(&mut self, ctx: &mut Context<'_>, tag: &str) {
+        assert_eq!(tag, "pulse");
+        ctx.log_info("timer");
+    }
+
+    fn on_late_update(&mut self, ctx: &mut Context<'_>, dt: f32) {
+        assert_eq!(dt, 0.25);
+        assert_eq!(ctx.script_time().dt, dt);
+        ctx.log_info("late");
     }
 }
 
@@ -855,6 +905,7 @@ fn sdk_module() -> &'static RveModule {
         "BoltProbe" => bolt_probe_factory,
         "TeardownProbe" => teardown_probe_factory,
         "PrefabProbe" => prefab_probe_factory,
+        "ClockProbe" => clock_probe_factory,
         "DeadHandleProbe" => dead_handle_probe_factory,
         "ExitWatcher" => exit_watcher_factory,
         "CameraControl" => camera_control_factory,
@@ -2393,6 +2444,94 @@ fn matching_version_rejects_an_invalid_header_size_before_reading_the_table() {
 }
 
 #[test]
+fn abi_v19_module_uses_its_exact_descriptor_layout_on_a_v20_host() {
+    let current = sdk_module();
+    // SAFETY: the SDK macro owns an immutable descriptor table for the process lifetime.
+    let current_descriptors =
+        unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV19] = Box::leak(
+        current_descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV19 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 19,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }));
+    // SAFETY: the module and exact-sized v19 descriptor array are leaked for the test lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert_eq!(library.abi_version(), 19);
+    let descriptor = library.script("Probe").unwrap();
+    assert!(descriptor.on_fixed_update.is_none());
+    assert!(descriptor.on_late_update.is_none());
+    assert!(descriptor.on_timer.is_none());
+
+    let mut world = scripted_world("Probe", r#"{ label = "abi19" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:abi19"),
+        "ABI v19 descriptors remain readable on the ABI v20 host"
+    );
+}
+
+#[test]
+fn abi_v20_fixed_update_message_timer_and_late_update_share_lua_phase_order() {
+    let library = library();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "runner"
+[[objects.heavy_scripts]]
+name = "ClockProbe"
+params = {}
+"#,
+    );
+    let mut host = load_host(&world, &library);
+    host.set_fixed_step_config(10, 2).unwrap();
+    host.update_frame(
+        &mut world,
+        ScriptFrameTime::advance(0.25, 1.0, 0.0, 0.0, 0.1, 1),
+    );
+
+    assert_eq!(
+        message_list(&mut host),
+        ["fixed", "fixed", "update", "message", "timer", "late"]
+    );
+    assert_eq!(host.time_scale(), 0.0);
+}
+
+#[test]
 fn abi_guest_reads_the_script_input_snapshot_from_a_module() {
     let _lock = test_lock();
     let mut world = scripted_world("InputProbe", "{}");
@@ -2560,6 +2699,9 @@ fn null_module() -> &'static RveModule {
         ui_event: None,
         on_enable: None,
         on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2585,6 +2727,9 @@ fn null_name_module() -> &'static RveModule {
         ui_event: None,
         on_enable: None,
         on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2611,6 +2756,9 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         ui_event: None,
         on_enable: None,
         on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3017,6 +3165,9 @@ fn error_message_module() -> &'static RveModule {
             ui_event: None,
             on_enable: None,
             on_disable: None,
+            on_fixed_update: None,
+            on_late_update: None,
+            on_timer: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -3034,6 +3185,9 @@ fn error_message_module() -> &'static RveModule {
             ui_event: None,
             on_enable: None,
             on_disable: None,
+            on_fixed_update: None,
+            on_late_update: None,
+            on_timer: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -3067,6 +3221,9 @@ fn set_local_during_create_module() -> &'static RveModule {
         ui_event: None,
         on_enable: None,
         on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3089,6 +3246,9 @@ fn poisoned_create_module() -> &'static RveModule {
         ui_event: None,
         on_enable: None,
         on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3205,13 +3365,13 @@ params = { role = "observer" }
     assert_eq!(
         message_list(&mut host),
         [
+            "sender:update",
+            "receiver:update",
+            "observer:update",
             "receiver:ping:sender",
             "sender:fan:sender",
             "receiver:fan:sender",
             "observer:fan:sender",
-            "sender:update",
-            "receiver:update",
-            "observer:update",
         ]
     );
     assert_eq!(
@@ -3234,10 +3394,10 @@ params = { role = "observer" }
     assert_eq!(
         message_list(&mut host),
         [
-            "sender:reply:receiver",
             "sender:update",
             "receiver:update",
             "observer:update",
+            "sender:reply:receiver",
         ]
     );
 }
@@ -3740,6 +3900,9 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         ui_event: None,
         on_enable: None,
         on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
     }]));
     RveModule::new(scripts)
 }
@@ -3822,6 +3985,9 @@ fn malformed_parameter_tables_are_rejected() {
             ui_event: None,
             on_enable: None,
             on_disable: None,
+            on_fixed_update: None,
+            on_late_update: None,
+            on_timer: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -3920,11 +4086,11 @@ fn abi_spawn_is_pending_then_applied_and_starts_before_messages() {
         info_messages(&mut host),
         [
             "start:bolt",
-            "hit:ping",
             "alive=true pending=false",
-            "destroy=true"
+            "destroy=true",
+            "hit:ping"
         ],
-        "on_start runs before the queued message; the spawned object is alive"
+        "the spawned object starts in the next frame, then update precedes its queued message"
     );
 }
 
@@ -3943,11 +4109,11 @@ fn abi_destroy_with_delay_keeps_the_object_until_due_and_dead_handles_warn_once(
     assert!(world.handle("bolt").is_some());
     assert_eq!(info_messages(&mut host), ["alive=true pending=false"]);
 
-    // Removal happens at the end of the phase, so the driver still sees it alive in this update.
+    // Due removal is applied after update and before this frame's queued messages.
     host.update(&mut world, 0.1, at(1.3, 4));
     assert_eq!(
         info_messages(&mut host),
-        ["alive=true pending=false", "bolt destroyed"]
+        ["bolt destroyed", "alive=false pending=false"]
     );
     assert!(world.handle("bolt").is_none());
     let changes = host.drain_world_changes();
@@ -4061,6 +4227,9 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         ui_event: None,
         on_enable: None,
         on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
     }]));
     Box::leak(Box::new(RveModule::new(scripts)))
 }
@@ -4787,10 +4956,10 @@ fn v17_legacy_collision_module() -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
     let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
-    let legacy: &'static [RveScriptDesc] = Box::leak(
+    let legacy: &'static [RveScriptDescV17] = Box::leak(
         descriptors
             .iter()
-            .map(|descriptor| RveScriptDesc {
+            .map(|descriptor| RveScriptDescV17 {
                 name: descriptor.name,
                 create: descriptor.create,
                 start: descriptor.start,
@@ -4815,7 +4984,7 @@ fn v17_legacy_collision_module() -> &'static RveModule {
             abi_version: 17,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
-        scripts: legacy.as_ptr(),
+        scripts: legacy.as_ptr().cast(),
         script_count: legacy.len(),
     }))
 }
@@ -4866,7 +5035,7 @@ radius = 0.5
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v17"),
-        "ABI v17 modules still load on the v19 host"
+        "ABI v17 modules still load on the v20 host"
     );
     host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
     for frame in 1..=5_u64 {
@@ -4901,16 +5070,46 @@ struct JumpProbe {
 }
 
 #[test]
-fn abi_v18_modules_load_on_the_v19_host_with_ui_and_lifecycle_descriptor_tail() {
+fn abi_v18_modules_load_on_the_v20_host_with_ui_and_lifecycle_descriptor_tail() {
     let _lock = test_lock();
     let current = sdk_module();
+    // ABI v18 keeps the exact v17 descriptor size while adding host capabilities.
+    let current_descriptors = unsafe {
+        std::slice::from_raw_parts(
+            current.scripts.cast::<RveScriptDesc>(),
+            current.script_count,
+        )
+    };
+    let legacy: &'static [RveScriptDescV17] = Box::leak(
+        current_descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV17 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
     let module = Box::leak(Box::new(RveModule {
         header: RveHeader {
             abi_version: 18,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
-        scripts: current.scripts,
-        script_count: current.script_count,
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
     }));
     // SAFETY: the module and its descriptor table live for the whole test process.
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
@@ -4955,7 +5154,7 @@ radius = 0.5
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v18"),
-        "guest ABI v18 runs on the v19 host"
+        "guest ABI v18 runs on the v20 host"
     );
     host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
     let mut saw_stay = false;

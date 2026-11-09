@@ -22,6 +22,9 @@ use std::time::Duration;
 #[path = "tests/parity.rs"]
 mod parity;
 
+#[path = "tests/time.rs"]
+mod time;
+
 #[path = "tests/activity.rs"]
 mod activity;
 mod script_physics;
@@ -1172,7 +1175,12 @@ return Script
 
 #[test]
 fn repeated_character_moves_sum_requested_velocity_once_and_zero_dt_creates_none() {
-    fn run(dt: f32, start_x: f32, move_distance: f32) -> (Vec<PhysicsCommand>, Vec3, Option<Vec3>) {
+    fn run(
+        dt: f32,
+        start_x: f32,
+        move_distance: f32,
+        fixed_update: bool,
+    ) -> (Vec<PhysicsCommand>, Vec3, Option<Vec3>) {
         let mut world = world(
             r#"
 [[assets]]
@@ -1240,11 +1248,12 @@ id = "crate"
             requested_displacement += hit.requested_displacement;
             normal_sum += hit.normal * hit.blocked_displacement.length();
         }
+        let phase_dt = if fixed_update { 1.0 / 60.0 } else { dt };
         let expected_impulse = expected_hit.and_then(|mut hit| {
             hit.blocked_displacement = blocked_displacement;
             hit.requested_displacement = requested_displacement;
             hit.normal = normal_sum.normalize_or_zero();
-            controller.push_impulse(&hit, dt)
+            controller.push_impulse(&hit, phase_dt)
         });
         let bindings = [
             PhysicsSceneBinding {
@@ -1260,10 +1269,15 @@ id = "crate"
                 character_controller: None,
             },
         ];
+        let callback = if fixed_update {
+            "on_fixed_update"
+        } else {
+            "on_update"
+        };
         let source = format!(
             r#"
 local Script = {{}}
-function Script:on_update(dt)
+function Script:{callback}(dt)
   local player = rve.find("player")
   player:move({{x={move_distance},y=0,z=0}})
   player:move({{x={move_distance},y=0,z=0}})
@@ -1279,7 +1293,15 @@ return Script
         )
         .unwrap();
         host.set_physics_snapshot(snapshot, &bindings);
-        host.update(&mut world, dt, ScriptTime::default());
+        if fixed_update {
+            host.set_fixed_step_config(60, 1).unwrap();
+            host.update_frame(
+                &mut world,
+                crate::ScriptFrameTime::advance(dt, 1.0, 0.0, 0.0, 1.0 / 60.0, 1),
+            );
+        } else {
+            host.update(&mut world, dt, ScriptTime::default());
+        }
         assert_eq!(hit_count, 2, "move={move_distance}, start={start_x}");
         (
             host.drain_physics_commands(),
@@ -1288,7 +1310,7 @@ return Script
         )
     }
 
-    let (commands, position, expected_impulse) = run(0.03, 0.2, 0.06);
+    let (commands, position, expected_impulse) = run(0.03, 0.2, 0.06, false);
     let pushes = commands
         .iter()
         .filter(|command| {
@@ -1314,7 +1336,7 @@ return Script
     assert!((impulse.x - 4.0).abs() < 1.0e-4, "{impulse:?}");
     assert!(position.x > 0.2 && position.x < 0.25, "{position:?}");
 
-    let (commands, _, expected_impulse) = run(0.03, 0.2, 0.4);
+    let (commands, _, expected_impulse) = run(0.03, 0.2, 0.4, false);
     let pushes = commands
         .iter()
         .filter(|command| {
@@ -1339,10 +1361,25 @@ return Script
     );
 
     for dt in [0.0, 0.5e-6] {
-        let (commands, _, expected_impulse) = run(dt, 0.2, 0.06);
+        let (commands, _, expected_impulse) = run(dt, 0.2, 0.06, false);
         assert!(commands.is_empty(), "dt={dt}");
         assert!(expected_impulse.is_none(), "dt={dt}");
     }
+
+    let (commands, _, expected_impulse) = run(0.03, 0.2, 0.06, true);
+    let pushes = commands
+        .iter()
+        .filter_map(|command| match command {
+            PhysicsCommand::AddImpulse {
+                body: BodyHandle(2),
+                impulse,
+                ..
+            } => Some(*impulse),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pushes.len(), 1);
+    assert!((pushes[0] - expected_impulse.unwrap()).length() < 1.0e-4);
 }
 
 #[test]
@@ -2000,12 +2037,12 @@ return Script
     assert_eq!(
         messages,
         [
-            "before_events",
             "collision_enter",
             "collision_exit:second",
             "trigger_enter:second",
             "trigger_exit:second",
             "update",
+            "before_events",
         ]
     );
 }
@@ -3665,7 +3702,7 @@ return Script
 }
 
 #[test]
-fn lua_messages_from_start_and_on_message_are_delivered_in_order_on_later_updates() {
+fn lua_messages_from_start_and_on_message_follow_update_in_snapshot_order() {
     let mut world = world(
         r#"
 [[assets]]
@@ -3724,13 +3761,13 @@ return Script
     assert_eq!(
         event_messages(&mut host),
         [
+            "sender:update",
+            "receiver:update",
+            "observer:update",
             "receiver:one:sender",
             "sender:fan:sender",
             "receiver:fan:sender",
             "observer:fan:sender",
-            "sender:update",
-            "receiver:update",
-            "observer:update",
         ]
     );
 
@@ -3745,10 +3782,10 @@ return Script
     assert_eq!(
         event_messages(&mut host),
         [
-            "sender:reply:receiver",
             "sender:update",
             "receiver:update",
             "observer:update",
+            "sender:reply:receiver",
         ]
     );
 }
@@ -3862,7 +3899,7 @@ return Script
     );
     assert_eq!(
         event_messages(&mut host),
-        ["message matrix 2", "update matrix 2"]
+        ["update matrix 2", "message matrix 2"]
     );
     assert_eq!(
         world
@@ -4021,9 +4058,16 @@ return Script
             && event.source == "scene/receiver/messages.lua"
             && event.message.contains("target \"missing\" does not exist")
     }));
-    assert!(events.iter().all(|event| {
-        !event.message.contains("receiver update") && !event.message.contains("observer received")
-    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "receiver update")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.message.contains("observer received"))
+    );
 
     host.update(
         &mut world,
@@ -4096,6 +4140,16 @@ return Script
             .iter()
             .any(|event| event.message == "sender remains enabled")
     );
+    assert!(!events.iter().any(|event| event.message == "received 4096"));
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
     assert!(events.iter().any(|event| event.message == "received 4096"));
 }
 

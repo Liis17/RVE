@@ -8,9 +8,9 @@ use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
     ScriptObjectRef, ScriptTransaction,
 };
+use crate::types::ScriptFrameTime;
 use crate::types::{
-    RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
-    ScriptTransform,
+    RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTransform,
 };
 use crate::ui::UiDelivery;
 use crate::ui_lua;
@@ -26,9 +26,10 @@ use engine_scene::{
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
+use mlua::thread::{ThreadEvent, ThreadStatus, ThreadTriggers};
 use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, RegistryKey,
-    StdLib, Table, UserData, UserDataFields, Value, VmState,
+    StdLib, Table, Thread, UserData, UserDataFields, Value, VmState,
 };
 use rve_sdk::abi::{RVE_GAMEPAD_SLOTS, RVE_INPUT_MAX_BINDINGS, RveGamepadState};
 use rve_sdk::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
@@ -165,6 +166,18 @@ pub(crate) struct ActiveCallDeadline<'lua> {
     lua: &'lua Lua,
     deadline: CallDeadline,
     owns_deadline: bool,
+    thread: Option<Thread>,
+}
+
+pub(crate) enum CoroutineYield {
+    NextFrame,
+    Frames(u64),
+    Seconds(f64),
+}
+
+pub(crate) enum CoroutineResume {
+    Finished,
+    Yielded(CoroutineYield),
 }
 
 impl CallDeadline {
@@ -199,7 +212,41 @@ impl CallDeadline {
             lua,
             deadline: self.clone(),
             owns_deadline,
+            thread: None,
         }
+    }
+
+    pub(crate) fn enter_thread<'lua>(
+        &self,
+        lua: &'lua Lua,
+        thread: &Thread,
+    ) -> mlua::Result<ActiveCallDeadline<'lua>> {
+        let owns_deadline = if let Some(limit) = self.call_time_limit {
+            if self.deadline.get().is_none() {
+                let now = Instant::now();
+                self.deadline
+                    .set(Some(now.checked_add(limit).unwrap_or(now)));
+                self.expired.set(false);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if let Err(error) = self.install_sparse_thread_hook(thread) {
+            if owns_deadline {
+                self.deadline.set(None);
+                self.expired.set(false);
+            }
+            return Err(error);
+        }
+        Ok(ActiveCallDeadline {
+            lua,
+            deadline: self.clone(),
+            owns_deadline,
+            thread: Some(thread.clone()),
+        })
     }
 
     fn install_sparse_hook(&self, lua: &Lua) -> mlua::Result<()> {
@@ -225,6 +272,30 @@ impl CallDeadline {
         )
     }
 
+    fn install_sparse_thread_hook(&self, thread: &Thread) -> mlua::Result<()> {
+        let deadline = self.clone();
+        let hooked_thread = thread.clone();
+        thread.set_hook(
+            HookTriggers::new().every_nth_instruction(LUA_HOOK_INSTRUCTION_INTERVAL),
+            move |_, _| {
+                if deadline.interrupted.load(Ordering::Acquire) {
+                    deadline.install_dense_thread_hook(&hooked_thread)?;
+                    return Err(LuaError::runtime("Lua execution interrupted"));
+                }
+                if deadline
+                    .deadline
+                    .get()
+                    .is_some_and(|expires_at| Instant::now() >= expires_at)
+                {
+                    deadline.expired.set(true);
+                    deadline.install_dense_thread_hook(&hooked_thread)?;
+                    return Err(LuaError::runtime(deadline.timeout_message()));
+                }
+                Ok(VmState::Continue)
+            },
+        )
+    }
+
     fn install_dense_hook(&self, lua: &Lua) -> mlua::Result<()> {
         let interrupted = self.interrupted.clone();
         let expired = self.expired.clone();
@@ -240,7 +311,22 @@ impl CallDeadline {
         })
     }
 
-    fn timeout_message(&self) -> String {
+    fn install_dense_thread_hook(&self, thread: &Thread) -> mlua::Result<()> {
+        let interrupted = self.interrupted.clone();
+        let expired = self.expired.clone();
+        let timeout_message = self.timeout_message();
+        thread.set_hook(HookTriggers::new().every_nth_instruction(1), move |_, _| {
+            if interrupted.load(Ordering::Acquire) {
+                Err(LuaError::runtime("Lua execution interrupted"))
+            } else if expired.get() {
+                Err(LuaError::runtime(timeout_message.clone()))
+            } else {
+                Ok(VmState::Continue)
+            }
+        })
+    }
+
+    pub(crate) fn timeout_message(&self) -> String {
         format!(
             "Lua call exceeded time limit of {:?}",
             self.call_time_limit.unwrap_or_default()
@@ -250,18 +336,20 @@ impl CallDeadline {
 
 impl Drop for ActiveCallDeadline<'_> {
     fn drop(&mut self) {
-        if !self.owns_deadline {
-            return;
+        if self.owns_deadline {
+            let expired = self.deadline.expired.get();
+            self.deadline.deadline.set(None);
+            if expired && !self.deadline.interrupted.load(Ordering::Acquire) {
+                let _ = self.deadline.install_sparse_hook(self.lua);
+            }
         }
-        let expired = self.deadline.expired.get();
-        self.deadline.deadline.set(None);
-        self.deadline.expired.set(false);
-        if expired && !self.deadline.interrupted.load(Ordering::Acquire) {
-            let _ = self.deadline.install_sparse_hook(self.lua);
+        if let Some(thread) = &self.thread {
+            let _ = self.deadline.install_sparse_thread_hook(thread);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_lua(
     events: EventQueue,
     active_source: ActiveSource,
@@ -270,14 +358,22 @@ pub(crate) fn create_lua(
     commands: LuaCommands,
     commands_generation: CommandGeneration,
     call_deadline: CallDeadline,
+    time_scale: Rc<Cell<f32>>,
 ) -> mlua::Result<LuaState> {
     let lua = Lua::new_with(
         // mlua always opens the Lua base library; these flags select the remaining libraries.
-        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
+        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE,
         LuaOptions::default(),
     )?;
     lua.set_memory_limit(LUA_MEMORY_LIMIT_BYTES)?;
     call_deadline.install_sparse_hook(&lua)?;
+    let thread_deadline = call_deadline.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_CREATE, move |_, event| {
+        if let ThreadEvent::Create(thread) = event {
+            thread_deadline.install_sparse_thread_hook(&thread)?;
+        }
+        Ok(())
+    });
 
     create_object_handles(&lua)?;
     ui_lua::create_registry(&lua)?;
@@ -297,11 +393,76 @@ pub(crate) fn create_lua(
     globals.set("print", print)?;
     globals.set("collectgarbage", restricted_gc_function(&lua)?)?;
 
-    let time = lua.create_table()?;
-    time.set("elapsed", 0.0)?;
-    time.set("frame", 0_u64)?;
+    let time_values = lua.create_table()?;
+    time_values.set("dt", 0.0)?;
+    time_values.set("unscaled_dt", 0.0)?;
+    time_values.set("elapsed", 0.0)?;
+    time_values.set("unscaled_elapsed", 0.0)?;
+    time_values.set("fixed_dt", 1.0 / 60.0)?;
+    time_values.set("frame", 0_u64)?;
+    let indexed_time_values = time_values.clone();
+    let time_metatable = lua.create_table()?;
+    time_metatable.set(
+        "__index",
+        lua.create_function({
+            let active_call = active_call.clone();
+            let time_scale = time_scale.clone();
+            move |_, (_table, key): (Table, Value)| {
+                if is_time_scale_key(&key) {
+                    let scale = if active_call.get().is_null() {
+                        time_scale.get()
+                    } else {
+                        with_active_call(&active_call, |transaction| Ok(transaction.time_scale()))?
+                    };
+                    return Ok(Value::Number(f64::from(scale)));
+                }
+                indexed_time_values.raw_get(key)
+            }
+        })?,
+    )?;
+    time_metatable.set(
+        "__newindex",
+        lua.create_function({
+            let active_call = active_call.clone();
+            move |_, (_table, key, value): (Table, Value, Value)| {
+                if !is_time_scale_key(&key) {
+                    return Ok(());
+                }
+                let scale = match value {
+                    Value::Number(scale) => scale as f32,
+                    Value::Integer(scale) => scale as f32,
+                    _ => return Err(LuaError::runtime("time scale must be a number")),
+                };
+                with_active_call(&active_call, |transaction| {
+                    transaction
+                        .stage_time_scale(scale)
+                        .map_err(LuaError::runtime)
+                })
+            }
+        })?,
+    )?;
+    time_values.set_metatable(Some(time_metatable))?;
     let rve = lua.create_table()?;
-    rve.set("time", time.clone())?;
+    rve.set("time", time_values.clone())?;
+    let timer = lua.create_table()?;
+    timer.set("after", timer_after_function(&lua, active_call.clone())?)?;
+    timer.set("every", timer_every_function(&lua, active_call.clone())?)?;
+    timer.set("cancel", timer_cancel_function(&lua, active_call.clone())?)?;
+    rve.set("timer", timer)?;
+    rve.set(
+        "start_coroutine",
+        lua.create_function({
+            let active_call = active_call.clone();
+            move |lua, callback: Function| {
+                let thread = lua.create_thread(callback)?;
+                with_active_call(&active_call, |transaction| {
+                    transaction
+                        .start_coroutine(thread)
+                        .map_err(LuaError::runtime)
+                })
+            }
+        })?,
+    )?;
     rve.set(
         "log",
         log_function(
@@ -412,10 +573,31 @@ pub(crate) fn create_lua(
     rve.set("ui", ui_lua::ui_table(&lua, active_call.clone())?)?;
     rve.set("input", input_table(&lua, active_call)?)?;
     globals.set("rve", rve)?;
+    lua.load(
+        r#"
+        rve.wait = function(seconds)
+            assert(type(seconds) == "number" and seconds >= 0 and seconds < math.huge,
+                "wait seconds must be finite and nonnegative")
+            return coroutine.yield("seconds", seconds)
+        end
+        rve.wait_frames = function(frames)
+            assert(type(frames) == "number" and frames >= 0 and frames < math.huge
+                and frames % 1 == 0, "wait_frames requires a nonnegative integer")
+            return coroutine.yield("frames", frames)
+        end
+        rve.wait_until = function(predicate)
+            assert(type(predicate) == "function", "wait_until requires a function")
+            while not predicate() do
+                coroutine.yield("frames", 1)
+            end
+        end
+        "#,
+    )
+    .exec()?;
     Ok(LuaState {
         lua,
         base_environment: globals,
-        time,
+        time: time_values,
         call_deadline,
     })
 }
@@ -444,6 +626,8 @@ pub(crate) fn compile_class(
         "on_enable",
         "on_disable",
         "on_update",
+        "on_fixed_update",
+        "on_late_update",
         "on_message",
         "on_destroy",
         "on_collision_enter",
@@ -731,6 +915,7 @@ pub(crate) fn properties(
         Rc::new(RefCell::new(std::collections::BTreeMap::new())),
         Rc::new(Cell::new(0)),
         CallDeadline::new(None, interrupted),
+        Rc::new(Cell::new(1.0)),
     )
     .map_err(|error| error.to_string())?;
     compile_class(&state.lua, &state.base_environment, label, source).map(|(_, schema)| schema)
@@ -811,6 +996,62 @@ impl LuaInstance {
 
     pub(crate) fn invoke_update(&self, dt: f32) -> mlua::Result<()> {
         self.invoke("on_update", (self.instance.clone(), dt))
+    }
+
+    pub(crate) fn invoke_fixed_update(&self, dt: f32) -> mlua::Result<()> {
+        self.invoke("on_fixed_update", (self.instance.clone(), dt))
+    }
+
+    pub(crate) fn invoke_late_update(&self, dt: f32) -> mlua::Result<()> {
+        self.invoke("on_late_update", (self.instance.clone(), dt))
+    }
+
+    pub(crate) fn invoke_timer(&self, callback: &Function, id: u64) -> mlua::Result<()> {
+        callback.call(id)
+    }
+
+    pub(crate) fn resume_coroutine(&self, thread: &Thread) -> mlua::Result<CoroutineResume> {
+        let yielded = thread.resume::<MultiValue>(())?;
+        if thread.status() == ThreadStatus::Finished {
+            return Ok(CoroutineResume::Finished);
+        }
+        let mut yielded = yielded.into_iter();
+        let Some(Value::String(kind)) = yielded.next() else {
+            return Ok(CoroutineResume::Yielded(CoroutineYield::NextFrame));
+        };
+        match kind.to_str()?.as_ref() {
+            "frames" => {
+                let frames = match yielded.next() {
+                    Some(Value::Integer(frames)) if frames >= 0 => frames as u64,
+                    Some(Value::Number(frames))
+                        if frames.is_finite()
+                            && frames >= 0.0
+                            && frames.fract() == 0.0
+                            && frames <= u64::MAX as f64 =>
+                    {
+                        frames as u64
+                    }
+                    _ => {
+                        return Err(LuaError::runtime(
+                            "wait_frames yielded an invalid frame count",
+                        ));
+                    }
+                };
+                Ok(CoroutineResume::Yielded(CoroutineYield::Frames(frames)))
+            }
+            "seconds" => {
+                let seconds = match yielded.next() {
+                    Some(Value::Number(seconds)) => seconds,
+                    Some(Value::Integer(seconds)) => seconds as f64,
+                    _ => return Err(LuaError::runtime("wait yielded an invalid duration")),
+                };
+                if !seconds.is_finite() || seconds < 0.0 {
+                    return Err(LuaError::runtime("wait yielded an invalid duration"));
+                }
+                Ok(CoroutineResume::Yielded(CoroutineYield::Seconds(seconds)))
+            }
+            _ => Ok(CoroutineResume::Yielded(CoroutineYield::NextFrame)),
+        }
     }
 
     pub(crate) fn invoke_enable(&self) -> mlua::Result<()> {
@@ -928,8 +1169,44 @@ impl LuaInstance {
     }
 }
 
-pub(crate) fn set_time(time_table: &Table, time: ScriptTime) -> mlua::Result<()> {
+fn timer_after_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, (delay, callback): (f64, Function)| {
+        with_active_call(&active_call, |transaction| {
+            transaction
+                .schedule_lua_timer(delay, None, callback)
+                .map_err(LuaError::runtime)
+        })
+    })
+}
+
+fn timer_every_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, (interval, callback): (f64, Function)| {
+        with_active_call(&active_call, |transaction| {
+            transaction
+                .schedule_lua_timer(interval, Some(interval), callback)
+                .map_err(LuaError::runtime)
+        })
+    })
+}
+
+fn timer_cancel_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, id: u64| {
+        with_active_call(&active_call, |transaction| {
+            transaction.cancel_timer(id).map_err(LuaError::runtime)
+        })
+    })
+}
+
+fn is_time_scale_key(key: &Value) -> bool {
+    matches!(key, Value::String(key) if key.to_str().is_ok_and(|key| key.as_ref() == "scale"))
+}
+
+pub(crate) fn set_time(time_table: &Table, time: ScriptFrameTime) -> mlua::Result<()> {
+    time_table.raw_set("dt", time.dt)?;
+    time_table.raw_set("unscaled_dt", time.unscaled_dt)?;
     time_table.raw_set("elapsed", time.elapsed)?;
+    time_table.raw_set("unscaled_elapsed", time.unscaled_elapsed)?;
+    time_table.raw_set("fixed_dt", time.fixed_dt)?;
     // Preserve integer frames where possible; Lua's native integer is signed.
     if let Ok(frame) = i64::try_from(time.frame) {
         time_table.raw_set("frame", frame)?;

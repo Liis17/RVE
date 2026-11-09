@@ -1263,11 +1263,63 @@ pub struct StepResult {
     pub skipped_commands: usize,
 }
 
-pub struct StepDriver {
-    world: PhysicsWorld,
+/// Fixed-step accumulator shared by physics and script update scheduling.
+pub struct FixedStepClock {
+    fixed_hz: u32,
     fixed_dt: f32,
     max_substeps: usize,
     accumulator: f64,
+}
+
+impl FixedStepClock {
+    pub fn new(fixed_hz: u32, max_substeps: usize) -> Result<Self, PhysicsWorldError> {
+        if !(1..=1000).contains(&fixed_hz) || !(1..=64).contains(&max_substeps) {
+            return Err(PhysicsWorldError::InvalidStepConfig);
+        }
+        Ok(Self {
+            fixed_hz,
+            fixed_dt: 1.0 / fixed_hz as f32,
+            max_substeps,
+            accumulator: 0.0,
+        })
+    }
+
+    pub fn fixed_dt(&self) -> f32 {
+        self.fixed_dt
+    }
+
+    pub fn fixed_hz(&self) -> u32 {
+        self.fixed_hz
+    }
+
+    pub fn max_substeps(&self) -> usize {
+        self.max_substeps
+    }
+
+    pub fn accumulator(&self) -> f64 {
+        self.accumulator
+    }
+
+    /// Adds one frame delta and returns the same capped count used by [`StepDriver`].
+    pub fn advance(&mut self, dt: f32) -> Result<usize, PhysicsWorldError> {
+        validate_nonnegative_dt(dt)?;
+        if dt == 0.0 {
+            return Ok(0);
+        }
+        let accumulated = self.accumulator + dt as f64;
+        let available = (accumulated / self.fixed_dt as f64).floor();
+        let substeps = available.min(self.max_substeps as f64) as usize;
+        self.accumulator = accumulated - substeps as f64 * self.fixed_dt as f64;
+        if available >= self.max_substeps as f64 {
+            self.accumulator = self.accumulator.min(self.fixed_dt as f64);
+        }
+        Ok(substeps)
+    }
+}
+
+pub struct StepDriver {
+    world: PhysicsWorld,
+    clock: FixedStepClock,
 }
 
 impl StepDriver {
@@ -1276,14 +1328,9 @@ impl StepDriver {
         fixed_hz: u32,
         max_substeps: usize,
     ) -> Result<Self, PhysicsWorldError> {
-        if !(1..=1000).contains(&fixed_hz) || !(1..=64).contains(&max_substeps) {
-            return Err(PhysicsWorldError::InvalidStepConfig);
-        }
         Ok(Self {
             world,
-            fixed_dt: 1.0 / fixed_hz as f32,
-            max_substeps,
-            accumulator: 0.0,
+            clock: FixedStepClock::new(fixed_hz, max_substeps)?,
         })
     }
 
@@ -1296,11 +1343,19 @@ impl StepDriver {
     }
 
     pub fn fixed_dt(&self) -> f32 {
-        self.fixed_dt
+        self.clock.fixed_dt()
+    }
+
+    pub fn fixed_hz(&self) -> u32 {
+        self.clock.fixed_hz()
+    }
+
+    pub fn max_substeps(&self) -> usize {
+        self.clock.max_substeps()
     }
 
     pub fn accumulator(&self) -> f64 {
-        self.accumulator
+        self.clock.accumulator()
     }
 
     /// Returns the unadvanced initial state without refreshing contact-pair events.
@@ -1368,15 +1423,12 @@ impl StepDriver {
         }
 
         events.extend(self.world.refresh_pairs()?);
-        let accumulated = self.accumulator + dt as f64;
-        let available = (accumulated / self.fixed_dt as f64).floor();
-        let substeps = available.min(self.max_substeps as f64) as usize;
-        self.accumulator = accumulated - substeps as f64 * self.fixed_dt as f64;
-        if available >= self.max_substeps as f64 {
-            self.accumulator = self.accumulator.min(self.fixed_dt as f64);
-        }
+        let substeps = self.clock.advance(dt)?;
         for index in 0..substeps {
-            events.extend(self.world.step_substep(self.fixed_dt, substeps - index)?);
+            events.extend(
+                self.world
+                    .step_substep(self.clock.fixed_dt(), substeps - index)?,
+            );
         }
         // Отчёт содержит только тела, чья поза изменилась с прошлого вызова.
         let mut poses = Vec::new();
@@ -1466,8 +1518,9 @@ fn validate_positive_dt(dt: f32) -> Result<(), PhysicsWorldError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent,
-        PhysicsWorld, PhysicsWorldError, SLEEP_ANGULAR_SPEED, SLEEP_LINEAR_SPEED, StepDriver,
+        BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, FixedStepClock, PhysicsCommand,
+        PhysicsEvent, PhysicsWorld, PhysicsWorldError, SLEEP_ANGULAR_SPEED, SLEEP_LINEAR_SPEED,
+        StepDriver,
     };
     use crate::{Hull, PhysicsMaterial, Pose, Shape, TriMesh};
     use glam::{Quat, Vec3};
@@ -1505,6 +1558,43 @@ mod tests {
 
     fn count_events(events: &[PhysicsEvent], predicate: impl Fn(&PhysicsEvent) -> bool) -> usize {
         events.iter().filter(|event| predicate(event)).count()
+    }
+
+    #[test]
+    fn shared_fixed_clock_matches_physics_substeps_and_clamps_backlog() {
+        let mut clock = FixedStepClock::new(10, 2).unwrap();
+        let mut driver = StepDriver::new(PhysicsWorld::default(), 10, 2).unwrap();
+
+        for dt in [0.04, 0.07, 0.25, 0.0] {
+            let script_substeps = clock.advance(dt).unwrap();
+            let physics_substeps = driver.advance_step(dt, []).unwrap().substeps;
+            assert_eq!(script_substeps, physics_substeps);
+            assert_eq!(clock.accumulator(), driver.accumulator());
+        }
+        assert!((clock.accumulator() - 0.06).abs() < 1.0e-6);
+        assert_eq!(clock.advance(0.0).unwrap(), 0);
+        assert_eq!(clock.advance(-0.1), Err(PhysicsWorldError::InvalidTimeStep));
+        assert_eq!(
+            FixedStepClock::new(0, 2).err(),
+            Some(PhysicsWorldError::InvalidStepConfig)
+        );
+    }
+
+    #[test]
+    fn zero_delta_does_not_consume_a_capped_fixed_step_backlog() {
+        let mut clock = FixedStepClock::new(10, 2).unwrap();
+        let mut driver = StepDriver::new(PhysicsWorld::default(), 10, 2).unwrap();
+
+        assert_eq!(clock.advance(0.35).unwrap(), 2);
+        assert_eq!(driver.advance_step(0.35, []).unwrap().substeps, 2);
+        assert!((clock.accumulator() - 0.1).abs() < 1.0e-6);
+        assert_eq!(clock.advance(0.0).unwrap(), 0);
+        assert_eq!(driver.advance_step(0.0, []).unwrap().substeps, 0);
+        assert!((clock.accumulator() - 0.1).abs() < 1.0e-6);
+        assert_eq!(clock.advance(0.01).unwrap(), 1);
+        assert_eq!(driver.advance_step(0.01, []).unwrap().substeps, 1);
+        assert!((clock.accumulator() - 0.01).abs() < 1.0e-6);
+        assert_eq!(clock.accumulator(), driver.accumulator());
     }
 
     fn floor_world() -> (PhysicsWorld, BodyHandle, BodyHandle) {
@@ -2222,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_step_force_uses_frame_dt_and_accumulator_cap_discards_catchup() {
+    fn zero_step_force_uses_frame_dt_and_zero_delta_preserves_capped_backlog() {
         let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
         let body = world
             .insert_body(BodyDesc::dynamic(
@@ -2248,9 +2338,12 @@ mod tests {
         let capped = driver.advance_step(0.55, []).unwrap();
         assert_eq!(capped.substeps, 2);
         assert!(driver.accumulator() <= driver.fixed_dt() as f64);
-        let carried = driver.advance_step(0.0, []).unwrap();
-        assert_eq!(carried.substeps, 1);
-        assert!(driver.accumulator() < 1.0e-5);
+        let paused = driver.advance_step(0.0, []).unwrap();
+        assert_eq!(paused.substeps, 0);
+        assert!((driver.accumulator() - f64::from(driver.fixed_dt())).abs() < 1.0e-6);
+        let resumed = driver.advance_step(0.01, []).unwrap();
+        assert_eq!(resumed.substeps, 1);
+        assert!((driver.accumulator() - 0.01).abs() < 1.0e-6);
     }
 
     #[test]

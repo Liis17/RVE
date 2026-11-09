@@ -10,14 +10,24 @@ impl Script for Bobber {
     fn on_start(&mut self, context: &mut Context<'_>) {
         self.base_y = context.transform.position[1];
         context.log_info("Bobber started");
+        if let Err(error) = context.schedule(1.0, None, "pulse") {
+            context.log_warn(format!("Bobber timer unavailable: {error}"));
+        }
     }
 
     fn on_update(&mut self, context: &mut Context<'_>, dt: f32) {
-        let phase = context.time().elapsed as f32 * self.speed;
         let movement = context.input().vector("Move").unwrap_or_default();
-        context.transform.position[1] = self.base_y + phase.sin() * self.amplitude;
         context.transform.position[0] += movement[0] * dt;
         context.transform.position[1] += movement[1] * dt;
+    }
+
+    fn on_fixed_update(&mut self, context: &mut Context<'_>, _: f32) {
+        let phase = context.script_time().elapsed as f32 * self.speed;
+        context.transform.position[1] = self.base_y + phase.sin() * self.amplitude;
+    }
+
+    fn on_timer(&mut self, context: &mut Context<'_>, tag: &str) {
+        context.log_info(format!("Bobber timer: {tag}"));
     }
 
     fn on_message(&mut self, context: &mut Context<'_>, sender: &str, name: &str, value: &Value) {

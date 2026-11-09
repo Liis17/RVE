@@ -98,12 +98,12 @@ fn script_set_enabled_disables_on_the_next_phase_and_keeps_it_off() {
     host.update(&mut world, 1.0 / 60.0, frame());
     assert_eq!(
         event_messages(&mut host),
-        ["update"],
-        "the write commits after the callback that made it"
+        ["update", "disable"],
+        "the write commits after update and takes effect before late update"
     );
 
     host.update(&mut world, 1.0 / 60.0, frame());
-    assert_eq!(event_messages(&mut host), ["disable"]);
+    assert!(event_messages(&mut host).is_empty());
 
     let prop = world.handle("prop").unwrap();
     world.set_active(prop, false).unwrap();

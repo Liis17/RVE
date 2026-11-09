@@ -26,8 +26,9 @@ use engine_scene::{
 };
 use engine_script::{
     CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, PreparedUi, RumbleRequest,
-    ScriptCursor, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
-    ScriptLoadOptions, ScriptTime, SpawnedObject, UiInputBridge, UiRegistry, UiTick, WorldChanges,
+    ScriptCursor, ScriptEvent, ScriptFrameTime, ScriptHost, ScriptInput, ScriptInterruptHandle,
+    ScriptLibrary, ScriptLoadOptions, ScriptTime, SpawnedObject, UiInputBridge, UiRegistry, UiTick,
+    WorldChanges,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -39,8 +40,6 @@ use std::time::{Duration, Instant};
 
 /// Дольше этого Lua-вызов считается зависшим и прерывается, чтобы UI ожил.
 const SCRIPT_TIME_LIMIT: Duration = Duration::from_secs(5);
-/// Шаг времени не растёт при паузах окна и отладчике.
-const MAX_DELTA_SECONDS: f32 = 0.25;
 
 /// Прерывает Lua, если отмеченный участок выполняется дольше предела.
 ///
@@ -574,6 +573,7 @@ pub struct PlaySession {
     time_limit: Duration,
     paused: bool,
     elapsed: f64,
+    unscaled_elapsed: f64,
     frame: u64,
     last_tick: Instant,
     input: ScriptInput,
@@ -583,6 +583,7 @@ pub struct PlaySession {
     rumble: Vec<RumbleRequest>,
     /// Команды эмиттеров частиц, поставленные скриптами с прошлого забора; забирает viewport.
     particle_commands: Vec<engine_scene::world::ParticleCommand>,
+    particle_dt: f32,
     heavy: HeavyLoads,
     last_step: PlayStep,
     /// Errors not associated with scripts wait for drain_events, such as physics rejecting a body.
@@ -788,6 +789,10 @@ impl PlaySession {
             },
         )
         .map_err(|error| error.to_string())?;
+        host.set_fixed_step_config(
+            physics_settings.fixed_hz,
+            physics_settings.max_substeps as usize,
+        )?;
         let ui_text_focus = Arc::new(AtomicBool::new(false));
         let ui_input = UiInputBridge::new(Arc::clone(&ui_text_focus));
         let mut ui_registry = UiRegistry::default();
@@ -828,6 +833,7 @@ impl PlaySession {
             time_limit,
             paused: false,
             elapsed: 0.0,
+            unscaled_elapsed: 0.0,
             frame: 0,
             last_tick: Instant::now(),
             last_step: PlayStep::default(),
@@ -842,6 +848,7 @@ impl PlaySession {
             pad_gate: PadGate::default(),
             rumble: Vec::new(),
             particle_commands: Vec::new(),
+            particle_dt: 0.0,
             heavy: HeavyLoads::new(resources),
         })
     }
@@ -967,10 +974,7 @@ impl PlaySession {
     /// Выполняет один кадр скриптов, если сцена не на паузе.
     pub fn tick(&mut self) -> Result<(), String> {
         let now = Instant::now();
-        let dt = now
-            .duration_since(self.last_tick)
-            .as_secs_f32()
-            .min(MAX_DELTA_SECONDS);
+        let dt = now.duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
         self.step(dt)
     }
@@ -992,22 +996,30 @@ impl PlaySession {
         if let Some(network) = &mut self.network {
             network.receive(&mut self.world, &mut self.host);
         }
-        self.elapsed += f64::from(dt);
-        self.frame += 1;
+        let frame_time = ScriptFrameTime::advance(
+            dt,
+            self.host.time_scale(),
+            self.elapsed,
+            self.unscaled_elapsed,
+            self.host.fixed_dt(),
+            self.frame.saturating_add(1),
+        );
+        self.elapsed = frame_time.elapsed;
+        self.unscaled_elapsed = frame_time.unscaled_elapsed;
+        self.frame = frame_time.frame;
         self.host.set_input(
             self.pending_input
                 .take()
                 .unwrap_or_else(|| self.input.take_frame()),
         );
-        let time = self.script_time();
         self.watchdog
             .set_deadline(Some(Instant::now() + self.time_limit));
-        self.host.update(&mut self.world, dt, time);
+        self.host.update_frame(&mut self.world, frame_time);
         self.watchdog.set_deadline(None);
         self.rumble = self.host.take_rumble_requests();
         // Порядок как в runtime: запросы скриптов, затем время; события уйдут в следующий update.
         self.animation.apply(self.host.drain_animation_requests());
-        let finished = self.animation.advance(dt);
+        let finished = self.animation.advance(frame_time.dt);
         self.host.queue_animation_events(
             &self.world,
             finished.into_iter().map(|event| match event {
@@ -1041,7 +1053,7 @@ impl PlaySession {
             let changes = std::mem::take(&mut physics.changes);
             physics
                 .client
-                .step_with_changes(dt, changes, commands)
+                .step_with_changes(frame_time.dt, changes, commands)
                 .map_err(|error| error.to_string())?;
             physics_step = physics_started.elapsed();
         }
@@ -1054,6 +1066,12 @@ impl PlaySession {
         };
         self.particle_commands
             .extend(self.host.drain_particle_commands());
+        let particle_dt = self.particle_dt + frame_time.dt;
+        self.particle_dt = if particle_dt.is_finite() {
+            particle_dt
+        } else {
+            f32::MAX
+        };
         if let Some(audio) = &mut self.audio {
             audio
                 .bridge
@@ -1324,6 +1342,17 @@ impl PlaySession {
     ) {
         let newer = std::mem::replace(&mut self.particle_commands, commands);
         self.particle_commands.extend(newer);
+    }
+
+    /// Забирает scaled time, накопленное для одного GPU шага частиц.
+    pub fn take_particle_dt(&mut self) -> f32 {
+        std::mem::take(&mut self.particle_dt)
+    }
+
+    /// Возвращает время незарендеренного кадра перед более новым накопленным временем.
+    pub fn restore_particle_dt(&mut self, dt: f32) {
+        let total = self.particle_dt + dt.max(0.0);
+        self.particle_dt = if total.is_finite() { total } else { f32::MAX };
     }
 
     /// Предупреждения звука, которые ещё не показаны: клип не загрузился, устройство недоступно.
@@ -1668,9 +1697,41 @@ return Rotate
         let document = document(SCENE);
         let mut session = PlaySession::start(&document, None, |_| Ok(ROTATE.to_owned())).unwrap();
         session.step(0.5).unwrap();
-        assert!((rotation_y(&mut session) - 45.0).abs() < 1e-3);
+        assert!((rotation_y(&mut session) - 22.5).abs() < 1e-3);
         let original = document.objects.iter().find(|o| o.id == "spinner").unwrap();
         assert_eq!(original.transform.rotation, [0.0; 3]);
+    }
+
+    #[test]
+    fn play_clock_clamps_scales_and_accumulates_like_runtime_clock() {
+        const CLOCK: &str = r#"
+local Clock = {}
+function Clock:on_update(dt)
+  if rve.time.frame == 1 then
+    assert(math.abs(dt - 0.25) < 0.00001)
+    assert(math.abs(rve.time.elapsed - 0.25) < 0.00001)
+    assert(math.abs(rve.time.unscaled_elapsed - 0.25) < 0.00001)
+    rve.time.scale = 0.5
+  elseif rve.time.frame == 2 then
+    assert(math.abs(dt - 0.125) < 0.00001)
+    assert(math.abs(rve.time.elapsed - 0.375) < 0.00001)
+    assert(math.abs(rve.time.unscaled_elapsed - 0.5) < 0.00001)
+  end
+end
+return Clock
+"#;
+        let mut session = start(CLOCK).unwrap();
+        session.step(2.0).unwrap();
+        assert_eq!(session.host.time_scale(), 0.5);
+        session.step(2.0).unwrap();
+        assert!(
+            session
+                .host
+                .drain_events()
+                .iter()
+                .all(|event| { event.level != engine_script::ScriptEventLevel::Error })
+        );
+        assert!((session.particle_dt - 0.375).abs() < 0.00001);
     }
 
     #[test]
@@ -1721,10 +1782,10 @@ return Rumble
         assert!(session.is_paused());
         session.step(0.5).unwrap();
         session.tick().unwrap();
-        assert!((rotation_y(&mut session) - 45.0).abs() < 1e-3);
+        assert!((rotation_y(&mut session) - 22.5).abs() < 1e-3);
         session.set_paused(false);
         session.step(0.5).unwrap();
-        assert!((rotation_y(&mut session) - 90.0).abs() < 1e-3);
+        assert!((rotation_y(&mut session) - 45.0).abs() < 1e-3);
     }
 
     #[test]
@@ -1883,7 +1944,9 @@ return Hero
         session.step(0.1).unwrap();
         let hero = session.world.handle("hero").unwrap();
         assert!(session.animation.has_animator(hero));
-        session.step(1.5).unwrap();
+        for _ in 0..12 {
+            session.step(0.1).unwrap();
+        }
         session.step(0.0).unwrap();
         let messages: Vec<String> = session
             .drain_events()

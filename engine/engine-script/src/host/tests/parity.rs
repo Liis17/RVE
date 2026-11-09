@@ -64,6 +64,10 @@ enum HostCapability {
     AudioSetSource,
     AudioPlayClipEx,
     AudioSetVoicePosition,
+    TimeScale,
+    TimerAfter,
+    TimerEvery,
+    TimerCancel,
 }
 
 // Add each script-facing capability to this shared inventory so Lua and ABI stay in parity.
@@ -74,6 +78,10 @@ const CAPABILITIES: &[(&str, &str, HostCapability)] = &[
     ("object", "set_transform", HostCapability::SetLocal),
     ("rve", "send", HostCapability::Send),
     ("rve", "broadcast", HostCapability::Broadcast),
+    ("timer", "after", HostCapability::TimerAfter),
+    ("timer", "every", HostCapability::TimerEvery),
+    ("timer", "cancel", HostCapability::TimerCancel),
+    ("time", "scale", HostCapability::TimeScale),
     ("object", "net_send", HostCapability::NetObjectSend),
     ("rve", "find_by_name", HostCapability::FindObjectsByName),
     ("rve", "find_all", HostCapability::FindObjectsByName),
@@ -234,12 +242,21 @@ path = "/api.lua"
             "script" => script.get(*name).unwrap(),
             "physics" => rve.get::<Table>("physics").unwrap().get(*name).unwrap(),
             "audio" => rve.get::<Table>("audio").unwrap().get(*name).unwrap(),
+            "timer" => rve.get::<Table>("timer").unwrap().get(*name).unwrap(),
+            "time" => rve.get::<Table>("time").unwrap().get(*name).unwrap(),
             _ => unreachable!(),
         };
-        assert!(
-            matches!(lua_value, LuaValue::Function(_)),
-            "Lua API missing {table}.{name}"
-        );
+        if matches!(capability, HostCapability::TimeScale) {
+            assert!(matches!(
+                lua_value,
+                LuaValue::Number(_) | LuaValue::Integer(_)
+            ));
+        } else {
+            assert!(
+                matches!(lua_value, LuaValue::Function(_)),
+                "Lua API missing {table}.{name}"
+            );
+        }
         let available = match capability {
             HostCapability::FindObject => abi.find_object as usize != 0,
             HostCapability::GetLocal => abi.get_local as usize != 0,
@@ -298,6 +315,11 @@ path = "/api.lua"
             HostCapability::AudioSetSource => abi.audio_set_source.is_some(),
             HostCapability::AudioPlayClipEx => abi.audio_play_clip_ex.is_some(),
             HostCapability::AudioSetVoicePosition => abi.audio_set_voice_position.is_some(),
+            HostCapability::TimeScale => {
+                abi.script_time.fixed_dt > 0.0 && abi.set_time_scale.is_some()
+            }
+            HostCapability::TimerAfter | HostCapability::TimerEvery => abi.schedule_timer.is_some(),
+            HostCapability::TimerCancel => abi.cancel_timer.is_some(),
         };
         assert!(available, "ABI callback missing for {table}.{name}");
     }

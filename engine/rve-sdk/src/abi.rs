@@ -20,8 +20,9 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 17 appends hierarchy and activity callbacks after the UI tail and lifecycle callbacks
 /// after ui_event in the descriptor.
 /// Version 18 appends physics callbacks after the hierarchy tail and adds trigger-stay events.
-/// Version 19 appends scene component callbacks after the physics tail; the descriptor is unchanged.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 19;
+/// Version 19 appends scene component callbacks after the physics tail.
+/// Version 20 appends clock and timer callbacks to the host and script callbacks to the descriptor.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 20;
 
 /// Component names accepted by RveHost::object_has_component, in the order used by
 /// components() on the guest side.
@@ -744,6 +745,19 @@ pub struct RveTime {
     /// Elapsed scene time in seconds.
     pub elapsed: f64,
     /// Current frame number.
+    pub frame: u64,
+}
+
+/// Full scaled and unscaled clock snapshot supplied by ABI v20.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveScriptTime {
+    pub dt: f32,
+    pub unscaled_dt: f32,
+    pub elapsed: f64,
+    pub unscaled_elapsed: f64,
+    pub fixed_dt: f32,
+    pub scale: f32,
     pub frame: u64,
 }
 
@@ -1881,6 +1895,14 @@ pub struct RveHost {
     /// Replaces the material of every mesh part with a `.rvemat` declared in the scene; appended
     /// in ABI v19 after the audio callbacks.
     pub mesh_set_material_path: Option<RveMeshSetMaterialPathFn>,
+    /// Full scaled and unscaled time snapshot appended in ABI v20.
+    pub script_time: RveScriptTime,
+    /// Stages a finite nonnegative time scale for the next frame; appended in ABI v20.
+    pub set_time_scale: Option<RveSetTimeScaleFn>,
+    /// Schedules a script-owned timer; a zero repeat interval denotes a one-shot timer.
+    pub schedule_timer: Option<RveScheduleTimerFn>,
+    /// Cancels a timer owned by the calling script.
+    pub cancel_timer: Option<RveCancelTimerFn>,
 }
 
 /// Sets a boolean on an object (`mesh_set_visible`, `particles_set_playing`); appended in v19.
@@ -2129,6 +2151,22 @@ pub type RveStartFn =
 /// Guest `on_update` callback.
 pub type RveUpdateFn =
     unsafe extern "C" fn(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus;
+/// Guest timer callback appended to the script descriptor in ABI v20.
+pub type RveTimerFn =
+    unsafe extern "C" fn(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus;
+/// Changes the transactional time scale for the current script callback.
+pub type RveSetTimeScaleFn = unsafe extern "C" fn(ctx: *mut c_void, scale: f32) -> bool;
+/// Schedules a script-owned timer. A zero repeat interval denotes a one-shot timer.
+pub type RveScheduleTimerFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    delay_seconds: f64,
+    repeat_seconds: f64,
+    tag: RveStr,
+    timer_id: *mut u64,
+) -> u32;
+/// Cancels a script-owned timer and reports whether it was active.
+pub type RveCancelTimerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, timer_id: u64, canceled: *mut bool) -> u32;
 /// Guest message callback.
 pub type RveMessageFn = unsafe extern "C" fn(
     instance: *mut c_void,
@@ -2344,7 +2382,27 @@ pub struct RveScriptDescV17 {
 /// ABI v18 adds physics callbacks to the host and keeps the ABI v17 descriptor layout.
 pub type RveScriptDescV18 = RveScriptDescV17;
 
-/// Current ABI v19 descriptor; scene component callbacks extend the host only.
+/// ABI v19 descriptor layout, retained so old modules can be normalized without reading past it.
+#[repr(C)]
+pub struct RveScriptDescV19 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+}
+
+/// Current ABI v20 descriptor; fixed, late, and timer callbacks append to the v19 tail.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -2362,6 +2420,9 @@ pub struct RveScriptDesc {
     pub ui_event: Option<RveUiEventFn>,
     pub on_enable: Option<RveStartFn>,
     pub on_disable: Option<RveStartFn>,
+    pub on_fixed_update: Option<RveUpdateFn>,
+    pub on_late_update: Option<RveUpdateFn>,
+    pub on_timer: Option<RveTimerFn>,
 }
 /// Parameter kind: boolean.
 pub const RVE_PARAM_BOOL: u32 = 0;
@@ -2468,6 +2529,7 @@ unsafe impl Sync for RveScriptDescV13 {}
 unsafe impl Sync for RveScriptDescV15 {}
 unsafe impl Sync for RveScriptDescV16 {}
 unsafe impl Sync for RveScriptDescV17 {}
+unsafe impl Sync for RveScriptDescV19 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
@@ -2599,7 +2661,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2653,7 +2715,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -2672,7 +2734,67 @@ mod tests {
         assert_eq!(
             offset_of!(RveHost, mesh_set_material_path)
                 + size_of::<Option<super::RveMeshSetMaterialPathFn>>(),
-            size_of::<RveHost>()
+            offset_of!(RveHost, script_time)
+        );
+    }
+
+    #[test]
+    fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+        assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
+        assert_eq!(size_of::<super::RveScriptTime>(), 40);
+        assert_eq!(align_of::<super::RveScriptTime>(), 8);
+        assert_eq!(offset_of!(super::RveScriptTime, dt), 0);
+        assert_eq!(offset_of!(super::RveScriptTime, unscaled_dt), 4);
+        assert_eq!(offset_of!(super::RveScriptTime, elapsed), 8);
+        assert_eq!(offset_of!(super::RveScriptTime, unscaled_elapsed), 16);
+        assert_eq!(offset_of!(super::RveScriptTime, fixed_dt), 24);
+        assert_eq!(offset_of!(super::RveScriptTime, scale), 28);
+        assert_eq!(offset_of!(super::RveScriptTime, frame), 32);
+
+        assert_eq!(
+            offset_of!(super::RveHost, script_time),
+            offset_of!(super::RveHost, mesh_set_material_path)
+                + size_of::<Option<super::RveMeshSetMaterialPathFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, set_time_scale),
+            offset_of!(super::RveHost, script_time) + size_of::<super::RveScriptTime>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, schedule_timer),
+            offset_of!(super::RveHost, set_time_scale)
+                + size_of::<Option<super::RveSetTimeScaleFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, cancel_timer),
+            offset_of!(super::RveHost, schedule_timer)
+                + size_of::<Option<super::RveScheduleTimerFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, cancel_timer) + size_of::<Option<super::RveCancelTimerFn>>()
+        );
+
+        assert_eq!(
+            size_of::<super::RveScriptDescV19>(),
+            offset_of!(super::RveScriptDesc, on_fixed_update)
+        );
+        assert_eq!(
+            offset_of!(super::RveScriptDesc, on_late_update),
+            offset_of!(super::RveScriptDesc, on_fixed_update)
+                + size_of::<Option<super::RveUpdateFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveScriptDesc, on_timer),
+            offset_of!(super::RveScriptDesc, on_late_update)
+                + size_of::<Option<super::RveUpdateFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveScriptDesc>(),
+            offset_of!(super::RveScriptDesc, on_timer) + size_of::<Option<super::RveTimerFn>>()
         );
     }
 }

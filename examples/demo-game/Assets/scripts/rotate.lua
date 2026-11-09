@@ -7,6 +7,23 @@ Rotate.properties = {
 function Rotate:on_start()
   rve.log_info("Rotate started; broadcasting demo_ready")
   rve.broadcast("demo_ready", "Lua start callback")
+  rve.timer.after(1.0, function()
+    rve.log_info("Rotate timer fired")
+  end)
+  rve.start_coroutine(function()
+    rve.wait_frames(2)
+    rve.wait(0.25)
+    rve.log_info("Rotate coroutine resumed")
+  end)
+end
+
+function Rotate:on_fixed_update(dt)
+  local rotation = self.transform.rotation
+  self.transform.rotation = {
+    x = rotation.x,
+    y = rotation.y + self.params.speed * dt,
+    z = rotation.z
+  }
 end
 
 function Rotate:on_update(dt)
@@ -33,12 +50,6 @@ function Rotate:on_update(dt)
       z = position.z
     }
   end
-  local rotation = self.transform.rotation
-  self.transform.rotation = {
-    x = rotation.x,
-    y = rotation.y + self.params.speed * dt,
-    z = rotation.z
-  }
 end
 
 return Rotate

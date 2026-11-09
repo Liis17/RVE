@@ -167,7 +167,7 @@ return Gun
     host.update(&mut world, 0.1, at(0.1, 2));
     assert_eq!(
         infos(&mut host),
-        ["start shot", "message hit", "update shot"]
+        ["start shot", "update shot", "message hit"]
     );
 }
 

@@ -15,13 +15,14 @@ use crate::net::{
     networked_template, validate_message,
 };
 use crate::physics::PhysicsScriptState;
+use crate::timeline::{CoroutineWait, DueTimer, ScriptCoroutine, ScriptTimeline, TimerCallback};
 use crate::transaction::{
     MAX_MESSAGE_BYTES_PER_FRAME, MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage,
     ScriptObjectRef, ScriptTransaction, ScriptTransactionInit,
 };
 use crate::types::{
-    RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams,
-    ScriptTime, ScriptTransform,
+    RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptFrameTime, ScriptInput,
+    ScriptParams, ScriptTime, ScriptTransform,
 };
 use crate::ui::{QueuedUiEvent, UiDelivery, UiScriptState, owner_key, queue_live};
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
@@ -29,7 +30,9 @@ use engine_files::VirtualPath;
 use engine_gui::document::UiDocument;
 use engine_gui::events::UiEvent;
 use engine_gui::system::UiSystem;
-use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
+use engine_physics::{
+    FixedStepClock, PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot,
+};
 use engine_project::InputSettings;
 use engine_scene::{
     AnimationRequest, AudioRequest, ComponentKind, LocalTransform, NetEvent, NetId, NetMode,
@@ -186,6 +189,8 @@ pub struct ScriptHost {
     instances: Vec<Option<ScriptInstance>>,
     free_instances: Vec<usize>,
     next_serial: u64,
+    /// Экземпляры, существовавшие в начале кадра; новые spawn запускаются в следующем кадре.
+    frame_serial_limit: u64,
     /// Скомпилированные классы lite-скриптов по путям; общие для сцены и префабов.
     classes: HashMap<String, (Table, Option<ParamSchema>)>,
     /// Heavy-скрипты библиотеки по имени: дескриптор и схема параметров.
@@ -203,6 +208,12 @@ pub struct ScriptHost {
     commands: LuaCommands,
     commands_generation: CommandGeneration,
     transaction: ScriptTransaction,
+    timeline: Rc<RefCell<ScriptTimeline>>,
+    time_scale: Rc<Cell<f32>>,
+    fixed_step: FixedStepClock,
+    frame_time: ScriptFrameTime,
+    due_timers: Vec<DueTimer>,
+    due_coroutines: Vec<ScriptCoroutine>,
     queued_messages: Vec<PendingMessage>,
     queued_bytes: usize,
     audio_requests: Vec<AudioRequest>,
@@ -275,8 +286,12 @@ enum Phase {
     /// `on_disable` перед `Destroy` активного экземпляра при уничтожении или выгрузке сцены.
     /// Как и `Destroy`, не допускает записей lifecycle.
     TeardownDisable,
+    FixedUpdate(f32),
     Update(f32),
+    LateUpdate(f32),
     Message,
+    Timer,
+    Coroutine,
     PhysicsEvent(ScriptPhysicsEvent),
     /// Сетевое событие; его данные передаются в `call_instance` отдельно.
     Net,
@@ -407,6 +422,8 @@ impl ScriptHost {
         let active_owner = Rc::new(Cell::new(None));
         let commands = Rc::new(RefCell::new(BTreeMap::new()));
         let commands_generation = Rc::new(Cell::new(0));
+        let timeline = Rc::new(RefCell::new(ScriptTimeline::default()));
+        let time_scale = Rc::new(Cell::new(1.0));
         let call_deadline = lite::CallDeadline::new(call_time_limit, interrupt.interrupted.clone());
         let lua_state = lite::create_lua(
             events.clone(),
@@ -416,6 +433,7 @@ impl ScriptHost {
             commands.clone(),
             commands_generation.clone(),
             call_deadline,
+            time_scale.clone(),
         )
         .map_err(|error| ScriptLoadError::LuaHost(error.to_string()))?;
         let lua = lua_state.lua;
@@ -423,12 +441,16 @@ impl ScriptHost {
         let loaded_library = library.and_then(ScriptLibrary::shared_library);
         let heavy = library.map(heavy_scripts).unwrap_or_default();
         let heavy_abi_version = library.map_or(0, ScriptLibrary::abi_version);
+        let mut transaction = ScriptTransaction::with_ui(ui.clone());
+        transaction.attach_time_state(timeline.clone(), time_scale.clone());
+        let fixed_step = FixedStepClock::new(60, 8).expect("default fixed-step config is valid");
         let mut host = Self {
             lua,
             base_environment,
             instances: Vec::new(),
             free_instances: Vec::new(),
             next_serial: 0,
+            frame_serial_limit: u64::MAX,
             classes: HashMap::new(),
             heavy,
             heavy_abi_version,
@@ -441,7 +463,13 @@ impl ScriptHost {
             active_owner,
             commands,
             commands_generation,
-            transaction: ScriptTransaction::with_ui(ui.clone()),
+            transaction,
+            timeline,
+            time_scale,
+            fixed_step,
+            frame_time: ScriptFrameTime::default(),
+            due_timers: Vec::with_capacity(crate::timeline::MAX_SCRIPT_TIMERS),
+            due_coroutines: Vec::with_capacity(crate::timeline::MAX_SCRIPT_COROUTINES),
             queued_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             queued_bytes: 0,
             audio_requests: Vec::new(),
@@ -941,6 +969,27 @@ impl ScriptHost {
         RefMut::map(self.ui.borrow_mut(), |state| &mut state.system)
     }
 
+    /// Current committed scale. Changes made by a script take effect on the next host update.
+    pub fn time_scale(&self) -> f32 {
+        self.time_scale.get()
+    }
+
+    /// Configures fixed callbacks to use the same limits as the physics scene.
+    pub fn set_fixed_step_config(
+        &mut self,
+        fixed_hz: u32,
+        max_substeps: usize,
+    ) -> Result<(), String> {
+        self.fixed_step =
+            FixedStepClock::new(fixed_hz, max_substeps).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Configured scaled simulation delta used by fixed callbacks.
+    pub fn fixed_dt(&self) -> f32 {
+        self.fixed_step.fixed_dt()
+    }
+
     /// Ставит события UI, например из `UiSystem::update`; они доходят до `on_ui_event`
     /// в начале следующего update. Событие канваса, закрытого к доставке, пропускается.
     pub fn queue_ui_events(&mut self, events: impl IntoIterator<Item = UiEvent>) {
@@ -954,24 +1003,96 @@ impl ScriptHost {
 
     /// Runs on_start once. update also calls start automatically if needed.
     pub fn start(&mut self, world: &mut World, time: ScriptTime) {
+        self.start_frame(
+            world,
+            ScriptFrameTime {
+                elapsed: time.elapsed,
+                unscaled_elapsed: time.elapsed,
+                fixed_dt: self.fixed_step.fixed_dt(),
+                scale: self.time_scale.get(),
+                frame: time.frame,
+                ..ScriptFrameTime::default()
+            },
+        );
+    }
+
+    fn start_frame(&mut self, world: &mut World, frame_time: ScriptFrameTime) {
         if self.started || self.destroyed {
             return;
         }
         self.started = true;
+        self.frame_time = frame_time;
+        let time = ScriptTime {
+            elapsed: frame_time.elapsed,
+            frame: frame_time.frame,
+        };
         self.open_scene_canvases(world);
-        self.sync_activity(world, time);
+        self.sync_activity(world, time, u64::MAX);
         self.apply_lifecycle(world, time);
     }
 
     /// Runs on_update for enabled instances, starting the host first if needed.
     pub fn update(&mut self, world: &mut World, dt: f32, time: ScriptTime) {
+        self.update_frame(
+            world,
+            ScriptFrameTime {
+                dt,
+                unscaled_dt: dt,
+                elapsed: time.elapsed,
+                unscaled_elapsed: time.elapsed,
+                fixed_dt: self.fixed_step.fixed_dt(),
+                scale: self.time_scale.get(),
+                frame: time.frame,
+            },
+        );
+    }
+
+    /// Runs fixed, frame, message, timer/coroutine and late callbacks using one clock snapshot.
+    pub fn update_frame(&mut self, world: &mut World, frame_time: ScriptFrameTime) {
         if self.destroyed {
             return;
         }
+        self.frame_time = frame_time;
+        let time = ScriptTime {
+            elapsed: frame_time.elapsed,
+            frame: frame_time.frame,
+        };
+        let frame_serial_limit = self.next_serial;
         if !self.started {
-            self.start(world, time);
+            self.start_frame(world, frame_time);
         }
-        self.run_phase(world, Phase::Update(dt), time);
+        self.frame_serial_limit = frame_serial_limit;
+        self.frame_spawned = 0;
+        {
+            let mut timeline = self.timeline.borrow_mut();
+            timeline.snapshot_due(frame_time.frame, frame_time.elapsed);
+            timeline.take_due_timers(frame_time.elapsed, &mut self.due_timers);
+            timeline.take_due_coroutines(&mut self.due_coroutines);
+        }
+        std::mem::swap(&mut self.queued_messages, &mut self.delivery_messages);
+        self.queued_bytes = 0;
+        match self.fixed_step.advance(frame_time.dt) {
+            Ok(substeps) => {
+                let fixed_dt = self.fixed_step.fixed_dt();
+                for _ in 0..substeps {
+                    self.run_phase(world, Phase::FixedUpdate(fixed_dt), time);
+                }
+            }
+            Err(error) => self.events.borrow_mut().push(ScriptEvent {
+                level: ScriptEventLevel::Error,
+                source: self.scene_name.clone(),
+                message: format!("invalid script frame delta: {error}"),
+            }),
+        }
+        self.run_phase(world, Phase::Update(frame_time.dt), time);
+        self.sync_after_run_phase(world, time);
+        self.resume_coroutines(world, time);
+        self.sync_phase_boundary(world, time);
+        self.deliver_messages(world, time);
+        self.sync_phase_boundary(world, time);
+        self.fire_timers(world, time);
+        self.sync_phase_boundary(world, time);
+        self.run_phase(world, Phase::LateUpdate(frame_time.dt), time);
     }
 
     /// Возвращает время последнего `update` по фазам; `Start` и `Destroy` сюда не входят.
@@ -987,9 +1108,14 @@ impl ScriptHost {
         self.destroyed = true;
         self.net_events.clear();
         self.actions.clear_frame_transients();
+        self.frame_time.elapsed = time.elapsed;
+        self.frame_time.unscaled_elapsed = time.elapsed;
         if self.started {
             self.run_phase(world, Phase::Destroy, time);
         }
+        self.timeline.borrow_mut().clear();
+        self.due_timers.clear();
+        self.due_coroutines.clear();
         self.remove_all_commands();
         self.release_all_pending(world);
     }
@@ -1442,12 +1568,10 @@ impl ScriptHost {
         let started = Instant::now();
         world.recalculate_world_matrices();
         profile.world_matrices = started.elapsed();
+        if !matches!(phase, Phase::Destroy | Phase::TeardownDisable) {
+            self.sync_activity(world, time, self.frame_serial_limit);
+        }
         if matches!(phase, Phase::Update(_)) {
-            self.frame_spawned = 0;
-            self.sync_activity(world, time);
-            let started = Instant::now();
-            self.deliver_messages(world, time);
-            profile.messages = started.elapsed();
             let started = Instant::now();
             self.deliver_physics_events(world, time);
             self.deliver_trigger_stays(world, time);
@@ -1456,7 +1580,7 @@ impl ScriptHost {
             self.deliver_net_events(world, time);
         }
 
-        let time_error = lite::set_time(&self.lua_time, time)
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
         let mut observed_interrupt = self.interrupt.is_interrupted();
@@ -1493,6 +1617,8 @@ impl ScriptHost {
                     None,
                     None,
                     time_error.as_deref(),
+                    None,
+                    None,
                 )
             };
             let elapsed = started.elapsed();
@@ -1543,16 +1669,19 @@ impl ScriptHost {
     /// вызывает `on_enable`, а первый запуск ещё и `on_start`; выход из работы — `on_disable`.
     /// Каждый экземпляр проверяется один раз за фазу: флаги, которые callback меняет, действуют
     /// со следующей фазы, поэтому цикл переключений не возникает.
-    fn sync_activity(&mut self, world: &mut World, time: ScriptTime) {
+    fn sync_activity(&mut self, world: &mut World, time: ScriptTime, serial_limit: u64) {
         self.current_time = time;
         self.lifecycle.borrow_mut().now = time.elapsed;
-        let time_error = lite::set_time(&self.lua_time, time)
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
         for index in 0..self.instances.len() {
             let Some(instance) = self.instances[index].as_ref() else {
                 continue;
             };
+            if instance.serial > serial_limit && !instance.running {
+                continue;
+            }
             let should_run = instance.enabled
                 && instance.user_enabled
                 && world.active_in_hierarchy(instance.handle) == Some(true);
@@ -1580,12 +1709,25 @@ impl ScriptHost {
                 };
                 // Экземпляр, остановленный ошибкой, уже не получает `on_disable`.
                 let notify = instance.enabled;
+                let serial = instance.serial;
                 instance.running = false;
                 if notify {
                     self.run_transition(index, world, Phase::Disable, time, time_error.as_deref());
                 }
+                self.timeline.borrow_mut().cancel_owner(serial);
             }
         }
+    }
+
+    fn sync_phase_boundary(&mut self, world: &mut World, time: ScriptTime) {
+        self.apply_lifecycle(world, time);
+        self.sync_activity(world, time, self.frame_serial_limit);
+        self.apply_lifecycle(world, time);
+    }
+
+    fn sync_after_run_phase(&mut self, world: &mut World, time: ScriptTime) {
+        self.sync_activity(world, time, self.frame_serial_limit);
+        self.apply_lifecycle(world, time);
     }
 
     /// Уничтожение экземпляра. Активный экземпляр сначала получает `on_disable` (порядок Unity:
@@ -1614,6 +1756,8 @@ impl ScriptHost {
                 None,
                 None,
                 time_error,
+                None,
+                None,
             ) {
                 CallOutcome::Committed => {}
                 outcome => return outcome,
@@ -1628,6 +1772,8 @@ impl ScriptHost {
             None,
             None,
             time_error,
+            None,
+            None,
         )
     }
 
@@ -1639,7 +1785,9 @@ impl ScriptHost {
         time: ScriptTime,
         time_error: Option<&str>,
     ) {
-        match self.call_instance(index, world, phase, time, None, None, None, time_error) {
+        match self.call_instance(
+            index, world, phase, time, None, None, None, time_error, None, None,
+        ) {
             CallOutcome::Committed => {}
             CallOutcome::Interrupted => self.disable_instance(index),
             CallOutcome::Failed(message) => self.fail_instance(index, message),
@@ -1647,13 +1795,11 @@ impl ScriptHost {
     }
 
     fn deliver_messages(&mut self, world: &mut World, time: ScriptTime) {
-        std::mem::swap(&mut self.queued_messages, &mut self.delivery_messages);
-        self.queued_bytes = 0;
         if self.delivery_messages.is_empty() {
             return;
         }
         self.delivery_messages.reverse();
-        let time_error = lite::set_time(&self.lua_time, time)
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
         while let Some(message) = self.delivery_messages.pop() {
@@ -1677,6 +1823,8 @@ impl ScriptHost {
                     None,
                     None,
                     time_error.as_deref(),
+                    None,
+                    None,
                 ) {
                     CallOutcome::Committed => {}
                     CallOutcome::Interrupted => self.disable_instance(index),
@@ -1684,6 +1832,92 @@ impl ScriptHost {
                 }
             }
         }
+    }
+
+    fn resume_coroutines(&mut self, world: &mut World, time: ScriptTime) {
+        let coroutines = std::mem::take(&mut self.due_coroutines);
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
+            .err()
+            .map(|error| error.to_string());
+        for coroutine in &coroutines {
+            let Some(index) = self.instances.iter().position(|instance| {
+                instance
+                    .as_ref()
+                    .is_some_and(|instance| instance.serial == coroutine.owner)
+            }) else {
+                continue;
+            };
+            if !self.instances[index]
+                .as_ref()
+                .is_some_and(|instance| instance.enabled && instance.running)
+            {
+                continue;
+            }
+            match self.call_instance(
+                index,
+                world,
+                Phase::Coroutine,
+                time,
+                None,
+                None,
+                None,
+                time_error.as_deref(),
+                None,
+                Some(coroutine),
+            ) {
+                CallOutcome::Committed => {}
+                CallOutcome::Interrupted => self.disable_instance(index),
+                CallOutcome::Failed(message) => self.fail_instance(index, message),
+            }
+        }
+        self.due_coroutines.clear();
+        self.due_coroutines = coroutines;
+    }
+
+    fn fire_timers(&mut self, world: &mut World, time: ScriptTime) {
+        let timers = std::mem::take(&mut self.due_timers);
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
+            .err()
+            .map(|error| error.to_string());
+        for timer in &timers {
+            if !self.timeline.borrow().timer_exists(timer.id, timer.owner) {
+                continue;
+            }
+            let Some(index) = self.instances.iter().position(|instance| {
+                instance
+                    .as_ref()
+                    .is_some_and(|instance| instance.serial == timer.owner)
+            }) else {
+                self.timeline.borrow_mut().finish_due_timer(timer);
+                continue;
+            };
+            if !self.instances[index]
+                .as_ref()
+                .is_some_and(|instance| instance.enabled && instance.running)
+            {
+                self.timeline.borrow_mut().finish_due_timer(timer);
+                continue;
+            }
+            match self.call_instance(
+                index,
+                world,
+                Phase::Timer,
+                time,
+                None,
+                None,
+                None,
+                time_error.as_deref(),
+                Some(timer),
+                None,
+            ) {
+                CallOutcome::Committed => {}
+                CallOutcome::Interrupted => self.disable_instance(index),
+                CallOutcome::Failed(message) => self.fail_instance(index, message),
+            }
+            self.timeline.borrow_mut().finish_due_timer(timer);
+        }
+        self.due_timers.clear();
+        self.due_timers = timers;
     }
 
     /// Доставляет принятые сетевые события: каждое событие отдельной транзакцией на каждый экземпляр.
@@ -1694,7 +1928,7 @@ impl ScriptHost {
         if events.is_empty() {
             return;
         }
-        let time_error = lite::set_time(&self.lua_time, time)
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
         for event in events {
@@ -1736,6 +1970,8 @@ impl ScriptHost {
                     Some(&event),
                     None,
                     time_error.as_deref(),
+                    None,
+                    None,
                 ) {
                     CallOutcome::Committed => {}
                     CallOutcome::Interrupted => self.disable_instance(index),
@@ -1794,7 +2030,7 @@ impl ScriptHost {
         if events.is_empty() {
             return;
         }
-        let time_error = lite::set_time(&self.lua_time, time)
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
         for QueuedUiEvent { owner, delivery } in events {
@@ -1823,6 +2059,8 @@ impl ScriptHost {
                     None,
                     Some(&delivery),
                     time_error.as_deref(),
+                    None,
+                    None,
                 ) {
                     CallOutcome::Committed => {}
                     CallOutcome::Interrupted => self.disable_instance(index),
@@ -2069,6 +2307,8 @@ impl ScriptHost {
                 None,
                 None,
                 None,
+                None,
+                None,
             ) {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => self.disable_instance(index),
@@ -2088,7 +2328,26 @@ impl ScriptHost {
         net_event: Option<&NetEvent>,
         ui_event: Option<&UiDelivery>,
         time_error: Option<&str>,
+        timer: Option<&DueTimer>,
+        coroutine: Option<&ScriptCoroutine>,
     ) -> CallOutcome {
+        let mut callback_time = self.frame_time;
+        match phase {
+            Phase::FixedUpdate(dt) | Phase::Update(dt) | Phase::LateUpdate(dt) => {
+                callback_time.dt = dt;
+                if matches!(phase, Phase::FixedUpdate(_)) {
+                    callback_time.unscaled_dt = if callback_time.scale > 0.0 {
+                        dt / callback_time.scale
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            _ => {}
+        }
+        if let Err(error) = lite::set_time(&self.lua_time, callback_time) {
+            return CallOutcome::Failed(error.to_string());
+        }
         let Self {
             instances,
             events,
@@ -2123,6 +2382,7 @@ impl ScriptHost {
             return CallOutcome::Failed("object no longer exists".to_owned());
         };
         let initial = script_transform(local);
+        transaction.set_frame_time(callback_time);
         transaction.begin(ScriptTransactionInit {
             world,
             self_object: Some(instance.handle),
@@ -2137,7 +2397,7 @@ impl ScriptHost {
             net: net.clone(),
             queued_net: net_requests.len(),
             physics_phase_dt: match phase {
-                Phase::Update(dt) => Some(dt),
+                Phase::FixedUpdate(dt) | Phase::Update(dt) => Some(dt),
                 _ => None,
             },
             lifecycle: lifecycle.clone(),
@@ -2150,14 +2410,33 @@ impl ScriptHost {
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
             ScriptKind::Lite(lite_instance) => {
                 *active_source.borrow_mut() = instance.source.clone();
-                let _active_call = ActiveCallGuard::new(
-                    lua,
-                    Some(call_deadline),
-                    active_call,
-                    transaction_ptr,
-                    active_owner,
-                    Some(index),
-                );
+                let _active_call = if let Some(coroutine) = coroutine {
+                    ActiveCallGuard::new_thread(
+                        lua,
+                        Some(call_deadline),
+                        &coroutine.thread,
+                        active_call,
+                        transaction_ptr,
+                        active_owner,
+                        Some(index),
+                    )
+                } else {
+                    Ok(ActiveCallGuard::new(
+                        lua,
+                        Some(call_deadline),
+                        active_call,
+                        transaction_ptr,
+                        active_owner,
+                        Some(index),
+                    ))
+                };
+                let _active_call = match _active_call {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        transaction.discard();
+                        return CallOutcome::Failed(error.to_string());
+                    }
+                };
                 let has_callback = match phase {
                     Phase::Message => lite_instance.has_message_callback(),
                     Phase::Enable => lite_instance.has_callback("on_enable"),
@@ -2182,7 +2461,13 @@ impl ScriptHost {
                                         Phase::Disable | Phase::TeardownDisable => {
                                             lite_instance.invoke_disable()
                                         }
+                                        Phase::FixedUpdate(dt) => {
+                                            lite_instance.invoke_fixed_update(dt)
+                                        }
                                         Phase::Update(dt) => lite_instance.invoke_update(dt),
+                                        Phase::LateUpdate(dt) => {
+                                            lite_instance.invoke_late_update(dt)
+                                        }
                                         Phase::Message => match message {
                                             Some(message) => lite_instance.invoke_message(
                                                 lua,
@@ -2224,6 +2509,76 @@ impl ScriptHost {
                                             None => Err(LuaError::runtime("missing ui event data")),
                                         },
                                         Phase::Destroy => lite_instance.invoke_destroy(),
+                                        Phase::Timer => match timer {
+                                            Some(timer) => match &timer.callback {
+                                                TimerCallback::Lua(callback) => {
+                                                    lite_instance.invoke_timer(callback, timer.id)
+                                                }
+                                                TimerCallback::Abi(_) => Err(LuaError::runtime(
+                                                    "ABI timer dispatched to Lua script",
+                                                )),
+                                            },
+                                            None => Err(LuaError::runtime("missing timer data")),
+                                        },
+                                        Phase::Coroutine => {
+                                            let Some(coroutine) = coroutine else {
+                                                return Err(LuaError::runtime("missing coroutine"));
+                                            };
+                                            match lite_instance
+                                                .resume_coroutine(&coroutine.thread)?
+                                            {
+                                                lite::CoroutineResume::Finished => unsafe {
+                                                    (*transaction_ptr)
+                                                        .remove_coroutine(coroutine.id);
+                                                },
+                                                lite::CoroutineResume::Yielded(yielded) => {
+                                                    let wait = match yielded {
+                                                        lite::CoroutineYield::NextFrame => {
+                                                            CoroutineWait::Frame(
+                                                                callback_time
+                                                                    .frame
+                                                                    .saturating_add(1),
+                                                            )
+                                                        }
+                                                        lite::CoroutineYield::Frames(frames) => {
+                                                            CoroutineWait::Frame(
+                                                                callback_time
+                                                                    .frame
+                                                                    .saturating_add(frames.max(1)),
+                                                            )
+                                                        }
+                                                        lite::CoroutineYield::Seconds(seconds)
+                                                            if seconds > 0.0 =>
+                                                        {
+                                                            let due =
+                                                                callback_time.elapsed + seconds;
+                                                            CoroutineWait::Time(
+                                                                if due.is_finite() {
+                                                                    due
+                                                                } else {
+                                                                    f64::MAX
+                                                                },
+                                                            )
+                                                        }
+                                                        lite::CoroutineYield::Seconds(_) => {
+                                                            CoroutineWait::Frame(
+                                                                callback_time
+                                                                    .frame
+                                                                    .saturating_add(1),
+                                                            )
+                                                        }
+                                                    };
+                                                    unsafe {
+                                                        (*transaction_ptr).reschedule_coroutine(
+                                                            coroutine.id,
+                                                            coroutine.thread.clone(),
+                                                            wait,
+                                                        )
+                                                    };
+                                                }
+                                            }
+                                            Ok(())
+                                        }
                                     })
                             }
                         };
@@ -2267,6 +2622,8 @@ impl ScriptHost {
                         script.invoke(AbiPhase::Disable, time, call)
                     }
                     Phase::Update(dt) => script.invoke(AbiPhase::Update(dt), time, call),
+                    Phase::FixedUpdate(dt) => script.invoke(AbiPhase::FixedUpdate(dt), time, call),
+                    Phase::LateUpdate(dt) => script.invoke(AbiPhase::LateUpdate(dt), time, call),
                     Phase::PhysicsEvent(event) => {
                         let Some(other) = (unsafe { (*transaction_ptr).abi_handle(event.other) })
                         else {
@@ -2293,6 +2650,13 @@ impl ScriptHost {
                         None => Err("missing ui event data".to_owned()),
                     },
                     Phase::Destroy => script.invoke(AbiPhase::Destroy, time, call),
+                    Phase::Timer => match timer.map(|timer| &timer.callback) {
+                        Some(TimerCallback::Abi(tag)) => script.invoke_timer(time, tag, call),
+                        _ => Err("missing ABI timer callback".to_owned()),
+                    },
+                    Phase::Coroutine => {
+                        Err("Rust ABI scripts do not have Lua coroutines".to_owned())
+                    }
                 }
                 .map(|()| None)
             }
@@ -2302,6 +2666,11 @@ impl ScriptHost {
             // SAFETY: the callback and its call-scoped transaction borrow have returned.
             unsafe { (*transaction_ptr).discard() };
             return CallOutcome::Interrupted;
+        }
+        if matches!(&instance.kind, ScriptKind::Lite(_)) && call_deadline.is_expired() {
+            // SAFETY: the callback and its call-scoped transaction borrow have returned.
+            unsafe { (*transaction_ptr).discard() };
+            return CallOutcome::Failed(call_deadline.timeout_message());
         }
 
         match callback_result {
@@ -2359,6 +2728,16 @@ impl ScriptHost {
     /// Применяет накопленные заявки в конце фазы: spawn в порядке commit, затем удаления,
     /// вытеснение по `max_instances` и созревшие отложенные удаления.
     fn apply_lifecycle(&mut self, world: &mut World, time: ScriptTime) {
+        let has_work = {
+            let lifecycle = self.lifecycle.borrow();
+            !lifecycle.enabled_writes.is_empty()
+                || !lifecycle.queued.is_empty()
+                || !lifecycle.destroys.is_empty()
+                || lifecycle.scheduled.values().any(|due| *due <= time.elapsed)
+        };
+        if !has_work {
+            return;
+        }
         // Флаги `set_enabled` меняются здесь; переход в работу выполнит следующая `sync_activity`.
         let enabled_writes = std::mem::take(&mut self.lifecycle.borrow_mut().enabled_writes);
         for (serial, enabled) in enabled_writes {
@@ -2794,7 +3173,7 @@ impl ScriptHost {
             }
         }
 
-        let time_error = lite::set_time(&self.lua_time, time)
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
         let indexes = (0..self.instances.len())
@@ -2947,6 +3326,7 @@ impl ScriptHost {
     fn remove_instance(&mut self, index: usize) {
         self.remove_commands_for_owner(index);
         if let Some(instance) = self.instances[index].take() {
+            self.timeline.borrow_mut().cancel_owner(instance.serial);
             self.lifecycle.borrow_mut().forget_instance(instance.serial);
             self.free_instances.push(index);
         }
@@ -2998,6 +3378,7 @@ impl ScriptHost {
     fn disable_instance(&mut self, index: usize) {
         if let Some(instance) = self.instances[index].as_mut() {
             instance.enabled = false;
+            self.timeline.borrow_mut().cancel_owner(instance.serial);
         }
         self.remove_commands_for_owner(index);
     }
@@ -3092,6 +3473,27 @@ impl<'lua> ActiveCallGuard<'lua> {
             active_owner: active_owner.clone(),
             _deadline: call_deadline.map(|deadline| deadline.enter(lua)),
         }
+    }
+
+    fn new_thread(
+        lua: &'lua Lua,
+        call_deadline: Option<&lite::CallDeadline>,
+        thread: &mlua::Thread,
+        active_call: &ActiveCall,
+        transaction: *mut ScriptTransaction,
+        active_owner: &ActiveOwner,
+        owner: Option<usize>,
+    ) -> mlua::Result<Self> {
+        let deadline = call_deadline
+            .map(|deadline| deadline.enter_thread(lua, thread))
+            .transpose()?;
+        active_call.set(transaction);
+        active_owner.set(owner);
+        Ok(Self {
+            active_call: active_call.clone(),
+            active_owner: active_owner.clone(),
+            _deadline: deadline,
+        })
     }
 }
 

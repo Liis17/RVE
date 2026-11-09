@@ -39,6 +39,8 @@ pub struct PhysicsStepResult {
 pub struct PhysicsInitialization {
     pub result: PhysicsStepResult,
     pub bindings: Vec<PhysicsSceneBinding>,
+    pub fixed_hz: u32,
+    pub max_substeps: usize,
 }
 
 impl PhysicsInitialization {
@@ -49,7 +51,12 @@ impl PhysicsInitialization {
     ) -> Result<Self, PhysicsServerError> {
         let result = build_initial_result(driver)
             .map_err(|error| PhysicsServerError::Initialization(error.to_string()))?;
-        Ok(Self { result, bindings })
+        Ok(Self {
+            result,
+            bindings,
+            fixed_hz: driver.fixed_hz(),
+            max_substeps: driver.max_substeps(),
+        })
     }
 }
 
@@ -213,6 +220,8 @@ impl PhysicsServer {
             .send(PhysicsReply::Initialized(PhysicsInitialization {
                 result: initial_result,
                 bindings,
+                fixed_hz: driver.fixed_hz(),
+                max_substeps: driver.max_substeps(),
             }))
             .map_err(|_| PhysicsServerError::ReplyChannelDisconnected)?;
 
@@ -595,6 +604,8 @@ mod tests {
                 skipped_commands: 0,
             },
             bindings: Vec::new(),
+            fixed_hz: 60,
+            max_substeps: 8,
         }
     }
 
