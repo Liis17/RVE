@@ -1118,10 +1118,12 @@ impl PlaySession {
             audio.bridge.apply(activity_requests, &self.world);
         }
         loop {
+            // Смена сцены в Play не подключена: `scene_replaced` здесь всегда пуст.
             let WorldChanges {
                 spawned,
                 despawned,
                 prefab_requests,
+                scene_replaced: _,
             } = self.host.drain_world_changes();
             if spawned.is_empty() && despawned.is_empty() && prefab_requests.is_empty() {
                 return;
