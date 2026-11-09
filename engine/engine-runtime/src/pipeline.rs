@@ -42,6 +42,7 @@ use engine_scene::camera::Camera;
 use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
 };
+use engine_scene::world::ParticleCommand;
 use engine_scene::{
     AntiAliasing, AudioRequest, CameraSettings, EnvironmentState, LightState, LocalLightState,
     ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
@@ -93,6 +94,8 @@ pub(crate) struct FrameSnapshot {
     /// Палитры skinning кадра; draw ссылается на них по индексу в `SkinBinding::palette`.
     pub joint_palettes: Vec<Vec<[[f32; 4]; 4]>>,
     pub particles: Vec<ParticleSnapshot>,
+    /// Команды эмиттеров, поставленные скриптами за кадр: перезапуск и выброс.
+    pub particle_commands: Vec<engine_scene::world::ParticleCommand>,
     /// Игровое время скриптового потока на момент снимка; основа шага симуляции частиц.
     pub sim_time: f64,
     /// Экранные шейдеры вида: включённые проходы камеры и время сцены.
@@ -135,6 +138,8 @@ pub(crate) enum EnvironmentCacheKey {
 pub(crate) struct ParticleSnapshot {
     pub object: ObjectHandle,
     pub transform: [[f32; 4]; 4],
+    /// Рождаются ли частицы в этом кадре (`particles:play`/`stop` из скриптов).
+    pub emitting: bool,
 }
 
 /// Уровни LOD объекта: каждый уровень — список пар «меш и материал».
@@ -682,6 +687,17 @@ impl RenderBackend for VulkanBackend {
         self.renderer.set_latency_frame(snapshot.sequence);
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let particle_step = particle_step(snapshot.sim_time, self.last_submitted_sim_time);
+        for (emitter, burst) in
+            resolve_particle_commands(&self.particle_emitters, &snapshot.particle_commands)
+        {
+            let outcome = match burst {
+                None => self.renderer.restart_particle_emitter(emitter),
+                Some(count) => self.renderer.emit_particle_burst(emitter, count),
+            };
+            if let Err(error) = outcome {
+                log::error!("команда эмиттера частиц не применена: {error}");
+            }
+        }
         let particles: Vec<ParticleEmitterFrame> = snapshot
             .particles
             .iter()
@@ -689,7 +705,7 @@ impl RenderBackend for VulkanBackend {
                 Some(ParticleEmitterFrame {
                     emitter: *self.particle_emitters.get(&instance.object)?,
                     transform: instance.transform,
-                    emitting: true,
+                    emitting: instance.emitting,
                 })
             })
             .collect();
@@ -1134,6 +1150,7 @@ fn scripts_thread(
     let mut published_cursor = None;
     set_initial_cursor(&mut scripts, &world, &cursor, &mut published_cursor);
     scripts.start(&mut world, start_time);
+    let mut particle_commands = scripts.drain_particle_commands();
     print_script_events(scripts.drain_events());
     publish_script_cursor(&scripts, &cursor, &mut published_cursor);
     let mut audio = audio.map(engine_audio::AudioBridge::new);
@@ -1382,6 +1399,7 @@ fn scripts_thread(
             audio.apply(scripts.drain_audio_requests(), &world);
         }
         animation.apply(scripts.drain_animation_requests());
+        particle_commands.extend(scripts.drain_particle_commands());
         let finished = animation.advance(dt);
         scripts.queue_animation_events(
             &world,
@@ -1473,6 +1491,7 @@ fn scripts_thread(
         let made =
             make_snapshot(scene_frame, &world, &gpu_scene, &animation).map(|mut snapshot| {
                 snapshot.sim_time = sim_time;
+                snapshot.particle_commands = std::mem::take(&mut particle_commands);
                 snapshot.screen_shaders.time = screen_shader_time(sim_time);
                 snapshot
             });
@@ -2157,6 +2176,7 @@ fn make_snapshot(
         .map(|instance| ParticleSnapshot {
             object: instance.object,
             transform: instance.model.to_cols_array_2d(),
+            emitting: instance.emitting,
         })
         .collect();
     Ok(FrameSnapshot {
@@ -2173,6 +2193,7 @@ fn make_snapshot(
         environment,
         draws,
         particles,
+        particle_commands: Vec::new(),
         sim_time: 0.0,
         joint_palettes,
         object_motion,
@@ -2350,6 +2371,24 @@ fn spawn_particle_requests(
                 object,
                 desc: Box::new(desc.clone()?),
             })
+        })
+        .collect()
+}
+
+/// Переводит команды скриптов в действия над эмиттерами: `None` — перезапуск, `Some(n)` — выброс.
+/// Команда объекта без эмиттера пропускается, как и заявки, пришедшие после уничтожения объекта.
+fn resolve_particle_commands<E: Copy>(
+    emitters: &HashMap<ObjectHandle, E>,
+    commands: &[ParticleCommand],
+) -> Vec<(E, Option<u32>)> {
+    commands
+        .iter()
+        .filter_map(|command| {
+            let (object, burst) = match *command {
+                ParticleCommand::Restart { object } => (object, None),
+                ParticleCommand::Burst { object, count } => (object, Some(count)),
+            };
+            Some((*emitters.get(&object)?, burst))
         })
         .collect()
 }
@@ -3843,6 +3882,7 @@ distance=2.0
         let active_camera = motion_test_handles().0;
         FrameSnapshot {
             particles: Vec::new(),
+            particle_commands: Vec::new(),
             sim_time: 0.0,
             sequence: 0,
             camera: Camera {
@@ -3889,6 +3929,7 @@ distance=2.0
     ) -> FrameSnapshot {
         FrameSnapshot {
             particles: Vec::new(),
+            particle_commands: Vec::new(),
             sim_time: 0.0,
             sequence: 0,
             camera: Camera {
@@ -7239,6 +7280,42 @@ mod particle_emitter_tests {
         assert_eq!(log, vec![8]);
         apply(&mut table, &mut log, ParticleRequest::Destroy(vec![a]));
         assert_eq!(log, vec![8], "повторное уничтожение не трогает эмиттер");
+    }
+}
+
+#[cfg(test)]
+mod particle_command_tests {
+    use super::resolve_particle_commands;
+    use engine_scene::world::ParticleCommand;
+    use engine_scene::{ObjectHandle, SceneDocument, World};
+    use std::collections::HashMap;
+
+    const SCENE: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+[[objects]]\nid = \"fire\"\n[objects.particle_emitter]\n\
+[[objects]]\nid = \"crate\"\n";
+
+    #[test]
+    fn commands_resolve_to_their_emitter_and_skip_objects_without_one() {
+        let world =
+            World::from_document(&SceneDocument::parse("test.rvescene", SCENE).unwrap()).unwrap();
+        let fire: ObjectHandle = world.handle("fire").unwrap();
+        let crate_handle: ObjectHandle = world.handle("crate").unwrap();
+        let emitters = HashMap::from([(fire, 7_u32)]);
+        let resolved = resolve_particle_commands(
+            &emitters,
+            &[
+                ParticleCommand::Burst {
+                    object: fire,
+                    count: 4,
+                },
+                ParticleCommand::Restart { object: fire },
+                ParticleCommand::Burst {
+                    object: crate_handle,
+                    count: 9,
+                },
+            ],
+        );
+        assert_eq!(resolved, vec![(7, Some(4)), (7, None)]);
     }
 }
 

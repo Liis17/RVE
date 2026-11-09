@@ -2145,6 +2145,11 @@ fn render_scene_frame(
     } else {
         engine_scene::PostProcessSettings::default()
     };
+    let particle_commands = state
+        .play
+        .as_mut()
+        .map(PlaySession::take_particle_commands)
+        .unwrap_or_default();
     let Some(parts) = state.frame_parts() else {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
@@ -2175,6 +2180,7 @@ fn render_scene_frame(
         preview_asset.as_deref(),
         parts.world,
         &scene_frame,
+        &particle_commands,
         scene_camera.position,
         game_camera.position,
         grid_camera_distance,

@@ -33,6 +33,7 @@ use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
 };
 use engine_scene::world::ObjectHandle;
+use engine_scene::world::ParticleCommand;
 use engine_scene::{
     AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, MaterialAlphaMode,
     MaterialAsset, MeshInstance, ParticleBlendMode, ParticleEmitterComponent,
@@ -1445,6 +1446,7 @@ impl SceneRenderer {
         preview_asset: Option<&str>,
         world: &World,
         frame: &SceneFrame,
+        particle_commands: &[ParticleCommand],
         scene_eye: Vec3,
         game_eye: Vec3,
         grid_camera_distance: Option<f32>,
@@ -1483,7 +1485,7 @@ impl SceneRenderer {
         self.scene_draws.clear();
         self.game_draws.clear();
         self.capture_draws.clear();
-        self.sync_particles(renderer, world, frame)?;
+        self.sync_particles(renderer, world, frame, particle_commands)?;
         let palette_index = palette_indices(&self.skins, play_bridge.or(self.animation.bridge()));
         let used_object_materials = {
             let mut resources = DrawResources {
@@ -1978,6 +1980,7 @@ impl SceneRenderer {
         renderer: &mut Renderer,
         world: &World,
         frame: &SceneFrame,
+        commands: &[ParticleCommand],
     ) -> Result<(), RenderError> {
         // Старые ссылки на эмиттеры могут уйти на замену; при ошибке кадр не должен их использовать.
         self.particle_frames.clear();
@@ -2041,7 +2044,7 @@ impl SceneRenderer {
                 frames.push(ParticleEmitterFrame {
                     emitter: entry.id,
                     transform: instance.model.to_cols_array_2d(),
-                    emitting: true,
+                    emitting: instance.emitting,
                 });
             }
         }
@@ -2054,6 +2057,19 @@ impl SceneRenderer {
         for handle in removed {
             if let Some(old) = self.particle_emitters.remove(&handle) {
                 renderer.destroy_particle_emitter(old.id)?;
+            }
+        }
+        for command in commands {
+            let (object, burst) = match *command {
+                ParticleCommand::Restart { object } => (object, None),
+                ParticleCommand::Burst { object, count } => (object, Some(count)),
+            };
+            let Some(entry) = self.particle_emitters.get(&object) else {
+                continue;
+            };
+            match burst {
+                None => renderer.restart_particle_emitter(entry.id)?,
+                Some(count) => renderer.emit_particle_burst(entry.id, count)?,
             }
         }
         self.particle_frames = frames;
