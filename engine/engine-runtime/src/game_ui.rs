@@ -711,12 +711,13 @@ impl GameUi {
                 }
                 continue;
             };
-            let range = batch.indices.start as usize..batch.indices.end as usize;
+            let vertices = batch.vertices.start as usize..batch.vertices.end as usize;
+            let indices = batch.indices.start as usize..batch.indices.end as usize;
             primitives.push(UiPrimitive {
                 clip_rect: batch.clip_rect,
                 image: UiImage::Texture(texture),
-                vertices: &self.vertices,
-                indices: &paint.draw_list.indices[range],
+                vertices: &self.vertices[vertices],
+                indices: &paint.draw_list.indices[indices],
             });
         }
         primitives
@@ -977,6 +978,7 @@ mod tests {
                 batches: vec![UiBatch {
                     texture: UiTexture::Image("ui/gone.png".to_owned()),
                     clip_rect: [0.0; 4],
+                    vertices: 0..1,
                     indices: 0..3,
                 }],
             }),

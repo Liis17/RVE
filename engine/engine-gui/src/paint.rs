@@ -45,12 +45,15 @@ pub struct UiVertex {
     pub color: [u8; 4],
 }
 
-/// Подряд идущие индексы одной текстуры и одной области отсечения.
+/// Подряд идущие меши одной текстуры и одной области отсечения.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiBatch {
     pub texture: UiTexture,
     /// Минимум и максимум по осям в физических пикселях: `[min_x, min_y, max_x, max_y]`.
     pub clip_rect: [f32; 4],
+    /// Вершины батча в `UiDrawList::vertices`: батч владеет только своим диапазоном.
+    pub vertices: Range<u32>,
+    /// Индексы батча в `UiDrawList::indices`; их значения локальны, от `vertices.start`.
     pub indices: Range<u32>,
 }
 
@@ -774,41 +777,50 @@ fn button_image<'a>(images: &'a StateValues<UiPath>, state: &ButtonState) -> Opt
 }
 
 /// Добавляет меш канваса в общий список: вершины переводятся в пиксели, соседние батчи с одной
-/// текстурой и клипом объединяются.
+/// текстурой и клипом объединяются. Индексы хранятся относительно первой вершины батча, поэтому
+/// каждый примитив может получить только свой срез вершин.
 fn push_mesh(list: &mut UiDrawList, mesh: &Mesh, texture: UiTexture, clip: Rect, scale: f32) {
     if mesh.indices.is_empty() {
         return;
     }
-    let base = list.vertices.len() as u32;
-    list.vertices
-        .extend(mesh.vertices.iter().map(|vertex| UiVertex {
-            pos: [vertex.pos.x * scale, vertex.pos.y * scale],
-            uv: [vertex.uv.x, vertex.uv.y],
-            color: vertex.color.to_array(),
-        }));
-    let start = list.indices.len() as u32;
-    list.indices
-        .extend(mesh.indices.iter().map(|index| base + index));
-    let end = list.indices.len() as u32;
     let clip_rect = [
         clip.min.x * scale,
         clip.min.y * scale,
         clip.max.x * scale,
         clip.max.y * scale,
     ];
-    if let Some(last) = list.batches.last_mut()
-        && last.texture == texture
-        && last.clip_rect == clip_rect
-        && last.indices.end == start
-    {
-        last.indices.end = end;
-        return;
+    let vertex_start = list.vertices.len() as u32;
+    let index_start = list.indices.len() as u32;
+    let open = list
+        .batches
+        .last_mut()
+        .filter(|last| last.texture == texture && last.clip_rect == clip_rect);
+    let base = vertex_start
+        - open
+            .as_ref()
+            .map_or(vertex_start, |last| last.vertices.start);
+    list.vertices
+        .extend(mesh.vertices.iter().map(|vertex| UiVertex {
+            pos: [vertex.pos.x * scale, vertex.pos.y * scale],
+            uv: [vertex.uv.x, vertex.uv.y],
+            color: vertex.color.to_array(),
+        }));
+    list.indices
+        .extend(mesh.indices.iter().map(|index| base + index));
+    let vertices = vertex_start..list.vertices.len() as u32;
+    let indices = index_start..list.indices.len() as u32;
+    match open {
+        Some(last) => {
+            last.vertices.end = vertices.end;
+            last.indices.end = indices.end;
+        }
+        None => list.batches.push(UiBatch {
+            texture,
+            clip_rect,
+            vertices,
+            indices,
+        }),
     }
-    list.batches.push(UiBatch {
-        texture,
-        clip_rect,
-        indices: start..end,
-    });
 }
 
 /// Стандартные шрифты epaint плюс зарегистрированные; свой шрифт — первым в семействе.
@@ -959,6 +971,34 @@ rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], o
             expected_start = batch.indices.end;
         }
         assert_eq!(expected_start as usize, paint.draw_list.indices.len());
+    }
+
+    #[test]
+    fn batches_own_disjoint_vertex_ranges_with_local_indices() {
+        let (mut system, _) = system_with(PANEL_IMAGE_TEXT);
+        system.register_image("/ui/icon.png", [64, 64]).unwrap();
+        let list = system.paint().draw_list;
+        assert!(list.batches.len() > 1, "нужны несколько батчей");
+        let mut expected_start = 0;
+        for batch in &list.batches {
+            assert_eq!(
+                batch.vertices.start, expected_start,
+                "вершины батчей идут подряд без пересечений"
+            );
+            expected_start = batch.vertices.end;
+            let count = batch.vertices.end - batch.vertices.start;
+            for index in &list.indices[batch.indices.start as usize..batch.indices.end as usize] {
+                assert!(
+                    *index < count,
+                    "индекс {index} выходит за вершины батча ({count})"
+                );
+            }
+        }
+        assert_eq!(
+            expected_start as usize,
+            list.vertices.len(),
+            "батчи покрывают все вершины"
+        );
     }
 
     #[test]

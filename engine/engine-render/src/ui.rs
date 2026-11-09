@@ -423,6 +423,25 @@ mod tests {
     }
 
     #[test]
+    fn batch_slices_pack_exactly_their_own_vertices() {
+        // Три батча одного draw list: каждый несёт только свои вершины, индексы локальны.
+        let all = vertices(9);
+        let packed = pack(
+            &[
+                primitive(&all[0..3], &[0, 1, 2]),
+                primitive(&all[3..7], &[0, 1, 2, 1, 2, 3]),
+                primitive(&all[7..9], &[1, 0, 1]),
+            ],
+            EXTENT,
+        )
+        .unwrap();
+        assert_eq!(packed.vertices.len(), 9 * size_of::<UiVertex>());
+        assert_eq!(packed.indices.len(), 12 * size_of::<u32>());
+        let offsets: Vec<i32> = packed.draws.iter().map(|draw| draw.vertex_offset).collect();
+        assert_eq!(offsets, vec![0, 3, 7]);
+    }
+
+    #[test]
     fn several_views_share_buffers_with_continuing_offsets() {
         let view_a = vertices(3);
         let view_b = vertices(4);
