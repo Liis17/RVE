@@ -323,3 +323,94 @@ fn failures_reported_by_the_thread_are_kept_for_the_owner_once() {
     );
     assert!(rig.bridge.take_warnings().is_empty());
 }
+
+fn clip(path: &str, params: ClipParams) -> AudioRequest {
+    AudioRequest::PlayClip {
+        voice: voice(7),
+        path: engine_files::VirtualPath::parse(path).unwrap(),
+        params,
+    }
+}
+
+#[test]
+fn clip_without_position_or_follow_is_two_dimensional() {
+    let mut rig = Rig::new();
+    let world = world(SCENE);
+    rig.bridge
+        .apply([clip("audio/shot.wav", ClipParams::default())], &world);
+    let sent = rig.take();
+    let Some(Command::Play { request, .. }) = sent.first() else {
+        panic!("ожидался Play: {sent:?}");
+    };
+    assert_eq!(
+        request.spatial, None,
+        "без позиции клип не пространственный"
+    );
+}
+
+#[test]
+fn follow_moves_the_emitter_and_stops_when_the_object_is_deactivated() {
+    let mut rig = Rig::new();
+    let scene = world(SCENE);
+    let speaker = scene.handle("speaker").unwrap();
+    rig.bridge.apply(
+        [clip(
+            "audio/shot.wav",
+            ClipParams {
+                follow: Some(speaker),
+                ..ClipParams::default()
+            },
+        )],
+        &scene,
+    );
+    let sent = rig.take();
+    let Some(Command::Play { lane, request, .. }) = sent.first() else {
+        panic!("ожидался Play: {sent:?}");
+    };
+    assert_eq!(request.spatial, Some(SCRIPT_DISTANCES));
+    assert_eq!(rig.handle.spatial().emitter(*lane), Some([3.0, 0.0, 0.0]));
+
+    let moved = world(&SCENE.replace("position = [3.0, 0.0, 0.0]", "position = [5.0, 0.0, 0.0]"));
+    rig.bridge.sync_positions(&moved);
+    assert_eq!(rig.handle.spatial().emitter(*lane), Some([5.0, 0.0, 0.0]));
+
+    let hidden = world(&SCENE.replace("id = \"speaker\"\n", "id = \"speaker\"\nactive = false\n"));
+    rig.bridge.sync_positions(&hidden);
+    assert!(
+        rig.take()
+            .iter()
+            .any(|command| matches!(command, Command::Stop(_))),
+        "неактивный объект останавливает голос скрипта"
+    );
+}
+
+#[test]
+fn set_voice_position_detaches_the_follow_object() {
+    let mut rig = Rig::new();
+    let scene = world(SCENE);
+    let speaker = scene.handle("speaker").unwrap();
+    rig.bridge.apply(
+        [clip(
+            "audio/shot.wav",
+            ClipParams {
+                follow: Some(speaker),
+                ..ClipParams::default()
+            },
+        )],
+        &scene,
+    );
+    let lane = match rig.take().first() {
+        Some(Command::Play { lane, .. }) => *lane,
+        other => panic!("ожидался Play: {other:?}"),
+    };
+    rig.bridge.apply(
+        [AudioRequest::SetVoicePosition {
+            voice: voice(7),
+            position: [9.0, 9.0, 9.0],
+        }],
+        &scene,
+    );
+    let moved = world(&SCENE.replace("position = [3.0, 0.0, 0.0]", "position = [-4.0, 0.0, 0.0]"));
+    rig.bridge.sync_positions(&moved);
+    assert_eq!(rig.handle.spatial().emitter(lane), Some([9.0, 9.0, 9.0]));
+}

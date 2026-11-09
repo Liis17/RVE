@@ -33,13 +33,20 @@ impl VoiceId {
 }
 
 /// Параметры одноразового или зацикленного клипа, запущенного скриптом.
-/// `position` делает голос пространственным с фиксированной точкой излучения.
+/// `position` делает голос пространственным с фиксированной точкой излучения; `follow` ведёт
+/// излучатель за объектом сцены, пока тот жив и активен.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipParams {
     pub group: AudioGroup,
     pub volume: f32,
     pub looping: bool,
     pub position: Option<[f32; 3]>,
+    pub follow: Option<ObjectHandle>,
+    /// Доля 3D-микширования `0..=1`; `0` — 2D-клип, даже если задана позиция.
+    pub spatial_blend: f32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub force_mono: bool,
 }
 
 impl Default for ClipParams {
@@ -49,6 +56,11 @@ impl Default for ClipParams {
             volume: 1.0,
             looping: false,
             position: None,
+            follow: None,
+            spatial_blend: 1.0,
+            min_distance: 1.0,
+            max_distance: 30.0,
+            force_mono: false,
         }
     }
 }
@@ -73,6 +85,8 @@ pub enum AudioRequest {
     },
     /// `rve.audio.stop(id)`.
     StopVoice { voice: VoiceId },
+    /// `rve.audio.set_voice_position(id, pos)`: фиксирует излучатель и снимает слежение за объектом.
+    SetVoicePosition { voice: VoiceId, position: [f32; 3] },
     /// `rve.audio.set_group_volume(group, v)`.
     SetGroupVolume { group: AudioGroup, volume: f32 },
 }
@@ -301,46 +315,52 @@ pub(crate) fn validate_audio_source(
             ),
         ));
     }
+    match audio_source_problem(audio) {
+        Some(problem) => Err(SceneError::new(source, Some(object_id), problem)),
+        None => Ok(()),
+    }
+}
+
+/// Причина отказа для пространственных опций клипа скрипта или `None`.
+pub fn clip_spatial_problem(params: &ClipParams) -> Option<&'static str> {
+    if !params.spatial_blend.is_finite() || !(0.0..=1.0).contains(&params.spatial_blend) {
+        return Some("spatial_blend должен быть конечным и в диапазоне 0..=1");
+    }
+    if !params.min_distance.is_finite()
+        || !params.max_distance.is_finite()
+        || params.min_distance <= 0.0
+        || params.min_distance >= params.max_distance
+    {
+        return Some(
+            "min_distance и max_distance должны удовлетворять 0 < min_distance < max_distance",
+        );
+    }
+    None
+}
+
+/// Причина отказа для значений источника (без проверки клипа и `[[assets]]`) или `None`.
+/// Тот же набор правил применяют сцена, скрипты и редактор.
+pub fn audio_source_problem(audio: &AudioSourceComponent) -> Option<&'static str> {
     if audio.group == AudioGroup::Master {
-        return Err(SceneError::new(
-            source,
-            Some(object_id),
-            "audio_source.group не может быть master",
-        ));
+        return Some("audio_source.group не может быть master");
     }
     if !audio.volume.is_finite() || !(0.0..=MAX_AUDIO_VOLUME).contains(&audio.volume) {
-        return Err(SceneError::new(
-            source,
-            Some(object_id),
-            "audio_source.volume должен быть конечным и в диапазоне 0..=4",
-        ));
+        return Some("audio_source.volume должен быть конечным и в диапазоне 0..=4");
     }
     if !audio.spatial_blend.is_finite() || !(0.0..=1.0).contains(&audio.spatial_blend) {
-        return Err(SceneError::new(
-            source,
-            Some(object_id),
-            "audio_source.spatial_blend должен быть конечным и в диапазоне 0..=1",
-        ));
+        return Some("audio_source.spatial_blend должен быть конечным и в диапазоне 0..=1");
     }
     if !audio.pitch.is_finite() || audio.pitch <= 0.0 || audio.pitch > MAX_AUDIO_PITCH {
-        return Err(SceneError::new(
-            source,
-            Some(object_id),
-            "audio_source.pitch должен быть конечным и в диапазоне (0..=4]",
-        ));
+        return Some("audio_source.pitch должен быть конечным и в диапазоне (0..=4]");
     }
     if !audio.min_distance.is_finite()
         || !audio.max_distance.is_finite()
         || audio.min_distance <= 0.0
         || audio.min_distance >= audio.max_distance
     {
-        return Err(SceneError::new(
-            source,
-            Some(object_id),
-            "audio_source должен удовлетворять 0 < min_distance < max_distance",
-        ));
+        return Some("audio_source должен удовлетворять 0 < min_distance < max_distance");
     }
-    Ok(())
+    None
 }
 
 #[cfg(test)]

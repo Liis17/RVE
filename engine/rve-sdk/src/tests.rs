@@ -588,6 +588,22 @@ fn host(state: &mut HostState) -> RveHost {
         physics_overlap: None,
         physics_raycast_all: None,
         physics_shape_cast: None,
+        light_get: None,
+        light_set: None,
+        mesh_get_visible: None,
+        mesh_set_visible: None,
+        mesh_set_material_params: None,
+        particles_get_playing: None,
+        particles_set_playing: None,
+        particles_command: None,
+        environment_get: None,
+        environment_set: None,
+        lod_get: None,
+        lod_set: None,
+        audio_get_source: None,
+        audio_set_source: None,
+        audio_play_clip_ex: None,
+        audio_set_voice_position: None,
     }
 }
 
@@ -2204,7 +2220,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 17);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2474,7 +2490,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 17);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
 }
 
 #[test]
@@ -2496,7 +2512,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 17);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
 }
 
 #[test]
@@ -2529,7 +2545,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDesc>(),
         size_of::<crate::abi::RveScriptDescV15>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 17);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
 }
 
 #[test]
@@ -2545,8 +2561,13 @@ fn object_hierarchy_callbacks_are_appended_after_the_v14_screen_shader_tail() {
         offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>()
     );
     assert_eq!(
+        offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
-            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>(),
+            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, audio_set_voice_position)
+            + size_of::<Option<crate::abi::RveAudioSetVoicePositionFn>>(),
         size_of::<RveHost>()
     );
 }

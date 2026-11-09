@@ -4,6 +4,7 @@
 //! `panic = "abort"` still terminates the process on panic because aborting panics cannot unwind.
 
 pub mod abi;
+mod components;
 
 /// Version of this SDK crate, as declared in its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -22,6 +23,7 @@ use abi::{
     RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue, RveScreenShaderState, RveStr,
     RveTime, RveTransform, RveValue, RveValueData,
 };
+pub use components::{ComponentError, LightKind, MAX_LOD_READ};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 

@@ -23,8 +23,14 @@ use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+mod components;
 mod hierarchy;
 
+pub use components::{
+    MAX_PARTICLE_BURST, MeshMaterialParams, ParticleCommand, directional_light_problem,
+    environment_intensity_problem, lod_distances_problem, mesh_material_problem,
+    point_light_problem, procedural_sky_problem, spot_light_problem,
+};
 pub use hierarchy::ObjectEdit;
 
 /// Наибольшее поколение слота. Слот, поколение которого исчерпано, больше не переиспользуется.
@@ -246,6 +252,11 @@ pub struct WorldObject {
     pub network_transform: Option<NetworkTransformComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
+    /// Runtime-состояние, которое меняют скрипты: не сохраняется в сцену и при загрузке равно
+    /// умолчанию (видимо, светит, эмиттер играет).
+    pub mesh_visible: bool,
+    pub light_enabled: bool,
+    pub particles_playing: bool,
 }
 
 /// Параметры света для потребителя кадра.
@@ -308,6 +319,8 @@ pub struct MeshInstance {
 pub struct ParticleEmitterInstance {
     pub object: ObjectHandle,
     pub model: Mat4,
+    /// Рождаются ли новые частицы; `false` после `particles:stop()` (симуляция продолжается).
+    pub emitting: bool,
 }
 
 /// Данные мирового пространства для отрисовки одного кадра сцены.
@@ -1008,11 +1021,9 @@ impl World {
         // Неактивный или отсутствующий направленный свет сбрасывает кэш: сцена не должна
         // освещаться последним светом, которого больше нет в кадре.
         let active = self.active_flags();
-        let directional_active = self
-            .objects
-            .iter()
-            .zip(&active)
-            .any(|(object, &active)| active && object.directional_light.is_some());
+        let directional_active = self.objects.iter().zip(&active).any(|(object, &active)| {
+            active && object.light_enabled && object.directional_light.is_some()
+        });
         if !directional_active {
             self.last_valid_light = LightState::default();
         }
@@ -1023,9 +1034,10 @@ impl World {
             let matrix = self.world_matrices[index];
             let camera_settings = (self.active_camera == self.objects[index].handle)
                 .then(|| self.objects[index].camera_settings.unwrap_or_default());
-            let light_settings = self.objects[index].directional_light.filter(|_| is_active);
-            let point_settings = self.objects[index].point_light.filter(|_| is_active);
-            let spot_settings = self.objects[index].spot_light.filter(|_| is_active);
+            let lights_on = is_active && self.objects[index].light_enabled;
+            let light_settings = self.objects[index].directional_light.filter(|_| lights_on);
+            let point_settings = self.objects[index].point_light.filter(|_| lights_on);
+            let spot_settings = self.objects[index].spot_light.filter(|_| lights_on);
             if let Some(settings) = camera_settings {
                 if let Some(value) = camera_from_matrix(matrix, settings) {
                     let state = (value, settings);
@@ -1095,7 +1107,9 @@ impl World {
             .objects
             .iter()
             .enumerate()
-            .filter(|(index, object)| active[*index] && object.mesh_renderer.is_some())
+            .filter(|(index, object)| {
+                active[*index] && object.mesh_renderer.is_some() && object.mesh_visible
+            })
             .map(|(index, object)| MeshInstance {
                 object: object.handle,
                 model: self.world_matrices[index],
@@ -1108,6 +1122,7 @@ impl World {
             .filter(|(index, object)| active[*index] && object.particle_emitter.is_some())
             .map(|(index, object)| ParticleEmitterInstance {
                 object: object.handle,
+                emitting: object.particles_playing,
                 model: self.world_matrices[index],
             })
             .collect();
@@ -1584,6 +1599,9 @@ fn world_object(
         network_transform: object.network_transform,
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
+        mesh_visible: true,
+        light_enabled: true,
+        particles_playing: true,
     }
 }
 

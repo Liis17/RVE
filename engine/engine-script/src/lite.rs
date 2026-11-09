@@ -1,3 +1,4 @@
+mod component_api;
 mod physics_api;
 
 use crate::actions::{ActionMutation, ActionValue};
@@ -1489,6 +1490,7 @@ fn object_table(
     )?;
     add_hierarchy_object_api(lua, &object, handle, active_call.clone())?;
     add_audio_object_api(lua, &object, handle, active_call.clone())?;
+    component_api::add_component_methods(lua, &object, handle, active_call.clone())?;
     add_animation_object_api(lua, &object, handle, active_call.clone())?;
     add_net_object_api(lua, &object, handle, active_call.clone())?;
     add_physics_object_api(lua, &object, handle, active_call)?;
@@ -2302,15 +2304,17 @@ fn audio_group(name: &str, allow_master: bool) -> mlua::Result<AudioGroup> {
 /// `rve.audio`: клипы без объекта, остановка по id и громкость групп.
 fn audio_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
     let audio = lua.create_table()?;
+    let active_for_position = active_call.clone();
 
     let play_active = active_call.clone();
     audio.set(
         "play",
-        lua.create_function(move |_, (path, options): (String, Option<Table>)| {
+        lua.create_function(move |lua, (path, options): (String, Option<Table>)| {
             let path = VirtualPath::parse(&path)
                 .map_err(|error| LuaError::runtime(format!("rve.audio.play: {error}")))?;
             let mut params = ClipParams::default();
             if let Some(options) = options {
+                component_api::read_clip_spatial_options(lua, &options, &mut params)?;
                 if let Some(group) = options.get::<Option<String>>("group")? {
                     params.group = audio_group(&group, false)?;
                 }
@@ -2365,6 +2369,10 @@ fn audio_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
                     .map_err(LuaError::runtime)
             })
         })?,
+    )?;
+    audio.set(
+        "set_voice_position",
+        component_api::audio_set_voice_position(lua, &active_for_position)?,
     )?;
     Ok(audio)
 }

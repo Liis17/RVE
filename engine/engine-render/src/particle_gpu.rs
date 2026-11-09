@@ -349,6 +349,25 @@ impl Renderer {
         Ok(())
     }
 
+    /// Ставит одноразовый выброс `count` частиц: он рождается на следующем шаге симуляции, даже если
+    /// эмиссия выключена. Выброс сверх свободного места капасити отбрасывается.
+    pub fn emit_particle_burst(
+        &mut self,
+        emitter: ParticleEmitterId,
+        count: u32,
+    ) -> Result<(), RenderError> {
+        let entry = self
+            .particles
+            .emitters
+            .get_mut(emitter.0)
+            .and_then(Option::as_mut)
+            .ok_or(RenderError::InvalidState(
+                "ParticleEmitterId не принадлежит renderer",
+            ))?;
+        entry.state.queue_burst(count);
+        Ok(())
+    }
+
     fn upload_particle_emitter(
         &self,
         desc: ParticleEmitterDesc,
