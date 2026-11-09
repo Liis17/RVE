@@ -348,11 +348,13 @@ impl SceneSwitch {
                 });
             }
         }
-        // Шаблоны префабов относятся к сцене: новые заменяют старые. Пути ресурсов сцены
-        // дополняются, поэтому объекты прежней сцены сохраняют свои ссылки.
-        gpu.prefabs = std::mem::take(&mut table.prefabs);
-        gpu.particle_templates = std::mem::take(&mut table.particle_templates);
-        gpu.material_templates = std::mem::take(&mut table.material_templates);
+        // Быстрые префабы резидентны: путь, который уже зарегистрировала прежняя сцена, сохраняет
+        // свои уровни и шаблоны, как и шаблон на scripts thread, а spawn из постоянных объектов
+        // продолжает его видеть. Новые записи того же пути не используются: их GPU-ресурсы не
+        // входят в `live` и освобождаются ниже.
+        retain_resident(&mut gpu.prefabs, &mut table.prefabs);
+        retain_resident(&mut gpu.particle_templates, &mut table.particle_templates);
+        retain_resident(&mut gpu.material_templates, &mut table.material_templates);
         gpu.environments.extend(table.environments);
         gpu.animation_models.extend(table.animation_models);
         gpu.animation_clips.extend(table.animation_clips);
@@ -389,6 +391,13 @@ impl SceneSwitch {
         self.owned = self.owned.intersect(&live);
         ctx.release(released, ctx.sequence);
         Ok(())
+    }
+}
+
+/// Добавляет в `target` записи `incoming`, которых там ещё нет. Существующая запись побеждает.
+fn retain_resident<V>(target: &mut HashMap<String, V>, incoming: &mut HashMap<String, V>) {
+    for (path, value) in incoming.drain() {
+        target.entry(path).or_insert(value);
     }
 }
 
@@ -663,6 +672,16 @@ return Script
             Ok(())
         }
 
+        /// Ответ render thread с таблицей `table` вместо пустой.
+        fn load_with_table(&mut self, path: &str, table: GpuSceneTable) -> Result<(), String> {
+            let upload = self.switch.request(Some(&self.loader), path)?;
+            self.switch.accept(SceneUploadReply {
+                generation: upload.generation,
+                result: Ok(Box::new(table)),
+            });
+            Ok(())
+        }
+
         fn commit(&mut self) -> Vec<(String, String)> {
             self.frame += 1;
             self.switch.apply(SceneCommit {
@@ -906,6 +925,44 @@ return Script
         assert_eq!(rig.host.prefab_status(x), Some(PrefabStatus::Resident));
         assert_eq!(rig.names(), sorted(&["c_crate", "camera_c", "hub"]));
         assert_eq!(rig.host.current_scene(), "levels/pc.rvescene");
+    }
+
+    #[test]
+    fn resident_prefab_templates_keep_their_gpu_and_cpu_entries_across_a_switch() {
+        let mut rig = Rig::start("levels/pa.rvescene");
+        let x = "prefabs/x.rveprefab";
+        let y = "prefabs/y.rveprefab";
+        // Таблица стартовой сцены: `x` с двумя объектами шаблона. Длина отличает её от таблицы
+        // следующей сцены, где `x` тоже объявлен, но с одним объектом.
+        rig.gpu.prefabs.insert(x.to_owned(), vec![vec![], vec![]]);
+        rig.gpu
+            .particle_templates
+            .insert(x.to_owned(), vec![None, None]);
+        rig.gpu
+            .material_templates
+            .insert(x.to_owned(), vec![None, None]);
+
+        let mut table = GpuSceneTable::default();
+        table.prefabs.insert(x.to_owned(), vec![vec![]]);
+        table.prefabs.insert(y.to_owned(), vec![vec![]]);
+        table.particle_templates.insert(x.to_owned(), vec![None]);
+        table.material_templates.insert(x.to_owned(), vec![None]);
+        rig.load_with_table("levels/pb.rvescene", table).unwrap();
+        let failures = rig.commit();
+        assert!(failures.is_empty(), "{failures:?}");
+
+        assert_eq!(
+            rig.gpu.prefabs[x].len(),
+            2,
+            "уровни резидентного x не заменяются"
+        );
+        assert_eq!(rig.gpu.prefabs[y].len(), 1, "новый префаб получает уровни");
+        assert_eq!(rig.gpu.particle_templates[x].len(), 2);
+        assert_eq!(rig.gpu.material_templates[x].len(), 2);
+        assert!(rig.gpu.material_templates.contains_key(x));
+
+        rig.frame_update();
+        assert!(rig.names().contains(&"spawned_x".to_owned()));
     }
 
     #[test]
