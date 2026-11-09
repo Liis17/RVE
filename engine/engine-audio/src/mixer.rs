@@ -469,8 +469,15 @@ fn mix_voice(
     let start_gain = voice.gain;
     let channels = usize::from(voice.clip.channels);
     let frame_count = voice.clip.frames() as f64;
-    // Пространственный голос с долей 3D сводится к моно до панорамы; force_mono — всегда.
-    let to_mono = voice.force_mono || (voice.distances.is_some() && voice.spatial_blend > 0.0);
+    // Доля моно-сведения до панорамы: force_mono — полностью; пространственный голос — по
+    // spatial_blend, чтобы стерео плавно переходило в моно; 2D-голос сохраняет стерео.
+    let mono_mix = if voice.force_mono {
+        1.0
+    } else if voice.distances.is_some() {
+        voice.spatial_blend
+    } else {
+        0.0
+    };
     let mut finished = false;
 
     for index in 0..frames {
@@ -479,12 +486,11 @@ fn mix_voice(
         if let Some(fade) = voice.fade {
             gain *= fade.left as f32 / fade.total as f32;
         }
-        let (mut left, mut right) = sample(&voice.clip, channels, voice.position, voice.looping);
-        if to_mono {
-            let mono = (left + right) * 0.5;
-            left = mono;
-            right = mono;
-        }
+        let (source_left, source_right) =
+            sample(&voice.clip, channels, voice.position, voice.looping);
+        let mono = (source_left + source_right) * 0.5;
+        let mut left = source_left + (mono - source_left) * mono_mix;
+        let mut right = source_right + (mono - source_right) * mono_mix;
         left = voice.lowpass_step(0, left, gains.lowpass);
         right = voice.lowpass_step(1, right, gains.lowpass);
         stereo[index * 2] += left * gain * gains.left;
@@ -638,6 +644,10 @@ impl Voice {
     /// равным входу, чтобы переход к фильтру не давал щелчка.
     fn lowpass_step(&mut self, channel: usize, input: f32, alpha: f32) -> f32 {
         let state = &mut self.lowpass[channel];
+        // Нечисловое состояние не восстанавливается само: NaN оставался бы в фильтре навсегда.
+        if !state.is_finite() {
+            *state = input;
+        }
         if alpha >= 1.0 {
             *state = input;
         } else {

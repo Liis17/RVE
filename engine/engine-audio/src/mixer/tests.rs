@@ -628,3 +628,56 @@ fn linear_rolloff_reaches_silence_at_max_and_differs_from_inverse() {
     assert_eq!(linear_attenuation(30.0, distances), 0.0);
     assert!((attenuation(15.5, distances) - linear_attenuation(15.5, distances)).abs() > 0.1);
 }
+
+/// Стерео-клип `[1, 0]` с излучателем в 1 м прямо перед слушателем: панорама нулевая, затухания нет.
+fn stereo_front_mixer(blend: f32) -> Mixer {
+    let spatial = Arc::new(Spatial::new());
+    spatial.set_listener([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+    spatial.set_emitter(0, [0.0, 0.0, -1.0]);
+    let mut mixer = Mixer::new(RATE, spatial);
+    let request = PlayRequest {
+        spatial: Some(Distances {
+            min: 1.0,
+            max: 30.0,
+        }),
+        spatial_blend: blend,
+        ..request(true)
+    };
+    play(&mut mixer, 1, 0, clip(RATE, 2, [1.0, 0.0].repeat(8)), request);
+    mixer
+}
+
+/// Разность левого и правого каналов в последнем кадре блока (голос уже вышел на целевую громкость).
+fn last_channel_difference(mixer: &mut Mixer) -> f32 {
+    let out = render_stereo(mixer, 256);
+    out[out.len() - 2] - out[out.len() - 1]
+}
+
+#[test]
+fn spatial_blend_mixes_toward_mono_instead_of_switching_at_any_positive_value() {
+    let stereo = last_channel_difference(&mut stereo_front_mixer(0.0));
+    let half = last_channel_difference(&mut stereo_front_mixer(0.5));
+    let full = last_channel_difference(&mut stereo_front_mixer(1.0));
+    assert!(stereo > 0.1, "стерео-разность потеряна: {stereo}");
+    assert!(full.abs() < 1e-4, "полный blend должен быть моно: {full}");
+    // Прежнее жёсткое переключение давало при blend 0.5 моно (разность 0); плавное сведение
+    // сохраняет часть стерео и уменьшает её относительно 2D.
+    assert!(
+        half > 0.2 * stereo && half < 0.9 * stereo,
+        "blend 0.5 должен частично сводить стерео: {half} при 2D {stereo}"
+    );
+}
+
+#[test]
+fn lowpass_recovers_when_its_state_becomes_non_finite() {
+    let mut mixer = spatial_mixer([0.0, 0.0, 5.0], 1.0, Rolloff::Inverse, vec![1.0; 4]);
+    // Излучатель за спиной: low-pass активен (alpha < 1), поэтому испорченное состояние
+    // продолжило бы распространяться NaN-ом, если его не сбросить.
+    let voice = mixer.voices[0].as_mut().expect("голос играет");
+    voice.lowpass = [f32::NAN, f32::INFINITY];
+    let out = render_stereo(&mut mixer, 512);
+    assert!(out.iter().all(|value| value.is_finite()), "{out:?}");
+    let tail = render_stereo(&mut mixer, 512);
+    assert!(tail.iter().all(|value| value.is_finite()));
+    assert!(tail.iter().any(|value| value.abs() > 1e-3), "голос замолчал");
+}
