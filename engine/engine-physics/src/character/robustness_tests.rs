@@ -112,6 +112,7 @@ fn walk(
     yaw_deg: f32,
     pitch_deg: f32,
     frames: usize,
+    dt: f32,
 ) -> Result<Vec3, String> {
     let controller = controller();
     let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
@@ -132,8 +133,8 @@ fn walk(
         if grounded && vertical < 0.0 {
             vertical = 0.0;
         }
-        vertical += GRAVITY * DT;
-        let displacement = direction * SPEED * DT + Vec3::Y * vertical * DT;
+        vertical += GRAVITY * dt;
+        let displacement = direction * SPEED * dt + Vec3::Y * vertical * dt;
         let result = controller
             .move_capsule(
                 &snapshot,
@@ -181,7 +182,7 @@ fn sweep(name: &str, blocks: &[Block], start: Vec3, yaws: &[f32], pitch_deg: f32
     for as_mesh in [false, true] {
         let colliders = colliders(blocks, as_mesh);
         for &yaw in yaws {
-            if let Err(error) = walk(&colliders, start, yaw, pitch_deg, 120) {
+            if let Err(error) = walk(&colliders, start, yaw, pitch_deg, 120, DT) {
                 failures.push(format!("{name} mesh={as_mesh} yaw={yaw}: {error}"));
             }
         }
@@ -252,6 +253,7 @@ fn walking_straight_climbs_the_stairs_to_the_landing() {
             0.0,
             0.0,
             120,
+            DT,
         )
         .unwrap();
         assert!(end.x > 3.0, "mesh={as_mesh}: {end}");
@@ -308,4 +310,162 @@ fn capsule_started_inside_a_wall_is_pushed_out_before_moving() {
             "mesh={as_mesh}: {pushed:?}"
         );
     }
+}
+
+/// Лестница из одних видимых граней, как в экспорте FBX: пол, подступенки, проступи и стены —
+/// одиночные квадраты без задних и нижних граней.
+fn open_faces_stairs() -> Vec<(Shape, Pose)> {
+    let mut vertices = Vec::new();
+    let mut triangles = Vec::new();
+    let mut quad = |corners: [Vec3; 4]| {
+        let base = vertices.len() as u32;
+        vertices.extend(corners);
+        triangles.push([base, base + 1, base + 2]);
+        triangles.push([base, base + 2, base + 3]);
+    };
+    let (near, far) = (-0.8, 0.8);
+    quad([
+        Vec3::new(-6.0, 0.0, -6.0),
+        Vec3::new(0.0, 0.0, -6.0),
+        Vec3::new(0.0, 0.0, 6.0),
+        Vec3::new(-6.0, 0.0, 6.0),
+    ]);
+    for step in 0..6 {
+        let x = step as f32 * 0.3;
+        let (low, high) = (step as f32 * 0.15, (step + 1) as f32 * 0.15);
+        let end = if step == 5 { 4.0 } else { x + 0.3 };
+        quad([
+            Vec3::new(x, low, near),
+            Vec3::new(x, high, near),
+            Vec3::new(x, high, far),
+            Vec3::new(x, low, far),
+        ]);
+        quad([
+            Vec3::new(x, high, near),
+            Vec3::new(end, high, near),
+            Vec3::new(end, high, far),
+            Vec3::new(x, high, far),
+        ]);
+    }
+    for z in [near, far] {
+        quad([
+            Vec3::new(-3.0, 0.0, z),
+            Vec3::new(4.0, 0.0, z),
+            Vec3::new(4.0, 3.0, z),
+            Vec3::new(-3.0, 3.0, z),
+        ]);
+    }
+    quad([
+        Vec3::new(4.0, 0.0, near),
+        Vec3::new(4.0, 3.0, near),
+        Vec3::new(4.0, 3.0, far),
+        Vec3::new(4.0, 0.0, far),
+    ]);
+    vec![(
+        Shape::TriMesh(Arc::new(TriMesh::new(vertices, triangles).unwrap())),
+        Pose::IDENTITY,
+    )]
+}
+
+fn check_sweep(name: &str, colliders: &[(Shape, Pose)], start: Vec3, yaws: &[f32], dt: f32) {
+    let failures = yaws
+        .iter()
+        .filter_map(|&yaw| {
+            walk(colliders, start, yaw, 0.0, (2.0 / dt) as usize, dt)
+                .err()
+                .map(|error| format!("{name} dt={dt} yaw={yaw}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn open_faced_stair_mesh_never_penetrates_and_is_climbable() {
+    let colliders = open_faces_stairs();
+    let start = standing_start(-1.0, 0.0);
+    check_sweep("open faces", &colliders, start, &yaws(-80, 80, 5), DT);
+    let end = walk(&colliders, start, 0.0, 0.0, 120, DT).unwrap();
+    assert!(end.x > 3.0 && (end.y - start.y - 0.9).abs() < 0.01, "{end}");
+}
+
+#[test]
+fn diagonal_walks_keep_climbing_and_reach_the_corner() {
+    // Срез движения по нескольким плоскостям (пол, стена, подступенок) не должен замораживать
+    // персонажа: по диагонали к стене он всё равно поднимается и доходит до угла.
+    let start = standing_start(-1.0, 0.0);
+    for as_mesh in [false, true] {
+        for yaw in [-45.0, 45.0] {
+            let end = walk(&colliders(&stairs(), as_mesh), start, yaw, 0.0, 120, DT).unwrap();
+            assert!(end.y > start.y + 0.3, "mesh={as_mesh} yaw={yaw}: {end}");
+        }
+        let end = walk(
+            &colliders(&corner(), as_mesh),
+            standing_start(-0.5, -0.5),
+            45.0,
+            0.0,
+            120,
+            DT,
+        )
+        .unwrap();
+        assert!(end.x > 0.6 && end.z > 0.6, "mesh={as_mesh}: {end}");
+    }
+}
+
+#[test]
+fn stairs_hold_at_low_and_high_frame_rates() {
+    let start = standing_start(-1.0, 0.0);
+    for dt in [1.0 / 30.0, 1.0 / 144.0] {
+        for as_mesh in [false, true] {
+            let colliders = colliders(&stairs(), as_mesh);
+            check_sweep("stairs", &colliders, start, &yaws(-80, 80, 20), dt);
+            let end = walk(&colliders, start, 0.0, 0.0, (2.0 / dt) as usize, dt).unwrap();
+            assert!(
+                end.x > 3.0 && (end.y - start.y - 0.9).abs() < 0.01,
+                "mesh={as_mesh} dt={dt}: {end}"
+            );
+        }
+    }
+}
+
+/// Склон вдоль +X от x = 0 и стена вдоль него с края z = 0.8.
+fn slope_with_wall(degrees: f32) -> Vec<(Shape, Pose)> {
+    let rise = degrees.to_radians().tan() * 6.0;
+    let vertices = vec![
+        Vec3::new(-6.0, 0.0, -3.0),
+        Vec3::new(0.0, 0.0, -3.0),
+        Vec3::new(0.0, 0.0, 3.0),
+        Vec3::new(-6.0, 0.0, 3.0),
+        Vec3::new(6.0, rise, -3.0),
+        Vec3::new(6.0, rise, 3.0),
+    ];
+    let triangles = vec![[0, 1, 2], [0, 2, 3], [1, 4, 5], [1, 5, 2]];
+    let mut colliders = vec![(
+        Shape::TriMesh(Arc::new(TriMesh::new(vertices, triangles).unwrap())),
+        Pose::IDENTITY,
+    )];
+    colliders.push(block_shape((
+        Vec3::new(-6.0, -1.0, 0.8),
+        Vec3::new(6.0, rise + 3.0, 1.0),
+    )));
+    colliders
+}
+
+#[test]
+fn ramp_climbs_steep_slope_blocks_and_neither_sinks() {
+    let start = standing_start(-1.0, 0.0);
+    let ramp = slope_with_wall(20.0);
+    check_sweep("ramp", &ramp, start, &yaws(-60, 80, 10), DT);
+    let end = walk(&ramp, start, 0.0, 0.0, 90, DT).unwrap();
+    assert!(end.x > 4.0 && end.y > start.y + 1.0, "{end}");
+    // Вдоль стены под углом в неё персонаж скользит по рампе дальше.
+    let along_wall = walk(&ramp, start, 30.0, 0.0, 90, DT).unwrap();
+    assert!(
+        along_wall.x > 3.0 && along_wall.y > start.y + 0.8,
+        "{along_wall}"
+    );
+
+    let steep = slope_with_wall(60.0);
+    check_sweep("steep", &steep, start, &yaws(-60, 80, 10), DT);
+    let end = walk(&steep, start, 0.0, 0.0, 90, DT).unwrap();
+    assert!(end.y < start.y + 0.35, "{end}");
 }
