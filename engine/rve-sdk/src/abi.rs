@@ -11,18 +11,17 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 10 appends animation callbacks after the v9 prefab tail.
 /// Version 11 appends gamepad state and rumble callbacks after the v10 animation tail.
 /// Version 12 appends post-process callbacks after the v11 gamepad tail.
-/// Version 13 appends network callbacks after the v12 post-process tail and the net event callback
-/// after the v6 collision tail of the descriptor.
+/// Version 13 appends network callbacks after the v12 post-process tail and net_event after the
+/// v6 collision callback.
 /// Version 14 appends screen shader callbacks after the v13 network tail.
-/// Version 15 adds parameter kinds and an argument string to parameter descriptors.
-/// Version 16 appends UI callbacks after the v14 screen shader tail of RveHost and the ui_event
-/// callback after the v13 net event callback of the descriptor.
-/// Version 17 appends hierarchy, activity, tag, layer and script-enable callbacks after the UI tail,
-/// and appends on_enable and on_disable after the v16 descriptor tail.
-/// Version 18 appends physics component, character, overlap and cast callbacks after the v17 host
-/// tail, and adds the RVE_TRIGGER_STAY event kind for on_trigger_stay./// Each version is a new number because hosts of the previous version already accept modules
-/// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 18;
+/// Version 15 adds typed parameter kinds and the argument string; historical reference and UI
+/// branches used distinct parameter and descriptor layouts at this version.
+/// Version 16 appends UI callbacks after the screen shader tail and ui_event after the v15 descriptor.
+/// Version 17 appends hierarchy and activity callbacks after the UI tail and lifecycle callbacks
+/// after ui_event in the descriptor.
+/// Version 18 appends physics callbacks after the hierarchy tail and adds trigger-stay events.
+/// Version 19 appends scene component callbacks after the physics tail; the descriptor is unchanged.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 19;
 
 /// Component names accepted by RveHost::object_has_component, in the order used by
 /// components() on the guest side.
@@ -45,7 +44,6 @@ pub const RVE_COMPONENT_NAMES: [&str; 17] = [
     "network_transform",
     "ui_canvas",
 ];
-
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
@@ -1862,7 +1860,210 @@ pub struct RveHost {
     pub physics_overlap: Option<RvePhysicsOverlapFn>,
     pub physics_raycast_all: Option<RvePhysicsRaycastAllFn>,
     pub physics_shape_cast: Option<RvePhysicsShapeCastFn>,
+    /// Light, mesh renderer, particle, environment, LOD, audio source and voice callbacks appended
+    /// in ABI v19; `None` marks an unavailable callback.
+    pub light_get: Option<RveLightGetFn>,
+    pub light_set: Option<RveLightSetFn>,
+    pub mesh_get_visible: Option<RveObjectBoolQueryFn>,
+    pub mesh_set_visible: Option<RveObjectSetBoolFn>,
+    pub mesh_set_material_params: Option<RveMeshSetMaterialParamsFn>,
+    pub particles_get_playing: Option<RveObjectBoolQueryFn>,
+    pub particles_set_playing: Option<RveObjectSetBoolFn>,
+    pub particles_command: Option<RveParticlesCommandFn>,
+    pub environment_get: Option<RveEnvironmentGetFn>,
+    pub environment_set: Option<RveEnvironmentSetFn>,
+    pub lod_get: Option<RveLodGetFn>,
+    pub lod_set: Option<RveLodSetFn>,
+    pub audio_get_source: Option<RveAudioGetSourceFn>,
+    pub audio_set_source: Option<RveAudioSetSourceFn>,
+    pub audio_play_clip_ex: Option<RveAudioPlayClipExFn>,
+    pub audio_set_voice_position: Option<RveAudioSetVoicePositionFn>,
+    /// Replaces the material of every mesh part with a `.rvemat` declared in the scene; appended
+    /// in ABI v19 after the audio callbacks.
+    pub mesh_set_material_path: Option<RveMeshSetMaterialPathFn>,
 }
+
+/// Sets a boolean on an object (`mesh_set_visible`, `particles_set_playing`); appended in v19.
+pub type RveObjectSetBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: bool) -> bool;
+/// Light kind code for `RveLightGetFn` and `RveLightSetFn`. Appended in ABI v19.
+pub const RVE_LIGHT_DIRECTIONAL: u32 = 0;
+/// Light kind code; see [`RVE_LIGHT_DIRECTIONAL`].
+pub const RVE_LIGHT_POINT: u32 = 1;
+/// Light kind code; see [`RVE_LIGHT_DIRECTIONAL`].
+pub const RVE_LIGHT_SPOT: u32 = 2;
+/// Particle command code for `particles_command`: restarts the emitter cycle. Appended in v19.
+pub const RVE_PARTICLE_RESTART: u32 = 0;
+/// Particle command code: one-shot burst of `count` particles. Appended in v19.
+pub const RVE_PARTICLE_BURST: u32 = 1;
+/// Largest burst accepted by `particles_command`; the host refuses larger counts.
+pub const RVE_MAX_PARTICLE_BURST: u32 = 4096;
+/// Audio rolloff code for [`RveAudioSourceState::rolloff`]. Appended in v19.
+pub const RVE_AUDIO_ROLLOFF_INVERSE: u32 = 0;
+/// Audio rolloff code; see [`RVE_AUDIO_ROLLOFF_INVERSE`].
+pub const RVE_AUDIO_ROLLOFF_LINEAR: u32 = 1;
+
+/// Light parameters for one light kind. Fields that a kind does not use are ignored on write and
+/// zero on read. Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveLightState {
+    pub color: [f32; 3],
+    /// Directional lights only.
+    pub ambient: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    /// Spot lights only, in degrees.
+    pub inner_angle_deg: f32,
+    /// Spot lights only, in degrees.
+    pub outer_angle_deg: f32,
+    /// Directional lights only.
+    pub shadow_distance: f32,
+    /// Directional lights only: 1..=4.
+    pub shadow_cascades: u32,
+    pub shadows: bool,
+    /// Whether the object's lights contribute to the frame.
+    pub enabled: bool,
+}
+
+/// Procedural sky parameters in linear RGB. Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveProceduralSky {
+    pub zenith_color: [f32; 3],
+    pub horizon_color: [f32; 3],
+    pub ground_color: [f32; 3],
+    pub sun_size_deg: f32,
+    pub sun_intensity: f32,
+}
+
+/// Environment intensity and, for procedural environments, the sky. Appended in ABI v19.
+/// `has_sky` is false for HDR environments; `sky` is then ignored on write.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveEnvironmentState {
+    pub intensity: f32,
+    pub has_sky: bool,
+    pub sky: RveProceduralSky,
+}
+
+/// Mesh material factor overrides. A `has_*` flag set to false keeps the current value.
+/// Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveMeshMaterialParams {
+    pub has_base_color: bool,
+    pub has_emissive: bool,
+    pub has_metallic: bool,
+    pub has_roughness: bool,
+    pub base_color: [f32; 3],
+    pub emissive: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+}
+
+/// Audio source settings readable and writable by scripts. The clip is set by the scene and is
+/// not part of this state. Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioSourceState {
+    /// One of the `RVE_AUDIO_GROUP_*` codes; `master` is rejected.
+    pub group: u32,
+    pub volume: f32,
+    pub looping: bool,
+    pub play_on_start: bool,
+    pub spatial_blend: f32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    /// One of the `RVE_AUDIO_ROLLOFF_*` codes.
+    pub rolloff: u32,
+    pub pitch: f32,
+    pub force_mono: bool,
+}
+
+/// Options for `audio_play_clip_ex`. `follow` is an object handle, zero when unused. Appended in
+/// ABI v19; `RveAudioParams` keeps its v7 layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioPlayExParams {
+    pub group: u32,
+    pub volume: f32,
+    pub looping: bool,
+    pub has_position: bool,
+    pub position: [f32; 3],
+    pub follow: u64,
+    pub spatial_blend: f32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub force_mono: bool,
+}
+
+/// Reads one light of the given kind; returns `false` when the object has no such light.
+pub type RveLightGetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, kind: u32, out: *mut RveLightState) -> bool;
+/// Writes one light of the given kind and its object-level enabled flag.
+pub type RveLightSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    kind: u32,
+    value: *const RveLightState,
+) -> bool;
+/// Writes material factor overrides of a mesh renderer.
+pub type RveMeshSetMaterialParamsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    params: *const RveMeshMaterialParams,
+) -> bool;
+/// Replaces the material of every mesh part with the `.rvemat` at `path`. The path must be declared
+/// in the scene's `[[assets]]`; otherwise the call returns `false` and changes nothing.
+pub type RveMeshSetMaterialPathFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, path: RveStr) -> bool;
+/// Restarts the emitter or queues a burst; `count` is used by bursts only.
+pub type RveParticlesCommandFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, kind: u32, count: u32) -> bool;
+/// Reads the environment of an object; returns `false` without an environment component.
+pub type RveEnvironmentGetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveEnvironmentState) -> bool;
+/// Writes the environment intensity and, when `has_sky` is set, the procedural sky.
+pub type RveEnvironmentSetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveEnvironmentState) -> bool;
+/// Copies LOD distances and the cull distance. Writes at most `capacity` distances and always
+/// stores the full level count in `count`; `has_cull` tells whether `cull` is set.
+pub type RveLodGetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    distances: *mut f32,
+    capacity: usize,
+    count: *mut usize,
+    has_cull: *mut bool,
+    cull: *mut f32,
+) -> bool;
+/// Sets LOD distances (one per level) and an optional cull distance.
+pub type RveLodSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    distances: *const f32,
+    count: usize,
+    has_cull: bool,
+    cull: f32,
+) -> bool;
+/// Reads the audio source settings of an object.
+pub type RveAudioGetSourceFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveAudioSourceState) -> bool;
+/// Writes the audio source settings of an object; the clip is kept.
+pub type RveAudioSetSourceFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveAudioSourceState) -> bool;
+/// Starts a clip with spatial options and writes its voice id; returns the same status code as
+/// `audio_play_clip`.
+pub type RveAudioPlayClipExFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioPlayExParams,
+    out_voice: *mut u64,
+) -> u32;
+/// Pins a voice's emitter at `position` and stops following its object.
+pub type RveAudioSetVoicePositionFn =
+    unsafe extern "C" fn(ctx: *mut c_void, voice: u64, position: *const [f32; 3]) -> u32;
 
 /// Sets an object's own active flag. Returns `false` for a dead object or a refused write.
 pub type RveObjectSetActiveFn =
@@ -2085,8 +2286,7 @@ pub struct RveScriptDescV13 {
 }
 
 /// ABI v15 reference-branch descriptor layout: typed parameters and network events, before UI
-/// callbacks. The UI branch appended `ui_event` to this prefix; the loader accepts that stride but
-/// ignores the callback because both branches used the same ABI version.
+/// callbacks. The UI branch appended one nullable ui_event callback to this descriptor stride.
 #[repr(C)]
 pub struct RveScriptDescV15 {
     pub name: RveStr,
@@ -2103,7 +2303,7 @@ pub struct RveScriptDescV15 {
     pub net_event: Option<RveNetEventFn>,
 }
 
-/// ABI v16 descriptor layout with UI events and no hierarchy lifecycle callbacks.
+/// ABI v16 descriptor layout; ui_event was appended after the v15 descriptor tail.
 #[repr(C)]
 pub struct RveScriptDescV16 {
     pub name: RveStr,
@@ -2121,7 +2321,30 @@ pub struct RveScriptDescV16 {
     pub ui_event: Option<RveUiEventFn>,
 }
 
-/// Current exported guest script implementation in ABI version 18.
+/// ABI v17 descriptor layout; lifecycle callbacks follow the ABI v16 ui_event tail.
+#[repr(C)]
+pub struct RveScriptDescV17 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+}
+
+/// ABI v18 adds physics callbacks to the host and keeps the ABI v17 descriptor layout.
+pub type RveScriptDescV18 = RveScriptDescV17;
+
+/// Current ABI v19 descriptor; scene component callbacks extend the host only.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -2136,11 +2359,8 @@ pub struct RveScriptDesc {
     pub command: Option<RveCommandFn>,
     pub collision: Option<RveCollisionFn>,
     pub net_event: Option<RveNetEventFn>,
-    /// UI event callback appended in ABI v16.
     pub ui_event: Option<RveUiEventFn>,
-    /// Optional callback run when the instance starts running; appended in ABI v17.
     pub on_enable: Option<RveStartFn>,
-    /// Optional callback run when a running instance stops; appended in ABI v17.
     pub on_disable: Option<RveStartFn>,
 }
 /// Parameter kind: boolean.
@@ -2247,6 +2467,7 @@ unsafe impl Sync for RveScriptDescV6 {}
 unsafe impl Sync for RveScriptDescV13 {}
 unsafe impl Sync for RveScriptDescV15 {}
 unsafe impl Sync for RveScriptDescV16 {}
+unsafe impl Sync for RveScriptDescV17 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
@@ -2378,7 +2599,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2429,17 +2650,28 @@ mod tests {
     }
 
     #[test]
-    fn runtime_physics_callbacks_append_after_the_v15_host_tail() {
+    fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 18);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
             offset_of!(RveHost, script_enabled) + size_of::<Option<RveScriptEnabledFn>>()
         );
+    }
+
+    #[test]
+    fn component_callbacks_append_after_the_v18_physics_tail() {
+        use std::mem::{offset_of, size_of};
+
         assert_eq!(
-            offset_of!(RveHost, physics_shape_cast) + size_of::<Option<RvePhysicsShapeCastFn>>(),
+            offset_of!(RveHost, light_get),
+            offset_of!(RveHost, physics_shape_cast) + size_of::<Option<RvePhysicsShapeCastFn>>()
+        );
+        assert_eq!(
+            offset_of!(RveHost, mesh_set_material_path)
+                + size_of::<Option<super::RveMeshSetMaterialPathFn>>(),
             size_of::<RveHost>()
         );
     }

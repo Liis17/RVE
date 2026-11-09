@@ -948,7 +948,7 @@ fn audio_source_prefab_override_replaces_the_whole_component_and_checks_its_clip
     let expanded = library.expand(&scene(&overridden)).unwrap().document;
     let audio = object(&expanded, "spk").audio_source.clone().unwrap();
     assert_eq!(audio.clip.as_str(), "audio/bell.ogg");
-    assert!(audio.spatial);
+    assert_eq!(audio.spatial_blend, 1.0);
     assert!(!audio.looping, "replacement must not keep inherited fields");
     assert_eq!(audio.volume, 1.0);
 

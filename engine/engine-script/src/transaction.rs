@@ -1,4 +1,5 @@
 use crate::actions::{ActionFrame, ActionMutation, ActionValue};
+use crate::component_writes::{ComponentWrites, MAX_PARTICLE_COMMANDS_PER_CALL};
 use crate::lifecycle::{
     DestroyRequest, Lifecycle, ObjectState, PrefabKind, PrefabRequest, PrefabStatus, SpawnArgs,
     SpawnRequest, check_spawn_request, prefab_display, prefab_key,
@@ -15,12 +16,15 @@ use engine_physics::{
     PhysicsCommand, Pose, PrimitiveShape, QueryFilter, QueryHit, QueryOverrides, Ray, Shape,
     character_controller_scaled, object_world_transform, primitive_collider_shape,
 };
+use engine_scene::world::{MeshMaterialParams, ParticleCommand};
 use engine_scene::{
-    AnimationRequest, AudioRequest, CameraSettings, CharacterControllerComponent,
-    ColliderComponent, ColliderShape, ComponentKind, LAYER_COUNT, LocalTransform,
-    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, MAX_SCREEN_SHADER_PARAMS,
-    NetMode, NetRequest, NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId,
-    PostProcessSettings, RigidBodyComponent, RigidBodyKind, SERVER_PEER_ID, World,
+    AnimationRequest, AudioRequest, AudioSourceComponent, CameraSettings,
+    CharacterControllerComponent, ColliderComponent, ColliderShape, ComponentKind,
+    DirectionalLightComponent, LAYER_COUNT, LocalTransform, MAX_MESSAGE_DEPTH,
+    MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, MAX_SCREEN_SHADER_PARAMS, NetMode, NetRequest,
+    NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId, PointLightComponent,
+    PostProcessSettings, ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SERVER_PEER_ID,
+    SpotLightComponent, World,
 };
 use glam::{EulerRot, Quat, Vec3};
 
@@ -31,6 +35,7 @@ pub(crate) struct ScreenShaderState {
     pub(crate) params: [f32; MAX_SCREEN_SHADER_PARAMS],
 }
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -39,6 +44,8 @@ use std::sync::{Arc, OnceLock};
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
 /// Звуковых запросов за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
 pub(crate) const MAX_AUDIO_REQUESTS_PER_FRAME: usize = 256;
+/// Сколько последних голосов помнит транзакция для проверки `set_voice_position`; старые вытесняются.
+const MAX_TRACKED_VOICES: usize = 4096;
 /// Запросов аниматора за кадр, включая уже зафиксированные скриптами.
 pub(crate) const MAX_ANIMATION_REQUESTS_PER_FRAME: usize = 256;
 /// Запросов вибрации за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
@@ -238,6 +245,9 @@ pub(crate) struct ScriptTransaction {
     pending_cursor_visible: Option<bool>,
     pending_cursor_locked: Option<bool>,
     pending_audio: Vec<AudioRequest>,
+    /// Пространственность голосов по `VoiceId::get`, как её записал последний зафиксированный
+    /// `play`. Хост переиспользует транзакцию между вызовами, поэтому таблица живёт весь сеанс.
+    voice_spatial: BTreeMap<u64, bool>,
     pending_rumble: Vec<RumbleRequest>,
     pending_animation: Vec<AnimationRequest>,
     net: Rc<RefCell<NetScriptState>>,
@@ -260,6 +270,8 @@ pub(crate) struct ScriptTransaction {
     pending_dead_warnings: Vec<(ObjectHandle, String)>,
     /// Изменения мира в порядке записи; применяются через `World::apply_edit` при коммите.
     pending_edits: Vec<ObjectEdit>,
+    /// Заявки компонентов сцены (свет, mesh, частицы, окружение, LOD, звук); применяются при коммите.
+    component_writes: ComponentWrites,
     /// Новое значение `set_enabled` экземпляра; применяется в `commit_lifecycle`.
     pending_script_enabled: Option<bool>,
     instance_enabled: bool,
@@ -322,6 +334,7 @@ impl Default for ScriptTransaction {
             pending_cursor_visible: None,
             pending_cursor_locked: None,
             pending_audio: Vec::new(),
+            voice_spatial: BTreeMap::new(),
             pending_rumble: Vec::new(),
             pending_animation: Vec::new(),
             net: Rc::new(RefCell::new(NetScriptState::default())),
@@ -338,6 +351,7 @@ impl Default for ScriptTransaction {
             pending_ids: HashMap::new(),
             pending_dead_warnings: Vec::new(),
             pending_edits: Vec::new(),
+            component_writes: ComponentWrites::default(),
             pending_script_enabled: None,
             instance_enabled: true,
             #[cfg(test)]
@@ -375,6 +389,7 @@ impl ScriptTransaction {
         self.pending_collider_enabled.clear();
         self.pending_pushes.clear();
         self.clear_component_writes();
+        self.component_writes.clear();
         self.pending_bytes = 0;
         self.queued_message_count = init.queued_messages.0;
         self.queued_message_bytes = init.queued_messages.1;
@@ -476,6 +491,30 @@ impl ScriptTransaction {
         if !self.writable {
             return Err("audio is unavailable during script creation".to_owned());
         }
+        if let AudioRequest::PlayClip { params, .. } = &request {
+            if let Some(problem) = engine_scene::audio::clip_spatial_problem(params) {
+                return Err(problem.to_owned());
+            }
+            if params
+                .position
+                .is_some_and(|position| !position.iter().all(|axis| axis.is_finite()))
+            {
+                return Err("clip position must be finite".to_owned());
+            }
+            if let Some(follow) = params.follow
+                && self.active_in_hierarchy(follow) != Some(true)
+            {
+                return Err("clip follow object is not alive and active".to_owned());
+            }
+        }
+        if let AudioRequest::SetVoicePosition { voice, .. } = &request
+            && self.voice_is_flat(*voice)
+        {
+            return Err(
+                "set_voice_position needs a spatial voice: play it with position or follow and spatial_blend > 0"
+                    .to_owned(),
+            );
+        }
         if self.queued_audio.saturating_add(self.pending_audio.len())
             >= MAX_AUDIO_REQUESTS_PER_FRAME
         {
@@ -485,6 +524,24 @@ impl ScriptTransaction {
         }
         self.pending_audio.push(request);
         Ok(())
+    }
+
+    /// Голос известен как 2D: его последний `play` (в этом вызове или зафиксированный раньше) не
+    /// пространственный. Неизвестный голос (вытесненный или чужой) не отвергается.
+    fn voice_is_flat(&self, voice: engine_scene::VoiceId) -> bool {
+        let staged = self
+            .pending_audio
+            .iter()
+            .rev()
+            .find_map(|request| match request {
+                AudioRequest::PlayClip {
+                    voice: played,
+                    params,
+                    ..
+                } if *played == voice => Some(!engine_scene::audio::clip_is_spatial(params)),
+                _ => None,
+            });
+        staged.unwrap_or_else(|| self.voice_spatial.get(&voice.get()) == Some(&false))
     }
 
     /// Ставит запрос вибрации до коммита. Как и звук, он отбрасывается вместе с отказавшим вызовом.
@@ -1717,7 +1774,134 @@ impl ScriptTransaction {
         for edit in &self.pending_edits {
             world.apply_edit(edit).map_err(|error| error.to_string())?;
         }
+        let writes = &self.component_writes;
+        for (handle, light) in &writes.directional_lights {
+            world
+                .set_directional_light(*handle, *light)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, light) in &writes.point_lights {
+            world
+                .set_point_light(*handle, *light)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, light) in &writes.spot_lights {
+            world
+                .set_spot_light(*handle, *light)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, enabled) in &writes.light_enabled {
+            world
+                .set_light_enabled(*handle, *enabled)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, visible) in &writes.mesh_visible {
+            world
+                .set_mesh_visible(*handle, *visible)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, params) in &writes.mesh_material {
+            world
+                .set_mesh_material_params(*handle, *params)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, path) in &writes.mesh_material_path {
+            world
+                .set_mesh_material_path(*handle, path.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, playing) in &writes.particles_playing {
+            world
+                .set_particles_playing(*handle, *playing)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, intensity) in &writes.environment_intensity {
+            world
+                .set_environment_intensity(*handle, *intensity)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, sky) in &writes.sky {
+            world
+                .set_procedural_sky(*handle, *sky)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, (distances, cull)) in &writes.lod {
+            world
+                .set_lod_distances(*handle, distances, *cull)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, settings) in &writes.audio_sources {
+            world
+                .set_audio_source_settings(*handle, settings.clone())
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
+    }
+
+    /// Проверяет, что объекты заявок всё ещё имеют нужные компоненты. Значения проверены при
+    /// вызове, поэтому здесь только присутствие: без клонирования мира.
+    fn component_writes_fit(&self, world: &World) -> Result<(), String> {
+        let writes = &self.component_writes;
+        let has = |handle: &ObjectHandle,
+                   present: fn(&engine_scene::world::WorldObject) -> bool| {
+            world.object(*handle).is_some_and(present)
+        };
+        let missing = "script changed a component on an object that no longer has it";
+        let fits = writes
+            .directional_lights
+            .keys()
+            .all(|handle| has(handle, |object| object.directional_light.is_some()))
+            && writes
+                .point_lights
+                .keys()
+                .all(|handle| has(handle, |object| object.point_light.is_some()))
+            && writes
+                .spot_lights
+                .keys()
+                .all(|handle| has(handle, |object| object.spot_light.is_some()))
+            && writes.light_enabled.keys().all(|handle| {
+                has(handle, |object| {
+                    object.directional_light.is_some()
+                        || object.point_light.is_some()
+                        || object.spot_light.is_some()
+                })
+            })
+            && writes
+                .mesh_visible
+                .keys()
+                .chain(writes.mesh_material.keys())
+                .chain(writes.mesh_material_path.keys())
+                .all(|handle| has(handle, |object| object.mesh_renderer.is_some()))
+            && writes
+                .particles_playing
+                .keys()
+                .chain(writes.particle_commands.iter().map(particle_object))
+                .all(|handle| has(handle, |object| object.particle_emitter.is_some()))
+            && writes
+                .environment_intensity
+                .keys()
+                .all(|handle| has(handle, |object| object.environment.is_some()))
+            && writes.sky.keys().all(|handle| {
+                has(handle, |object| {
+                    object
+                        .environment
+                        .as_ref()
+                        .is_some_and(|environment| environment.procedural.is_some())
+                })
+            })
+            && writes
+                .lod
+                .keys()
+                .all(|handle| has(handle, |object| object.lod_group.is_some()))
+            && writes
+                .audio_sources
+                .keys()
+                .all(|handle| has(handle, |object| object.audio_source.is_some()));
+        if fits {
+            Ok(())
+        } else {
+            Err(missing.to_owned())
+        }
     }
 
     /// Последняя заявка активности самого объекта в этом вызове.
@@ -2165,6 +2349,7 @@ impl ScriptTransaction {
         animation: &mut Vec<AnimationRequest>,
         net: &mut Vec<NetRequest>,
         rumble: &mut Vec<RumbleRequest>,
+        particle_commands: &mut Vec<ParticleCommand>,
     ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
             transform
@@ -2250,6 +2435,10 @@ impl ScriptTransaction {
             self.discard();
             return Err("script selected an object without a camera as active".to_owned());
         }
+        if let Err(message) = self.component_writes_fit(world) {
+            self.discard();
+            return Err(message);
+        }
         if let Err(message) = self.probe_edits(world) {
             self.discard();
             return Err(message);
@@ -2291,6 +2480,8 @@ impl ScriptTransaction {
         self.pending_screen_shaders.clear();
         self.pending_active_camera = None;
         self.pending_edits.clear();
+        particle_commands.append(&mut self.component_writes.particle_commands);
+        self.component_writes.clear();
 
         if let Some(visible) = self.pending_cursor_visible.take() {
             self.cursor.visible = visible;
@@ -2346,6 +2537,21 @@ impl ScriptTransaction {
         }
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
+        for request in &self.pending_audio {
+            match request {
+                AudioRequest::PlayClip { voice, params, .. } => {
+                    self.voice_spatial
+                        .insert(voice.get(), engine_scene::audio::clip_is_spatial(params));
+                }
+                AudioRequest::StopVoice { voice } => {
+                    self.voice_spatial.remove(&voice.get());
+                }
+                _ => {}
+            }
+        }
+        while self.voice_spatial.len() > MAX_TRACKED_VOICES {
+            self.voice_spatial.pop_first();
+        }
         audio.append(&mut self.pending_audio);
         animation.append(&mut self.pending_animation);
         net.append(&mut self.pending_net);
@@ -2420,6 +2626,7 @@ impl ScriptTransaction {
         self.pending_collider_enabled.clear();
         self.pending_pushes.clear();
         self.clear_component_writes();
+        self.component_writes.clear();
         self.pending_bytes = 0;
         self.queued_message_count = 0;
         self.queued_message_bytes = 0;
@@ -2525,4 +2732,414 @@ fn spawn_identity(request: &SpawnRequest) -> (Option<String>, String) {
         request.args.options.id.clone(),
         request.args.options.name.clone().unwrap_or_default(),
     )
+}
+
+fn particle_object(command: &ParticleCommand) -> &ObjectHandle {
+    match command {
+        ParticleCommand::Restart { object } | ParticleCommand::Burst { object, .. } => object,
+    }
+}
+
+/// Компонентные заявки скриптов. Чтения видят заявки текущего вызова, затем мир; записи
+/// проверяются здесь же, чтобы ошибка значения давала ошибку вызова, а не падение кадра.
+impl ScriptTransaction {
+    fn stored_object(&self, handle: ObjectHandle) -> Option<&engine_scene::world::WorldObject> {
+        self.world().and_then(|world| world.object(handle))
+    }
+
+    pub(crate) fn directional_light(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<DirectionalLightComponent> {
+        self.component_writes
+            .directional_lights
+            .get(&handle)
+            .copied()
+            .or_else(|| self.stored_object(handle)?.directional_light)
+    }
+
+    pub(crate) fn point_light(&self, handle: ObjectHandle) -> Option<PointLightComponent> {
+        self.component_writes
+            .point_lights
+            .get(&handle)
+            .copied()
+            .or_else(|| self.stored_object(handle)?.point_light)
+    }
+
+    pub(crate) fn spot_light(&self, handle: ObjectHandle) -> Option<SpotLightComponent> {
+        self.component_writes
+            .spot_lights
+            .get(&handle)
+            .copied()
+            .or_else(|| self.stored_object(handle)?.spot_light)
+    }
+
+    /// Пользовательский флаг света объекта; `None`, если у объекта нет света.
+    pub(crate) fn light_enabled(&self, handle: ObjectHandle) -> Option<bool> {
+        let object = self.stored_object(handle)?;
+        let has_light = object.directional_light.is_some()
+            || object.point_light.is_some()
+            || object.spot_light.is_some();
+        has_light.then(|| {
+            self.component_writes
+                .light_enabled
+                .get(&handle)
+                .copied()
+                .unwrap_or(object.light_enabled)
+        })
+    }
+
+    pub(crate) fn mesh_visible(&self, handle: ObjectHandle) -> Option<bool> {
+        let object = self.stored_object(handle)?;
+        object.mesh_renderer.as_ref()?;
+        Some(
+            self.component_writes
+                .mesh_visible
+                .get(&handle)
+                .copied()
+                .unwrap_or(object.mesh_visible),
+        )
+    }
+
+    pub(crate) fn particles_playing(&self, handle: ObjectHandle) -> Option<bool> {
+        let object = self.stored_object(handle)?;
+        object.particle_emitter.as_ref()?;
+        Some(
+            self.component_writes
+                .particles_playing
+                .get(&handle)
+                .copied()
+                .unwrap_or(object.particles_playing),
+        )
+    }
+
+    /// Интенсивность и процедурное небо окружения (с учётом заявок); `None` без `environment`.
+    pub(crate) fn environment_state(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<(f32, Option<ProceduralSkyComponent>)> {
+        let environment = self.stored_object(handle)?.environment.as_ref()?;
+        let intensity = self
+            .component_writes
+            .environment_intensity
+            .get(&handle)
+            .copied()
+            .unwrap_or(environment.intensity);
+        let sky = self
+            .component_writes
+            .sky
+            .get(&handle)
+            .copied()
+            .or(environment.procedural);
+        Some((intensity, sky))
+    }
+
+    /// Дистанции уровней LOD и дистанция отсечения (с учётом заявок); `None` без `lod_group`.
+    pub(crate) fn lod_distances(&self, handle: ObjectHandle) -> Option<(Vec<f32>, Option<f32>)> {
+        let group = self.stored_object(handle)?.lod_group.as_ref()?;
+        Some(match self.component_writes.lod.get(&handle) {
+            Some((distances, cull)) => (distances.clone(), *cull),
+            None => (
+                group.levels.iter().map(|level| level.distance).collect(),
+                group.cull_distance,
+            ),
+        })
+    }
+
+    /// Параметры звукового источника с учётом заявок; `None` без `audio_source`.
+    pub(crate) fn audio_settings(&self, handle: ObjectHandle) -> Option<AudioSourceComponent> {
+        self.component_writes
+            .audio_sources
+            .get(&handle)
+            .cloned()
+            .or_else(|| self.stored_object(handle)?.audio_source.clone())
+    }
+
+    pub(crate) fn stage_directional_light(
+        &mut self,
+        handle: ObjectHandle,
+        light: DirectionalLightComponent,
+    ) -> Result<(), String> {
+        self.require_writable("light changes")?;
+        if self.directional_light(handle).is_none() {
+            return Err("object has no directional_light".to_owned());
+        }
+        if let Some(problem) = engine_scene::world::directional_light_problem(&light) {
+            return Err(problem.to_owned());
+        }
+        self.component_writes
+            .directional_lights
+            .insert(handle, light);
+        Ok(())
+    }
+
+    pub(crate) fn stage_point_light(
+        &mut self,
+        handle: ObjectHandle,
+        light: PointLightComponent,
+    ) -> Result<(), String> {
+        self.require_writable("light changes")?;
+        if self.point_light(handle).is_none() {
+            return Err("object has no point_light".to_owned());
+        }
+        if let Some(problem) = engine_scene::world::point_light_problem(&light) {
+            return Err(problem.to_owned());
+        }
+        self.component_writes.point_lights.insert(handle, light);
+        Ok(())
+    }
+
+    pub(crate) fn stage_spot_light(
+        &mut self,
+        handle: ObjectHandle,
+        light: SpotLightComponent,
+    ) -> Result<(), String> {
+        self.require_writable("light changes")?;
+        if self.spot_light(handle).is_none() {
+            return Err("object has no spot_light".to_owned());
+        }
+        if let Some(problem) = engine_scene::world::spot_light_problem(&light) {
+            return Err(problem.to_owned());
+        }
+        self.component_writes.spot_lights.insert(handle, light);
+        Ok(())
+    }
+
+    pub(crate) fn stage_light_enabled(
+        &mut self,
+        handle: ObjectHandle,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.require_writable("light changes")?;
+        if self.light_enabled(handle).is_none() {
+            return Err("object has no light".to_owned());
+        }
+        self.component_writes.light_enabled.insert(handle, enabled);
+        Ok(())
+    }
+
+    pub(crate) fn stage_mesh_visible(
+        &mut self,
+        handle: ObjectHandle,
+        visible: bool,
+    ) -> Result<(), String> {
+        self.require_writable("mesh visibility")?;
+        if self.mesh_visible(handle).is_none() {
+            return Err("object has no mesh_renderer".to_owned());
+        }
+        self.component_writes.mesh_visible.insert(handle, visible);
+        Ok(())
+    }
+
+    /// Объединяет параметры материала с заявками этого вызова: заданные поля перекрывают прежние.
+    pub(crate) fn stage_mesh_material(
+        &mut self,
+        handle: ObjectHandle,
+        params: MeshMaterialParams,
+    ) -> Result<(), String> {
+        self.require_writable("material changes")?;
+        if self.mesh_visible(handle).is_none() {
+            return Err("object has no mesh_renderer".to_owned());
+        }
+        if let Some(problem) = engine_scene::world::mesh_material_problem(&params) {
+            return Err(problem.to_owned());
+        }
+        let merged = self
+            .component_writes
+            .mesh_material
+            .entry(handle)
+            .or_default();
+        if params.base_color.is_some() {
+            merged.base_color = params.base_color;
+        }
+        if params.emissive.is_some() {
+            merged.emissive = params.emissive;
+        }
+        if params.metallic.is_some() {
+            merged.metallic = params.metallic;
+        }
+        if params.roughness.is_some() {
+            merged.roughness = params.roughness;
+        }
+        Ok(())
+    }
+
+    /// Ставит материал всех частей меш-рендерера по пути `.rvemat`. Путь проверяется при вызове:
+    /// он должен быть объявлен в `[[assets]]` сцены.
+    pub(crate) fn stage_mesh_material_path(
+        &mut self,
+        handle: ObjectHandle,
+        path: engine_files::VirtualPath,
+    ) -> Result<(), String> {
+        self.require_writable("material changes")?;
+        if self.mesh_visible(handle).is_none() {
+            return Err("object has no mesh_renderer".to_owned());
+        }
+        let world = self.world().ok_or("material changes need a live world")?;
+        if let Some(problem) = world.mesh_material_path_problem_for(handle, &path) {
+            return Err(problem);
+        }
+        self.component_writes
+            .mesh_material_path
+            .insert(handle, path);
+        Ok(())
+    }
+
+    pub(crate) fn stage_particles_playing(
+        &mut self,
+        handle: ObjectHandle,
+        playing: bool,
+    ) -> Result<(), String> {
+        self.require_writable("particle changes")?;
+        if self.particles_playing(handle).is_none() {
+            return Err("object has no particle_emitter".to_owned());
+        }
+        self.component_writes
+            .particles_playing
+            .insert(handle, playing);
+        Ok(())
+    }
+
+    /// Ставит команду эмиттеру в очередь хоста: перезапуск или выброс.
+    pub(crate) fn stage_particle_command(
+        &mut self,
+        command: ParticleCommand,
+    ) -> Result<(), String> {
+        self.require_writable("particle changes")?;
+        if self.component_writes.particle_commands.len() >= MAX_PARTICLE_COMMANDS_PER_CALL {
+            return Err(format!(
+                "too many particle commands in one call (limit {MAX_PARTICLE_COMMANDS_PER_CALL})"
+            ));
+        }
+        let world = self.world().ok_or("particle changes need a live world")?;
+        world
+            .particle_command_target(command)
+            .map_err(|error| error.to_string())?;
+        // Команда неактивному эмиттеру не применяется ни в runtime, ни в редакторе: отказ здесь
+        // делает поведение одинаковым для обоих потребителей.
+        let object = match command {
+            ParticleCommand::Restart { object } | ParticleCommand::Burst { object, .. } => object,
+        };
+        if self.active_in_hierarchy(object) != Some(true) {
+            return Err("particle commands need an active object".to_owned());
+        }
+        self.component_writes.particle_commands.push(command);
+        Ok(())
+    }
+
+    pub(crate) fn stage_environment_intensity(
+        &mut self,
+        handle: ObjectHandle,
+        intensity: f32,
+    ) -> Result<(), String> {
+        self.require_writable("environment changes")?;
+        if self.environment_state(handle).is_none() {
+            return Err("object has no environment".to_owned());
+        }
+        if let Some(problem) = engine_scene::world::environment_intensity_problem(intensity) {
+            return Err(problem.to_owned());
+        }
+        self.component_writes
+            .environment_intensity
+            .insert(handle, intensity);
+        Ok(())
+    }
+
+    pub(crate) fn stage_procedural_sky(
+        &mut self,
+        handle: ObjectHandle,
+        sky: ProceduralSkyComponent,
+    ) -> Result<(), String> {
+        self.require_writable("environment changes")?;
+        match self.environment_state(handle) {
+            None => return Err("object has no environment".to_owned()),
+            Some((_, None)) => return Err("environment uses HDR, not a procedural sky".to_owned()),
+            Some(_) => {}
+        }
+        if let Some(problem) = engine_scene::world::procedural_sky_problem(&sky) {
+            return Err(problem.to_owned());
+        }
+        self.component_writes.sky.insert(handle, sky);
+        Ok(())
+    }
+
+    /// Интенсивность и небо одним вызовом: все значения проверяются до первой записи, поэтому
+    /// отказ не оставляет частично применённого окружения.
+    pub(crate) fn stage_environment(
+        &mut self,
+        handle: ObjectHandle,
+        intensity: Option<f32>,
+        sky: Option<ProceduralSkyComponent>,
+    ) -> Result<(), String> {
+        self.require_writable("environment changes")?;
+        match self.environment_state(handle) {
+            None => return Err("object has no environment".to_owned()),
+            Some((_, None)) if sky.is_some() => {
+                return Err("environment uses HDR, not a procedural sky".to_owned());
+            }
+            Some(_) => {}
+        }
+        if let Some(problem) =
+            intensity.and_then(engine_scene::world::environment_intensity_problem)
+        {
+            return Err(problem.to_owned());
+        }
+        if let Some(problem) = sky
+            .as_ref()
+            .and_then(engine_scene::world::procedural_sky_problem)
+        {
+            return Err(problem.to_owned());
+        }
+        if let Some(intensity) = intensity {
+            self.stage_environment_intensity(handle, intensity)?;
+        }
+        if let Some(sky) = sky {
+            self.stage_procedural_sky(handle, sky)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_lod_distances(
+        &mut self,
+        handle: ObjectHandle,
+        distances: Vec<f32>,
+        cull: Option<f32>,
+    ) -> Result<(), String> {
+        self.require_writable("LOD changes")?;
+        let Some((levels, _)) = self.lod_distances(handle) else {
+            return Err("object has no lod_group".to_owned());
+        };
+        if levels.len() != distances.len() {
+            return Err(format!(
+                "lod_group has {} levels, but {} distances were given",
+                levels.len(),
+                distances.len()
+            ));
+        }
+        if let Some(problem) = engine_scene::world::lod_distances_problem(&distances, cull) {
+            return Err(problem.to_owned());
+        }
+        self.component_writes.lod.insert(handle, (distances, cull));
+        Ok(())
+    }
+
+    pub(crate) fn stage_audio_settings(
+        &mut self,
+        handle: ObjectHandle,
+        settings: AudioSourceComponent,
+    ) -> Result<(), String> {
+        self.require_writable("audio source changes")?;
+        let Some(current) = self.audio_settings(handle) else {
+            return Err("object has no audio_source".to_owned());
+        };
+        let settings = AudioSourceComponent {
+            clip: current.clip,
+            ..settings
+        };
+        if let Some(problem) = engine_scene::audio::audio_source_problem(&settings) {
+            return Err(problem.to_owned());
+        }
+        self.component_writes.audio_sources.insert(handle, settings);
+        Ok(())
+    }
 }

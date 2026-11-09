@@ -380,6 +380,7 @@ fn run_from_args(
         Arc::clone(&status),
         resource_handle.clone(),
         !headless,
+        project.audio.mono_output,
         network_engine,
     ) {
         Ok(started) => started,
@@ -739,11 +740,13 @@ fn start_modules(
     status: Arc<RuntimeStatus>,
     resources: ResourceHandle,
     audio_output: bool,
+    mono_output: bool,
     network: Option<(NetworkEngine, NetworkHandle)>,
 ) -> std::io::Result<(PhysicsClient, engine_audio::AudioHandle)> {
     let (audio, audio_handle) = engine_audio::AudioEngine::new(engine_audio::AudioConfig {
         resources: Some(resources),
         output: audio_output,
+        mono_output,
     });
     let audio_stop = audio_handle.clone();
     modules.spawn(

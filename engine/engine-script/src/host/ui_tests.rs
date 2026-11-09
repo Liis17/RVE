@@ -303,6 +303,38 @@ fn ui_events_reach_only_instances_of_the_canvas_owner() {
 }
 
 #[test]
+fn ui_events_are_delivered_only_while_the_canvas_owner_is_running() {
+    let mut world = scene(&canvas_object("menu", "listener.lua"), &["listener.lua"]);
+    let mut host = load(&world, &[("listener.lua", LISTENER_SCRIPT)]);
+    host.start(&mut world, ScriptTime::default());
+    let owner = world.handle("menu").unwrap();
+    let canvas = component(&host, &world, "menu");
+    let go = element(&host, canvas, "go");
+    let event = || UiEvent {
+        canvas,
+        element: go,
+        kind: UiEventKind::Click,
+        value: None,
+    };
+
+    world.set_active(owner, false).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    host.queue_ui_events([event()]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        messages(&mut host)
+            .iter()
+            .all(|message| !message.starts_with("ui ")),
+        "an inactive canvas owner does not receive queued UI events"
+    );
+
+    world.set_active(owner, true).unwrap();
+    host.queue_ui_events([event()]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(messages(&mut host).contains(&"ui menu go click nil".to_owned()));
+}
+
+#[test]
 fn scene_canvases_open_before_on_start_with_component_visibility_and_layer() {
     let objects = "[[objects]]\nid = \"hud\"\n[objects.ui_canvas]\ndocument = \"/ui/menu.rveui\"\n\
          visible = false\nlayer = 9\n[[objects.lite_scripts]]\npath = \"/hud.lua\"\n\

@@ -28,8 +28,8 @@ pub use animation::{
 };
 pub use asset_kind::AssetKind;
 pub use audio::{
-    AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
-    activity_audio_requests,
+    AudioGroup, AudioRequest, AudioRolloff, AudioSourceComponent, ClipParams, MAX_AUDIO_PITCH,
+    MAX_AUDIO_VOLUME, VoiceId, activity_audio_requests,
 };
 pub use light::ShadowSettings;
 pub use material_asset::{

@@ -33,6 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Ресурсы одного объекта с мешом: уровни LOD (модель и текстура) и замена материала.
+#[derive(Clone, Debug)]
 pub(crate) struct ObjectModel {
     pub levels: Vec<(String, Option<String>)>,
     pub material: Option<MaterialOverride>,
@@ -64,6 +65,74 @@ pub(crate) struct PreparedRenderAssets {
     /// Исходники `.glsl` экранных шейдеров камер по пути. Заполняются только для игрового клиента:
     /// headless-сервер шейдеры не читает.
     pub screen_shaders: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedMaterialAssets {
+    pub models: HashMap<String, Model>,
+    pub textures: HashMap<String, TextureData>,
+    pub material_assets: HashMap<String, Result<MaterialAsset, String>>,
+    pub shader_assets: HashMap<String, Result<ShaderAsset, String>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MaterialAssetView<'a> {
+    pub models: &'a HashMap<String, Model>,
+    pub textures: &'a HashMap<String, TextureData>,
+    pub material_assets: &'a HashMap<String, Result<MaterialAsset, String>>,
+    pub shader_assets: &'a HashMap<String, Result<ShaderAsset, String>>,
+    fallback: Option<&'a PreparedRenderAssets>,
+}
+
+impl<'a> MaterialAssetView<'a> {
+    pub(crate) fn from_scene(assets: &'a PreparedRenderAssets) -> Self {
+        Self {
+            models: &assets.models,
+            textures: &assets.textures,
+            material_assets: &assets.material_assets,
+            shader_assets: &assets.shader_assets,
+            fallback: None,
+        }
+    }
+
+    pub(crate) fn from_prefab(
+        assets: &'a PreparedMaterialAssets,
+        fallback: Option<&'a PreparedRenderAssets>,
+    ) -> Self {
+        Self {
+            models: &assets.models,
+            textures: &assets.textures,
+            material_assets: &assets.material_assets,
+            shader_assets: &assets.shader_assets,
+            fallback,
+        }
+    }
+
+    fn model(&self, path: &str) -> Option<&'a Model> {
+        self.models
+            .get(path)
+            .or_else(|| self.fallback.and_then(|assets| assets.models.get(path)))
+    }
+
+    fn texture(&self, path: &str) -> Option<&'a TextureData> {
+        self.textures
+            .get(path)
+            .or_else(|| self.fallback.and_then(|assets| assets.textures.get(path)))
+    }
+
+    fn material_asset(&self, path: &str) -> Option<&'a Result<MaterialAsset, String>> {
+        self.material_assets.get(path).or_else(|| {
+            self.fallback
+                .and_then(|assets| assets.material_assets.get(path))
+        })
+    }
+
+    fn shader_asset(&self, path: &str) -> Option<&'a Result<ShaderAsset, String>> {
+        self.shader_assets.get(path).or_else(|| {
+            self.fallback
+                .and_then(|assets| assets.shader_assets.get(path))
+        })
+    }
 }
 
 /// Эмиттер частиц объекта: параметры сцены и путь текстуры, уже загруженной в `textures`.
@@ -376,6 +445,12 @@ fn prepare_scene_with_model_loader(
         prefab_particles.insert(path.clone(), emitters);
     }
 
+    // Все объявленные `.rvemat` готовятся, а не только слоты: скрипт назначает их через set_material.
+    for path in world.asset_paths() {
+        if path.as_str().to_ascii_lowercase().ends_with(".rvemat") {
+            set.material_paths.insert(path.as_str().to_owned());
+        }
+    }
     set.load_surface_assets(resources, assets, scene_path);
 
     let RenderAssetSet {
@@ -662,7 +737,18 @@ pub(crate) struct ResolvedUserTexture {
     pub(crate) color_space: TextureColorSpace,
 }
 
-struct GpuTextureCache<T> {
+/// GPU-кэши сцены, которые переживают загрузку: текстуры, шейдеры и запасной материал. Render thread
+/// забирает их, чтобы заменять материалы объектов без повторной загрузки текстур.
+#[derive(Default)]
+pub(crate) struct MaterialUploadCaches {
+    pub(crate) textures: GpuTextureCache<TextureId>,
+    pub(crate) shaders: HashMap<String, Result<ShaderId, String>>,
+    pub(crate) error_material: Option<MaterialId>,
+    ownership: MaterialResourceOwnership<MaterialId, TextureId, ShaderId>,
+    pinned_shader_paths: HashSet<String>,
+}
+
+pub(crate) struct GpuTextureCache<T> {
     model: HashMap<(String, usize, TextureColorSpace), T>,
     scene: HashMap<(String, TextureColorSpace), T>,
 }
@@ -672,6 +758,240 @@ impl<T> Default for GpuTextureCache<T> {
         Self {
             model: HashMap::new(),
             scene: HashMap::new(),
+        }
+    }
+}
+
+pub(crate) struct MaterialResourceDependencies<T, S> {
+    textures: HashSet<T>,
+    shader: Option<S>,
+}
+
+pub(crate) type MaterialDependencyMap =
+    HashMap<MaterialId, MaterialResourceDependencies<TextureId, ShaderId>>;
+
+struct MaterialResourceOwnership<M, T, S> {
+    pinned_textures: HashSet<T>,
+    pinned_shaders: HashSet<S>,
+    materials: HashMap<M, MaterialResourceDependencies<T, S>>,
+    texture_refs: HashMap<T, usize>,
+    shader_refs: HashMap<S, usize>,
+}
+
+impl<M, T, S> Default for MaterialResourceOwnership<M, T, S> {
+    fn default() -> Self {
+        Self {
+            pinned_textures: HashSet::new(),
+            pinned_shaders: HashSet::new(),
+            materials: HashMap::new(),
+            texture_refs: HashMap::new(),
+            shader_refs: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MaterialResourceReleases<T: Eq + Hash, S: Eq + Hash> {
+    textures: HashSet<T>,
+    shaders: HashSet<S>,
+}
+
+impl<M, T, S> MaterialResourceOwnership<M, T, S>
+where
+    M: Copy + Eq + Hash,
+    T: Copy + Eq + Hash,
+    S: Copy + Eq + Hash,
+{
+    fn pin_texture(&mut self, texture: T) {
+        self.pinned_textures.insert(texture);
+    }
+
+    fn pin_shader(&mut self, shader: S) {
+        self.pinned_shaders.insert(shader);
+    }
+
+    fn retain_material(&mut self, material: M, dependencies: MaterialResourceDependencies<T, S>) {
+        if self.materials.contains_key(&material) {
+            return;
+        }
+        for texture in &dependencies.textures {
+            *self.texture_refs.entry(*texture).or_default() += 1;
+        }
+        if let Some(shader) = dependencies.shader {
+            *self.shader_refs.entry(shader).or_default() += 1;
+        }
+        self.materials.insert(material, dependencies);
+    }
+
+    fn release_materials(
+        &mut self,
+        materials: impl IntoIterator<Item = M>,
+    ) -> MaterialResourceReleases<T, S> {
+        let mut released = MaterialResourceReleases::default();
+        for material in materials {
+            let Some(dependencies) = self.materials.remove(&material) else {
+                continue;
+            };
+            for texture in dependencies.textures {
+                let exhausted = if let Some(refs) = self.texture_refs.get_mut(&texture) {
+                    *refs = refs.saturating_sub(1);
+                    *refs == 0
+                } else {
+                    false
+                };
+                if exhausted {
+                    self.texture_refs.remove(&texture);
+                    if !self.pinned_textures.contains(&texture) {
+                        released.textures.insert(texture);
+                    }
+                }
+            }
+            if let Some(shader) = dependencies.shader {
+                let exhausted = if let Some(refs) = self.shader_refs.get_mut(&shader) {
+                    *refs = refs.saturating_sub(1);
+                    *refs == 0
+                } else {
+                    false
+                };
+                if exhausted {
+                    self.shader_refs.remove(&shader);
+                    if !self.pinned_shaders.contains(&shader) {
+                        released.shaders.insert(shader);
+                    }
+                }
+            }
+        }
+        released
+    }
+
+    fn keeps_texture(&self, texture: T) -> bool {
+        self.pinned_textures.contains(&texture) || self.texture_refs.contains_key(&texture)
+    }
+
+    fn keeps_shader(&self, shader: S) -> bool {
+        self.pinned_shaders.contains(&shader) || self.shader_refs.contains_key(&shader)
+    }
+}
+
+impl<T> GpuTextureCache<T>
+where
+    T: Copy + Eq + Hash,
+{
+    fn ids(&self) -> HashSet<T> {
+        self.model
+            .values()
+            .chain(self.scene.values())
+            .copied()
+            .collect()
+    }
+
+    fn remove_id(&mut self, id: T) {
+        self.model.retain(|_, cached| *cached != id);
+        self.scene.retain(|_, cached| *cached != id);
+    }
+}
+
+impl<T: Eq + Hash, S: Eq + Hash> Default for MaterialResourceReleases<T, S> {
+    fn default() -> Self {
+        Self {
+            textures: HashSet::new(),
+            shaders: HashSet::new(),
+        }
+    }
+}
+
+impl MaterialUploadCaches {
+    pub(crate) fn pin_scene_resources(&mut self) {
+        for texture in self.textures.ids() {
+            self.ownership.pin_texture(texture);
+        }
+        for shader in self
+            .shaders
+            .values()
+            .filter_map(|result| result.as_ref().ok())
+        {
+            self.ownership.pin_shader(*shader);
+        }
+        self.pinned_shader_paths = self.shaders.keys().cloned().collect();
+    }
+
+    pub(crate) fn retain_materials(
+        &mut self,
+        dependencies: HashMap<MaterialId, MaterialResourceDependencies<TextureId, ShaderId>>,
+    ) {
+        for (material, dependencies) in dependencies {
+            self.ownership.retain_material(material, dependencies);
+        }
+    }
+
+    pub(crate) fn release_materials(&mut self, renderer: &mut Renderer, materials: &[MaterialId]) {
+        let released = self.ownership.release_materials(materials.iter().copied());
+        for texture in released.textures {
+            match renderer.destroy_texture(texture) {
+                Ok(()) => self.textures.remove_id(texture),
+                Err(error) => log::error!("текстура материала не уничтожена: {error}"),
+            }
+        }
+        for shader in released.shaders {
+            let path = self.shaders.iter().find_map(|(path, result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .filter(|cached| **cached == shader)
+                    .map(|_| path.clone())
+            });
+            let Some(path) = path else { continue };
+            match renderer.destroy_surface_shader(shader) {
+                Ok(()) => {
+                    self.shaders.remove(&path);
+                }
+                Err(error) => log::error!("шейдер материала /{path} не уничтожен: {error}"),
+            }
+        }
+    }
+
+    pub(crate) fn prune_unowned(&mut self, renderer: &mut Renderer) {
+        let textures = self
+            .textures
+            .ids()
+            .into_iter()
+            .filter(|texture| !self.ownership.keeps_texture(*texture))
+            .collect::<Vec<_>>();
+        for texture in textures {
+            match renderer.destroy_texture(texture) {
+                Ok(()) => self.textures.remove_id(texture),
+                Err(error) => log::error!("текстура материала не уничтожена: {error}"),
+            }
+        }
+
+        let shaders = self
+            .shaders
+            .iter()
+            .filter_map(|(path, result)| match result {
+                Ok(shader)
+                    if self.pinned_shader_paths.contains(path)
+                        || self.ownership.keeps_shader(*shader) =>
+                {
+                    None
+                }
+                Ok(_) | Err(_) => Some(path.clone()),
+            })
+            .collect::<Vec<_>>();
+        for path in shaders {
+            let destroy = match self.shaders.get(&path) {
+                Some(Ok(shader)) => match renderer.destroy_surface_shader(*shader) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!("шейдер материала /{path} не уничтожен: {error}");
+                        false
+                    }
+                },
+                Some(Err(_)) => true,
+                None => false,
+            };
+            if destroy {
+                self.shaders.remove(&path);
+            }
         }
     }
 }
@@ -1056,6 +1376,16 @@ pub(crate) fn prepare_template(
     if stop() {
         return Err(STOPPED.to_owned());
     }
+    for asset in template.assets() {
+        if asset
+            .path
+            .as_str()
+            .to_ascii_lowercase()
+            .ends_with(".rvemat")
+        {
+            set.material_paths.insert(asset.path.as_str().to_owned());
+        }
+    }
     set.load_surface_assets(resources, assets, label);
     let RenderAssetSet {
         models,
@@ -1156,12 +1486,14 @@ pub(crate) fn load_screen_shader_sources(
 pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
+    caches: &mut MaterialUploadCaches,
 ) -> Result<GpuSceneTable, RenderError> {
     let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
-    let mut texture_cache = GpuTextureCache::<TextureId>::default();
-    let mut shader_cache = HashMap::<String, Result<ShaderId, String>>::new();
+    let mut texture_cache = std::mem::take(&mut caches.textures);
+    let mut shader_cache = std::mem::take(&mut caches.shaders);
     let mut material_cache = HashMap::<String, MaterialId>::new();
-    let mut error_material = None;
+    let mut error_material = caches.error_material.take();
+    let material_assets = MaterialAssetView::from_scene(assets);
     // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
     let animated = animated_model_paths(assets);
 
@@ -1198,9 +1530,10 @@ pub(crate) fn upload_scene(
                 &resolved,
                 path,
                 model,
-                &assets.textures,
+                material_assets,
                 &mut texture_cache,
                 &mut material_cache,
+                None,
                 None,
             )?;
             gpu_meshes.push((mesh_id, material_id));
@@ -1211,6 +1544,16 @@ pub(crate) fn upload_scene(
     let mut table = GpuSceneTable {
         environments: assets.environments.clone(),
         animation_clips: assets.clips.clone(),
+        material_sources: assets
+            .objects
+            .iter()
+            .map(|(handle, object)| (*handle, object.clone()))
+            .collect(),
+        material_templates: assets
+            .prefabs
+            .iter()
+            .map(|(path, models)| (path.clone(), models.clone()))
+            .collect(),
         ..GpuSceneTable::default()
     };
     for (path, image) in &assets.ui_images {
@@ -1235,12 +1578,13 @@ pub(crate) fn upload_scene(
     for (handle, object) in &assets.objects {
         let levels = upload_object_levels(
             renderer,
-            assets,
+            material_assets,
             &gpu_models,
             &mut texture_cache,
             &mut shader_cache,
             &mut material_cache,
             &mut error_material,
+            None,
             object,
         )?;
         if object.animated
@@ -1268,12 +1612,13 @@ pub(crate) fn upload_scene(
             templates.push(match object {
                 Some(object) => upload_object_levels(
                     renderer,
-                    assets,
+                    material_assets,
                     &gpu_models,
                     &mut texture_cache,
                     &mut shader_cache,
                     &mut material_cache,
                     &mut error_material,
+                    None,
                     object,
                 )?,
                 None => Vec::new(),
@@ -1297,6 +1642,9 @@ pub(crate) fn upload_scene(
         }
         table.particle_templates.insert(path.clone(), descs);
     }
+    caches.textures = texture_cache;
+    caches.shaders = shader_cache;
+    caches.error_material = error_material;
     Ok(table)
 }
 
@@ -1423,14 +1771,15 @@ pub(crate) fn particle_emitter_desc(
 /// Уровни LOD объекта. Без замены материала и текстуры переиспользуются меши модели; иначе для
 /// каждой части берётся материал с заменами, одинаковые материалы создаются один раз.
 #[allow(clippy::too_many_arguments)]
-fn upload_object_levels(
+pub(crate) fn upload_object_levels(
     renderer: &mut Renderer,
-    assets: &PreparedRenderAssets,
+    assets: MaterialAssetView<'_>,
     gpu_models: &HashMap<String, Vec<(MeshId, MaterialId)>>,
     texture_cache: &mut GpuTextureCache<TextureId>,
     shader_cache: &mut HashMap<String, Result<ShaderId, String>>,
     material_cache: &mut HashMap<String, MaterialId>,
     error_material: &mut Option<MaterialId>,
+    mut material_dependencies: Option<&mut MaterialDependencyMap>,
     object: &ObjectModel,
 ) -> Result<Vec<Vec<(MeshId, MaterialId)>>, RenderError> {
     let mut levels = Vec::with_capacity(object.levels.len());
@@ -1445,7 +1794,7 @@ fn upload_object_levels(
             levels.push(model_meshes.clone());
             continue;
         }
-        let model = assets.models.get(model_path).ok_or({
+        let model = assets.model(model_path).ok_or({
             RenderError::InvalidState("CPU-модель отсутствует в таблице подготовленных ресурсов")
         })?;
         let mut draws = Vec::with_capacity(model_meshes.len());
@@ -1474,6 +1823,7 @@ fn upload_object_levels(
                     shader_cache,
                     material_cache,
                     error_material,
+                    material_dependencies.as_deref_mut(),
                 )?,
                 None => {
                     let resolved = resolve_material(
@@ -1486,10 +1836,11 @@ fn upload_object_levels(
                         &resolved,
                         model_path,
                         model,
-                        &assets.textures,
+                        assets,
                         texture_cache,
                         material_cache,
                         None,
+                        material_dependencies.as_deref_mut(),
                     )?
                 }
             };
@@ -1500,18 +1851,19 @@ fn upload_object_levels(
     Ok(levels)
 }
 
-/// Создаёт GPU-материал или возвращает уже созданный для тех же входных данных. Материалы живут
-/// до завершения рендера вместе со сценой, поэтому кэш владения не меняет.
+/// Создаёт GPU-материал или возвращает уже созданный для тех же входных данных. Короткоживущие
+/// материалы записывают зависимости, чтобы вызывающий код мог освободить их вместе с материалом.
 #[allow(clippy::too_many_arguments)]
 fn upload_resolved_material(
     renderer: &mut Renderer,
     resolved: &ResolvedMaterial,
     model_path: &str,
     model: &Model,
-    scene_texture_data: &HashMap<String, TextureData>,
+    assets: MaterialAssetView<'_>,
     texture_cache: &mut GpuTextureCache<TextureId>,
     material_cache: &mut HashMap<String, MaterialId>,
     shader: Option<ShaderId>,
+    material_dependencies: Option<&mut MaterialDependencyMap>,
 ) -> Result<MaterialId, RenderError> {
     let key = material_cache_key(model_path, resolved);
     if let Some(&material) = material_cache.get(&key) {
@@ -1523,7 +1875,7 @@ fn upload_resolved_material(
         TextureColorSpace::Srgb,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let metallic_roughness_texture = upload_material_texture(
@@ -1532,7 +1884,7 @@ fn upload_resolved_material(
         TextureColorSpace::Linear,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let normal_texture = upload_material_texture(
@@ -1541,7 +1893,7 @@ fn upload_resolved_material(
         TextureColorSpace::Linear,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let emissive_texture = upload_material_texture(
@@ -1550,7 +1902,7 @@ fn upload_resolved_material(
         TextureColorSpace::Srgb,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let occlusion_texture = upload_material_texture(
@@ -1559,14 +1911,14 @@ fn upload_resolved_material(
         TextureColorSpace::Linear,
         model_path,
         model,
-        scene_texture_data,
+        assets,
         texture_cache,
     )?;
     let mut user_textures = [None; 8];
     for (slot, source) in resolved.user_texture_sources.iter().enumerate() {
         let Some(source) = source else { continue };
         let key = (source.path.clone(), source.color_space);
-        let data = scene_texture_data.get(&source.path).ok_or_else(|| {
+        let data = assets.texture(&source.path).ok_or_else(|| {
             RenderError::InvalidTexture(format!(
                 "ресурсная текстура /{} отсутствует или не загружена",
                 source.path
@@ -1600,6 +1952,20 @@ fn upload_resolved_material(
         normal_scale: resolved.normal_scale,
         occlusion_strength: resolved.occlusion_strength,
     })?;
+    if let Some(material_dependencies) = material_dependencies {
+        let textures = [
+            base_color_texture,
+            metallic_roughness_texture,
+            normal_texture,
+            emissive_texture,
+            occlusion_texture,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(user_textures.iter().flatten().copied())
+        .collect();
+        material_dependencies.insert(material, MaterialResourceDependencies { textures, shader });
+    }
     material_cache.insert(key, material);
     Ok(material)
 }
@@ -1618,7 +1984,7 @@ fn material_cache_key(model_path: &str, resolved: &ResolvedMaterial) -> String {
 #[allow(clippy::too_many_arguments)]
 fn upload_material_slot(
     renderer: &mut Renderer,
-    assets: &PreparedRenderAssets,
+    assets: MaterialAssetView<'_>,
     path: &str,
     model_material: &ModelMaterial,
     replacement_texture: Option<&str>,
@@ -1629,10 +1995,10 @@ fn upload_material_slot(
     shader_cache: &mut HashMap<String, Result<ShaderId, String>>,
     material_cache: &mut HashMap<String, MaterialId>,
     error_material: &mut Option<MaterialId>,
+    material_dependencies: Option<&mut MaterialDependencyMap>,
 ) -> Result<MaterialId, RenderError> {
     let resolved = assets
-        .material_assets
-        .get(path)
+        .material_asset(path)
         .ok_or_else(|| format!("материал /{path} не был подготовлен"))
         .and_then(|result| result.as_ref().map_err(Clone::clone))
         .and_then(|material| {
@@ -1641,8 +2007,7 @@ fn upload_material_slot(
                 .as_ref()
                 .map(|shader_path| {
                     assets
-                        .shader_assets
-                        .get(shader_path.as_str())
+                        .shader_asset(shader_path.as_str())
                         .ok_or_else(|| format!("шейдер /{} не был подготовлен", shader_path))?
                         .as_ref()
                         .map_err(Clone::clone)
@@ -1689,10 +2054,11 @@ fn upload_material_slot(
         &resolved,
         model_path,
         model,
-        &assets.textures,
+        assets,
         texture_cache,
         material_cache,
         shader,
+        material_dependencies,
     ) {
         Ok(material) => Ok(material),
         Err(error) => {
@@ -1723,7 +2089,7 @@ fn upload_material_texture(
     color_space: TextureColorSpace,
     model_path: &str,
     model: &Model,
-    scene_texture_data: &HashMap<String, TextureData>,
+    assets: MaterialAssetView<'_>,
     texture_cache: &mut GpuTextureCache<TextureId>,
 ) -> Result<Option<TextureId>, RenderError> {
     let Some(source) = source else {
@@ -1748,7 +2114,7 @@ fn upload_material_texture(
         }
         MaterialTextureSource::Scene(path) => {
             let key = (path.clone(), color_space);
-            let texture = scene_texture_data.get(path).ok_or({
+            let texture = assets.texture(path).ok_or({
                 RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
             })?;
             get_or_insert_gpu(&mut texture_cache.scene, key, || {
@@ -1767,10 +2133,10 @@ fn upload_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, ScreenShaderGpu,
-        get_or_insert_gpu, load_scene, load_screen_shader_sources, material_cache_key,
-        prepare_scene_with_model_loader, resolve_material, resolve_material_asset,
-        screen_shader_paths, upload_screen_shaders,
+        GpuTextureCache, MaterialAssetView, MaterialTextureSource, PreparedMaterialAssets,
+        PreparedPrefabs, ScreenShaderGpu, get_or_insert_gpu, load_scene,
+        load_screen_shader_sources, material_cache_key, prepare_scene_with_model_loader,
+        resolve_material, resolve_material_asset, screen_shader_paths, upload_screen_shaders,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
@@ -2253,6 +2619,63 @@ id = "camera"
         format!(
             "[[assets]]\npath = \"/materials/ice.rvephysmat\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\nmaterial = \"/materials/ice.rvephysmat\"\n"
         )
+    }
+
+    #[test]
+    fn declared_rvemat_without_a_slot_is_prepared_so_set_material_can_use_it() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!(
+                "[[assets]]\npath = \"/materials/spare.rvemat\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"lamp\"\n[objects.point_light]\n"
+            )
+            .as_bytes(),
+        );
+        project.write("materials/spare.rvemat", b"");
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .render_assets
+                .material_assets
+                .get("materials/spare.rvemat")
+                .is_some_and(Result::is_ok),
+            "{:?}",
+            prepared
+                .render_assets
+                .material_assets
+                .keys()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prefab_material_view_resolves_scene_declared_materials() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!("[[assets]]\npath = \"/materials/gold.rvemat\"\n{CAMERA_SCENE}").as_bytes(),
+        );
+        project.write("materials/gold.rvemat", b"");
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let prefab_assets = PreparedMaterialAssets::default();
+        let view = MaterialAssetView::from_prefab(&prefab_assets, Some(&prepared.render_assets));
+
+        assert!(
+            view.material_asset("materials/gold.rvemat")
+                .is_some_and(Result::is_ok)
+        );
     }
 
     #[test]
@@ -3274,5 +3697,62 @@ mod particle_mapping_tests {
         assert_eq!(desc.blend, ParticleBlend::Additive);
         assert!(desc.collision.is_none());
         assert!(desc.texture.is_none());
+    }
+}
+
+#[cfg(test)]
+mod material_resource_ownership_tests {
+    use super::{
+        MaterialResourceDependencies, MaterialResourceOwnership, MaterialResourceReleases,
+    };
+    use std::collections::HashSet;
+
+    fn dependencies(
+        textures: impl IntoIterator<Item = u32>,
+        shader: Option<u32>,
+    ) -> MaterialResourceDependencies<u32, u32> {
+        MaterialResourceDependencies {
+            textures: textures.into_iter().collect(),
+            shader,
+        }
+    }
+
+    #[test]
+    fn dynamic_material_dependencies_are_shared_and_retired_with_the_last_material() {
+        let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
+        ownership.pin_texture(1);
+        ownership.pin_shader(11);
+        ownership.retain_material(100, dependencies([1, 2], Some(11)));
+        ownership.retain_material(200, dependencies([2], Some(12)));
+
+        assert_eq!(
+            ownership.release_materials([100]),
+            MaterialResourceReleases::default()
+        );
+        assert!(ownership.keeps_texture(1));
+        assert!(ownership.keeps_texture(2));
+        assert!(ownership.keeps_shader(11));
+        assert!(ownership.keeps_shader(12));
+
+        let released = ownership.release_materials([200]);
+        assert_eq!(released.textures, HashSet::from([2]));
+        assert_eq!(released.shaders, HashSet::from([12]));
+        assert_eq!(
+            ownership.release_materials([200]),
+            MaterialResourceReleases::default()
+        );
+    }
+
+    #[test]
+    fn stale_material_replies_release_resources_and_failed_uploads_do_not_pin_them() {
+        let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
+        ownership.retain_material(300, dependencies([3], Some(13)));
+        let stale = ownership.release_materials([300]);
+        assert_eq!(stale.textures, HashSet::from([3]));
+        assert_eq!(stale.shaders, HashSet::from([13]));
+
+        // A failed upload can cache dependencies before material creation, but no material owns them.
+        assert!(!ownership.keeps_texture(4));
+        assert!(!ownership.keeps_shader(14));
     }
 }

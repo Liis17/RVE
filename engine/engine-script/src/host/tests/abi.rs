@@ -443,6 +443,11 @@ impl Script for Probe {
             contact.point[0], contact.normal[0]
         ));
     }
+
+    fn on_trigger_stay(&mut self, ctx: &mut rve_sdk::Context<'_>, other: rve_sdk::Object) {
+        let id = other.id(ctx).expect("trigger event object is readable");
+        ctx.log_info(format!("abi stay:{id}"));
+    }
 }
 
 impl Drop for Probe {
@@ -1576,7 +1581,7 @@ fn v15_module() -> &'static RveModule {
 }
 
 #[test]
-fn abi_v15_modules_load_on_the_v18_host_without_enable_callbacks() {
+fn abi_v15_modules_load_on_the_v19_host_without_enable_callbacks() {
     let _lock = test_lock();
     let module = v15_module();
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1594,7 +1599,7 @@ fn abi_v15_modules_load_on_the_v18_host_without_enable_callbacks() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v15"),
-        "guest ABI v15 runs on the v18 host"
+        "guest ABI v15 runs on the v19 host"
     );
 }
 
@@ -1719,7 +1724,7 @@ fn v16_ui_module() -> &'static RveModule {
 }
 
 #[test]
-fn abi_v16_ui_modules_load_on_v18_host_and_keep_ui_callbacks() {
+fn abi_v16_ui_modules_load_on_v19_host_and_keep_ui_callbacks() {
     let _lock = test_lock();
     let library =
         unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v16_ui_module())) }.unwrap();
@@ -1941,7 +1946,7 @@ fn abi_v13_modules_load_on_the_v16_host() {
 }
 
 #[test]
-fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v18_host() {
+fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v19_host() {
     let _lock = test_lock();
     let module = v13_module(14);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1959,7 +1964,7 @@ fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v18_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v14"),
-        "guest ABI v14 runs on the v18 host and its parameters use the pre-v15 layout"
+        "guest ABI v14 runs on the v19 host and its parameters use the pre-v15 layout"
     );
 }
 
@@ -4861,7 +4866,7 @@ radius = 0.5
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v17"),
-        "ABI v17 modules still load on the v18 host"
+        "ABI v17 modules still load on the v19 host"
     );
     host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
     for frame in 1..=5_u64 {
@@ -4895,6 +4900,86 @@ struct JumpProbe {
     jumped: bool,
 }
 
+#[test]
+fn abi_v18_modules_load_on_the_v19_host_with_ui_and_lifecycle_descriptor_tail() {
+    let _lock = test_lock();
+    let current = sdk_module();
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 18,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: current.scripts,
+        script_count: current.script_count,
+    }));
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert_eq!(library.abi_version(), 18);
+
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[objects.collider]
+shape = "sphere"
+radius = 1.0
+trigger = true
+[[objects.heavy_scripts]]
+name = "Probe"
+params = { label = "v18" }
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.5, 0.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+"#,
+    );
+    let (mut driver, bindings) = PhysicsSceneDesc::from_world(&world, &[], glam::Vec3::ZERO, 60, 8)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v18"),
+        "guest ABI v18 runs on the v19 host"
+    );
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    let mut saw_stay = false;
+    for frame in 1..=5_u64 {
+        host.update(
+            &mut world,
+            1.0 / 60.0,
+            ScriptTime {
+                elapsed: frame as f64 / 60.0,
+                frame,
+            },
+        );
+        saw_stay |= message_list(&mut host)
+            .iter()
+            .any(|message| message == "abi stay:ball");
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+        host.queue_physics_events(result.events);
+    }
+    assert!(saw_stay, "ABI v18 must receive active trigger stay events");
+}
 fn jump_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(JumpProbe { jumped: false }))
 }

@@ -22,6 +22,10 @@ fn request(looping: bool) -> PlayRequest {
         volume: 1.0,
         looping,
         spatial: None,
+        spatial_blend: 0.0,
+        rolloff: Rolloff::Inverse,
+        pitch: 1.0,
+        force_mono: false,
     }
 }
 

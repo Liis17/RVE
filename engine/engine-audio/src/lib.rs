@@ -17,7 +17,7 @@ pub mod output;
 
 pub use bridge::AudioBridge;
 pub use decode::{Clip, DecodeError};
-pub use mixer::{Distances, PlayRequest};
+pub use mixer::{Distances, PlayRequest, Rolloff};
 
 use decode::{MAX_CLIP_FILE_BYTES, decode};
 use engine_resources::{ResourceHandle, ResourceRequest};
@@ -49,6 +49,8 @@ pub struct AudioConfig {
     pub resources: Option<ResourceHandle>,
     /// Открывать устройство вывода. `false` — микширование без звука (CI, тесты).
     pub output: bool,
+    /// Сводить весь вывод к моно (настройка проекта `mono_output`).
+    pub mono_output: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +97,7 @@ pub(crate) enum Command {
     Stop(VoiceId),
     StopAll,
     SetPaused(bool),
+    SetMonoOutput(bool),
     SetVoiceVolume {
         voice: VoiceId,
         volume: f32,
@@ -261,6 +264,11 @@ impl AudioHandle {
         self.send(Command::SetPaused(paused))
     }
 
+    /// Сводит весь вывод к моно или возвращает стерео. Применяется со следующего блока микшера.
+    pub fn set_mono_output(&self, mono: bool) -> Result<(), AudioError> {
+        self.send(Command::SetMonoOutput(mono))
+    }
+
     pub fn set_voice_volume(&self, voice: VoiceId, volume: f32) -> Result<(), AudioError> {
         self.send(Command::SetVoiceVolume { voice, volume })
     }
@@ -290,9 +298,9 @@ impl AudioHandle {
         }
     }
 
-    /// Пишет позицию и правую ось слушателя.
-    pub fn set_listener(&self, position: [f32; 3], right: [f32; 3]) {
-        self.spatial.set_listener(position, right);
+    /// Пишет позицию, правую и переднюю оси слушателя.
+    pub fn set_listener(&self, position: [f32; 3], right: [f32; 3], forward: [f32; 3]) {
+        self.spatial.set_listener(position, right, forward);
     }
 
     /// Забирает накопившиеся события. Вызывать из одного владельца.
@@ -368,6 +376,10 @@ impl AudioEngine {
             spatial: Arc::clone(&spatial),
             stopping: Arc::clone(&stopping),
         };
+        // Очередь пуста, поэтому отправка стартового режима не может упереться в заполненную очередь.
+        if config.mono_output {
+            let _ = handle.set_mono_output(true);
+        }
         let engine = Self {
             config,
             commands,
@@ -547,6 +559,7 @@ impl Core {
                 self.send_mixer(MixerCommand::StopAll);
             }
             Command::SetPaused(paused) => self.send_mixer(MixerCommand::SetPaused(paused)),
+            Command::SetMonoOutput(mono) => self.send_mixer(MixerCommand::SetMonoOutput(mono)),
             Command::SetVoiceVolume { voice, volume } => {
                 for pending in self
                     .pending

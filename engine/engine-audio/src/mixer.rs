@@ -31,13 +31,31 @@ pub struct Distances {
     pub max: f32,
 }
 
+/// Кривая затухания пространственного голоса.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rolloff {
+    /// `(min/d)·(max−d)/(max−min)`: прежняя кривая, по умолчанию для совместимости.
+    #[default]
+    Inverse,
+    /// Линейно: 1 на `min`, 0 на `max`.
+    Linear,
+}
+
 /// Параметры запуска голоса.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayRequest {
     pub group: AudioGroup,
     pub volume: f32,
     pub looping: bool,
+    /// Дистанции пространственного голоса; `None` — 2D-звук без затухания и панорамы.
     pub spatial: Option<Distances>,
+    /// Доля 3D-микширования `0..=1` при заданных `spatial`: `0` — 2D, `1` — полностью 3D.
+    pub spatial_blend: f32,
+    pub rolloff: Rolloff,
+    /// Множитель скорости воспроизведения (и высоты тона), конечный и больше нуля.
+    pub pitch: f32,
+    /// Сводит стерео-клип к моно до панорамы.
+    pub force_mono: bool,
 }
 
 /// Команды от потока `rve-audio` к callback.
@@ -62,7 +80,17 @@ pub enum MixerCommand {
         group: AudioGroup,
         volume: f32,
     },
+    /// Сводит весь вывод к моно; применяется к следующему блоку.
+    SetMonoOutput(bool),
 }
+
+/// Позиция, правая и передняя оси слушателя.
+type Listener = ([f32; 3], [f32; 3], [f32; 3]);
+
+/// Затухание за спиной слушателя: доля громкости, которую убирают при полностью заднем звуке.
+const BEHIND_ATTENUATION: f32 = 0.25;
+/// Коэффициент one-pole low-pass за спиной: при полностью заднем звуке `alpha = 1 - 0.8 = 0.2`.
+const BEHIND_CUTOFF: f32 = 0.8;
 
 /// Значение из нескольких слов под seqlock: писатель меняет его под блокировкой [`Spatial`],
 /// читатель (callback) повторяет чтение не больше [`SEQ_READ_ATTEMPTS`] раз.
@@ -112,8 +140,8 @@ impl<const N: usize> SeqSlot<N> {
 /// Последние позиции излучателей и слушателя. Не очередь: новые значения перезаписывают старые.
 pub struct Spatial {
     emitters: [SeqSlot<3>; VOICE_SLOTS],
-    /// Позиция слушателя и его правая ось (`[px, py, pz, rx, ry, rz]`).
-    listener: SeqSlot<6>,
+    /// Позиция слушателя, его правая и передняя оси (`[px, py, pz, rx, ry, rz, fx, fy, fz]`).
+    listener: SeqSlot<9>,
     /// Писатели (игровой поток, редактор, любые клоны хендла) выстраиваются в очередь здесь.
     /// Callback только читает и эту блокировку не берёт.
     writers: Mutex<()>,
@@ -142,7 +170,7 @@ impl Spatial {
     }
 
     /// Пишет слушателя. Писатели сериализуются блокировкой `writers`.
-    pub fn set_listener(&self, position: [f32; 3], right: [f32; 3]) {
+    pub fn set_listener(&self, position: [f32; 3], right: [f32; 3], forward: [f32; 3]) {
         let _writer = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
         self.listener.store([
             position[0],
@@ -151,12 +179,15 @@ impl Spatial {
             right[0],
             right[1],
             right[2],
+            forward[0],
+            forward[1],
+            forward[2],
         ]);
     }
 
-    fn listener(&self) -> Option<([f32; 3], [f32; 3])> {
-        let [px, py, pz, rx, ry, rz] = self.listener.try_load()?;
-        Some(([px, py, pz], [rx, ry, rz]))
+    fn listener(&self) -> Option<Listener> {
+        let [px, py, pz, rx, ry, rz, fx, fy, fz] = self.listener.try_load()?;
+        Some(([px, py, pz], [rx, ry, rz], [fx, fy, fz]))
     }
 }
 
@@ -178,9 +209,14 @@ struct Voice {
     group: AudioGroup,
     volume: f32,
     distances: Option<Distances>,
+    spatial_blend: f32,
+    rolloff: Rolloff,
+    force_mono: bool,
     lane: usize,
     /// Текущий (сглаженный) множитель громкости; меняется линейно внутри блока.
     gain: f32,
+    /// Состояние one-pole low-pass по левому и правому каналу за спиной слушателя.
+    lowpass: [f32; 2],
     /// Fade-out после остановки; `None`, пока голос не останавливают.
     fade: Option<Fade>,
     /// Последняя прочитанная позиция излучателя: используется, пока писатель её меняет.
@@ -208,9 +244,10 @@ pub struct Mixer {
     /// Индексы [`AudioGroup`]: Master, Music, Effects, Ambient.
     group_gains: [f32; 4],
     paused: bool,
+    mono_output: bool,
     ended: EndedQueue,
     /// Последний согласованный слушатель: используется, пока писатель его меняет.
-    listener: ([f32; 3], [f32; 3]),
+    listener: Listener,
 }
 
 impl Mixer {
@@ -223,11 +260,12 @@ impl Mixer {
             voices: std::array::from_fn(|_| None),
             group_gains: [1.0; 4],
             paused: false,
+            mono_output: false,
             ended: EndedQueue {
                 items: [None; ENDED_CAPACITY],
                 len: 0,
             },
-            listener: ([0.0; 3], [0.0; 3]),
+            listener: ([0.0; 3], [0.0; 3], [0.0; 3]),
         }
     }
 
@@ -255,6 +293,7 @@ impl Mixer {
             MixerCommand::SetGroupVolume { group, volume } => {
                 self.group_gains[group_index(group)] = volume;
             }
+            MixerCommand::SetMonoOutput(mono) => self.mono_output = mono,
         }
     }
 
@@ -268,7 +307,13 @@ impl Mixer {
         if let Some(previous) = self.voices[lane].take() {
             self.push_ended(previous.id);
         }
-        let step = f64::from(clip.sample_rate) / f64::from(self.device_rate);
+        // Некорректный pitch не должен сделать шаг NaN: голос без конца. Вызовы его уже отклоняют.
+        let pitch = if request.pitch.is_finite() && request.pitch > 0.0 {
+            request.pitch
+        } else {
+            1.0
+        };
+        let step = f64::from(clip.sample_rate) / f64::from(self.device_rate) * f64::from(pitch);
         self.voices[lane] = Some(Voice {
             id,
             clip,
@@ -278,8 +323,12 @@ impl Mixer {
             group: request.group,
             volume: request.volume,
             distances: request.spatial,
+            spatial_blend: request.spatial_blend.clamp(0.0, 1.0),
+            rolloff: request.rolloff,
+            force_mono: request.force_mono,
             lane,
             gain: 0.0,
+            lowpass: [0.0; 2],
             fade: None,
             emitter: [0.0; 3],
         });
@@ -313,11 +362,15 @@ impl Mixer {
             let stereo = &mut scratch[..count * 2];
             self.render_block(stereo);
             for index in 0..count {
-                let (left, right) = (stereo[index * 2], stereo[index * 2 + 1]);
+                let (mut left, mut right) = (stereo[index * 2], stereo[index * 2 + 1]);
+                if self.mono_output || channels == 1 {
+                    left = (left + right) * 0.5;
+                    right = left;
+                }
                 let start = (done + index) * channels;
                 let frame = &mut out[start..start + channels];
                 if channels == 1 {
-                    frame[0] = sanitize((left + right) * 0.5);
+                    frame[0] = sanitize(left);
                 } else {
                     frame[0] = sanitize(left);
                     frame[1] = sanitize(right);
@@ -395,24 +448,36 @@ fn mix_voice(
     frames: usize,
     base_gain: f32,
     spatial: &Spatial,
-    listener: ([f32; 3], [f32; 3]),
+    listener: Listener,
 ) -> bool {
-    let (pan_left, pan_right, attenuation) = match voice.distances {
+    let gains = match voice.distances {
         Some(distances) => {
             if let Some(emitter) = spatial.emitter(voice.lane) {
                 voice.emitter = emitter;
             }
-            let (position, right) = listener;
-            let (left, right_gain, distance_gain) =
-                spatial_gains(voice.emitter, position, right, distances);
-            (left, right_gain, distance_gain)
+            spatial_gains(
+                voice.emitter,
+                listener,
+                distances,
+                voice.spatial_blend,
+                voice.rolloff,
+            )
         }
-        None => (1.0, 1.0, 1.0),
+        None => SpatialGains::FLAT,
     };
-    let target = base_gain * voice.volume * attenuation;
+    let target = base_gain * voice.volume * gains.attenuation;
     let start_gain = voice.gain;
     let channels = usize::from(voice.clip.channels);
     let frame_count = voice.clip.frames() as f64;
+    // Доля моно-сведения до панорамы: force_mono — полностью; пространственный голос — по
+    // spatial_blend, чтобы стерео плавно переходило в моно; 2D-голос сохраняет стерео.
+    let mono_mix = if voice.force_mono {
+        1.0
+    } else if voice.distances.is_some() {
+        voice.spatial_blend
+    } else {
+        0.0
+    };
     let mut finished = false;
 
     for index in 0..frames {
@@ -421,15 +486,15 @@ fn mix_voice(
         if let Some(fade) = voice.fade {
             gain *= fade.left as f32 / fade.total as f32;
         }
-        let (left, right) = sample(&voice.clip, channels, voice.position, voice.looping);
-        if voice.distances.is_some() {
-            let mono = (left + right) * 0.5;
-            stereo[index * 2] += mono * gain * pan_left;
-            stereo[index * 2 + 1] += mono * gain * pan_right;
-        } else {
-            stereo[index * 2] += left * gain;
-            stereo[index * 2 + 1] += right * gain;
-        }
+        let (source_left, source_right) =
+            sample(&voice.clip, channels, voice.position, voice.looping);
+        let mono = (source_left + source_right) * 0.5;
+        let mut left = source_left + (mono - source_left) * mono_mix;
+        let mut right = source_right + (mono - source_right) * mono_mix;
+        left = voice.lowpass_step(0, left, gains.lowpass);
+        right = voice.lowpass_step(1, right, gains.lowpass);
+        stereo[index * 2] += left * gain * gains.left;
+        stereo[index * 2 + 1] += right * gain * gains.right;
 
         voice.position += voice.step;
         if voice.position >= frame_count {
@@ -485,31 +550,111 @@ fn sample(clip: &Clip, channels: usize, position: f64, looping: bool) -> (f32, f
     }
 }
 
-/// Громкость по расстоянию и панорама: `(левый, правый, затухание)`.
+/// Множители голоса за блок: панорама по каналам, общее затухание и коэффициент low-pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SpatialGains {
+    left: f32,
+    right: f32,
+    attenuation: f32,
+    /// Коэффициент one-pole фильтра; `1` — без фильтрации.
+    lowpass: f32,
+}
+
+impl SpatialGains {
+    /// 2D-голос: без панорамы, затухания и фильтра.
+    const FLAT: Self = Self {
+        left: 1.0,
+        right: 1.0,
+        attenuation: 1.0,
+        lowpass: 1.0,
+    };
+}
+
+/// Панорама, затухание и фильтр по позиции излучателя. `blend` смешивает результат с 2D:
+/// `0` даёт [`SpatialGains::FLAT`], `1` — полностью пространственный звук.
 fn spatial_gains(
     emitter: [f32; 3],
-    listener: [f32; 3],
-    right: [f32; 3],
+    listener: Listener,
     distances: Distances,
-) -> (f32, f32, f32) {
+    blend: f32,
+    rolloff: Rolloff,
+) -> SpatialGains {
+    let (position, right, forward) = listener;
     let offset = [
-        emitter[0] - listener[0],
-        emitter[1] - listener[1],
-        emitter[2] - listener[2],
+        emitter[0] - position[0],
+        emitter[1] - position[1],
+        emitter[2] - position[2],
     ];
     let distance = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
-    let attenuation = attenuation(distance, distances);
-    if distance <= f32::EPSILON || distance.is_nan() {
-        return (
-            std::f32::consts::FRAC_1_SQRT_2,
-            std::f32::consts::FRAC_1_SQRT_2,
-            attenuation,
-        );
+    let curve = match rolloff {
+        Rolloff::Inverse => attenuation(distance, distances),
+        Rolloff::Linear => linear_attenuation(distance, distances),
+    };
+    let (pan_left, pan_right, attenuated, lowpass) =
+        if distance <= f32::EPSILON || distance.is_nan() {
+            (
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+                curve,
+                1.0,
+            )
+        } else {
+            let dot_right = dot(offset, right) / distance;
+            let angle = (dot_right.clamp(-1.0, 1.0) + 1.0) * FRAC_PI_4;
+            // Звук за спиной: `front < 0`. Сила эффекта растёт от 0 у бока до 1 позади.
+            let behind = (-dot(offset, forward) / distance).clamp(0.0, 1.0);
+            (
+                angle.cos(),
+                angle.sin(),
+                curve * (1.0 - BEHIND_ATTENUATION * behind),
+                1.0 - BEHIND_CUTOFF * behind,
+            )
+        };
+    let blend = if blend.is_finite() {
+        blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mix = |value: f32| 1.0 + (value - 1.0) * blend;
+    SpatialGains {
+        left: mix(pan_left),
+        right: mix(pan_right),
+        attenuation: mix(attenuated),
+        lowpass: mix(lowpass),
     }
-    let dot = (offset[0] * right[0] + offset[1] * right[1] + offset[2] * right[2]) / distance;
-    let x = dot.clamp(-1.0, 1.0);
-    let angle = (x + 1.0) * FRAC_PI_4;
-    (angle.cos(), angle.sin(), attenuation)
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Линейное затухание: 1 у `min`, 0 у `max`.
+pub fn linear_attenuation(distance: f32, distances: Distances) -> f32 {
+    if distance <= distances.min {
+        1.0
+    } else if distance >= distances.max {
+        0.0
+    } else {
+        (distances.max - distance) / (distances.max - distances.min)
+    }
+}
+
+impl Voice {
+    /// One-pole low-pass по каналу. `alpha >= 1` пропускает вход без изменений и держит состояние
+    /// равным входу, чтобы переход к фильтру не давал щелчка.
+    fn lowpass_step(&mut self, channel: usize, input: f32, alpha: f32) -> f32 {
+        let state = &mut self.lowpass[channel];
+        // Нечисловое состояние не восстанавливается само: NaN оставался бы в фильтре навсегда.
+        if !state.is_finite() {
+            *state = input;
+        }
+        if alpha >= 1.0 {
+            *state = input;
+        } else {
+            *state += alpha * (input - *state);
+        }
+        *state
+    }
 }
 
 /// `d ≤ min` → 1; `d ≥ max` → 0; между ними `(min/d)·(max−d)/(max−min)`.

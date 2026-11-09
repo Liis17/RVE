@@ -47,6 +47,23 @@ enum HostCapability {
     PhysicsOverlap,
     PhysicsRaycastAll,
     PhysicsShapeCast,
+    LightGet,
+    LightSet,
+    MeshGetVisible,
+    MeshSetVisible,
+    MeshSetMaterialParams,
+    MeshSetMaterialPath,
+    ParticlesGetPlaying,
+    ParticlesSetPlaying,
+    ParticlesCommand,
+    EnvironmentGet,
+    EnvironmentSet,
+    LodGet,
+    LodSet,
+    AudioGetSource,
+    AudioSetSource,
+    AudioPlayClipEx,
+    AudioSetVoicePosition,
 }
 
 // Add each script-facing capability to this shared inventory so Lua and ABI stay in parity.
@@ -121,6 +138,53 @@ const CAPABILITIES: &[(&str, &str, HostCapability)] = &[
     ("physics", "sphere_cast", HostCapability::PhysicsShapeCast),
     ("physics", "box_cast", HostCapability::PhysicsShapeCast),
     ("physics", "capsule_cast", HostCapability::PhysicsShapeCast),
+    ("object", "get_light", HostCapability::LightGet),
+    ("object", "set_light", HostCapability::LightSet),
+    ("object", "is_visible", HostCapability::MeshGetVisible),
+    ("object", "set_visible", HostCapability::MeshSetVisible),
+    (
+        "object",
+        "set_material_params",
+        HostCapability::MeshSetMaterialParams,
+    ),
+    (
+        "object",
+        "set_material",
+        HostCapability::MeshSetMaterialPath,
+    ),
+    (
+        "object",
+        "particles_is_playing",
+        HostCapability::ParticlesGetPlaying,
+    ),
+    (
+        "object",
+        "particles_play",
+        HostCapability::ParticlesSetPlaying,
+    ),
+    (
+        "object",
+        "particles_stop",
+        HostCapability::ParticlesSetPlaying,
+    ),
+    (
+        "object",
+        "particles_restart",
+        HostCapability::ParticlesCommand,
+    ),
+    ("object", "particles_emit", HostCapability::ParticlesCommand),
+    ("object", "get_environment", HostCapability::EnvironmentGet),
+    ("object", "set_environment", HostCapability::EnvironmentSet),
+    ("object", "get_lod", HostCapability::LodGet),
+    ("object", "set_lod_distances", HostCapability::LodSet),
+    ("object", "get_audio_source", HostCapability::AudioGetSource),
+    ("object", "set_audio_source", HostCapability::AudioSetSource),
+    ("audio", "play", HostCapability::AudioPlayClipEx),
+    (
+        "audio",
+        "set_voice_position",
+        HostCapability::AudioSetVoicePosition,
+    ),
 ];
 
 #[test]
@@ -169,6 +233,7 @@ path = "/api.lua"
             "object" => object.get(*name).unwrap(),
             "script" => script.get(*name).unwrap(),
             "physics" => rve.get::<Table>("physics").unwrap().get(*name).unwrap(),
+            "audio" => rve.get::<Table>("audio").unwrap().get(*name).unwrap(),
             _ => unreachable!(),
         };
         assert!(
@@ -216,6 +281,23 @@ path = "/api.lua"
             HostCapability::PhysicsOverlap => abi.physics_overlap.is_some(),
             HostCapability::PhysicsRaycastAll => abi.physics_raycast_all.is_some(),
             HostCapability::PhysicsShapeCast => abi.physics_shape_cast.is_some(),
+            HostCapability::LightGet => abi.light_get.is_some(),
+            HostCapability::LightSet => abi.light_set.is_some(),
+            HostCapability::MeshGetVisible => abi.mesh_get_visible.is_some(),
+            HostCapability::MeshSetVisible => abi.mesh_set_visible.is_some(),
+            HostCapability::MeshSetMaterialParams => abi.mesh_set_material_params.is_some(),
+            HostCapability::MeshSetMaterialPath => abi.mesh_set_material_path.is_some(),
+            HostCapability::ParticlesGetPlaying => abi.particles_get_playing.is_some(),
+            HostCapability::ParticlesSetPlaying => abi.particles_set_playing.is_some(),
+            HostCapability::ParticlesCommand => abi.particles_command.is_some(),
+            HostCapability::EnvironmentGet => abi.environment_get.is_some(),
+            HostCapability::EnvironmentSet => abi.environment_set.is_some(),
+            HostCapability::LodGet => abi.lod_get.is_some(),
+            HostCapability::LodSet => abi.lod_set.is_some(),
+            HostCapability::AudioGetSource => abi.audio_get_source.is_some(),
+            HostCapability::AudioSetSource => abi.audio_set_source.is_some(),
+            HostCapability::AudioPlayClipEx => abi.audio_play_clip_ex.is_some(),
+            HostCapability::AudioSetVoicePosition => abi.audio_set_voice_position.is_some(),
         };
         assert!(available, "ABI callback missing for {table}.{name}");
     }

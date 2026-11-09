@@ -6,7 +6,7 @@ use rve_sdk::abi::{
     RVE_PARAM_ENUM, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
     RVE_PARAM_OBJECT, RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule,
     RveParamDesc, RveParamDescV13, RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
-    RveScriptDescV15, RveScriptDescV16, RveStr, RveUiEventFn,
+    RveScriptDescV15, RveScriptDescV16, RveScriptDescV17, RveStr, RveUiEventFn,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -202,7 +202,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            17.. => std::mem::size_of::<RveScriptDesc>(),
+            19.. => std::mem::size_of::<RveScriptDesc>(),
+            17..=18 => std::mem::size_of::<RveScriptDescV17>(),
             16 => std::mem::size_of::<RveScriptDescV16>(),
             15 => {
                 std::mem::size_of::<RveScriptDescV15>()
@@ -235,8 +236,11 @@ impl ScriptLibrary {
         };
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v17 = (header.abi_version >= 17)
+        let descriptors_v19 = (header.abi_version >= 19)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
+        let descriptors_v17 = ((17..=18).contains(&header.abi_version)).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV17>(), count)
+        });
         let descriptors_v16 = (header.abi_version == 16).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV16>(), count)
         });
@@ -262,8 +266,27 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v17 {
+            let descriptor = if let Some(descriptors) = descriptors_v19 {
                 &descriptors[index]
+            } else if let Some(descriptors) = descriptors_v17 {
+                let descriptor = &descriptors[index];
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    ui_event: descriptor.ui_event,
+                    on_enable: descriptor.on_enable,
+                    on_disable: descriptor.on_disable,
+                }))
             } else if let Some(descriptors) = descriptors_v16 {
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {

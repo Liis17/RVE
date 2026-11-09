@@ -23,9 +23,16 @@ use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
+mod components;
 mod hierarchy;
 
+pub use components::{
+    MAX_PARTICLE_BURST, MeshMaterialParams, ParticleCommand, directional_light_problem,
+    environment_intensity_problem, lod_distances_problem, mesh_material_problem,
+    point_light_problem, procedural_sky_problem, spot_light_problem,
+};
 pub use hierarchy::ObjectEdit;
 
 /// Наибольшее поколение слота. Слот, поколение которого исчерпано, больше не переиспользуется.
@@ -248,6 +255,16 @@ pub struct WorldObject {
     pub ui_canvas: Option<UiCanvasComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
+    /// Runtime-состояние, которое меняют скрипты: не сохраняется в сцену и при загрузке равно
+    /// умолчанию (видимо, светит, эмиттер играет).
+    pub mesh_visible: bool,
+    pub light_enabled: bool,
+    pub particles_playing: bool,
+    /// Путь `.rvemat`, которым скрипт заменил материал всех частей меш-рендерера; `None` — материал
+    /// сцены.
+    pub mesh_material_path: Option<VirtualPath>,
+    /// Ревизия материала меш-рендерера: растёт при каждом изменении, которое надо загрузить в GPU.
+    pub mesh_material_revision: u64,
 }
 
 /// Параметры света для потребителя кадра.
@@ -310,6 +327,8 @@ pub struct MeshInstance {
 pub struct ParticleEmitterInstance {
     pub object: ObjectHandle,
     pub model: Mat4,
+    /// Рождаются ли новые частицы; `false` после `particles:stop()` (симуляция продолжается).
+    pub emitting: bool,
 }
 
 /// Данные мирового пространства для отрисовки одного кадра сцены.
@@ -368,6 +387,8 @@ pub struct SpawnOptions {
 pub struct World {
     source_label: String,
     asset_paths: Vec<VirtualPath>,
+    /// Material assets declared by each spawned prefab instance, shared by its objects.
+    spawned_material_paths: HashMap<ObjectHandle, Arc<[VirtualPath]>>,
     /// Слоты и поколения. Резервирование меняет их через `&self`.
     slots: RefCell<SlotTable>,
     objects: Vec<WorldObject>,
@@ -386,6 +407,8 @@ pub struct World {
     spawn_serial: u64,
     /// Объекты, у которых действующая активность изменилась; см. [`World::take_activity_changes`].
     activity_changes: Vec<ObjectHandle>,
+    /// Объекты, у которых сменились материалы меш-рендерера; см. [`World::take_mesh_material_changes`].
+    mesh_material_changes: HashSet<ObjectHandle>,
 }
 
 impl World {
@@ -474,6 +497,7 @@ impl World {
                 .iter()
                 .map(|asset| asset.path.clone())
                 .collect(),
+            spawned_material_paths: HashMap::new(),
             world_matrices,
             world_rotations,
             active_camera: objects[active_index].handle,
@@ -488,6 +512,7 @@ impl World {
             last_valid_environment: None,
             spawn_serial: 0,
             activity_changes: Vec::new(),
+            mesh_material_changes: HashSet::new(),
         };
         let _ = world.build_frame();
         Ok(world)
@@ -1015,11 +1040,9 @@ impl World {
         // Неактивный или отсутствующий направленный свет сбрасывает кэш: сцена не должна
         // освещаться последним светом, которого больше нет в кадре.
         let active = self.active_flags();
-        let directional_active = self
-            .objects
-            .iter()
-            .zip(&active)
-            .any(|(object, &active)| active && object.directional_light.is_some());
+        let directional_active = self.objects.iter().zip(&active).any(|(object, &active)| {
+            active && object.light_enabled && object.directional_light.is_some()
+        });
         if !directional_active {
             self.last_valid_light = LightState::default();
         }
@@ -1030,9 +1053,10 @@ impl World {
             let matrix = self.world_matrices[index];
             let camera_settings = (self.active_camera == self.objects[index].handle)
                 .then(|| self.objects[index].camera_settings.unwrap_or_default());
-            let light_settings = self.objects[index].directional_light.filter(|_| is_active);
-            let point_settings = self.objects[index].point_light.filter(|_| is_active);
-            let spot_settings = self.objects[index].spot_light.filter(|_| is_active);
+            let lights_on = is_active && self.objects[index].light_enabled;
+            let light_settings = self.objects[index].directional_light.filter(|_| lights_on);
+            let point_settings = self.objects[index].point_light.filter(|_| lights_on);
+            let spot_settings = self.objects[index].spot_light.filter(|_| lights_on);
             if let Some(settings) = camera_settings {
                 if let Some(value) = camera_from_matrix(matrix, settings) {
                     let state = (value, settings);
@@ -1102,7 +1126,9 @@ impl World {
             .objects
             .iter()
             .enumerate()
-            .filter(|(index, object)| active[*index] && object.mesh_renderer.is_some())
+            .filter(|(index, object)| {
+                active[*index] && object.mesh_renderer.is_some() && object.mesh_visible
+            })
             .map(|(index, object)| MeshInstance {
                 object: object.handle,
                 model: self.world_matrices[index],
@@ -1115,6 +1141,7 @@ impl World {
             .filter(|(index, object)| active[*index] && object.particle_emitter.is_some())
             .map(|(index, object)| ParticleEmitterInstance {
                 object: object.handle,
+                emitting: object.particles_playing,
                 model: self.world_matrices[index],
             })
             .collect();
@@ -1345,6 +1372,19 @@ impl World {
         ids: Vec<String>,
     ) {
         let base = self.objects.len();
+        let material_paths: Arc<[VirtualPath]> = template
+            .assets()
+            .iter()
+            .filter(|asset| {
+                asset
+                    .path
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .ends_with(".rvemat")
+            })
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>()
+            .into();
         let spawned_refs = template
             .objects
             .iter()
@@ -1360,6 +1400,8 @@ impl World {
             .collect::<HashMap<_, _>>();
         for (local, object) in template.objects.iter().enumerate() {
             let handle = reserved[local];
+            self.spawned_material_paths
+                .insert(handle, Arc::clone(&material_paths));
             let mut scene_object = object.clone();
             scene_object.id = ids[local].clone();
             remap_script_object_refs(&mut scene_object, &spawned_refs);
@@ -1456,6 +1498,9 @@ impl World {
             .filter(|&&index| removed[index])
             .map(|&index| self.objects[index].handle)
             .collect::<Vec<_>>();
+        for handle in &removed_handles {
+            self.spawned_material_paths.remove(handle);
+        }
         let mut new_index = vec![usize::MAX; removed.len()];
         let mut kept = 0;
         {
@@ -1592,6 +1637,11 @@ fn world_object(
         ui_canvas: object.ui_canvas.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
+        mesh_visible: true,
+        light_enabled: true,
+        particles_playing: true,
+        mesh_material_path: None,
+        mesh_material_revision: 0,
     }
 }
 

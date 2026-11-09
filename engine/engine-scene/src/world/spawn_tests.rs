@@ -89,6 +89,31 @@ fn spawn_appends_subtrees_and_despawn_removes_them_children_first() {
 }
 
 #[test]
+fn spawned_prefab_material_path_uses_its_declared_assets() {
+    let mut world = world(CAMERA_SCENE);
+    let material_prefab = template(
+        "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n",
+    );
+    let other_prefab = template(
+        "[[assets]]\npath = \"/models/other.fbx\"\n[[assets]]\npath = \"/materials/silver.rvemat\"\n[[objects]]\nid = \"other\"\n[objects.mesh_renderer]\nmodel = \"/models/other.fbx\"\n",
+    );
+    let crated = spawn(&mut world, &material_prefab, SpawnOptions::default()).unwrap()[0];
+    let other = spawn(&mut world, &other_prefab, SpawnOptions::default()).unwrap()[0];
+
+    let gold = VirtualPath::parse("/materials/gold.rvemat").unwrap();
+    let silver = VirtualPath::parse("/materials/silver.rvemat").unwrap();
+    world.set_mesh_material_path(crated, gold.clone()).unwrap();
+    world.set_active(crated, false).unwrap();
+    world.set_active(crated, true).unwrap();
+    assert_eq!(world.mesh_material_path(crated), Some(&gold));
+    assert!(world.set_mesh_material_path(crated, silver).is_err());
+
+    world.despawn_many(&[crated]).unwrap();
+    assert!(world.set_mesh_material_path(crated, gold).is_err());
+    assert!(world.is_alive(other));
+}
+
+#[test]
 fn stale_handle_stays_dead_after_its_slot_is_reused() {
     let mut world = world(CAMERA_SCENE);
     let lone = template(LONE);

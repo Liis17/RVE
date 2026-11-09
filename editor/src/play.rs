@@ -581,10 +581,11 @@ pub struct PlaySession {
     /// Rumble requests of the last update. They play at the next `poll_gamepads` while pads are
     /// accepted, so the editor delivers them the same way the runtime does.
     rumble: Vec<RumbleRequest>,
+    /// Команды эмиттеров частиц, поставленные скриптами с прошлого забора; забирает viewport.
+    particle_commands: Vec<engine_scene::world::ParticleCommand>,
     heavy: HeavyLoads,
     last_step: PlayStep,
-    /// Ошибки, которые не относятся к скриптам и ждут `drain_events`: например, отказ физики
-    /// при создании тела активированного объекта.
+    /// Errors not associated with scripts wait for drain_events, such as physics rejecting a body.
     pending_events: Vec<ScriptEvent>,
     ui_input: UiInputBridge,
     ui_text_focus: Arc<AtomicBool>,
@@ -840,6 +841,7 @@ impl PlaySession {
             input: ScriptInput::default(),
             pad_gate: PadGate::default(),
             rumble: Vec::new(),
+            particle_commands: Vec::new(),
             heavy: HeavyLoads::new(resources),
         })
     }
@@ -1050,6 +1052,8 @@ impl PlaySession {
             world_changes,
             prefab_replies,
         };
+        self.particle_commands
+            .extend(self.host.drain_particle_commands());
         if let Some(audio) = &mut self.audio {
             audio
                 .bridge
@@ -1306,6 +1310,20 @@ impl PlaySession {
         let mut events = std::mem::take(&mut self.pending_events);
         events.extend(self.host.drain_events());
         events
+    }
+
+    /// Забирает команды эмиттеров частиц, накопленные со времени прошлого забора.
+    pub fn take_particle_commands(&mut self) -> Vec<engine_scene::world::ParticleCommand> {
+        std::mem::take(&mut self.particle_commands)
+    }
+
+    /// Возвращает забранные, но не применённые кадром команды: они идут перед накопленными.
+    pub fn restore_particle_commands(
+        &mut self,
+        commands: Vec<engine_scene::world::ParticleCommand>,
+    ) {
+        let newer = std::mem::replace(&mut self.particle_commands, commands);
+        self.particle_commands.extend(newer);
     }
 
     /// Предупреждения звука, которые ещё не показаны: клип не загрузился, устройство недоступно.
@@ -2232,6 +2250,7 @@ spatial = true
         let audio = AudioConfig {
             resources: Some(resources.handle()),
             output: false,
+            mono_output: false,
         };
         let mut session = PlaySession::start_with_world_limit(
             &scene,

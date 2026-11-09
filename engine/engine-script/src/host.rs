@@ -207,6 +207,7 @@ pub struct ScriptHost {
     queued_bytes: usize,
     audio_requests: Vec<AudioRequest>,
     animation_requests: Vec<AnimationRequest>,
+    particle_requests: Vec<engine_scene::world::ParticleCommand>,
     rumble_requests: Vec<RumbleRequest>,
     delivery_messages: Vec<PendingMessage>,
     lua_time: Table,
@@ -445,6 +446,7 @@ impl ScriptHost {
             queued_bytes: 0,
             audio_requests: Vec::new(),
             animation_requests: Vec::new(),
+            particle_requests: Vec::new(),
             rumble_requests: Vec::new(),
             delivery_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             lua_time: lua_state.time,
@@ -1003,6 +1005,10 @@ impl ScriptHost {
     }
 
     /// Takes animator requests committed by scripts since the previous drain, in commit order.
+    pub fn drain_particle_commands(&mut self) -> Vec<engine_scene::world::ParticleCommand> {
+        std::mem::take(&mut self.particle_requests)
+    }
+
     pub fn drain_animation_requests(&mut self) -> Vec<AnimationRequest> {
         std::mem::take(&mut self.animation_requests)
     }
@@ -1400,6 +1406,7 @@ impl ScriptHost {
             &mut self.animation_requests,
             &mut self.net_requests,
             &mut self.rumble_requests,
+            &mut self.particle_requests,
         ) {
             Ok(mutations) => {
                 self.cursor = self.transaction.cursor();
@@ -2095,6 +2102,7 @@ impl ScriptHost {
             queued_bytes,
             audio_requests,
             animation_requests,
+            particle_requests,
             rumble_requests,
             lua,
             interrupt,
@@ -2335,6 +2343,7 @@ impl ScriptHost {
                 animation_requests,
                 net_requests,
                 rumble_requests,
+                particle_requests,
             )
         } {
             Ok(mutations) => {
@@ -3279,6 +3288,8 @@ fn event_source(scene_name: &str, object_id: &str, script_name: &str) -> String 
 mod animation_tests;
 #[cfg(test)]
 mod audio_tests;
+#[cfg(test)]
+mod component_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

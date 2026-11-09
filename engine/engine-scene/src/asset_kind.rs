@@ -93,7 +93,7 @@ mod tests {
     use super::AssetKind;
 
     #[test]
-    fn ui_assets_are_a_supported_typed_asset_kind() {
+    fn ui_assets_are_classified_and_round_trip_by_name() {
         assert_eq!(AssetKind::of("ui/hud.RVEUI"), AssetKind::Ui);
         assert_eq!(AssetKind::parse("ui"), Some(AssetKind::Ui));
         assert_eq!(AssetKind::Ui.name(), "ui");

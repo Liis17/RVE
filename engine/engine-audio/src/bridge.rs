@@ -3,9 +3,9 @@
 //! Используется и runtime, и редактором в Play-режиме. Мир передаётся по ссылке в каждый вызов;
 //! объектный id бридж хранит как [`ObjectHandle`], поэтому после замены мира его нужно создать заново.
 
-use crate::{AudioError, AudioEvent, AudioHandle, Distances, PlayRequest};
+use crate::{AudioError, AudioEvent, AudioHandle, Distances, PlayRequest, Rolloff};
 use engine_scene::world::ObjectHandle;
-use engine_scene::{AudioRequest, AudioSourceComponent, VoiceId, World};
+use engine_scene::{AudioRequest, AudioRolloff, AudioSourceComponent, ClipParams, VoiceId, World};
 use std::collections::{HashMap, HashSet};
 
 /// Расстояния клипов скриптов, запущенных с позицией.
@@ -28,6 +28,8 @@ pub struct AudioBridge {
     rejected: Vec<String>,
     /// Пути вне `[[assets]]`, о которых уже предупреждали: предупреждение один раз на путь.
     undeclared_warned: HashSet<String>,
+    /// Голоса скриптов, излучатель которых ведёт объект сцены (`follow`).
+    followers: HashMap<VoiceId, ObjectHandle>,
     /// Предупреждения для владельца моста (редактор показывает их в журнале). Копятся до
     /// `WARNING_LIMIT`, сверх лимита отбрасываются.
     warnings: Vec<String>,
@@ -46,6 +48,7 @@ impl AudioBridge {
             emitters: HashMap::new(),
             rejected: Vec::new(),
             undeclared_warned: HashSet::new(),
+            followers: HashMap::new(),
             warnings: Vec::new(),
         }
     }
@@ -122,22 +125,16 @@ impl AudioBridge {
                             path.as_str()
                         );
                     }
-                    let request = PlayRequest {
-                        group: params.group,
-                        volume: params.volume,
-                        looping: params.looping,
-                        spatial: params.position.map(|_| SCRIPT_DISTANCES),
-                    };
-                    let result = match params.position {
-                        Some(position) => {
-                            self.handle.play_at(voice, path.as_str(), request, position)
-                        }
-                        None => self.handle.play(voice, path.as_str(), request),
-                    };
-                    self.note(result, &format!("воспроизведение /{}", path.as_str()));
+                    self.play_clip(voice, path.as_str(), params, world);
                 }
                 AudioRequest::StopVoice { voice } => {
+                    self.followers.remove(&voice);
                     self.stop_voice(voice, "остановка голоса");
+                }
+                AudioRequest::SetVoicePosition { voice, position } => {
+                    // Явная позиция отменяет слежение за объектом.
+                    self.followers.remove(&voice);
+                    self.handle.set_emitter(voice, position);
                 }
                 AudioRequest::SetGroupVolume { group, volume } => {
                     let result = self.handle.set_group_volume(group, volume);
@@ -146,6 +143,45 @@ impl AudioBridge {
             }
         }
         self.flush_rejected();
+    }
+
+    /// Запускает клип скрипта. Без позиции и `follow` клип 2D; с ними он пространственный, если
+    /// `spatial_blend` больше нуля. Клип на неактивном или удалённом `follow` не запускается.
+    fn play_clip(&mut self, voice: VoiceId, path: &str, params: ClipParams, world: &World) {
+        let follow_position = match params.follow {
+            Some(object) => {
+                if !world.is_alive(object) || world.active_in_hierarchy(object) != Some(true) {
+                    return;
+                }
+                world_position(world, object)
+            }
+            None => None,
+        };
+        let position = params.position.or(follow_position);
+        let spatial = (position.is_some() && params.spatial_blend > 0.0).then_some(Distances {
+            min: params.min_distance,
+            max: params.max_distance,
+        });
+        let request = PlayRequest {
+            group: params.group,
+            volume: params.volume,
+            looping: params.looping,
+            spatial,
+            spatial_blend: params.spatial_blend,
+            rolloff: Rolloff::Inverse,
+            pitch: 1.0,
+            force_mono: params.force_mono,
+        };
+        let result = match position {
+            Some(position) => self.handle.play_at(voice, path, request, position),
+            None => self.handle.play(voice, path, request),
+        };
+        if result.is_ok()
+            && let Some(object) = params.follow
+        {
+            self.followers.insert(voice, object);
+        }
+        self.note(result, &format!("воспроизведение /{path}"));
     }
 
     fn play_source(&mut self, object: ObjectHandle, voice: VoiceId, world: &World) {
@@ -168,12 +204,7 @@ impl AudioBridge {
             self.sources.remove(&object);
         }
         let volume = self.volumes.get(&object).copied().unwrap_or(audio.volume);
-        let request = PlayRequest {
-            group: audio.group,
-            volume,
-            looping: audio.looping,
-            spatial: spatial_distances(audio),
-        };
+        let request = source_request(audio, volume);
         let result = match source_position(world, object, audio) {
             Some(position) => self
                 .handle
@@ -237,10 +268,29 @@ impl AudioBridge {
         if let Some(camera) = world.world_matrix(world.active_camera()) {
             let position = camera.w_axis.truncate();
             let right = camera.x_axis.truncate().normalize_or_zero();
-            if position.is_finite() && right.is_finite() && right.length_squared() > 0.0 {
+            // Камера смотрит вдоль -Z своей системы координат.
+            let forward = -camera.z_axis.truncate().normalize_or_zero();
+            if position.is_finite()
+                && right.is_finite()
+                && right.length_squared() > 0.0
+                && forward.length_squared() > 0.0
+            {
                 self.handle
-                    .set_listener(position.to_array(), right.to_array());
+                    .set_listener(position.to_array(), right.to_array(), forward.to_array());
             }
+        }
+
+        let mut lost = Vec::new();
+        for (&voice, &object) in &self.followers {
+            let alive = world.is_alive(object) && world.active_in_hierarchy(object) == Some(true);
+            match world_position(world, object) {
+                Some(position) if alive => self.handle.set_emitter(voice, position),
+                _ => lost.push(voice),
+            }
+        }
+        for voice in lost {
+            self.followers.remove(&voice);
+            self.stop_voice(voice, "остановка слежения за объектом");
         }
 
         let mut stale = Vec::new();
@@ -249,7 +299,7 @@ impl AudioBridge {
                 stale.push(object);
                 continue;
             };
-            if !audio.spatial {
+            if audio.spatial_blend <= 0.0 {
                 continue;
             }
             match world.world_matrix(object) {
@@ -285,6 +335,7 @@ impl AudioBridge {
             match event {
                 AudioEvent::VoiceEnded(voice) => {
                     self.sources.retain(|_, current| *current != voice);
+                    self.followers.remove(&voice);
                 }
                 // Поток звука уже записал ошибку в лог; здесь её только сохраняем для владельца.
                 AudioEvent::Failed(message) => self.keep_warning(message),
@@ -300,15 +351,37 @@ fn source_position(
     object: ObjectHandle,
     audio: &AudioSourceComponent,
 ) -> Option<[f32; 3]> {
-    if !audio.spatial {
+    if audio.spatial_blend <= 0.0 {
         return None;
     }
+    world_position(world, object)
+}
+
+/// Позиция объекта по последней мировой матрице; `None`, если матрицы нет или она не конечна.
+fn world_position(world: &World, object: ObjectHandle) -> Option<[f32; 3]> {
     let position = world.world_matrix(object)?.w_axis.truncate();
     position.is_finite().then(|| position.to_array())
 }
 
+/// Параметры голоса источника. `spatial_blend` 0 даёт 2D-голос без дистанций.
+fn source_request(audio: &AudioSourceComponent, volume: f32) -> PlayRequest {
+    PlayRequest {
+        group: audio.group,
+        volume,
+        looping: audio.looping,
+        spatial: spatial_distances(audio),
+        spatial_blend: audio.spatial_blend,
+        rolloff: match audio.rolloff {
+            AudioRolloff::Inverse => Rolloff::Inverse,
+            AudioRolloff::Linear => Rolloff::Linear,
+        },
+        pitch: audio.pitch,
+        force_mono: audio.force_mono,
+    }
+}
+
 fn spatial_distances(audio: &AudioSourceComponent) -> Option<Distances> {
-    audio.spatial.then_some(Distances {
+    (audio.spatial_blend > 0.0).then_some(Distances {
         min: audio.min_distance,
         max: audio.max_distance,
     })

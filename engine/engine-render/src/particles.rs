@@ -446,6 +446,15 @@ pub struct ParticleEmitterState {
     batches: VecDeque<ParticleBatch>,
     time: f64,
     rate_remainder: f64,
+    /// Ручной выброс, ожидающий следующего шага; рождается даже при выключенной эмиссии.
+    queued_burst: u32,
+}
+
+impl ParticleEmitterState {
+    /// Ставит одноразовый выброс `count` частиц на следующий шаг симуляции.
+    pub fn queue_burst(&mut self, count: u32) {
+        self.queued_burst = self.queued_burst.saturating_add(count);
+    }
 }
 
 impl ParticleEmitterState {
@@ -499,6 +508,21 @@ impl ParticleEmitterState {
             next.retire(start);
             let mut available = input.capacity.saturating_sub(next.occupied());
             let retire_time = end + f64::from(input.lifetime_max);
+
+            // Ручной выброс берётся в любом случае; не умещающийся в буфер выброс отбрасывается.
+            let manual = std::mem::take(&mut next.queued_burst);
+            let accepted = manual.min(available);
+            if accepted > 0 {
+                spawns.push(next.push_batch(
+                    input.capacity,
+                    accepted,
+                    PreAge::Fixed(0.0),
+                    input.origin,
+                    retire_time,
+                    input.motion_margin,
+                ));
+                available -= accepted;
+            }
 
             if input.emitting {
                 for (time, count) in
@@ -1003,6 +1027,34 @@ mod tests {
             motion_margin: 0.0,
             step: 0.1,
         }
+    }
+
+    #[test]
+    fn queued_burst_spawns_once_and_ignores_the_emitting_flag() {
+        let mut state = ParticleEmitterState::default();
+        state.queue_burst(3);
+        let mut input = step_input(&[]);
+        input.emitting = false;
+        let plan = commit(&mut state, &input);
+        assert_eq!(plan.spawns.iter().map(|spawn| spawn.count).sum::<u32>(), 3);
+        let again = commit(&mut state, &input);
+        assert!(again.spawns.is_empty(), "выброс берётся один раз");
+    }
+
+    #[test]
+    fn queued_burst_waits_for_a_simulation_step_and_is_clamped_by_capacity() {
+        let mut state = ParticleEmitterState::default();
+        state.queue_burst(20);
+        let mut input = step_input(&[]);
+        input.capacity = 8;
+        input.step = 0.0;
+        assert!(
+            commit(&mut state, &input).spawns.is_empty(),
+            "без шага выброс ждёт"
+        );
+        input.step = 0.1;
+        let plan = commit(&mut state, &input);
+        assert_eq!(plan.spawns.iter().map(|spawn| spawn.count).sum::<u32>(), 8);
     }
 
     fn commit(state: &mut ParticleEmitterState, input: &StepInput<'_>) -> ParticleStepPlan {

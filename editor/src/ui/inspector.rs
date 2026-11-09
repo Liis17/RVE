@@ -10,12 +10,12 @@ use engine_files::VirtualPath;
 use engine_scene::ComponentKind as ScriptComponentKind;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    AntiAliasing, AudioGroup, AudioSourceComponent, CameraComponent, CharacterControllerComponent,
-    ColliderComponent, ColliderShape, EnvironmentComponent, HeavyScript, LAYER_COUNT, LodGroup,
-    LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, NetAuthority, NetworkIdentityComponent,
-    NetworkTransformComponent, ParamKind, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
-    ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform,
-    SpotLightComponent,
+    AntiAliasing, AudioGroup, AudioRolloff, AudioSourceComponent, CameraComponent,
+    CharacterControllerComponent, ColliderComponent, ColliderShape, EnvironmentComponent,
+    HeavyScript, LAYER_COUNT, LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, NetAuthority,
+    NetworkIdentityComponent, NetworkTransformComponent, ParamKind, ParamSchema, ParamSpec,
+    ParamValue, PointLightComponent, ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind,
+    SceneObject, SceneTransform, SpotLightComponent,
 };
 use std::collections::BTreeMap;
 
@@ -1752,8 +1752,36 @@ fn show_audio_source(
                     ui.label("Play on start");
                     let play_on_start = ui.checkbox(&mut value.play_on_start, "");
                     ui.end_row();
-                    ui.label("Spatial");
-                    let spatial = ui.checkbox(&mut value.spatial, "");
+                    ui.label("Spatial blend");
+                    let spatial = ui.add(
+                        egui::DragValue::new(&mut value.spatial_blend)
+                            .speed(0.01)
+                            .range(0.0..=1.0),
+                    );
+                    ui.end_row();
+                    ui.label("Rolloff");
+                    let rolloff = egui::ComboBox::from_id_salt(("audio_rolloff", id))
+                        .selected_text(audio_rolloff_label(value.rolloff))
+                        .show_ui(ui, |ui| {
+                            for option in [AudioRolloff::Inverse, AudioRolloff::Linear] {
+                                ui.selectable_value(
+                                    &mut value.rolloff,
+                                    option,
+                                    audio_rolloff_label(option),
+                                );
+                            }
+                        })
+                        .response;
+                    ui.end_row();
+                    ui.label("Pitch");
+                    let pitch = ui.add(
+                        egui::DragValue::new(&mut value.pitch)
+                            .speed(0.01)
+                            .range(0.01..=engine_scene::MAX_AUDIO_PITCH),
+                    );
+                    ui.end_row();
+                    ui.label("Force mono");
+                    let force_mono = ui.checkbox(&mut value.force_mono, "");
                     ui.end_row();
                     ui.label("Min distance");
                     let min = ui.add(
@@ -1769,7 +1797,16 @@ fn show_audio_source(
                             .range(f32::MIN_POSITIVE..=f32::MAX),
                     );
                     ui.end_row();
-                    let response = group | volume | looping | play_on_start | spatial | min | max;
+                    let response = group
+                        | volume
+                        | looping
+                        | play_on_start
+                        | spatial
+                        | rolloff
+                        | pitch
+                        | force_mono
+                        | min
+                        | max;
                     commit(state, id, "audio_source", &response, |object| {
                         object.audio_source = Some(value.clone());
                     });
@@ -2309,6 +2346,13 @@ fn audio_group_label(group: AudioGroup) -> &'static str {
         AudioGroup::Music => "Music",
         AudioGroup::Effects => "Effects",
         AudioGroup::Ambient => "Ambient",
+    }
+}
+
+fn audio_rolloff_label(rolloff: AudioRolloff) -> &'static str {
+    match rolloff {
+        AudioRolloff::Inverse => "Inverse",
+        AudioRolloff::Linear => "Linear",
     }
 }
 

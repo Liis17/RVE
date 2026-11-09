@@ -1,3 +1,5 @@
+mod components;
+
 use crate::abi_string::read_abi_str;
 use crate::actions::ActionMutation;
 use crate::lifecycle::{ObjectState, PrefabRequest, PrefabStatus, SpawnArgs};
@@ -342,6 +344,23 @@ impl<'a> AbiCallContext<'a> {
                 .transaction
                 .physics_attached()
                 .then_some(host_physics_raycast_all),
+            light_get: Some(components::host_light_get),
+            light_set: Some(components::host_light_set),
+            mesh_get_visible: Some(components::host_mesh_get_visible),
+            mesh_set_visible: Some(components::host_mesh_set_visible),
+            mesh_set_material_params: Some(components::host_mesh_set_material_params),
+            mesh_set_material_path: Some(components::host_mesh_set_material_path),
+            particles_get_playing: Some(components::host_particles_get_playing),
+            particles_set_playing: Some(components::host_particles_set_playing),
+            particles_command: Some(components::host_particles_command),
+            environment_get: Some(components::host_environment_get),
+            environment_set: Some(components::host_environment_set),
+            lod_get: Some(components::host_lod_get),
+            lod_set: Some(components::host_lod_set),
+            audio_get_source: Some(components::host_audio_get_source),
+            audio_set_source: Some(components::host_audio_set_source),
+            audio_play_clip_ex: Some(components::host_audio_play_clip_ex),
+            audio_set_voice_position: Some(components::host_audio_set_voice_position),
             physics_shape_cast: self
                 .transaction
                 .physics_attached()
@@ -1511,6 +1530,7 @@ fn clip_params(params: &RveAudioParams) -> Result<ClipParams, String> {
         volume: audio_volume(params.volume)?,
         looping: params.looping,
         position,
+        ..ClipParams::default()
     })
 }
 
@@ -4616,6 +4636,9 @@ impl OwnedAbiParams {
 }
 
 #[cfg(test)]
+mod component_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{ScriptCursor, ScriptEventLevel, ScriptInput};
@@ -5244,6 +5267,7 @@ mod tests {
                 &mut queued_bytes,
                 &events,
                 &mut audio,
+                &mut Vec::new(),
                 &mut Vec::new(),
                 &mut Vec::new(),
                 &mut Vec::new(),

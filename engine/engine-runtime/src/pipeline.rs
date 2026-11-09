@@ -8,15 +8,19 @@ use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use crate::net::{self, NetworkSession, ScriptNetwork};
 use crate::prefabs::{
-    LoadedPrefab, LoaderRequest, PREFAB_UPLOAD_BUDGET, ParticleRequest, PrefabCpu, PrefabGpu,
-    PrefabLoads, PrefabReady, PrefabReply, PrefabToken, RenderResourceRequest,
+    LoadedPrefab, LoaderRequest, MaterialLevels, MaterialReply, MaterialRequest,
+    PREFAB_UPLOAD_BUDGET, ParticleRequest, PrefabCpu, PrefabGpu, PrefabLoads, PrefabReady,
+    PrefabReply, PrefabToken, RenderResourceRequest,
 };
 use crate::profiling::{
     PhaseWindow, SOURCE_RENDER, SOURCE_RESOURCES, SOURCE_SCRIPTS, SOURCE_STARTUP,
     log_startup_profile, record_frame_profile, record_update_profile, render_groups, render_phase,
     script_phase, scripts_groups,
 };
-use crate::scene::{ParticleSource, PreparedPrefabs, particle_emitter_desc};
+use crate::scene::{
+    MaterialAssetView, MaterialUploadCaches, ObjectModel, ParticleSource, PreparedMaterialAssets,
+    PreparedPrefabs, PreparedRenderAssets, particle_emitter_desc, upload_object_levels,
+};
 use engine_animation::{AnimationBridge, AnimationEvent};
 use engine_assets::{Model, ModelAnimation, TextureData};
 #[cfg(feature = "dev-console")]
@@ -45,6 +49,7 @@ use engine_scene::camera::Camera;
 use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
 };
+use engine_scene::world::ParticleCommand;
 use engine_scene::{
     AntiAliasing, AudioRequest, CameraSettings, EnvironmentState, LightState, LocalLightState,
     ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
@@ -61,7 +66,7 @@ use engine_ui::render::UiBridge;
 use flume::{Receiver, RecvTimeoutError, Selector, Sender, TryRecvError};
 use glam::{Mat3, Vec3};
 use std::collections::VecDeque;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -96,6 +101,8 @@ pub(crate) struct FrameSnapshot {
     /// Палитры skinning кадра; draw ссылается на них по индексу в `SkinBinding::palette`.
     pub joint_palettes: Vec<Vec<[[f32; 4]; 4]>>,
     pub particles: Vec<ParticleSnapshot>,
+    /// Команды эмиттеров, поставленные скриптами за кадр: перезапуск и выброс.
+    pub particle_commands: Vec<engine_scene::world::ParticleCommand>,
     /// Игровое время скриптового потока на момент снимка; основа шага симуляции частиц.
     pub sim_time: f64,
     /// Игровой UI кадра: draw list и атлас, как их выдал `engine-gui` на этом тике.
@@ -140,6 +147,8 @@ pub(crate) enum EnvironmentCacheKey {
 pub(crate) struct ParticleSnapshot {
     pub object: ObjectHandle,
     pub transform: [[f32; 4]; 4],
+    /// Рождаются ли частицы в этом кадре (`particles:play`/`stop` из скриптов).
+    pub emitting: bool,
 }
 
 /// Уровни LOD объекта: каждый уровень — список пар «меш и материал».
@@ -148,6 +157,13 @@ type GpuLevels = Vec<Vec<(MeshId, MaterialId)>>;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, GpuLevels>,
+    /// CPU material sources for scene objects and objects spawned from prefab templates.
+    pub material_sources: HashMap<ObjectHandle, ObjectModel>,
+    /// CPU material sources by object index for fast and loaded heavy prefabs.
+    pub material_templates: HashMap<String, Vec<Option<ObjectModel>>>,
+    /// Current heavy load generation by path and by spawned object.
+    pub prefab_tokens: HashMap<String, PrefabToken>,
+    pub material_tokens: HashMap<ObjectHandle, PrefabToken>,
     /// Уровни шаблонов быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub prefabs: HashMap<String, Vec<GpuLevels>>,
     /// Эмиттеры частиц объектов сцены; создаются при загрузке и передаются render thread.
@@ -210,6 +226,12 @@ impl std::fmt::Debug for dyn FrameLatency {
     }
 }
 
+/// Ответ render thread, который scripts thread принимает в очередь ответов до `update`.
+pub(crate) enum ScriptReply {
+    Prefab(PrefabReply),
+    Material(Box<MaterialReply>),
+}
+
 #[derive(Debug)]
 pub(crate) enum ScriptControl {
     /// Reflex-handle renderer; приходит один раз перед первым `Go`.
@@ -220,6 +242,8 @@ pub(crate) enum ScriptControl {
     Console(CommandLine),
     /// Ответ загрузчика или render thread на загрузку тяжёлого префаба.
     Prefab(PrefabReply),
+    /// Ответ render thread на замену материала объекта скриптом.
+    Material(Box<MaterialReply>),
     Shutdown,
 }
 
@@ -362,6 +386,19 @@ pub(crate) trait RenderBackend: Send {
     fn release_prefab(&mut self, token: &PrefabToken);
     /// Применяет заявку эмиттера частиц; у тестовых backend эмиттеров нет.
     fn apply_particle_request(&mut self, _request: ParticleRequest) {}
+    /// Применяет команды частиц перед отрисовкой кадра. Вызывается render thread ровно один раз
+    /// для каждой команды, даже если тот же снимок перерисовывается.
+    fn apply_particle_commands(&mut self, _commands: &[engine_scene::world::ParticleCommand]) {}
+    /// Создаёт GPU-материалы объекта по заявке скрипта. Без GPU-ресурсов сцены отвечает ошибкой.
+    fn submit_material(&mut self, request: MaterialRequest) -> MaterialReply {
+        MaterialReply {
+            object: request.object,
+            revision: request.revision,
+            result: Err("замена материала не поддерживается этим backend".to_owned()),
+        }
+    }
+    /// Уничтожает материалы, которыми уже не пользуются снимки; вызывается после их `last_seq`.
+    fn release_materials(&mut self, _materials: &[MaterialId]) {}
 }
 
 pub(crate) trait ExitRequester: Send + Sync {
@@ -475,6 +512,12 @@ pub(crate) struct VulkanBackend {
     /// GPU-ресурсы игрового UI: атлас, картинки по пути и буфер вершин.
     game_ui: GameUi,
     scene_screen_shaders: Vec<engine_render::ScreenShaderId>,
+    /// Подготовленные ресурсы сцены для замены материалов объектов; нет у тестовых сцен без GPU.
+    material_assets: Option<Arc<PreparedRenderAssets>>,
+    /// CPU material sources for heavy prefabs, retained until that token's delayed release.
+    prefab_material_assets: HashMap<PrefabToken, Arc<PreparedMaterialAssets>>,
+    /// Текстуры, шейдеры и запасной материал сцены, которые переиспользуют замены материалов.
+    material_caches: MaterialUploadCaches,
 }
 
 #[cfg(feature = "dev-console")]
@@ -506,6 +549,89 @@ impl VulkanBackend {
             scene_skin_instances: Vec::new(),
             game_ui: GameUi::default(),
             scene_screen_shaders: Vec::new(),
+            material_assets: None,
+            prefab_material_assets: HashMap::new(),
+            material_caches: MaterialUploadCaches::default(),
+        }
+    }
+
+    /// Передаёт ресурсы сцены и GPU-кэши, которые остались после загрузки: по ним создаются
+    /// материалы при замене скриптом.
+    pub fn with_material_uploads(
+        mut self,
+        assets: Arc<PreparedRenderAssets>,
+        mut caches: MaterialUploadCaches,
+    ) -> Self {
+        caches.pin_scene_resources();
+        self.material_assets = Some(assets);
+        self.material_caches = caches;
+        self
+    }
+
+    /// Создаёт материалы объекта по текущему состоянию мира. Меши и уровни LOD не меняются; новые
+    /// материалы принадлежат только этому ответу, и при ошибке созданные уничтожаются.
+    fn upload_object_materials(
+        &mut self,
+        request: MaterialRequest,
+    ) -> Result<MaterialLevels, String> {
+        let MaterialRequest {
+            levels,
+            model,
+            prefab_token,
+            ..
+        } = request;
+        let assets = match prefab_token.as_ref() {
+            Some(token) => MaterialAssetView::from_prefab(
+                self.prefab_material_assets
+                    .get(token)
+                    .ok_or("CPU-ресурсы токена префаба уже освобождены")?,
+                self.material_assets.as_deref(),
+            ),
+            None => MaterialAssetView::from_scene(
+                self.material_assets
+                    .as_deref()
+                    .ok_or("ресурсы сцены не переданы render thread")?,
+            ),
+        };
+        let gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = model
+            .levels
+            .iter()
+            .zip(&levels)
+            .map(|((model_path, _), meshes)| (model_path.clone(), meshes.clone()))
+            .collect();
+        let mut material_cache = HashMap::new();
+        let mut material_dependencies = HashMap::new();
+        let uploaded = upload_object_levels(
+            &mut self.renderer,
+            assets,
+            &gpu_models,
+            &mut self.material_caches.textures,
+            &mut self.material_caches.shaders,
+            &mut material_cache,
+            &mut self.material_caches.error_material,
+            Some(&mut material_dependencies),
+            &model,
+        );
+        let created: Vec<MaterialId> = material_cache.into_values().collect();
+        match uploaded {
+            Ok(levels) => {
+                self.material_caches.retain_materials(material_dependencies);
+                self.material_caches.prune_unowned(&mut self.renderer);
+                Ok(MaterialLevels { levels, created })
+            }
+            Err(error) => {
+                self.destroy_materials(&created);
+                self.material_caches.prune_unowned(&mut self.renderer);
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn destroy_materials(&mut self, materials: &[MaterialId]) {
+        for &material in materials {
+            if let Err(error) = self.renderer.destroy_material(material) {
+                log::error!("материал не уничтожен: {error}");
+            }
         }
     }
 
@@ -619,6 +745,7 @@ impl RenderBackend for VulkanBackend {
 
     fn submit_prefab(&mut self, mut prefab: LoadedPrefab) -> Option<PrefabReply> {
         let token = prefab.token.clone();
+        let material_assets = Arc::clone(&prefab.material_assets);
         if let Err(error) =
             self.game_ui
                 .attach(&mut self.renderer, token.clone(), &prefab.cpu.ui.images)
@@ -629,23 +756,27 @@ impl RenderBackend for VulkanBackend {
             });
         }
         let particles = std::mem::take(&mut prefab.particles);
-        let created =
-            match create_prefab_particles(&mut self.renderer, &prefab.textures, &particles) {
-                Ok(created) => created,
-                Err(error) => {
-                    self.game_ui.detach(&mut self.renderer, &token);
-                    return Some(PrefabReply::Failed {
-                        token,
-                        error: error.to_string(),
-                    });
-                }
-            };
+        let created = match create_prefab_particles(
+            &mut self.renderer,
+            &prefab.material_assets.textures,
+            &particles,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                self.game_ui.detach(&mut self.renderer, &token);
+                return Some(PrefabReply::Failed {
+                    token,
+                    error: error.to_string(),
+                });
+            }
+        };
         let reply = self.prefabs.submit(prefab);
         if reply.is_some() {
             release_prefab_particles(&mut self.renderer, created.textures);
             self.game_ui.detach(&mut self.renderer, &token);
         } else {
-            self.prefab_particles.insert(token, created);
+            self.prefab_particles.insert(token.clone(), created);
+            self.prefab_material_assets.insert(token, material_assets);
         }
         reply
     }
@@ -664,6 +795,7 @@ impl RenderBackend for VulkanBackend {
                     if let Some(entry) = self.prefab_particles.remove(token) {
                         release_prefab_particles(&mut self.renderer, entry.textures);
                     }
+                    self.prefab_material_assets.remove(token);
                 }
             }
         }
@@ -676,9 +808,40 @@ impl RenderBackend for VulkanBackend {
 
     fn release_prefab(&mut self, token: &PrefabToken) {
         self.prefabs.release(&mut self.renderer, token);
+        self.prefab_material_assets.remove(token);
         self.game_ui.detach(&mut self.renderer, token);
         if let Some(entry) = self.prefab_particles.remove(token) {
             release_prefab_particles(&mut self.renderer, entry.textures);
+        }
+        self.material_caches.prune_unowned(&mut self.renderer);
+    }
+
+    fn submit_material(&mut self, request: MaterialRequest) -> MaterialReply {
+        let object = request.object;
+        let revision = request.revision;
+        let result = self.upload_object_materials(request);
+        MaterialReply {
+            object,
+            revision,
+            result,
+        }
+    }
+
+    fn release_materials(&mut self, materials: &[MaterialId]) {
+        self.destroy_materials(materials);
+        self.material_caches
+            .release_materials(&mut self.renderer, materials);
+    }
+
+    fn apply_particle_commands(&mut self, commands: &[engine_scene::world::ParticleCommand]) {
+        for (emitter, burst) in resolve_particle_commands(&self.particle_emitters, commands) {
+            let outcome = match burst {
+                None => self.renderer.restart_particle_emitter(emitter),
+                Some(count) => self.renderer.emit_particle_burst(emitter, count),
+            };
+            if let Err(error) = outcome {
+                log::error!("команда эмиттера частиц не применена: {error}");
+            }
         }
     }
 
@@ -721,7 +884,7 @@ impl RenderBackend for VulkanBackend {
                 Some(ParticleEmitterFrame {
                     emitter: *self.particle_emitters.get(&instance.object)?,
                     transform: instance.transform,
-                    emitting: true,
+                    emitting: instance.emitting,
                 })
             })
             .collect();
@@ -1144,8 +1307,10 @@ fn scripts_thread(
     let mut applied_background = false;
     #[cfg(feature = "dev-console")]
     let mut pending_console_commands = PendingConsoleCommands::default();
+    let material_resources = render_resources.clone();
     let mut prefab_loads = PrefabLoads::new(prefab_loader, render_resources);
     let mut pending_prefab = VecDeque::new();
+    let mut material_sync = MaterialSync::default();
     let mut frame_latency: Option<Arc<dyn FrameLatency>> = None;
     let gpu_scene = loop {
         match control_rx.recv() {
@@ -1158,7 +1323,12 @@ fn scripts_thread(
             }
             #[cfg(feature = "dev-console")]
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
-            Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
+            Ok(ScriptControl::Prefab(reply)) => {
+                pending_prefab.push_back(ScriptReply::Prefab(reply))
+            }
+            Ok(ScriptControl::Material(reply)) => {
+                pending_prefab.push_back(ScriptReply::Material(reply))
+            }
         }
     };
     let Some(mut gpu_scene) = gpu_scene else {
@@ -1187,6 +1357,7 @@ fn scripts_thread(
     let mut published_cursor = None;
     set_initial_cursor(&mut scripts, &world, &cursor, &mut published_cursor);
     scripts.start(&mut world, start_time);
+    let mut particle_commands = scripts.drain_particle_commands();
     print_script_events(scripts.drain_events());
     publish_script_cursor(&scripts, &cursor, &mut published_cursor);
     let mut audio = audio.map(engine_audio::AudioBridge::new);
@@ -1250,7 +1421,11 @@ fn scripts_thread(
                     }
                     ScriptControl::Go(_) => false,
                     ScriptControl::Prefab(reply) => {
-                        pending_prefab.push_back(reply);
+                        pending_prefab.push_back(ScriptReply::Prefab(reply));
+                        false
+                    }
+                    ScriptControl::Material(reply) => {
+                        pending_prefab.push_back(ScriptReply::Material(reply));
                         false
                     }
                     #[cfg(feature = "dev-console")]
@@ -1323,7 +1498,12 @@ fn scripts_thread(
                     }
                     Ok(ScriptControl::Latency(latency)) => frame_latency = Some(latency),
                     Ok(ScriptControl::Background(false)) | Ok(ScriptControl::Go(_)) => {}
-                    Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
+                    Ok(ScriptControl::Prefab(reply)) => {
+                        pending_prefab.push_back(ScriptReply::Prefab(reply))
+                    }
+                    Ok(ScriptControl::Material(reply)) => {
+                        pending_prefab.push_back(ScriptReply::Material(reply))
+                    }
                     #[cfg(feature = "dev-console")]
                     Ok(ScriptControl::Console(command)) => {
                         pending_console_commands.push_back(command);
@@ -1394,8 +1574,10 @@ fn scripts_thread(
             &mut gpu_scene,
             &mut spawn_physics,
             &mut prefab_loads,
+            &mut material_sync,
             &mut ui_registry,
         );
+        material_sync.apply_replies(&world, &mut gpu_scene, &material_resources, frame_number);
         timings.record(
             script_phase::LOOP,
             script_phase::PREFAB_REPLIES,
@@ -1456,6 +1638,7 @@ fn scripts_thread(
             audio.apply(scripts.drain_audio_requests(), &world);
         }
         animation.apply(scripts.drain_animation_requests());
+        particle_commands.extend(scripts.drain_particle_commands());
         let finished = animation.advance(dt);
         scripts.queue_animation_events(
             &world,
@@ -1476,6 +1659,7 @@ fn scripts_thread(
             audio.as_mut(),
         ));
         net::tick(&mut network, &mut world, &mut scripts, &mut spawned_roots);
+        material_sync.request_changes(&mut world, &gpu_scene, &material_resources);
         timings.record(
             script_phase::LOOP,
             script_phase::WORLD_CHANGES,
@@ -1550,6 +1734,7 @@ fn scripts_thread(
         let made =
             make_snapshot(scene_frame, &world, &gpu_scene, &animation).map(|mut snapshot| {
                 snapshot.sim_time = sim_time;
+                snapshot.particle_commands = std::mem::take(&mut particle_commands);
                 snapshot.ui = ui_paint;
                 snapshot.screen_shaders.time = screen_shader_time(sim_time);
                 snapshot
@@ -1837,8 +2022,9 @@ fn apply_changes(
         if let Some(templates) = gpu_scene.prefabs.get(&spawned.prefab) {
             attach_prefab_levels(&mut gpu_scene.by_object, templates, spawned);
         }
+        attach_prefab_material_sources(gpu_scene, spawned);
     }
-    detach_objects(&mut gpu_scene.by_object, &changes.despawned);
+    detach_object_render_data(gpu_scene, &changes.despawned);
     if !changes.despawned.is_empty() {
         prefabs.send_particles(ParticleRequest::Destroy(changes.despawned.clone()));
     }
@@ -1886,7 +2072,7 @@ fn apply_changes(
                         &format!("физика отклонила объект {:?}: {error}", spawned.prefab),
                     );
                     print_script_events(scripts.drain_events());
-                    detach_objects(&mut gpu_scene.by_object, &spawned.objects);
+                    detach_object_render_data(gpu_scene, &spawned.objects);
                     continue;
                 }
             }
@@ -1944,6 +2130,8 @@ fn apply_prefab_requests(
             PrefabRequest::Unload(path) => {
                 gpu_scene.prefabs.remove(path);
                 gpu_scene.particle_templates.remove(path);
+                gpu_scene.material_templates.remove(path);
+                gpu_scene.prefab_tokens.remove(path);
                 if let Some(slot) = prefabs.forget(path) {
                     if let Some(geometry) = slot.geometry {
                         spawn_physics.remove_heavy_geometry(&geometry);
@@ -1956,18 +2144,193 @@ fn apply_prefab_requests(
     }
 }
 
+/// Замены материалов меш-рендерера скриптом на scripts thread: заявки render thread, владение
+/// материалами, созданными по ним, и ответы, ещё не применённые к `by_object`.
+#[derive(Default)]
+struct MaterialSync {
+    owned: MaterialOwnership<MaterialId>,
+    /// Объекты, для которых заявка уже у render thread: новая заявка ждёт ответа.
+    in_flight: HashSet<ObjectHandle>,
+    /// Объекты, у которых материал надо создать заново.
+    dirty: HashSet<ObjectHandle>,
+    /// Принятые ответы render thread, которые ещё не применены.
+    replies: VecDeque<MaterialReply>,
+}
+
+impl MaterialSync {
+    fn accept(&mut self, reply: MaterialReply) {
+        self.replies.push_back(reply);
+    }
+
+    /// Ставит заявки на объекты, у которых изменился материал. На объект не больше одной заявки в
+    /// полёте: изменения во время заявки ждут ответа и уходят следующей заявкой.
+    fn request_changes(
+        &mut self,
+        world: &mut World,
+        gpu_scene: &GpuSceneTable,
+        resources: &Sender<RenderResourceRequest>,
+    ) {
+        self.dirty.extend(world.take_mesh_material_changes());
+        let ready: Vec<ObjectHandle> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|handle| !self.in_flight.contains(handle))
+            .collect();
+        for handle in ready {
+            self.dirty.remove(&handle);
+            let Some(levels) = gpu_scene.by_object.get(&handle) else {
+                continue;
+            };
+            let (Some(revision), Some(object)) =
+                (world.mesh_material_revision(handle), world.object(handle))
+            else {
+                continue;
+            };
+            let Some(mesh) = object.mesh_renderer.as_ref() else {
+                continue;
+            };
+            let Some(mut model) = gpu_scene.material_sources.get(&handle).cloned() else {
+                log::warn!(
+                    "[material] объект {}: CPU-описание модели для замены материала отсутствует",
+                    object.id
+                );
+                continue;
+            };
+            model.material = mesh.material.clone();
+            if let Some(path) = world.mesh_material_path(handle) {
+                let part_count = levels.iter().map(Vec::len).max().unwrap_or(0);
+                model.material_slots = vec![Some(path.as_str().to_owned()); part_count];
+            }
+            let request = MaterialRequest {
+                object: handle,
+                revision,
+                levels: levels.clone(),
+                model,
+                prefab_token: gpu_scene.material_tokens.get(&handle).cloned(),
+            };
+            if resources
+                .send(RenderResourceRequest::Material(Box::new(request)))
+                .is_ok()
+            {
+                self.in_flight.insert(handle);
+            }
+        }
+    }
+
+    /// Применяет ответы: новые уровни заменяют прежние, материалы прежних освобождаются после снимков
+    /// `seq ≥ last_seq`. Ответ по удалённому объекту освобождает свои материалы сразу.
+    fn apply_replies(
+        &mut self,
+        world: &World,
+        gpu_scene: &mut GpuSceneTable,
+        resources: &Sender<RenderResourceRequest>,
+        last_seq: u64,
+    ) {
+        while let Some(reply) = self.replies.pop_front() {
+            self.in_flight.remove(&reply.object);
+            match reply.result {
+                Ok(MaterialLevels { levels, created })
+                    if world.is_alive(reply.object)
+                        && world.mesh_material_revision(reply.object) == Some(reply.revision)
+                        && gpu_scene.by_object.contains_key(&reply.object) =>
+                {
+                    gpu_scene.by_object.insert(reply.object, levels);
+                    let previous = self.owned.replace(reply.object, created);
+                    send_material_release(resources, previous, last_seq);
+                }
+                Ok(MaterialLevels { created, .. }) => {
+                    send_material_release(resources, created, 0);
+                }
+                Err(message) => {
+                    let id = world
+                        .object(reply.object)
+                        .map_or("?", |object| object.id.as_str());
+                    log::warn!("[material] объект {id}: материал не заменён: {message}");
+                }
+            }
+            // Изменения, пришедшие во время заявки, ставят объект в очередь ещё раз.
+            if world.mesh_material_revision(reply.object) != Some(reply.revision) {
+                self.dirty.insert(reply.object);
+            }
+        }
+        // Материалы объектов, удалённых из таблицы GPU, освобождаются вместе с ними.
+        let gone = self
+            .owned
+            .take_dead(|handle| gpu_scene.by_object.contains_key(&handle));
+        send_material_release(resources, gone, last_seq);
+    }
+}
+
+/// Материалы, созданные по заявкам замены, по объектам: при следующей замене или удалении объекта
+/// прежние материалы уходят на освобождение. Материалы сцены сюда не входят: они могут быть общими.
+struct MaterialOwnership<M> {
+    owned: HashMap<ObjectHandle, Vec<M>>,
+}
+
+impl<M> Default for MaterialOwnership<M> {
+    fn default() -> Self {
+        Self {
+            owned: HashMap::new(),
+        }
+    }
+}
+
+impl<M> MaterialOwnership<M> {
+    /// Записывает материалы новой замены и возвращает материалы прежней.
+    fn replace(&mut self, object: ObjectHandle, created: Vec<M>) -> Vec<M> {
+        self.owned.insert(object, created).unwrap_or_default()
+    }
+
+    /// Забирает материалы объектов, для которых `is_live` ложно.
+    fn take_dead(&mut self, is_live: impl Fn(ObjectHandle) -> bool) -> Vec<M> {
+        let dead: Vec<ObjectHandle> = self
+            .owned
+            .keys()
+            .copied()
+            .filter(|&handle| !is_live(handle))
+            .collect();
+        dead.into_iter()
+            .filter_map(|handle| self.owned.remove(&handle))
+            .flatten()
+            .collect()
+    }
+}
+
+fn send_material_release(
+    resources: &Sender<RenderResourceRequest>,
+    materials: Vec<MaterialId>,
+    last_seq: u64,
+) {
+    if !materials.is_empty() {
+        let _ = resources.send(RenderResourceRequest::ReleaseMaterials {
+            materials,
+            last_seq,
+        });
+    }
+}
+
 /// Применяет ответы загрузки: регистрирует шаблон, добавляет его GPU-уровни и геометрию. Ответы
 /// со старым токеном освобождаются сразу: их ресурсы никто не использует.
+#[allow(clippy::too_many_arguments)]
 fn drain_prefab_replies(
-    pending: &mut VecDeque<PrefabReply>,
+    pending: &mut VecDeque<ScriptReply>,
     scripts: &mut ScriptHost,
     world: &mut World,
     gpu_scene: &mut GpuSceneTable,
     spawn_physics: &mut SpawnPhysics,
     prefabs: &mut PrefabLoads,
+    materials: &mut MaterialSync,
     ui_registry: &mut UiRegistry,
 ) {
     while let Some(reply) = pending.pop_front() {
+        let reply = match reply {
+            ScriptReply::Material(reply) => {
+                materials.accept(*reply);
+                continue;
+            }
+            ScriptReply::Prefab(reply) => reply,
+        };
         match reply {
             PrefabReply::Ready(ready) => {
                 let PrefabReady {
@@ -1984,6 +2347,7 @@ fn drain_prefab_replies(
                     template,
                     sources,
                     geometry,
+                    material_models,
                     ui,
                 } = cpu;
                 if let Err(error) = ui_registry.register(scripts, &ui) {
@@ -2005,6 +2369,12 @@ fn drain_prefab_replies(
                 gpu_scene
                     .particle_templates
                     .insert(token.path.clone(), particles);
+                gpu_scene
+                    .material_templates
+                    .insert(token.path.clone(), material_models);
+                gpu_scene
+                    .prefab_tokens
+                    .insert(token.path.clone(), token.clone());
                 prefabs.mark_ready(&token, geometry_paths);
             }
             PrefabReply::Failed { token, error } => {
@@ -2029,6 +2399,33 @@ fn attach_prefab_levels<T: Clone>(
             by_object.insert(*object, levels.clone());
         }
     }
+}
+
+fn attach_prefab_material_sources(gpu_scene: &mut GpuSceneTable, spawned: &SpawnedObject) {
+    let Some(templates) = gpu_scene.material_templates.get(&spawned.prefab) else {
+        return;
+    };
+    let token = gpu_scene.prefab_tokens.get(&spawned.prefab).cloned();
+    for (object, source) in spawned.objects.iter().zip(templates) {
+        if let Some(source) = source {
+            gpu_scene.material_sources.insert(*object, source.clone());
+            if let Some(token) = &token {
+                gpu_scene.material_tokens.insert(*object, token.clone());
+            }
+        }
+    }
+}
+
+fn detach_material_sources(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
+    for handle in handles {
+        gpu_scene.material_sources.remove(handle);
+        gpu_scene.material_tokens.remove(handle);
+    }
+}
+
+fn detach_object_render_data(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
+    detach_objects(&mut gpu_scene.by_object, handles);
+    detach_material_sources(gpu_scene, handles);
 }
 
 fn detach_objects<T>(by_object: &mut HashMap<ObjectHandle, Vec<Vec<T>>>, handles: &[ObjectHandle]) {
@@ -2243,6 +2640,7 @@ fn make_snapshot(
         .map(|instance| ParticleSnapshot {
             object: instance.object,
             transform: instance.model.to_cols_array_2d(),
+            emitting: instance.emitting,
         })
         .collect();
     Ok(FrameSnapshot {
@@ -2259,6 +2657,7 @@ fn make_snapshot(
         environment,
         draws,
         particles,
+        particle_commands: Vec::new(),
         sim_time: 0.0,
         joint_palettes,
         ui: empty_paint(),
@@ -2437,6 +2836,24 @@ fn spawn_particle_requests(
                 object,
                 desc: Box::new(desc.clone()?),
             })
+        })
+        .collect()
+}
+
+/// Переводит команды скриптов в действия над эмиттерами: `None` — перезапуск, `Some(n)` — выброс.
+/// Команда объекта без эмиттера пропускается, как и заявки, пришедшие после уничтожения объекта.
+fn resolve_particle_commands<E: Copy>(
+    emitters: &HashMap<ObjectHandle, E>,
+    commands: &[ParticleCommand],
+) -> Vec<(E, Option<u32>)> {
+    commands
+        .iter()
+        .filter_map(|command| {
+            let (object, burst) = match *command {
+                ParticleCommand::Restart { object } => (object, None),
+                ParticleCommand::Burst { object, count } => (object, Some(count)),
+            };
+            Some((*emitters.get(&object)?, burst))
         })
         .collect()
 }
@@ -2723,7 +3140,7 @@ fn send_snapshot(
     background: &mut bool,
     #[cfg(feature = "dev-console")] pending_console_commands: &mut PendingConsoleCommands,
     #[cfg(not(feature = "dev-console"))] _: &mut PendingConsoleCommands,
-    pending_prefab: &mut VecDeque<PrefabReply>,
+    pending_prefab: &mut VecDeque<ScriptReply>,
 ) -> SendOutcome {
     loop {
         let selection = Selector::new()
@@ -2749,7 +3166,10 @@ fn send_snapshot(
             // Latency и Go приходят только до первого кадра, поэтому здесь они не нужны.
             ScriptSelection::Control(Ok(ScriptControl::Go(_) | ScriptControl::Latency(_))) => {}
             ScriptSelection::Control(Ok(ScriptControl::Prefab(reply))) => {
-                pending_prefab.push_back(reply);
+                pending_prefab.push_back(ScriptReply::Prefab(reply));
+            }
+            ScriptSelection::Control(Ok(ScriptControl::Material(reply))) => {
+                pending_prefab.push_back(ScriptReply::Material(reply));
             }
         }
     }
@@ -2762,7 +3182,7 @@ fn wait_background_tick(
     deadline: Duration,
     #[cfg(feature = "dev-console")] pending_console_commands: &mut PendingConsoleCommands,
     #[cfg(not(feature = "dev-console"))] _: &mut PendingConsoleCommands,
-    pending_prefab: &mut VecDeque<PrefabReply>,
+    pending_prefab: &mut VecDeque<ScriptReply>,
 ) -> bool {
     while *background {
         let now = clock.now();
@@ -2779,7 +3199,12 @@ fn wait_background_tick(
             }
             #[cfg(feature = "dev-console")]
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
-            Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
+            Ok(ScriptControl::Prefab(reply)) => {
+                pending_prefab.push_back(ScriptReply::Prefab(reply))
+            }
+            Ok(ScriptControl::Material(reply)) => {
+                pending_prefab.push_back(ScriptReply::Material(reply))
+            }
             Ok(ScriptControl::Go(_) | ScriptControl::Latency(_))
             | Err(RecvTimeoutError::Timeout) => {}
         }
@@ -2898,10 +3323,15 @@ enum RenderSelection {
     Resource(Result<RenderResourceRequest, flume::RecvError>),
 }
 
-/// Освобождение префаба, которое ждёт, пока render thread обработает снимки с `seq ≥ last_seq`.
+/// Освобождение, которое ждёт, пока render thread обработает снимки с `seq ≥ last_seq`.
 struct PendingRelease {
-    token: PrefabToken,
+    target: ReleaseTarget,
     last_seq: u64,
+}
+
+enum ReleaseTarget {
+    Prefab(PrefabToken),
+    Materials(Vec<MaterialId>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2926,6 +3356,9 @@ fn render_loop(
     // Номер последнего снимка, принятого из канала кадров.
     let mut taken_seq = 0_u64;
     let mut releases: Vec<PendingRelease> = Vec::new();
+    // Команды частиц принятых снимков, которые ещё не отрисованы. Снимок копирует их при приёме,
+    // поэтому перерисовка того же снимка и пауза не применяют и не теряют их.
+    let mut particle_queue: Vec<engine_scene::world::ParticleCommand> = Vec::new();
     let mut resources_open = true;
     #[cfg(feature = "dev-console")]
     let mut ui_frame = ConsoleUiFrame::default();
@@ -3032,6 +3465,7 @@ fn render_loop(
                 backend,
                 Arc::make_mut(snapshot),
                 &mut motion_history,
+                &mut particle_queue,
                 paused,
                 width,
                 height,
@@ -3100,6 +3534,7 @@ fn render_loop(
             | RenderSelection::Frame(Err(_)) => return Ok(()),
             RenderSelection::Frame(Ok(snapshot)) => {
                 taken_seq = snapshot.sequence;
+                particle_queue.extend_from_slice(&snapshot.particle_commands);
                 latest_snapshot = Some(snapshot);
                 let Some(snapshot) = latest_snapshot.as_mut() else {
                     continue;
@@ -3108,6 +3543,7 @@ fn render_loop(
                     backend,
                     Arc::make_mut(snapshot),
                     &mut motion_history,
+                    &mut particle_queue,
                     paused,
                     width,
                     height,
@@ -3146,7 +3582,23 @@ fn handle_resource_request(
         }
         RenderResourceRequest::Particle(request) => backend.apply_particle_request(request),
         RenderResourceRequest::Release { token, last_seq } => {
-            releases.push(PendingRelease { token, last_seq });
+            releases.push(PendingRelease {
+                target: ReleaseTarget::Prefab(token),
+                last_seq,
+            });
+        }
+        RenderResourceRequest::Material(request) => {
+            let reply = backend.submit_material(*request);
+            let _ = script_tx.send(ScriptControl::Material(Box::new(reply)));
+        }
+        RenderResourceRequest::ReleaseMaterials {
+            materials,
+            last_seq,
+        } => {
+            releases.push(PendingRelease {
+                target: ReleaseTarget::Materials(materials),
+                last_seq,
+            });
         }
     }
 }
@@ -3170,7 +3622,10 @@ fn finish_releases(
         {
             *latest = None;
         }
-        backend.release_prefab(&release.token);
+        match &release.target {
+            ReleaseTarget::Prefab(token) => backend.release_prefab(token),
+            ReleaseTarget::Materials(materials) => backend.release_materials(materials),
+        }
         false
     });
 }
@@ -3184,6 +3639,7 @@ fn render_snapshot(
     backend: &mut dyn RenderBackend,
     snapshot: &mut FrameSnapshot,
     motion_history: &mut MotionHistory,
+    particle_queue: &mut Vec<engine_scene::world::ParticleCommand>,
     paused: bool,
     width: u32,
     height: u32,
@@ -3192,6 +3648,10 @@ fn render_snapshot(
 ) -> Result<Option<FrameOutcome>, String> {
     if paused {
         return Ok(None);
+    }
+    if !particle_queue.is_empty() {
+        let commands = std::mem::take(particle_queue);
+        backend.apply_particle_commands(&commands);
     }
     motion_history.prepare(snapshot);
     let started = Instant::now();
@@ -3336,18 +3796,22 @@ mod tests {
     use super::execute_console_commands;
     use super::{
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
-        GpuSceneTable, MotionHistory, PhysicsWait, RenderBackend, RenderControl,
-        RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, apply_physics_step, drop_mismatched_skins, log_script_events_with,
-        make_snapshot, procedural_environment_key, receive_physics_interruptibly,
-        render_local_lights, render_loop, render_snapshot, render_thread, selected_level,
-        send_snapshot, sync_input_background, wait_background_tick,
+        GpuSceneTable, MotionHistory, PendingRelease, PhysicsWait, ReleaseTarget, RenderBackend,
+        RenderControl, RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl,
+        ScriptStartupError, ScriptThreadConfig, apply_physics_step, drop_mismatched_skins,
+        finish_releases, log_script_events_with, make_snapshot, procedural_environment_key,
+        receive_physics_interruptibly, render_local_lights, render_loop, render_snapshot,
+        render_thread, selected_level, send_snapshot, sync_input_background, wait_background_tick,
     };
     use super::{FrameLatency, publish_script_cursor, set_initial_cursor};
+    use super::{MaterialSync, ScriptReply};
     #[cfg(feature = "dev-console")]
     use super::{PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION, publish_command_catalog};
     use super::{SpawnPhysics, apply_world_changes, drain_prefab_replies};
-    use super::{attach_prefab_levels, detach_objects};
+    use super::{
+        attach_prefab_levels, attach_prefab_material_sources, detach_object_render_data,
+        detach_objects,
+    };
     use crate::cursor::{CursorControl, RecordingCursorSink};
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
@@ -3356,8 +3820,9 @@ mod tests {
         LoadedPrefab, LoaderRequest, PrefabCpu, PrefabLoads, PrefabReady, PrefabReply, PrefabToken,
         RenderResourceRequest,
     };
+    use crate::prefabs::{MaterialLevels, MaterialReply, MaterialRequest};
     use crate::profiling::{PhaseWindow, SOURCE_RENDER, render_groups, render_phase};
-    use crate::scene::PreparedPrefabs;
+    use crate::scene::{ObjectModel, PreparedMaterialAssets, PreparedPrefabs};
     use engine_animation::AnimationBridge;
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
@@ -3370,18 +3835,23 @@ mod tests {
         PhysicsWorld, Pose,
     };
     use engine_project::{InputAction, InputSettings};
-    use engine_render::{DrawCommand, FrameOutcome, FrameStatus, LatencyMarker, LocalLight};
+    use engine_render::{
+        DrawCommand, FrameOutcome, FrameStatus, LatencyMarker, LocalLight, MaterialId, MeshId,
+    };
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
-    use engine_scene::{LocalLightState, ObjectHandle, SceneDocument, World};
+    use engine_scene::world::MeshMaterialParams;
+    use engine_scene::{LocalLightState, ObjectHandle, SceneDocument, SpawnOptions, World};
     use engine_script::ScriptLoadOptions;
     use engine_script::{
         Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
+        SpawnedObject,
     };
     use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
     use engine_window::CursorState;
+    use flume::Receiver;
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
@@ -3701,9 +4171,12 @@ distance=2.0
         prefab_uploads: VecDeque<LoadedPrefab>,
         /// Куда сообщать об освобождении токенов: тест ждёт событие, а не опрашивает состояние.
         released: Option<mpsc::Sender<PrefabToken>>,
+        released_materials: Option<mpsc::Sender<Vec<MaterialId>>>,
         /// Куда сообщать о смене debug view: тест ждёт, что цикл уже обработал её.
         #[cfg(feature = "dev-console")]
         debug_views: Option<mpsc::Sender<engine_render::DebugView>>,
+        /// Пачки команд частиц, принятые `apply_particle_commands`: тест считает применения.
+        applied_particles: Option<mpsc::Sender<Vec<engine_scene::world::ParticleCommand>>>,
     }
 
     impl RenderBackend for FakeBackend {
@@ -3742,6 +4215,18 @@ distance=2.0
         fn release_prefab(&mut self, token: &PrefabToken) {
             if let Some(released) = &self.released {
                 let _ = released.send(token.clone());
+            }
+        }
+
+        fn release_materials(&mut self, materials: &[MaterialId]) {
+            if let Some(released) = &self.released_materials {
+                let _ = released.send(materials.to_vec());
+            }
+        }
+
+        fn apply_particle_commands(&mut self, commands: &[engine_scene::world::ParticleCommand]) {
+            if let Some(applied) = &self.applied_particles {
+                let _ = applied.send(commands.to_vec());
             }
         }
 
@@ -3804,6 +4289,7 @@ distance=2.0
             backend,
             snapshot,
             history,
+            &mut Vec::new(),
             paused,
             640,
             480,
@@ -3933,6 +4419,7 @@ distance=2.0
         FrameSnapshot {
             ui: crate::game_ui::empty_paint(),
             particles: Vec::new(),
+            particle_commands: Vec::new(),
             sim_time: 0.0,
             sequence: 0,
             camera: Camera {
@@ -3980,6 +4467,7 @@ distance=2.0
         FrameSnapshot {
             ui: crate::game_ui::empty_paint(),
             particles: Vec::new(),
+            particle_commands: Vec::new(),
             sim_time: 0.0,
             sequence: 0,
             camera: Camera {
@@ -4633,6 +5121,652 @@ return Script
         let _ = frame_tx;
     }
 
+    fn snapshot_with_particle_commands(
+        commands: Vec<engine_scene::world::ParticleCommand>,
+    ) -> Arc<FrameSnapshot> {
+        let mut snapshot = empty_snapshot();
+        snapshot.particle_commands = commands;
+        Arc::new(snapshot)
+    }
+
+    #[test]
+    fn particle_commands_of_a_paused_frame_are_applied_once_when_the_next_frame_renders() {
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (applied_tx, applied_rx) = mpsc::channel();
+        let mut backend = FakeBackend {
+            applied_particles: Some(applied_tx),
+            ..Default::default()
+        };
+        let command = engine_scene::world::ParticleCommand::Restart {
+            object: motion_test_handles().1,
+        };
+        let worker = std::thread::spawn(move || {
+            render_loop(
+                &mut backend,
+                640,
+                480,
+                None,
+                &frame_rx,
+                &flume::unbounded::<RenderResourceRequest>().1,
+                &control_rx,
+                &script_tx,
+                &mut render_test_window(),
+            )
+        });
+        control_tx.send(RenderControl::Occluded(true)).unwrap();
+        assert!(matches!(
+            script_rx.recv().unwrap(),
+            ScriptControl::Background(true)
+        ));
+        // Снимок с командой принят на паузе и заменён следующим: команда не должна пропасть.
+        frame_tx
+            .send(snapshot_with_particle_commands(vec![command]))
+            .unwrap();
+        frame_tx
+            .send(snapshot_with_particle_commands(Vec::new()))
+            .unwrap();
+        control_tx.send(RenderControl::Occluded(false)).unwrap();
+        assert!(matches!(
+            script_rx.recv().unwrap(),
+            ScriptControl::Background(false)
+        ));
+        frame_tx
+            .send(snapshot_with_particle_commands(Vec::new()))
+            .unwrap();
+        control_tx.send(RenderControl::Shutdown).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert_eq!(
+            applied_rx.try_iter().collect::<Vec<_>>(),
+            vec![vec![command]]
+        );
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn particle_commands_are_not_reapplied_when_the_latest_frame_is_redrawn() {
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, _script_rx) = flume::unbounded();
+        let (applied_tx, applied_rx) = mpsc::channel();
+        let mut backend = FakeBackend {
+            applied_particles: Some(applied_tx),
+            ..Default::default()
+        };
+        let command = engine_scene::world::ParticleCommand::Restart {
+            object: motion_test_handles().1,
+        };
+        let worker = std::thread::spawn(move || {
+            render_loop(
+                &mut backend,
+                640,
+                480,
+                None,
+                &frame_rx,
+                &flume::unbounded::<RenderResourceRequest>().1,
+                &control_rx,
+                &script_tx,
+                &mut render_test_window(),
+            )
+        });
+        frame_tx
+            .send(snapshot_with_particle_commands(vec![command]))
+            .unwrap();
+        assert_eq!(
+            applied_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![command]
+        );
+        // Смена debug view перерисовывает последний снимок тем же набором команд.
+        control_tx
+            .send(RenderControl::DebugView(
+                engine_render::DebugView::Wireframe,
+            ))
+            .unwrap();
+        control_tx.send(RenderControl::Shutdown).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert!(
+            applied_rx.try_iter().next().is_none(),
+            "перерисовка не применяет команды повторно"
+        );
+    }
+
+    const MATERIAL_SCENE: &str = "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n";
+
+    const MATERIAL_LOD_SCENE: &str = "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/models/crate_lod.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n[objects.lod_group]\n[[objects.lod_group.levels]]\nmodel = \"/models/crate_lod.fbx\"\ndistance = 10.0\n";
+
+    const MATERIAL_PREFAB: &str = "[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n";
+
+    fn material_test_world() -> (World, ObjectHandle) {
+        let world = World::from_document(
+            &SceneDocument::parse("materials.rvescene", MATERIAL_SCENE).unwrap(),
+        )
+        .unwrap();
+        let crate_handle = world.handle("crate").unwrap();
+        (world, crate_handle)
+    }
+
+    fn next_material_request(requests: &Receiver<RenderResourceRequest>) -> Box<MaterialRequest> {
+        match requests.try_recv() {
+            Ok(RenderResourceRequest::Material(request)) => request,
+            _ => panic!("ожидалась заявка материала"),
+        }
+    }
+
+    fn material_source() -> ObjectModel {
+        ObjectModel {
+            levels: vec![("models/crate.fbx".to_owned(), None)],
+            material: None,
+            material_slots: vec![None, None],
+            animated: false,
+        }
+    }
+
+    fn fake_mesh_id(value: usize) -> MeshId {
+        // SAFETY: MeshId is a single usize wrapper; every usize is a valid test-only id.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn fake_material_id(value: usize) -> MaterialId {
+        // SAFETY: MaterialId is a single usize wrapper; every usize is a valid test-only id.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn material_levels(seed: usize) -> Vec<Vec<(MeshId, MaterialId)>> {
+        vec![vec![
+            (fake_mesh_id(seed), fake_material_id(seed + 1)),
+            (fake_mesh_id(seed + 2), fake_material_id(seed + 3)),
+        ]]
+    }
+
+    fn snapshot_materials(
+        world: &mut World,
+        gpu_scene: &GpuSceneTable,
+        object: ObjectHandle,
+    ) -> Vec<MaterialId> {
+        let (frame, warnings) = world.build_frame();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let snapshot = make_snapshot(frame, world, gpu_scene, &AnimationBridge::default()).unwrap();
+        let range = snapshot
+            .object_motion
+            .get(&object)
+            .expect("object has snapshot draws")
+            .draw_range
+            .clone();
+        snapshot.draws[range]
+            .iter()
+            .map(|draw| draw.material.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn material_changes_request_one_upload_per_object_and_a_reply_swaps_its_levels() {
+        let (mut world, crate_handle) = material_test_world();
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .by_object
+            .insert(crate_handle, material_levels(10));
+        gpu_scene
+            .material_sources
+            .insert(crate_handle, material_source());
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+
+        world
+            .set_mesh_material_params(
+                crate_handle,
+                MeshMaterialParams {
+                    roughness: Some(0.5),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let first = next_material_request(&resources_rx);
+        assert_eq!((first.object, first.revision), (crate_handle, 1));
+        assert_eq!(first.levels, material_levels(10));
+        assert_eq!(
+            first.model.material.as_ref().and_then(|m| m.roughness),
+            Some(0.5)
+        );
+        assert_eq!(first.model.material_slots, vec![None, None]);
+
+        // Вторая замена ждёт ответа на первую: заявка на тот же объект не уходит.
+        world
+            .set_mesh_material_params(
+                crate_handle,
+                MeshMaterialParams {
+                    base_color: Some([1.0, 0.0, 0.0]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        assert!(resources_rx.try_recv().is_err());
+
+        // Устаревший ответ не меняет уровни; его материалы освобождаются сразу, затем уходит
+        // заявка с последней ревизией.
+        sync.accept(MaterialReply {
+            object: crate_handle,
+            revision: first.revision,
+            result: Ok(MaterialLevels {
+                levels: material_levels(20),
+                created: vec![fake_material_id(21), fake_material_id(23)],
+            }),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 5);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(11), fake_material_id(13)],
+            "stale reply must not change the next frame snapshot"
+        );
+        match resources_rx.try_recv().unwrap() {
+            RenderResourceRequest::ReleaseMaterials {
+                materials,
+                last_seq,
+            } => {
+                assert_eq!(materials, [fake_material_id(21), fake_material_id(23)]);
+                assert_eq!(last_seq, 0, "stale materials never entered a snapshot");
+            }
+            _ => panic!("stale reply materials must be released immediately"),
+        }
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let second = next_material_request(&resources_rx);
+        assert_eq!(second.revision, 2);
+        assert_eq!(second.levels, material_levels(10));
+        let material = second
+            .model
+            .material
+            .as_ref()
+            .expect("переопределения переданы");
+        assert_eq!(material.roughness, Some(0.5), "прежние поля сохраняются");
+        assert_eq!(material.base_color, Some([1.0, 0.0, 0.0]));
+
+        sync.accept(MaterialReply {
+            object: crate_handle,
+            revision: second.revision,
+            result: Ok(MaterialLevels {
+                levels: material_levels(30),
+                created: vec![fake_material_id(31), fake_material_id(33)],
+            }),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 7);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(31), fake_material_id(33)]
+        );
+        assert!(
+            resources_rx.try_recv().is_err(),
+            "the accepted second reply has no previous owned materials"
+        );
+    }
+
+    #[test]
+    fn set_material_path_reaches_the_request_and_a_refused_reply_keeps_the_levels() {
+        let (mut world, crate_handle) = material_test_world();
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .by_object
+            .insert(crate_handle, material_levels(40));
+        gpu_scene
+            .material_sources
+            .insert(crate_handle, material_source());
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+        let gold = engine_files::VirtualPath::parse("/materials/gold.rvemat").unwrap();
+        world.set_mesh_material_path(crate_handle, gold).unwrap();
+
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let request = next_material_request(&resources_rx);
+        assert_eq!(
+            request.model.material_slots,
+            vec![
+                Some("materials/gold.rvemat".to_owned()),
+                Some("materials/gold.rvemat".to_owned())
+            ]
+        );
+        sync.accept(MaterialReply {
+            object: crate_handle,
+            revision: request.revision,
+            result: Err("материал не загрузился".to_owned()),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 3);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(41), fake_material_id(43)],
+            "отказ не меняет уровни"
+        );
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        assert!(
+            resources_rx.try_recv().is_err(),
+            "ревизия не менялась: повторной заявки нет"
+        );
+    }
+
+    #[test]
+    fn set_material_path_covers_parts_from_every_lod_level() {
+        let document = SceneDocument::parse("materials.rvescene", MATERIAL_LOD_SCENE).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let crate_handle = world.handle("crate").unwrap();
+        let first_level = material_levels(170).remove(0);
+        let second_level = vec![
+            (fake_mesh_id(180), fake_material_id(181)),
+            (fake_mesh_id(182), fake_material_id(183)),
+            (fake_mesh_id(184), fake_material_id(185)),
+        ];
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .by_object
+            .insert(crate_handle, vec![first_level, second_level]);
+        gpu_scene.material_sources.insert(
+            crate_handle,
+            ObjectModel {
+                levels: vec![
+                    ("models/crate.fbx".to_owned(), None),
+                    ("models/crate_lod.fbx".to_owned(), None),
+                ],
+                material: None,
+                material_slots: vec![None; 2],
+                animated: false,
+            },
+        );
+        world
+            .set_mesh_material_path(
+                crate_handle,
+                engine_files::VirtualPath::parse("/materials/gold.rvemat").unwrap(),
+            )
+            .unwrap();
+        let (resources_tx, resources_rx) = flume::unbounded();
+        MaterialSync::default().request_changes(&mut world, &gpu_scene, &resources_tx);
+
+        let request = next_material_request(&resources_rx);
+        assert_eq!(
+            request.model.material_slots,
+            vec![Some("materials/gold.rvemat".to_owned()); 3]
+        );
+    }
+
+    #[test]
+    fn spawned_fast_and_heavy_prefabs_send_material_sources_and_swap_snapshot_levels() {
+        let world_document = SceneDocument::parse(
+            "materials.rvescene",
+            "[[assets]]\npath = \"/materials/scene.rvemat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&world_document).unwrap();
+        let fast_path = "prefabs/fast.rveprefab";
+        let heavy_path = "prefabs/heavy.rveprefab";
+        let fast_template = prefab_template(fast_path, MATERIAL_PREFAB);
+        let heavy_template = prefab_template(heavy_path, MATERIAL_PREFAB);
+        let fast_handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &fast_template,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let heavy_handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &heavy_template,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let fast = SpawnedObject {
+            handle: fast_handles[0],
+            objects: fast_handles,
+            prefab: fast_path.to_owned(),
+            template_index: 0,
+            initial_velocity: None,
+        };
+        let heavy = SpawnedObject {
+            handle: heavy_handles[0],
+            objects: heavy_handles,
+            prefab: heavy_path.to_owned(),
+            template_index: 0,
+            initial_velocity: None,
+        };
+        let token = PrefabToken {
+            path: heavy_path.to_owned(),
+            load_id: 4,
+        };
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .prefabs
+            .insert(fast_path.to_owned(), vec![material_levels(50)]);
+        gpu_scene
+            .prefabs
+            .insert(heavy_path.to_owned(), vec![material_levels(60)]);
+        gpu_scene
+            .material_templates
+            .insert(fast_path.to_owned(), vec![Some(material_source())]);
+        gpu_scene
+            .material_templates
+            .insert(heavy_path.to_owned(), vec![Some(material_source())]);
+        gpu_scene
+            .prefab_tokens
+            .insert(heavy_path.to_owned(), token.clone());
+        attach_prefab_levels(
+            &mut gpu_scene.by_object,
+            &gpu_scene.prefabs[fast_path],
+            &fast,
+        );
+        attach_prefab_material_sources(&mut gpu_scene, &fast);
+        attach_prefab_levels(
+            &mut gpu_scene.by_object,
+            &gpu_scene.prefabs[heavy_path],
+            &heavy,
+        );
+        attach_prefab_material_sources(&mut gpu_scene, &heavy);
+
+        let gold = engine_files::VirtualPath::parse("/materials/gold.rvemat").unwrap();
+        world
+            .set_mesh_material_path(fast.handle, gold.clone())
+            .unwrap();
+        let scene_material = engine_files::VirtualPath::parse("/materials/scene.rvemat").unwrap();
+        world
+            .set_mesh_material_path(heavy.handle, scene_material)
+            .unwrap();
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let requests = [
+            next_material_request(&resources_rx),
+            next_material_request(&resources_rx),
+        ];
+        let fast_request = requests
+            .iter()
+            .find(|request| request.object == fast.handle)
+            .unwrap();
+        let heavy_request = requests
+            .iter()
+            .find(|request| request.object == heavy.handle)
+            .unwrap();
+        assert!(fast_request.prefab_token.is_none());
+        assert_eq!(heavy_request.prefab_token.as_ref(), Some(&token));
+        assert!(
+            fast_request
+                .model
+                .material_slots
+                .iter()
+                .all(Option::is_some)
+        );
+        assert!(
+            heavy_request
+                .model
+                .material_slots
+                .iter()
+                .all(Option::is_some)
+        );
+        assert_eq!(
+            fast_request.model.material_slots[0].as_deref(),
+            Some("materials/gold.rvemat")
+        );
+        assert_eq!(
+            heavy_request.model.material_slots[0].as_deref(),
+            Some("materials/scene.rvemat")
+        );
+
+        for (request, seed) in [(fast_request, 80), (heavy_request, 100)] {
+            sync.accept(MaterialReply {
+                object: request.object,
+                revision: request.revision,
+                result: Ok(MaterialLevels {
+                    levels: material_levels(seed),
+                    created: vec![fake_material_id(seed + 1), fake_material_id(seed + 3)],
+                }),
+            });
+        }
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 3);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, fast.handle),
+            [fake_material_id(81), fake_material_id(83)]
+        );
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, heavy.handle),
+            [fake_material_id(101), fake_material_id(103)]
+        );
+    }
+
+    #[test]
+    fn deleted_prefab_object_releases_an_outdated_material_reply_immediately() {
+        let world_document = SceneDocument::parse(
+            "materials.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&world_document).unwrap();
+        let prefab_path = "prefabs/heavy.rveprefab";
+        let template = prefab_template(prefab_path, MATERIAL_PREFAB);
+        let handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &template,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let spawned = SpawnedObject {
+            handle: handles[0],
+            objects: handles.clone(),
+            prefab: prefab_path.to_owned(),
+            template_index: 0,
+            initial_velocity: None,
+        };
+        let token = PrefabToken {
+            path: prefab_path.to_owned(),
+            load_id: 8,
+        };
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .prefabs
+            .insert(prefab_path.to_owned(), vec![material_levels(120)]);
+        gpu_scene
+            .material_templates
+            .insert(prefab_path.to_owned(), vec![Some(material_source())]);
+        gpu_scene
+            .prefab_tokens
+            .insert(prefab_path.to_owned(), token);
+        attach_prefab_levels(
+            &mut gpu_scene.by_object,
+            &gpu_scene.prefabs[prefab_path],
+            &spawned,
+        );
+        attach_prefab_material_sources(&mut gpu_scene, &spawned);
+        world
+            .set_mesh_material_params(
+                spawned.handle,
+                MeshMaterialParams {
+                    roughness: Some(0.25),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let request = next_material_request(&resources_rx);
+
+        world.despawn_many(&[spawned.handle]).unwrap();
+        detach_object_render_data(&mut gpu_scene, &handles);
+        assert!(!gpu_scene.material_sources.contains_key(&spawned.handle));
+        assert!(!gpu_scene.material_tokens.contains_key(&spawned.handle));
+        sync.accept(MaterialReply {
+            object: request.object,
+            revision: request.revision,
+            result: Ok(MaterialLevels {
+                levels: material_levels(140),
+                created: vec![fake_material_id(141), fake_material_id(143)],
+            }),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 9);
+        assert!(!gpu_scene.by_object.contains_key(&spawned.handle));
+        match resources_rx.try_recv().unwrap() {
+            RenderResourceRequest::ReleaseMaterials {
+                materials,
+                last_seq,
+            } => {
+                assert_eq!(materials, [fake_material_id(141), fake_material_id(143)]);
+                assert_eq!(
+                    last_seq, 0,
+                    "the object never appeared in a submitted snapshot"
+                );
+            }
+            _ => panic!("unused reply materials must be released immediately"),
+        }
+    }
+
+    #[test]
+    fn despawn_releases_accepted_materials_after_the_last_snapshot() {
+        let (mut world, crate_handle) = material_test_world();
+        let mut gpu_scene = GpuSceneTable::default();
+        gpu_scene
+            .by_object
+            .insert(crate_handle, material_levels(150));
+        gpu_scene
+            .material_sources
+            .insert(crate_handle, material_source());
+        let (resources_tx, resources_rx) = flume::unbounded();
+        let mut sync = MaterialSync::default();
+        world
+            .set_mesh_material_params(
+                crate_handle,
+                MeshMaterialParams {
+                    roughness: Some(0.75),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sync.request_changes(&mut world, &gpu_scene, &resources_tx);
+        let request = next_material_request(&resources_rx);
+        sync.accept(MaterialReply {
+            object: crate_handle,
+            revision: request.revision,
+            result: Ok(MaterialLevels {
+                levels: material_levels(160),
+                created: vec![fake_material_id(161), fake_material_id(163)],
+            }),
+        });
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 6);
+        assert_eq!(
+            snapshot_materials(&mut world, &gpu_scene, crate_handle),
+            [fake_material_id(161), fake_material_id(163)]
+        );
+
+        world.despawn_many(&[crate_handle]).unwrap();
+        detach_object_render_data(&mut gpu_scene, &[crate_handle]);
+        sync.apply_replies(&world, &mut gpu_scene, &resources_tx, 12);
+        match resources_rx.try_recv().unwrap() {
+            RenderResourceRequest::ReleaseMaterials {
+                materials,
+                last_seq,
+            } => {
+                assert_eq!(materials, [fake_material_id(161), fake_material_id(163)]);
+                assert_eq!(last_seq, 12);
+            }
+            _ => panic!("despawned object's materials must be retired after submitted snapshots"),
+        }
+    }
+
     #[test]
     fn paused_snapshot_is_dropped_without_calling_the_renderer() {
         let mut backend = FakeBackend::default();
@@ -4643,6 +5777,7 @@ return Script
                 &mut backend,
                 &mut snapshot,
                 &mut history,
+                &mut Vec::new(),
                 true,
                 0,
                 0,
@@ -4752,11 +5887,9 @@ return Script
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
-            models: HashMap::new(),
-            textures: HashMap::new(),
-            material_assets: HashMap::new(),
-            shader_assets: HashMap::new(),
+            material_assets: Arc::new(PreparedMaterialAssets::default()),
             levels: Vec::new(),
             particles: Vec::new(),
         };
@@ -6684,6 +7817,7 @@ return Gun
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
         }))
     }
@@ -6695,7 +7829,8 @@ return Gun
         loads: PrefabLoads,
         gpu: GpuSceneTable,
         spawn_physics: SpawnPhysics,
-        pending: VecDeque<PrefabReply>,
+        pending: VecDeque<ScriptReply>,
+        material: MaterialSync,
         loader_rx: flume::Receiver<LoaderRequest>,
         render_rx: flume::Receiver<RenderResourceRequest>,
         elapsed: f64,
@@ -6728,6 +7863,7 @@ return Gun
                 gpu: GpuSceneTable::default(),
                 spawn_physics: SpawnPhysics::default(),
                 pending: VecDeque::new(),
+                material: MaterialSync::default(),
                 loader_rx,
                 render_rx,
                 elapsed: 0.0,
@@ -6761,7 +7897,7 @@ return Gun
         }
 
         fn reply(&mut self, reply: PrefabReply) {
-            self.pending.push_back(reply);
+            self.pending.push_back(ScriptReply::Prefab(reply));
             drain_prefab_replies(
                 &mut self.pending,
                 &mut self.scripts,
@@ -6769,6 +7905,7 @@ return Gun
                 &mut self.gpu,
                 &mut self.spawn_physics,
                 &mut self.loads,
+                &mut self.material,
                 &mut crate::game_ui::UiRegistry::default(),
             );
         }
@@ -7008,6 +8145,33 @@ return Gun
         assert!(render.worker.join().unwrap().is_ok());
     }
 
+    #[test]
+    fn material_release_waits_until_the_last_snapshot_is_dropped() {
+        let (released_tx, released_rx) = mpsc::channel();
+        let mut backend = FakeBackend {
+            released_materials: Some(released_tx),
+            ..FakeBackend::default()
+        };
+        let materials = vec![fake_material_id(77)];
+        let mut snapshot = empty_snapshot();
+        snapshot.sequence = 5;
+        let mut latest = Some(Arc::new(snapshot));
+        let mut releases = vec![PendingRelease {
+            target: ReleaseTarget::Materials(materials.clone()),
+            last_seq: 5,
+        }];
+
+        finish_releases(&mut backend, &mut releases, 4, &mut latest);
+        assert!(released_rx.try_recv().is_err());
+        assert_eq!(releases.len(), 1);
+        assert!(latest.is_some());
+
+        finish_releases(&mut backend, &mut releases, 5, &mut latest);
+        assert_eq!(released_rx.try_recv().unwrap(), materials);
+        assert!(releases.is_empty());
+        assert!(latest.is_none());
+    }
+
     /// Удержанный снимок с `seq ≤ last_seq` сбрасывается вместе с освобождением, поэтому
     /// перерисовка по смене debug view его не рисует. Снимок 4 отправляется только после того,
     /// как цикл принял смену view: перерисовка успевает отработать до приёма следующего снимка.
@@ -7088,11 +8252,9 @@ return Gun
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
-            models: HashMap::new(),
-            textures: HashMap::new(),
-            material_assets: HashMap::new(),
-            shader_assets: HashMap::new(),
+            material_assets: Arc::new(PreparedMaterialAssets::default()),
             levels: Vec::new(),
             particles: Vec::new(),
         };
@@ -7358,6 +8520,42 @@ mod particle_emitter_tests {
         assert_eq!(log, vec![8]);
         apply(&mut table, &mut log, ParticleRequest::Destroy(vec![a]));
         assert_eq!(log, vec![8], "повторное уничтожение не трогает эмиттер");
+    }
+}
+
+#[cfg(test)]
+mod particle_command_tests {
+    use super::resolve_particle_commands;
+    use engine_scene::world::ParticleCommand;
+    use engine_scene::{ObjectHandle, SceneDocument, World};
+    use std::collections::HashMap;
+
+    const SCENE: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+[[objects]]\nid = \"fire\"\n[objects.particle_emitter]\n\
+[[objects]]\nid = \"crate\"\n";
+
+    #[test]
+    fn commands_resolve_to_their_emitter_and_skip_objects_without_one() {
+        let world =
+            World::from_document(&SceneDocument::parse("test.rvescene", SCENE).unwrap()).unwrap();
+        let fire: ObjectHandle = world.handle("fire").unwrap();
+        let crate_handle: ObjectHandle = world.handle("crate").unwrap();
+        let emitters = HashMap::from([(fire, 7_u32)]);
+        let resolved = resolve_particle_commands(
+            &emitters,
+            &[
+                ParticleCommand::Burst {
+                    object: fire,
+                    count: 4,
+                },
+                ParticleCommand::Restart { object: fire },
+                ParticleCommand::Burst {
+                    object: crate_handle,
+                    count: 9,
+                },
+            ],
+        );
+        assert_eq!(resolved, vec![(7, Some(4)), (7, None)]);
     }
 }
 

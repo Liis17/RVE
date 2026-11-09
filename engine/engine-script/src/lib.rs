@@ -6,6 +6,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod abi_host;
 mod abi_string;
 mod actions;
+mod component_writes;
 mod host;
 mod library;
 mod lifecycle;

@@ -148,7 +148,7 @@ mod tests {
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
                 .count();
-            // Подокна Scene Assets, Project Prefabs, Project Settings и UI Editor открываются из меню Window.
+            // Scene Assets, Project Prefabs, Project Settings and UI Editor open from menus.
             let optional = matches!(
                 tab,
                 Tab::SceneAssets | Tab::ProjectPrefabs | Tab::ProjectSettings | Tab::UiEditor

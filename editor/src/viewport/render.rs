@@ -33,6 +33,7 @@ use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
 };
 use engine_scene::world::ObjectHandle;
+use engine_scene::world::ParticleCommand;
 use engine_scene::{
     AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, MaterialAlphaMode,
     MaterialAsset, MeshInstance, ParticleBlendMode, ParticleEmitterComponent,
@@ -1445,24 +1446,14 @@ impl SceneRenderer {
         preview_asset: Option<&str>,
         world: &World,
         frame: &SceneFrame,
+        particle_commands: &[ParticleCommand],
         scene_eye: Vec3,
         game_eye: Vec3,
         grid_camera_distance: Option<f32>,
         play_bridge: Option<&AnimationBridge>,
         capture_eye: Option<Vec3>,
     ) -> Result<(), RenderError> {
-        let mut active_asset_paths = world
-            .objects()
-            .iter()
-            .filter_map(|object| object.mesh_renderer.as_ref())
-            .flat_map(|mesh| mesh.materials.iter().flatten())
-            .map(|path| path.as_str().to_owned())
-            .collect::<HashSet<_>>();
-        if let Some(path) = preview_asset
-            && path.to_ascii_lowercase().ends_with(".rvemat")
-        {
-            active_asset_paths.insert(path.to_owned());
-        }
+        let active_asset_paths = active_material_paths(world, preview_asset);
         let preview_shader_path =
             preview_asset.filter(|path| path.to_ascii_lowercase().ends_with(".rveshader"));
         let asset_materials = self.prepare_asset_materials(
@@ -1483,7 +1474,7 @@ impl SceneRenderer {
         self.scene_draws.clear();
         self.game_draws.clear();
         self.capture_draws.clear();
-        self.sync_particles(renderer, world, frame)?;
+        self.sync_particles(renderer, world, frame, particle_commands)?;
         let palette_index = palette_indices(&self.skins, play_bridge.or(self.animation.bridge()));
         let used_object_materials = {
             let mut resources = DrawResources {
@@ -1979,6 +1970,7 @@ impl SceneRenderer {
         renderer: &mut Renderer,
         world: &World,
         frame: &SceneFrame,
+        commands: &[ParticleCommand],
     ) -> Result<(), RenderError> {
         // Старые ссылки на эмиттеры могут уйти на замену; при ошибке кадр не должен их использовать.
         self.particle_frames.clear();
@@ -2042,7 +2034,7 @@ impl SceneRenderer {
                 frames.push(ParticleEmitterFrame {
                     emitter: entry.id,
                     transform: instance.model.to_cols_array_2d(),
-                    emitting: true,
+                    emitting: instance.emitting,
                 });
             }
         }
@@ -2055,6 +2047,19 @@ impl SceneRenderer {
         for handle in removed {
             if let Some(old) = self.particle_emitters.remove(&handle) {
                 renderer.destroy_particle_emitter(old.id)?;
+            }
+        }
+        for command in commands {
+            let (object, burst) = match *command {
+                ParticleCommand::Restart { object } => (object, None),
+                ParticleCommand::Burst { object, count } => (object, Some(count)),
+            };
+            let Some(entry) = self.particle_emitters.get(&object) else {
+                continue;
+            };
+            match burst {
+                None => renderer.restart_particle_emitter(entry.id)?,
+                Some(count) => renderer.emit_particle_burst(entry.id, count)?,
             }
         }
         self.particle_frames = frames;
@@ -2289,11 +2294,11 @@ fn append_world_draws(
         for (mesh_index, (mesh_id, base_material, base_material_id)) in
             model.meshes.iter().enumerate()
         {
-            let assigned = mesh
-                .materials
-                .get(mesh_index)
-                .and_then(Option::as_ref)
-                .and_then(|path| resources.asset_materials.get(path.as_str()));
+            // Путь из set_material заменяет слоты всех частей, как в runtime.
+            let slot = world
+                .mesh_material_path(instance.object)
+                .or_else(|| mesh.materials.get(mesh_index).and_then(Option::as_ref));
+            let assigned = slot.and_then(|path| resources.asset_materials.get(path.as_str()));
             let (base_material, base_material_id) = assigned
                 .map_or((*base_material, *base_material_id), |(material, id)| {
                     (*material, *id)
@@ -3263,6 +3268,37 @@ fn materials_using_shader(
     paths
 }
 
+fn active_material_paths(world: &World, preview_asset: Option<&str>) -> HashSet<String> {
+    let mut paths = world
+        .objects()
+        .iter()
+        .filter_map(|object| object.mesh_renderer.as_ref())
+        .flat_map(|mesh| mesh.materials.iter().flatten())
+        .map(|path| path.as_str().to_owned())
+        .collect::<HashSet<_>>();
+    // Все объявленные `.rvemat` готовятся, а не только слоты: скрипт назначает их через set_material.
+    paths.extend(
+        world
+            .asset_paths()
+            .iter()
+            .filter(|path| path.as_str().to_ascii_lowercase().ends_with(".rvemat"))
+            .map(|path| path.as_str().to_owned()),
+    );
+    paths.extend(
+        world
+            .objects()
+            .iter()
+            .filter_map(|object| world.mesh_material_path(object.handle))
+            .map(|path| path.as_str().to_owned()),
+    );
+    if let Some(path) = preview_asset
+        && path.to_ascii_lowercase().ends_with(".rvemat")
+    {
+        paths.insert(path.to_owned());
+    }
+    paths
+}
+
 /// Шейдеры без ссылок из материалов. Шейдер превью исключается: его материал создаётся позже
 /// в том же кадре, и уничтожение заставило бы компилировать шейдер заново.
 fn unused_surface_shaders<T: Copy + Eq + Hash>(
@@ -3280,7 +3316,9 @@ fn unused_surface_shaders<T: Copy + Eq + Hash>(
 mod tests {
     use super::*;
     use engine_files::VirtualPath;
-    use engine_scene::{EnvironmentComponent, LodLevel, ProceduralSkyComponent};
+    use engine_scene::{
+        EnvironmentComponent, LodLevel, PrefabTemplate, ProceduralSkyComponent, SpawnOptions,
+    };
 
     #[test]
     fn hot_reload_rebuilds_only_new_revisions_that_have_not_failed() {
@@ -3325,6 +3363,32 @@ mod tests {
         let referenced = HashSet::from([3_usize]);
         let retired = unused_surface_shaders(loaded, &referenced, Some("/s/preview.rveshader"));
         assert_eq!(retired, [("/s/unused.rveshader".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn spawned_prefab_material_is_active_for_play_rendering() {
+        let document = engine_scene::SceneDocument::parse(
+            "materials.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let prefab_path = VirtualPath::parse("prefabs/crate.rveprefab").unwrap();
+        let prefab = PrefabTemplate::load(&prefab_path, &mut |_| {
+            Ok("[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n[[objects]]\nid = \"crate\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n".to_owned())
+        })
+        .unwrap();
+        let handles = world
+            .spawn(
+                vec![world.reserve_object()],
+                &prefab,
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let material = VirtualPath::parse("/materials/gold.rvemat").unwrap();
+        world.set_mesh_material_path(handles[0], material).unwrap();
+
+        assert!(active_material_paths(&world, None).contains("materials/gold.rvemat"));
     }
 
     fn camera() -> Camera {

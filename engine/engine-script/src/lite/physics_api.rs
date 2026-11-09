@@ -542,14 +542,14 @@ fn objects_table(
 }
 
 /// Аргумент метода-таблицы; `self` отбрасывается так же, как в остальных методах объекта.
-fn table_argument(arguments: MultiValue, name: &str) -> mlua::Result<Table> {
+pub(super) fn table_argument(arguments: MultiValue, name: &str) -> mlua::Result<Table> {
     match method_argument(arguments, name)? {
         Value::Table(table) => Ok(table),
         _ => Err(LuaError::runtime(format!("{name} expects a table"))),
     }
 }
 
-fn reject_unknown_fields(table: &Table, known: &[&str], what: &str) -> mlua::Result<()> {
+pub(super) fn reject_unknown_fields(table: &Table, known: &[&str], what: &str) -> mlua::Result<()> {
     for pair in table.clone().pairs::<String, Value>() {
         let (key, _) = pair?;
         if !known.contains(&key.as_str()) {
@@ -561,7 +561,7 @@ fn reject_unknown_fields(table: &Table, known: &[&str], what: &str) -> mlua::Res
     Ok(())
 }
 
-fn number_field(table: &Table, key: &str) -> mlua::Result<Option<f32>> {
+pub(super) fn number_field(table: &Table, key: &str) -> mlua::Result<Option<f32>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
         Value::Integer(value) => finite_f32(value as f64, key).map(Some),
@@ -570,7 +570,7 @@ fn number_field(table: &Table, key: &str) -> mlua::Result<Option<f32>> {
     }
 }
 
-fn bool_field(table: &Table, key: &str) -> mlua::Result<Option<bool>> {
+pub(super) fn bool_field(table: &Table, key: &str) -> mlua::Result<Option<bool>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
         Value::Boolean(value) => Ok(Some(value)),
@@ -578,7 +578,7 @@ fn bool_field(table: &Table, key: &str) -> mlua::Result<Option<bool>> {
     }
 }
 
-fn vector_field(table: &Table, key: &str) -> mlua::Result<Option<[f32; 3]>> {
+pub(super) fn vector_field(table: &Table, key: &str) -> mlua::Result<Option<[f32; 3]>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
         Value::Table(vector) => read_vector(&vector, key).map(Some),
@@ -586,7 +586,7 @@ fn vector_field(table: &Table, key: &str) -> mlua::Result<Option<[f32; 3]>> {
     }
 }
 
-fn string_field(table: &Table, key: &str) -> mlua::Result<Option<String>> {
+pub(super) fn string_field(table: &Table, key: &str) -> mlua::Result<Option<String>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
         Value::String(value) => Ok(Some(value.to_str()?.to_owned())),

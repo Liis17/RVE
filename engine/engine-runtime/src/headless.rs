@@ -5,7 +5,9 @@
 //! процесс без `on_destroy` скриптов.
 
 use crate::pipeline::ScriptControl;
-use crate::prefabs::{LoadedPrefab, PrefabReady, PrefabReply, RenderResourceRequest};
+use crate::prefabs::{
+    LoadedPrefab, MaterialReply, PrefabReady, PrefabReply, RenderResourceRequest,
+};
 use flume::{Receiver, RecvTimeoutError, Sender};
 use std::io::BufRead;
 use std::sync::Arc;
@@ -42,7 +44,21 @@ pub(crate) fn run_resource_responder(
                     break;
                 }
             }
-            Ok(RenderResourceRequest::Particle(_) | RenderResourceRequest::Release { .. }) => {}
+            Ok(RenderResourceRequest::Material(request)) => {
+                let reply = ScriptControl::Material(Box::new(MaterialReply {
+                    object: request.object,
+                    revision: request.revision,
+                    result: Err("headless-сервер не создаёт GPU-материалы".to_owned()),
+                }));
+                if script_tx.send(reply).is_err() {
+                    break;
+                }
+            }
+            Ok(
+                RenderResourceRequest::Particle(_)
+                | RenderResourceRequest::Release { .. }
+                | RenderResourceRequest::ReleaseMaterials { .. },
+            ) => {}
             Err(RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::Acquire) {
                     break;
@@ -85,6 +101,7 @@ mod tests {
     use crate::prefabs::{
         LoadedPrefab, PrefabCpu, PrefabReply, PrefabToken, RenderResourceRequest,
     };
+    use crate::scene::PreparedMaterialAssets;
     use engine_files::VirtualPath;
     use engine_scene::PrefabTemplate;
     use std::collections::BTreeMap;
@@ -107,11 +124,9 @@ mod tests {
                 template: Arc::new(template),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
+                material_models: Vec::new(),
             },
-            models: Default::default(),
-            textures: Default::default(),
-            material_assets: Default::default(),
-            shader_assets: Default::default(),
+            material_assets: Arc::new(PreparedMaterialAssets::default()),
             levels: Vec::new(),
             particles: Vec::new(),
         }
