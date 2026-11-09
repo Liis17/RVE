@@ -64,7 +64,7 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
     engine-project, engine-render, engine-resources, engine-scene,
     engine-script, engine-window, engine-console, engine-ui.
   - rve-build: engine-assets, engine-files, engine-pak, engine-project,
-    engine-resources, engine-scene, engine-script, rve-sdk.
+    engine-render, engine-resources, engine-scene, engine-script, rve-sdk.
   - engine-script (потребители engine-runtime и rve-editor): engine-console, engine-files, engine-physics, engine-scene, rve-sdk.
   - engine-audio (потребители engine-runtime и rve-editor): engine-resources, engine-scene, cpal, lewton, flume, rtrb, log.
   - engine-animation (потребители engine-runtime и rve-editor): engine-assets, engine-files, engine-scene, glam.

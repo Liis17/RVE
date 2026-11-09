@@ -11,7 +11,7 @@ use crate::state::EditorState;
 use engine_mcp::{Permission, ToolCall, ToolResult, ToolSpec};
 use engine_render::{CaptureTicket, CapturedImage, RenderError};
 use engine_scene::camera::Camera;
-use engine_scene::{CameraSettings, PostProcessSettings, World};
+use engine_scene::{CameraSettings, PostProcessSettings, ScreenShaderRef, World};
 use serde_json::{Value, json};
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
@@ -266,6 +266,24 @@ pub(crate) fn object_camera(world: &World, id: &str) -> Option<CaptureCamera> {
         post: world.post_process(handle).copied().unwrap_or_default(),
         scene_like: false,
     })
+}
+
+/// Экранные шейдеры кадра захвата, как у панели того же вида: Editor их не применяет, Game берёт
+/// шейдеры Game-камеры, камера объекта — свои.
+pub(crate) fn screen_shaders_for(
+    choice: &CameraChoice,
+    game: &[ScreenShaderRef],
+    world: &World,
+) -> Vec<ScreenShaderRef> {
+    match choice {
+        CameraChoice::Editor => Vec::new(),
+        CameraChoice::Game => game.to_vec(),
+        CameraChoice::Object(id) => world
+            .handle(id)
+            .and_then(|handle| world.screen_shaders(handle))
+            .map(<[_]>::to_vec)
+            .unwrap_or_default(),
+    }
 }
 
 fn prepare(
@@ -781,6 +799,49 @@ mod tests {
         assert!(needs_scene_frame(false, true, false));
         assert!(needs_scene_frame(false, false, true));
         assert!(!needs_scene_frame(false, false, false));
+    }
+
+    #[test]
+    fn capture_screen_shaders_follow_the_panel_that_shows_the_camera() {
+        let document = engine_scene::SceneDocument::parse(
+            "capture.rvescene",
+            r#"
+[[assets]]
+path="/fx/vhs.glsl"
+[[objects]]
+id="cam"
+[objects.camera]
+active=true
+[[objects.camera.screen_shaders]]
+shader="/fx/vhs.glsl"
+stage="after_post"
+[[objects]]
+id="plain"
+[objects.camera]
+active=false
+"#,
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let game = world
+            .screen_shaders(world.handle("cam").unwrap())
+            .unwrap()
+            .to_vec();
+        assert_eq!(game.len(), 1);
+
+        assert!(screen_shaders_for(&CameraChoice::Editor, &game, &world).is_empty());
+        assert_eq!(screen_shaders_for(&CameraChoice::Game, &game, &world), game);
+        assert_eq!(
+            screen_shaders_for(&CameraChoice::Object("cam".to_owned()), &[], &world),
+            game
+        );
+        assert!(
+            screen_shaders_for(&CameraChoice::Object("plain".to_owned()), &game, &world).is_empty()
+        );
+        assert!(
+            screen_shaders_for(&CameraChoice::Object("missing".to_owned()), &game, &world)
+                .is_empty()
+        );
     }
 
     #[test]

@@ -524,6 +524,7 @@ impl EditorApp {
         self.state.previews.clear();
         self.state.clear_lite_schemas();
         self.state.models.clear();
+        self.state.screen_shader_errors.clear();
         self.state.materials = crate::materials::MaterialLibrary::default();
         self.state.inspected_asset = None;
         if let Some(texture) = self.state.material_preview_texture.take() {
@@ -724,6 +725,7 @@ impl EditorApp {
                 &changes,
                 &mut self.state.model_loader,
                 &mut self.state.log,
+                &mut self.state.screen_shader_errors,
             )
         {
             self.fail(&error);
@@ -2022,6 +2024,8 @@ fn render_scene_frame(
         game_camera,
         game_settings,
         game_post,
+        game_screen_shaders,
+        capture_screen_shaders,
         game_camera_handle,
         has_light,
         frame_target,
@@ -2082,17 +2086,43 @@ fn render_scene_frame(
                 model.bounds()?,
             ))
         });
+        // Экранные шейдеры берёт камера, которую показывает Game-вид, а не активная камера сцены.
+        let game_screen_shaders = parts
+            .world
+            .screen_shaders(game_camera_handle)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        // Кадр захвата использует шейдеры своей камеры: как Game-вид, камера объекта или ничего для Scene.
+        let capture_screen_shaders = capture_frame.as_ref().map_or_else(Vec::new, |frame| {
+            capture::screen_shaders_for(&frame.camera, &game_screen_shaders, &*parts.world)
+        });
         (
             scene_frame,
             game_camera,
             game_settings,
             game_post,
+            game_screen_shaders,
+            capture_screen_shaders,
             game_camera_handle,
             has_light,
             frame_target,
         )
     };
     state.pending_frame = still_loading;
+    if let Some(project) = state.project.as_ref() {
+        gpu.scene.sync_screen_shaders(
+            &mut gpu.renderer,
+            project,
+            &game_screen_shaders,
+            &mut state.screen_shader_errors,
+        );
+        gpu.scene.sync_screen_shaders(
+            &mut gpu.renderer,
+            project,
+            &capture_screen_shaders,
+            &mut state.screen_shader_errors,
+        );
+    }
     if let Some((center, radius)) = frame_target
         && state.camera.needs_framing(center, radius)
     {
@@ -2220,6 +2250,7 @@ fn render_scene_frame(
             height,
             scene_settings,
             scene_post,
+            &[],
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
@@ -2238,6 +2269,7 @@ fn render_scene_frame(
             height,
             game_settings,
             game_post,
+            &game_screen_shaders,
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
@@ -2264,6 +2296,7 @@ fn render_scene_frame(
                 height,
                 camera.settings,
                 camera.post,
+                &capture_screen_shaders,
                 &scene_frame.light,
                 &local_lights,
                 &local_light_shadows,
@@ -2821,6 +2854,17 @@ mod tests {
                 .entries()
                 .any(|entry| entry.message.contains("префаба"))
         );
+    }
+
+    #[test]
+    fn opening_a_project_forgets_screen_shader_errors_of_the_previous_one() {
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.screen_shader_errors.insert(
+            "/fx/old.glsl".to_owned(),
+            "ошибка прежнего проекта".to_owned(),
+        );
+        app.reset_project_assets();
+        assert!(app.state.screen_shader_errors.is_empty());
     }
 
     #[test]

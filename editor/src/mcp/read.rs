@@ -686,6 +686,7 @@ fn parse_asset_kind(input: &str) -> Result<AssetKind, String> {
         "prefab" => Ok(AssetKind::Prefab),
         "camera_settings" => Ok(AssetKind::CameraSettings),
         "post_process" => Ok(AssetKind::PostProcess),
+        "screen_shader" => Ok(AssetKind::ScreenShader),
         "physics_material" => Ok(AssetKind::PhysicsMaterial),
         "material" => Ok(AssetKind::Material),
         "shader" => Ok(AssetKind::Shader),
@@ -705,6 +706,7 @@ fn asset_kind_name(kind: AssetKind) -> &'static str {
         AssetKind::Prefab => "prefab",
         AssetKind::CameraSettings => "camera_settings",
         AssetKind::PostProcess => "post_process",
+        AssetKind::ScreenShader => "screen_shader",
         AssetKind::PhysicsMaterial => "physics_material",
         AssetKind::Material => "material",
         AssetKind::Shader => "shader",
@@ -844,6 +846,16 @@ mod tests {
                 permissions
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn screen_shader_asset_kind_name_round_trips_through_list_filter() {
+        let kind = crate::assets_fs::AssetKind::of("fx/vhs.glsl");
+        assert_eq!(kind, crate::assets_fs::AssetKind::ScreenShader);
+        assert_eq!(
+            super::parse_asset_kind(super::asset_kind_name(kind)),
+            Ok(kind)
         );
     }
 

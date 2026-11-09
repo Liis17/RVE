@@ -400,6 +400,11 @@ fn run_from_args(
         prefabs,
         ..
     } = prepared;
+    let mut render_assets = render_assets;
+    if !headless {
+        // Исходники экранных шейдеров читает только игровой клиент; headless их не открывает.
+        render_assets.screen_shaders = scene::load_screen_shader_sources(&resource_handle, &world);
+    }
     let (script_tx, script_rx) = flume::unbounded();
     let (frame_tx, frame_rx) = flume::bounded(1);
     let (render_tx, render_rx) = flume::unbounded();

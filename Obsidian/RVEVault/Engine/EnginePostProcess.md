@@ -71,7 +71,9 @@ TOML с таблицами `exposure`, `tonemapping`, `bloom`, `ambient_occlusio
 6. Filters — motion blur (по velocity), затем depth of field; оба используют scratch-цели HDR с перестановкой ping-pong.
 7. Exposure — гистограмма log-яркости (WGSL, 256 бинов, диапазон log2 −10..+4), усреднение и адаптация по перцентилям low/high с отдельными скоростями роста и падения. Адаптированный EV хранится в буфере на вид.
 8. Bloom — prefilter, downsample и аддитивный upsample; уровней не больше 6, строится, пока меньшая сторона не меньше 8. Prefilter сравнивает порог с яркостью в той же экспонированной шкале, что composite (ручной EV плюс adapted EV в auto), и читает adapted EV из буфера вида. Сам bloom хранится без экспозиции.
-9. Tonemap composite (`tonemap.frag`): chromatic aberration → сложение с bloom → экспозиция (EV плюс адаптированный EV при auto) → цветокоррекция в linear → tonemapper → lift/gamma/gain → vignette. Затем output-проход (`output.frag`) добавляет film grain.
+9. Tonemap composite (`tonemap.frag`): chromatic aberration → сложение с bloom → экспозиция (EV плюс адаптированный EV при auto) → цветокоррекция в linear → tonemapper → lift/gamma/gain → vignette. После composite идут экранные шейдеры `after_post` ([[Engine/EngineScreenShaders]]). Затем output-проход (`output.frag`) добавляет film grain.
+
+Экранные шейдеры `before_post` записываются после temporal resolve и перед filters (п. 6), поэтому motion blur, DoF, экспозиция, bloom и composite видят их выход. Без пользовательских шейдеров эти проходы не записываются.
 
 Буфер экспозиции и адаптация принадлежат виду (`TemporalView`), а не кадровому слоту. Порядок адаптации между кадрами одного вида задаёт барьер в начале записи экспозиции (`record_exposure` в `engine/engine-render/src/exposure.rs`): его источник — стадии `COMPUTE_SHADER | FRAGMENT_SHADER`, назначение — заполнение гистограммы. Барьер покрывает запись адаптации и чтение composite/bloom предыдущего кадра вида; семафоров для этого нет. CPU не ждёт. Состояние адаптации меняется только после успешного submit.
 

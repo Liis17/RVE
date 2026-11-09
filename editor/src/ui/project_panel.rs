@@ -197,6 +197,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
         AssetKind::Prefab => "PREFAB",
         AssetKind::CameraSettings => "CAMERA",
         AssetKind::PostProcess => "POST",
+        AssetKind::ScreenShader => "GLSL",
         AssetKind::PhysicsMaterial => "PHYSMAT",
         AssetKind::Material => "MATERIAL",
         AssetKind::Shader => "SHADER",

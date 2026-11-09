@@ -4,6 +4,7 @@
 //! без GPU. Выполнение проходов остаётся в `lib.rs` и использует результаты этого модуля.
 
 use crate::filters::FilterParams;
+use crate::screen_shader::{ScreenChain, ScreenShaderStage, ScreenShaders};
 use crate::{DebugView, Tonemapper};
 
 /// Число `vec4` в push constants composite-прохода (tonemap.frag).
@@ -716,11 +717,16 @@ pub struct PostFrame {
     pub filters: FilterParams,
     /// Настройки экранного AO; применяются только при плане prepass.
     pub ao: AmbientOcclusion,
+    /// Экранные шейдеры до motion blur и DoF; пусто без Lit-вида и при нулевом extent.
+    pub(crate) screen_before: ScreenChain,
+    /// Экранные шейдеры после composite; пусто без Lit-вида и при нулевом extent.
+    pub(crate) screen_after: ScreenChain,
 }
 
 impl PostFrame {
     /// Строит план и параметры вида; сид зерна берётся из счётчика кадров renderer.
-    /// `near_far` — плоскости отсечения камеры для линеаризации глубины в DoF.
+    /// `near_far` — плоскости отсечения камеры для линеаризации глубины в DoF; `screens` —
+    /// экранные шейдеры вида, которые попадают в цепочку только для `DebugView::Lit`.
     pub fn new(
         post: &PostProcess,
         debug_view: DebugView,
@@ -728,9 +734,25 @@ impl PostFrame {
         output_extent: (u32, u32),
         frame_serial: u32,
         near_far: [f32; 2],
+        screens: &ScreenShaders,
     ) -> Self {
         let plan = plan(post, debug_view, render_extent, output_extent);
+        let sized = render_extent.0 > 0
+            && render_extent.1 > 0
+            && output_extent.0 > 0
+            && output_extent.1 > 0;
+        let screen_frame = frame_serial % GRAIN_SEED_PERIOD;
+        let (screen_before, screen_after) = if debug_view == DebugView::Lit && sized {
+            (
+                ScreenChain::collect(screens, ScreenShaderStage::BeforePost, screen_frame),
+                ScreenChain::collect(screens, ScreenShaderStage::AfterPost, screen_frame),
+            )
+        } else {
+            (ScreenChain::default(), ScreenChain::default())
+        };
         Self {
+            screen_before,
+            screen_after,
             plan,
             composite: composite_params(post, &plan, debug_view),
             grain: grain_params(&plan, post, frame_serial),
@@ -769,6 +791,7 @@ pub fn grain_params(plan: &PostPlan, post: &PostProcess, frame_serial: u32) -> [
 mod tests {
     use super::plan as build_plan;
     use super::*;
+    use crate::screen_shader::{SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass};
 
     const ALL_VIEWS: [DebugView; 6] = [
         DebugView::Lit,
@@ -1040,6 +1063,95 @@ mod tests {
         assert_eq!(motion_parameters(&motion), [0.25, 24.0, 16.0, 0.0]);
     }
 
+    fn screen_pass(id: usize, stage: ScreenShaderStage) -> Option<ScreenShaderPass> {
+        Some(ScreenShaderPass {
+            shader: ScreenShaderId(id),
+            stage,
+            params: [0.25; SCREEN_SHADER_PARAM_COUNT],
+        })
+    }
+
+    #[test]
+    fn screen_chains_keep_order_and_split_by_stage() {
+        let shaders = ScreenShaders {
+            passes: [
+                screen_pass(0, ScreenShaderStage::BeforePost),
+                screen_pass(1, ScreenShaderStage::AfterPost),
+                screen_pass(2, ScreenShaderStage::BeforePost),
+                screen_pass(3, ScreenShaderStage::AfterPost),
+            ],
+            time: 12.5,
+        };
+        let frame = PostFrame::new(
+            &PostProcess::default(),
+            DebugView::Lit,
+            (640, 360),
+            (1280, 720),
+            4097,
+            [0.1, 100.0],
+            &shaders,
+        );
+        let before: Vec<usize> = frame
+            .screen_before
+            .passes
+            .iter()
+            .flatten()
+            .map(|pass| pass.shader.0)
+            .collect();
+        let after: Vec<usize> = frame
+            .screen_after
+            .passes
+            .iter()
+            .flatten()
+            .map(|pass| pass.shader.0)
+            .collect();
+        assert_eq!(before, [0, 2]);
+        assert_eq!(after, [1, 3]);
+        assert_eq!(frame.screen_before.time, 12.5);
+        assert_eq!(
+            frame.screen_before.frame, 1,
+            "номер кадра берётся по модулю периода"
+        );
+    }
+
+    #[test]
+    fn screen_chains_are_empty_without_shaders_lit_view_or_extent() {
+        let shaders = ScreenShaders {
+            passes: [
+                screen_pass(0, ScreenShaderStage::AfterPost),
+                None,
+                None,
+                None,
+            ],
+            time: 0.0,
+        };
+        let post = PostProcess::default();
+        let cases = [
+            (DebugView::Lit, (0, 360), (1280, 720)),
+            (DebugView::Wireframe, (640, 360), (1280, 720)),
+            (DebugView::Lit, (640, 360), (0, 720)),
+        ];
+        for (debug_view, render, output) in cases {
+            let frame = PostFrame::new(&post, debug_view, render, output, 0, [0.1, 1.0], &shaders);
+            assert_eq!(
+                frame.screen_after.len(),
+                0,
+                "{debug_view:?} {render:?} {output:?}"
+            );
+        }
+        let idle = PostFrame::new(
+            &post,
+            DebugView::Lit,
+            (640, 360),
+            (1280, 720),
+            0,
+            [0.1, 1.0],
+            &ScreenShaders::default(),
+        );
+        assert_eq!(idle.screen_before.len(), 0);
+        assert_eq!(idle.screen_after.len(), 0);
+    }
+
     #[test]
     fn filter_parameters_follow_the_plan_and_depth_planes() {
         let mut post = PostProcess::default();
@@ -1052,6 +1164,7 @@ mod tests {
             (1280, 720),
             0,
             [0.1, 1000.0],
+            &ScreenShaders::default(),
         );
         assert!(lit.filters.motion.is_some() && lit.filters.dof.is_some());
         assert_eq!(lit.filters.near_far, [0.1, 1000.0]);
@@ -1062,6 +1175,7 @@ mod tests {
             (1280, 720),
             0,
             [0.1, 1000.0],
+            &ScreenShaders::default(),
         );
         assert_eq!(wireframe.filters.motion, None);
         assert_eq!(wireframe.filters.dof, None);
