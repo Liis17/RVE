@@ -446,6 +446,7 @@ fn component_present(object: &WorldObject, kind: &ComponentKind) -> bool {
         ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ComponentKind::Script(path) => object
             .lite_scripts
             .iter()

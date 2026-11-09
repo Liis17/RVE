@@ -55,6 +55,14 @@ pub fn show_with_mcp(
     state.game_view.visible = false;
     state.game_view.hovered = false;
     state.game_view.rect = None;
+    if state.ui_editor_rect.is_none() {
+        state.ui_editor_active = false;
+    }
+    if ui.input(|i| i.pointer.any_pressed()) {
+        state.ui_editor_active = state
+            .ui_editor_rect
+            .is_some_and(|r| ui.input(|i| i.pointer.interact_pos().is_some_and(|p| r.contains(p))));
+    }
     state.material_preview.visible = false;
     if std::mem::take(&mut state.preview_requested) {
         if let Some(path) = dock.find_tab(&Tab::MaterialPreview) {
@@ -64,6 +72,25 @@ pub fn show_with_mcp(
         }
     }
     toolbar::handle_shortcuts(ui.ctx(), state);
+    state.ui_editor_rect = None;
+    if std::mem::take(&mut state.ui_editor_requested) {
+        if !crate::layout::is_open(dock, Tab::UiEditor) {
+            if let Some(scene) = dock
+                .find_tab(&Tab::Scene)
+                .or_else(|| dock.find_tab(&Tab::Game))
+            {
+                dock.set_focused_node_and_surface(scene.node_path());
+            }
+            dock.push_to_focused_leaf(Tab::UiEditor);
+        }
+        if let Some(path) = dock.find_tab(&Tab::UiEditor) {
+            let _ = dock.set_active_tab(path);
+        }
+    }
+    state.ui_authoring = dock.find_tab(&Tab::UiEditor).is_some_and(|path| {
+        dock.leaf(path.node_path())
+            .is_ok_and(|leaf| leaf.active == path.tab && !leaf.collapsed)
+    }) && state.ui_document.is_some();
     toolbar::show_with_mcp(ui, state, dock, preferences, mcp_settings);
     show_status_bar(ui, state);
 
@@ -79,6 +106,7 @@ pub fn show_with_mcp(
     show_apply_prompt(ui.ctx(), state);
     show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
+    crate::ui_editor::pending_dialog(ui.ctx(), state);
     show_new_project_dialog(ui.ctx(), state);
     preferences::show(ui.ctx(), preferences, mcp_status);
     state.smart_zoom = false;

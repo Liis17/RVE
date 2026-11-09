@@ -23,7 +23,12 @@ use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams,
     ScriptTime, ScriptTransform,
 };
+use crate::ui::{QueuedUiEvent, UiDelivery, UiScriptState, owner_key, queue_live};
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
+use engine_files::VirtualPath;
+use engine_gui::document::UiDocument;
+use engine_gui::events::UiEvent;
+use engine_gui::system::UiSystem;
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
 use engine_project::InputSettings;
 use engine_scene::{
@@ -33,7 +38,7 @@ use engine_scene::{
 };
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use rve_sdk::abi::RveScriptDesc;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -226,6 +231,8 @@ pub struct ScriptHost {
     net_errors: NetErrorLog,
     /// Ошибки callback по участнику с прошлого drain; сообщения от одного пира.
     peer_faults: HashMap<PeerId, u32>,
+    /// Игровой UI: `UiSystem`, документы, канвасы компонентов и очередь событий; общий с транзакцией.
+    ui: Rc<RefCell<UiScriptState>>,
 }
 
 /// Время последнего `update` хоста по фазам. Все поля нулевые до первого `update`.
@@ -272,6 +279,8 @@ enum Phase {
     PhysicsEvent(ScriptPhysicsEvent),
     /// Сетевое событие; его данные передаются в `call_instance` отдельно.
     Net,
+    /// Событие UI; его данные передаются в `call_instance` отдельно.
+    Ui,
     Destroy,
 }
 
@@ -392,6 +401,7 @@ impl ScriptHost {
         }
         let events = Rc::new(RefCell::new(ScriptEventQueue::default()));
         let active_source = Rc::new(RefCell::new(scene_name.to_owned()));
+        let ui = Rc::new(RefCell::new(UiScriptState::default()));
         let active_call = Rc::new(Cell::new(std::ptr::null_mut()));
         let active_owner = Rc::new(Cell::new(None));
         let commands = Rc::new(RefCell::new(BTreeMap::new()));
@@ -430,7 +440,7 @@ impl ScriptHost {
             active_owner,
             commands,
             commands_generation,
-            transaction: ScriptTransaction::default(),
+            transaction: ScriptTransaction::with_ui(ui.clone()),
             queued_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             queued_bytes: 0,
             audio_requests: Vec::new(),
@@ -455,6 +465,7 @@ impl ScriptHost {
             inbound: InboundBudget::default(),
             net_errors: NetErrorLog::default(),
             peer_faults: HashMap::new(),
+            ui,
         };
 
         for object in world.objects() {
@@ -909,12 +920,43 @@ impl ScriptHost {
         });
     }
 
+    /// Регистрирует предзагруженный `.rveui`. `open` и канвасы компонентов принимают только такие
+    /// документы; вызывать до [`Self::start`], чтобы канвасы сцены открылись до `on_start`.
+    pub fn register_ui_document(&mut self, path: VirtualPath, document: Arc<UiDocument>) {
+        self.ui
+            .borrow_mut()
+            .documents
+            .insert(path.as_str().to_owned(), document);
+    }
+
+    /// Состояние UI для runtime и редактора: ввод, регистрация шрифтов и картинок, paint.
+    pub fn ui(&self) -> Ref<'_, UiSystem> {
+        Ref::map(self.ui.borrow(), |state| &state.system)
+    }
+
+    /// Изменяемое состояние UI вне callback скриптов.
+    pub fn ui_mut(&mut self) -> RefMut<'_, UiSystem> {
+        RefMut::map(self.ui.borrow_mut(), |state| &mut state.system)
+    }
+
+    /// Ставит события UI, например из `UiSystem::update`; они доходят до `on_ui_event`
+    /// в начале следующего update. Событие канваса, закрытого к доставке, пропускается.
+    pub fn queue_ui_events(&mut self, events: impl IntoIterator<Item = UiEvent>) {
+        let mut state = self.ui.borrow_mut();
+        let queued: Vec<QueuedUiEvent> = events
+            .into_iter()
+            .filter_map(|event| queue_live(&state.system, event))
+            .collect();
+        state.queued.extend(queued);
+    }
+
     /// Runs on_start once. update also calls start automatically if needed.
     pub fn start(&mut self, world: &mut World, time: ScriptTime) {
         if self.started || self.destroyed {
             return;
         }
         self.started = true;
+        self.open_scene_canvases(world);
         self.sync_activity(world, time);
         self.apply_lifecycle(world, time);
     }
@@ -1403,6 +1445,7 @@ impl ScriptHost {
             self.deliver_physics_events(world, time);
             self.deliver_trigger_stays(world, time);
             profile.physics_events = started.elapsed();
+            self.deliver_ui_events(world, time);
             self.deliver_net_events(world, time);
         }
 
@@ -1434,7 +1477,16 @@ impl ScriptHost {
             let outcome = if matches!(phase, Phase::Destroy) {
                 self.call_destroy(index, world, time, time_error.as_deref())
             } else {
-                self.call_instance(index, world, phase, time, None, None, time_error.as_deref())
+                self.call_instance(
+                    index,
+                    world,
+                    phase,
+                    time,
+                    None,
+                    None,
+                    None,
+                    time_error.as_deref(),
+                )
             };
             let elapsed = started.elapsed();
             if is_lite {
@@ -1553,13 +1605,23 @@ impl ScriptHost {
                 time,
                 None,
                 None,
+                None,
                 time_error,
             ) {
                 CallOutcome::Committed => {}
                 outcome => return outcome,
             }
         }
-        self.call_instance(index, world, Phase::Destroy, time, None, None, time_error)
+        self.call_instance(
+            index,
+            world,
+            Phase::Destroy,
+            time,
+            None,
+            None,
+            None,
+            time_error,
+        )
     }
 
     fn run_transition(
@@ -1570,7 +1632,7 @@ impl ScriptHost {
         time: ScriptTime,
         time_error: Option<&str>,
     ) {
-        match self.call_instance(index, world, phase, time, None, None, time_error) {
+        match self.call_instance(index, world, phase, time, None, None, None, time_error) {
             CallOutcome::Committed => {}
             CallOutcome::Interrupted => self.disable_instance(index),
             CallOutcome::Failed(message) => self.fail_instance(index, message),
@@ -1605,6 +1667,7 @@ impl ScriptHost {
                     Phase::Message,
                     time,
                     Some(&message),
+                    None,
                     None,
                     time_error.as_deref(),
                 ) {
@@ -1664,6 +1727,7 @@ impl ScriptHost {
                     time,
                     None,
                     Some(&event),
+                    None,
                     time_error.as_deref(),
                 ) {
                     CallOutcome::Committed => {}
@@ -1714,6 +1778,129 @@ impl ScriptHost {
             source: self.scene_name.clone(),
             message,
         });
+    }
+
+    /// Доставляет `on_ui_event` экземплярам владельца канваса; каждая доставка — отдельная транзакция.
+    fn deliver_ui_events(&mut self, world: &mut World, time: ScriptTime) {
+        // События, поставленные во время доставки, ждут следующего update.
+        let events = std::mem::take(&mut self.ui.borrow_mut().queued);
+        if events.is_empty() {
+            return;
+        }
+        let time_error = lite::set_time(&self.lua_time, time)
+            .err()
+            .map(|error| error.to_string());
+        for QueuedUiEvent { owner, delivery } in events {
+            let object = owner;
+            let targets: Vec<usize> = (0..self.instances.len())
+                .filter(|&index| {
+                    self.instances[index].as_ref().is_some_and(|instance| {
+                        instance.enabled && instance.running && instance.handle == object
+                    }) && self.has_ui_callback(index)
+                })
+                .collect();
+            for index in targets {
+                // Экземпляр мог отключиться предыдущим событием этого же кадра.
+                if !self.instances[index]
+                    .as_ref()
+                    .is_some_and(|instance| instance.enabled && instance.running)
+                {
+                    continue;
+                }
+                match self.call_instance(
+                    index,
+                    world,
+                    Phase::Ui,
+                    time,
+                    None,
+                    None,
+                    Some(&delivery),
+                    time_error.as_deref(),
+                ) {
+                    CallOutcome::Committed => {}
+                    CallOutcome::Interrupted => self.disable_instance(index),
+                    CallOutcome::Failed(message) => self.fail_instance(index, message),
+                }
+            }
+        }
+    }
+
+    /// Есть ли у экземпляра callback `on_ui_event`; ABI-модули до v16 такого не имеют.
+    fn has_ui_callback(&self, index: usize) -> bool {
+        match self.instances[index]
+            .as_ref()
+            .map(|instance| &instance.kind)
+        {
+            Some(ScriptKind::Lite(instance)) => {
+                instance.has_callback("on_ui_event").unwrap_or(true)
+            }
+            Some(ScriptKind::Heavy(HeavyInstance::Abi(script))) => script.has_ui_event(),
+            None => false,
+        }
+    }
+
+    /// Открывает канвасы компонентов `ui_canvas` сцены; вызывается до `on_start`.
+    fn open_scene_canvases(&mut self, world: &World) {
+        let handles: Vec<ObjectHandle> = world
+            .objects()
+            .iter()
+            .filter(|object| object.ui_canvas.is_some())
+            .map(|object| object.handle)
+            .collect();
+        self.open_component_canvases(world, &handles);
+    }
+
+    /// Открывает канвас каждого объекта с `ui_canvas`, видимость и слой берутся из компонента.
+    /// Незарегистрированный документ — Error, объект остаётся без канваса.
+    fn open_component_canvases(&mut self, world: &World, handles: &[ObjectHandle]) {
+        for &handle in handles {
+            let Some(component) = world.ui_canvas(handle) else {
+                continue;
+            };
+            let key = owner_key(handle);
+            let mut state = self.ui.borrow_mut();
+            if state
+                .component_canvases
+                .get(&key)
+                .is_some_and(|canvas| state.system.layer(*canvas).is_ok())
+            {
+                continue;
+            }
+            let path = component.document.as_str();
+            let Some(document) = state.documents.get(path).cloned() else {
+                drop(state);
+                let object = world.object(handle).map(|object| object.id.clone());
+                self.events.borrow_mut().push(ScriptEvent {
+                    level: ScriptEventLevel::Error,
+                    source: self.scene_name.clone(),
+                    message: format!(
+                        "UI-документ {path:?} объекта {:?} не зарегистрирован",
+                        object.unwrap_or_default()
+                    ),
+                });
+                continue;
+            };
+            let canvas = state.system.open(document, key);
+            if !component.visible {
+                // Свежий канвас всегда жив, поэтому ошибок у установки видимости и слоя нет.
+                let _ = state.system.set_canvas_visible(canvas, false);
+            }
+            if let Some(layer) = component.layer {
+                let _ = state.system.set_layer(canvas, layer);
+            }
+            state.component_canvases.insert(key, canvas);
+        }
+    }
+
+    /// Закрывает все канвасы удалённых объектов, включая открытые их скриптами. События закрытия
+    /// не доставляются: владелец уже удалён.
+    fn close_owned_canvases(&mut self, removed: &[ObjectHandle]) {
+        let mut state = self.ui.borrow_mut();
+        for &handle in removed {
+            let key = owner_key(handle);
+            state.component_canvases.remove(&key);
+            let _ = state.system.close_owned(key);
+        }
     }
 
     fn deliver_physics_events(&mut self, world: &mut World, time: ScriptTime) {
@@ -1874,6 +2061,7 @@ impl ScriptHost {
                 None,
                 None,
                 None,
+                None,
             ) {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => self.disable_instance(index),
@@ -1891,6 +2079,7 @@ impl ScriptHost {
         time: ScriptTime,
         message: Option<&PendingMessage>,
         net_event: Option<&NetEvent>,
+        ui_event: Option<&UiDelivery>,
         time_error: Option<&str>,
     ) -> CallOutcome {
         let Self {
@@ -2018,6 +2207,14 @@ impl ScriptHost {
                                                 Err(LuaError::runtime("missing net event data"))
                                             }
                                         },
+                                        Phase::Ui => match ui_event {
+                                            Some(event) => lite_instance.invoke_ui_event(
+                                                lua,
+                                                active_call,
+                                                event,
+                                            ),
+                                            None => Err(LuaError::runtime("missing ui event data")),
+                                        },
                                         Phase::Destroy => lite_instance.invoke_destroy(),
                                     })
                             }
@@ -2082,6 +2279,10 @@ impl ScriptHost {
                     Phase::Net => match net_event {
                         Some(event) => script.invoke_net_event(time, event, call),
                         None => Err("missing net event data".to_owned()),
+                    },
+                    Phase::Ui => match ui_event {
+                        Some(event) => script.invoke_ui_event(time, event, call),
+                        None => Err("missing ui event data".to_owned()),
                     },
                     Phase::Destroy => script.invoke(AbiPhase::Destroy, time, call),
                 }
@@ -2333,6 +2534,7 @@ impl ScriptHost {
             let _ = world.despawn_many(&handles);
             return Err(message);
         }
+        self.open_component_canvases(world, &handles);
         // Счётчик кадра растёт только после успеха: откат поддерева не тратит лимит кадра.
         self.frame_spawned += count;
 
@@ -2643,6 +2845,7 @@ impl ScriptHost {
         for handle in &removed {
             self.net.borrow_mut().clear_object(*handle);
         }
+        self.close_owned_canvases(&removed);
         Some(removed)
     }
 
@@ -2993,6 +3196,7 @@ fn has_component(object: &engine_scene::WorldObject, component: &ComponentKind) 
         ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ComponentKind::Script(name) => {
             object
                 .lite_scripts
@@ -3023,12 +3227,12 @@ pub fn lite_properties(
     })
 }
 
-/// `RVE_TRIGGER_STAY` появился в ABI v17. Модуль старше отвергает неизвестный вид события ошибкой,
+/// `RVE_TRIGGER_STAY` появился в ABI v18. Модуль старше отвергает неизвестный вид события ошибкой,
 /// поэтому ему stay не доставляется.
 fn accepts_physics_event(kind: &ScriptKind, event: ScriptPhysicsEventKind) -> bool {
     match kind {
         ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
-            !matches!(event, ScriptPhysicsEventKind::TriggerStay) || script.abi_version() >= 17
+            !matches!(event, ScriptPhysicsEventKind::TriggerStay) || script.abi_version() >= 18
         }
         _ => true,
     }
@@ -3081,3 +3285,5 @@ mod lifecycle_tests;
 mod net_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod ui_tests;

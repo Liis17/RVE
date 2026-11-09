@@ -3,6 +3,7 @@
 /// Asset kind inferred from a virtual path's file extension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum AssetKind {
+    Ui,
     Scene,
     Prefab,
     CameraSettings,
@@ -27,6 +28,7 @@ impl AssetKind {
             .and_then(|name| name.rsplit_once('.'))
             .map(|(_, extension)| extension.to_ascii_lowercase());
         match extension.as_deref() {
+            Some("rveui") => Self::Ui,
             Some("rvescene") => Self::Scene,
             Some("rveprefab") => Self::Prefab,
             Some("camerasettings") => Self::CameraSettings,
@@ -46,6 +48,7 @@ impl AssetKind {
 
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
+            "ui" => Self::Ui,
             "scene" => Self::Scene,
             "prefab" => Self::Prefab,
             "camera_settings" => Self::CameraSettings,
@@ -66,6 +69,7 @@ impl AssetKind {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Ui => "ui",
             Self::Scene => "scene",
             Self::Prefab => "prefab",
             Self::CameraSettings => "camera_settings",
@@ -81,5 +85,17 @@ impl AssetKind {
             Self::Script => "script",
             Self::Other => "other",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AssetKind;
+
+    #[test]
+    fn ui_assets_are_a_supported_typed_asset_kind() {
+        assert_eq!(AssetKind::of("ui/hud.RVEUI"), AssetKind::Ui);
+        assert_eq!(AssetKind::parse("ui"), Some(AssetKind::Ui));
+        assert_eq!(AssetKind::Ui.name(), "ui");
     }
 }

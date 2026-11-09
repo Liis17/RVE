@@ -1,6 +1,7 @@
 use crate::error::BuildError;
 use engine_assets::{AssetError, Assets};
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
+use engine_gui::document::UiDocument;
 use engine_project::{
     BootstrapConfig, PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile, ProjectSettings,
 };
@@ -522,6 +523,40 @@ fn record_asset_recursive(
             .map_err(|error| BuildError::input(error.to_string()))?;
     }
 
+    if extension_is(path.as_str(), "rveui") {
+        let bytes = sources
+            .handle
+            .read_all(format!("/{path}"))
+            .and_then(|request| request.wait())
+            .map_err(|error| resource_error(&format!("UI-документ /{path}"), error))?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            BuildError::input(format!("UI-документ /{path} должен быть UTF-8: {error}"))
+        })?;
+        let document = UiDocument::parse(format!("/{path}"), &source)
+            .map_err(|error| BuildError::input(format!("UI-документ /{path}: {error}")))?;
+        // Картинки и шрифты документа принадлежат тому же владельцу и архиву, что и документ.
+        for asset in document.assets() {
+            let dependency = VirtualPath::parse(asset.path.as_str()).map_err(|error| {
+                BuildError::input(format!(
+                    "UI-документ /{path} содержит неверный ассет: {error}"
+                ))
+            })?;
+            sources
+                .handle
+                .stat(format!("/{dependency}"))
+                .and_then(|request| request.wait())
+                .map_err(|error| resource_error(&format!("UI-ассет /{dependency}"), error))?;
+            require_asset_file(sources.assets_dir, &dependency)?;
+            usages
+                .entry(dependency.clone())
+                .or_default()
+                .add_owner(owner);
+            if let Some(archive) = list_archive {
+                add_explicit_archive(usages, &dependency, owner, archive.to_owned());
+            }
+        }
+    }
+
     if extension_is(path.as_str(), "rvemat") {
         let source = read_asset_text(sources, path, "материал")?;
         let material = MaterialAsset::parse(format!("/{path}"), &source)
@@ -711,6 +746,7 @@ fn has_component(object: &SceneObject, component: &ComponentKind) -> bool {
         ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ComponentKind::Script(script) => {
             object
                 .lite_scripts
@@ -1178,12 +1214,27 @@ mod tests {
 mod lite_params_tests {
     use super::{prepare_project, read_lite_properties_with_timeout};
     use crate::temporary::TempDir;
+    use engine_files::VirtualPath;
+    use engine_scene::{ComponentKind, SceneObject, UiCanvasComponent};
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
     const SCRIPT: &str =
         "return { properties = { speed = { type = \"float\", default = 30, min = 0 } } }\n";
+
+    #[test]
+    fn ui_canvas_is_available_to_component_reference_parameters() {
+        let object = SceneObject {
+            ui_canvas: Some(UiCanvasComponent {
+                document: VirtualPath::parse("/ui/hud.rveui").unwrap(),
+                visible: true,
+                layer: None,
+            }),
+            ..SceneObject::default()
+        };
+        assert!(super::has_component(&object, &ComponentKind::UiCanvas));
+    }
 
     fn project(root: &Path, params: &str) {
         let assets = root.join("Assets");
@@ -1922,6 +1973,114 @@ mod demo_game_tests {
             "shared"
         );
         assert!(build.files.contains_key(&path("/prefabs/tower.rveprefab")));
+    }
+}
+
+#[cfg(test)]
+mod ui_document_tests {
+    use super::prepare_project;
+    use crate::temporary::TempDir;
+    use engine_files::VirtualPath;
+    use std::fs;
+    use std::path::Path;
+
+    const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
+    const HUD: &str = "[[assets]]\npath = \"/ui/icon.png\"\n[[assets]]\npath = \"/ui/font.ttf\"\n\
+        [[elements]]\nid = \"icon\"\nimage = { path = \"/ui/icon.png\" }\n";
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let path = root.join("Assets").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn project(root: &Path, scene: &str, prefabs: Option<&str>) {
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        if let Some(list) = prefabs {
+            fs::write(root.join("prefabs.rveprefabs"), list).unwrap();
+        }
+        write(root, "scenes/main.rvescene", scene);
+        write(root, "ui/hud.rveui", HUD);
+        write(root, "ui/icon.png", "png");
+        write(root, "ui/font.ttf", "font");
+    }
+
+    fn path(value: &str) -> VirtualPath {
+        VirtualPath::parse(value).unwrap()
+    }
+
+    #[test]
+    fn scene_ui_document_packs_its_images_and_fonts_with_the_scene() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-ui").unwrap();
+        let scene = format!(
+            "[[assets]]\npath = \"/ui/hud.rveui\"\n{CAMERA}[[objects]]\nid = \"hud\"\n\
+             [objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\n"
+        );
+        project(root.path(), &scene, None);
+        let build = prepare_project(root.path()).unwrap();
+        let archive = |value: &str| build.assignments[&path(value)].clone();
+        assert!(build.files.contains_key(&path("/ui/icon.png")));
+        assert!(build.files.contains_key(&path("/ui/font.ttf")));
+        assert_eq!(archive("/ui/icon.png"), archive("/ui/hud.rveui"));
+        assert_eq!(archive("/ui/font.ttf"), archive("/ui/hud.rveui"));
+    }
+
+    #[test]
+    fn heavy_prefab_ui_assets_follow_the_prefab_archive() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-ui").unwrap();
+        project(
+            root.path(),
+            CAMERA,
+            Some(
+                "[[prefabs]]\npath = \"/prefabs/hud.rveprefab\"\narchive = \"towers\"\nmax_instances = 3\n",
+            ),
+        );
+        write(
+            root.path(),
+            "prefabs/hud.rveprefab",
+            "[[assets]]\npath = \"/ui/hud.rveui\"\n[[objects]]\nid = \"hud\"\n\
+             [objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\n",
+        );
+        let build = prepare_project(root.path()).unwrap();
+        assert_eq!(build.assignments[&path("/ui/icon.png")], "towers");
+        assert_eq!(build.assignments[&path("/ui/font.ttf")], "towers");
+    }
+
+    #[test]
+    fn missing_ui_asset_is_a_build_error_with_its_path() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-ui").unwrap();
+        let scene = format!(
+            "[[assets]]\npath = \"/ui/hud.rveui\"\n{CAMERA}[[objects]]\nid = \"hud\"\n\
+             [objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\n"
+        );
+        project(root.path(), &scene, None);
+        fs::remove_file(root.path().join("Assets/ui/icon.png")).unwrap();
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("icon.png"), "{error}");
+    }
+
+    #[test]
+    fn invalid_ui_document_is_a_build_error_with_its_path() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-ui").unwrap();
+        let scene = format!(
+            "[[assets]]\npath = \"/ui/hud.rveui\"\n{CAMERA}[[objects]]\nid = \"hud\"\n\
+             [objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\n"
+        );
+        project(root.path(), &scene, None);
+        write(
+            root.path(),
+            "ui/hud.rveui",
+            "[[elements]]\nid = \"icon\"\nunknown = 1\n",
+        );
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("hud.rveui"), "{error}");
     }
 }
 

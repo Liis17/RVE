@@ -314,6 +314,45 @@ impl ScriptInput {
         self.wheel = [0.0; 2];
     }
 
+    /// Hides a key from scripts in this frame: its press, hold and release all disappear.
+    /// Used by the runtime to mask input that the game UI consumed.
+    pub fn hide_key(&mut self, key: Key) {
+        let bit = 1_u128 << (key as u32);
+        self.key_down &= !bit;
+        self.key_pressed &= !bit;
+        self.key_released &= !bit;
+    }
+
+    /// Hides a mouse button from scripts in this frame: its press, hold and release all disappear.
+    pub fn hide_mouse_button(&mut self, button: MouseButton) {
+        let bit = 1_u8 << (button as u32);
+        self.mouse_down &= !bit;
+        self.mouse_pressed &= !bit;
+        self.mouse_released &= !bit;
+    }
+
+    /// Hides gamepad buttons (ABI button bits) of the pad at zero-based `index` in this frame.
+    pub fn hide_pad_buttons(&mut self, index: usize, buttons: u32) {
+        if let Some(pad) = self.pads.get_mut(index) {
+            pad.down &= !buttons;
+            pad.pressed &= !buttons;
+            pad.released &= !buttons;
+        }
+    }
+
+    /// Hides the left stick of the pad at zero-based `index` in this frame: its axes read as zero.
+    pub fn hide_pad_left_stick(&mut self, index: usize) {
+        if let Some(pad) = self.pads.get_mut(index) {
+            pad.axes[GamepadAxis::LeftX as usize] = 0.0;
+            pad.axes[GamepadAxis::LeftY as usize] = 0.0;
+        }
+    }
+
+    /// Hides the wheel delta of this frame.
+    pub fn hide_wheel(&mut self) {
+        self.wheel = [0.0; 2];
+    }
+
     /// Releases held input and drops pending presses and pointer motion for Background.
     pub fn reset_for_background(&mut self) {
         self.key_released |= self.key_down;
@@ -484,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn hiding_left_stick_zeroes_only_that_sticks_axes_of_one_pad() {
+        let mut input = ScriptInput::default();
+        input.set_pad(0, true, 0, [0.5, -0.25, 0.75, 0.125, 0.25, 0.0]);
+        input.set_pad(1, true, 0, [0.1, 0.2, 0.0, 0.0, 0.0, 0.0]);
+        input.hide_pad_left_stick(0);
+
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftX), 0.0);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftY), 0.0);
+        assert_eq!(input.pad(0).axis(GamepadAxis::RightX), 0.75);
+        assert_eq!(input.pad(0).axis(GamepadAxis::RightY), 0.125);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftTrigger), 0.25);
+        assert_eq!(input.pad(1).axis(GamepadAxis::LeftX), 0.1);
+    }
+
+    #[test]
     fn release_all_and_background_release_pads_and_zero_axes() {
         let mut input = ScriptInput::default();
         input.set_pad(2, true, SOUTH | EAST, [0.3; 6]);
@@ -553,5 +607,27 @@ mod tests {
             })
         );
         assert_eq!(RumbleRequest::new(5, 0.5, 0.5, 1.0), None);
+    }
+
+    #[test]
+    fn hidden_keys_buttons_pad_buttons_and_wheel_leave_no_edges() {
+        let mut input = ScriptInput::default();
+        input.set_key(Key::Enter, true);
+        input.set_key(Key::A, true);
+        input.set_mouse_button(MouseButton::Left, true);
+        input.set_pad(0, true, 1 << 13, [0.0; 6]);
+        input.add_wheel(0.0, 2.0);
+
+        input.hide_key(Key::Enter);
+        input.hide_mouse_button(MouseButton::Left);
+        input.hide_pad_buttons(0, 1 << 13);
+        input.hide_wheel();
+
+        assert_eq!(input.key_state(Key::Enter as u32), 0);
+        assert!(input.key_down(Key::A) && input.key_pressed(Key::A));
+        assert!(!input.mouse_down(MouseButton::Left) && !input.mouse_pressed(MouseButton::Left));
+        assert_eq!(input.gamepad_state(1).unwrap().pressed, 0);
+        assert_eq!(input.gamepad_state(1).unwrap().down, 0);
+        assert_eq!(input.wheel(), [0.0; 2]);
     }
 }
