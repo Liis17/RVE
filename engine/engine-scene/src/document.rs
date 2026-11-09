@@ -1526,48 +1526,31 @@ fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(),
     Ok(())
 }
 
+/// Переводит причину отказа общего правила (`world::*_problem`) в ошибку сцены с объектом.
+fn problem_error(
+    source: &str,
+    object_id: &str,
+    problem: Option<&'static str>,
+) -> Result<(), SceneError> {
+    match problem {
+        Some(problem) => Err(SceneError::new(source, Some(object_id), problem)),
+        None => Ok(()),
+    }
+}
+
+// Правила света и окружения берутся из `world::components`, чтобы сцена, скрипты и редактор
+// не расходились в проверках.
+
 fn validate_light(
     source: &str,
     object: &SceneObject,
     light: &DirectionalLightComponent,
 ) -> Result<(), SceneError> {
-    if !light
-        .color
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.color должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light
-        .ambient
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.ambient должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light.shadow_distance.is_finite() || light.shadow_distance <= 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.shadow_distance должен быть конечным и > 0",
-        ));
-    }
-    if !(1..=crate::light::MAX_SHADOW_CASCADES).contains(&light.shadow_cascades) {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.shadow_cascades должен быть в диапазоне 1..=4",
-        ));
-    }
-    Ok(())
+    problem_error(
+        source,
+        &object.id,
+        crate::world::directional_light_problem(light),
+    )
 }
 
 fn validate_point_light(
@@ -1575,32 +1558,7 @@ fn validate_point_light(
     object: &SceneObject,
     light: &PointLightComponent,
 ) -> Result<(), SceneError> {
-    if !light
-        .color
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "point_light.color должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light.intensity.is_finite() || light.intensity < 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "point_light.intensity должен быть конечным и >= 0",
-        ));
-    }
-    if !light.range.is_finite() || light.range <= 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "point_light.range должен быть конечным и > 0",
-        ));
-    }
-    Ok(())
+    problem_error(source, &object.id, crate::world::point_light_problem(light))
 }
 
 fn validate_spot_light(
@@ -1608,44 +1566,7 @@ fn validate_spot_light(
     object: &SceneObject,
     light: &SpotLightComponent,
 ) -> Result<(), SceneError> {
-    if !light
-        .color
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light.color должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light.intensity.is_finite() || light.intensity < 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light.intensity должен быть конечным и >= 0",
-        ));
-    }
-    if !light.range.is_finite() || light.range <= 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light.range должен быть конечным и > 0",
-        ));
-    }
-    if !light.inner_angle_deg.is_finite()
-        || !light.outer_angle_deg.is_finite()
-        || light.inner_angle_deg <= 0.0
-        || light.inner_angle_deg > light.outer_angle_deg
-        || light.outer_angle_deg > 90.0
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light angles должны удовлетворять 0 < inner_angle_deg <= outer_angle_deg <= 90",
-        ));
-    }
-    Ok(())
+    problem_error(source, &object.id, crate::world::spot_light_problem(light))
 }
 
 pub(crate) fn validate_environment(
@@ -1661,46 +1582,21 @@ pub(crate) fn validate_environment(
             "environment должен задавать ровно один источник: hdr или procedural",
         ));
     }
-    if !environment.intensity.is_finite() || environment.intensity < 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(object_id),
-            "environment.intensity должен быть конечным и >= 0",
-        ));
-    }
+    problem_error(
+        source,
+        object_id,
+        crate::world::environment_intensity_problem(environment.intensity),
+    )?;
     if let Some(path) = &environment.hdr {
         require_asset_path(source, object_id, assets, path, "HDR environment")?;
         require_extension(source, object_id, path, "hdr", "HDR environment")?;
     }
     if let Some(sky) = environment.procedural {
-        if [sky.zenith_color, sky.horizon_color, sky.ground_color]
-            .into_iter()
-            .flatten()
-            .any(|value| !value.is_finite() || value < 0.0)
-        {
-            return Err(SceneError::new(
-                source,
-                Some(object_id),
-                "environment.procedural цвета должны содержать конечные компоненты >= 0",
-            ));
-        }
-        if !sky.sun_size_deg.is_finite()
-            || !(0.0..=180.0).contains(&sky.sun_size_deg)
-            || sky.sun_size_deg == 0.0
-        {
-            return Err(SceneError::new(
-                source,
-                Some(object_id),
-                "environment.procedural.sun_size_deg должен быть конечным и в диапазоне (0, 180]",
-            ));
-        }
-        if !sky.sun_intensity.is_finite() || sky.sun_intensity < 0.0 {
-            return Err(SceneError::new(
-                source,
-                Some(object_id),
-                "environment.procedural.sun_intensity должен быть конечным и >= 0",
-            ));
-        }
+        problem_error(
+            source,
+            object_id,
+            crate::world::procedural_sky_problem(&sky),
+        )?;
     }
     Ok(())
 }
