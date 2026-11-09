@@ -586,6 +586,7 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
             if let Some(path) = camera.post_process.clone() {
                 show_post_process_editor(ui, state, &path);
             }
+            show_screen_shaders(ui, state, id, &camera.screen_shaders);
             egui::CollapsingHeader::new("Cursor")
                 .id_salt("camera_cursor")
                 .default_open(false)
@@ -3572,6 +3573,154 @@ mod schema_tests {
 
         reset_schema_param(&mut params, "speed", Some(ParamValue::Int(30)), false);
         assert!(!params.contains_key("speed"));
+    }
+}
+
+/// Экранные шейдеры камеры: до четырёх `.glsl` с порядком, стадией, включением и параметрами.
+/// Каждая правка идёт через `edit_scene`, поэтому откатывается отменой; ошибка компиляции из
+/// горячей перезагрузки показывается под шейдером.
+fn show_screen_shaders(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    shaders: &[engine_scene::ScreenShaderRef],
+) {
+    egui::CollapsingHeader::new("Screen Shaders")
+        .id_salt("camera_screen_shaders")
+        .default_open(false)
+        .show(ui, |ui| {
+            let options = state.assets_of_kind(AssetKind::ScreenShader);
+            let mut next = shaders.to_vec();
+            let mut other_change = false;
+            let mut param_key: Option<String> = None;
+            let mut remove = None;
+            let mut swap = None;
+            for (index, shader) in shaders.iter().enumerate() {
+                ui.push_id(index, |ui| {
+                    ui.horizontal(|ui| {
+                        let current = shader.shader.as_str().to_owned();
+                        if let Some(chosen) =
+                            asset_picker(ui, "screen_shader_asset", &current, &options)
+                            && let Some(path) = parse_path(state, &chosen)
+                        {
+                            next[index].shader = path;
+                            other_change = true;
+                        }
+                        let mut stage = shader.stage;
+                        egui::ComboBox::from_id_salt("screen_shader_stage")
+                            .selected_text(screen_stage_label(stage))
+                            .show_ui(ui, |ui| {
+                                for value in [
+                                    engine_scene::ScreenShaderStage::BeforePost,
+                                    engine_scene::ScreenShaderStage::AfterPost,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut stage,
+                                        value,
+                                        screen_stage_label(value),
+                                    );
+                                }
+                            });
+                        if stage != shader.stage {
+                            next[index].stage = stage;
+                            other_change = true;
+                        }
+                        let mut enabled = shader.enabled;
+                        if ui.checkbox(&mut enabled, "On").changed() {
+                            next[index].enabled = enabled;
+                            other_change = true;
+                        }
+                        if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
+                            swap = Some((index, index - 1));
+                        }
+                        if ui
+                            .add_enabled(index + 1 < shaders.len(), egui::Button::new("Down"))
+                            .clicked()
+                        {
+                            swap = Some((index, index + 1));
+                        }
+                        if ui.button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                    if let Some(error) = state.screen_shader_errors.get(shader.shader.as_str()) {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                    egui::CollapsingHeader::new("Parameters")
+                        .id_salt("screen_shader_params")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("screen_shader_grid")
+                                .num_columns(4)
+                                .show(ui, |ui| {
+                                    for parameter in 0..engine_scene::MAX_SCREEN_SHADER_PARAMS {
+                                        ui.label(format!("p{parameter}"));
+                                        let mut value =
+                                            shader.params.get(parameter).copied().unwrap_or(0.0);
+                                        let response =
+                                            ui.add(egui::DragValue::new(&mut value).speed(0.01));
+                                        if response.changed() {
+                                            let params = &mut next[index].params;
+                                            params.resize(
+                                                engine_scene::MAX_SCREEN_SHADER_PARAMS,
+                                                0.0,
+                                            );
+                                            params[parameter] = value;
+                                            param_key = Some(format!(
+                                                "screen-shader-{id}-{index}-p{parameter}"
+                                            ));
+                                        }
+                                        finish_edit(state, &response);
+                                        if parameter % 4 == 3 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        });
+                });
+            }
+            if let Some(index) = remove {
+                next.remove(index);
+                other_change = true;
+            }
+            if let Some((from, to)) = swap {
+                next.swap(from, to);
+                other_change = true;
+            }
+            if shaders.len() < engine_scene::MAX_SCREEN_SHADERS {
+                match options.first().and_then(|path| parse_path(state, path)) {
+                    Some(path) => {
+                        if ui.button("Add Screen Shader").clicked() {
+                            next.push(engine_scene::ScreenShaderRef {
+                                shader: path,
+                                stage: engine_scene::ScreenShaderStage::AfterPost,
+                                enabled: true,
+                                params: Vec::new(),
+                            });
+                            other_change = true;
+                        }
+                    }
+                    None => {
+                        ui.label("Add a .glsl asset to the project to use screen shaders.");
+                    }
+                }
+            }
+            if other_change || param_key.is_some() {
+                // Только правка одного параметра объединяется с соседними шагами перетаскивания.
+                let coalesce = if other_change {
+                    None
+                } else {
+                    param_key.as_deref()
+                };
+                state.edit_scene(|scene| scene.set_camera_screen_shaders(id, next, coalesce));
+            }
+        });
+}
+
+fn screen_stage_label(stage: engine_scene::ScreenShaderStage) -> &'static str {
+    match stage {
+        engine_scene::ScreenShaderStage::BeforePost => "Before post",
+        engine_scene::ScreenShaderStage::AfterPost => "After post",
     }
 }
 

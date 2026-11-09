@@ -11,13 +11,14 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 10 appends animation callbacks after the v9 prefab tail.
 /// Version 11 appends gamepad state and rumble callbacks after the v10 animation tail.
 /// Version 12 appends post-process callbacks after the v11 gamepad tail.
-/// Version 14 appends UI callbacks after the v13 net tail of `RveHost` and the `ui_event` callback
+/// Version 14 appends camera screen shader callbacks after the v13 net tail.
+/// Version 15 appends UI callbacks after the v14 screen shader tail of `RveHost` and the `ui_event` callback
 /// after the v13 net event callback of the descriptor.
 /// Version 13 appends network callbacks after the v12 post-process tail and the net event callback
 /// after the v6 collision tail of the descriptor.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 14;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 15;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -885,6 +886,42 @@ pub type RveSetPostProcessFn = unsafe extern "C" fn(
     settings: *const RvePostProcessSettings,
 ) -> bool;
 
+/// State of one camera screen shader slot: `enabled` is 0 or 1; `params` are `rve_param(0..16)`.
+/// Path and stage are fixed by the scene; appended in ABI v14.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveScreenShaderState {
+    pub enabled: u32,
+    pub params: [f32; 16],
+}
+
+impl Default for RveScreenShaderState {
+    fn default() -> Self {
+        Self {
+            enabled: 0,
+            params: [0.0; 16],
+        }
+    }
+}
+
+/// Writes the number of screen shader slots of one camera. Appended in ABI v14.
+pub type RveScreenShaderCountFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u32) -> bool;
+/// Copies one screen shader slot (zero-based). Appended in ABI v14.
+pub type RveGetScreenShaderFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    out: *mut RveScreenShaderState,
+) -> bool;
+/// Stages enabled flag and parameters of one screen shader slot (zero-based). Appended in ABI v14.
+pub type RveSetScreenShaderFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    state: *const RveScreenShaderState,
+) -> bool;
+
 /// Host callback that copies a guest error string for the duration of the call.
 pub type RveSetErrorFn = unsafe extern "C" fn(ctx: *mut c_void, message: RveStr);
 /// Host callback that appends a guest log event.
@@ -1561,7 +1598,11 @@ pub struct RveHost {
     pub net_object_has_authority: Option<RveNetObjectBoolFn>,
     pub net_object_set_owner: Option<RveNetObjectSetOwnerFn>,
     pub net_object_send: Option<RveNetObjectSendFn>,
-    /// UI callbacks appended in ABI v14; `None` on hosts without the game UI.
+    /// Screen shader callbacks appended in ABI v14; `None` marks an unavailable callback.
+    pub screen_shader_count: Option<RveScreenShaderCountFn>,
+    pub get_screen_shader: Option<RveGetScreenShaderFn>,
+    pub set_screen_shader: Option<RveSetScreenShaderFn>,
+    /// UI callbacks appended in ABI v15; `None` on hosts without the game UI.
     pub ui_open: Option<RveUiOpenFn>,
     pub ui_close: Option<RveUiCloseFn>,
     pub ui_object_canvas: Option<RveUiObjectCanvasFn>,
@@ -1748,7 +1789,7 @@ pub struct RveScriptDescV13 {
     pub net_event: Option<RveNetEventFn>,
 }
 
-/// One exported guest script implementation in ABI version 14.
+/// One exported guest script implementation in ABI version 15.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -1763,7 +1804,7 @@ pub struct RveScriptDesc {
     pub command: Option<RveCommandFn>,
     pub collision: Option<RveCollisionFn>,
     pub net_event: Option<RveNetEventFn>,
-    /// Optional UI event callback appended in ABI v14.
+    /// Optional UI event callback appended in ABI v15.
     pub ui_event: Option<RveUiEventFn>,
 }
 
@@ -1971,7 +2012,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);

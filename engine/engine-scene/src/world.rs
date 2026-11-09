@@ -7,8 +7,9 @@ use crate::camera::Camera;
 use crate::document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup,
-    PointLightComponent, RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneObject,
-    SpotLightComponent, camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
+    MAX_SCREEN_SHADER_PARAMS, PointLightComponent, RigidBodyComponent, RigidBodyKind,
+    SceneDocument, SceneError, SceneObject, ScreenShaderRef, SpotLightComponent,
+    camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
 use crate::light::ShadowSettings;
 use crate::network::{NetworkIdentityComponent, NetworkTransformComponent};
@@ -307,6 +308,8 @@ pub struct SceneFrame {
     pub view: CameraSettings,
     /// Постобработка активной камеры.
     pub post_process: PostProcessSettings,
+    /// Экранные шейдеры активной камеры по порядку записи; пусто без камеры или без шейдеров.
+    pub screen_shaders: Vec<ScreenShaderRef>,
     pub light: LightState,
     pub local_lights: Vec<LocalLightState>,
     pub environment: Option<EnvironmentState>,
@@ -689,6 +692,53 @@ impl World {
         Ok(())
     }
 
+    /// Экранные шейдеры камеры по порядку записи; `None`, если объект не содержит Camera component.
+    pub fn screen_shaders(&self, handle: ObjectHandle) -> Option<&[ScreenShaderRef]> {
+        self.object(handle)?
+            .camera
+            .as_ref()
+            .map(|camera| camera.screen_shaders.as_slice())
+    }
+
+    /// Меняет включение и параметры существующего слота экранного шейдера камеры. Путь и стадия
+    /// не меняются: смена шейдера требует компиляции и не входит в текущую версию. Параметры
+    /// дополняются нулями до шестнадцати.
+    pub fn set_screen_shader(
+        &mut self,
+        handle: ObjectHandle,
+        slot: usize,
+        enabled: bool,
+        params: &[f32],
+    ) -> Result<(), SceneError> {
+        let index = self.live_index_or_error(handle)?;
+        let object = &mut self.objects[index];
+        let Some(camera) = object.camera.as_mut() else {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                "у объекта нет Camera component",
+            ));
+        };
+        if params.len() > MAX_SCREEN_SHADER_PARAMS || !params.iter().all(|value| value.is_finite())
+        {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                "параметры экранного шейдера должны быть конечными и не длиннее 16",
+            ));
+        }
+        let Some(shader) = camera.screen_shaders.get_mut(slot) else {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                format!("у камеры нет экранного шейдера с индексом {slot}"),
+            ));
+        };
+        shader.enabled = enabled;
+        shader.params = params.to_vec();
+        Ok(())
+    }
+
     /// Читает `.rvephysmat` всех коллайдеров мира и заполняет их разрешённые материалы.
     pub fn resolve_physics_materials(
         &mut self,
@@ -896,12 +946,18 @@ impl World {
             .object(self.active_camera)
             .and_then(|object| object.post_process)
             .unwrap_or_default();
+        let screen_shaders = self
+            .object(self.active_camera)
+            .and_then(|object| object.camera.as_ref())
+            .map(|camera| camera.screen_shaders.clone())
+            .unwrap_or_default();
 
         (
             SceneFrame {
                 camera,
                 view,
                 post_process,
+                screen_shaders,
                 light,
                 local_lights,
                 environment,
@@ -1776,6 +1832,81 @@ position=[2.0,0.0,0.0]
         let (second, warnings) = world.build_frame();
         assert_eq!(second.camera, previous);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn demo_scene_ships_three_disabled_screen_shaders_on_its_camera() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/demo-game/Assets/scenes/main.rvescene"
+        ))
+        .expect("сцена демо");
+        let document = SceneDocument::parse("scenes/main.rvescene", &source).unwrap();
+        let camera = document
+            .objects
+            .iter()
+            .find(|object| object.id == "camera")
+            .and_then(|object| object.camera.as_ref())
+            .expect("камера демо");
+        let paths: Vec<&str> = camera
+            .screen_shaders
+            .iter()
+            .map(|shader| shader.shader.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["fx/color_isolate.glsl", "fx/vhs.glsl", "fx/crt.glsl"]
+        );
+        assert!(
+            camera.screen_shaders.iter().all(|shader| !shader.enabled),
+            "демо выглядит как прежде"
+        );
+    }
+
+    #[test]
+    fn screen_shaders_are_per_camera_and_only_slots_change() {
+        let document = SceneDocument::parse(
+            "screens.rvescene",
+            r#"
+[[assets]]
+path="/fx/vhs.glsl"
+[[objects]]
+id="main"
+[objects.camera]
+active=true
+[[objects.camera.screen_shaders]]
+shader="/fx/vhs.glsl"
+stage="after_post"
+params=[0.5]
+[[objects]]
+id="mesh"
+"#,
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let main = world.handle("main").unwrap();
+        let mesh = world.handle("mesh").unwrap();
+        assert_eq!(world.screen_shaders(mesh), None);
+        assert_eq!(world.screen_shaders(main).unwrap().len(), 1);
+        assert_eq!(world.build_frame().0.screen_shaders.len(), 1);
+
+        world
+            .set_screen_shader(main, 0, false, &[0.25, 0.75])
+            .unwrap();
+        let shader = &world.screen_shaders(main).unwrap()[0];
+        assert!(!shader.enabled);
+        assert_eq!(shader.params, [0.25, 0.75]);
+        assert_eq!(shader.shader.as_str(), "fx/vhs.glsl", "путь не меняется");
+        assert!(!world.build_frame().0.screen_shaders[0].enabled);
+
+        assert!(world.set_screen_shader(mesh, 0, true, &[]).is_err());
+        assert!(world.set_screen_shader(main, 1, true, &[]).is_err());
+        assert!(world.set_screen_shader(main, 0, true, &[f32::NAN]).is_err());
+        assert!(world.set_screen_shader(main, 0, true, &[0.0; 17]).is_err());
+        assert!(
+            !world.screen_shaders(main).unwrap()[0].enabled,
+            "ошибочные вызовы не меняют состояние"
+        );
     }
 
     #[test]

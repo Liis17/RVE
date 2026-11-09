@@ -4030,3 +4030,51 @@ fn abi_v13_modules_load_without_ui_callbacks_and_keep_net_events() {
         "{events:?}"
     );
 }
+
+fn v14_net_module() -> &'static RveModule {
+    let old = v13_net_module();
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 14,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: old.scripts,
+        script_count: old.script_count,
+    }))
+}
+#[test]
+fn abi_v14_screen_shader_layout_keeps_legacy_descriptors_without_ui() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v14_net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    message_list(&mut host);
+    host.queue_network_events(&world, [engine_scene::NetEvent::PeerConnected { peer: 8 }]);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| event.message == "connected 8"),
+        "{events:?}"
+    );
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    let names = library.script_names();
+    assert!(
+        names.contains(&"NetGuest") && names.contains(&"NetAlias"),
+        "{names:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}

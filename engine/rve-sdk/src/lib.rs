@@ -16,7 +16,7 @@ use abi::{
     RVE_NET_TARGET_SERVER, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
     RveCameraSettings, RveCharacterMoveResult, RveHost, RveParams, RvePostProcessSettings,
-    RveRaycastHit, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RveRaycastHit, RveScreenShaderState, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use abi::{
     RVE_UI_EVENT_BLUR, RVE_UI_EVENT_CANCEL, RVE_UI_EVENT_CLICK, RVE_UI_EVENT_FOCUS,
@@ -1646,6 +1646,46 @@ impl Object {
         };
         // SAFETY: host callback and settings are valid during this guest callback.
         unsafe { callback(ctx.host.ctx, self.handle, settings) }
+    }
+
+    /// Number of screen shader slots of this camera; `None` when the object is not a camera or the
+    /// host does not provide ABI v14 callbacks.
+    pub fn screen_shader_count(&self, ctx: &Context<'_>) -> Option<u32> {
+        let callback = ctx.host.screen_shader_count?;
+        let mut count = 0;
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut count) } {
+            Some(count)
+        } else {
+            None
+        }
+    }
+
+    /// Returns one screen shader slot (zero-based). `None` when the slot does not exist.
+    pub fn screen_shader(&self, ctx: &Context<'_>, slot: u32) -> Option<RveScreenShaderState> {
+        let callback = ctx.host.get_screen_shader?;
+        let mut state = RveScreenShaderState::default();
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, slot, &mut state) } {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    /// Stages enabled flag and parameters of one screen shader slot (zero-based). Returns false when
+    /// the host lacks ABI v14 callbacks, the object is not a camera or the slot does not exist.
+    pub fn set_screen_shader(
+        &self,
+        ctx: &mut Context<'_>,
+        slot: u32,
+        state: &RveScreenShaderState,
+    ) -> bool {
+        let Some(callback) = ctx.host.set_screen_shader else {
+            return false;
+        };
+        // SAFETY: host callback and state are valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, slot, state) }
     }
 
     /// Stages this object as the active scene camera.

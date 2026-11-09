@@ -1,5 +1,6 @@
 use crate::actions::{ActionMutation, ActionValue};
 use crate::lifecycle::{ObjectState, PrefabRequest, SpawnArgs};
+use crate::transaction::ScreenShaderState;
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
     ScriptTransaction,
@@ -16,9 +17,9 @@ use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
     AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AudioGroup, AudioRequest,
-    CameraSettings, ClipParams, ExposureMode, NetEvent, NetMode, NetTarget, ObjectHandle,
-    ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId, PostProcessSettings, Tonemapper,
-    VoiceId,
+    CameraSettings, ClipParams, ExposureMode, MAX_SCREEN_SHADER_PARAMS, NetEvent, NetMode,
+    NetTarget, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId,
+    PostProcessSettings, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
@@ -1141,6 +1142,74 @@ fn object_table(
                 Ok(transaction.set_camera_settings(handle, settings))
             })?;
             Ok(accepted)
+        })?,
+    )?;
+
+    let screen_count_active = active_call.clone();
+    object.set(
+        "screen_shader_count",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&screen_count_active, handle)? {
+                return Ok(Value::Nil);
+            }
+            let count = with_active_call(&screen_count_active, |transaction| {
+                Ok(transaction.screen_shader_count(handle))
+            })?;
+            Ok(count.map_or(Value::Nil, |count| Value::Integer(count as i64)))
+        })?,
+    )?;
+
+    let screen_get_active = active_call.clone();
+    object.set(
+        "screen_shader",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let (slot, _) = screen_call_arguments(arguments, "object.screen_shader")?;
+            if !object_alive(&screen_get_active, handle)? {
+                return Ok(Value::Nil);
+            }
+            let state = with_active_call(&screen_get_active, |transaction| {
+                Ok(transaction.screen_shader(handle, slot))
+            })?;
+            match state {
+                Some(state) => Ok(Value::Table(screen_shader_table(lua, &state)?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    let screen_set_active = active_call.clone();
+    object.set(
+        "set_screen_shader",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let (slot, table) = screen_call_arguments(arguments, "object.set_screen_shader")?;
+            let Some(table) = table else {
+                return Err(LuaError::runtime(
+                    "object.set_screen_shader expects a table with enabled and params",
+                ));
+            };
+            if !object_alive(&screen_set_active, handle)? {
+                return Ok(false);
+            }
+            let (writable, current) = with_active_call(&screen_set_active, |transaction| {
+                Ok((
+                    transaction.writable(),
+                    transaction.screen_shader(handle, slot),
+                ))
+            })?;
+            if !writable {
+                return Err(LuaError::runtime(
+                    "object.set_screen_shader is unavailable during script creation",
+                ));
+            }
+            let Some(mut state) = current else {
+                return Err(LuaError::runtime(
+                    "object.set_screen_shader target has no such screen shader slot",
+                ));
+            };
+            apply_screen_shader_table(&table, &mut state)?;
+            with_active_call(&screen_set_active, |transaction| {
+                Ok(transaction.set_screen_shader(handle, slot, state))
+            })
         })?,
     )?;
 
@@ -2764,6 +2833,79 @@ fn post_process_section(
             "post process.{name} must be a table"
         ))),
     }
+}
+
+/// Аргументы `obj:screen_shader(i)` или `obj:set_screen_shader(i, t)`: слот (1-based в Lua) и,
+/// для записи, таблица. Ведущий объект-таблица пропускается, если за ним идёт номер слота.
+fn screen_call_arguments(
+    arguments: MultiValue,
+    name: &str,
+) -> mlua::Result<(usize, Option<Table>)> {
+    let mut values: Vec<Value> = arguments.into_iter().collect();
+    if matches!(values.first(), Some(Value::Table(_))) && values.len() > 1 {
+        values.remove(0);
+    }
+    let slot = match values.first() {
+        Some(Value::Integer(index)) if *index >= 1 => (*index - 1) as usize,
+        Some(Value::Number(index)) if index.fract() == 0.0 && *index >= 1.0 => {
+            (*index as usize) - 1
+        }
+        _ => {
+            return Err(LuaError::runtime(format!(
+                "{name} expects a 1-based screen shader index"
+            )));
+        }
+    };
+    let table = match values.get(1) {
+        Some(Value::Table(table)) => Some(table.clone()),
+        _ => None,
+    };
+    Ok((slot, table))
+}
+
+/// Таблица состояния слота: `enabled` (boolean) и `params` (массив из шестнадцати чисел).
+fn screen_shader_table(lua: &Lua, state: &ScreenShaderState) -> mlua::Result<Table> {
+    let result = lua.create_table()?;
+    result.set("enabled", state.enabled)?;
+    let params = lua.create_table()?;
+    for (index, value) in state.params.iter().enumerate() {
+        params.set(index + 1, f64::from(*value))?;
+    }
+    result.set("params", params)?;
+    Ok(result)
+}
+
+/// Читает `enabled` и `params` из таблицы; отсутствующие поля сохраняют текущие значения.
+/// `params` заменяет все шестнадцать значений, недостающие дополняются нулями.
+fn apply_screen_shader_table(table: &Table, state: &mut ScreenShaderState) -> mlua::Result<()> {
+    ensure_known_fields(table, &["enabled", "params"], "screen shader")?;
+    optional_bool(table, "enabled", &mut state.enabled)?;
+    match table.get::<Value>("params")? {
+        Value::Nil => {}
+        Value::Table(list) => {
+            if list.raw_len() > MAX_SCREEN_SHADER_PARAMS {
+                return Err(LuaError::runtime(format!(
+                    "screen shader params accept at most {MAX_SCREEN_SHADER_PARAMS} numbers"
+                )));
+            }
+            let mut params = [0.0_f32; MAX_SCREEN_SHADER_PARAMS];
+            for (index, target) in params.iter_mut().enumerate() {
+                *target = match list.get::<Value>(index + 1)? {
+                    Value::Nil => 0.0,
+                    Value::Integer(value) => value as f32,
+                    Value::Number(value) if value.is_finite() => value as f32,
+                    _ => {
+                        return Err(LuaError::runtime(
+                            "screen shader params must be finite numbers",
+                        ));
+                    }
+                };
+            }
+            state.params = params;
+        }
+        _ => return Err(LuaError::runtime("params must be an array of numbers")),
+    }
+    Ok(())
 }
 
 fn optional_bool(table: &Table, key: &str, destination: &mut bool) -> mlua::Result<()> {

@@ -8,6 +8,15 @@ path = "/cameras/default.camerasettings"
 path = "/cameras/default.postprocess"
 
 [[assets]]
+path = "/fx/color_isolate.glsl"
+
+[[assets]]
+path = "/fx/vhs.glsl"
+
+[[assets]]
+path = "/fx/crt.glsl"
+
+[[assets]]
 path = "/scripts/rotate.lua"
 
 [[assets]]
@@ -21,6 +30,24 @@ position = [0.0, 1.15, 6.0]
 [objects.camera]
 settings = "/cameras/default.camerasettings"
 post_process = "/cameras/default.postprocess"
+# Экранные шейдеры выключены: демо выглядит как прежде; включите enabled = true, чтобы увидеть эффект.
+[[objects.camera.screen_shaders]]
+shader = "/fx/color_isolate.glsl"
+stage = "after_post"
+enabled = false
+params = [0.33, 0.08, 1.0]
+
+[[objects.camera.screen_shaders]]
+shader = "/fx/vhs.glsl"
+stage = "after_post"
+enabled = false
+params = [0.6, 0.4]
+
+[[objects.camera.screen_shaders]]
+shader = "/fx/crt.glsl"
+stage = "after_post"
+enabled = false
+params = [0.5, 0.5]
 
 [[objects]]
 id = "sun"

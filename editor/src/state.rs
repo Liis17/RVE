@@ -53,6 +53,8 @@ pub enum Action {
     },
     Save,
     SaveAs,
+    /// Сохранить в явно заданный путь без системного диалога.
+    SaveAsAt(String),
     Exit,
     Play,
     Stop,
@@ -62,6 +64,8 @@ pub enum Action {
     RefreshTree,
     /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
     BuildPlayer,
+    /// Собрать релиз в явно заданный каталог без системного диалога.
+    BuildPlayerAt(PathBuf),
     /// Сохранить поддерево объекта в новый префаб и заменить его экземпляром.
     CreatePrefab(String),
     /// Перенести overrides объекта экземпляра в файл префаба.
@@ -172,6 +176,10 @@ pub struct EditorState {
     pub ui_editor_active: bool,
     pub ui_authoring: bool,
     pub ui_editor_rect: Option<egui::Rect>,
+    /// Invalidates queued MCP calls whenever a project or scene is replaced.
+    pub mcp_generation: u64,
+    /// Незавершённый `capture_view`: ответ отправляется, когда кадр отдал PNG или задача снята.
+    pub(crate) mcp_capture: Option<crate::mcp::capture::CaptureJob>,
     pub project: Option<OpenProject>,
     /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
     pub project_prefabs: Option<ProjectPrefabs>,
@@ -258,11 +266,17 @@ pub struct EditorState {
     pub apply_prompt: Option<String>,
     /// Идущая сборка релиза; одновременно — не больше одной.
     pub build: Option<BuildJob>,
+    /// Хвост вывода последней/текущей сборки для MCP build_status.
+    pub build_output_tail: Vec<String>,
+    /// Итог последней сборки: None до завершения, Some(true) при успехе.
+    pub build_succeeded: Option<bool>,
     /// Схемы `properties` lite-скриптов по пути; ошибка пишется в Console один раз.
     /// Кэшированные схемы читаются повторно после изменения исходного файла.
     pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
     /// Фоновый разбор FBX для `models`.
     pub model_loader: ModelLoader,
+    /// Последняя ошибка компиляции экранного шейдера по пути `.glsl`; показывается в инспекторе.
+    pub screen_shader_errors: HashMap<String, String>,
     /// Выпуклые оболочки и trimesh для рёбер коллайдеров и ошибок инспектора.
     pub collider_cache: ColliderCache,
     /// Настройки превью аниматора выбранного объекта; меняет инспектор.
@@ -283,6 +297,8 @@ impl EditorState {
             ui_editor_active: false,
             ui_authoring: false,
             ui_editor_rect: None,
+            mcp_generation: 0,
+            mcp_capture: None,
             project: None,
             project_prefabs: None,
             scene: None,
@@ -344,9 +360,12 @@ impl EditorState {
             pending_frame: None,
             models: HashMap::new(),
             build: None,
+            build_output_tail: Vec::new(),
+            build_succeeded: None,
             apply_prompt: None,
             lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),
+            screen_shader_errors: HashMap::new(),
             collider_cache: ColliderCache::default(),
             animation_preview: AnimationPreview::default(),
             animation_status: PreviewStatus::default(),
@@ -358,6 +377,10 @@ impl EditorState {
 
     pub fn is_playing(&self) -> bool {
         self.play.is_some()
+    }
+
+    pub fn advance_mcp_generation(&mut self) {
+        self.mcp_generation = self.mcp_generation.wrapping_add(1);
     }
 
     /// Начинает переименование в Hierarchy; поле получит фокус один раз при отрисовке.

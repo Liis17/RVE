@@ -570,6 +570,9 @@ fn host(state: &mut HostState) -> RveHost {
         ui_set_options: None,
         ui_set_image: None,
         ui_focus: None,
+        screen_shader_count: None,
+        get_screen_shader: None,
+        set_screen_shader: None,
     }
 }
 
@@ -1952,7 +1955,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2222,7 +2225,29 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+}
+
+#[test]
+fn screen_shader_callbacks_are_appended_in_v14() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, screen_shader_count),
+        offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, get_screen_shader),
+        offset_of!(RveHost, screen_shader_count)
+            + size_of::<Option<crate::abi::RveScreenShaderCountFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_screen_shader),
+        offset_of!(RveHost, get_screen_shader)
+            + size_of::<Option<crate::abi::RveGetScreenShaderFn>>()
+    );
+    assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
+    assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
 }
 
 #[test]
@@ -2245,11 +2270,12 @@ fn network_callbacks_and_descriptor_keep_the_v13_layout() {
 }
 
 #[test]
-fn ui_callbacks_and_descriptor_keep_the_v14_layout() {
+fn ui_callbacks_and_descriptor_keep_the_v15_layout() {
     use std::mem::{offset_of, size_of};
     assert_eq!(
         offset_of!(RveHost, ui_open),
-        offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
+        offset_of!(RveHost, set_screen_shader)
+            + size_of::<Option<crate::abi::RveSetScreenShaderFn>>()
     );
     assert_eq!(
         offset_of!(RveHost, ui_focus),
@@ -2264,7 +2290,7 @@ fn ui_callbacks_and_descriptor_keep_the_v14_layout() {
         offset_of!(crate::abi::RveScriptDescV13, net_event)
             + size_of::<Option<crate::abi::RveNetEventFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
 }
 
 unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {

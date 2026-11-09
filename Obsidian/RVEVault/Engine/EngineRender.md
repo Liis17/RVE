@@ -25,9 +25,10 @@ Parent: [[Index]]
 | `engine/engine-render/shaders/shadow.vert`, `engine/engine-render/shaders/shadow.frag` | `light_view_projection`, `model`, UV и alpha-mask material descriptor | Shadow pass отбрасывает mask texels по тому же base-color alpha и cutoff; blend материалы пропускаются |
 | `engine/engine-render/shaders/overlay.vert`, `engine/engine-render/shaders/overlay.frag` | push constant `target_size` | 2D-оверлей: пиксели окна → NDC, цвет вершины с альфой |
 | `engine/engine-render/src/ui.rs`, `engine/engine-render/shaders/ui.vert`, `engine/engine-render/shaders/ui.frag` | `UiVertex`, `UiPrimitive`, `UiImage`, `RetireQueue`, `RetiredSwapchains`, UI shader | Преобразование геометрии и текстур интерфейса в triangle list и swapchain pass |
-| engine/engine-render/build.rs | SHADERS | Компиляция встроенного GLSL в SPIR-V через naga в OUT_DIR; runtime shader compilation находится в src/surface_shader.rs |
+| `engine/engine-render/build.rs` | `SHADERS` | Компиляция встроенного GLSL в SPIR-V через naga в `OUT_DIR`; renderer встраивает результат через `include_bytes!`. Runtime-компиляция Surface GLSL находится в `src/surface_shader.rs` |
+| `engine/engine-render/src/screen_shader.rs` | `compile_screen_shader`, `ScreenShaderStage`, `ScreenShaders`, `ScreenShaderPipelines`, `ScreenShaderScratch`, `record_screen_chain` | Пользовательские экранные шейдеры камеры: prelude, компиляция naga без GPU, проверка IR, push constants и проходы; см. [[Engine/EngineScreenShaders]] |
 | `engine/engine-render/Cargo.toml`, `engine/engine-render/build.rs` | feature `dlss`, `RVE_DLSS_SDK` | Windows x64 MSVC DLSS feature связывается с `nvsdk_ngx_s.lib`; runtime SDK DLL не хранится в репозитории |
-| engine/engine-render/Cargo.toml | ash, libloading, engine-platform, raw-window-handle, naga | Vulkan bindings, динамический FSR loader, platform integration, raw window handles и naga для build/runtime GLSL |
+| `engine/engine-render/Cargo.toml` | `ash`, `libloading`, `engine-platform`, `raw-window-handle`, зависимость `naga` (шейдеры renderer при сборке, Surface GLSL и пользовательские экранные шейдеры во время работы) | Vulkan bindings, динамический FSR loader, платформенная интеграция, оконные handles без зависимости от winit и сборка шейдеров |
 
 ## Публичные контракты
 
@@ -77,11 +78,24 @@ Parent: [[Index]]
 | `UiImage` | `Texture(UiTextureId)` или `Viewport(ViewportId)` |
 | `Renderer::create_ui_texture`, `update_ui_texture`, `free_ui_texture` | UI-текстуры RGBA8 создаются и обновляются по области, имеют один mip level и удаляются отложенно |
 | `Renderer::create_viewport`, `resize_viewport`, `free_viewport` | Создают и управляют scene render targets; нулевой размер пропускает pass, targets каждого frame slot заменяются после ожидания своего fence |
+| `Renderer::request_viewport_capture`, `take_captures`, `cancel_capture` | Readback post-composite изображения viewport в `CapturedImage { width, height, rgba8 }`. Запрос ставится в очередь и выполняется в первом отрисованном кадре с этим viewport; `take_captures` неблокирующе отдаёт готовые результаты, `cancel_capture` безопасен в любом состоянии. Подробности — в разделе «Захват viewport» |
+| `CaptureTicket`, `CapturedImage` | Непрозрачный идентификатор запроса и изображение в RGBA8 sRGB. Перестановка байтов выполняется только для BGRA-формата вывода; текущий `LDR_FORMAT` — `R8G8B8A8_SRGB`, поэтому перестановки нет |
 | `Renderer::render_frame_with_ui(scenes, ui, clear)` | Для каждой переданной сцены выполняет собственные cluster compute, directional и local shadow, HDR, tonemap и output passes в viewport target, затем рисует UI прямо в swapchain. Каждый `Frame` несёт свои camera position, local shadow selection/matrices и `ViewSettings`; frame slot хранит отдельные матрицы, а общий local depth array последовательно очищается и перерисовывается для каждого viewport до его opaque pass. Повтор viewport или неизвестная ссылка дают `InvalidTexture`; `Frame::overlay` здесь не используется. GPU-время измеряет первую нарисованную сцену до конца tonemap |
 | `FrameStatus::Presented` | `queue_present` вернул успех, в том числе при suboptimal; это не подтверждение фактического сканирования кадра монитором |
 | `FrameStatus::Skipped` | Нулевой размер, пересоздание swapchain, `OUT_OF_DATE` или `TIMEOUT`/`NOT_READY` от acquire, либо `OUT_OF_DATE` от present без успешной презентации |
 | `Renderer::render_frame_with_outcome` и `render_frame_with_ui_outcome` | Расширенные варианты render API возвращают `FrameOutcome { status, submitted }`; `submitted` истинно после успешного `vkQueueSubmit2`, даже если `queue_present` затем сообщил `OUT_OF_DATE`. Это позволяет runtime продвигать temporal model history только для кадров, действительно отправленных в очередь. Исходные `render_frame` и `render_frame_with_ui` сохраняют контракт `FrameStatus` |
 | RenderError | Варианты InvalidConfig, Loader, Handle, Vulkan, Unsupported, NoSuitableDevice, InvalidState, InvalidMesh, InvalidTexture, InvalidMaterial, InvalidShader и InvalidEnvironment. InvalidShader покрывает compile, shader id/layout и удаление shader, на который ещё ссылается material; реализует Display и Error |
+
+## Захват viewport
+
+Захват — асинхронный readback изображения вывода viewport после composite и экранных шейдеров камеры: копия записывается после output-прохода, который читает результат `ScreenShaderAfter` ([[Engine/EngineScreenShaders]]). Его использует редактор для `capture_view` ([[Engine/RveEditor]]). Изменение аддитивно: `render_frame*` без запросов захвата работают как прежде.
+
+- Изображение вывода viewport создаётся с `TRANSFER_SRC` вместе с `COLOR_ATTACHMENT` и `SAMPLED`.
+- Тикет проходит состояния `Queued` (ждёт кадра, где viewport отрисован) → `Submitted` (копия записана в кадр слота, ждёт fence слота) → `Completed` или `Failed`. `Cancelled` возможен из любого состояния. Готовый результат отдаётся `take_captures` один раз.
+- При записи кадра после composite барьер переводит вывод в `TRANSFER_SRC_OPTIMAL`, `cmd_copy_image_to_buffer` пишет в host-visible буфер, затем барьер возвращает layout `SHADER_READ_ONLY_OPTIMAL` для UI. Буфер создаётся на каждый тикет, общего пула нет.
+- `take_captures` опрашивает fence отправленных слотов (`vkGetFenceStatus`) без ожидания; он не ждёт повторного использования слота. Буфер читается и освобождается только после сигнала fence. Отменённый, но уже отправленный тикет удерживает буфер до своего fence.
+- `cancel_capture` переводит тикет в `Cancelled` до отправки. Для отправленного тикета помечается только результат, без раннего освобождения staging-буфера.
+- `free_viewport` переводит ожидающие тикеты этого viewport в ошибку: очередь получает `InvalidTexture`, отправленные — `InvalidState`. Потеря синхронизации слотов или сбой записи кадра переводят тикеты в `InvalidState`.
 
 ## Skinning
 
@@ -97,13 +111,14 @@ Parent: [[Index]]
 
 ## Зависимости и взаимодействия
 
-- Использует ash 0.38.0 и raw-window-handle 0.6.2; naga 30.0.1 — build-зависимость для встроенных shaders и runtime-зависимость для Surface GLSL. naga 30.0.1 не собирает `glsl-in` без `wgsl-in` или `spv-in`, поэтому в `Cargo.toml` дополнительно включена `wgsl-in`. [[Engine/EnginePlatform]] предоставляет загрузку Vulkan, требования платформы и surface через ash-window 0.13.0.
+- Использует ash 0.38.0 и raw-window-handle 0.6.2; naga 30.0.1 — build-зависимость для встроенных shaders и runtime-зависимость для Surface GLSL и пользовательских экранных шейдеров ([[Engine/EngineScreenShaders]]). naga 30.0.1 не собирает `glsl-in` без `wgsl-in` или `spv-in`, поэтому в `Cargo.toml` дополнительно включена `wgsl-in`. [[Engine/EnginePlatform]] предоставляет загрузку Vulkan, требования платформы и surface через ash-window 0.13.0.
 - Используется в [[Engine/Sandbox]] и [[Engine/RveEditor]], которые передают `Arc<Window>` из [[Engine/EngineWindow]]. Renderer получает UI-треугольники без зависимости от egui; редактор переводит egui output и управляет scene viewport-ами.
 - `engine-render` намеренно не зависит от winit; это проверяется командой `cargo tree -p engine-render`.
 
 ## Ограничения и важные детали
 
 - GPU-профайлер: `GpuPass` перечисляет проходы в порядке выполнения. На каждый вид выделяется `GpuPass::COUNT + 1` запросов (начало и граница после каждого прохода), для вывода на swapchain — два; всего до `MAX_PROFILED_VIEWS` видов за кадр. Все границы пишутся стадией `ALL_COMMANDS` вне `cmd_begin_rendering`…`cmd_end_rendering`. Пул сбрасывается при начале command buffer. Чтение — один вызов с `TYPE_64 | WITH_AVAILABILITY`; недоступная граница означает, что проход не выполнялся в кадре, и его время попадает в следующий записанный проход. `NOT_READY` не отменяет чтение остальных запросов.
+- Экранные шейдеры камеры записываются как `GpuPass::ScreenShaderBefore` (после temporal resolve, до filters) и `GpuPass::ScreenShaderAfter` (после composite). Без включённых шейдеров эти границы не пишутся, а проходы и scratch не создаются. Порядок и контракт описаны в [[Engine/EngineScreenShaders]].
 - Submit ждёт `image_available` на стадии `COLOR_ATTACHMENT_OUTPUT`, поэтому ожидание acquire может попасть в первый color-проход (обычно Opaque), а не в вывод на swapchain. Синхронизация этим решением не меняется. GPU-данные отстают от CPU-фаз на число кадров в полёте. Точность на MoltenVK и Windows (FSR/DLSS в TemporalResolve) отдельно не сверялась.
 
 ## Решения и основания

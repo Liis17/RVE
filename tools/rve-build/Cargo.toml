@@ -1,11 +1,12 @@
 [package]
 name = "rve-build"
-version = "0.8.0"
+version = "0.9.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 engine-assets = { path = "../../engine/engine-assets" }
+engine-render = { path = "../../engine/engine-render" }
 engine-files = { path = "../../engine/engine-files" }
 engine-gui = { path = "../../engine/engine-gui" }
 engine-pak = { path = "../../engine/engine-pak" }

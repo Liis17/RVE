@@ -58,9 +58,10 @@ pub use camera_settings::{
 pub use document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
-    MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue,
-    PointLightComponent, ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset,
-    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
+    MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS, MaterialAlphaMode,
+    MaterialOverride, MeshRenderer, ParamValue, PointLightComponent, ProceduralSkyComponent,
+    RigidBodyComponent, RigidBodyKind, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform, ScreenShaderRef, ScreenShaderStage, SpotLightComponent,
 };
 pub use params::{ParamKind, ParamSchema, ParamSpec};
 pub use post_process::{

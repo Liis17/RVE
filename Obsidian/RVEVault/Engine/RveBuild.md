@@ -29,7 +29,7 @@ New Project при PATH только с системными каталогам�
 помощью `SceneDocument`. Выключенные сцены не открываются. В сборку попадают файлы
 включённых сцен, их `[[assets]]`, внешние PNG-зависимости FBX через
 `Assets::model_dependencies` и заданный `BootstrapConfig.app_icon`. Каждый объявленный
-asset `.camerasettings` проверяется как UTF-8/TOML с диапазонами настроек до сборки; asset `.postprocess` проверяется тем же парсером `PostProcessSettings`; `.rvephysmat` проверяется так же и пакуется вместе со сценой, которая на него ссылается.
+asset `.camerasettings` проверяется как UTF-8/TOML с диапазонами настроек до сборки; asset `.postprocess` проверяется тем же парсером `PostProcessSettings`; `.rvephysmat` проверяется так же и пакуется вместе со сценой, которая на него ссылается. Asset `.glsl` проверяется `compile_screen_shader` для обеих стадий тем же кодом, что и renderer; ошибка отклоняет сборку с путём файла и номером строки ([[Engine/EngineScreenShaders]]).
 Иконка должна
 иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
 Неиспользуемые файлы каталога Assets не копируются.

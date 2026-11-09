@@ -402,6 +402,11 @@ fn run_from_args(
         ui,
         ..
     } = prepared;
+    let mut render_assets = render_assets;
+    if !headless {
+        // Исходники экранных шейдеров читает только игровой клиент; headless их не открывает.
+        render_assets.screen_shaders = scene::load_screen_shader_sources(&resource_handle, &world);
+    }
     let ui_text_focus = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (script_tx, script_rx) = flume::unbounded();
     let (frame_tx, frame_rx) = flume::bounded(1);

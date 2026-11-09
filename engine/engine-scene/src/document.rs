@@ -288,6 +288,7 @@ impl SceneDocument {
                         "постобработка камеры",
                     )?;
                 }
+                validate_screen_shaders(source, &object.id, &asset_paths, &camera.screen_shaders)?;
             }
             if let Some(material) = object.collider.as_ref().and_then(|c| c.material.as_ref()) {
                 require_asset_path(
@@ -728,6 +729,39 @@ impl Default for SceneTransform {
     }
 }
 
+/// Стадия экранного шейдера камеры относительно цепочки постобработки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenShaderStage {
+    /// HDR после TAA/FSR/DLSS, до motion blur, экспозиции, bloom и tonemap.
+    BeforePost,
+    /// LDR после tonemap, до FXAA, film grain и UI.
+    AfterPost,
+}
+
+/// Экранный шейдер камеры: GLSL-ассет, стадия, включение и параметры `rve_param(0..16)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenShaderRef {
+    #[serde(with = "virtual_path_serde")]
+    pub shader: VirtualPath,
+    pub stage: ScreenShaderStage,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Не больше [`MAX_SCREEN_SHADER_PARAMS`] конечных чисел; недостающие считаются нулями.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<f32>,
+}
+
+/// Максимум экранных шейдеров на одну камеру.
+pub const MAX_SCREEN_SHADERS: usize = 4;
+/// Максимум пользовательских параметров экранного шейдера.
+pub const MAX_SCREEN_SHADER_PARAMS: usize = 16;
+
+fn default_enabled() -> bool {
+    true
+}
+
 /// Ссылка на настройки камеры и выбор активной камеры сцены.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -737,6 +771,9 @@ pub struct CameraComponent {
     /// Файл `.postprocess`; без него используется постобработка по умолчанию.
     #[serde(default, with = "option_virtual_path_serde")]
     pub post_process: Option<VirtualPath>,
+    /// Экранные шейдеры камеры в порядке записи; не больше [`MAX_SCREEN_SHADERS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screen_shaders: Vec<ScreenShaderRef>,
     pub active: bool,
     /// Состояние курсора при старте сцены; действует, только если камера активна.
     #[serde(default, skip_serializing_if = "CameraCursor::is_default")]
@@ -1573,6 +1610,15 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, "camera.post_process", path)),
             );
+            if let Some(shaders) = camera.get("screen_shaders").and_then(toml::Value::as_array) {
+                paths.extend(
+                    shaders
+                        .iter()
+                        .filter_map(toml::Value::as_table)
+                        .filter_map(|table| table.get("shader").and_then(toml::Value::as_str))
+                        .map(|path| (object_id, "camera.screen_shaders.shader", path)),
+                );
+            }
         }
         if let Some(environment) = object.get("environment").and_then(toml::Value::as_table) {
             paths.extend(
@@ -1752,6 +1798,44 @@ pub(crate) fn validate_material_override(
         if let Some(path) = path {
             require_asset_path(source, object_id, assets, path, kind)?;
             require_extension(source, object_id, path, "png", kind)?;
+        }
+    }
+    Ok(())
+}
+
+/// Проверяет экранные шейдеры камеры: не больше четырёх, объявленные `.glsl` и конечные параметры
+/// не длиннее шестнадцати. Общая для сцены, префабов и их override.
+pub(crate) fn validate_screen_shaders(
+    source: &str,
+    object_id: &str,
+    assets: &HashSet<VirtualPath>,
+    shaders: &[ScreenShaderRef],
+) -> Result<(), SceneError> {
+    if shaders.len() > MAX_SCREEN_SHADERS {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            format!("у камеры больше {MAX_SCREEN_SHADERS} экранных шейдеров"),
+        ));
+    }
+    for shader in shaders {
+        require_asset_path(source, object_id, assets, &shader.shader, "экранный шейдер")?;
+        require_extension(source, object_id, &shader.shader, "glsl", "экранный шейдер")?;
+        if shader.params.len() > MAX_SCREEN_SHADER_PARAMS {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                format!(
+                    "экранный шейдер принимает не больше {MAX_SCREEN_SHADER_PARAMS} параметров"
+                ),
+            ));
+        }
+        if !shader.params.iter().all(|value| value.is_finite()) {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "параметры экранного шейдера должны быть конечными",
+            ));
         }
     }
     Ok(())
@@ -1953,6 +2037,7 @@ pub(crate) mod option_virtual_path_serde {
 
 #[cfg(test)]
 mod tests {
+    use super::ScreenShaderStage;
     use super::{
         CharacterControllerComponent, ColliderComponent, LodGroup, LodLevel, MAX_LOD_LEVELS,
         MaterialAlphaMode, ParamValue, RigidBodyComponent, SceneDocument,
@@ -2401,6 +2486,95 @@ scale=[1.0,1.0,0.0]
                 .as_ref()
                 .is_some_and(|camera| camera.post_process.is_some())
         );
+    }
+
+    /// Камера с экранными шейдерами поверх `VALID`; `extra` вставляется строками после `[objects.camera]`.
+    fn camera_with_screen_shaders(extra: &str) -> String {
+        format!(
+            "[[assets]]\npath=\"/fx/vhs.glsl\"\n[[assets]]\npath=\"/fx/crt.glsl\"\n{}",
+            VALID.replace("[objects.camera]", &format!("[objects.camera]\n{extra}"))
+        )
+    }
+
+    #[test]
+    fn screen_shaders_parse_with_defaults_and_round_trip() {
+        let document = parse(&camera_with_screen_shaders(
+            "[[objects.camera.screen_shaders]]\nshader=\"/fx/vhs.glsl\"\nstage=\"after_post\"\nparams=[0.7, 0.3]\n[[objects.camera.screen_shaders]]\nshader=\"/fx/crt.glsl\"\nstage=\"before_post\"\nenabled=false",
+        ))
+        .unwrap();
+        let shaders = &document.objects[0].camera.as_ref().unwrap().screen_shaders;
+        assert_eq!(shaders.len(), 2);
+        assert_eq!(shaders[0].stage, ScreenShaderStage::AfterPost);
+        assert!(shaders[0].enabled, "enabled по умолчанию true");
+        assert_eq!(shaders[0].params, [0.7, 0.3]);
+        assert_eq!(shaders[1].stage, ScreenShaderStage::BeforePost);
+        assert!(!shaders[1].enabled);
+        assert!(shaders[1].params.is_empty());
+
+        let written = document.to_toml().unwrap();
+        let reparsed = parse(&written).unwrap();
+        assert_eq!(
+            reparsed.objects[0].camera.as_ref().unwrap().screen_shaders,
+            *shaders
+        );
+    }
+
+    #[test]
+    fn scene_without_screen_shaders_is_written_without_the_field() {
+        let document = parse(VALID).unwrap();
+        let written = document.to_toml().unwrap();
+        assert!(!written.contains("screen_shaders"), "{written}");
+    }
+
+    #[test]
+    fn screen_shaders_reject_invalid_declarations() {
+        let shader = |path: &str, params: &str| {
+            format!(
+                "[[objects.camera.screen_shaders]]\nshader=\"{path}\"\nstage=\"after_post\"\n{params}"
+            )
+        };
+        let rejects = |input: String, expected: &str| {
+            let message = parse(&input).unwrap_err().to_string();
+            assert!(message.contains(expected), "{message}");
+        };
+        let five = (0..5)
+            .map(|_| shader("/fx/vhs.glsl", ""))
+            .collect::<String>();
+        rejects(
+            camera_with_screen_shaders(&five),
+            "больше 4 экранных шейдеров",
+        );
+        let many_params = format!("params={:?}", vec![0.0_f32; 17]);
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/vhs.glsl", &many_params)),
+            "не больше 16 параметров",
+        );
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/vhs.glsl", "params=[nan]")),
+            "параметры экранного шейдера должны быть конечными",
+        );
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/missing.glsl", "")),
+            "отсутствует в [[assets]]",
+        );
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/vhs.glsl", "bogus=1\n")),
+            "bogus",
+        );
+        rejects(
+            camera_with_screen_shaders(
+                "[[objects.camera.screen_shaders]]\nshader=\"/fx/vhs.glsl\"\nstage=\"middle\"",
+            ),
+            "middle",
+        );
+        let wrong_extension = format!(
+            "[[assets]]\npath=\"/fx/vhs.txt\"\n{}",
+            VALID.replace(
+                "[objects.camera]",
+                &format!("[objects.camera]\n{}", shader("/fx/vhs.txt", ""))
+            )
+        );
+        rejects(wrong_extension, "расширение .glsl");
     }
 
     #[test]

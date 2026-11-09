@@ -952,6 +952,7 @@ impl WindowHandler for Sandbox {
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
                 post: render_post_process(&self.post_process),
+                screen_shaders: engine_render::ScreenShaders::default(),
                 anti_aliasing: match self.camera_settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,

@@ -157,8 +157,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            14.. => std::mem::size_of::<RveScriptDesc>(),
-            13 => std::mem::size_of::<RveScriptDescV13>(),
+            15.. => std::mem::size_of::<RveScriptDesc>(),
+            13..=14 => std::mem::size_of::<RveScriptDescV13>(),
             6..=12 => std::mem::size_of::<RveScriptDescV6>(),
             4 | 5 => std::mem::size_of::<RveScriptDescV4>(),
             3 => std::mem::size_of::<RveScriptDescV3>(),
@@ -178,10 +178,10 @@ impl ScriptLibrary {
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v14 = (header.abi_version >= 14)
+        let descriptors_v15 = (header.abi_version >= 15)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        // SAFETY: version 13 has the net event tail but no UI callback.
-        let descriptors_v13 = (header.abi_version == 13).then(|| unsafe {
+        // SAFETY: versions 13 and 14 have the net event tail but no UI callback.
+        let descriptors_v13 = ((13..=14).contains(&header.abi_version)).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV13>(), count)
         });
         // SAFETY: versions 6 through 12 share the descriptor layout without network callbacks.
@@ -202,7 +202,7 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v14 {
+            let descriptor = if let Some(descriptors) = descriptors_v15 {
                 &descriptors[index]
             } else if let Some(descriptors) = descriptors_v13 {
                 // ABI v13 has no UI callback; normalize it to `None`.

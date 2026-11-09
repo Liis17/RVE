@@ -1682,7 +1682,7 @@ impl ScriptHost {
         }
     }
 
-    /// Есть ли у экземпляра callback `on_ui_event`; ABI-модули до v14 такого не имеют.
+    /// Есть ли у экземпляра callback `on_ui_event`; ABI-модули до v15 такого не имеют.
     fn has_ui_callback(&self, index: usize) -> bool {
         match self.instances[index]
             .as_ref()
