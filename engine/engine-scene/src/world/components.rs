@@ -12,7 +12,6 @@ use crate::document::{
 };
 use crate::{SceneError, light::MAX_SHADOW_CASCADES};
 use engine_files::VirtualPath;
-use std::collections::HashSet;
 
 /// Наибольший одноразовый выброс частиц за вызов.
 pub const MAX_PARTICLE_BURST: u32 = 4096;
@@ -342,10 +341,9 @@ impl World {
     /// и повторы пропускаются.
     pub fn take_mesh_material_changes(&mut self) -> Vec<ObjectHandle> {
         let changes = std::mem::take(&mut self.mesh_material_changes);
-        let mut seen = HashSet::with_capacity(changes.len());
         changes
             .into_iter()
-            .filter(|&handle| self.is_alive(handle) && seen.insert(handle))
+            .filter(|&handle| self.is_alive(handle))
             .collect()
     }
 
@@ -353,7 +351,7 @@ impl World {
         if let Some(index) = self.dense(handle) {
             let object = &mut self.objects[index];
             object.mesh_material_revision += 1;
-            self.mesh_material_changes.push(handle);
+            self.mesh_material_changes.insert(handle);
         }
     }
 

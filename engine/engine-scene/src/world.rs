@@ -403,7 +403,7 @@ pub struct World {
     /// Объекты, у которых действующая активность изменилась; см. [`World::take_activity_changes`].
     activity_changes: Vec<ObjectHandle>,
     /// Объекты, у которых сменились материалы меш-рендерера; см. [`World::take_mesh_material_changes`].
-    mesh_material_changes: Vec<ObjectHandle>,
+    mesh_material_changes: HashSet<ObjectHandle>,
 }
 
 impl World {
@@ -506,7 +506,7 @@ impl World {
             last_valid_environment: None,
             spawn_serial: 0,
             activity_changes: Vec::new(),
-            mesh_material_changes: Vec::new(),
+            mesh_material_changes: HashSet::new(),
         };
         let _ = world.build_frame();
         Ok(world)
