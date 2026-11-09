@@ -166,3 +166,17 @@ play_on_start = true
 spatial = true
 min_distance = 2.0
 max_distance = 25.0
+
+[[assets]]
+path = "/ui/hud.rveui"
+
+[[assets]]
+path = "/scripts/hud.lua"
+
+[[objects]]
+id = "game-hud"
+name = "Game HUD"
+[objects.ui_canvas]
+document = "/ui/hud.rveui"
+[[objects.lite_scripts]]
+path = "/scripts/hud.lua"

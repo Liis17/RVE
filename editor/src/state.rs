@@ -174,6 +174,12 @@ pub struct FrameParts<'a> {
 }
 
 pub struct EditorState {
+    pub ui_document: Option<crate::ui_editor::CanvasEditor>,
+    pub ui_pending_path: Option<String>,
+    pub ui_editor_requested: bool,
+    pub ui_editor_active: bool,
+    pub ui_authoring: bool,
+    pub ui_editor_rect: Option<egui::Rect>,
     /// Invalidates queued MCP calls whenever a project or scene is replaced.
     pub mcp_generation: u64,
     /// Незавершённый `capture_view`: ответ отправляется, когда кадр отдал PNG или задача снята.
@@ -293,6 +299,12 @@ pub struct EditorState {
 impl EditorState {
     pub fn new(scripts_path: Option<PathBuf>) -> Self {
         Self {
+            ui_document: None,
+            ui_pending_path: None,
+            ui_editor_requested: false,
+            ui_editor_active: false,
+            ui_authoring: false,
+            ui_editor_rect: None,
             mcp_generation: 0,
             mcp_capture: None,
             project: None,
@@ -614,6 +626,8 @@ impl EditorState {
     pub fn project_replaced(&mut self) {
         self.project_prefabs = None;
         self.tags_layers = None;
+        self.ui_document = None;
+        self.ui_pending_path = None;
         self.materials = MaterialLibrary::default();
         self.inspected_asset = None;
         self.material_preview_asset = None;
@@ -622,7 +636,10 @@ impl EditorState {
 
     /// Есть ли несохранённые правки сцены или списка тяжёлых префабов.
     pub fn has_unsaved_changes(&self) -> bool {
-        self.scene.as_ref().is_some_and(EditorScene::is_dirty)
+        self.ui_document
+            .as_ref()
+            .is_some_and(crate::ui_editor::CanvasEditor::is_dirty)
+            || self.scene.as_ref().is_some_and(EditorScene::is_dirty)
             || self
                 .project_prefabs
                 .as_ref()
@@ -631,6 +648,11 @@ impl EditorState {
 
     /// Сохраняет список тяжёлых префабов, если в нём есть правки; без правок файл не трогается.
     pub fn save_project_prefabs(&mut self) -> Result<(), String> {
+        if let (Some(editor), Some(project)) = (&mut self.ui_document, &self.project)
+            && editor.is_dirty()
+        {
+            editor.save(project)?;
+        }
         match self.project_prefabs.as_mut() {
             Some(prefabs) if prefabs.is_dirty() => prefabs.save(),
             _ => Ok(()),

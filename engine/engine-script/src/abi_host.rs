@@ -12,8 +12,12 @@ use crate::transaction::{
     QueueMessageError, ScriptObjectRef, ScriptTransaction,
 };
 use crate::types::{RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
+use crate::ui::UiDelivery;
 use engine_console::CommandSpec;
 use engine_files::VirtualPath;
+use engine_gui::document::RectSpec;
+use engine_gui::events::{UiEventKind, UiValue};
+use engine_gui::system::{UiCanvasHandle, UiElementHandle};
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
@@ -51,6 +55,15 @@ use rve_sdk::abi::{
     RVE_SPAWN_HAS_POSITION, RVE_SPAWN_HAS_ROTATION, RVE_SPAWN_HAS_SCALE, RVE_SPAWN_HAS_VELOCITY,
     RVE_SPAWN_KNOWN_FLAGS, RveSpawnOptions,
 };
+use rve_sdk::abi::{
+    RVE_UI_EVENT_BLUR, RVE_UI_EVENT_CANCEL, RVE_UI_EVENT_CLICK, RVE_UI_EVENT_FOCUS,
+    RVE_UI_EVENT_HOVER_ENTER, RVE_UI_EVENT_HOVER_EXIT, RVE_UI_EVENT_SUBMIT,
+    RVE_UI_EVENT_VALUE_CHANGED, RVE_UI_INVALID_INPUT, RVE_UI_OK, RVE_UI_PROP_CANVAS_LAYER,
+    RVE_UI_PROP_CANVAS_VISIBLE, RVE_UI_PROP_COLOR, RVE_UI_PROP_INTERACTABLE, RVE_UI_PROP_TEXT,
+    RVE_UI_PROP_VALUE, RVE_UI_PROP_VISIBLE, RVE_UI_REJECTED, RVE_UI_VALUE_BOOL, RVE_UI_VALUE_COLOR,
+    RVE_UI_VALUE_INDEX, RVE_UI_VALUE_INTEGER, RVE_UI_VALUE_NONE, RVE_UI_VALUE_NUMBER,
+    RVE_UI_VALUE_TEXT, RveUiEvent, RveUiRect, RveUiValue,
+};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -66,6 +79,8 @@ pub(crate) struct AbiCallContext<'a> {
     commands_allowed: bool,
     error: Option<String>,
     action_binding: String,
+    /// Текст последнего UI-значения, возвращённого гостю; живёт до конца callback.
+    ui_text: String,
     poisoned: bool,
 }
 
@@ -105,6 +120,7 @@ impl<'a> AbiCallContext<'a> {
             commands_allowed: false,
             error: None,
             action_binding: String::new(),
+            ui_text: String::new(),
             poisoned: false,
         }
     }
@@ -127,6 +143,7 @@ impl<'a> AbiCallContext<'a> {
             commands_allowed: command_access.allowed,
             error: None,
             action_binding: String::new(),
+            ui_text: String::new(),
             poisoned: false,
         }
     }
@@ -240,6 +257,19 @@ impl<'a> AbiCallContext<'a> {
             net_object_has_authority: Some(host_net_object_has_authority),
             net_object_set_owner: Some(host_net_object_set_owner),
             net_object_send: Some(host_net_object_send),
+            ui_open: Some(host_ui_open),
+            ui_close: Some(host_ui_close),
+            ui_object_canvas: Some(host_ui_object_canvas),
+            ui_focused: Some(host_ui_focused),
+            ui_pointer_over: Some(host_ui_pointer_over),
+            ui_find: Some(host_ui_find),
+            ui_get: Some(host_ui_get),
+            ui_set: Some(host_ui_set),
+            ui_get_rect: Some(host_ui_get_rect),
+            ui_set_rect: Some(host_ui_set_rect),
+            ui_set_options: Some(host_ui_set_options),
+            ui_set_image: Some(host_ui_set_image),
+            ui_focus: Some(host_ui_focus),
             object_set_active: Some(host_object_set_active),
             object_is_active: Some(host_object_is_active),
             object_active_in_hierarchy: Some(host_object_active_in_hierarchy),
@@ -498,6 +528,50 @@ impl AbiScriptInstance {
             // SAFETY: the event, its borrowed strings and value, the instance, and the host remain
             // live throughout the callback.
             unsafe { callback(self.instance, &host, event) }
+        };
+        context.callback_result(status)
+    }
+
+    /// Есть ли у дескриптора callback UI-событий (ABI v16).
+    pub(crate) fn has_ui_event(&self) -> bool {
+        self.descriptor.ui_event.is_some()
+    }
+
+    /// Вызывает `on_ui_event` гостя. Без callback (модуль до v16) событие пропускается без ошибки.
+    pub(crate) fn invoke_ui_event(
+        &mut self,
+        time: ScriptTime,
+        event: &UiDelivery,
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let Some(callback) = self.descriptor.ui_event else {
+            return Ok(());
+        };
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let status = {
+            let host = context.host(time);
+            let ui_event = RveUiEvent {
+                kind: ui_event_code(event.kind),
+                canvas: canvas_to_abi(event.canvas),
+                element: event.element.index() as u32,
+                element_id: RveStr::from_str_ref(&event.element_id),
+                value: ui_event_value(&event.value),
+            };
+            // SAFETY: the event, its borrowed strings, the instance, and the host remain live
+            // throughout the callback.
+            unsafe { callback(self.instance, &host, ui_event) }
         };
         context.callback_result(status)
     }
@@ -2839,6 +2913,529 @@ unsafe extern "C" fn host_net_object_send(
             reliable,
         )
     })
+}
+
+// ---- Игровой UI (ABI v16) ----
+//
+// Все записи идут через транзакцию вызова: откат при ошибке гостя и отложенные закрытия работают
+// так же, как у остальных callback. Хендлы в ABI — `(generation << 32) | (index + 1)` для канваса и
+// индекс в документе для элемента; устаревший хендл даёт `RVE_UI_REJECTED`.
+
+/// Код канваса в ABI: индекс слота (+1) и поколение в старших 32 битах, как у объектов.
+fn canvas_to_abi(canvas: UiCanvasHandle) -> u64 {
+    (u64::from(canvas.generation()) << 32) | (u64::from(canvas.index()) + 1)
+}
+
+fn ui_canvas(value: u64) -> Result<UiCanvasHandle, String> {
+    let slot = (value & u64::from(u32::MAX)) as u32;
+    if slot == 0 {
+        return Err("UI-хендл канваса не подходит".to_owned());
+    }
+    Ok(UiCanvasHandle::from_raw(slot - 1, (value >> 32) as u32))
+}
+
+fn ui_element(
+    context: &AbiCallContext<'_>,
+    canvas: u64,
+    element: u32,
+) -> Result<UiElementHandle, String> {
+    context
+        .transaction
+        .ui_element_at(ui_canvas(canvas)?, element as usize)
+}
+
+/// Отказ UI-вызова: причина попадает в события скрипта, как у остальных callback хоста.
+fn ui_failure(context: &mut AbiCallContext<'_>, message: String) -> u32 {
+    context.events.borrow_mut().push(ScriptEvent {
+        level: ScriptEventLevel::Error,
+        source: context.source.to_owned(),
+        message,
+    });
+    RVE_UI_REJECTED
+}
+
+fn ui_outcome(context: &mut AbiCallContext<'_>, result: Result<(), String>) -> u32 {
+    match result {
+        Ok(()) => RVE_UI_OK,
+        Err(message) => ui_failure(context, message),
+    }
+}
+
+/// Значение свойства до перевода в ABI.
+enum UiReadout {
+    Nothing,
+    Bool(bool),
+    Integer(i64),
+    Number(f64),
+    Index(usize),
+    Text(String),
+    Color([u8; 4]),
+}
+
+fn readout_to_abi(context: &mut AbiCallContext<'_>, readout: UiReadout) -> RveUiValue {
+    let mut value = RveUiValue {
+        kind: RVE_UI_VALUE_NONE,
+        flag: false,
+        number: 0.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    };
+    match readout {
+        UiReadout::Nothing => {}
+        UiReadout::Bool(flag) => {
+            value.kind = RVE_UI_VALUE_BOOL;
+            value.flag = flag;
+        }
+        UiReadout::Integer(integer) => {
+            value.kind = RVE_UI_VALUE_INTEGER;
+            value.integer = integer;
+        }
+        UiReadout::Number(number) => {
+            value.kind = RVE_UI_VALUE_NUMBER;
+            value.number = number;
+        }
+        UiReadout::Index(index) => {
+            value.kind = RVE_UI_VALUE_INDEX;
+            value.integer = i64::try_from(index).unwrap_or(i64::MAX);
+        }
+        UiReadout::Text(text) => {
+            context.ui_text = text;
+            value.kind = RVE_UI_VALUE_TEXT;
+            value.text = RveStr::from_str_ref(&context.ui_text);
+        }
+        UiReadout::Color(color) => {
+            value.kind = RVE_UI_VALUE_COLOR;
+            value.color = color;
+        }
+    }
+    value
+}
+
+fn ui_read(
+    context: &AbiCallContext<'_>,
+    canvas: u64,
+    element: u32,
+    property: u32,
+) -> Result<UiReadout, String> {
+    let transaction = &*context.transaction;
+    Ok(match property {
+        RVE_UI_PROP_CANVAS_VISIBLE => {
+            UiReadout::Bool(transaction.ui_canvas_visible(ui_canvas(canvas)?)?)
+        }
+        RVE_UI_PROP_CANVAS_LAYER => {
+            UiReadout::Integer(i64::from(transaction.ui_canvas_layer(ui_canvas(canvas)?)?))
+        }
+        RVE_UI_PROP_TEXT => {
+            UiReadout::Text(transaction.ui_text(ui_element(context, canvas, element)?)?)
+        }
+        RVE_UI_PROP_VALUE => match transaction.ui_value(ui_element(context, canvas, element)?)? {
+            None => UiReadout::Nothing,
+            Some(UiValue::Number(number)) => UiReadout::Number(f64::from(number)),
+            Some(UiValue::Bool(flag)) => UiReadout::Bool(flag),
+            Some(UiValue::Index(index)) => UiReadout::Index(index),
+            Some(UiValue::Text(text)) => UiReadout::Text(text),
+        },
+        RVE_UI_PROP_VISIBLE => {
+            UiReadout::Bool(transaction.ui_visible(ui_element(context, canvas, element)?)?)
+        }
+        RVE_UI_PROP_INTERACTABLE => {
+            UiReadout::Bool(transaction.ui_interactable(ui_element(context, canvas, element)?)?)
+        }
+        RVE_UI_PROP_COLOR => {
+            UiReadout::Color(transaction.ui_color(ui_element(context, canvas, element)?)?)
+        }
+        _ => return Err("неизвестное свойство UI".to_owned()),
+    })
+}
+
+fn ui_bool(value: &RveUiValue) -> Result<bool, String> {
+    if value.kind == RVE_UI_VALUE_BOOL {
+        Ok(value.flag)
+    } else {
+        Err("UI-свойство ожидает логическое значение".to_owned())
+    }
+}
+
+/// Строка из значения гостя; гость держит её читаемой на время вызова.
+fn ui_text_arg(value: RveStr) -> Result<String, String> {
+    // SAFETY: the guest keeps the borrowed text readable for this callback.
+    unsafe { read_abi_str(value) }
+        .map(str::to_owned)
+        .map_err(|_| "строка UI не читается как UTF-8".to_owned())
+}
+
+fn ui_value_arg(value: &RveUiValue) -> Result<UiValue, String> {
+    Ok(match value.kind {
+        RVE_UI_VALUE_NUMBER => {
+            if !value.number.is_finite() {
+                return Err("UI-значение должно быть конечным числом".to_owned());
+            }
+            UiValue::Number(value.number as f32)
+        }
+        RVE_UI_VALUE_BOOL => UiValue::Bool(value.flag),
+        RVE_UI_VALUE_INDEX => UiValue::Index(
+            usize::try_from(value.integer)
+                .map_err(|_| "индекс UI не может быть отрицательным".to_owned())?,
+        ),
+        RVE_UI_VALUE_TEXT => UiValue::Text(ui_text_arg(value.text)?),
+        _ => return Err("неподдерживаемый вид значения UI".to_owned()),
+    })
+}
+
+fn ui_write(
+    context: &mut AbiCallContext<'_>,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    value: &RveUiValue,
+) -> Result<(), String> {
+    match property {
+        RVE_UI_PROP_CANVAS_VISIBLE => {
+            let visible = ui_bool(value)?;
+            let canvas = ui_canvas(canvas)?;
+            context.transaction.ui_set_canvas_visible(canvas, visible)
+        }
+        RVE_UI_PROP_CANVAS_LAYER => {
+            if value.kind != RVE_UI_VALUE_INTEGER {
+                return Err("слой канваса ожидает целое число".to_owned());
+            }
+            let layer = i32::try_from(value.integer)
+                .map_err(|_| "слой канваса вне диапазона i32".to_owned())?;
+            let canvas = ui_canvas(canvas)?;
+            context.transaction.ui_set_canvas_layer(canvas, layer)
+        }
+        RVE_UI_PROP_TEXT => {
+            let text = ui_text_arg(value.text)?;
+            let element = ui_element(context, canvas, element)?;
+            context.transaction.ui_set_text(element, &text)
+        }
+        RVE_UI_PROP_VALUE => {
+            let value = ui_value_arg(value)?;
+            let element = ui_element(context, canvas, element)?;
+            context.transaction.ui_set_value(element, value)
+        }
+        RVE_UI_PROP_VISIBLE => {
+            let visible = ui_bool(value)?;
+            let element = ui_element(context, canvas, element)?;
+            context.transaction.ui_set_visible(element, visible)
+        }
+        RVE_UI_PROP_INTERACTABLE => {
+            let interactable = ui_bool(value)?;
+            let element = ui_element(context, canvas, element)?;
+            context
+                .transaction
+                .ui_set_interactable(element, interactable)
+        }
+        RVE_UI_PROP_COLOR => {
+            if value.kind != RVE_UI_VALUE_COLOR {
+                return Err("цвет UI ожидает четыре компоненты".to_owned());
+            }
+            let element = ui_element(context, canvas, element)?;
+            context.transaction.ui_set_color(element, value.color)
+        }
+        _ => Err("неизвестное свойство UI".to_owned()),
+    }
+}
+
+fn rect_to_abi(rect: RectSpec) -> RveUiRect {
+    RveUiRect {
+        anchor_min: rect.anchor_min,
+        anchor_max: rect.anchor_max,
+        pivot: rect.pivot,
+        offset_min: rect.offset_min,
+        offset_max: rect.offset_max,
+    }
+}
+
+fn rect_from_abi(rect: RveUiRect) -> RectSpec {
+    RectSpec {
+        anchor_min: rect.anchor_min,
+        anchor_max: rect.anchor_max,
+        pivot: rect.pivot,
+        offset_min: rect.offset_min,
+        offset_max: rect.offset_max,
+    }
+}
+
+unsafe extern "C" fn host_ui_open(ctx: *mut c_void, path: RveStr, out: *mut u64) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        if out.is_null() {
+            return RVE_UI_INVALID_INPUT;
+        }
+        // SAFETY: the guest keeps the path readable for this call.
+        let Ok(path) = (unsafe { read_abi_str(path) }) else {
+            return RVE_UI_INVALID_INPUT;
+        };
+        match context.transaction.ui_open(path) {
+            Ok(canvas) => {
+                // SAFETY: the output was checked and the guest owns the writable slot.
+                unsafe { *out = canvas_to_abi(canvas) };
+                RVE_UI_OK
+            }
+            Err(message) => ui_failure(context, message),
+        }
+    })
+}
+
+unsafe extern "C" fn host_ui_close(ctx: *mut c_void, canvas: u64) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        let result = ui_canvas(canvas).and_then(|canvas| context.transaction.ui_close(canvas));
+        ui_outcome(context, result)
+    })
+}
+
+unsafe extern "C" fn host_ui_object_canvas(ctx: *mut c_void, object: u64, out: *mut u64) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = ObjectHandle::from_abi(object) else {
+            return false;
+        };
+        let Some(canvas) = context.transaction.ui_component_canvas(handle) else {
+            return false;
+        };
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: the output was checked and the guest owns the writable slot.
+        unsafe { *out = canvas_to_abi(canvas) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_ui_focused(
+    ctx: *mut c_void,
+    canvas: *mut u64,
+    element: *mut u32,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if canvas.is_null() || element.is_null() {
+            return false;
+        }
+        let Some(focused) = context.transaction.ui_focused() else {
+            return false;
+        };
+        // SAFETY: both outputs were checked and the guest owns the writable slots.
+        unsafe {
+            *canvas = canvas_to_abi(focused.canvas());
+            *element = focused.index() as u32;
+        }
+        true
+    })
+}
+
+unsafe extern "C" fn host_ui_pointer_over(ctx: *mut c_void) -> bool {
+    guarded(ctx, false, |context| context.transaction.ui_pointer_over())
+}
+
+unsafe extern "C" fn host_ui_find(
+    ctx: *mut c_void,
+    canvas: u64,
+    id: RveStr,
+    out: *mut u32,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Ok(canvas) = ui_canvas(canvas) else {
+            return false;
+        };
+        // SAFETY: the guest keeps the identifier readable for this call.
+        let Ok(id) = (unsafe { read_abi_str(id) }) else {
+            return false;
+        };
+        match context.transaction.ui_find(canvas, id) {
+            Ok(Some(element)) => {
+                // SAFETY: the output was checked and the guest owns the writable slot.
+                unsafe { *out = element.index() as u32 };
+                true
+            }
+            Ok(None) => false,
+            Err(message) => {
+                ui_failure(context, message);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_ui_get(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    out: *mut RveUiValue,
+) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        if out.is_null() {
+            return RVE_UI_INVALID_INPUT;
+        }
+        match ui_read(context, canvas, element, property) {
+            Ok(readout) => {
+                let value = readout_to_abi(context, readout);
+                // SAFETY: the output was checked and the guest owns the writable slot.
+                unsafe { *out = value };
+                RVE_UI_OK
+            }
+            Err(message) => ui_failure(context, message),
+        }
+    })
+}
+
+unsafe extern "C" fn host_ui_set(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    value: *const RveUiValue,
+) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        if value.is_null() {
+            return RVE_UI_INVALID_INPUT;
+        }
+        // SAFETY: the value was checked; the guest keeps it readable for this call.
+        let value = unsafe { *value };
+        let result = ui_write(context, canvas, element, property, &value);
+        ui_outcome(context, result)
+    })
+}
+
+unsafe extern "C" fn host_ui_get_rect(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    out: *mut RveUiRect,
+) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        if out.is_null() {
+            return RVE_UI_INVALID_INPUT;
+        }
+        let result = ui_element(context, canvas, element)
+            .and_then(|element| context.transaction.ui_rect(element));
+        match result {
+            Ok(rect) => {
+                // SAFETY: the output was checked and the guest owns the writable slot.
+                unsafe { *out = rect_to_abi(rect) };
+                RVE_UI_OK
+            }
+            Err(message) => ui_failure(context, message),
+        }
+    })
+}
+
+unsafe extern "C" fn host_ui_set_rect(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    rect: *const RveUiRect,
+) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        if rect.is_null() {
+            return RVE_UI_INVALID_INPUT;
+        }
+        // SAFETY: the rectangle was checked; the guest keeps it readable for this call.
+        let rect = rect_from_abi(unsafe { *rect });
+        let result = ui_element(context, canvas, element)
+            .and_then(|element| context.transaction.ui_set_rect(element, rect));
+        ui_outcome(context, result)
+    })
+}
+
+unsafe extern "C" fn host_ui_set_options(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    options: *const RveStr,
+    count: usize,
+) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        if count > 0 && options.is_null() {
+            return RVE_UI_INVALID_INPUT;
+        }
+        let mut list = Vec::with_capacity(count);
+        for index in 0..count {
+            // SAFETY: the guest passes `count` readable strings for this call.
+            let option = unsafe { *options.add(index) };
+            match ui_text_arg(option) {
+                Ok(text) => list.push(text),
+                Err(message) => return ui_failure(context, message),
+            }
+        }
+        let result = ui_element(context, canvas, element)
+            .and_then(|element| context.transaction.ui_set_options(element, list));
+        ui_outcome(context, result)
+    })
+}
+
+unsafe extern "C" fn host_ui_set_image(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    path: RveStr,
+) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        let path = match ui_text_arg(path) {
+            Ok(path) => path,
+            Err(message) => return ui_failure(context, message),
+        };
+        let result = ui_element(context, canvas, element)
+            .and_then(|element| context.transaction.ui_set_image(element, &path));
+        ui_outcome(context, result)
+    })
+}
+
+unsafe extern "C" fn host_ui_focus(ctx: *mut c_void, canvas: u64, element: u32) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        let result = ui_element(context, canvas, element)
+            .and_then(|element| context.transaction.ui_focus(element));
+        ui_outcome(context, result)
+    })
+}
+
+/// Код вида события для гостя.
+fn ui_event_code(kind: UiEventKind) -> u32 {
+    match kind {
+        UiEventKind::Click => RVE_UI_EVENT_CLICK,
+        UiEventKind::ValueChanged => RVE_UI_EVENT_VALUE_CHANGED,
+        UiEventKind::Submit => RVE_UI_EVENT_SUBMIT,
+        UiEventKind::Cancel => RVE_UI_EVENT_CANCEL,
+        UiEventKind::Focus => RVE_UI_EVENT_FOCUS,
+        UiEventKind::Blur => RVE_UI_EVENT_BLUR,
+        UiEventKind::HoverEnter => RVE_UI_EVENT_HOVER_ENTER,
+        UiEventKind::HoverExit => RVE_UI_EVENT_HOVER_EXIT,
+    }
+}
+
+/// Значение события, заимствованное у доставляемого события на время callback.
+fn ui_event_value(value: &Option<UiValue>) -> RveUiValue {
+    let mut abi = RveUiValue {
+        kind: RVE_UI_VALUE_NONE,
+        flag: false,
+        number: 0.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    };
+    match value {
+        None => {}
+        Some(UiValue::Number(number)) => {
+            abi.kind = RVE_UI_VALUE_NUMBER;
+            abi.number = f64::from(*number);
+        }
+        Some(UiValue::Bool(flag)) => {
+            abi.kind = RVE_UI_VALUE_BOOL;
+            abi.flag = *flag;
+        }
+        Some(UiValue::Index(index)) => {
+            abi.kind = RVE_UI_VALUE_INDEX;
+            abi.integer = i64::try_from(*index).unwrap_or(i64::MAX);
+        }
+        Some(UiValue::Text(text)) => {
+            abi.kind = RVE_UI_VALUE_TEXT;
+            abi.text = RveStr::from_str_ref(text);
+        }
+    }
+    abi
 }
 
 unsafe extern "C" fn host_key_state(ctx: *mut c_void, key: u32) -> u32 {

@@ -37,6 +37,7 @@ pub(crate) mod script_phase {
     pub const SNAPSHOT_SEND_WAIT: usize = 6;
     pub const WORLD_CHANGES: usize = 7;
     pub const PREFAB_REPLIES: usize = 8;
+    pub const UI: usize = 9;
 
     pub const UPDATE_TOTAL: usize = 0;
     pub const UPDATE_WORLD_MATRICES: usize = 1;
@@ -81,6 +82,7 @@ pub(crate) fn scripts_groups() -> Vec<(&'static str, Vec<&'static str>)> {
                 "snapshot send wait",
                 "world changes",
                 "prefab replies",
+                "ui",
             ],
         ),
         (

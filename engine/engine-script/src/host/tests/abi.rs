@@ -4,7 +4,10 @@ use crate::host::{ScriptHost, ScriptLoadError};
 use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec};
 use crate::transaction::{MAX_MESSAGE_NAME_BYTES, MAX_MESSAGES_PER_FRAME};
 use crate::types::ScriptEventLevel;
+use crate::ui::owner_key;
 use engine_files::VirtualPath;
+use engine_gui::document::UiDocument;
+use engine_gui::system::UiCanvasHandle;
 use engine_project::{InputAction, InputSettings};
 use engine_scene::{
     AudioRequest, MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
@@ -14,12 +17,12 @@ use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
     RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParamDescV13, RveParams,
     RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6,
-    RveScriptDescV13, RveScriptDescV15, RveSpawnOptions, RveStatus, RveStr, RveTransform,
-    RveUpdateFn, RveValue,
+    RveScriptDescV13, RveScriptDescV15, RveScriptDescV16, RveSpawnOptions, RveStatus, RveStr,
+    RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
-    NetTarget, Object, Params, PhysicalInput, Script, Tonemapper, Value,
+    NetTarget, Object, Params, PhysicalInput, Script, Tonemapper, UiEvent, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -1535,7 +1538,7 @@ fn v13_module(abi_version: u32) -> &'static RveModule {
     }))
 }
 
-/// Модуль ABI v15: descriptor без `on_enable` и `on_disable`, но с параметрами v15.
+/// ABI v15 table: typed reference parameters and net events, without UI callbacks.
 fn v15_module() -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
@@ -1571,7 +1574,7 @@ fn v15_module() -> &'static RveModule {
 }
 
 #[test]
-fn abi_v15_modules_load_on_the_v16_host_without_enable_callbacks() {
+fn abi_v15_modules_load_on_the_v17_host_without_enable_callbacks() {
     let _lock = test_lock();
     let module = v15_module();
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1589,8 +1592,157 @@ fn abi_v15_modules_load_on_the_v16_host_without_enable_callbacks() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v15"),
-        "guest ABI v15 runs on the v16 host"
+        "guest ABI v15 runs on the v17 host"
     );
+}
+
+/// The UI branch temporarily used ABI v15 with the old parameter prefix and a descriptor UI tail.
+#[repr(C)]
+struct RveScriptDescV15Ui {
+    descriptor: RveScriptDescV15,
+    ui_event: Option<rve_sdk::abi::RveUiEventFn>,
+}
+
+unsafe extern "C" fn unused_v15_ui_event(
+    _: *mut c_void,
+    _: *const RveHost,
+    _: rve_sdk::abi::RveUiEvent,
+) -> RveStatus {
+    RveStatus::Ok
+}
+
+fn v15_ui_module() -> &'static RveModule {
+    let params: &'static [RveParamDescV13] = Box::leak(
+        vec![
+            RveParamDescV13 {
+                name: RveStr::from_static("enabled"),
+                kind: rve_sdk::abi::RVE_PARAM_BOOL,
+                default: RveValue::boolean(true),
+                min: 0.0,
+                max: 0.0,
+                flags: 0,
+                label: RveStr::empty(),
+            },
+            RveParamDescV13 {
+                name: RveStr::from_static("amount"),
+                kind: rve_sdk::abi::RVE_PARAM_INT,
+                default: RveValue::integer(2),
+                min: 0.0,
+                max: 0.0,
+                flags: 0,
+                label: RveStr::empty(),
+            },
+        ]
+        .into_boxed_slice(),
+    );
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let scripts = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let probe = scripts
+        .iter()
+        .find(|descriptor| unsafe {
+            std::slice::from_raw_parts(descriptor.name.ptr, descriptor.name.len) == b"Probe"
+        })
+        .expect("Probe descriptor");
+    let descriptor = |name| RveScriptDescV15 {
+        name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+        params: params.as_ptr().cast(),
+        param_count: params.len(),
+        command: probe.command,
+        collision: probe.collision,
+        net_event: probe.net_event,
+    };
+    let legacy: &'static [RveScriptDescV15Ui] = Box::leak(
+        vec![
+            RveScriptDescV15Ui {
+                descriptor: descriptor(RveStr::from_static("Probe")),
+                ui_event: Some(unused_v15_ui_event),
+            },
+            RveScriptDescV15Ui {
+                descriptor: descriptor(RveStr::from_static("ProbeTwo")),
+                ui_event: Some(unused_v15_ui_event),
+            },
+        ]
+        .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 15,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+fn v16_ui_module() -> &'static RveModule {
+    let current = ui_module();
+    // SAFETY: ui_module returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV16] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV16 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 16,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+#[test]
+fn abi_v16_ui_modules_load_on_v17_host_and_keep_ui_callbacks() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v16_ui_module())) }.unwrap();
+    let mut world = ui_world(
+        "[[objects]]\nid = \"hud\"\n[[objects.heavy_scripts]]\nname = \"UiGuest\"\nparams = {}\n",
+    );
+    let mut host = load_host(&world, &library);
+    register_ui_menu(&mut host);
+    host.start(&mut world, ScriptTime::default());
+    assert_eq!(abi_ui_callbacks(&host), [true]);
+    assert!(message_list(&mut host).contains(&"readback Ok(\"hello\")".to_owned()));
+    let hud = world.handle("hud").unwrap();
+    let canvas = open_ui_canvases(&host)
+        .into_iter()
+        .find(|canvas| host.ui().owner(*canvas) == Ok(owner_key(hud)))
+        .expect("guest-opened canvas");
+    let label = host.ui().find(canvas, "label").unwrap();
+    host.queue_ui_events([engine_gui::events::UiEvent {
+        canvas,
+        element: label,
+        kind: engine_gui::events::UiEventKind::Click,
+        value: None,
+    }]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"ui label Click None".to_owned()));
 }
 
 #[test]
@@ -1787,7 +1939,7 @@ fn abi_v13_modules_load_on_the_v16_host() {
 }
 
 #[test]
-fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v16_host() {
+fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v17_host() {
     let _lock = test_lock();
     let module = v13_module(14);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1805,7 +1957,86 @@ fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v16_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v14"),
-        "guest ABI v14 runs on the v16 host and its parameters use the pre-v15 layout"
+        "guest ABI v14 runs on the v17 host and its parameters use the pre-v15 layout"
+    );
+}
+
+#[test]
+fn abi_v15_modules_keep_typed_reference_params_without_ui_callbacks() {
+    let _lock = test_lock();
+    let module = v15_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let schema = library.schema("ReferenceProbe").unwrap();
+    assert_eq!(
+        schema.get("target").unwrap().kind,
+        engine_scene::ParamKind::Object
+    );
+    assert!(matches!(
+        schema.get("camera").unwrap().kind,
+        engine_scene::ParamKind::Component(_)
+    ));
+
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ReferenceProbe"
+params = { target = { object = "target" }, camera = { object = "target" } }
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+"#,
+    );
+    let mut host = load_host(&world, &library);
+    assert_eq!(abi_ui_callbacks(&host), [false, false]);
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+}
+
+#[test]
+fn abi_v15_ui_descriptor_keeps_legacy_parameter_layout() {
+    let _lock = test_lock();
+    let module = v15_ui_module();
+    // SAFETY: the module and both descriptor tables live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert!(library.contains_script("ProbeTwo"));
+    let schema = library.schema("Probe").unwrap();
+    assert_eq!(
+        schema.get("enabled").unwrap().kind,
+        engine_scene::ParamKind::Bool
+    );
+    assert_eq!(
+        schema.get("amount").unwrap().kind,
+        engine_scene::ParamKind::Int
+    );
+
+    let mut world = scripted_world("Probe", r#"{ enabled = true, amount = 2 }"#);
+    let mut host = load_host(&world, &library);
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|event| event == "start:default")
     );
 }
 
@@ -2319,6 +2550,7 @@ fn null_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        ui_event: None,
         on_enable: None,
         on_disable: None,
     }];
@@ -2343,6 +2575,7 @@ fn null_name_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        ui_event: None,
         on_enable: None,
         on_disable: None,
     }];
@@ -2368,6 +2601,7 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        ui_event: None,
         on_enable: None,
         on_disable: None,
     }];
@@ -2773,6 +3007,7 @@ fn error_message_module() -> &'static RveModule {
             command: None,
             collision: None,
             net_event: None,
+            ui_event: None,
             on_enable: None,
             on_disable: None,
         },
@@ -2789,6 +3024,7 @@ fn error_message_module() -> &'static RveModule {
             command: None,
             collision: None,
             net_event: None,
+            ui_event: None,
             on_enable: None,
             on_disable: None,
         },
@@ -2821,6 +3057,7 @@ fn set_local_during_create_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        ui_event: None,
         on_enable: None,
         on_disable: None,
     }];
@@ -2842,6 +3079,7 @@ fn poisoned_create_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        ui_event: None,
         on_enable: None,
         on_disable: None,
     }];
@@ -3492,6 +3730,7 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         command: None,
         collision: None,
         net_event: None,
+        ui_event: None,
         on_enable: None,
         on_disable: None,
     }]));
@@ -3573,6 +3812,7 @@ fn malformed_parameter_tables_are_rejected() {
             command: None,
             collision: None,
             net_event: None,
+            ui_event: None,
             on_enable: None,
             on_disable: None,
         }]));
@@ -3811,6 +4051,7 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        ui_event: None,
         on_enable: None,
         on_disable: None,
     }]));
@@ -4216,4 +4457,306 @@ name = "TeardownProbe"
     assert_eq!(info_messages(&mut host), ["disable"]);
     host.destroy(&mut hidden, at(0.3, 3));
     assert_eq!(info_messages(&mut host), ["destroy"]);
+}
+
+const UI_MENU: &str = r#"
+[[elements]]
+id = "label"
+text = { string = "Hi" }
+"#;
+
+struct UiGuest;
+
+impl Script for UiGuest {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let ui = ctx.ui();
+        match ui.open("ui/menu.rveui") {
+            Ok(canvas) => {
+                if let Ok(Some(label)) = ui.find(canvas, "label") {
+                    ctx.log_info(format!("write {:?}", ui.set_text(label, "hello")));
+                    ctx.log_info(format!("readback {:?}", ui.text(label)));
+                }
+            }
+            Err(error) => ctx.log_error(format!("open failed: {error}")),
+        }
+    }
+
+    fn on_ui_event(&mut self, ctx: &mut Context<'_>, event: UiEvent) {
+        ctx.log_info(format!(
+            "ui {} {:?} {:?}",
+            event.element_id, event.kind, event.value
+        ));
+    }
+}
+
+/// Пишет в метку собственного канваса и падает: запись должна откатиться.
+struct UiPanicGuest;
+
+impl Script for UiPanicGuest {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        let ui = ctx.ui();
+        let object = ctx.find("hud").expect("hud object");
+        let canvas = ui.canvas_of(object).expect("component canvas");
+        let label = ui.find(canvas, "label").unwrap().unwrap();
+        ui.set_text(label, "changed").unwrap();
+        panic!("guest exploded after a ui write");
+    }
+}
+
+fn ui_guest_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(UiGuest))
+}
+
+fn ui_panic_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(UiPanicGuest))
+}
+
+fn ui_module() -> &'static RveModule {
+    rve_sdk::script_module! {
+        "UiGuest" => ui_guest_factory,
+        "UiPanic" => ui_panic_factory,
+    }
+}
+
+/// Таблица версии 13 в layout `RveScriptDescV13` из двух дескрипторов: `NetGuest` и его псевдоним
+/// `NetAlias` с тем же фабрикой. Оба должны сохранить `net_event` и не получить `ui_event`.
+fn v13_net_module() -> &'static RveModule {
+    let current = net_module();
+    // SAFETY: `net_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV13] = Box::leak(
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some((descriptor, params, param_count))
+            })
+            .flat_map(|(descriptor, params, param_count)| {
+                let alias = RveScriptDescV13 {
+                    name: RveStr::from_static("NetAlias"),
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params,
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                };
+                [
+                    RveScriptDescV13 {
+                        name: descriptor.name,
+                        create: descriptor.create,
+                        start: descriptor.start,
+                        update: descriptor.update,
+                        message: descriptor.message,
+                        destroy: descriptor.destroy,
+                        drop: descriptor.drop,
+                        params,
+                        param_count,
+                        command: descriptor.command,
+                        collision: descriptor.collision,
+                        net_event: descriptor.net_event,
+                    },
+                    alias,
+                ]
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 13,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+fn ui_world(objects: &str) -> World {
+    world(&format!(
+        "[[assets]]\npath = \"/ui/menu.rveui\"\n{objects}\n[[objects]]\nid = \"camera\"\n[objects.camera]\n"
+    ))
+}
+
+fn register_ui_menu(host: &mut ScriptHost) {
+    host.register_ui_document(
+        VirtualPath::parse("ui/menu.rveui").unwrap(),
+        Arc::new(UiDocument::parse("ui/menu.rveui", UI_MENU).unwrap()),
+    );
+}
+
+/// Есть ли у каждого ABI-экземпляра callback `on_ui_event`, в порядке экземпляров.
+fn abi_ui_callbacks(host: &ScriptHost) -> Vec<bool> {
+    host.instances
+        .iter()
+        .flatten()
+        .filter_map(|instance| match &instance.kind {
+            crate::host::ScriptKind::Heavy(crate::host::HeavyInstance::Abi(script)) => {
+                Some(script.has_ui_event())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn open_ui_canvases(host: &ScriptHost) -> Vec<UiCanvasHandle> {
+    let ui = host.ui();
+    (0..64)
+        .flat_map(|index| (0..4).map(move |generation| UiCanvasHandle::from_raw(index, generation)))
+        .filter(|canvas| ui.layer(*canvas).is_ok())
+        .collect()
+}
+
+#[test]
+fn abi_ui_guest_opens_writes_and_receives_events_for_its_canvas() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(ui_module())) }.unwrap();
+    let mut world = ui_world(
+        "[[objects]]\nid = \"hud\"\n[[objects.heavy_scripts]]\nname = \"UiGuest\"\nparams = {}\n",
+    );
+    let mut host = load_host(&world, &library);
+    register_ui_menu(&mut host);
+    host.start(&mut world, ScriptTime::default());
+    let events = message_list(&mut host);
+    assert!(events.contains(&"write Ok(())".to_owned()), "{events:?}");
+    assert!(
+        events.contains(&"readback Ok(\"hello\")".to_owned()),
+        "{events:?}"
+    );
+
+    assert_eq!(abi_ui_callbacks(&host), [true]);
+    let hud = world.handle("hud").unwrap();
+    let canvas = open_ui_canvases(&host)
+        .into_iter()
+        .find(|canvas| host.ui().owner(*canvas) == Ok(owner_key(hud)))
+        .expect("guest-opened canvas");
+    let label = host.ui().find(canvas, "label").unwrap();
+    host.queue_ui_events([engine_gui::events::UiEvent {
+        canvas,
+        element: label,
+        kind: engine_gui::events::UiEventKind::Click,
+        value: None,
+    }]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"ui label Click None".to_owned()));
+}
+
+#[test]
+fn abi_ui_writes_roll_back_when_the_guest_panics() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(ui_module())) }.unwrap();
+    let mut world = ui_world(
+        "[[objects]]\nid = \"hud\"\n[objects.ui_canvas]\ndocument = \"/ui/menu.rveui\"\n\
+         [[objects.heavy_scripts]]\nname = \"UiPanic\"\nparams = {}\n",
+    );
+    let mut host = load_host(&world, &library);
+    register_ui_menu(&mut host);
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error && event.message.contains("guest exploded")
+        }),
+        "{events:?}"
+    );
+    let hud = world.handle("hud").unwrap();
+    let canvas = open_ui_canvases(&host)
+        .into_iter()
+        .find(|canvas| host.ui().owner(*canvas) == Ok(owner_key(hud)))
+        .expect("scene canvas");
+    let label = host.ui().find(canvas, "label").unwrap();
+    assert_eq!(host.ui().text(label), Ok("Hi".to_owned()));
+}
+
+#[test]
+fn abi_v13_modules_load_without_ui_callbacks_and_keep_net_events() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v13_net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    message_list(&mut host);
+    host.queue_network_events(&world, [engine_scene::NetEvent::PeerConnected { peer: 8 }]);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| event.message == "connected 8"),
+        "{events:?}"
+    );
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    let names = library.script_names();
+    assert!(
+        names.contains(&"NetGuest") && names.contains(&"NetAlias"),
+        "{names:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+fn v14_net_module() -> &'static RveModule {
+    let old = v13_net_module();
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 14,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: old.scripts,
+        script_count: old.script_count,
+    }))
+}
+#[test]
+fn abi_v14_screen_shader_layout_keeps_legacy_descriptors_without_ui() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v14_net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    message_list(&mut host);
+    host.queue_network_events(&world, [engine_scene::NetEvent::PeerConnected { peer: 8 }]);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| event.message == "connected 8"),
+        "{events:?}"
+    );
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    let names = library.script_names();
+    assert!(
+        names.contains(&"NetGuest") && names.contains(&"NetAlias"),
+        "{names:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
 }

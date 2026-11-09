@@ -17,6 +17,7 @@ pub mod post_process;
 pub mod prefab;
 pub mod shader_asset;
 pub mod transform;
+pub mod ui_canvas;
 pub mod world;
 
 /// Версия крейта, заданная в `Cargo.toml`.
@@ -51,6 +52,7 @@ pub use shader_asset::{
     ShaderColorSpace, ShaderLighting, ShaderProperty, ShaderPropertyDefault, ShaderPropertyKind,
     ShaderPropertyLayout, ShaderSchema, TextureFallback,
 };
+pub use ui_canvas::UiCanvasComponent;
 
 pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,

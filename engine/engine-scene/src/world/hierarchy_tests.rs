@@ -268,7 +268,8 @@ fn tags_and_layers_are_validated_on_write() {
 #[test]
 fn components_report_presence_and_scripts_by_path() {
     let scene = "[[assets]]\npath = \"/door.lua\"\n\
-[[objects]]\nid = \"crate\"\n[objects.collider]\n\
+[[assets]]\npath = \"/ui/hud.rveui\"\n\
+[[objects]]\nid = \"crate\"\n[objects.collider]\n[objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\n\
 [[objects.lite_scripts]]\npath = \"/door.lua\"\n\
 [[objects]]\nid = \"camera\"\n[objects.camera]\n";
     let world = world(scene);
@@ -287,6 +288,10 @@ fn components_report_presence_and_scripts_by_path() {
     );
     assert_eq!(
         world.has_component(crate_handle, &ComponentKind::Transform),
+        Some(true)
+    );
+    assert_eq!(
+        world.has_component(crate_handle, &ComponentKind::UiCanvas),
         Some(true)
     );
 }

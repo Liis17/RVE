@@ -9,6 +9,7 @@ use crate::physics::PhysicsScriptState;
 use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
 };
+use crate::ui::{UiJournal, UiScriptState};
 use engine_physics::{
     BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
     QueryHit, Ray,
@@ -197,7 +198,7 @@ pub(crate) enum QueueMessageError {
 /// this transaction is committed or discarded.
 pub(crate) struct ScriptTransaction {
     world: *const World,
-    self_object: Option<ObjectHandle>,
+    pub(crate) self_object: Option<ObjectHandle>,
     writable: bool,
     source: String,
     pending_transforms: HashMap<ObjectHandle, LocalTransform>,
@@ -233,6 +234,10 @@ pub(crate) struct ScriptTransaction {
     net: Rc<RefCell<NetScriptState>>,
     queued_net: usize,
     pending_net: Vec<NetRequest>,
+    /// Игровой UI хоста; общий с `ScriptHost`, задаётся при создании хоста.
+    pub(crate) ui: Rc<RefCell<UiScriptState>>,
+    /// Журнал UI-записей текущего вызова: откат при ошибке, отложенные закрытия.
+    pub(crate) ui_journal: UiJournal,
     lifecycle: Rc<RefCell<Lifecycle>>,
     lifecycle_writes: bool,
     instance_serial: u64,
@@ -258,6 +263,16 @@ struct PendingPush {
     controller: engine_physics::CharacterController,
     hit: CharacterHit,
     normal_sum: Vec3,
+}
+
+impl ScriptTransaction {
+    /// Пустая транзакция с общим состоянием UI хоста.
+    pub(crate) fn with_ui(ui: Rc<RefCell<UiScriptState>>) -> Self {
+        Self {
+            ui,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for ScriptTransaction {
@@ -298,6 +313,8 @@ impl Default for ScriptTransaction {
             net: Rc::new(RefCell::new(NetScriptState::default())),
             queued_net: 0,
             pending_net: Vec::new(),
+            ui: Rc::new(RefCell::new(UiScriptState::default())),
+            ui_journal: UiJournal::default(),
             lifecycle: Rc::new(RefCell::new(Lifecycle::default())),
             lifecycle_writes: false,
             instance_serial: 0,
@@ -1784,6 +1801,7 @@ impl ScriptTransaction {
         if let Some(locked) = self.pending_cursor_locked.take() {
             self.cursor.locked = locked;
         }
+        self.commit_ui();
         self.commit_lifecycle(events);
 
         self.physics.borrow_mut().commit(
@@ -1870,6 +1888,7 @@ impl ScriptTransaction {
     }
 
     pub(crate) fn discard(&mut self) {
+        self.discard_ui();
         if !self.world.is_null() {
             // SAFETY: `world` is the live reference from `begin`, cleared only below; releasing a
             // reservation needs just a shared borrow and touches no other state of the world.

@@ -61,13 +61,13 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
     tools.push(ToolSpec::new(
         "set_component",
         "Merge component JSON over its current value by default, validate, and store one undoable edit.",
-        json!({"type":"object","properties":{"id":{"type":"string"},"kind":{"type":"string","enum":["transform","camera","mesh_renderer","lod_group","directional_light","point_light","spot_light","environment","collider","rigid_body","character_controller","audio_source","animator","particle_emitter","network_identity","network_transform"]},"value":{"type":"object"},"merge":{"type":"boolean"}},"required":["id","kind","value"],"additionalProperties":false}),
+        json!({"type":"object","properties":{"id":{"type":"string"},"kind":{"type":"string","enum":["transform","camera","mesh_renderer","lod_group","directional_light","point_light","spot_light","environment","collider","rigid_body","character_controller","audio_source","animator","particle_emitter","network_identity","network_transform","ui_canvas"]},"value":{"type":"object"},"merge":{"type":"boolean"}},"required":["id","kind","value"],"additionalProperties":false}),
         Permission::EditScene,
     ));
     tools.push(ToolSpec::new(
         "remove_component",
         "Remove a component using its scene command and validation rules.",
-        json!({"type":"object","properties":{"id":{"type":"string"},"kind":{"type":"string","enum":["camera","mesh_renderer","lod_group","directional_light","point_light","spot_light","environment","collider","rigid_body","character_controller","audio_source","animator","particle_emitter","network_identity","network_transform"]}},"required":["id","kind"],"additionalProperties":false}),
+        json!({"type":"object","properties":{"id":{"type":"string"},"kind":{"type":"string","enum":["camera","mesh_renderer","lod_group","directional_light","point_light","spot_light","environment","collider","rigid_body","character_controller","audio_source","animator","particle_emitter","network_identity","network_transform","ui_canvas"]}},"required":["id","kind"],"additionalProperties":false}),
         Permission::EditScene,
     ));
     tools.push(ToolSpec::new(
@@ -310,6 +310,10 @@ fn remove_component(arguments: &Value, state: &mut EditorState) -> Result<Value,
         ComponentKind::ParticleEmitter => scene.remove_particle_emitter(id)?,
         ComponentKind::NetworkIdentity => scene.remove_network_identity(id)?,
         ComponentKind::NetworkTransform => scene.remove_network_transform(id)?,
+        ComponentKind::UiCanvas => scene.edit_object(id, None, |o| {
+            o.ui_canvas = None;
+            Ok(())
+        })?,
         _ => scene.edit_object(id, None, |object| {
             match kind {
                 ComponentKind::DirectionalLight => object.directional_light = None,
@@ -472,6 +476,7 @@ fn component_from_value(kind: ComponentKind, value: Value) -> Result<Component, 
         ComponentKind::ParticleEmitter => parse!(ParticleEmitterComponent, ParticleEmitter),
         ComponentKind::NetworkIdentity => parse!(NetworkIdentityComponent, NetworkIdentity),
         ComponentKind::NetworkTransform => parse!(NetworkTransformComponent, NetworkTransform),
+        ComponentKind::UiCanvas => parse!(engine_scene::UiCanvasComponent, UiCanvas),
     }
 }
 
@@ -497,6 +502,20 @@ mod tests {
     use crate::project::OpenProject;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn ui_canvas_component_round_trips_through_mcp_and_rejects_invalid_paths() {
+        let kind = parse_component_kind("ui_canvas").unwrap();
+        let component = component_from_value(
+            kind,
+            json!({"document":"/ui/hud.rveui","visible":false,"layer":7}),
+        )
+        .unwrap();
+        let value = component_value(component).unwrap();
+        assert_eq!(value["layer"], 7);
+        assert_eq!(value["visible"], false);
+        assert!(component_from_value(kind, json!({"document":"../outside.rveui"})).is_err());
+    }
 
     struct TempProject {
         root: PathBuf,

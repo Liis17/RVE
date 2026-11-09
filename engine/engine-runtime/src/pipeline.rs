@@ -3,6 +3,7 @@ use crate::console::ConsoleUiSlot;
 #[cfg(feature = "dev-console")]
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::cursor::CursorControl;
+use crate::game_ui::{GameUi, PreparedUi, UiInputBridge, UiRegistry, UiTick, empty_paint};
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use crate::net::{self, NetworkSession, ScriptNetwork};
@@ -21,11 +22,13 @@ use engine_assets::{Model, ModelAnimation, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_core::profile::ProfileBoard;
+use engine_gui::paint::UiPaint;
 use engine_network::SpawnedRoot;
 use engine_physics::{
     BodyChange, BodyHandle, ModelGeometry, PhysicsClient, PhysicsCommand, PhysicsInitialization,
     PhysicsReceive, PhysicsSceneSync, PhysicsStepResult, ShapeCache,
 };
+use engine_render::UiTextureId;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
@@ -95,6 +98,8 @@ pub(crate) struct FrameSnapshot {
     pub particles: Vec<ParticleSnapshot>,
     /// Игровое время скриптового потока на момент снимка; основа шага симуляции частиц.
     pub sim_time: f64,
+    /// Игровой UI кадра: draw list и атлас, как их выдал `engine-gui` на этом тике.
+    pub ui: UiPaint,
     /// Экранные шейдеры вида: включённые проходы камеры и время сцены.
     pub screen_shaders: engine_render::ScreenShaders,
     object_motion: HashMap<ObjectHandle, ObjectMotion>,
@@ -158,6 +163,8 @@ pub(crate) struct GpuSceneTable {
     pub skin_instances: HashMap<ObjectHandle, Vec<SkinId>>,
     /// Число костей модели объекта с экземплярами skinning; палитра моста должна иметь ту же длину.
     pub joint_counts: HashMap<ObjectHandle, u32>,
+    /// UI-текстуры картинок сцены по пути; создаются при загрузке GPU-ресурсов.
+    pub ui_images: HashMap<String, UiTextureId>,
     /// Экранные шейдеры камер по пути `.glsl`; создаются при загрузке сцены и освобождаются с ней.
     pub screen_shaders: HashMap<String, engine_render::ScreenShaderId>,
 }
@@ -388,6 +395,10 @@ pub(crate) struct ScriptThreadConfig {
     pub prefabs: PreparedPrefabs,
     /// Геометрия моделей для коллайдеров spawn-объектов.
     pub physics_geometry: Vec<ModelGeometry>,
+    /// `.rveui` сцены и быстрых префабов с ассетами: регистрируются до `start`.
+    pub ui: PreparedUi,
+    /// Фокус InputField: scripts thread пишет, главный поток включает по нему IME.
+    pub ui_text_focus: Arc<AtomicBool>,
     /// Заявки загрузчика тяжёлых префабов.
     pub prefab_loader: Sender<LoaderRequest>,
     /// Заявки render thread: выгрузка тяжёлых префабов.
@@ -461,6 +472,8 @@ pub(crate) struct VulkanBackend {
     console_viewport: Option<(ViewportId, u32, u32)>,
     /// Экземпляры skinning сцены, которые освобождаются в `release_scene`.
     scene_skin_instances: Vec<SkinId>,
+    /// GPU-ресурсы игрового UI: атлас, картинки по пути и буфер вершин.
+    game_ui: GameUi,
     scene_screen_shaders: Vec<engine_render::ScreenShaderId>,
 }
 
@@ -491,6 +504,7 @@ impl VulkanBackend {
             #[cfg(feature = "dev-console")]
             console_viewport: None,
             scene_skin_instances: Vec::new(),
+            game_ui: GameUi::default(),
             scene_screen_shaders: Vec::new(),
         }
     }
@@ -520,6 +534,11 @@ impl VulkanBackend {
 
     pub fn with_scene_skin_instances(mut self, instances: Vec<SkinId>) -> Self {
         self.scene_skin_instances = instances;
+        self
+    }
+
+    pub fn with_ui_images(mut self, images: HashMap<String, UiTextureId>) -> Self {
+        self.game_ui = GameUi::with_scene_images(images);
         self
     }
 
@@ -600,11 +619,21 @@ impl RenderBackend for VulkanBackend {
 
     fn submit_prefab(&mut self, mut prefab: LoadedPrefab) -> Option<PrefabReply> {
         let token = prefab.token.clone();
+        if let Err(error) =
+            self.game_ui
+                .attach(&mut self.renderer, token.clone(), &prefab.cpu.ui.images)
+        {
+            return Some(PrefabReply::Failed {
+                token,
+                error: error.to_string(),
+            });
+        }
         let particles = std::mem::take(&mut prefab.particles);
         let created =
             match create_prefab_particles(&mut self.renderer, &prefab.textures, &particles) {
                 Ok(created) => created,
                 Err(error) => {
+                    self.game_ui.detach(&mut self.renderer, &token);
                     return Some(PrefabReply::Failed {
                         token,
                         error: error.to_string(),
@@ -614,6 +643,7 @@ impl RenderBackend for VulkanBackend {
         let reply = self.prefabs.submit(prefab);
         if reply.is_some() {
             release_prefab_particles(&mut self.renderer, created.textures);
+            self.game_ui.detach(&mut self.renderer, &token);
         } else {
             self.prefab_particles.insert(token, created);
         }
@@ -630,6 +660,7 @@ impl RenderBackend for VulkanBackend {
                     }
                 }
                 PrefabReply::Failed { token, .. } => {
+                    self.game_ui.detach(&mut self.renderer, token);
                     if let Some(entry) = self.prefab_particles.remove(token) {
                         release_prefab_particles(&mut self.renderer, entry.textures);
                     }
@@ -645,6 +676,7 @@ impl RenderBackend for VulkanBackend {
 
     fn release_prefab(&mut self, token: &PrefabToken) {
         self.prefabs.release(&mut self.renderer, token);
+        self.game_ui.detach(&mut self.renderer, token);
         if let Some(entry) = self.prefab_particles.remove(token) {
             release_prefab_particles(&mut self.renderer, entry.textures);
         }
@@ -694,6 +726,10 @@ impl RenderBackend for VulkanBackend {
             })
             .collect();
         let joint_palettes = palette_refs(snapshot);
+        self.game_ui
+            .sync(&mut self.renderer, &snapshot.ui)
+            .map_err(|error| error.to_string())?;
+        let ui_primitives = self.game_ui.primitives(&snapshot.ui);
         let frame = Frame {
             joint_palettes: &joint_palettes,
             clear_color: [
@@ -714,6 +750,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
+            ui: &ui_primitives,
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
@@ -743,6 +780,7 @@ impl RenderBackend for VulkanBackend {
     }
 
     fn release_scene(&mut self) {
+        self.game_ui.release_all(&mut self.renderer);
         for instance in self.scene_skin_instances.drain(..) {
             if let Err(error) = self.renderer.destroy_skin_instance(instance) {
                 eprintln!("failed to release skin instance: {error}");
@@ -818,6 +856,10 @@ impl RenderBackend for VulkanBackend {
 
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let joint_palettes = palette_refs(snapshot);
+        self.game_ui
+            .sync(&mut self.renderer, &snapshot.ui)
+            .map_err(|error| error.to_string())?;
+        let game_ui = self.game_ui.primitives(&snapshot.ui);
         let scene = Frame {
             joint_palettes: &joint_palettes,
             clear_color: [
@@ -838,6 +880,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
+            ui: &game_ui,
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
@@ -994,6 +1037,8 @@ fn scripts_thread(
         render_resources,
         network,
         frame_limit,
+        ui,
+        ui_text_focus,
         ..
     } = config;
     let library = match load_script_library(
@@ -1038,6 +1083,14 @@ fn scripts_thread(
             return;
         }
     }
+    let mut ui_registry = UiRegistry::default();
+    if let Err(error) = ui_registry.register(&mut scripts, &ui) {
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(ScriptStartupError::Load(error)));
+        }
+        return;
+    }
+    let mut ui_input = UiInputBridge::new(ui_text_focus);
     let mut spawn_physics = SpawnPhysics {
         geometry: physics_geometry,
         ..SpawnPhysics::default()
@@ -1235,6 +1288,7 @@ fn scripts_thread(
         }
         sync_input_background(&input, background, &mut applied_background);
         if background {
+            ui_input.suspend(&mut scripts);
             if !wait_background_tick(
                 &control_rx,
                 clock.as_ref(),
@@ -1340,6 +1394,7 @@ fn scripts_thread(
             &mut gpu_scene,
             &mut spawn_physics,
             &mut prefab_loads,
+            &mut ui_registry,
         );
         timings.record(
             script_phase::LOOP,
@@ -1351,14 +1406,33 @@ fn scripts_thread(
         }
         net::receive(&mut network, &mut world, &mut scripts);
         gamepads.poll();
-        let (input_frame, accepting_input) = {
+        let (input_frame, accepting_input, text, screen) = {
             let mut accumulator = lock_input(&input);
             let accepting = accumulator.set_pads(&gamepads.snapshot());
-            (accumulator.take_frame(), accepting)
+            (
+                accumulator.take_frame(),
+                accepting,
+                accumulator.take_text(),
+                accumulator.window_size(),
+            )
         };
         if !accepting_input {
             gamepads.stop_rumble();
         }
+        let ui_started = Instant::now();
+        let pointer = Some(input_frame.cursor());
+        let input_frame = ui_input.tick(
+            &mut scripts,
+            input_frame,
+            UiTick {
+                accepting: accepting_input,
+                pointer,
+                screen_px: screen,
+                text,
+            },
+            time.elapsed,
+        );
+        timings.record(script_phase::LOOP, script_phase::UI, ui_started.elapsed());
         scripts.set_input(input_frame);
         let update_started = Instant::now();
         scripts.update(&mut world, dt, time);
@@ -1464,10 +1538,14 @@ fn scripts_thread(
         if let Some(audio) = audio.as_mut() {
             audio.sync_positions(&world);
         }
+        let ui_started = Instant::now();
+        let ui_paint = scripts.ui_mut().paint();
+        timings.record(script_phase::LOOP, script_phase::UI, ui_started.elapsed());
         let snapshot_started = Instant::now();
         let made =
             make_snapshot(scene_frame, &world, &gpu_scene, &animation).map(|mut snapshot| {
                 snapshot.sim_time = sim_time;
+                snapshot.ui = ui_paint;
                 snapshot.screen_shaders.time = screen_shader_time(sim_time);
                 snapshot
             });
@@ -1876,6 +1954,7 @@ fn drain_prefab_replies(
     gpu_scene: &mut GpuSceneTable,
     spawn_physics: &mut SpawnPhysics,
     prefabs: &mut PrefabLoads,
+    ui_registry: &mut UiRegistry,
 ) {
     while let Some(reply) = pending.pop_front() {
         match reply {
@@ -1894,7 +1973,14 @@ fn drain_prefab_replies(
                     template,
                     sources,
                     geometry,
+                    ui,
                 } = cpu;
+                if let Err(error) = ui_registry.register(scripts, &ui) {
+                    prefabs.forget(&token.path);
+                    scripts.prefab_failed(world, &token.path, &error);
+                    prefabs.release(token);
+                    continue;
+                }
                 if let Err(error) = scripts.register_prefab(world, &token.path, template, &sources)
                 {
                     prefabs.forget(&token.path);
@@ -2164,6 +2250,7 @@ fn make_snapshot(
         particles,
         sim_time: 0.0,
         joint_palettes,
+        ui: empty_paint(),
         object_motion,
     })
 }
@@ -3337,6 +3424,8 @@ return Input
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "input.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
@@ -3831,6 +3920,7 @@ distance=2.0
     fn empty_snapshot() -> FrameSnapshot {
         let active_camera = motion_test_handles().0;
         FrameSnapshot {
+            ui: crate::game_ui::empty_paint(),
             particles: Vec::new(),
             sim_time: 0.0,
             sequence: 0,
@@ -3877,6 +3967,7 @@ distance=2.0
         objects: &[(ObjectHandle, [[f32; 4]; 4])],
     ) -> FrameSnapshot {
         FrameSnapshot {
+            ui: crate::game_ui::empty_paint(),
             particles: Vec::new(),
             sim_time: 0.0,
             sequence: 0,
@@ -4294,6 +4385,8 @@ return Script
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "scene.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources,
@@ -4644,6 +4737,7 @@ return Script
         let loaded = LoadedPrefab {
             token,
             cpu: PrefabCpu {
+                ui: Default::default(),
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
@@ -4881,6 +4975,8 @@ return Script
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -4990,6 +5086,8 @@ return Script
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -5099,6 +5197,8 @@ return Script
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "physics-start.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -5218,6 +5318,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "physics-teleport.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -5391,6 +5493,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "physics-failure.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
@@ -5473,6 +5577,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -5790,6 +5896,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([(
@@ -5851,6 +5959,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -5908,6 +6018,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -5980,6 +6092,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
@@ -6169,6 +6283,8 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
                 scene_name: "spawn.rvescene".to_owned(),
                 cursor: CursorControl::default(),
                 sources: sources
@@ -6546,6 +6662,7 @@ return Gun
             gpu: Vec::new(),
             particles: Vec::new(),
             cpu: PrefabCpu {
+                ui: Default::default(),
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),
@@ -6634,6 +6751,7 @@ return Gun
                 &mut self.gpu,
                 &mut self.spawn_physics,
                 &mut self.loads,
+                &mut crate::game_ui::UiRegistry::default(),
             );
         }
 
@@ -6948,6 +7066,7 @@ return Gun
         let prefab = LoadedPrefab {
             token: render_token(1),
             cpu: PrefabCpu {
+                ui: Default::default(),
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),

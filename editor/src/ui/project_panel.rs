@@ -12,6 +12,7 @@ const TILE_SIZE: f32 = 88.0;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectDialog {
     NewFolder { name: String },
+    NewUi { name: String },
     Rename { path: String, name: String },
     Delete { path: String, is_dir: bool },
     NewPhysicsMaterial { name: String },
@@ -21,6 +22,11 @@ pub enum ProjectDialog {
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
+        if ui.button("New UI Canvas").clicked() {
+            state.project_dialog = Some(ProjectDialog::NewUi {
+                name: "Canvas".into(),
+            });
+        }
         if ui.button("New Folder").clicked() {
             state.project_dialog = Some(ProjectDialog::NewFolder {
                 name: String::new(),
@@ -194,6 +200,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
     }
     match AssetKind::of(&entry.path) {
         AssetKind::Scene => "SCENE",
+        AssetKind::Ui => "UI",
         AssetKind::Prefab => "PREFAB",
         AssetKind::CameraSettings => "CAMERA",
         AssetKind::PostProcess => "POST",
@@ -305,7 +312,9 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
         .then(|| entry.path.clone());
     }
     if response.double_clicked() {
-        if entry.is_dir {
+        if AssetKind::of(&entry.path) == AssetKind::Ui && !entry.is_dir {
+            crate::ui_editor::open(state, &entry.path);
+        } else if entry.is_dir {
             state.current_folder = entry.path.clone();
         } else if matches!(
             AssetKind::of(&entry.path),
@@ -385,6 +394,10 @@ pub fn show_dialog(ctx: &egui::Context, state: &mut EditorState) {
     egui::Modal::new(egui::Id::new("project_dialog")).show(ctx, |ui| {
         ui.set_max_width(380.0);
         match &mut dialog {
+            ProjectDialog::NewUi { name } => {
+                ui.heading("New UI Canvas");
+                ui.text_edit_singleline(name);
+            }
             ProjectDialog::NewFolder { name } => {
                 ui.heading("New Folder");
                 ui.text_edit_singleline(name).request_focus();
@@ -442,6 +455,25 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
     let Some(project) = state.project.as_ref() else {
         return;
     };
+    if let ProjectDialog::NewUi { name } = dialog {
+        let name = if name.ends_with(".rveui") {
+            name.clone()
+        } else {
+            format!("{name}.rveui")
+        };
+        let text = "[canvas]\nlayer = 0\n";
+        match project
+            .assets_dir
+            .create_file(&state.current_folder, &name, text)
+        {
+            Ok(path) => {
+                state.action(Action::RefreshTree);
+                crate::ui_editor::open(state, &path);
+            }
+            Err(error) => state.log.error(error.to_string()),
+        }
+        return;
+    }
     if let ProjectDialog::NewPhysicsMaterial { name } = dialog {
         match project.create_physics_material(&state.current_folder, name) {
             Ok(path) => {
@@ -480,7 +512,7 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
         ProjectDialog::Rename { path, name } => assets
             .rename(path, name)
             .map(|target| format!("{path} переименован в {target}")),
-        ProjectDialog::NewPhysicsMaterial { .. } => return,
+        ProjectDialog::NewPhysicsMaterial { .. } | ProjectDialog::NewUi { .. } => return,
         ProjectDialog::NewMaterial { .. } | ProjectDialog::NewShader { .. } => return,
         ProjectDialog::Delete { path, .. } => {
             assets.remove(path).map(|()| format!("Удалён {path}"))
