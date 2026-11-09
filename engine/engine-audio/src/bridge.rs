@@ -77,6 +77,7 @@ impl AudioBridge {
                     .audio_source
                     .as_ref()
                     .is_some_and(|audio| audio.play_on_start)
+                    && world.active_in_hierarchy(object.handle) == Some(true)
             })
             .map(|object| AudioRequest::PlaySource {
                 object: object.handle,
@@ -152,6 +153,10 @@ impl AudioBridge {
             log::warn!("объект без audio_source не может воспроизвести звук");
             return;
         };
+        // Неактивный объект молчит: его источник остановлен и не запускается заново.
+        if world.active_in_hierarchy(object) != Some(true) {
+            return;
+        }
         if let Some(&current) = self.sources.get(&object) {
             if audio.looping {
                 return;

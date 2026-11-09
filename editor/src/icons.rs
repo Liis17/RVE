@@ -69,6 +69,9 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         id: _,
         name: _,
         parent: _,
+        active: _,
+        tag: _,
+        layer: _,
         transform: _,
         camera,
         mesh_renderer,
@@ -295,6 +298,7 @@ mod tests {
             lite_scripts: vec![engine_scene::LiteScript {
                 path: VirtualPath::parse("/scripts/spin.lua").unwrap(),
                 params: Default::default(),
+                enabled: true,
             }],
             ..empty
         };

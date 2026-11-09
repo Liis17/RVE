@@ -820,3 +820,6 @@ fn poll_request(mut request: ResourceRequest<Vec<u8>>) -> ReadPoll {
 
 #[cfg(test)]
 mod tests;
+
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

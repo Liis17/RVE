@@ -1,7 +1,7 @@
 //! Звуковые компоненты сцены. Модуль не зависит от аудио-бэкенда: воспроизведение и микширование — в `engine-audio`.
 
 use crate::document::{SceneError, require_asset_path, virtual_path_serde};
-use crate::world::ObjectHandle;
+use crate::world::{ObjectHandle, World};
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -75,6 +75,34 @@ pub enum AudioRequest {
     StopVoice { voice: VoiceId },
     /// `rve.audio.set_group_volume(group, v)`.
     SetGroupVolume { group: AudioGroup, volume: f32 },
+}
+
+/// Заявки звука на смену действующей активности: источники скрытых объектов останавливаются,
+/// у показанных объектов с `play_on_start` источник запускается заново, как при повторном
+/// включении объекта. Вызывающий передаёт объекты, у которых активность изменилась.
+pub fn activity_audio_requests(
+    world: &World,
+    hidden: &[ObjectHandle],
+    shown: &[ObjectHandle],
+) -> Vec<AudioRequest> {
+    hidden
+        .iter()
+        .map(|&object| AudioRequest::StopSource { object })
+        .chain(
+            shown
+                .iter()
+                .filter(|&&object| {
+                    world.is_alive(object)
+                        && world
+                            .audio_source(object)
+                            .is_some_and(|audio| audio.play_on_start)
+                })
+                .map(|&object| AudioRequest::PlaySource {
+                    object,
+                    voice: VoiceId::allocate(),
+                }),
+        )
+        .collect()
 }
 
 /// Группа громкости. `Master` — общий множитель; источники сцены его не назначают.

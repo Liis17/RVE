@@ -232,6 +232,7 @@ fn collect_markers(state: &mut EditorState) -> Option<Vec<Marker>> {
         world
             .objects()
             .iter()
+            .filter(|object| world.active_in_hierarchy(object.handle) == Some(true))
             .filter_map(|object| {
                 let matrix = world.world_matrix(object.handle)?;
                 let label = if object.camera.is_some() {
@@ -321,6 +322,7 @@ fn collider_wires(state: &mut EditorState) -> Vec<ColliderWire> {
     let sources: Vec<WireSource> = world
         .objects()
         .iter()
+        .filter(|object| world.active_in_hierarchy(object.handle) == Some(true))
         .filter(|object| object.collider.is_some() || object.character_controller.is_some())
         .filter(|object| show_all || selected.contains(&object.id))
         .filter_map(|object| {

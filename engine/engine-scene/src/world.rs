@@ -23,6 +23,10 @@ use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+mod hierarchy;
+
+pub use hierarchy::ObjectEdit;
+
 /// Наибольшее поколение слота. Слот, поколение которого исчерпано, больше не переиспользуется.
 pub const MAX_GENERATION: u32 = i32::MAX as u32;
 /// Наибольшее число живых объектов в одном мире.
@@ -215,6 +219,12 @@ pub struct WorldObject {
     pub id: String,
     pub name: String,
     pub parent: Option<ObjectHandle>,
+    /// Собственный флаг активности; действующая активность учитывает родителей.
+    pub active: bool,
+    /// Тег объекта; пустая строка означает отсутствие тега.
+    pub tag: String,
+    /// Слой объекта `0..32`.
+    pub layer: u8,
     pub transform: LocalTransform,
     pub mesh_renderer: Option<crate::document::MeshRenderer>,
     pub lod_group: Option<LodGroup>,
@@ -373,6 +383,8 @@ pub struct World {
     invalid_basis_reported: HashSet<ObjectHandle>,
     /// Номер для генерации id `<stem>@<serial>`.
     spawn_serial: u64,
+    /// Объекты, у которых действующая активность изменилась; см. [`World::take_activity_changes`].
+    activity_changes: Vec<ObjectHandle>,
 }
 
 impl World {
@@ -427,16 +439,32 @@ impl World {
             calculate_world_matrices(&transforms, &parents, &object_ids, document.source_label())?;
         let world_rotations = calculate_world_rotations(&transforms, &parents, &order);
         let object_count = objects.len();
-        let active_index = document
-            .objects
-            .iter()
-            .position(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
-            .or_else(|| {
-                document
-                    .objects
-                    .iter()
-                    .position(|object| object.camera.is_some())
+        // Предпочитаем камеру, помеченную активной и действующую в иерархии: объект и все его
+        // предки активны.
+        let hierarchy_active = |index: usize| {
+            let mut current = Some(index);
+            while let Some(index) = current {
+                if !document.objects[index].active {
+                    return false;
+                }
+                current = parents[index];
+            }
+            true
+        };
+        let active_index = (0..object_count)
+            .find(|&index| {
+                hierarchy_active(index)
+                    && document.objects[index]
+                        .camera
+                        .as_ref()
+                        .is_some_and(|camera| camera.active)
             })
+            .or_else(|| {
+                (0..object_count).find(|&index| {
+                    hierarchy_active(index) && document.objects[index].camera.is_some()
+                })
+            })
+            .or_else(|| (0..object_count).find(|&index| document.objects[index].camera.is_some()))
             .expect("SceneDocument validation requires a camera");
         let mut world = Self {
             source_label: document.source_label().to_owned(),
@@ -458,6 +486,7 @@ impl World {
             invalid_basis_reported: HashSet::new(),
             last_valid_environment: None,
             spawn_serial: 0,
+            activity_changes: Vec::new(),
         };
         let _ = world.build_frame();
         Ok(world)
@@ -822,16 +851,27 @@ impl World {
         self.recalculate_world_matrices();
         let mut warnings = Vec::new();
         let mut camera_state = self.last_valid_camera;
+        // Неактивный или отсутствующий направленный свет сбрасывает кэш: сцена не должна
+        // освещаться последним светом, которого больше нет в кадре.
+        let active = self.active_flags();
+        let directional_active = self
+            .objects
+            .iter()
+            .zip(&active)
+            .any(|(object, &active)| active && object.directional_light.is_some());
+        if !directional_active {
+            self.last_valid_light = LightState::default();
+        }
         let mut light = self.last_valid_light;
         let mut local_lights = Vec::new();
 
-        for index in 0..self.objects.len() {
+        for (index, &is_active) in active.iter().enumerate() {
             let matrix = self.world_matrices[index];
             let camera_settings = (self.active_camera == self.objects[index].handle)
                 .then(|| self.objects[index].camera_settings.unwrap_or_default());
-            let light_settings = self.objects[index].directional_light;
-            let point_settings = self.objects[index].point_light;
-            let spot_settings = self.objects[index].spot_light;
+            let light_settings = self.objects[index].directional_light.filter(|_| is_active);
+            let point_settings = self.objects[index].point_light.filter(|_| is_active);
+            let spot_settings = self.objects[index].spot_light.filter(|_| is_active);
             if let Some(settings) = camera_settings {
                 if let Some(value) = camera_from_matrix(matrix, settings) {
                     let state = (value, settings);
@@ -901,7 +941,7 @@ impl World {
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, object)| object.mesh_renderer.is_some())
+            .filter(|(index, object)| active[*index] && object.mesh_renderer.is_some())
             .map(|(index, object)| MeshInstance {
                 object: object.handle,
                 model: self.world_matrices[index],
@@ -911,20 +951,18 @@ impl World {
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, object)| object.particle_emitter.is_some())
+            .filter(|(index, object)| active[*index] && object.particle_emitter.is_some())
             .map(|(index, object)| ParticleEmitterInstance {
                 object: object.handle,
                 model: self.world_matrices[index],
             })
             .collect();
-        let has_light = self
-            .objects
-            .iter()
-            .any(|object| object.directional_light.is_some());
+        let has_light = directional_active;
         let environment_owner = self
             .objects
             .iter()
-            .position(|object| object.environment.is_some());
+            .zip(&active)
+            .position(|(object, &active)| active && object.environment.is_some());
         let environment = environment_owner.and_then(|index| {
             let component = self.objects[index].environment.as_ref()?.clone();
             let rotation = self.world_rotations[index];
@@ -1366,6 +1404,9 @@ fn world_object(
         id: object.id.clone(),
         name: object.display_name().to_owned(),
         parent,
+        active: object.active,
+        tag: object.tag.clone(),
+        layer: object.layer,
         transform: object.transform.into(),
         mesh_renderer: object.mesh_renderer.clone(),
         lod_group: object.lod_group.clone(),
@@ -1493,6 +1534,9 @@ fn local_light_position_from_matrix(matrix: Mat4) -> Option<[f32; 3]> {
 
 #[cfg(test)]
 mod spawn_tests;
+
+#[cfg(test)]
+mod hierarchy_tests;
 
 #[cfg(test)]
 mod tests {

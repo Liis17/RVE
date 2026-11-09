@@ -746,6 +746,7 @@ fn has_component(object: &SceneObject, component: &ComponentKind) -> bool {
         ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ComponentKind::Script(script) => {
             object
                 .lite_scripts
@@ -1213,12 +1214,27 @@ mod tests {
 mod lite_params_tests {
     use super::{prepare_project, read_lite_properties_with_timeout};
     use crate::temporary::TempDir;
+    use engine_files::VirtualPath;
+    use engine_scene::{ComponentKind, SceneObject, UiCanvasComponent};
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
     const SCRIPT: &str =
         "return { properties = { speed = { type = \"float\", default = 30, min = 0 } } }\n";
+
+    #[test]
+    fn ui_canvas_is_available_to_component_reference_parameters() {
+        let object = SceneObject {
+            ui_canvas: Some(UiCanvasComponent {
+                document: VirtualPath::parse("/ui/hud.rveui").unwrap(),
+                visible: true,
+                layer: None,
+            }),
+            ..SceneObject::default()
+        };
+        assert!(super::has_component(&object, &ComponentKind::UiCanvas));
+    }
 
     fn project(root: &Path, params: &str) {
         let assets = root.join("Assets");

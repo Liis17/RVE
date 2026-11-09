@@ -162,7 +162,13 @@ struct ScriptInstance {
     handle: ObjectHandle,
     source: String,
     kind: ScriptKind,
+    /// `false` после ошибки или прерывания: экземпляр больше не вызывается.
     enabled: bool,
+    /// Флаг `script:set_enabled`; меняется коммитом транзакции.
+    user_enabled: bool,
+    /// Экземпляр сейчас работает: включён, не отключён ошибкой и его объект действующе активен.
+    /// Определяет доставку update, сообщений, физики и сети, а также `on_enable` и `on_disable`.
+    running: bool,
     /// `on_start` уже вызван (или вызывается) для этого экземпляра.
     started: bool,
     /// Уникальный номер экземпляра; отличает занятый слот от освобождённого.
@@ -180,8 +186,6 @@ pub struct ScriptHost {
     instances: Vec<Option<ScriptInstance>>,
     free_instances: Vec<usize>,
     next_serial: u64,
-    /// Экземпляры, которым нужен `on_start` в начале следующего update.
-    start_queue: Vec<(usize, u64)>,
     /// Скомпилированные классы lite-скриптов по путям; общие для сцены и префабов.
     classes: HashMap<String, (Table, Option<ParamSchema>)>,
     /// Heavy-скрипты библиотеки по имени: дескриптор и схема параметров.
@@ -261,6 +265,13 @@ impl ScriptUpdateProfile {
 #[derive(Clone, Copy)]
 enum Phase {
     Start,
+    /// Переход экземпляра в работу; вызывается до `Start` при первом запуске.
+    Enable,
+    /// Выход экземпляра из работы: флаг выключен или объект стал неактивным.
+    Disable,
+    /// `on_disable` перед `Destroy` активного экземпляра при уничтожении или выгрузке сцены.
+    /// Как и `Destroy`, не допускает записей lifecycle.
+    TeardownDisable,
     Update(f32),
     Message,
     PhysicsEvent(ScriptPhysicsEvent),
@@ -411,7 +422,6 @@ impl ScriptHost {
             instances: Vec::new(),
             free_instances: Vec::new(),
             next_serial: 0,
-            start_queue: Vec::new(),
             classes: HashMap::new(),
             heavy,
             lifecycle: Rc::new(RefCell::new(lifecycle)),
@@ -483,6 +493,7 @@ impl ScriptHost {
                         lifecycle: host.lifecycle.clone(),
                         lifecycle_writes: false,
                         instance_serial: 0,
+                        instance_enabled: true,
                         cursor: host.cursor,
                     });
                     let _active_call = ActiveCallGuard::new(
@@ -541,6 +552,8 @@ impl ScriptHost {
                     source: event_source(scene_name, &object.id, path),
                     kind: ScriptKind::Lite(instance),
                     enabled: true,
+                    user_enabled: script.enabled,
+                    running: false,
                     started: false,
                     serial,
                 });
@@ -597,6 +610,7 @@ impl ScriptHost {
                         lifecycle: host.lifecycle.clone(),
                         lifecycle_writes: false,
                         instance_serial: serial,
+                        instance_enabled: true,
                         cursor: host.cursor,
                     });
                     let result = AbiScriptInstance::create(
@@ -631,6 +645,8 @@ impl ScriptHost {
                         source,
                         kind: ScriptKind::Heavy(HeavyInstance::Abi(instance)),
                         enabled: true,
+                        user_enabled: script.enabled,
+                        running: false,
                         started: false,
                         serial,
                     });
@@ -933,7 +949,8 @@ impl ScriptHost {
         }
         self.started = true;
         self.open_scene_canvases(world);
-        self.run_phase(world, Phase::Start, time);
+        self.sync_activity(world, time);
+        self.apply_lifecycle(world, time);
     }
 
     /// Runs on_update for enabled instances, starting the host first if needed.
@@ -1292,6 +1309,7 @@ impl ScriptHost {
             lifecycle: self.lifecycle.clone(),
             lifecycle_writes: true,
             instance_serial: serial,
+            instance_enabled: true,
             cursor: self.cursor,
         });
         let transaction_ptr = &mut self.transaction as *mut ScriptTransaction;
@@ -1411,7 +1429,7 @@ impl ScriptHost {
         profile.world_matrices = started.elapsed();
         if matches!(phase, Phase::Update(_)) {
             self.frame_spawned = 0;
-            self.run_pending_starts(world, time);
+            self.sync_activity(world, time);
             let started = Instant::now();
             self.deliver_messages(world, time);
             profile.messages = started.elapsed();
@@ -1433,11 +1451,12 @@ impl ScriptHost {
             if !instance.enabled {
                 continue;
             }
-            if matches!(phase, Phase::Destroy) && !instance.started {
+            if matches!(phase, Phase::Destroy) {
+                if !instance.started {
+                    continue;
+                }
+            } else if !instance.running {
                 continue;
-            }
-            if matches!(phase, Phase::Start) {
-                instance.started = true;
             }
             let is_lite = matches!(&instance.kind, ScriptKind::Lite(_));
             if is_lite && self.interrupt.is_interrupted() {
@@ -1446,16 +1465,20 @@ impl ScriptHost {
                 continue;
             }
             let started = Instant::now();
-            let outcome = self.call_instance(
-                index,
-                world,
-                phase,
-                time,
-                None,
-                None,
-                None,
-                time_error.as_deref(),
-            );
+            let outcome = if matches!(phase, Phase::Destroy) {
+                self.call_destroy(index, world, time, time_error.as_deref())
+            } else {
+                self.call_instance(
+                    index,
+                    world,
+                    phase,
+                    time,
+                    None,
+                    None,
+                    None,
+                    time_error.as_deref(),
+                )
+            };
             let elapsed = started.elapsed();
             if is_lite {
                 profile.lua += elapsed;
@@ -1500,34 +1523,110 @@ impl ScriptHost {
         }
     }
 
-    /// `on_start` экземпляров, созданных spawn: до сообщений первого update после применения.
-    fn run_pending_starts(&mut self, world: &mut World, time: ScriptTime) {
-        let queue = std::mem::take(&mut self.start_queue);
+    /// Сверяет работу экземпляров с флагами и действующей активностью объектов. Переход в работу
+    /// вызывает `on_enable`, а первый запуск ещё и `on_start`; выход из работы — `on_disable`.
+    /// Каждый экземпляр проверяется один раз за фазу: флаги, которые callback меняет, действуют
+    /// со следующей фазы, поэтому цикл переключений не возникает.
+    fn sync_activity(&mut self, world: &mut World, time: ScriptTime) {
+        self.current_time = time;
+        self.lifecycle.borrow_mut().now = time.elapsed;
         let time_error = lite::set_time(&self.lua_time, time)
             .err()
             .map(|error| error.to_string());
-        for (index, serial) in queue {
-            let Some(instance) = self.instances.get_mut(index).and_then(Option::as_mut) else {
+        for index in 0..self.instances.len() {
+            let Some(instance) = self.instances[index].as_ref() else {
                 continue;
             };
-            if instance.serial != serial || !instance.enabled || instance.started {
+            let should_run = instance.enabled
+                && instance.user_enabled
+                && world.active_in_hierarchy(instance.handle) == Some(true);
+            if should_run == instance.running {
                 continue;
             }
-            instance.started = true;
+            if should_run {
+                let first_start = !instance.started;
+                if let Some(instance) = self.instances[index].as_mut() {
+                    instance.running = true;
+                }
+                self.run_transition(index, world, Phase::Enable, time, time_error.as_deref());
+                let still_running = self.instances[index]
+                    .as_ref()
+                    .is_some_and(|instance| instance.enabled && instance.running);
+                if first_start && still_running {
+                    if let Some(instance) = self.instances[index].as_mut() {
+                        instance.started = true;
+                    }
+                    self.run_transition(index, world, Phase::Start, time, time_error.as_deref());
+                }
+            } else {
+                let Some(instance) = self.instances[index].as_mut() else {
+                    continue;
+                };
+                // Экземпляр, остановленный ошибкой, уже не получает `on_disable`.
+                let notify = instance.enabled;
+                instance.running = false;
+                if notify {
+                    self.run_transition(index, world, Phase::Disable, time, time_error.as_deref());
+                }
+            }
+        }
+    }
+
+    /// Уничтожение экземпляра. Активный экземпляр сначала получает `on_disable` (порядок Unity:
+    /// OnDisable, затем OnDestroy); неактивный уже отключён при выходе из работы и получает
+    /// только `on_destroy`. Ошибка или прерывание `on_disable` пропускают `on_destroy`.
+    fn call_destroy(
+        &mut self,
+        index: usize,
+        world: &mut World,
+        time: ScriptTime,
+        time_error: Option<&str>,
+    ) -> CallOutcome {
+        let running = self.instances[index]
+            .as_ref()
+            .is_some_and(|instance| instance.running);
+        if running {
+            if let Some(instance) = self.instances[index].as_mut() {
+                instance.running = false;
+            }
             match self.call_instance(
                 index,
                 world,
-                Phase::Start,
+                Phase::TeardownDisable,
                 time,
                 None,
                 None,
                 None,
-                time_error.as_deref(),
+                time_error,
             ) {
                 CallOutcome::Committed => {}
-                CallOutcome::Interrupted => self.disable_instance(index),
-                CallOutcome::Failed(message) => self.fail_instance(index, message),
+                outcome => return outcome,
             }
+        }
+        self.call_instance(
+            index,
+            world,
+            Phase::Destroy,
+            time,
+            None,
+            None,
+            None,
+            time_error,
+        )
+    }
+
+    fn run_transition(
+        &mut self,
+        index: usize,
+        world: &mut World,
+        phase: Phase,
+        time: ScriptTime,
+        time_error: Option<&str>,
+    ) {
+        match self.call_instance(index, world, phase, time, None, None, None, time_error) {
+            CallOutcome::Committed => {}
+            CallOutcome::Interrupted => self.disable_instance(index),
+            CallOutcome::Failed(message) => self.fail_instance(index, message),
         }
     }
 
@@ -1550,7 +1649,7 @@ impl ScriptHost {
                     MessageTarget::Object(handle) => instance.handle == handle,
                     MessageTarget::Broadcast => true,
                 };
-                if !instance.enabled || !is_target {
+                if !instance.enabled || !instance.running || !is_target {
                     continue;
                 }
                 match self.call_instance(
@@ -1598,14 +1697,17 @@ impl ScriptHost {
                         }
                         NetEvent::PeerConnected { .. } | NetEvent::PeerDisconnected { .. } => true,
                     };
-                    instance.enabled && addressed && self.has_net_callback(index, &event)
+                    instance.enabled
+                        && instance.running
+                        && addressed
+                        && self.has_net_callback(index, &event)
                 })
                 .collect();
             for index in targets {
                 // Экземпляр мог отключиться предыдущим событием этого же кадра.
                 if !self.instances[index]
                     .as_ref()
-                    .is_some_and(|instance| instance.enabled)
+                    .is_some_and(|instance| instance.enabled && instance.running)
                 {
                     continue;
                 }
@@ -1683,17 +1785,16 @@ impl ScriptHost {
             let object = owner;
             let targets: Vec<usize> = (0..self.instances.len())
                 .filter(|&index| {
-                    self.instances[index]
-                        .as_ref()
-                        .is_some_and(|instance| instance.enabled && instance.handle == object)
-                        && self.has_ui_callback(index)
+                    self.instances[index].as_ref().is_some_and(|instance| {
+                        instance.enabled && instance.running && instance.handle == object
+                    }) && self.has_ui_callback(index)
                 })
                 .collect();
             for index in targets {
                 // Экземпляр мог отключиться предыдущим событием этого же кадра.
                 if !self.instances[index]
                     .as_ref()
-                    .is_some_and(|instance| instance.enabled)
+                    .is_some_and(|instance| instance.enabled && instance.running)
                 {
                     continue;
                 }
@@ -1891,7 +1992,9 @@ impl ScriptHost {
             .filter_map(|(index, instance)| {
                 instance
                     .as_ref()
-                    .filter(|instance| instance.enabled && instance.handle == object)
+                    .filter(|instance| {
+                        instance.enabled && instance.running && instance.handle == object
+                    })
                     .map(|_| index)
             })
             .collect::<Vec<_>>();
@@ -1976,8 +2079,9 @@ impl ScriptHost {
                 _ => None,
             },
             lifecycle: lifecycle.clone(),
-            lifecycle_writes: !matches!(phase, Phase::Destroy),
+            lifecycle_writes: !matches!(phase, Phase::Destroy | Phase::TeardownDisable),
             instance_serial: instance.serial,
+            instance_enabled: instance.user_enabled,
             cursor: *cursor,
         });
         let transaction_ptr = transaction as *mut ScriptTransaction;
@@ -1992,10 +2096,13 @@ impl ScriptHost {
                     active_owner,
                     Some(index),
                 );
-                let has_callback = if matches!(phase, Phase::Message) {
-                    lite_instance.has_message_callback()
-                } else {
-                    Ok(true)
+                let has_callback = match phase {
+                    Phase::Message => lite_instance.has_message_callback(),
+                    Phase::Enable => lite_instance.has_callback("on_enable"),
+                    Phase::Disable | Phase::TeardownDisable => {
+                        lite_instance.has_callback("on_disable")
+                    }
+                    _ => Ok(true),
                 };
                 has_callback
                     .and_then(|has_callback| {
@@ -2009,6 +2116,10 @@ impl ScriptHost {
                                     .set_transform(initial)
                                     .and_then(|()| match phase {
                                         Phase::Start => lite_instance.invoke_start(),
+                                        Phase::Enable => lite_instance.invoke_enable(),
+                                        Phase::Disable | Phase::TeardownDisable => {
+                                            lite_instance.invoke_disable()
+                                        }
                                         Phase::Update(dt) => lite_instance.invoke_update(dt),
                                         Phase::Message => match message {
                                             Some(message) => lite_instance.invoke_message(
@@ -2089,6 +2200,10 @@ impl ScriptHost {
                         None => Err("missing message data".to_owned()),
                     },
                     Phase::Start => script.invoke(AbiPhase::Start, time, call),
+                    Phase::Enable => script.invoke(AbiPhase::Enable, time, call),
+                    Phase::Disable | Phase::TeardownDisable => {
+                        script.invoke(AbiPhase::Disable, time, call)
+                    }
                     Phase::Update(dt) => script.invoke(AbiPhase::Update(dt), time, call),
                     Phase::PhysicsEvent(event) => {
                         let Some(other) = (unsafe { (*transaction_ptr).abi_handle(event.other) })
@@ -2181,6 +2296,18 @@ impl ScriptHost {
     /// Применяет накопленные заявки в конце фазы: spawn в порядке commit, затем удаления,
     /// вытеснение по `max_instances` и созревшие отложенные удаления.
     fn apply_lifecycle(&mut self, world: &mut World, time: ScriptTime) {
+        // Флаги `set_enabled` меняются здесь; переход в работу выполнит следующая `sync_activity`.
+        let enabled_writes = std::mem::take(&mut self.lifecycle.borrow_mut().enabled_writes);
+        for (serial, enabled) in enabled_writes {
+            if let Some(instance) = self
+                .instances
+                .iter_mut()
+                .flatten()
+                .find(|instance| instance.serial == serial)
+            {
+                instance.user_enabled = enabled;
+            }
+        }
         self.apply_queued_spawns(world);
 
         let mut doomed = Vec::new();
@@ -2388,10 +2515,7 @@ impl ScriptHost {
     ) -> Result<(), String> {
         let mut created = Vec::new();
         match self.create_instances_into(world, handles, &mut created) {
-            Ok(()) => {
-                self.start_queue.extend(created);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(message) => {
                 for (index, _) in created {
                     self.remove_instance(index);
@@ -2447,6 +2571,8 @@ impl ScriptHost {
                     source: event_source(&self.scene_name, &id, path),
                     kind: ScriptKind::Lite(instance),
                     enabled: true,
+                    user_enabled: script.enabled,
+                    running: false,
                     started: false,
                     serial,
                 });
@@ -2485,6 +2611,7 @@ impl ScriptHost {
                     lifecycle: self.lifecycle.clone(),
                     lifecycle_writes: false,
                     instance_serial: serial,
+                    instance_enabled: true,
                     cursor: self.cursor,
                 });
                 let result = AbiScriptInstance::create(
@@ -2515,6 +2642,8 @@ impl ScriptHost {
                     source,
                     kind: ScriptKind::Heavy(HeavyInstance::Abi(instance)),
                     enabled: true,
+                    user_enabled: script.enabled,
+                    running: false,
                     started: false,
                     serial,
                 });
@@ -2612,16 +2741,7 @@ impl ScriptHost {
             })
             .collect::<Vec<_>>();
         for index in indexes {
-            match self.call_instance(
-                index,
-                world,
-                Phase::Destroy,
-                time,
-                None,
-                None,
-                None,
-                time_error.as_deref(),
-            ) {
+            match self.call_destroy(index, world, time, time_error.as_deref()) {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => self.disable_instance(index),
                 CallOutcome::Failed(message) => self.fail_instance(index, message),
@@ -2667,14 +2787,6 @@ impl ScriptHost {
                 self.remove_instance(index);
             }
         }
-        // Экземпляры, которым ещё не поставили on_start, из очереди уходят вместе с ними.
-        let instances = &self.instances;
-        self.start_queue.retain(|&(index, serial)| {
-            instances
-                .get(index)
-                .and_then(Option::as_ref)
-                .is_some_and(|instance| instance.serial == serial)
-        });
         for handle in &removed {
             self.net.borrow_mut().clear_object(*handle);
         }
@@ -2802,6 +2914,7 @@ impl ScriptHost {
             lifecycle: self.lifecycle.clone(),
             lifecycle_writes: false,
             instance_serial: 0,
+            instance_enabled: true,
             cursor: self.cursor,
         });
         let guard = ActiveCallGuard::new(
@@ -3028,6 +3141,7 @@ fn has_component(object: &engine_scene::WorldObject, component: &ComponentKind) 
         ComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ComponentKind::Script(name) => {
             object
                 .lite_scripts

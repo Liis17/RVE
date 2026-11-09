@@ -15,11 +15,35 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// after the v6 collision tail of the descriptor.
 /// Version 14 appends screen shader callbacks after the v13 network tail.
 /// Version 15 adds parameter kinds and an argument string to parameter descriptors.
-/// Version 16 appends UI callbacks after the v14 screen shader tail of `RveHost` and the `ui_event`
+/// Version 16 appends UI callbacks after the v14 screen shader tail of RveHost and the ui_event
 /// callback after the v13 net event callback of the descriptor.
+/// Version 17 appends hierarchy, activity, tag, layer and script-enable callbacks after the UI tail,
+/// and appends on_enable and on_disable after the v16 descriptor tail.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 16;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 17;
+
+/// Component names accepted by RveHost::object_has_component, in the order used by
+/// components() on the guest side.
+pub const RVE_COMPONENT_NAMES: [&str; 17] = [
+    "transform",
+    "camera",
+    "mesh_renderer",
+    "lod_group",
+    "directional_light",
+    "point_light",
+    "spot_light",
+    "environment",
+    "collider",
+    "rigid_body",
+    "character_controller",
+    "audio_source",
+    "animator",
+    "particle_emitter",
+    "network_identity",
+    "network_transform",
+    "ui_canvas",
+];
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -1637,7 +1661,7 @@ pub struct RveHost {
     pub screen_shader_count: Option<RveScreenShaderCountFn>,
     pub get_screen_shader: Option<RveGetScreenShaderFn>,
     pub set_screen_shader: Option<RveSetScreenShaderFn>,
-    /// UI callbacks appended in ABI v16; `None` on hosts without the game UI.
+    /// UI callbacks appended in ABI v16; None on hosts without the game UI.
     pub ui_open: Option<RveUiOpenFn>,
     pub ui_close: Option<RveUiCloseFn>,
     pub ui_object_canvas: Option<RveUiObjectCanvasFn>,
@@ -1651,7 +1675,80 @@ pub struct RveHost {
     pub ui_set_options: Option<RveUiSetOptionsFn>,
     pub ui_set_image: Option<RveUiSetImageFn>,
     pub ui_focus: Option<RveUiFocusFn>,
+    /// Hierarchy, activity, tag, layer and script-enable callbacks appended after the UI tail in ABI v17.
+    /// None marks an unavailable callback.
+    pub object_set_active: Option<RveObjectSetActiveFn>,
+    pub object_is_active: Option<RveObjectBoolQueryFn>,
+    pub object_active_in_hierarchy: Option<RveObjectBoolQueryFn>,
+    pub object_parent: Option<RveObjectParentFn>,
+    pub object_set_parent: Option<RveObjectSetParentFn>,
+    pub object_children: Option<RveObjectListFn>,
+    pub object_world_position: Option<RveObjectVec3QueryFn>,
+    pub object_set_world_position: Option<RveObjectSetVec3Fn>,
+    pub object_world_rotation: Option<RveObjectVec3QueryFn>,
+    pub object_set_world_rotation: Option<RveObjectSetVec3Fn>,
+    pub object_tag: Option<RveObjectStrQueryFn>,
+    pub object_set_tag: Option<RveObjectSetStrFn>,
+    pub object_layer: Option<RveObjectLayerQueryFn>,
+    pub object_set_layer: Option<RveObjectSetLayerFn>,
+    pub object_has_component: Option<RveObjectHasComponentFn>,
+    pub find_objects_by_name: Option<RveFindObjectsFn>,
+    pub find_objects_by_tag: Option<RveFindObjectsFn>,
+    pub script_set_enabled: Option<RveScriptSetEnabledFn>,
+    pub script_enabled: Option<RveScriptEnabledFn>,
 }
+
+/// Sets an object's own active flag. Returns `false` for a dead object or a refused write.
+pub type RveObjectSetActiveFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, active: bool) -> bool;
+/// Reads a boolean from an object into `out`; returns `false` for an unavailable object.
+pub type RveObjectBoolQueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut bool) -> bool;
+/// Writes the parent handle into `out`; `0` means no parent.
+pub type RveObjectParentFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u64) -> bool;
+/// Sets the parent (`0` for a root). `keep_world` preserves the world pose.
+pub type RveObjectSetParentFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, parent: u64, keep_world: bool) -> bool;
+/// Writes up to `capacity` handles into `out` and the total count into `count`.
+pub type RveObjectListFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Writes a `[x, y, z]` vector into `out`.
+pub type RveObjectVec3QueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut [f32; 3]) -> bool;
+/// Sets a `[x, y, z]` vector read from `value`.
+pub type RveObjectSetVec3Fn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const [f32; 3]) -> bool;
+/// Writes the object's tag into `out`; an empty string means no tag.
+pub type RveObjectStrQueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveStr) -> bool;
+pub type RveObjectSetStrFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: RveStr) -> bool;
+pub type RveObjectLayerQueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u32) -> bool;
+pub type RveObjectSetLayerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, layer: u32) -> bool;
+/// Tests a component name from [`RVE_COMPONENT_NAMES`] or `script:<path>`.
+pub type RveObjectHasComponentFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, name: RveStr, out: *mut bool) -> bool;
+/// Writes live objects with the given name or tag into `out`, up to `capacity`, and the total
+/// count into `count`.
+pub type RveFindObjectsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    value: RveStr,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Sets the calling instance's enabled flag.
+pub type RveScriptSetEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, enabled: bool) -> bool;
+/// Reads the calling instance's enabled flag into `out`.
+pub type RveScriptEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut bool) -> bool;
 
 /// Guest factory callback.
 pub type RveCreateFn = unsafe extern "C" fn(
@@ -1821,7 +1918,9 @@ pub struct RveScriptDescV13 {
     pub net_event: Option<RveNetEventFn>,
 }
 
-/// ABI v15 descriptor layout: typed parameters and network events, before UI callbacks.
+/// ABI v15 reference-branch descriptor layout: typed parameters and network events, before UI
+/// callbacks. The UI branch appended `ui_event` to this prefix; the loader accepts that stride but
+/// ignores the callback because both branches used the same ABI version.
 #[repr(C)]
 pub struct RveScriptDescV15 {
     pub name: RveStr,
@@ -1835,11 +1934,28 @@ pub struct RveScriptDescV15 {
     pub param_count: usize,
     pub command: Option<RveCommandFn>,
     pub collision: Option<RveCollisionFn>,
-    /// Optional network event callback appended in ABI v13.
     pub net_event: Option<RveNetEventFn>,
 }
 
-/// One exported guest script implementation in ABI version 16.
+/// ABI v16 descriptor layout with UI events and no hierarchy lifecycle callbacks.
+#[repr(C)]
+pub struct RveScriptDescV16 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+}
+
+/// Current exported guest script implementation in ABI version 17.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -1854,10 +1970,13 @@ pub struct RveScriptDesc {
     pub command: Option<RveCommandFn>,
     pub collision: Option<RveCollisionFn>,
     pub net_event: Option<RveNetEventFn>,
-    /// Optional UI event callback appended in ABI v16.
+    /// UI event callback appended in ABI v16.
     pub ui_event: Option<RveUiEventFn>,
+    /// Optional callback run when the instance starts running; appended in ABI v17.
+    pub on_enable: Option<RveStartFn>,
+    /// Optional callback run when a running instance stops; appended in ABI v17.
+    pub on_disable: Option<RveStartFn>,
 }
-
 /// Parameter kind: boolean.
 pub const RVE_PARAM_BOOL: u32 = 0;
 /// Parameter kind: signed 64-bit integer.
@@ -1961,6 +2080,7 @@ unsafe impl Sync for RveScriptDescV4 {}
 unsafe impl Sync for RveScriptDescV6 {}
 unsafe impl Sync for RveScriptDescV13 {}
 unsafe impl Sync for RveScriptDescV15 {}
+unsafe impl Sync for RveScriptDescV16 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
@@ -2091,7 +2211,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 17);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);

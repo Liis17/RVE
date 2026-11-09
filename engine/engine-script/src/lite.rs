@@ -18,8 +18,8 @@ use engine_project::InputActionKind;
 use engine_scene::{
     AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AssetKind, AudioGroup, AudioRequest,
     CameraSettings, ClipParams, ComponentKind, ExposureMode, MAX_SCREEN_SHADER_PARAMS, NetEvent,
-    NetMode, NetTarget, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId,
-    PostProcessSettings, Tonemapper, VoiceId,
+    NetMode, NetTarget, ObjectEdit, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue,
+    PeerId, PostProcessSettings, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
@@ -385,6 +385,9 @@ pub(crate) fn create_lua(
     )?;
     rve.set("console", console)?;
     rve.set("find", find_function(&lua, active_call.clone())?)?;
+    for (name, function) in object_finders(&lua, active_call.clone())? {
+        rve.set(name, function)?;
+    }
     let physics = lua.create_table()?;
     physics.set(
         "raycast",
@@ -434,6 +437,8 @@ pub(crate) fn compile_class(
     };
     for callback in [
         "on_start",
+        "on_enable",
+        "on_disable",
         "on_update",
         "on_message",
         "on_destroy",
@@ -772,6 +777,7 @@ impl LuaInstance {
         let instance = lua.create_table()?;
         instance.set("params", params)?;
         instance.set("object", object)?;
+        instance.set("script", script_table(lua, active_call.clone())?)?;
         instance.set("transform", transform.clone())?;
         let metatable = lua.create_table()?;
         metatable.set("__index", class.clone())?;
@@ -800,6 +806,14 @@ impl LuaInstance {
 
     pub(crate) fn invoke_update(&self, dt: f32) -> mlua::Result<()> {
         self.invoke("on_update", (self.instance.clone(), dt))
+    }
+
+    pub(crate) fn invoke_enable(&self) -> mlua::Result<()> {
+        self.invoke("on_enable", (self.instance.clone(),))
+    }
+
+    pub(crate) fn invoke_disable(&self) -> mlua::Result<()> {
+        self.invoke("on_disable", (self.instance.clone(),))
     }
 
     pub(crate) fn invoke_destroy(&self) -> mlua::Result<()> {
@@ -1483,6 +1497,7 @@ fn object_table(
             })
         })?,
     )?;
+    add_hierarchy_object_api(lua, &object, handle, active_call.clone())?;
     add_audio_object_api(lua, &object, handle, active_call.clone())?;
     add_animation_object_api(lua, &object, handle, active_call.clone())?;
     add_net_object_api(lua, &object, handle, active_call.clone())?;
@@ -2495,6 +2510,436 @@ fn add_physics_object_api(
         })?,
     )?;
     Ok(())
+}
+
+/// Аргументы метода без необязательного `self`: первая таблица отбрасывается, только если это
+/// сам объект. Так работают и `obj:set_parent(p)`, и `obj.set_parent(p)` с другим объектом первым.
+fn method_arguments(
+    lua: &Lua,
+    arguments: MultiValue,
+    handle: ObjectHandle,
+) -> mlua::Result<Vec<Value>> {
+    let mut values = arguments.into_iter().collect::<Vec<_>>();
+    if let Some(Value::Table(table)) = values.first()
+        && object_handle_of(lua, table)? == Some(handle)
+    {
+        values.remove(0);
+    }
+    Ok(values)
+}
+
+/// Таблица живого объекта по хендлу; `None`, если объект уже мёртв.
+fn live_object_table(
+    lua: &Lua,
+    active_call: &ActiveCall,
+    handle: ObjectHandle,
+) -> mlua::Result<Option<Table>> {
+    let identity = with_active_call(active_call, |transaction| {
+        Ok(transaction.object_identity(handle))
+    })?;
+    let Some((id, name)) = identity else {
+        return Ok(None);
+    };
+    Ok(Some(object_table(
+        lua,
+        handle,
+        id,
+        name,
+        active_call.clone(),
+    )?))
+}
+
+/// Список объектов из хендлов в порядке, который вернул движок.
+fn object_list(
+    lua: &Lua,
+    active_call: &ActiveCall,
+    handles: Vec<ObjectHandle>,
+) -> mlua::Result<Table> {
+    let list = lua.create_table()?;
+    for handle in handles {
+        if let Some(table) = live_object_table(lua, active_call, handle)? {
+            list.push(table)?;
+        }
+    }
+    Ok(list)
+}
+
+/// Иерархия, активность, теги, слои и компоненты объекта. Чтения видят заявки текущего вызова,
+/// где движок их поддерживает; мировые позиции и поиск читают последний коммит мира.
+fn add_hierarchy_object_api(
+    lua: &Lua,
+    object: &Table,
+    handle: ObjectHandle,
+    active_call: ActiveCall,
+) -> mlua::Result<()> {
+    let parent_call = active_call.clone();
+    object.set(
+        "parent",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let parent = with_active_call(&parent_call, |transaction| {
+                Ok(transaction.parent(handle).flatten())
+            })?;
+            match parent {
+                Some(parent) => match live_object_table(lua, &parent_call, parent)? {
+                    Some(table) => Ok(Value::Table(table)),
+                    None => Ok(Value::Nil),
+                },
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    let children_call = active_call.clone();
+    object.set(
+        "children",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let children = with_active_call(&children_call, |transaction| {
+                Ok(transaction.children(handle).unwrap_or_default())
+            })?;
+            object_list(lua, &children_call, children)
+        })?,
+    )?;
+
+    let set_parent_call = active_call.clone();
+    object.set(
+        "set_parent",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let parent = match values.first() {
+                None | Some(Value::Nil) => None,
+                Some(Value::Table(table)) => {
+                    Some(object_handle_of(lua, table)?.ok_or_else(|| {
+                        LuaError::runtime("object.set_parent expects an object or nil")
+                    })?)
+                }
+                Some(_) => {
+                    return Err(LuaError::runtime(
+                        "object.set_parent expects an object or nil",
+                    ));
+                }
+            };
+            let keep_world = match values.get(1) {
+                None => true,
+                Some(Value::Boolean(keep_world)) => *keep_world,
+                Some(_) => {
+                    return Err(LuaError::runtime(
+                        "object.set_parent expects keep_world to be a boolean",
+                    ));
+                }
+            };
+            with_active_call(&set_parent_call, |transaction| {
+                let parent_alive = parent
+                    .is_none_or(|parent| transaction.object_state(parent) == ObjectState::Alive);
+                let staged = parent_alive
+                    && transaction.stage_edit(ObjectEdit::SetParent {
+                        object: handle,
+                        parent,
+                        keep_world,
+                    });
+                Ok(staged)
+            })
+        })?,
+    )?;
+
+    let active_query_call = active_call.clone();
+    object.set(
+        "is_active",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&active_query_call, |transaction| {
+                Ok(transaction.is_active(handle).unwrap_or(false))
+            })
+        })?,
+    )?;
+
+    let hierarchy_call = active_call.clone();
+    object.set(
+        "active_in_hierarchy",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&hierarchy_call, |transaction| {
+                Ok(transaction.active_in_hierarchy(handle).unwrap_or(false))
+            })
+        })?,
+    )?;
+
+    let set_active_call = active_call.clone();
+    object.set(
+        "set_active",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let active = lua_boolean(
+                values.into_iter().next().unwrap_or(Value::Nil),
+                "object.set_active",
+            )?;
+            with_active_call(&set_active_call, |transaction| {
+                Ok(transaction.stage_edit(ObjectEdit::SetActive {
+                    object: handle,
+                    active,
+                }))
+            })
+        })?,
+    )?;
+
+    let position_call = active_call.clone();
+    object.set(
+        "get_world_position",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let position = with_active_call(&position_call, |transaction| {
+                Ok(transaction.world_position(handle))
+            })?;
+            match position {
+                Some(position) => Ok(Value::Table(vector_table(lua, position.to_array())?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    let set_position_call = active_call.clone();
+    object.set(
+        "set_world_position",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let Some(Value::Table(table)) = values.into_iter().next() else {
+                return Err(LuaError::runtime(
+                    "object.set_world_position expects a vector table",
+                ));
+            };
+            let position = read_vector(&table, "set_world_position")?;
+            with_active_call(&set_position_call, |transaction| {
+                Ok(transaction.stage_edit(ObjectEdit::SetWorldPosition {
+                    object: handle,
+                    position: Vec3::from_array(position),
+                }))
+            })
+        })?,
+    )?;
+
+    let rotation_call = active_call.clone();
+    object.set(
+        "get_world_rotation",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let rotation = with_active_call(&rotation_call, |transaction| {
+                Ok(transaction.world_rotation_deg(handle))
+            })?;
+            match rotation {
+                Some(rotation) => Ok(Value::Table(vector_table(lua, rotation.to_array())?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    let set_rotation_call = active_call.clone();
+    object.set(
+        "set_world_rotation",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let Some(Value::Table(table)) = values.into_iter().next() else {
+                return Err(LuaError::runtime(
+                    "object.set_world_rotation expects a vector table in degrees",
+                ));
+            };
+            let rotation = read_vector(&table, "set_world_rotation")?;
+            with_active_call(&set_rotation_call, |transaction| {
+                Ok(transaction.stage_edit(ObjectEdit::SetWorldRotation {
+                    object: handle,
+                    rotation_deg: Vec3::from_array(rotation),
+                }))
+            })
+        })?,
+    )?;
+
+    let tag_call = active_call.clone();
+    object.set(
+        "tag",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&tag_call, |transaction| {
+                Ok(transaction.tag(handle).map(str::to_owned))
+            })
+        })?,
+    )?;
+
+    let set_tag_call = active_call.clone();
+    object.set(
+        "set_tag",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let tag = match values.into_iter().next() {
+                Some(Value::String(tag)) => tag.to_str()?.to_owned(),
+                _ => return Err(LuaError::runtime("object.set_tag expects a string")),
+            };
+            with_active_call(&set_tag_call, |transaction| {
+                Ok(transaction.stage_edit(ObjectEdit::SetTag {
+                    object: handle,
+                    tag,
+                }))
+            })
+        })?,
+    )?;
+
+    let layer_call = active_call.clone();
+    object.set(
+        "layer",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&layer_call, |transaction| {
+                Ok(transaction.layer(handle).map(i64::from))
+            })
+        })?,
+    )?;
+
+    let set_layer_call = active_call.clone();
+    object.set(
+        "set_layer",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let layer = lua_integer(
+                values.into_iter().next().unwrap_or(Value::Nil),
+                "object.set_layer",
+            )?;
+            let Ok(layer) = u8::try_from(layer) else {
+                return Ok(false);
+            };
+            with_active_call(&set_layer_call, |transaction| {
+                Ok(transaction.stage_edit(ObjectEdit::SetLayer {
+                    object: handle,
+                    layer,
+                }))
+            })
+        })?,
+    )?;
+
+    let component_call = active_call.clone();
+    object.set(
+        "has_component",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let name = match values.into_iter().next() {
+                Some(Value::String(name)) => name.to_str()?.to_owned(),
+                _ => return Err(LuaError::runtime("object.has_component expects a name")),
+            };
+            has_component_by_name(&component_call, handle, &name)
+        })?,
+    )?;
+
+    let components_call = active_call.clone();
+    object.set(
+        "components",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let list = lua.create_table()?;
+            for name in rve_sdk::abi::RVE_COMPONENT_NAMES {
+                if has_component_by_name(&components_call, handle, name)? {
+                    list.push(name)?;
+                }
+            }
+            Ok(list)
+        })?,
+    )?;
+    Ok(())
+}
+
+/// Проверяет компонент по имени из `RVE_COMPONENT_NAMES` или `script:<путь>`; неизвестное имя — `false`.
+fn has_component_by_name(
+    active_call: &ActiveCall,
+    handle: ObjectHandle,
+    name: &str,
+) -> mlua::Result<bool> {
+    let Some(kind) = ComponentKind::parse(name) else {
+        return Ok(false);
+    };
+    with_active_call(active_call, |transaction| {
+        Ok(transaction.has_component(handle, &kind).unwrap_or(false))
+    })
+}
+
+/// Поиск объектов по имени и тегу: `rve.find_by_name`, `rve.find_all`, `rve.find_with_tag`, `rve.find_all_with_tag`.
+fn object_finders(
+    lua: &Lua,
+    active_call: ActiveCall,
+) -> mlua::Result<Vec<(&'static str, Function)>> {
+    let mut finders = Vec::new();
+    let by_name_call = active_call.clone();
+    finders.push((
+        "find_by_name",
+        lua.create_function(move |lua, name: String| {
+            let found = with_active_call(&by_name_call, |transaction| {
+                Ok(transaction.find_by_name(&name))
+            })?;
+            match found {
+                Some(handle) => match live_object_table(lua, &by_name_call, handle)? {
+                    Some(table) => Ok(Value::Table(table)),
+                    None => Ok(Value::Nil),
+                },
+                None => Ok(Value::Nil),
+            }
+        })?,
+    ));
+    let all_name_call = active_call.clone();
+    finders.push((
+        "find_all",
+        lua.create_function(move |lua, name: String| {
+            let found = with_active_call(&all_name_call, |transaction| {
+                Ok(transaction.find_all_by_name(&name))
+            })?;
+            object_list(lua, &all_name_call, found)
+        })?,
+    ));
+    let tag_call = active_call.clone();
+    finders.push((
+        "find_with_tag",
+        lua.create_function(move |lua, tag: String| {
+            let found =
+                with_active_call(&tag_call, |transaction| Ok(transaction.find_with_tag(&tag)))?;
+            match found {
+                Some(handle) => match live_object_table(lua, &tag_call, handle)? {
+                    Some(table) => Ok(Value::Table(table)),
+                    None => Ok(Value::Nil),
+                },
+                None => Ok(Value::Nil),
+            }
+        })?,
+    ));
+    let all_tag_call = active_call;
+    finders.push((
+        "find_all_with_tag",
+        lua.create_function(move |lua, tag: String| {
+            let found = with_active_call(&all_tag_call, |transaction| {
+                Ok(transaction.find_all_with_tag(&tag))
+            })?;
+            object_list(lua, &all_tag_call, found)
+        })?,
+    ));
+    Ok(finders)
+}
+
+/// Таблица `self.script` экземпляра: `set_enabled(enabled)` и `enabled()`. Записи коммитятся
+/// вместе с вызовом; сам экземпляр не может менять чужой флаг.
+fn script_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let script = lua.create_table()?;
+    let set_call = active_call.clone();
+    script.set(
+        "set_enabled",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let mut values = arguments.into_iter();
+            let first = values.next();
+            let value = match first {
+                Some(Value::Table(_)) => values.next(),
+                value => value,
+            };
+            let enabled = lua_boolean(value.unwrap_or(Value::Nil), "script.set_enabled")?;
+            with_active_call(&set_call, |transaction| {
+                Ok(transaction.set_script_enabled(enabled))
+            })
+        })?,
+    )?;
+    let enabled_call = active_call;
+    script.set(
+        "enabled",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(
+                &enabled_call,
+                |transaction| Ok(transaction.script_enabled()),
+            )
+        })?,
+    )?;
+    Ok(script)
 }
 
 fn method_argument(mut arguments: MultiValue, name: &str) -> mlua::Result<Value> {

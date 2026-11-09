@@ -11,8 +11,8 @@ use engine_scene::ComponentKind as ScriptComponentKind;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
     AntiAliasing, AudioGroup, AudioSourceComponent, CameraComponent, CharacterControllerComponent,
-    ColliderComponent, ColliderShape, EnvironmentComponent, HeavyScript, LodGroup, LodLevel,
-    MAX_LOD_LEVELS, MaterialAlphaMode, NetAuthority, NetworkIdentityComponent,
+    ColliderComponent, ColliderShape, EnvironmentComponent, HeavyScript, LAYER_COUNT, LodGroup,
+    LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, NetAuthority, NetworkIdentityComponent,
     NetworkTransformComponent, ParamKind, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
     ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform,
     SpotLightComponent,
@@ -142,6 +142,24 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
                 ui.ctx().data_mut(|data| data.insert_temp(editor_id, text));
             }
             ui.end_row();
+
+            ui.label("Active");
+            ui.add_enabled_ui(!part, |ui| {
+                let mut active = object.active;
+                let response = ui.checkbox(&mut active, "");
+                commit(state, id, "active", &response, |object| {
+                    object.active = active;
+                });
+            });
+            ui.end_row();
+
+            ui.label("Tag");
+            ui.add_enabled_ui(!part, |ui| tag_combo(ui, state, object));
+            ui.end_row();
+
+            ui.label("Layer");
+            ui.add_enabled_ui(!part, |ui| layer_combo(ui, state, object));
+            ui.end_row();
         });
     if name_reverted {
         revert(state, id, OverrideField::Name);
@@ -239,6 +257,73 @@ fn marked_text(text: &str, overridden: bool) -> egui::RichText {
         egui::RichText::new(text).strong().color(OVERRIDE_COLOR)
     } else {
         egui::RichText::new(text)
+    }
+}
+
+/// Тег объекта из `[tags]` проекта; пустой тег означает «Untagged».
+fn tag_combo(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
+    let names = state
+        .project
+        .as_ref()
+        .map(|project| project.settings.tags.names.clone())
+        .unwrap_or_default();
+    let id = object.id.as_str();
+    let before = object.tag.clone();
+    let mut tag = before.clone();
+    let selected = if tag.is_empty() {
+        "Untagged".to_owned()
+    } else {
+        tag.clone()
+    };
+    egui::ComboBox::from_id_salt(("object_tag", id))
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut tag, String::new(), "Untagged");
+            for name in &names {
+                ui.selectable_value(&mut tag, name.clone(), name.as_str());
+            }
+        });
+    if tag != before {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, None, |object| {
+                object.tag = tag;
+                Ok(())
+            })
+        });
+    }
+}
+
+/// Слой объекта `0..32`; имя берётся из `[layers]` проекта по индексу.
+fn layer_combo(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
+    let names = state
+        .project
+        .as_ref()
+        .map(|project| project.settings.layers.names.clone())
+        .unwrap_or_default();
+    let id = object.id.as_str();
+    let before = object.layer;
+    let mut layer = before;
+    egui::ComboBox::from_id_salt(("object_layer", id))
+        .selected_text(layer_label(before, &names))
+        .show_ui(ui, |ui| {
+            for index in 0..LAYER_COUNT {
+                ui.selectable_value(&mut layer, index, layer_label(index, &names));
+            }
+        });
+    if layer != before {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, None, |object| {
+                object.layer = layer;
+                Ok(())
+            })
+        });
+    }
+}
+
+fn layer_label(layer: u8, names: &[String]) -> String {
+    match names.get(usize::from(layer)) {
+        Some(name) if !name.is_empty() => format!("{layer}: {name}"),
+        _ => layer.to_string(),
     }
 }
 
@@ -2882,6 +2967,8 @@ fn show_lite_script(
     let mut params = script.params.clone();
     let mut params_response = None;
     let mut reset = None;
+    let mut enabled = script.enabled;
+    let mut enabled_response = None;
     let action = component_header(
         ui,
         HeaderTitle {
@@ -2892,28 +2979,37 @@ fn show_lite_script(
         mark(state, id, field.clone()),
         None,
         true,
-        |ui| match &schema {
-            Ok(Some(schema)) => {
-                params_response = schema_params_ui(
-                    ui,
-                    state,
-                    id,
-                    ("lite", id, index),
-                    schema,
-                    &mut params,
-                    &mut reset,
-                );
-            }
-            Ok(None) => params_response = params_ui(ui, ("lite", id, index), &mut params),
-            Err(_) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    "Ошибка схемы properties, см. Console",
-                );
-                params_response = params_ui(ui, ("lite", id, index), &mut params);
+        |ui| {
+            enabled_response = Some(ui.checkbox(&mut enabled, "Enabled"));
+            match &schema {
+                Ok(Some(schema)) => {
+                    params_response = schema_params_ui(
+                        ui,
+                        state,
+                        id,
+                        ("lite", id, index),
+                        schema,
+                        &mut params,
+                        &mut reset,
+                    );
+                }
+                Ok(None) => params_response = params_ui(ui, ("lite", id, index), &mut params),
+                Err(_) => {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "Ошибка схемы properties, см. Console",
+                    );
+                    params_response = params_ui(ui, ("lite", id, index), &mut params);
+                }
             }
         },
     );
+    if let Some(response) = &enabled_response {
+        let key = format!("lite-enabled-{index}");
+        commit(state, id, &key, response, |object| {
+            object.lite_scripts[index].enabled = enabled;
+        });
+    }
     if let Some((name, default)) = reset {
         let base_has_param = default.is_some()
             && prefab_base_object(state, id).is_some_and(|base| {
@@ -2955,6 +3051,8 @@ fn show_heavy_script(
     let mut params = script.params.clone();
     let mut params_response = None;
     let mut reset = None;
+    let mut enabled = script.enabled;
+    let mut enabled_response = None;
     let action = component_header(
         ui,
         HeaderTitle {
@@ -2965,21 +3063,30 @@ fn show_heavy_script(
         mark(state, id, field.clone()),
         None,
         true,
-        |ui| match &schema {
-            Some(schema) => {
-                params_response = schema_params_ui(
-                    ui,
-                    state,
-                    id,
-                    ("heavy", id, index),
-                    schema,
-                    &mut params,
-                    &mut reset,
-                );
+        |ui| {
+            enabled_response = Some(ui.checkbox(&mut enabled, "Enabled"));
+            match &schema {
+                Some(schema) => {
+                    params_response = schema_params_ui(
+                        ui,
+                        state,
+                        id,
+                        ("heavy", id, index),
+                        schema,
+                        &mut params,
+                        &mut reset,
+                    );
+                }
+                None => params_response = params_ui(ui, ("heavy", id, index), &mut params),
             }
-            None => params_response = params_ui(ui, ("heavy", id, index), &mut params),
         },
     );
+    if let Some(response) = &enabled_response {
+        let key = format!("heavy-enabled-{index}");
+        commit(state, id, &key, response, |object| {
+            object.heavy_scripts[index].enabled = enabled;
+        });
+    }
     if let Some((name, default)) = reset {
         let base_has_param = default.is_some()
             && prefab_base_object(state, id).is_some_and(|base| {
@@ -3568,6 +3675,7 @@ fn reference_matches(kind: &ParamKind, object: &SceneObject) -> bool {
         ScriptComponentKind::ParticleEmitter => object.particle_emitter.is_some(),
         ScriptComponentKind::NetworkIdentity => object.network_identity.is_some(),
         ScriptComponentKind::NetworkTransform => object.network_transform.is_some(),
+        ScriptComponentKind::UiCanvas => object.ui_canvas.is_some(),
         ScriptComponentKind::Script(script) => {
             object
                 .lite_scripts
@@ -3815,6 +3923,7 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                         object.heavy_scripts.push(HeavyScript {
                             name: script,
                             params: BTreeMap::new(),
+                            enabled: true,
                         });
                         Ok(())
                     })

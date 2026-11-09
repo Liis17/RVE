@@ -108,7 +108,7 @@ load_scene и load_prefab_template через engine/engine-runtime/src/scene.rs
 Scripts thread регистрирует каждый быстрый шаблон до `Ready` (`ScriptHost::register_prefab`); ошибка даёт код 2. После `start`, console-команд и `update` вызывается `apply_world_changes` до `sync_world_commands`. Она берёт `drain_world_changes` и:
 - переносит уровни шаблона на объекты поддерева и удаляет записи удалённых объектов;
 - снимает тела удалённых объектов (`Remove`), затем вставляет тела новых (`Insert`) и добавляет `SetVelocity` для скорости spawn; всё уходит в ближайший `step_with_changes`;
-- передаёт звуку `StopSource` для удалённых объектов и `PlaySource` для spawn-объектов с `play_on_start`.
+- передаёт звуку `StopSource` для объектов, ставших неактивными, и `PlaySource` для spawn-объектов с `play_on_start`; объекты, снова ставшие активными, тоже получают `PlaySource`, если у них `play_on_start` (`engine_scene::activity_audio_requests`, та же логика в editor play).
 
 Если физика отвергла вставку (например, нулевой масштаб), `apply_world_changes` вызывает `ScriptHost::revert_spawn`: поддерево удаляется из `World` вместе с экземплярами скриптов, Error из отката печатается сразу. Удаления не попадают в следующий `drain_world_changes`, поэтому GPU и физика не получают второе удаление. Тесты без GPU проверяют физику и откат, а draw-команды по GPU-таблице сквозь `make_snapshot` не проверяются, потому что `MeshId` нельзя создать вне engine-render. Тяжёлые префабы описаны в [[#Тяжёлые префабы]].
 
@@ -220,6 +220,10 @@ Background сохраняют raw `released` edges и сбрасывают analo
 - Поток рендера: ожидание снимка, ресурсные запросы префабов (`resource requests`: загрузка и освобождение бюджетными шагами), вызов backend, CPU-фазы и GPU-проходы первого вида из `take_frame_profile` ([[Engine/EngineRender]]). Вместе с окнами он публикует группу `Resources` (источник `resources`): дельту `ResourceStats` за интервал, `in flight` и максимумы очереди и чтения с запуска ([[Engine/EngineResources]]).
 - Старт: `StartupProfile` записывает фазы до окна (`hardware probe`, `window icon`, `scene load`, `physics build`, `physics module`, `scripts start`, `scripts ready`) и в `PlayerWindow::init` — `renderer` (создание `Renderer`) и `GPU upload` (`upload_scene`: модели, текстуры, материалы). Отчёт публикуется после GPU upload, а в лог одной записью пишется при первом показанном кадре. Окружение (IBL) в отчёт старта не входит: `Renderer::create_environment` вызывается лениво на render-потоке при первом кадре с окружением, и его время попадает в фазу `render backend`.
 - С `dev-console`: F3 переключает оверлей профайлера. Оверлей работает при закрытой консоли, не блокирует игровой ввод и обновляется раз в 500 мс. Команда `profile` выводит отчёты в консоль. Она перехватывается главным потоком до отправки скриптам и имеет приоритет над одноимённой командой скрипта; при затенении в лог пишется одно предупреждение. Строка `profile` добавлена в каталог команд для help и автодополнения. Таблица рисуется `engine_ui::profiler`.
+
+## Активность объектов
+
+- Перед применением spawn и destroy `apply_world_changes` вызывает `apply_activity_changes`: тела неактивных объектов удаляются, тела активированных создаются заново, звук неактивных источников останавливается. Расписание `on_enable`, `on_disable` и `on_start` ведёт `ScriptHost` ([[Engine/EngineScript]]).
 
 ## Курсор игрока
 

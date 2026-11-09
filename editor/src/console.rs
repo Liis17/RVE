@@ -45,6 +45,10 @@ impl ConsoleLog {
         self.push(LogLevel::Info, message);
     }
 
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.push(LogLevel::Warn, message);
+    }
+
     pub fn error(&mut self, message: impl Into<String>) {
         self.push(LogLevel::Error, message);
     }

@@ -187,6 +187,8 @@ pub struct EditorState {
     pub project: Option<OpenProject>,
     /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
     pub project_prefabs: Option<ProjectPrefabs>,
+    /// Несохранённые теги и слои проекта (вкладка Project Settings).
+    pub tags_layers: Option<crate::project_tags::TagsLayersDraft>,
     pub scene: Option<EditorScene>,
     pub log: ConsoleLog,
     pub profile: EditorProfile,
@@ -307,6 +309,7 @@ impl EditorState {
             mcp_capture: None,
             project: None,
             project_prefabs: None,
+            tags_layers: None,
             scene: None,
             log: ConsoleLog::default(),
             profile: EditorProfile::default(),
@@ -622,6 +625,7 @@ impl EditorState {
     /// проекта несохранённые правки прошлого списка не переносятся.
     pub fn project_replaced(&mut self) {
         self.project_prefabs = None;
+        self.tags_layers = None;
         self.ui_document = None;
         self.ui_pending_path = None;
         self.materials = MaterialLibrary::default();

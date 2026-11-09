@@ -17,13 +17,15 @@ pub enum Tab {
     SceneAssets,
     /// Подокно списка тяжёлых префабов `prefabs.rveprefabs` проекта.
     ProjectPrefabs,
+    /// Подокно тегов и слоёв `[tags]` и `[layers]` в `project.rveproject`.
+    ProjectSettings,
     Profiler,
     UiEditor,
     MaterialPreview,
 }
 
 impl Tab {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
@@ -32,6 +34,7 @@ impl Tab {
         Self::Console,
         Self::SceneAssets,
         Self::ProjectPrefabs,
+        Self::ProjectSettings,
         Self::Profiler,
         Self::UiEditor,
         Self::MaterialPreview,
@@ -47,6 +50,7 @@ impl Tab {
             Self::Console => "Console",
             Self::SceneAssets => "Scene Assets",
             Self::ProjectPrefabs => "Project Prefabs",
+            Self::ProjectSettings => "Project Settings",
             Self::Profiler => "Profiler",
             Self::UiEditor => "UI Editor",
             Self::MaterialPreview => "Material Preview",
@@ -111,6 +115,7 @@ impl TabViewer for EditorTabs<'_> {
             Tab::Console => ui::console::show(ui, self.state),
             Tab::SceneAssets => ui::scene_assets::show(ui, self.state),
             Tab::ProjectPrefabs => ui::project_prefabs::show(ui, self.state),
+            Tab::ProjectSettings => ui::project_tags::show(ui, self.state),
             Tab::Profiler => ui::profiler::show(ui, self.state),
             Tab::UiEditor => {
                 self.state.ui_editor_rect = Some(ui.max_rect());
@@ -143,8 +148,11 @@ mod tests {
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
                 .count();
-            // Подокна Scene Assets и Project Prefabs открываются из меню Window.
-            let optional = matches!(tab, Tab::SceneAssets | Tab::ProjectPrefabs | Tab::UiEditor);
+            // Подокна Scene Assets, Project Prefabs, Project Settings и UI Editor открываются из меню Window.
+            let optional = matches!(
+                tab,
+                Tab::SceneAssets | Tab::ProjectPrefabs | Tab::ProjectSettings | Tab::UiEditor
+            );
             let expected = usize::from(!optional);
             assert_eq!(count, expected, "{tab:?}");
         }

@@ -149,6 +149,10 @@ impl PhysicsSceneDesc {
         let mut cache = ShapeCache::default();
         let mut bodies = Vec::new();
         for object in world.objects() {
+            // Тело неактивного объекта создаётся при активации, а не при загрузке сцены.
+            if world.active_in_hierarchy(object.handle) != Some(true) {
+                continue;
+            }
             if let Some(body) = scene_body(world, object, &models, &mut cache)? {
                 bodies.push(body);
             }
@@ -265,6 +269,18 @@ impl PhysicsSceneSync {
         &self.bindings
     }
 
+    /// Объекты из `objects`, которые ещё не привязаны к телу. Привязанные пропускаются: например,
+    /// объект, который активация уже вставила в этом кадре, не должен получить второе тело.
+    pub fn unbound_objects(&self, objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
+        let bound: HashSet<ObjectHandle> =
+            self.bindings.iter().map(|binding| binding.object).collect();
+        objects
+            .iter()
+            .copied()
+            .filter(|object| !bound.contains(object))
+            .collect()
+    }
+
     /// Объект, которому принадлежит тело. Учитывает тела, удалённые с последним результатом
     /// шага и предыдущим, чтобы доставить их `*_exit` выжившим объектам.
     pub fn object_for_body(&self, body: BodyHandle) -> Option<ObjectHandle> {
@@ -278,7 +294,7 @@ impl PhysicsSceneSync {
     }
 
     /// Создаёт тела для объектов мира по хендлам, например после `World::spawn`. Объекты без
-    /// коллайдера и character controller пропускаются. Все проверки выполняются до изменения
+    /// коллайдера и character controller пропускаются, как и объекты, неактивные в иерархии. Все проверки выполняются до изменения
     /// привязок: при ошибке состояние не меняется.
     pub fn insert_objects(
         &mut self,
@@ -299,6 +315,10 @@ impl PhysicsSceneSync {
             let scene_object = world
                 .object(object)
                 .ok_or(PhysicsSceneSyncError::MissingObject(object))?;
+            // Тело неактивного объекта создаётся при активации, как и при загрузке сцены.
+            if world.active_in_hierarchy(object) != Some(true) {
+                continue;
+            }
             let Some(body) = scene_body(world, scene_object, &models, cache)? else {
                 continue;
             };
@@ -848,6 +868,19 @@ mod tests {
     }
 
     #[test]
+    fn inactive_objects_and_their_children_get_no_body_at_load() {
+        let scene = world(
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+[[objects]]\nid = \"hidden\"\nactive = false\n[objects.collider]\n\
+[[objects]]\nid = \"hidden_child\"\nparent = \"hidden\"\n[objects.collider]\n\
+[[objects]]\nid = \"shown\"\n[objects.collider]\n",
+        );
+        let description = desc(&scene, &[]);
+        let bodies: Vec<_> = description.bodies.iter().map(|body| body.object).collect();
+        assert_eq!(bodies, [scene.handle("shown").unwrap()]);
+    }
+
+    #[test]
     fn scene_builds_convex_hull_and_triangle_mesh_from_base_model_geometry() {
         let scene = world(&format!(
             "{CAMERA}\n[[assets]]\npath='/models/cube.fbx'\n\
@@ -1241,6 +1274,47 @@ mod tests {
             BodyChange::Insert { handle, desc } => (*handle, desc),
             other => panic!("expected an insertion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unbound_objects_skips_objects_that_already_have_a_body() {
+        let scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='ball'\n[objects.collider]\n"
+        ));
+        let ball = scene.handle("ball").unwrap();
+        let camera = scene.handle("camera").unwrap();
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+        sync.insert_objects(&scene, &[ball], &[], &mut cache)
+            .unwrap();
+
+        assert_eq!(sync.unbound_objects(&[ball, camera]), [camera]);
+        assert!(sync.unbound_objects(&[ball]).is_empty());
+    }
+
+    #[test]
+    fn inserted_objects_inactive_in_the_hierarchy_get_no_body_until_activated() {
+        let mut scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='hidden'\nactive=false\n[objects.collider]\n\
+             [[objects]]\nid='hidden_child'\nparent='hidden'\n[objects.collider]\n"
+        ));
+        let hidden = scene.handle("hidden").unwrap();
+        let hidden_child = scene.handle("hidden_child").unwrap();
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+
+        let changes = sync
+            .insert_objects(&scene, &[hidden, hidden_child], &[], &mut cache)
+            .unwrap();
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(sync.bindings().is_empty());
+
+        scene.set_active(hidden, true).unwrap();
+        let changes = sync
+            .insert_objects(&scene, &[hidden, hidden_child], &[], &mut cache)
+            .unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(sync.bindings().len(), 2);
     }
 
     #[test]

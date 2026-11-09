@@ -17,8 +17,8 @@ use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
     RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParamDescV13, RveParams,
     RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6,
-    RveScriptDescV13, RveScriptDescV15, RveSpawnOptions, RveStatus, RveStr, RveTransform,
-    RveUpdateFn, RveValue,
+    RveScriptDescV13, RveScriptDescV15, RveScriptDescV16, RveSpawnOptions, RveStatus, RveStr,
+    RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
@@ -788,6 +788,27 @@ impl Script for BoltProbe {
     }
 }
 
+/// Logs its lifecycle callbacks so tests can check their order.
+struct TeardownProbe;
+
+fn teardown_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(TeardownProbe))
+}
+
+impl Script for TeardownProbe {
+    fn on_enable(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("enable");
+    }
+
+    fn on_disable(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("disable");
+    }
+
+    fn on_destroy(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("destroy");
+    }
+}
+
 /// Reads prefab states and requests from `on_start`.
 struct PrefabProbe;
 
@@ -825,6 +846,7 @@ fn sdk_module() -> &'static RveModule {
         "InputActionsProbe" => input_actions_probe_factory,
         "SpawnDriver" => spawn_driver_factory,
         "BoltProbe" => bolt_probe_factory,
+        "TeardownProbe" => teardown_probe_factory,
         "PrefabProbe" => prefab_probe_factory,
         "DeadHandleProbe" => dead_handle_probe_factory,
         "ExitWatcher" => exit_watcher_factory,
@@ -1516,7 +1538,7 @@ fn v13_module(abi_version: u32) -> &'static RveModule {
     }))
 }
 
-/// Table for ABI v15: the typed parameter descriptor and net event, without the UI callback tail.
+/// ABI v15 table: typed reference parameters and net events, without UI callbacks.
 fn v15_module() -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
@@ -1549,6 +1571,29 @@ fn v15_module() -> &'static RveModule {
         scripts: legacy.as_ptr().cast(),
         script_count: legacy.len(),
     }))
+}
+
+#[test]
+fn abi_v15_modules_load_on_the_v17_host_without_enable_callbacks() {
+    let _lock = test_lock();
+    let module = v15_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v15" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v15"),
+        "guest ABI v15 runs on the v17 host"
+    );
 }
 
 /// The UI branch temporarily used ABI v15 with the old parameter prefix and a descriptor UI tail.
@@ -1599,8 +1644,8 @@ fn v15_ui_module() -> &'static RveModule {
             std::slice::from_raw_parts(descriptor.name.ptr, descriptor.name.len) == b"Probe"
         })
         .expect("Probe descriptor");
-    let descriptor = RveScriptDescV15 {
-        name: probe.name,
+    let descriptor = |name| RveScriptDescV15 {
+        name,
         create: probe.create,
         start: probe.start,
         update: probe.update,
@@ -1614,10 +1659,16 @@ fn v15_ui_module() -> &'static RveModule {
         net_event: probe.net_event,
     };
     let legacy: &'static [RveScriptDescV15Ui] = Box::leak(
-        vec![RveScriptDescV15Ui {
-            descriptor,
-            ui_event: Some(unused_v15_ui_event),
-        }]
+        vec![
+            RveScriptDescV15Ui {
+                descriptor: descriptor(RveStr::from_static("Probe")),
+                ui_event: Some(unused_v15_ui_event),
+            },
+            RveScriptDescV15Ui {
+                descriptor: descriptor(RveStr::from_static("ProbeTwo")),
+                ui_event: Some(unused_v15_ui_event),
+            },
+        ]
         .into_boxed_slice(),
     );
     Box::leak(Box::new(RveModule {
@@ -1628,6 +1679,70 @@ fn v15_ui_module() -> &'static RveModule {
         scripts: legacy.as_ptr().cast(),
         script_count: legacy.len(),
     }))
+}
+
+fn v16_ui_module() -> &'static RveModule {
+    let current = ui_module();
+    // SAFETY: ui_module returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV16] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV16 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 16,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+#[test]
+fn abi_v16_ui_modules_load_on_v17_host_and_keep_ui_callbacks() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v16_ui_module())) }.unwrap();
+    let mut world = ui_world(
+        "[[objects]]\nid = \"hud\"\n[[objects.heavy_scripts]]\nname = \"UiGuest\"\nparams = {}\n",
+    );
+    let mut host = load_host(&world, &library);
+    register_ui_menu(&mut host);
+    host.start(&mut world, ScriptTime::default());
+    assert_eq!(abi_ui_callbacks(&host), [true]);
+    assert!(message_list(&mut host).contains(&"readback Ok(\"hello\")".to_owned()));
+    let hud = world.handle("hud").unwrap();
+    let canvas = open_ui_canvases(&host)
+        .into_iter()
+        .find(|canvas| host.ui().owner(*canvas) == Ok(owner_key(hud)))
+        .expect("guest-opened canvas");
+    let label = host.ui().find(canvas, "label").unwrap();
+    host.queue_ui_events([engine_gui::events::UiEvent {
+        canvas,
+        element: label,
+        kind: engine_gui::events::UiEventKind::Click,
+        value: None,
+    }]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"ui label Click None".to_owned()));
 }
 
 #[test]
@@ -1824,7 +1939,7 @@ fn abi_v13_modules_load_on_the_v16_host() {
 }
 
 #[test]
-fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v16_host() {
+fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v17_host() {
     let _lock = test_lock();
     let module = v13_module(14);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1842,7 +1957,7 @@ fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v16_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v14"),
-        "guest ABI v14 runs on the v16 host and its parameters use the pre-v15 layout"
+        "guest ABI v14 runs on the v17 host and its parameters use the pre-v15 layout"
     );
 }
 
@@ -1897,6 +2012,7 @@ fn abi_v15_ui_descriptor_keeps_legacy_parameter_layout() {
     let module = v15_ui_module();
     // SAFETY: the module and both descriptor tables live for the whole test process.
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert!(library.contains_script("ProbeTwo"));
     let schema = library.schema("Probe").unwrap();
     assert_eq!(
         schema.get("enabled").unwrap().kind,
@@ -2435,6 +2551,8 @@ fn null_module() -> &'static RveModule {
         collision: None,
         net_event: None,
         ui_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2458,6 +2576,8 @@ fn null_name_module() -> &'static RveModule {
         collision: None,
         net_event: None,
         ui_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2482,6 +2602,8 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         collision: None,
         net_event: None,
         ui_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2886,6 +3008,8 @@ fn error_message_module() -> &'static RveModule {
             collision: None,
             net_event: None,
             ui_event: None,
+            on_enable: None,
+            on_disable: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -2901,6 +3025,8 @@ fn error_message_module() -> &'static RveModule {
             collision: None,
             net_event: None,
             ui_event: None,
+            on_enable: None,
+            on_disable: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -2932,6 +3058,8 @@ fn set_local_during_create_module() -> &'static RveModule {
         collision: None,
         net_event: None,
         ui_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2952,6 +3080,8 @@ fn poisoned_create_module() -> &'static RveModule {
         collision: None,
         net_event: None,
         ui_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3601,6 +3731,8 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         collision: None,
         net_event: None,
         ui_event: None,
+        on_enable: None,
+        on_disable: None,
     }]));
     RveModule::new(scripts)
 }
@@ -3681,6 +3813,8 @@ fn malformed_parameter_tables_are_rejected() {
             collision: None,
             net_event: None,
             ui_event: None,
+            on_enable: None,
+            on_disable: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -3918,6 +4052,8 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         collision: None,
         net_event: None,
         ui_event: None,
+        on_enable: None,
+        on_disable: None,
     }]));
     Box::leak(Box::new(RveModule::new(scripts)))
 }
@@ -4288,6 +4424,39 @@ fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
         ]
     );
     assert_eq!(host.drain_peer_faults(), [(3, 1)]);
+}
+
+#[test]
+fn shutdown_runs_abi_on_disable_before_on_destroy_only_for_running_instances() {
+    let _lock = test_lock();
+    let library = library();
+    let scene = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "TeardownProbe"
+"#;
+
+    let mut running = world(scene);
+    let mut host = load_host(&running, &library);
+    host.update(&mut running, 0.1, at(0.1, 1));
+    assert_eq!(info_messages(&mut host), ["enable"]);
+    host.destroy(&mut running, at(0.2, 2));
+    assert_eq!(info_messages(&mut host), ["disable", "destroy"]);
+
+    let mut hidden = world(scene);
+    let probe = hidden.handle("probe").unwrap();
+    let mut host = load_host(&hidden, &library);
+    host.update(&mut hidden, 0.1, at(0.1, 1));
+    info_messages(&mut host);
+    hidden.set_active(probe, false).unwrap();
+    host.update(&mut hidden, 0.1, at(0.2, 2));
+    assert_eq!(info_messages(&mut host), ["disable"]);
+    host.destroy(&mut hidden, at(0.3, 3));
+    assert_eq!(info_messages(&mut host), ["destroy"]);
 }
 
 const UI_MENU: &str = r#"

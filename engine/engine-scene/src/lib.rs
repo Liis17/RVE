@@ -29,6 +29,7 @@ pub use animation::{
 pub use asset_kind::AssetKind;
 pub use audio::{
     AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
+    activity_audio_requests,
 };
 pub use light::ShadowSettings;
 pub use material_asset::{
@@ -59,11 +60,12 @@ pub use camera_settings::{
 };
 pub use document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
-    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
-    MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS, MaterialAlphaMode,
-    MaterialOverride, MeshRenderer, ParamValue, PointLightComponent, ProceduralSkyComponent,
-    RigidBodyComponent, RigidBodyKind, SceneAsset, SceneDocument, SceneError, SceneObject,
-    SceneTransform, ScreenShaderRef, ScreenShaderStage, SpotLightComponent,
+    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LAYER_COUNT, LiteScript,
+    LodGroup, LodLevel, MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS,
+    MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue, PointLightComponent,
+    ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset, SceneDocument,
+    SceneError, SceneObject, SceneTransform, ScreenShaderRef, ScreenShaderStage,
+    SpotLightComponent,
 };
 pub use params::{ComponentKind, ParamKind, ParamSchema, ParamSpec};
 pub use post_process::{
@@ -79,6 +81,6 @@ pub use prefab::{
 };
 pub use world::{
     EnvironmentState, LightState, LocalLightState, LocalTransform, MAX_GENERATION,
-    MAX_LIVE_OBJECTS, MeshInstance, ObjectHandle, ParticleEmitterInstance, SceneFrame,
+    MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle, ParticleEmitterInstance, SceneFrame,
     SceneWarning, SpawnOptions, World, WorldObject,
 };

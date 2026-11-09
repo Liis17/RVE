@@ -328,6 +328,37 @@ impl EditorScene {
         &self.expansion.document
     }
 
+    /// Ids объектов, действующая активность которых выключена: сам объект или один из предков
+    /// неактивен. Считается за один проход по раскрытому документу.
+    pub fn inactive_in_hierarchy(&self) -> std::collections::HashSet<String> {
+        let objects = &self.view().objects;
+        let index: std::collections::HashMap<&str, &SceneObject> = objects
+            .iter()
+            .map(|object| (object.id.as_str(), object))
+            .collect();
+        let mut inactive = std::collections::HashSet::new();
+        for object in objects {
+            let mut current = Some(object);
+            let mut hidden = false;
+            // Документ проверен на отсутствие циклов; ограничение по числу шагов страхует от зацикливания.
+            for _ in 0..=objects.len() {
+                let Some(item) = current else { break };
+                if !item.active {
+                    hidden = true;
+                    break;
+                }
+                current = item
+                    .parent
+                    .as_deref()
+                    .and_then(|parent| index.get(parent).copied());
+            }
+            if hidden {
+                inactive.insert(object.id.clone());
+            }
+        }
+        inactive
+    }
+
     /// Происхождение объекта экземпляра; `None` — собственный объект документа.
     pub fn origin(&self, id: &str) -> Option<&ObjectOrigin> {
         self.expansion.origins.get(id)
@@ -1682,6 +1713,7 @@ impl EditorScene {
                 .push(engine_scene::LiteScript {
                     path,
                     params: Default::default(),
+                    enabled: true,
                 });
             Ok(())
         })

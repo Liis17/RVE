@@ -28,6 +28,7 @@ pub enum ComponentKind {
     ParticleEmitter,
     NetworkIdentity,
     NetworkTransform,
+    UiCanvas,
     Script(String),
 }
 
@@ -53,6 +54,7 @@ impl ComponentKind {
             "particle_emitter" => Self::ParticleEmitter,
             "network_identity" => Self::NetworkIdentity,
             "network_transform" => Self::NetworkTransform,
+            "ui_canvas" => Self::UiCanvas,
             _ => return None,
         })
     }
@@ -75,6 +77,7 @@ impl ComponentKind {
             Self::ParticleEmitter => "particle_emitter".to_owned(),
             Self::NetworkIdentity => "network_identity".to_owned(),
             Self::NetworkTransform => "network_transform".to_owned(),
+            Self::UiCanvas => "ui_canvas".to_owned(),
             Self::Script(script) => format!("script:{script}"),
         }
     }

@@ -6,7 +6,7 @@ use rve_sdk::abi::{
     RVE_PARAM_ENUM, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
     RVE_PARAM_OBJECT, RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule,
     RveParamDesc, RveParamDescV13, RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
-    RveScriptDescV15,
+    RveScriptDescV15, RveScriptDescV16, RveStr, RveUiEventFn,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -38,6 +38,7 @@ pub enum ScriptLibraryError {
     InvalidScriptName { index: usize, name: String },
     DuplicateScriptName(String),
     ScriptCountOverflow,
+    AmbiguousAbiV15DescriptorLayout,
     InvalidParams { script: String, message: String },
 }
 
@@ -79,6 +80,9 @@ impl fmt::Display for ScriptLibraryError {
                 write!(f, "script module contains duplicate name {name:?}")
             }
             Self::ScriptCountOverflow => f.write_str("script table size overflows address space"),
+            Self::AmbiguousAbiV15DescriptorLayout => f.write_str(
+                "script ABI v15 descriptor layout is ambiguous; rebuild the script module",
+            ),
             Self::InvalidParams { script, message } => {
                 write!(
                     f,
@@ -90,6 +94,43 @@ impl fmt::Display for ScriptLibraryError {
 }
 
 impl Error for ScriptLibraryError {}
+
+/// ABI v15 was independently used by the reference and UI branches. Their descriptors share a
+/// prefix, but the UI branch appended `ui_event` to each descriptor. The second name distinguishes
+/// their strides without reading a function pointer or constructing an invalid typed descriptor.
+///
+/// # Safety
+/// `scripts` must point to at least two process-lifetime ABI v15 descriptors in one of those two
+/// layouts. The candidate second names are read only from bytes inside the first two descriptors.
+unsafe fn abi_v15_descriptor_stride(
+    scripts: *const u8,
+    count: usize,
+) -> Result<usize, ScriptLibraryError> {
+    let reference_stride = std::mem::size_of::<RveScriptDescV15>();
+    let ui_stride = reference_stride + std::mem::size_of::<Option<RveUiEventFn>>();
+    if count == 1 {
+        return Ok(reference_stride);
+    }
+
+    // SAFETY: with at least two descriptors, both candidate RveStr values lie within the first
+    // two entries for either historical stride. Reading RveStr itself does not dereference its
+    // string pointer or impose validity on the following callbacks.
+    let reference_name = unsafe {
+        scripts
+            .add(reference_stride)
+            .cast::<RveStr>()
+            .read_unaligned()
+    };
+    // SAFETY: same range argument as above; the UI stride starts the actual second descriptor in
+    // the UI layout and remains within the first two entries in the reference layout.
+    let ui_name = unsafe { scripts.add(ui_stride).cast::<RveStr>().read_unaligned() };
+    let has_name_shape = |name: RveStr| !name.ptr.is_null() && (1..=64).contains(&name.len);
+    match (has_name_shape(reference_name), has_name_shape(ui_name)) {
+        (true, false) => Ok(reference_stride),
+        (false, true) => Ok(ui_stride),
+        _ => Err(ScriptLibraryError::AmbiguousAbiV15DescriptorLayout),
+    }
+}
 
 impl ScriptLibrary {
     /// Opens and validates an ABI script library.
@@ -159,8 +200,12 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            16.. => std::mem::size_of::<RveScriptDesc>(),
-            15 => std::mem::size_of::<RveScriptDescV15>(),
+            17.. => std::mem::size_of::<RveScriptDesc>(),
+            16 => std::mem::size_of::<RveScriptDescV16>(),
+            15 => {
+                std::mem::size_of::<RveScriptDescV15>()
+                    + std::mem::size_of::<Option<RveUiEventFn>>()
+            }
             13..=14 => std::mem::size_of::<RveScriptDescV13>(),
             6..=12 => std::mem::size_of::<RveScriptDescV6>(),
             4 | 5 => std::mem::size_of::<RveScriptDescV4>(),
@@ -179,12 +224,18 @@ impl ScriptLibrary {
                 library: None,
             });
         }
+        let descriptors_v15 = if header.abi_version == 15 {
+            // SAFETY: ABI v15's two historical branches used distinct descriptor strides.
+            Some(unsafe { abi_v15_descriptor_stride(scripts_ptr.cast(), count) }?)
+        } else {
+            None
+        };
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v16 = (header.abi_version >= 16)
+        let descriptors_v17 = (header.abi_version >= 17)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        let descriptors_v15 = (header.abi_version == 15).then(|| unsafe {
-            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV15>(), count)
+        let descriptors_v16 = (header.abi_version == 16).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV16>(), count)
         });
         // SAFETY: versions 13 and 14 have the net event tail and pre-v15 parameter descriptors.
         let descriptors_v13 = ((13..=14).contains(&header.abi_version)).then(|| unsafe {
@@ -208,9 +259,9 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v16 {
+            let descriptor = if let Some(descriptors) = descriptors_v17 {
                 &descriptors[index]
-            } else if let Some(descriptors) = descriptors_v15 {
+            } else if let Some(descriptors) = descriptors_v16 {
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,
@@ -225,7 +276,35 @@ impl ScriptLibrary {
                     command: descriptor.command,
                     collision: descriptor.collision,
                     net_event: descriptor.net_event,
+                    ui_event: descriptor.ui_event,
+                    on_enable: None,
+                    on_disable: None,
+                }))
+            } else if let Some(stride) = descriptors_v15 {
+                // SAFETY: the selected stride matches the module's ABI v15 branch; the module
+                // contract guarantees every descriptor prefix is initialized and process-lived.
+                let descriptor = unsafe {
+                    &*scripts_ptr
+                        .cast::<u8>()
+                        .add(index * stride)
+                        .cast::<RveScriptDescV15>()
+                };
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
                     ui_event: None,
+                    on_enable: None,
+                    on_disable: None,
                 }))
             } else if let Some(descriptors) = descriptors_v13 {
                 let descriptor = &descriptors[index];
@@ -243,6 +322,8 @@ impl ScriptLibrary {
                     collision: descriptor.collision,
                     net_event: descriptor.net_event,
                     ui_event: None,
+                    on_enable: None,
+                    on_disable: None,
                 }))
             } else if let Some(descriptors) = descriptors_v6 {
                 // ABI v6 through v12 have no network callback; normalize it to `None`.
@@ -261,6 +342,8 @@ impl ScriptLibrary {
                     collision: descriptor.collision,
                     net_event: None,
                     ui_event: None,
+                    on_enable: None,
+                    on_disable: None,
                 }))
             } else if let Some(descriptors) = descriptors_v4 {
                 // ABI v4 and v5 have no collision pointer; normalize it to `None`.
@@ -279,6 +362,8 @@ impl ScriptLibrary {
                     collision: None,
                     net_event: None,
                     ui_event: None,
+                    on_enable: None,
+                    on_disable: None,
                 }))
             } else if let Some(descriptors) = descriptors_v3 {
                 let descriptor = &descriptors[index];
@@ -297,6 +382,8 @@ impl ScriptLibrary {
                     collision: None,
                     net_event: None,
                     ui_event: None,
+                    on_enable: None,
+                    on_disable: None,
                 }))
             } else {
                 let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
@@ -316,6 +403,8 @@ impl ScriptLibrary {
                     collision: None,
                     net_event: None,
                     ui_event: None,
+                    on_enable: None,
+                    on_disable: None,
                 }))
             };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.

@@ -20,7 +20,10 @@ use engine_project::{GamepadSettings, InputSettings, PhysicsSettings, PrefabCata
 use engine_resources::ResourceHandle;
 use engine_scene::document::mesh_collider_model;
 use engine_scene::prefab::PREFAB_EXTENSION;
-use engine_scene::{AudioRequest, ObjectHandle, PrefabTemplate, SceneDocument, VoiceId, World};
+use engine_scene::{
+    AudioRequest, ObjectHandle, PrefabTemplate, SceneDocument, VoiceId, World,
+    activity_audio_requests,
+};
 use engine_script::{
     CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, PreparedUi, RumbleRequest,
     ScriptCursor, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
@@ -580,6 +583,9 @@ pub struct PlaySession {
     rumble: Vec<RumbleRequest>,
     heavy: HeavyLoads,
     last_step: PlayStep,
+    /// Ошибки, которые не относятся к скриптам и ждут `drain_events`: например, отказ физики
+    /// при создании тела активированного объекта.
+    pending_events: Vec<ScriptEvent>,
     ui_input: UiInputBridge,
     ui_text_focus: Arc<AtomicBool>,
     pending_input: Option<ScriptInput>,
@@ -823,6 +829,7 @@ impl PlaySession {
             frame: 0,
             last_tick: Instant::now(),
             last_step: PlayStep::default(),
+            pending_events: Vec::new(),
             ui_input,
             ui_text_focus,
             pending_input: None,
@@ -1060,6 +1067,12 @@ impl PlaySession {
     /// синхронизации поз, поэтому новые тела не телепортируются. Выгрузка может сразу запросить
     /// новую загрузку (отложенный spawn), поэтому заявки вычитываются, пока очередь не опустеет.
     fn apply_world_changes(&mut self) {
+        let activity_requests = self.apply_activity_changes();
+        if let Some(audio) = &mut self.audio
+            && !activity_requests.is_empty()
+        {
+            audio.bridge.apply(activity_requests, &self.world);
+        }
         loop {
             let WorldChanges {
                 spawned,
@@ -1079,6 +1092,47 @@ impl PlaySession {
             self.apply_spawns(spawned, &despawned);
             self.apply_prefab_requests(prefab_requests);
         }
+    }
+
+    /// Переключает тела объектов с изменившейся действующей активностью, как в `rve-runtime`:
+    /// тела неактивных объектов удаляются, тела активированных создаются заново. Возвращает заявки
+    /// звука: источники неактивных объектов останавливаются, у показанных запускаются `play_on_start`.
+    fn apply_activity_changes(&mut self) -> Vec<AudioRequest> {
+        let changed = self.world.take_activity_changes();
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        let (hidden, shown): (Vec<ObjectHandle>, Vec<ObjectHandle>) = changed
+            .into_iter()
+            .partition(|&object| self.world.active_in_hierarchy(object) != Some(true));
+        if let Some(physics) = &mut self.physics {
+            physics.changes.extend(physics.sync.remove_objects(&hidden));
+            let bound: std::collections::HashSet<ObjectHandle> = physics
+                .sync
+                .bindings()
+                .iter()
+                .map(|binding| binding.object)
+                .collect();
+            let unbound: Vec<ObjectHandle> = shown
+                .iter()
+                .copied()
+                .filter(|object| self.world.is_alive(*object) && !bound.contains(object))
+                .collect();
+            if !unbound.is_empty() {
+                match physics.sync.insert_objects(
+                    &self.world,
+                    &unbound,
+                    &physics.geometry,
+                    &mut physics.shapes,
+                ) {
+                    Ok(inserted) => physics.changes.extend(inserted),
+                    Err(error) => self.pending_events.push(physics_error_event(format!(
+                        "физика не создала тела активированных объектов: {error}"
+                    ))),
+                }
+            }
+        }
+        activity_audio_requests(&self.world, &hidden, &shown)
     }
 
     /// Вставляет тела spawn-объектов и удаляет тела уничтоженных. Отказ физики откатывает spawn;
@@ -1102,9 +1156,11 @@ impl PlaySession {
                 continue;
             }
             if let Some(physics) = &mut self.physics {
+                // Объект, который активация этого кадра уже вставила, второе тело не получает.
+                let fresh = physics.sync.unbound_objects(&spawned.objects);
                 let inserted = physics.sync.insert_objects(
                     &self.world,
-                    &spawned.objects,
+                    &fresh,
                     &physics.geometry,
                     &mut physics.shapes,
                 );
@@ -1137,6 +1193,7 @@ impl PlaySession {
                         self.world
                             .audio_source(object)
                             .is_some_and(|audio| audio.play_on_start)
+                            && self.world.active_in_hierarchy(object) == Some(true)
                     })
                     .map(|&object| AudioRequest::PlaySource {
                         object,
@@ -1239,7 +1296,9 @@ impl PlaySession {
     }
 
     pub fn drain_events(&mut self) -> Vec<ScriptEvent> {
-        self.host.drain_events()
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(self.host.drain_events());
+        events
     }
 
     /// Предупреждения звука, которые ещё не показаны: клип не загрузился, устройство недоступно.
@@ -1261,7 +1320,8 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.destroy(&mut self.world, time);
         self.watchdog.set_deadline(None);
-        let mut events = self.host.drain_events();
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(self.host.drain_events());
         if let Some(mut physics) = self.physics.take()
             && let Err(error) = physics.shutdown()
         {
@@ -1509,6 +1569,33 @@ function Rotate:on_destroy()
 end
 return Rotate
 "#;
+
+    #[test]
+    fn hiding_stops_the_object_sound_and_showing_restarts_its_play_on_start_source() {
+        const SPEAKER: &str = "[[assets]]\npath = \"/audio/hum.wav\"\n\
+            [[objects]]\nid = \"camera\"\n[objects.camera]\n\
+            [[objects]]\nid = \"ball\"\n[objects.audio_source]\n\
+            clip = \"/audio/hum.wav\"\nplay_on_start = true\n";
+        let mut session = PlaySession::start(&document(SPEAKER), None, |_| {
+            Err("scripts are not used".to_owned())
+        })
+        .unwrap();
+        let ball = session.world.handle("ball").unwrap();
+
+        session.world.set_active(ball, false).unwrap();
+        let hidden = session.apply_activity_changes();
+        assert!(
+            matches!(hidden.as_slice(), [AudioRequest::StopSource { object }] if *object == ball),
+            "{hidden:?}"
+        );
+
+        session.world.set_active(ball, true).unwrap();
+        let shown = session.apply_activity_changes();
+        assert!(
+            matches!(shown.as_slice(), [AudioRequest::PlaySource { object, .. }] if *object == ball),
+            "{shown:?}"
+        );
+    }
 
     fn document(source: &str) -> SceneDocument {
         SceneDocument::parse("scene", source).unwrap()
