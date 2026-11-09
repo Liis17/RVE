@@ -472,3 +472,51 @@ fn initial_active_camera_is_not_taken_from_a_hidden_subtree() {
     );
     assert_eq!(scene.active_camera(), handle(&scene, "main"));
 }
+
+#[test]
+fn set_parent_refuses_to_put_a_keep_on_load_root_under_any_parent() {
+    let scene = "[[objects]]\nid = \"persistent_parent\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"scene_parent\"\n\
+         [[objects]]\nid = \"persistent\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"nonpersistent\"\n\
+         [[objects]]\nid = \"persistent_child\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"camera\"\n[objects.camera]\n";
+    for parent_id in ["persistent_parent", "scene_parent"] {
+        let mut world = world(scene);
+        let persistent = handle(&world, "persistent");
+        let parent = handle(&world, parent_id);
+
+        let error = world
+            .set_parent(persistent, Some(parent), true)
+            .expect_err("keep_on_load is only valid on a root");
+
+        assert!(error.to_string().contains("keep_on_load"), "{error}");
+        assert_eq!(
+            world.object(persistent).unwrap().parent,
+            None,
+            "{parent_id}"
+        );
+        assert_eq!(world.keep_on_load(persistent), Some(true), "{parent_id}");
+        assert_eq!(world.children(parent), Some(Vec::new()), "{parent_id}");
+    }
+}
+
+#[test]
+fn set_parent_still_reparents_a_nonpersistent_object_under_a_persistent_root() {
+    let mut world = world(
+        "[[objects]]\nid = \"persistent\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"nonpersistent\"\n\
+         [[objects]]\nid = \"camera\"\n[objects.camera]\n",
+    );
+    let persistent = handle(&world, "persistent");
+    let nonpersistent = handle(&world, "nonpersistent");
+
+    world
+        .set_parent(nonpersistent, Some(persistent), false)
+        .unwrap();
+
+    assert_eq!(
+        world.object(nonpersistent).unwrap().parent,
+        Some(persistent)
+    );
+}

@@ -78,3 +78,53 @@ return Script
             .any(|event| event.level == ScriptEventLevel::Error)
     );
 }
+
+fn parented_pair_world() -> World {
+    let document = SceneDocument::parse(
+        "keep.rvescene",
+        "[[assets]]\npath = \"/keep.lua\"\n[[objects]]\nid = \"runner\"\n[[objects.lite_scripts]]\npath = \"/keep.lua\"\n[[objects]]\nid = \"other\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+    )
+    .unwrap();
+    World::from_document(&document).unwrap()
+}
+
+#[test]
+fn keep_then_parent_in_one_callback_refuses_the_parent_and_keeps_the_root_valid() {
+    let script = r#"
+local Script = {}
+function Script:on_update()
+  local runner = rve.find("runner")
+  assert(runner:set_keep_on_load(true))
+  assert(runner:set_parent(rve.find("other")) == false)
+end
+return Script
+"#;
+    let mut world = parented_pair_world();
+    let runner = world.handle("runner").unwrap();
+    let mut host = load(&world, script);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(host.drain_events().is_empty());
+    assert_eq!(world.object(runner).unwrap().parent, None);
+    assert_eq!(world.keep_on_load(runner), Some(true));
+}
+
+#[test]
+fn parent_then_keep_in_one_callback_refuses_the_keep_and_keeps_the_root_valid() {
+    let script = r#"
+local Script = {}
+function Script:on_update()
+  local runner = rve.find("runner")
+  assert(runner:set_parent(rve.find("other")) == true)
+  assert(runner:set_keep_on_load(true) == false)
+end
+return Script
+"#;
+    let mut world = parented_pair_world();
+    let runner = world.handle("runner").unwrap();
+    let other = world.handle("other").unwrap();
+    let mut host = load(&world, script);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(host.drain_events().is_empty());
+    assert_eq!(world.object(runner).unwrap().parent, Some(other));
+    assert_eq!(world.keep_on_load(runner), Some(false));
+}

@@ -119,7 +119,8 @@ impl World {
     /// при этом сдвиг, вызванный неравномерным масштабом родителя, не восстанавливается точно.
     ///
     /// Отказывает для циклов, родителя-самого объекта, dynamic rigid body и character controller
-    /// (они остаются корнями) и для переноса активной камеры под неактивного родителя.
+    /// (они остаются корнями), сохраняемого объекта (`keep_on_load` только у корней) и для переноса
+    /// активной камеры под неактивного родителя.
     pub fn set_parent(
         &mut self,
         handle: ObjectHandle,
@@ -135,6 +136,9 @@ impl World {
             return Ok(());
         }
         if let Some(parent_index) = parent_index {
+            if self.objects[index].keep_on_load {
+                return Err(self.object_error(index, "keep_on_load is only valid on a root object"));
+            }
             let mut cursor = Some(parent_index);
             while let Some(current) = cursor {
                 if current == index {

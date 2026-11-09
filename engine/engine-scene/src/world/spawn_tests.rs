@@ -819,3 +819,34 @@ fn spawned_emitters_join_the_frame_and_despawn_removes_them() {
         "переиспользованный слот получает новое поколение"
     );
 }
+
+#[test]
+fn spawn_refuses_a_keep_on_load_root_under_a_parent_and_releases_reservations() {
+    let scene = format!("{CAMERA_SCENE}\n[[objects]]\nid = \"rig\"\n");
+    let mut world = world(&scene);
+    let persistent = template(
+        "[[objects]]\nid = \"body\"\nkeep_on_load = true\n[objects.transform]\nposition = [0.0, 1.0, 0.0]\n",
+    );
+    let rig = world.handle("rig").unwrap();
+    let reserved = vec![world.reserve_object()];
+    let stale = reserved[0];
+
+    let error = world
+        .spawn(
+            reserved,
+            &persistent,
+            SpawnOptions {
+                parent: Some(rig),
+                ..SpawnOptions::default()
+            },
+        )
+        .unwrap_err();
+
+    assert!(error.message.contains("keep_on_load"), "{error}");
+    assert!(!world.is_reserved(stale));
+    assert_eq!(world.children(rig), Some(Vec::new()));
+
+    let free = spawn(&mut world, &persistent, SpawnOptions::default()).unwrap();
+    assert_eq!(world.keep_on_load(free[0]), Some(true));
+    assert_eq!(world.object(free[0]).unwrap().parent, None);
+}

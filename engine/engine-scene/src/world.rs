@@ -1576,6 +1576,13 @@ impl World {
     ) -> Result<Vec<String>, SceneError> {
         template.check_spawnable()?;
         let source = &self.source_label;
+        if options.parent.is_some() && template.objects[template.root].keep_on_load {
+            return Err(SceneError::new(
+                source,
+                Some(root_id),
+                "keep_on_load is only valid on a root object",
+            ));
+        }
         if let Some(id) = &options.id
             && !valid_ascii_name(id, true)
         {

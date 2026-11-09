@@ -2132,15 +2132,19 @@ impl ScriptTransaction {
         };
         // Структурные правки меняют состав сохраняемых корней и поддеревьев удаляемых. Замена
         // сцены строит план на этом составе до teardown, поэтому в `on_disable` и `on_destroy`
-        // они отказываются. Остальные правки на план не влияют и остаются разрешёнными.
-        let structural_in_teardown = !self.lifecycle_writes
-            && matches!(
-                edit,
-                ObjectEdit::SetParent { .. } | ObjectEdit::SetKeepOnLoad { .. }
-            );
+        // они отказываются. Сохраняемый объект не получает родителя ни в одной фазе: отказ
+        // возвращает `false` до записи, как и `set_keep_on_load` под родителем.
+        let refused_structure = match &edit {
+            ObjectEdit::SetParent { object, parent, .. } => {
+                !self.lifecycle_writes
+                    || (parent.is_some() && self.keep_on_load(*object) == Some(true))
+            }
+            ObjectEdit::SetKeepOnLoad { .. } => !self.lifecycle_writes,
+            _ => false,
+        };
         if !self.writable
             || !value_valid
-            || structural_in_teardown
+            || refused_structure
             || self
                 .world()
                 .and_then(|world| world.object(target))
