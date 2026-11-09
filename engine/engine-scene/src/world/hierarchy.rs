@@ -18,6 +18,10 @@ pub enum ObjectEdit {
         object: ObjectHandle,
         active: bool,
     },
+    SetKeepOnLoad {
+        object: ObjectHandle,
+        keep: bool,
+    },
     SetTag {
         object: ObjectHandle,
         tag: String,
@@ -295,6 +299,18 @@ impl World {
     pub fn apply_edit(&mut self, edit: &ObjectEdit) -> Result<(), SceneError> {
         match edit {
             ObjectEdit::SetActive { object, active } => self.set_active(*object, *active),
+            ObjectEdit::SetKeepOnLoad { object, keep } => {
+                let index = self.live_index_or_error(*object)?;
+                if self.objects[index].parent.is_some() && *keep {
+                    return Err(SceneError::new(
+                        &self.source_label,
+                        Some(&self.objects[index].id),
+                        "keep_on_load is only valid on a root object",
+                    ));
+                }
+                self.objects[index].keep_on_load = *keep;
+                Ok(())
+            }
             ObjectEdit::SetTag { object, tag } => self.set_tag(*object, tag.clone()),
             ObjectEdit::SetLayer { object, layer } => self.set_layer(*object, *layer),
             ObjectEdit::SetParent {

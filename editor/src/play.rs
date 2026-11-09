@@ -864,6 +864,11 @@ impl PlaySession {
         &mut self.world
     }
 
+    /// Loads the editor-isolated save file before the first Play callback.
+    pub fn load_save_file(&mut self, path: &Path) -> Result<(), String> {
+        self.host.load_save_file(path)
+    }
+
     /// Мир и мост анимации для кадра: палитры берутся из моста, а скиннинг — из мира.
     pub fn world_and_animation(&mut self) -> (&mut World, &AnimationBridge) {
         (&mut self.world, &self.animation)

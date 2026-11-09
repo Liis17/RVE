@@ -92,6 +92,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         ui_canvas,
         lite_scripts,
         heavy_scripts,
+        keep_on_load: _,
     } = object;
     if camera.is_some() {
         Some("camera")

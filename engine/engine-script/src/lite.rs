@@ -444,6 +444,9 @@ pub(crate) fn create_lua(
     time_values.set_metatable(Some(time_metatable))?;
     let rve = lua.create_table()?;
     rve.set("time", time_values.clone())?;
+    crate::math_lua::install(&lua, &rve)?;
+    rve.set("asset", asset_function(&lua)?)?;
+    rve.set("save", save_table(&lua, active_call.clone())?)?;
     let timer = lua.create_table()?;
     timer.set("after", timer_after_function(&lua, active_call.clone())?)?;
     timer.set("every", timer_every_function(&lua, active_call.clone())?)?;
@@ -2951,6 +2954,31 @@ fn add_hierarchy_object_api(
         })?,
     )?;
 
+    let keep_on_load_call = active_call.clone();
+    object.set(
+        "keep_on_load",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&keep_on_load_call, |transaction| {
+                Ok(transaction.keep_on_load(handle).unwrap_or(false))
+            })
+        })?,
+    )?;
+
+    let set_keep_on_load_call = active_call.clone();
+    object.set(
+        "set_keep_on_load",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let keep = lua_boolean(
+                values.into_iter().next().unwrap_or(Value::Nil),
+                "object.set_keep_on_load",
+            )?;
+            with_active_call(&set_keep_on_load_call, |transaction| {
+                Ok(transaction.set_keep_on_load(handle, keep))
+            })
+        })?,
+    )?;
+
     let set_active_call = active_call.clone();
     object.set(
         "set_active",
@@ -4293,6 +4321,118 @@ pub(crate) fn lua_boolean(value: Value, function: &str) -> mlua::Result<bool> {
     }
 }
 
+struct AssetUserData(VirtualPath);
+
+impl UserData for AssetUserData {}
+
+fn asset_function(lua: &Lua) -> mlua::Result<Function> {
+    lua.create_function(|lua, path: LuaString| {
+        let path = path
+            .to_str()
+            .map_err(|_| LuaError::runtime("asset paths must be valid UTF-8"))?;
+        let path = VirtualPath::parse(path.as_ref())
+            .map_err(|error| LuaError::runtime(error.to_string()))?;
+        lua.create_userdata(AssetUserData(path))
+    })
+}
+
+fn save_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let save = lua.create_table()?;
+    save.set(
+        "set",
+        lua.create_function({
+            let active_call = active_call.clone();
+            move |lua, (key, value): (LuaString, Value)| {
+                let key = key
+                    .to_str()
+                    .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                    .to_owned();
+                with_active_call(&active_call, |transaction| {
+                    let mut budget = MessageValueBudget::new();
+                    let value = lua_param_value_inner(
+                        value,
+                        0,
+                        &mut budget,
+                        Some(lua),
+                        Some(&active_call),
+                    )?;
+                    transaction.save_set(&key, value).map_err(LuaError::runtime)
+                })
+            }
+        })?,
+    )?;
+    save.set(
+        "get",
+        lua.create_function({
+            let active_call = active_call.clone();
+            move |lua, key: LuaString| {
+                let key = key
+                    .to_str()
+                    .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                    .to_owned();
+                let value =
+                    with_active_call(&active_call, |transaction| Ok(transaction.save_get(&key)))?;
+                match value {
+                    Some(ParamValue::Asset(path)) => {
+                        Ok(Value::UserData(lua.create_userdata(AssetUserData(path))?))
+                    }
+                    Some(value) => param_value(lua, &value, &active_call, None),
+                    None => Ok(Value::Nil),
+                }
+            }
+        })?,
+    )?;
+    let delete_active = active_call.clone();
+    save.set(
+        "delete",
+        lua.create_function(move |_, key: LuaString| {
+            let key = key
+                .to_str()
+                .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                .to_owned();
+            with_active_call(&delete_active, |transaction| {
+                transaction.save_delete(&key).map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    let has_active = active_call.clone();
+    save.set(
+        "has",
+        lua.create_function(move |_, key: LuaString| {
+            let key = key
+                .to_str()
+                .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                .to_owned();
+            with_active_call(&has_active, |transaction| {
+                transaction.save_has(&key).map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    let keys_active = active_call.clone();
+    save.set(
+        "keys",
+        lua.create_function(move |lua, ()| {
+            let keys = with_active_call(&keys_active, |transaction| Ok(transaction.save_keys()))?;
+            let table = lua.create_table_with_capacity(keys.len(), 0)?;
+            for (index, key) in keys.into_iter().enumerate() {
+                table.raw_set(index + 1, key)?;
+            }
+            Ok(table)
+        })?,
+    )?;
+    let flush_active = active_call;
+    save.set(
+        "flush",
+        lua.create_function(move |_, ()| {
+            with_active_call(&flush_active, |transaction| {
+                transaction.save_flush().map_err(LuaError::runtime)
+            })?;
+            Ok(true)
+        })?,
+    )?;
+    Ok(save)
+}
+
 fn action_button_function(
     lua: &Lua,
     active_call: ActiveCall,
@@ -4611,6 +4751,15 @@ fn lua_param_value_inner(
                 .to_str()
                 .map(|value| ParamValue::String(value.to_owned()))
                 .map_err(|_| LuaError::runtime("message strings must contain valid UTF-8"))
+        }
+        Value::UserData(value) => {
+            let asset = value
+                .borrow::<AssetUserData>()
+                .map_err(|_| LuaError::runtime("save userdata values must be assets"))?;
+            budget
+                .add_string(asset.0.as_str().len())
+                .map_err(LuaError::runtime)?;
+            Ok(ParamValue::Asset(asset.0.clone()))
         }
         Value::Table(table) => {
             if let (Some(lua), Some(active_call)) = (lua, active_call)

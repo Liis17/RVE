@@ -247,6 +247,8 @@ struct HostState {
     time_scale: Option<f32>,
     scheduled_timers: Vec<(f64, f64, String)>,
     canceled_timers: Vec<u64>,
+    save_values: std::collections::BTreeMap<String, i64>,
+    save_flushed: bool,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -523,6 +525,99 @@ unsafe extern "C" fn set_active_camera(ctx: *mut c_void, object: u64) -> bool {
     true
 }
 
+unsafe extern "C" fn save_get(ctx: *mut c_void, key: RveStr, out: *mut RveValue) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: this test host owns its context and output during the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    let Some(value) = state.save_values.get(key).copied() else {
+        return false;
+    };
+    // SAFETY: out is checked above and belongs to the current guest call.
+    unsafe { *out = RveValue::integer(value) };
+    true
+}
+
+unsafe extern "C" fn save_set(ctx: *mut c_void, key: RveStr, value: *const RveValue) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: the test host and borrowed inputs live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    // SAFETY: value is checked above and valid for the callback.
+    let value = unsafe { *value };
+    if value.tag != crate::abi::RVE_VALUE_INT {
+        return false;
+    }
+    // SAFETY: the tag selects the integer payload.
+    state
+        .save_values
+        .insert(key.to_owned(), unsafe { value.data.integer });
+    true
+}
+
+unsafe extern "C" fn save_delete(ctx: *mut c_void, key: RveStr) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    state.save_values.remove(key).is_some()
+}
+
+unsafe extern "C" fn save_has(ctx: *mut c_void, key: RveStr) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    state.save_values.contains_key(key)
+}
+
+unsafe extern "C" fn save_keys(
+    ctx: *mut c_void,
+    keys: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    if count.is_null() || (capacity > 0 && keys.is_null()) {
+        return false;
+    }
+    // SAFETY: test host and output buffers are valid during this callback.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    // SAFETY: count is checked above.
+    unsafe { *count = state.save_values.len() };
+    if capacity == 0 {
+        return true;
+    }
+    if capacity < state.save_values.len() {
+        return false;
+    }
+    // SAFETY: keys points to at least capacity initialized output slots.
+    let output = unsafe { std::slice::from_raw_parts_mut(keys, capacity) };
+    for (slot, key) in output.iter_mut().zip(state.save_values.keys()) {
+        *slot = RveStr::from_str_ref(key);
+    }
+    true
+}
+
+unsafe extern "C" fn save_flush(ctx: *mut c_void) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    unsafe { (&mut *ctx.cast::<HostState>()).save_flushed = true };
+    true
+}
+
 fn host(state: &mut HostState) -> RveHost {
     state.matrix = [2.0; 16];
     RveHost {
@@ -680,6 +775,14 @@ fn host(state: &mut HostState) -> RveHost {
         set_time_scale: Some(set_time_scale),
         schedule_timer: Some(schedule_timer),
         cancel_timer: Some(cancel_timer),
+        save_get: Some(save_get),
+        save_set: Some(save_set),
+        save_delete: Some(save_delete),
+        save_has: Some(save_has),
+        save_keys: Some(save_keys),
+        save_flush: Some(save_flush),
+        object_keep_on_load: None,
+        object_set_keep_on_load: None,
     }
 }
 
@@ -1020,6 +1123,32 @@ fn console_command_registration_reports_unavailable_optional_host_callbacks() {
     let context = Context::new(&host).unwrap();
     assert!(context.console.register("sdk.cmd", None).is_err());
     assert!(context.console.unregister("sdk.cmd").is_err());
+}
+
+#[test]
+fn sdk_save_api_round_trips_values_and_reports_optional_callbacks() {
+    let mut state = HostState::default();
+    let host_table = host(&mut state);
+    let context = Context::new(&host_table).unwrap();
+    let save = context.save();
+
+    save.set("score", &Value::Int(12)).unwrap();
+    assert_eq!(save.get("score").unwrap(), Some(Value::Int(12)));
+    assert!(save.has("score").unwrap());
+    assert_eq!(save.keys().unwrap(), vec!["score"]);
+    assert!(save.delete("score").unwrap());
+    assert!(!save.has("score").unwrap());
+    assert!(save.keys().unwrap().is_empty());
+    save.flush().unwrap();
+    assert!(state.save_flushed);
+
+    let mut unavailable = host(&mut state);
+    unavailable.save_set = None;
+    let context = Context::new(&unavailable).unwrap();
+    assert_eq!(
+        context.save().set("score", &Value::Int(1)),
+        Err(crate::SaveError::Unavailable)
+    );
 }
 
 #[test]
@@ -2323,7 +2452,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2593,7 +2722,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
 }
 
 #[test]
@@ -2615,7 +2744,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
 }
 
 #[test]
@@ -2639,7 +2768,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
 }
 
 #[test]
@@ -2675,7 +2804,7 @@ fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
         offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
 }
 
 #[test]
@@ -2721,7 +2850,7 @@ fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
 fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
     assert_eq!(RVE_TRIGGER_STAY, 4);
     assert_eq!(
         offset_of!(RveHost, physics_get_collider),
@@ -2738,7 +2867,7 @@ fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
 fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
     assert_eq!(
         offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
@@ -2774,7 +2903,7 @@ fn runtime_physics_value_types_are_c_layout_in_v18() {
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);

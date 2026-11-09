@@ -8,7 +8,7 @@ use crate::document::ColliderShape;
 use crate::document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup,
-    MAX_SCREEN_SHADER_PARAMS, PointLightComponent, RigidBodyComponent, RigidBodyKind,
+    MAX_SCREEN_SHADER_PARAMS, ParamValue, PointLightComponent, RigidBodyComponent, RigidBodyKind,
     SceneDocument, SceneError, SceneObject, ScreenShaderRef, SpotLightComponent,
     camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
@@ -229,6 +229,8 @@ pub struct WorldObject {
     pub parent: Option<ObjectHandle>,
     /// Собственный флаг активности; действующая активность учитывает родителей.
     pub active: bool,
+    /// Whether this object is marked as a persistent root for scene loads.
+    pub keep_on_load: bool,
     /// Тег объекта; пустая строка означает отсутствие тега.
     pub tag: String,
     /// Слой объекта `0..32`.
@@ -562,6 +564,155 @@ impl World {
 
     pub fn object_by_id(&self, id: &str) -> Option<&WorldObject> {
         self.handle(id).and_then(|handle| self.object(handle))
+    }
+
+    /// Returns whether an object is marked as a persistent root for scene loads.
+    pub fn keep_on_load(&self, handle: ObjectHandle) -> Option<bool> {
+        self.object(handle).map(|object| object.keep_on_load)
+    }
+
+    /// Sets whether an object is marked as a persistent root for scene loads.
+    pub fn set_keep_on_load(&mut self, handle: ObjectHandle, keep: bool) -> bool {
+        let Some(index) = self.dense(handle) else {
+            return false;
+        };
+        if keep && self.objects[index].parent.is_some() {
+            return false;
+        }
+        self.objects[index].keep_on_load = keep;
+        true
+    }
+
+    /// Appends persistent roots from a previous scene while retaining their object handles.
+    ///
+    /// The operation validates id, reference, and slot collisions before mutating `self`. A
+    /// persistent script may only refer to objects inside its retained subtree; this avoids
+    /// silently rebinding an old object reference to an unrelated object in the new scene.
+    pub fn append_persistent_from(
+        &mut self,
+        previous: &World,
+    ) -> Result<Vec<ObjectHandle>, SceneError> {
+        let roots = previous
+            .objects
+            .iter()
+            .filter(|object| object.keep_on_load && object.parent.is_none())
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let handles = previous.subtree(&roots);
+        if self.objects.len().saturating_add(handles.len()) > MAX_LIVE_OBJECTS {
+            return Err(SceneError::new(
+                &self.source_label,
+                None,
+                "persistent objects exceed the world object limit",
+            ));
+        }
+
+        let kept = handles
+            .iter()
+            .filter_map(|handle| previous.object(*handle))
+            .collect::<Vec<_>>();
+        let kept_ids = kept
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        for object in &kept {
+            if self.indices_by_id.contains_key(&object.id) {
+                return Err(SceneError::new(
+                    &self.source_label,
+                    Some(&object.id),
+                    "persistent object id collides with the new scene",
+                ));
+            }
+            if object.keep_on_load && object.parent.is_some() {
+                return Err(SceneError::new(
+                    &self.source_label,
+                    Some(&object.id),
+                    "keep_on_load is only valid on a persistent root",
+                ));
+            }
+            for script in object
+                .lite_scripts
+                .iter()
+                .map(|script| &script.params)
+                .chain(object.heavy_scripts.iter().map(|script| &script.params))
+            {
+                for (name, value) in script {
+                    if let Some(reference) = external_object_reference(value, &kept_ids) {
+                        return Err(SceneError::new(
+                            &self.source_label,
+                            Some(&object.id),
+                            format!(
+                                "persistent script parameter {name:?} references nonpersistent object {reference:?}"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        {
+            let slots = self.slots.borrow();
+            for object in &kept {
+                if let Some(slot) = slots.slots.get(object.handle.index())
+                    && (slot.state != SlotState::Vacant
+                        || slot.generation != object.handle.generation)
+                {
+                    return Err(SceneError::new(
+                        &self.source_label,
+                        Some(&object.id),
+                        "persistent object handle collides with the new scene",
+                    ));
+                }
+            }
+        }
+
+        let mut appended = Vec::with_capacity(kept.len());
+        for object in kept {
+            let source_index = previous
+                .dense(object.handle)
+                .expect("persistent source handle was alive during validation");
+            let dense_index = self.objects.len();
+            let slot_index = object.handle.index();
+            {
+                let slots = self.slots.get_mut();
+                while slots.slots.len() <= slot_index {
+                    let index = slots.slots.len() as u32;
+                    slots.slots.push(Slot {
+                        generation: 0,
+                        state: SlotState::Vacant,
+                    });
+                    slots.free.push(index);
+                }
+                slots.free.retain(|&index| index != object.handle.index);
+                let slot = &mut slots.slots[slot_index];
+                slot.generation = object.handle.generation;
+                slot.state = SlotState::Live(dense_index);
+            }
+            self.indices_by_id.insert(object.id.clone(), object.handle);
+            self.invalid_basis_reported.remove(&object.handle);
+            self.last_valid_local_lights
+                .push(previous.last_valid_local_lights[source_index]);
+            self.world_matrices.push(Mat4::IDENTITY);
+            self.world_rotations.push(Quat::IDENTITY);
+            if let Some(paths) = previous.spawned_material_paths.get(&object.handle) {
+                self.spawned_material_paths
+                    .insert(object.handle, Arc::clone(paths));
+            }
+            self.objects.push(object.clone());
+            appended.push(object.handle);
+        }
+        let base = self.objects.len() - appended.len();
+        self.topological_order.extend(base..self.objects.len());
+        let added_paths = previous
+            .asset_paths
+            .iter()
+            .filter(|path| !self.asset_paths.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.asset_paths.extend(added_paths);
+        self.recalculate_world_matrices();
+        let _ = self.build_frame();
+        Ok(appended)
     }
 
     pub fn local_transform(&self, handle: ObjectHandle) -> Option<&LocalTransform> {
@@ -1543,6 +1694,19 @@ impl World {
     }
 }
 
+fn external_object_reference<'a>(
+    value: &'a ParamValue,
+    retained_ids: &HashSet<&str>,
+) -> Option<&'a str> {
+    match value {
+        ParamValue::Object(id) if !id.is_empty() && !retained_ids.contains(id.as_str()) => Some(id),
+        ParamValue::Array(values) => values
+            .iter()
+            .find_map(|value| external_object_reference(value, retained_ids)),
+        _ => None,
+    }
+}
+
 fn remap_script_object_refs(object: &mut SceneObject, mapped: &HashMap<String, String>) {
     fn remap_params(
         params: &mut std::collections::BTreeMap<String, crate::ParamValue>,
@@ -1611,6 +1775,7 @@ fn world_object(
         name: object.display_name().to_owned(),
         parent,
         active: object.active,
+        keep_on_load: object.keep_on_load,
         tag: object.tag.clone(),
         layer: object.layer,
         transform: object.transform.into(),

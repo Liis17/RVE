@@ -1,6 +1,6 @@
 [package]
 name = "engine-script"
-version = "0.17.0"
+version = "0.18.0"
 edition.workspace = true
 license.workspace = true
 
@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 engine-console = { path = "../engine-console" }
+engine-platform = { path = "../engine-platform" }
 engine-gui = { path = "../engine-gui" }
 engine-physics = { path = "../engine-physics" }
 engine-files = { path = "../engine-files" }
@@ -17,5 +18,8 @@ engine-scene = { path = "../engine-scene" }
 epaint = "=0.36.2"
 glam.workspace = true
 libloading.workspace = true
+log.workspace = true
 mlua.workspace = true
 rve-sdk = { path = "../rve-sdk" }
+serde.workspace = true
+toml.workspace = true

@@ -789,6 +789,39 @@ fn abi_param_kind(kind: u32, argument: &str) -> Option<ParamKind> {
     })
 }
 
+#[cfg(test)]
+mod abi21_compat_tests {
+    use super::ScriptLibrary;
+    use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveHeader, RveModule};
+    use rve_sdk::{Params, Script};
+
+    struct Probe;
+
+    impl Script for Probe {}
+
+    fn probe(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(Probe))
+    }
+
+    #[test]
+    fn abi20_module_layout_loads_on_abi21_host() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 21);
+        let current = rve_sdk::script_module! { "Probe" => probe };
+        let legacy = Box::leak(Box::new(RveModule {
+            header: RveHeader {
+                abi_version: 20,
+                header_size: std::mem::size_of::<RveHeader>() as u32,
+            },
+            scripts: current.scripts,
+            script_count: current.script_count,
+        }));
+        // SAFETY: the module, descriptor table, names and callbacks are process-lifetime values.
+        let library = unsafe { ScriptLibrary::from_module(std::ptr::from_ref(legacy)) }.unwrap();
+        assert_eq!(library.abi_version(), 20);
+        assert!(library.schema("Probe").is_none());
+    }
+}
+
 #[cfg(all(test, windows))]
 mod ownership_tests {
     #[test]

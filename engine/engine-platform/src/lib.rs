@@ -1,10 +1,13 @@
 //! Выбирает платформенную интеграцию при сборке для целевой ОС.
 
+/// Platform crate version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod cache;
 
 pub use cache::{
     load_pipeline_cache, pipeline_cache_path, read_pipeline_cache, safe_cache_app_name,
-    save_pipeline_cache, write_pipeline_cache,
+    save_data_path, save_pipeline_cache, write_pipeline_cache, write_user_data_atomically,
 };
 
 #[cfg(target_os = "windows")]

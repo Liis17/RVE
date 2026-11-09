@@ -191,6 +191,13 @@ impl SceneDocument {
 
         let mut object_indices = HashMap::with_capacity(self.objects.len());
         for (index, object) in self.objects.iter().enumerate() {
+            if object.keep_on_load && object.parent.is_some() {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    "keep_on_load is only valid on a root object",
+                ));
+            }
             if self.expanded {
                 if !crate::prefab::valid_expanded_id(&object.id) {
                     return Err(SceneError::new(
@@ -637,6 +644,9 @@ pub struct SceneObject {
     /// `false` скрывает объект и его поддерево из кадра, физики, звука и скриптов.
     #[serde(default = "default_active", skip_serializing_if = "is_active")]
     pub active: bool,
+    /// Keeps this object and its descendants when a script loads another scene.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keep_on_load: bool,
     /// Тег из `[tags]` проекта; пустая строка означает отсутствие тега.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
@@ -690,6 +700,7 @@ impl Default for SceneObject {
             name: None,
             parent: None,
             active: true,
+            keep_on_load: false,
             tag: String::new(),
             layer: 0,
             transform: SceneTransform::default(),
@@ -2168,6 +2179,21 @@ id = "camera"
         assert!(error.message.contains("[[assets]]"));
         document.objects.clear();
         assert!(document.validate().unwrap_err().message.contains("камер"));
+    }
+
+    #[test]
+    fn keep_on_load_defaults_false_and_is_valid_only_on_scene_roots() {
+        let root =
+            parse("[[objects]]\nid = \"root\"\nkeep_on_load = true\n[objects.camera]\n").unwrap();
+        assert!(root.objects[0].keep_on_load);
+        let defaulted = parse("[[objects]]\nid = \"camera\"\n[objects.camera]\n").unwrap();
+        assert!(!defaulted.objects[0].keep_on_load);
+        assert!(!defaulted.to_toml().unwrap().contains("keep_on_load"));
+        assert!(parse(&root.to_toml().unwrap()).unwrap().objects[0].keep_on_load);
+        error(
+            "[[objects]]\nid = \"root\"\n[objects.camera]\n[[objects]]\nid = \"child\"\nparent = \"root\"\nkeep_on_load = true\n",
+            "root object",
+        );
     }
 
     fn parse(input: &str) -> Result<SceneDocument, super::SceneError> {

@@ -11,8 +11,11 @@ mod host;
 mod library;
 mod lifecycle;
 mod lite;
+mod math_lua;
 mod net;
 mod physics;
+mod save_file;
+mod save_writer;
 mod timeline;
 mod transaction;
 mod types;
@@ -33,6 +36,7 @@ pub use lifecycle::{
     PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, PrefabStatus, SpawnedObject, WorldChanges,
 };
 pub use rve_sdk::{Key, MouseButton};
+pub use save_file::{decode_save_data, encode_save_data};
 pub use types::{
     MAX_RUMBLE_SECONDS, RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel,
     ScriptFrameTime, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,

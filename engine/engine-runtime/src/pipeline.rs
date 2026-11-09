@@ -408,6 +408,7 @@ pub(crate) trait ExitRequester: Send + Sync {
 
 pub(crate) struct ScriptThreadConfig {
     pub scene_name: String,
+    pub save_path: Option<PathBuf>,
     pub sources: std::collections::BTreeMap<String, String>,
     pub input_settings: engine_project::InputSettings,
     pub scripts_library: Option<PathBuf>,
@@ -1175,6 +1176,7 @@ fn scripts_thread(
 ) {
     let ScriptThreadConfig {
         scene_name,
+        save_path,
         sources,
         input_settings,
         scripts_library,
@@ -1239,6 +1241,11 @@ fn scripts_thread(
             return;
         }
     };
+    if let Some(path) = save_path
+        && let Err(error) = scripts.load_save_file(&path)
+    {
+        log::warn!("save data is unavailable at {}: {error}", path.display());
+    }
     for (path, template) in &prefabs.templates {
         if let Err(error) = scripts.register_prefab(&world, path, Arc::clone(template), &sources) {
             if let Some(ready_tx) = ready_tx.take() {
@@ -3931,6 +3938,7 @@ return Input
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "input.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
                 input_settings: InputSettings {
@@ -4910,6 +4918,7 @@ return Script
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "scene.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources,
                 input_settings: engine_project::InputSettings::default(),
@@ -6148,6 +6157,7 @@ return Script
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
@@ -6278,6 +6288,7 @@ return Clock
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("clock.lua".to_owned(), script.to_owned())]),
                 input_settings: engine_project::InputSettings::default(),
@@ -6389,6 +6400,7 @@ return Script
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-start.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("probe.lua".to_owned(), script.to_owned())]),
@@ -6511,6 +6523,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-teleport.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("move.lua".to_owned(), script.to_owned())]),
@@ -6690,6 +6703,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-failure.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
@@ -6774,6 +6788,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7093,6 +7108,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([(
                     "scripts/bad.lua".to_owned(),
@@ -7156,6 +7172,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7215,6 +7232,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7289,6 +7307,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7481,6 +7500,7 @@ return Move
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "spawn.rvescene".to_owned(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: sources
                     .iter()

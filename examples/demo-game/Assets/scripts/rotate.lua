@@ -7,6 +7,12 @@ Rotate.properties = {
 function Rotate:on_start()
   rve.log_info("Rotate started; broadcasting demo_ready")
   rve.broadcast("demo_ready", "Lua start callback")
+  local starts = rve.save.get("rotate_starts") or 0
+  rve.save.set("rotate_starts", starts + 1)
+  rve.save.flush()
+  local facing = rve.look_rotation(rve.vec3(0, 0, 1), rve.vec3(0, 1, 0))
+  local euler = rve.quat_to_euler(facing)
+  rve.log_info(string.format("Lua math Y rotation %.1f", euler.y))
   rve.timer.after(1.0, function()
     rve.log_info("Rotate timer fired")
   end)

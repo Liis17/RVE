@@ -55,6 +55,9 @@ pub(crate) const MAX_RUMBLE_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_NAME_BYTES: usize = 256;
 pub(crate) const MAX_MESSAGE_TARGET_ID_BYTES: usize = 256;
+const MAX_SAVE_KEY_BYTES: usize = 128;
+const MAX_SAVE_KEYS: usize = 4_096;
+const MAX_SAVE_BYTES: usize = 1_048_576;
 
 #[derive(Clone)]
 pub(crate) struct ScriptObjectRef {
@@ -260,6 +263,11 @@ pub(crate) struct ScriptTransaction {
     pub(crate) ui: Rc<RefCell<UiScriptState>>,
     /// Журнал UI-записей текущего вызова: откат при ошибке, отложенные закрытия.
     pub(crate) ui_journal: UiJournal,
+    save_values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
+    save_flush_requested: Rc<Cell<bool>>,
+    save_generation: Rc<Cell<u64>>,
+    pending_save: BTreeMap<String, Option<ParamValue>>,
+    pending_save_flush: bool,
     lifecycle: Rc<RefCell<Lifecycle>>,
     lifecycle_writes: bool,
     instance_serial: u64,
@@ -295,6 +303,83 @@ struct PendingPush {
 }
 
 impl ScriptTransaction {
+    pub(crate) fn attach_save_state(
+        &mut self,
+        values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
+        flush_requested: Rc<Cell<bool>>,
+        generation: Rc<Cell<u64>>,
+    ) {
+        self.save_values = values;
+        self.save_flush_requested = flush_requested;
+        self.save_generation = generation;
+    }
+
+    pub(crate) fn save_get(&self, key: &str) -> Option<ParamValue> {
+        self.pending_save
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| self.save_values.borrow().get(key).cloned())
+    }
+
+    pub(crate) fn save_set(&mut self, key: &str, value: ParamValue) -> Result<(), String> {
+        self.require_writable("save writes")?;
+        validate_save_key(key)?;
+        validate_save_value(&value, 0)?;
+        let mut values = self.save_values.borrow().clone();
+        for (key, value) in &self.pending_save {
+            match value {
+                Some(value) => {
+                    values.insert(key.clone(), value.clone());
+                }
+                None => {
+                    values.remove(key);
+                }
+            }
+        }
+        values.insert(key.to_owned(), value.clone());
+        if values.len() > MAX_SAVE_KEYS || save_values_size(&values) > MAX_SAVE_BYTES {
+            return Err("save data exceeds the 4096 key or 1 MiB limit".to_owned());
+        }
+        self.pending_save.insert(key.to_owned(), Some(value));
+        Ok(())
+    }
+
+    pub(crate) fn save_delete(&mut self, key: &str) -> Result<bool, String> {
+        self.require_writable("save writes")?;
+        validate_save_key(key)?;
+        let existed = self.save_get(key).is_some();
+        self.pending_save.insert(key.to_owned(), None);
+        Ok(existed)
+    }
+
+    pub(crate) fn save_has(&self, key: &str) -> Result<bool, String> {
+        validate_save_key(key)?;
+        Ok(self.save_get(key).is_some())
+    }
+
+    pub(crate) fn save_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .save_values
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for (key, value) in &self.pending_save {
+            if value.is_some() {
+                keys.insert(key.clone());
+            } else {
+                keys.remove(key);
+            }
+        }
+        keys.into_iter().collect()
+    }
+
+    pub(crate) fn save_flush(&mut self) -> Result<(), String> {
+        self.require_writable("save flush")?;
+        self.pending_save_flush = true;
+        Ok(())
+    }
+
     pub(crate) fn attach_time_state(
         &mut self,
         timeline: Rc<RefCell<ScriptTimeline>>,
@@ -471,6 +556,73 @@ fn validate_timer(delay: f64, repeat: Option<f64>) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_save_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > MAX_SAVE_KEY_BYTES || key.chars().any(char::is_control) {
+        return Err(format!(
+            "save key must contain 1..={MAX_SAVE_KEY_BYTES} non-control UTF-8 bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_save_values(values: &BTreeMap<String, ParamValue>) -> Result<(), String> {
+    if values.len() > MAX_SAVE_KEYS || save_values_size(values) > MAX_SAVE_BYTES {
+        return Err("save data exceeds the 4096 key or 1 MiB limit".to_owned());
+    }
+    for (key, value) in values {
+        validate_save_key(key)?;
+        validate_save_value(value, 0)?;
+    }
+    Ok(())
+}
+
+fn validate_save_value(value: &ParamValue, depth: usize) -> Result<(), String> {
+    if depth > MAX_MESSAGE_DEPTH {
+        return Err(format!("save value nesting exceeds {MAX_MESSAGE_DEPTH}"));
+    }
+    match value {
+        ParamValue::Float(value) if !value.is_finite() => {
+            Err("save numbers must be finite".to_owned())
+        }
+        ParamValue::String(value) if value.len() > MAX_MESSAGE_STRING_BYTES => Err(format!(
+            "save strings exceed {MAX_MESSAGE_STRING_BYTES} bytes"
+        )),
+        ParamValue::Object(value) if value.len() > MAX_MESSAGE_TARGET_ID_BYTES => Err(format!(
+            "save object references exceed {MAX_MESSAGE_TARGET_ID_BYTES} bytes"
+        )),
+        ParamValue::Array(values) if values.len() > MAX_MESSAGE_ELEMENTS => Err(format!(
+            "save arrays exceed {MAX_MESSAGE_ELEMENTS} elements"
+        )),
+        ParamValue::Array(values) => {
+            for value in values {
+                validate_save_value(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn save_values_size(values: &BTreeMap<String, ParamValue>) -> usize {
+    fn value_size(value: &ParamValue) -> usize {
+        match value {
+            ParamValue::Bool(_) => 1,
+            ParamValue::Int(_) | ParamValue::Float(_) => 8,
+            ParamValue::String(value) => value.len(),
+            ParamValue::Object(value) => value.len().saturating_add(16),
+            ParamValue::Asset(value) => value.as_str().len().saturating_add(16),
+            ParamValue::Array(values) => values.iter().fold(8_usize, |size, value| {
+                size.saturating_add(value_size(value))
+            }),
+        }
+    }
+    values.iter().fold(0_usize, |size, (key, value)| {
+        size.saturating_add(key.len())
+            .saturating_add(value_size(value))
+            .saturating_add(8)
+    })
+}
+
 impl Default for ScriptTransaction {
     fn default() -> Self {
         Self {
@@ -518,6 +670,11 @@ impl Default for ScriptTransaction {
             pending_net: Vec::new(),
             ui: Rc::new(RefCell::new(UiScriptState::default())),
             ui_journal: UiJournal::default(),
+            save_values: Rc::new(RefCell::new(BTreeMap::new())),
+            save_flush_requested: Rc::new(Cell::new(false)),
+            save_generation: Rc::new(Cell::new(0)),
+            pending_save: BTreeMap::new(),
+            pending_save_flush: false,
             lifecycle: Rc::new(RefCell::new(Lifecycle::default())),
             lifecycle_writes: false,
             instance_serial: 0,
@@ -538,6 +695,90 @@ impl Default for ScriptTransaction {
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod save_validation_tests {
+    use super::{MAX_SAVE_KEYS, ScriptTransaction, validate_save_values};
+    use engine_scene::ParamValue;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    #[test]
+    fn save_accepts_documented_key_array_and_nesting_boundaries() {
+        let mut nested = ParamValue::Int(0);
+        for _ in 0..engine_scene::MAX_MESSAGE_DEPTH {
+            nested = ParamValue::Array(vec![nested]);
+        }
+        let values = BTreeMap::from([
+            ("é".repeat(64), nested),
+            (
+                "array".to_owned(),
+                ParamValue::Array(vec![
+                    ParamValue::Bool(true);
+                    engine_scene::MAX_MESSAGE_ELEMENTS
+                ]),
+            ),
+        ]);
+        assert!(validate_save_values(&values).is_ok());
+    }
+
+    #[test]
+    fn save_rejects_excess_keys_depth_elements_and_total_size() {
+        let mut too_many_keys = (0..MAX_SAVE_KEYS)
+            .map(|index| (format!("k{index}"), ParamValue::Int(0)))
+            .collect::<BTreeMap<_, _>>();
+        too_many_keys.insert("overflow".to_owned(), ParamValue::Int(0));
+        assert!(validate_save_values(&too_many_keys).is_err());
+
+        let mut too_deep = ParamValue::Int(0);
+        for _ in 0..=engine_scene::MAX_MESSAGE_DEPTH {
+            too_deep = ParamValue::Array(vec![too_deep]);
+        }
+        assert!(validate_save_values(&BTreeMap::from([("deep".to_owned(), too_deep,)])).is_err());
+
+        let too_many_elements = ParamValue::Array(vec![
+            ParamValue::Bool(true);
+            engine_scene::MAX_MESSAGE_ELEMENTS + 1
+        ]);
+        assert!(
+            validate_save_values(&BTreeMap::from([("array".to_owned(), too_many_elements,)]))
+                .is_err()
+        );
+
+        let oversized = (0..18)
+            .map(|index| (format!("k{index}"), ParamValue::String("x".repeat(60_000))))
+            .collect();
+        assert!(validate_save_values(&oversized).is_err());
+    }
+
+    #[test]
+    fn rejected_save_write_does_not_stage_or_mutate_existing_values() {
+        let values = Rc::new(RefCell::new(
+            (0..MAX_SAVE_KEYS)
+                .map(|index| (format!("k{index}"), ParamValue::Int(0)))
+                .collect::<BTreeMap<_, _>>(),
+        ));
+        let original = values.borrow().clone();
+        let mut transaction = ScriptTransaction {
+            writable: true,
+            ..ScriptTransaction::default()
+        };
+        transaction.attach_save_state(
+            values.clone(),
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+        );
+
+        assert!(
+            transaction
+                .save_set("overflow", ParamValue::Bool(true))
+                .is_err()
+        );
+        assert!(transaction.pending_save.is_empty());
+        assert_eq!(*values.borrow(), original);
     }
 }
 
@@ -637,6 +878,8 @@ impl ScriptTransaction {
         self.instance_enabled = init.instance_enabled;
         self.pending_edits.clear();
         self.pending_script_enabled = None;
+        self.pending_save.clear();
+        self.pending_save_flush = false;
         self.pending_timeline.clear();
         self.pending_time_scale = None;
         self.pending_spawns.clear();
@@ -1839,6 +2082,7 @@ impl ScriptTransaction {
     pub(crate) fn stage_edit(&mut self, edit: ObjectEdit) -> bool {
         let target = match &edit {
             ObjectEdit::SetActive { object, .. }
+            | ObjectEdit::SetKeepOnLoad { object, .. }
             | ObjectEdit::SetTag { object, .. }
             | ObjectEdit::SetLayer { object, .. }
             | ObjectEdit::SetParent { object, .. }
@@ -1894,7 +2138,9 @@ impl ScriptTransaction {
         let local_only = self.pending_edits.iter().all(|edit| {
             !matches!(
                 edit,
-                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
+                ObjectEdit::SetActive { .. }
+                    | ObjectEdit::SetKeepOnLoad { .. }
+                    | ObjectEdit::SetParent { .. }
             )
         }) && self.pose_edits_are_local(world);
         if !local_only {
@@ -1933,7 +2179,9 @@ impl ScriptTransaction {
                     .check_world_rotation(*object, *rotation_deg)
                     .map_err(|error| error.to_string())?,
                 // Исключены условием local_only выше.
-                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. } => {}
+                ObjectEdit::SetActive { .. }
+                | ObjectEdit::SetKeepOnLoad { .. }
+                | ObjectEdit::SetParent { .. } => {}
             }
         }
         Ok(())
@@ -2171,6 +2419,27 @@ impl ScriptTransaction {
             current = object_ref.parent;
         }
         Some(true)
+    }
+
+    pub(crate) fn keep_on_load(&self, handle: ObjectHandle) -> Option<bool> {
+        self.pending_edits
+            .iter()
+            .rev()
+            .find_map(|edit| match edit {
+                ObjectEdit::SetKeepOnLoad { object, keep } if *object == handle => Some(*keep),
+                _ => None,
+            })
+            .or_else(|| self.world()?.keep_on_load(handle))
+    }
+
+    pub(crate) fn set_keep_on_load(&mut self, handle: ObjectHandle, keep: bool) -> bool {
+        if keep && self.parent(handle).flatten().is_some() {
+            return false;
+        }
+        self.stage_edit(ObjectEdit::SetKeepOnLoad {
+            object: handle,
+            keep,
+        })
     }
 
     /// Родитель с учётом заявок этого вызова; внешний `None` — объект мёртв.
@@ -2787,6 +3056,24 @@ impl ScriptTransaction {
             self.time_scale.set(scale);
         }
         self.timeline.borrow_mut().apply(&mut self.pending_timeline);
+        if !self.pending_save.is_empty() {
+            let mut values = self.save_values.borrow_mut();
+            for (key, value) in std::mem::take(&mut self.pending_save) {
+                match value {
+                    Some(value) => {
+                        values.insert(key, value);
+                    }
+                    None => {
+                        values.remove(&key);
+                    }
+                }
+            }
+            self.save_generation
+                .set(self.save_generation.get().wrapping_add(1));
+        }
+        if std::mem::take(&mut self.pending_save_flush) {
+            self.save_flush_requested.set(true);
+        }
         for request in &self.pending_audio {
             match request {
                 AudioRequest::PlayClip { voice, params, .. } => {
@@ -2864,6 +3151,8 @@ impl ScriptTransaction {
         self.pending_dead_warnings.clear();
         self.pending_edits.clear();
         self.pending_script_enabled = None;
+        self.pending_save.clear();
+        self.pending_save_flush = false;
         self.pending_timeline.clear();
         self.pending_time_scale = None;
         self.pending_transforms.clear();

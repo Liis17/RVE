@@ -68,6 +68,14 @@ enum HostCapability {
     TimerAfter,
     TimerEvery,
     TimerCancel,
+    SaveSet,
+    SaveGet,
+    SaveDelete,
+    SaveHas,
+    SaveKeys,
+    SaveFlush,
+    KeepOnLoad,
+    SetKeepOnLoad,
 }
 
 // Add each script-facing capability to this shared inventory so Lua and ABI stay in parity.
@@ -125,6 +133,14 @@ const CAPABILITIES: &[(&str, &str, HostCapability)] = &[
     ("object", "components", HostCapability::Components),
     ("script", "set_enabled", HostCapability::ScriptSetEnabled),
     ("script", "enabled", HostCapability::ScriptEnabled),
+    ("object", "keep_on_load", HostCapability::KeepOnLoad),
+    ("object", "set_keep_on_load", HostCapability::SetKeepOnLoad),
+    ("save", "set", HostCapability::SaveSet),
+    ("save", "get", HostCapability::SaveGet),
+    ("save", "delete", HostCapability::SaveDelete),
+    ("save", "has", HostCapability::SaveHas),
+    ("save", "keys", HostCapability::SaveKeys),
+    ("save", "flush", HostCapability::SaveFlush),
     ("object", "get_collider", HostCapability::GetCollider),
     ("object", "set_collider", HostCapability::SetCollider),
     ("object", "get_rigid_body", HostCapability::GetRigidBody),
@@ -244,6 +260,7 @@ path = "/api.lua"
             "audio" => rve.get::<Table>("audio").unwrap().get(*name).unwrap(),
             "timer" => rve.get::<Table>("timer").unwrap().get(*name).unwrap(),
             "time" => rve.get::<Table>("time").unwrap().get(*name).unwrap(),
+            "save" => rve.get::<Table>("save").unwrap().get(*name).unwrap(),
             _ => unreachable!(),
         };
         if matches!(capability, HostCapability::TimeScale) {
@@ -320,6 +337,14 @@ path = "/api.lua"
             }
             HostCapability::TimerAfter | HostCapability::TimerEvery => abi.schedule_timer.is_some(),
             HostCapability::TimerCancel => abi.cancel_timer.is_some(),
+            HostCapability::SaveSet => abi.save_set.is_some(),
+            HostCapability::SaveGet => abi.save_get.is_some(),
+            HostCapability::SaveDelete => abi.save_delete.is_some(),
+            HostCapability::SaveHas => abi.save_has.is_some(),
+            HostCapability::SaveKeys => abi.save_keys.is_some(),
+            HostCapability::SaveFlush => abi.save_flush.is_some(),
+            HostCapability::KeepOnLoad => abi.object_keep_on_load.is_some(),
+            HostCapability::SetKeepOnLoad => abi.object_set_keep_on_load.is_some(),
         };
         assert!(available, "ABI callback missing for {table}.{name}");
     }

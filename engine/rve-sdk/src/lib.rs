@@ -5,6 +5,7 @@
 
 pub mod abi;
 mod components;
+mod math;
 
 /// Version of this SDK crate, as declared in its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -34,6 +35,7 @@ use abi::{
     RVE_UI_VALUE_TEXT, RveUiRect, RveUiValue,
 };
 pub use components::{ComponentError, LightKind, MAX_LOD_READ};
+pub use math::{Quat, Vec3};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -431,6 +433,111 @@ pub struct Context<'a> {
     /// Console logging and command registration for this script instance.
     pub console: Console<'a>,
     _not_send_or_sync: PhantomData<*const ()>,
+}
+
+/// Failure of a save operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SaveError {
+    /// The host does not provide save callbacks.
+    Unavailable,
+    /// The host rejected the key, value, or current callback phase.
+    Rejected,
+    /// The host returned a malformed value.
+    InvalidValue(ValueError),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "save callbacks are unavailable in this host",
+            Self::Rejected => "the host rejected the save operation",
+            Self::InvalidValue(error) => return write!(formatter, "invalid save value: {error}"),
+        })
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+/// Call-scoped save-data access from [`Context::save`].
+pub struct Save<'a> {
+    host: &'a RveHost,
+}
+
+impl Save<'_> {
+    /// Reads a value, returning `None` when the key does not exist.
+    pub fn get(&self, key: &str) -> Result<Option<Value>, SaveError> {
+        let callback = self.host.save_get.ok_or(SaveError::Unavailable)?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the callback only borrows `key` and writes a value backed by its call context.
+        if !unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &mut value) } {
+            return Ok(None);
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        unsafe { value.into_owned() }
+            .map(Some)
+            .map_err(SaveError::InvalidValue)
+    }
+
+    /// Stages a value write for this script callback's transaction.
+    pub fn set(&self, key: &str, value: &Value) -> Result<(), SaveError> {
+        let callback = self.host.save_set.ok_or(SaveError::Unavailable)?;
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the key and recursive value buffers live through the synchronous callback.
+        if unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &value.value) } {
+            Ok(())
+        } else {
+            Err(SaveError::Rejected)
+        }
+    }
+
+    /// Removes a key. Returns `false` when it was not present.
+    pub fn delete(&self, key: &str) -> Result<bool, SaveError> {
+        let callback = self.host.save_delete.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the key bytes live through this synchronous callback.
+        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+    }
+
+    /// Checks whether a key is present.
+    pub fn has(&self, key: &str) -> Result<bool, SaveError> {
+        let callback = self.host.save_has.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the key bytes live through this synchronous callback.
+        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+    }
+
+    /// Returns save keys in sorted order.
+    pub fn keys(&self) -> Result<Vec<String>, SaveError> {
+        let callback = self.host.save_keys.ok_or(SaveError::Unavailable)?;
+        let mut count = 0;
+        // SAFETY: the zero-capacity query only writes `count`.
+        if !unsafe { callback(self.host.ctx, std::ptr::null_mut(), 0, &mut count) } {
+            return Err(SaveError::Rejected);
+        }
+        let mut keys = vec![RveStr::empty(); count];
+        // SAFETY: the host writes at most `count` borrowed strings into this buffer.
+        if !unsafe { callback(self.host.ctx, keys.as_mut_ptr(), keys.len(), &mut count) } {
+            return Err(SaveError::Rejected);
+        }
+        keys.into_iter()
+            .take(count)
+            .map(|key| {
+                // SAFETY: each key remains in the host call context until this callback returns.
+                unsafe { key.to_str() }
+                    .map(str::to_owned)
+                    .map_err(|error| SaveError::InvalidValue(ValueError(error.to_string())))
+            })
+            .collect()
+    }
+
+    /// Requests an atomic flush after this callback commits.
+    pub fn flush(&self) -> Result<(), SaveError> {
+        let callback = self.host.save_flush.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the host callback stages a write request in the active transaction.
+        if unsafe { callback(self.host.ctx) } {
+            Ok(())
+        } else {
+            Err(SaveError::Rejected)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1348,6 +1455,11 @@ impl<'a> Context<'a> {
         Object {
             handle: self.host.self_object,
         }
+    }
+
+    /// Returns call-scoped access to project save data.
+    pub fn save(&self) -> Save<'_> {
+        Save { host: self.host }
     }
 
     fn new(host: &'a RveHost) -> Result<Self, String> {
@@ -3059,6 +3171,23 @@ impl Object {
         };
         // SAFETY: the host context is valid for this callback.
         unsafe { callback(ctx.host.ctx, self.handle, active) }
+    }
+
+    /// Returns whether this root object persists when a scene is loaded.
+    pub fn keep_on_load(&self, ctx: &Context<'_>) -> Option<bool> {
+        let callback = ctx.host.object_keep_on_load?;
+        let mut keep = false;
+        // SAFETY: the host callback and output slot are valid during this guest call.
+        unsafe { callback(ctx.host.ctx, self.handle, &mut keep) }.then_some(keep)
+    }
+
+    /// Stages whether this root object persists when a scene is loaded.
+    pub fn set_keep_on_load(&self, ctx: &mut Context<'_>, keep: bool) -> bool {
+        let Some(callback) = ctx.host.object_set_keep_on_load else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, keep) }
     }
 
     /// Returns the world position.

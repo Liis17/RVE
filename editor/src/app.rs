@@ -51,6 +51,24 @@ const IDLE_GAMEPAD_POLL: Duration = Duration::from_secs(1);
 /// Как часто забирать готовый захват `capture_view`, пока задача активна.
 const CAPTURE_POLL: Duration = Duration::from_millis(16);
 
+fn player_save_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(".rve")
+        .join("playersave")
+        .join("save.toml")
+}
+
+fn load_project_starting_scene(project: &OpenProject) -> Result<EditorScene, String> {
+    let starting_scene = project
+        .settings
+        .starting_scene()
+        .ok_or_else(|| "В проекте не указана стартовая сцена".to_owned())?;
+    project.read_text(starting_scene).and_then(|text| {
+        let path = VirtualPath::parse(starting_scene).map_err(|error| error.to_string())?;
+        EditorScene::parse(path, &text, project.prefab_loader())
+    })
+}
+
 pub struct EditorApp {
     state: EditorState,
     control_click: bool,
@@ -1360,17 +1378,17 @@ impl EditorApp {
     }
 
     fn start_play_now(&mut self) {
-        let Some(scene) = &self.state.scene else {
+        let Some(project) = &self.state.project else {
             return;
         };
-        if scene.document().is_prefab() {
-            self.state
-                .log
-                .error("Play недоступен для префаба: откройте сцену");
-            return;
-        }
-        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
-            return;
+        let play_scene = match load_project_starting_scene(project) {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.state
+                    .log
+                    .error(format!("Не удалось загрузить стартовую сцену: {error}"));
+                return;
+            }
         };
         let heavy = match PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME)) {
             Ok(heavy) => heavy,
@@ -1380,14 +1398,14 @@ impl EditorApp {
             }
         };
         let (prefabs, warnings) = PlayPrefabs::load(
-            scene.view(),
+            play_scene.view(),
             &mut |path| project.read_text(path),
-            scene.instanced_prefabs(),
+            play_scene.instanced_prefabs(),
             &heavy,
         );
         let mut prefabs = prefabs.with_resources(project.resource_handle());
         let needs_library = prefabs.has_heavy_scripts()
-            || scene
+            || play_scene
                 .view()
                 .objects
                 .iter()
@@ -1406,14 +1424,14 @@ impl EditorApp {
                 return;
             }
         }
-        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+        let Some(project) = &self.state.project else {
             return;
         };
         let protocol = engine_network::protocol_id(&project.settings.id, &project.settings.version);
         let network = match self.state.play_network.plan(
             &project.settings.network,
             protocol,
-            engine_network::replication::scene_hash(scene.view()),
+            engine_network::replication::scene_hash(play_scene.view()),
         ) {
             Ok(network) => network,
             Err(error) => {
@@ -1425,9 +1443,11 @@ impl EditorApp {
         let tuning = gamepad_tuning(&project.settings.input.gamepad);
         editor_gamepads(&mut self.state.gamepads, tuning).begin_session(tuning);
         let mut ui_images = None;
+        let player_save_path = player_save_path(&project.root);
+        let mut save_warning = None;
         let result: Result<PlaySession, String> = (|| {
             let mut world =
-                World::from_document(scene.view()).map_err(|error| error.to_string())?;
+                World::from_document(play_scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
             project.apply_physics_materials(&mut world)?;
             prefabs.prepare_ui(&world, &project.assets)?;
@@ -1436,7 +1456,7 @@ impl EditorApp {
                 PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
             let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
             let mut session = PlaySession::start_with_world_and_physics(
-                scene.view(),
+                play_scene.view(),
                 world,
                 self.state.library.as_ref(),
                 &project.settings.input,
@@ -1451,11 +1471,19 @@ impl EditorApp {
                 },
                 animation,
             )?;
+            if let Err(error) = session.load_save_file(&player_save_path) {
+                save_warning = Some(error);
+            }
             if let Some(plan) = network {
                 session.attach_network(plan)?;
             }
             Ok(session)
         })();
+        if let Some(error) = save_warning {
+            self.state
+                .log
+                .warn(format!("Play save data is unavailable: {error}"));
+        }
         match result {
             Ok(session) => {
                 if let (Some(gpu), Some(images)) = (&mut self.gpu, ui_images.as_ref())
@@ -2922,6 +2950,21 @@ mod tests {
     use egui::{Event, Key, Modifiers, RawInput, Rect, pos2, vec2};
 
     #[test]
+    fn editor_player_save_path_is_scoped_inside_the_project() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let project = std::env::temp_dir().join(format!("rve-editor-save-{id}"));
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(
+            player_save_path(&project),
+            project.join(".rve").join("playersave").join("save.toml")
+        );
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
     fn numpad_keys_map_to_scene_commands_and_ctrl_flips_the_front_views() {
         assert_eq!(
             numpad_command(KeyCode::Numpad1, false),
@@ -2981,24 +3024,44 @@ mod tests {
     }
 
     #[test]
-    fn pending_play_rechecks_the_current_document_after_build() {
+    fn play_loads_project_starting_scene_without_changing_open_document() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rve-editor-play-scene-{id}"));
+        std::fs::create_dir_all(root.join("Assets/scenes")).unwrap();
+        std::fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/scenes/start.rvescene\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Assets/scenes/start.rvescene"),
+            "[[objects]]\nid = \"project-camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let project = OpenProject::open(&root).unwrap();
         let mut app = EditorApp::new(None, None, None, false);
         app.state.scene = Some(
             EditorScene::parse(
                 VirtualPath::parse("prefabs/test.rveprefab").unwrap(),
-                "[[objects]]\nid = \"root\"\n",
+                "[[objects]]\nid = \"edit-root\"\n",
                 crate::scene_edit::no_prefabs(),
             )
             .unwrap(),
         );
-        app.start_play_now();
-        assert!(!app.state.is_playing());
-        assert!(
-            app.state
-                .log
-                .entries()
-                .any(|entry| entry.message.contains("префаба"))
+        app.state.project = Some(project);
+
+        let loaded = load_project_starting_scene(app.state.project.as_ref().unwrap()).unwrap();
+
+        assert_eq!(loaded.view().objects[0].id, "project-camera");
+        assert_eq!(
+            app.state.scene.as_ref().unwrap().view().objects[0].id,
+            "edit-root"
         );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

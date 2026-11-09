@@ -15,6 +15,7 @@ use crate::net::{
     networked_template, validate_message,
 };
 use crate::physics::PhysicsScriptState;
+use crate::save_writer::SaveWriter;
 use crate::timeline::{CoroutineWait, DueTimer, ScriptCoroutine, ScriptTimeline, TimerCallback};
 use crate::transaction::{
     MAX_MESSAGE_BYTES_PER_FRAME, MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage,
@@ -45,6 +46,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -208,6 +210,11 @@ pub struct ScriptHost {
     commands: LuaCommands,
     commands_generation: CommandGeneration,
     transaction: ScriptTransaction,
+    save_values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
+    save_flush_requested: Rc<Cell<bool>>,
+    save_generation: Rc<Cell<u64>>,
+    save_writer: Option<SaveWriter>,
+    persisted_save_generation: u64,
     timeline: Rc<RefCell<ScriptTimeline>>,
     time_scale: Rc<Cell<f32>>,
     fixed_step: FixedStepClock,
@@ -424,6 +431,9 @@ impl ScriptHost {
         let commands_generation = Rc::new(Cell::new(0));
         let timeline = Rc::new(RefCell::new(ScriptTimeline::default()));
         let time_scale = Rc::new(Cell::new(1.0));
+        let save_values = Rc::new(RefCell::new(BTreeMap::new()));
+        let save_flush_requested = Rc::new(Cell::new(false));
+        let save_generation = Rc::new(Cell::new(0));
         let call_deadline = lite::CallDeadline::new(call_time_limit, interrupt.interrupted.clone());
         let lua_state = lite::create_lua(
             events.clone(),
@@ -443,6 +453,11 @@ impl ScriptHost {
         let heavy_abi_version = library.map_or(0, ScriptLibrary::abi_version);
         let mut transaction = ScriptTransaction::with_ui(ui.clone());
         transaction.attach_time_state(timeline.clone(), time_scale.clone());
+        transaction.attach_save_state(
+            save_values.clone(),
+            save_flush_requested.clone(),
+            save_generation.clone(),
+        );
         let fixed_step = FixedStepClock::new(60, 8).expect("default fixed-step config is valid");
         let mut host = Self {
             lua,
@@ -464,6 +479,11 @@ impl ScriptHost {
             commands,
             commands_generation,
             transaction,
+            save_values,
+            save_flush_requested,
+            save_generation,
+            save_writer: None,
+            persisted_save_generation: 0,
             timeline,
             time_scale,
             fixed_step,
@@ -708,6 +728,43 @@ impl ScriptHost {
     /// at the next phase or lite-call boundary; ABI scripts continue to run.
     pub fn interrupt_handle(&self) -> ScriptInterruptHandle {
         self.interrupt.clone()
+    }
+
+    /// Replaces save values before callbacks start. Save files are owned by the runtime host.
+    pub fn set_save_values(&mut self, values: BTreeMap<String, ParamValue>) -> Result<(), String> {
+        if self.started {
+            return Err("save values can only be loaded before scripts start".to_owned());
+        }
+        crate::transaction::validate_save_values(&values)?;
+        *self.save_values.borrow_mut() = values;
+        Ok(())
+    }
+
+    /// Loads this project's save file and enables asynchronous persistence before callbacks start.
+    pub fn load_save_file(&mut self, path: &Path) -> Result<(), String> {
+        if self.started || self.destroyed || self.save_writer.is_some() {
+            return Err("save file must be attached once before scripts start".to_owned());
+        }
+        let (writer, values) = SaveWriter::open(path)?;
+        self.set_save_values(values)?;
+        self.persisted_save_generation = self.save_generation();
+        self.save_writer = Some(writer);
+        Ok(())
+    }
+
+    /// Returns the committed save data for persistence by the runtime.
+    pub fn save_values(&self) -> BTreeMap<String, ParamValue> {
+        self.save_values.borrow().clone()
+    }
+
+    /// Generation of committed save mutations, for nonblocking persistence outside callbacks.
+    pub fn save_generation(&self) -> u64 {
+        self.save_generation.get()
+    }
+
+    /// Whether an explicit `save.flush()` request was committed since the last check.
+    pub fn take_save_flush_requested(&self) -> bool {
+        self.save_flush_requested.replace(false)
     }
 
     /// Replaces the input snapshot used by the next update and its lifecycle callbacks.
@@ -1029,6 +1086,7 @@ impl ScriptHost {
         self.open_scene_canvases(world);
         self.sync_activity(world, time, u64::MAX);
         self.apply_lifecycle(world, time);
+        self.persist_save_changes();
     }
 
     /// Runs on_update for enabled instances, starting the host first if needed.
@@ -1093,6 +1151,7 @@ impl ScriptHost {
         self.fire_timers(world, time);
         self.sync_phase_boundary(world, time);
         self.run_phase(world, Phase::LateUpdate(frame_time.dt), time);
+        self.persist_save_changes();
     }
 
     /// Возвращает время последнего `update` по фазам; `Start` и `Destroy` сюда не входят.
@@ -1118,6 +1177,36 @@ impl ScriptHost {
         self.due_coroutines.clear();
         self.remove_all_commands();
         self.release_all_pending(world);
+        self.persist_save_changes();
+        if let Some(writer) = self.save_writer.take()
+            && let Err(error) = writer.finish(self.save_values())
+        {
+            log::error!("final save flush failed: {error}");
+        }
+    }
+
+    fn persist_save_changes(&mut self) {
+        let generation = self.save_generation();
+        if generation != self.persisted_save_generation {
+            if let Some(writer) = self.save_writer.as_ref() {
+                if writer.snapshot(self.save_values()) {
+                    self.persisted_save_generation = generation;
+                }
+            } else {
+                self.persisted_save_generation = generation;
+            }
+        }
+        if self.take_save_flush_requested() {
+            if let Some(writer) = self.save_writer.as_ref() {
+                if let Err(error) = writer.flush(self.save_values()) {
+                    log::error!("explicit save flush failed: {error}");
+                } else {
+                    self.persisted_save_generation = generation;
+                }
+            } else {
+                log::warn!("save.flush() was requested but no save path is available");
+            }
+        }
     }
 
     /// Takes all log and runtime-error events accumulated since the previous drain.
@@ -3700,9 +3789,15 @@ mod audio_tests;
 #[cfg(test)]
 mod component_tests;
 #[cfg(test)]
+#[path = "host/keep_on_load_tests.rs"]
+mod keep_on_load_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod net_tests;
+#[cfg(test)]
+#[path = "host/save_tests.rs"]
+mod save_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

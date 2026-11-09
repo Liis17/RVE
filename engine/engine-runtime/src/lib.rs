@@ -444,6 +444,7 @@ fn run_from_args(
         world,
         ScriptThreadConfig {
             scene_name: name,
+            save_path: engine_platform::save_data_path(&project.name),
             sources,
             input_settings: project.input.clone(),
             scripts_library,

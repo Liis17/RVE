@@ -1,4 +1,4 @@
-use rve_sdk::{Context, Params, Script, Value};
+use rve_sdk::{Context, Params, Quat, Script, Value, Vec3};
 
 struct Bobber {
     base_y: f32,
@@ -10,6 +10,24 @@ impl Script for Bobber {
     fn on_start(&mut self, context: &mut Context<'_>) {
         self.base_y = context.transform.position[1];
         context.log_info("Bobber started");
+        let starts = match context.save().get("bobber_starts") {
+            Ok(Some(Value::Int(value))) => value,
+            Ok(_) => 0,
+            Err(error) => {
+                context.log_warn(format!("Bobber save read failed: {error}"));
+                0
+            }
+        };
+        if let Err(error) = context
+            .save()
+            .set("bobber_starts", &Value::Int(starts.saturating_add(1)))
+        {
+            context.log_warn(format!("Bobber save write failed: {error}"));
+        } else if let Err(error) = context.save().flush() {
+            context.log_warn(format!("Bobber save flush failed: {error}"));
+        }
+        let forward = Quat::look_rotation(Vec3::Z, Vec3::Y).rotate_vec3(Vec3::Z);
+        context.log_info(format!("Bobber math forward {forward:?}"));
         if let Err(error) = context.schedule(1.0, None, "pulse") {
             context.log_warn(format!("Bobber timer unavailable: {error}"));
         }
