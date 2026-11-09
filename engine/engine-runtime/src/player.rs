@@ -29,9 +29,12 @@ use engine_resources::ResourceHandle;
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
 use engine_ui::console::ConsoleOverlay;
-use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, WindowProxy, run};
+use engine_window::{
+    Key, MouseButton, TextInputEvent, Window, WindowConfig, WindowHandler, WindowProxy, run,
+};
 use flume::{Receiver, Sender};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 #[cfg(feature = "dev-console")]
@@ -78,6 +81,8 @@ pub(crate) struct PlayerConfig {
     pub resource_stats: ResourceHandle,
     pub startup: StartupProfile,
     pub input: Arc<Mutex<InputAccumulator>>,
+    /// Фокус InputField из scripts thread: по нему включается IME окна.
+    pub text_focus: Arc<AtomicBool>,
     #[cfg(feature = "dev-console")]
     pub console_buffer: Arc<Mutex<ConsoleBuffer>>,
     #[cfg(feature = "dev-console")]
@@ -115,6 +120,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         resource_stats,
         startup,
         input,
+        text_focus,
         #[cfg(feature = "dev-console")]
         console_buffer,
         #[cfg(feature = "dev-console")]
@@ -159,6 +165,9 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         render_started: false,
         cleaned: false,
         input,
+        text_focus,
+        text_proxy: None,
+        text_ime: false,
         #[cfg(feature = "dev-console")]
         console_buffer,
         #[cfg(feature = "dev-console")]
@@ -227,6 +236,11 @@ struct PlayerWindow<'a> {
     render_started: bool,
     cleaned: bool,
     input: Arc<Mutex<InputAccumulator>>,
+    text_focus: Arc<AtomicBool>,
+    /// Прокси окна для включения IME; появляется в `attach_proxy`.
+    text_proxy: Option<WindowProxy>,
+    /// Последнее состояние IME, отправленное окну.
+    text_ime: bool,
     debug_view: DebugView,
     #[cfg(feature = "dev-console")]
     wireframe_supported: bool,
@@ -362,6 +376,18 @@ impl PlayerWindow<'_> {
     fn publish_console_ui(&self, frame: ConsoleUiFrame) {
         if self.console_ui.publish(frame) {
             let _ = self.render_tx.send(RenderControl::ConsoleUiChanged);
+        }
+    }
+
+    /// Включает IME окна, пока InputField в фокусе и игра принимает ввод. Вызов только при смене.
+    fn sync_text_input(&mut self) {
+        let wanted =
+            self.text_focus.load(Ordering::Acquire) && lock_input(&self.input).accepting_input();
+        if wanted != self.text_ime
+            && let Some(proxy) = &self.text_proxy
+        {
+            proxy.set_text_input(wanted);
+            self.text_ime = wanted;
         }
     }
 
@@ -739,6 +765,7 @@ impl WindowHandler for PlayerWindow<'_> {
     fn attach_proxy(&mut self, proxy: WindowProxy) {
         self.activation.attach(proxy.clone());
         self.cursor.attach(proxy.clone());
+        self.text_proxy = Some(proxy.clone());
         self.window_exit = Some(Arc::new(WindowExit(proxy)));
     }
 
@@ -855,7 +882,8 @@ impl WindowHandler for PlayerWindow<'_> {
         let backend =
             VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view)
                 .with_particle_emitters(std::mem::take(&mut gpu_scene.particles))
-                .with_scene_skin_instances(gpu_scene.skin_instance_ids());
+                .with_scene_skin_instances(gpu_scene.skin_instance_ids())
+                .with_ui_images(std::mem::take(&mut gpu_scene.ui_images));
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(
@@ -918,6 +946,7 @@ impl WindowHandler for PlayerWindow<'_> {
                 .record_failure("поток рендера не завершился после закрытия окна");
             false
         } else {
+            self.sync_text_input();
             #[cfg(feature = "dev-console")]
             self.update_console(_window);
             true
@@ -925,6 +954,7 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn resized(&mut self, width: u32, height: u32) {
+        lock_input(&self.input).set_window_size(width, height);
         let _ = self.render_tx.send(RenderControl::Resize(width, height));
         #[cfg(feature = "dev-console")]
         if width > 0 && height > 0 && self.overlays.visible() && !self.window_occluded {
@@ -1019,6 +1049,10 @@ impl WindowHandler for PlayerWindow<'_> {
         }
         #[cfg(not(feature = "dev-console"))]
         lock_input(&self.input).focused(focused);
+    }
+
+    fn text_input(&mut self, event: TextInputEvent) {
+        lock_input(&self.input).text_input(event);
     }
 
     fn exiting(&mut self) {

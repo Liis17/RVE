@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1094,6 +1094,7 @@ dependencies = [
  "engine-console",
  "engine-core",
  "engine-files",
+ "engine-gui",
  "engine-input",
  "engine-network",
  "engine-neural",
@@ -1106,6 +1107,7 @@ dependencies = [
  "engine-script",
  "engine-ui",
  "engine-window",
+ "epaint",
  "flume",
  "glam",
  "log",

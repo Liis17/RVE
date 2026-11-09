@@ -6,6 +6,7 @@
 //! переопределений и ссылки на текстуры принадлежат токену. Освобождение токена уменьшает
 //! ссылки, а ресурс, на который больше никто не ссылается, уничтожается.
 
+use crate::game_ui::PreparedUi;
 use crate::module_host::ModuleHost;
 use crate::pipeline::ScriptControl;
 use crate::scene::{
@@ -54,6 +55,8 @@ pub(crate) struct PrefabCpu {
     pub template: Arc<PrefabTemplate>,
     pub sources: BTreeMap<String, String>,
     pub geometry: Vec<ModelGeometry>,
+    /// `.rveui` префаба и их ассеты: регистрируются в скриптах, картинки уходят в GPU.
+    pub ui: PreparedUi,
 }
 
 /// Результат CPU-загрузки. Модели и текстуры нужны только render thread для GPU.
@@ -820,6 +823,7 @@ pub(crate) fn load_prefab(
             template: Arc::new(template),
             sources: prepared.sources,
             geometry,
+            ui: prepared.ui,
         },
         models: prepared.models,
         textures: prepared.textures,
@@ -1116,6 +1120,7 @@ mod tests {
         LoadedPrefab {
             token: load,
             cpu: PrefabCpu {
+                ui: Default::default(),
                 template: Arc::new(template),
                 sources: BTreeMap::new(),
                 geometry: Vec::new(),

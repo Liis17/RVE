@@ -1,6 +1,9 @@
+use engine_gui::input::TextInputEvent;
 use engine_input::{GamepadSnapshot, PadGate};
 use engine_script::{Key, MouseButton, ScriptInput};
-use engine_window::{Key as WindowKey, MouseButton as WindowMouseButton};
+use engine_window::{
+    Key as WindowKey, MouseButton as WindowMouseButton, TextInputEvent as WindowTextInputEvent,
+};
 use std::sync::{Mutex, MutexGuard};
 
 /// Event-thread accumulator for a single script update snapshot.
@@ -10,9 +13,36 @@ pub(crate) struct InputAccumulator {
     focused: bool,
     background: bool,
     pad_gate: PadGate,
+    /// Текст окна с прошлого тика scripts thread; сбрасывается вместе с потерей ввода.
+    text: Vec<TextInputEvent>,
+    /// Размер окна в физических пикселях: UI раскладывается по нему.
+    window_size: [u32; 2],
 }
 
 impl InputAccumulator {
+    /// Копит текст, пока игра принимает ввод: при потере фокуса, фоне и открытой консоли он не нужен.
+    pub(crate) fn text_input(&mut self, event: WindowTextInputEvent) {
+        if self.accepting_input() {
+            self.text.push(map_text_input(event));
+        }
+    }
+
+    pub(crate) fn take_text(&mut self) -> Vec<TextInputEvent> {
+        std::mem::take(&mut self.text)
+    }
+
+    pub(crate) fn set_window_size(&mut self, width: u32, height: u32) {
+        self.window_size = [width, height];
+    }
+
+    pub(crate) fn window_size(&self) -> [u32; 2] {
+        self.window_size
+    }
+
+    pub(crate) fn accepting_input(&self) -> bool {
+        self.focused && !self.background
+    }
+
     pub(crate) fn key(&mut self, key: WindowKey, pressed: bool) {
         if self.accepting_input() {
             self.input.set_key(map_key(key), pressed);
@@ -49,6 +79,7 @@ impl InputAccumulator {
         if !focused {
             self.input.release_all();
             self.input.clear_pointer();
+            self.text.clear();
         }
     }
 
@@ -64,6 +95,7 @@ impl InputAccumulator {
         self.background = background;
         if background {
             self.input.reset_for_background();
+            self.text.clear();
         }
     }
 
@@ -83,9 +115,18 @@ impl InputAccumulator {
         }
         accepting
     }
+}
 
-    fn accepting_input(&self) -> bool {
-        self.focused && !self.background
+fn map_text_input(event: WindowTextInputEvent) -> TextInputEvent {
+    match event {
+        WindowTextInputEvent::Text(text) => TextInputEvent::Text(text),
+        WindowTextInputEvent::Backspace => TextInputEvent::Backspace,
+        WindowTextInputEvent::Delete => TextInputEvent::Delete,
+        WindowTextInputEvent::Left => TextInputEvent::Left,
+        WindowTextInputEvent::Right => TextInputEvent::Right,
+        WindowTextInputEvent::Home => TextInputEvent::Home,
+        WindowTextInputEvent::End => TextInputEvent::End,
+        WindowTextInputEvent::Enter => TextInputEvent::Enter,
     }
 }
 
@@ -582,5 +623,82 @@ mod tests {
             assert_eq!(frame.gamepad_state(1).unwrap().connected, 0);
             assert!(!south_down(&frame));
         }
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::InputAccumulator;
+    use engine_gui::input::TextInputEvent;
+    use engine_window::TextInputEvent as WindowText;
+
+    fn focused() -> InputAccumulator {
+        let mut input = InputAccumulator::default();
+        input.focused(true);
+        input
+    }
+
+    #[test]
+    fn text_is_taken_once_and_mapped_to_gui_events() {
+        let mut input = focused();
+        input.text_input(WindowText::Text("ab".to_owned()));
+        input.text_input(WindowText::Backspace);
+        input.text_input(WindowText::Enter);
+        assert_eq!(
+            input.take_text(),
+            vec![
+                TextInputEvent::Text("ab".to_owned()),
+                TextInputEvent::Backspace,
+                TextInputEvent::Enter,
+            ]
+        );
+        assert!(input.take_text().is_empty());
+    }
+
+    #[test]
+    fn text_is_dropped_outside_focus() {
+        let mut input = InputAccumulator::default();
+        input.text_input(WindowText::Text("x".to_owned()));
+        assert!(input.take_text().is_empty(), "без фокуса текст не копится");
+    }
+
+    #[test]
+    fn losing_focus_clears_pending_text() {
+        let mut input = focused();
+        input.text_input(WindowText::Text("x".to_owned()));
+        input.focused(false);
+        assert!(input.take_text().is_empty());
+    }
+
+    #[test]
+    fn background_clears_pending_text() {
+        let mut input = focused();
+        input.text_input(WindowText::Text("x".to_owned()));
+        input.set_background(true);
+        assert!(input.take_text().is_empty(), "фон сбрасывает текст");
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn open_console_clears_pending_text_and_blocks_new_text() {
+        let mut input = focused();
+        input.text_input(WindowText::Text("y".to_owned()));
+        input.console_open(true, true);
+        assert!(
+            input.take_text().is_empty(),
+            "открытая консоль сбрасывает текст"
+        );
+        input.text_input(WindowText::Text("z".to_owned()));
+        assert!(
+            input.take_text().is_empty(),
+            "пока консоль открыта, текст не копится"
+        );
+    }
+
+    #[test]
+    fn window_size_is_stored_for_ui_layout() {
+        let mut input = InputAccumulator::default();
+        input.set_window_size(1280, 720);
+        assert_eq!(input.window_size(), [1280, 720]);
     }
 }
