@@ -1,3 +1,5 @@
+mod physics_api;
+
 use crate::actions::{ActionMutation, ActionValue};
 use crate::lifecycle::{ObjectState, PrefabRequest, SpawnArgs};
 use crate::transaction::{
@@ -389,6 +391,7 @@ pub(crate) fn create_lua(
         "raycast",
         physics_raycast_function(&lua, active_call.clone())?,
     )?;
+    physics_api::add_query_functions(&lua, &physics, active_call.clone())?;
     rve.set("physics", physics)?;
     rve.set(
         "active_camera",
@@ -441,6 +444,7 @@ pub(crate) fn compile_class(
         "on_collision_exit",
         "on_trigger_enter",
         "on_trigger_exit",
+        "on_trigger_stay",
     ] {
         match class
             .get::<Value>(callback)
@@ -2302,6 +2306,7 @@ fn add_physics_object_api(
     handle: ObjectHandle,
     active_call: ActiveCall,
 ) -> mlua::Result<()> {
+    physics_api::add_component_methods(lua, object, handle, active_call.clone())?;
     let get_active = active_call.clone();
     object.set(
         "get_velocity",

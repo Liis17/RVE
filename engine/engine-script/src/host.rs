@@ -287,6 +287,7 @@ enum ScriptPhysicsEventKind {
     CollisionExit,
     TriggerEnter,
     TriggerExit,
+    TriggerStay,
 }
 
 impl ScriptPhysicsEventKind {
@@ -296,6 +297,7 @@ impl ScriptPhysicsEventKind {
             Self::CollisionExit => "on_collision_exit",
             Self::TriggerEnter => "on_trigger_enter",
             Self::TriggerExit => "on_trigger_exit",
+            Self::TriggerStay => "on_trigger_stay",
         }
     }
 
@@ -305,6 +307,7 @@ impl ScriptPhysicsEventKind {
             Self::CollisionExit => rve_sdk::abi::RVE_COLLISION_EXIT,
             Self::TriggerEnter => rve_sdk::abi::RVE_TRIGGER_ENTER,
             Self::TriggerExit => rve_sdk::abi::RVE_TRIGGER_EXIT,
+            Self::TriggerStay => rve_sdk::abi::RVE_TRIGGER_STAY,
         }
     }
 }
@@ -1393,6 +1396,7 @@ impl ScriptHost {
             profile.messages = started.elapsed();
             let started = Instant::now();
             self.deliver_physics_events(world, time);
+            self.deliver_trigger_stays(world, time);
             profile.physics_events = started.elapsed();
             self.deliver_net_events(world, time);
         }
@@ -1776,6 +1780,36 @@ impl ScriptHost {
                     normal: -normal,
                 },
             );
+        }
+    }
+
+    /// `on_trigger_stay` для каждой активной пары триггера на кадре обновления. Вызов идёт по
+    /// снимку текущего шага, поэтому кадр входа тоже получает stay, а кадр выхода — нет. В отличие
+    /// от Unity, это по кадру, а не по подшагу физики.
+    fn deliver_trigger_stays(&mut self, world: &mut World, time: ScriptTime) {
+        let Ok(snapshot) = self.physics.borrow().shared_snapshot() else {
+            return;
+        };
+        for &(first, second) in snapshot.trigger_pairs() {
+            let (Some(first_object), Some(second_object)) = (
+                self.body_object(world, first),
+                self.body_object(world, second),
+            ) else {
+                continue;
+            };
+            for (object, other) in [(first_object, second_object), (second_object, first_object)] {
+                self.deliver_physics_event(
+                    world,
+                    time,
+                    object,
+                    ScriptPhysicsEvent {
+                        kind: ScriptPhysicsEventKind::TriggerStay,
+                        other,
+                        point: glam::Vec3::ZERO,
+                        normal: glam::Vec3::ZERO,
+                    },
+                );
+            }
         }
     }
 

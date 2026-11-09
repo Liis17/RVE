@@ -98,6 +98,10 @@ impl PreparedScene {
             settings.fixed_hz,
             settings.max_substeps as usize,
         )
+        .map(|mut desc| {
+            desc.collision_matrix = settings.collision_matrix.masks;
+            desc
+        })
         .and_then(|desc| desc.build())
         .map_err(|error| error.to_string())
     }

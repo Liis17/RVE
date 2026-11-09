@@ -5,19 +5,21 @@ use crate::lifecycle::{
 };
 use crate::lite::EventQueue;
 use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
-use crate::physics::PhysicsScriptState;
+use crate::physics::{BindingUpdate, PhysicsScriptState};
 use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
 };
 use engine_physics::{
-    BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
-    QueryHit, Ray,
+    BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, PrimitiveShape,
+    QueryFilter, QueryHit, QueryOverrides, Ray, Shape, character_controller_scaled,
+    object_world_transform, primitive_collider_shape,
 };
 use engine_scene::{
-    AnimationRequest, AudioRequest, CameraSettings, ComponentKind, LAYER_COUNT, LocalTransform,
+    AnimationRequest, AudioRequest, CameraSettings, CharacterControllerComponent,
+    ColliderComponent, ColliderShape, ComponentKind, LAYER_COUNT, LocalTransform,
     MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetMode, NetRequest,
-    NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId, PostProcessSettings, SERVER_PEER_ID,
-    World,
+    NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId, PostProcessSettings,
+    RigidBodyComponent, RigidBodyKind, SERVER_PEER_ID, World,
 };
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
@@ -213,6 +215,13 @@ pub(crate) struct ScriptTransaction {
     pending_grounded: HashMap<ObjectHandle, bool>,
     pending_collider_enabled: HashMap<BodyHandle, bool>,
     pending_pushes: HashMap<BodyHandle, PendingPush>,
+    /// Заявки компонентов физики; проверяются миром при коммите, затем применяются к нему.
+    pending_colliders: HashMap<ObjectHandle, ColliderComponent>,
+    pending_rigid_bodies: HashMap<ObjectHandle, RigidBodyComponent>,
+    pending_controllers: HashMap<ObjectHandle, CharacterControllerComponent>,
+    /// Изменения привязок физики (тип тела, контроллер), которые применяются после коммита.
+    pending_bindings: HashMap<ObjectHandle, BindingUpdate>,
+    pending_vertical: HashMap<ObjectHandle, f32>,
     pending_action_mutations: Vec<ActionMutation>,
     /// Курсор, применённый хостом; меняется только при успешном commit.
     cursor: ScriptCursor,
@@ -278,6 +287,11 @@ impl Default for ScriptTransaction {
             pending_grounded: HashMap::new(),
             pending_collider_enabled: HashMap::new(),
             pending_pushes: HashMap::new(),
+            pending_colliders: HashMap::new(),
+            pending_rigid_bodies: HashMap::new(),
+            pending_controllers: HashMap::new(),
+            pending_bindings: HashMap::new(),
+            pending_vertical: HashMap::new(),
             pending_action_mutations: Vec::with_capacity(2),
             cursor: ScriptCursor::default(),
             pending_cursor_visible: None,
@@ -332,6 +346,7 @@ impl ScriptTransaction {
         self.pending_grounded.clear();
         self.pending_collider_enabled.clear();
         self.pending_pushes.clear();
+        self.clear_component_writes();
         self.pending_bytes = 0;
         self.queued_message_count = init.queued_messages.0;
         self.queued_message_bytes = init.queued_messages.1;
@@ -650,6 +665,7 @@ impl ScriptTransaction {
                 QueryFilter {
                     ignore,
                     include_triggers,
+                    layer_mask: u32::MAX,
                 },
                 &excluded,
                 &overrides,
@@ -748,8 +764,11 @@ impl ScriptTransaction {
             return Err("character displacement must be finite".to_owned());
         }
         let binding = self.physics.borrow().binding(object)?;
-        let controller = binding
-            .character_controller
+        let controller = self
+            .pending_bindings
+            .get(&object)
+            .and_then(|update| update.controller)
+            .or(binding.character_controller)
             .ok_or_else(|| "object does not have a character controller".to_owned())?;
         let mut transform = self
             .local_transform(object)
@@ -865,6 +884,392 @@ impl ScriptTransaction {
             return Ok(*enabled);
         }
         self.physics.borrow().collider_enabled(binding.body)
+    }
+
+    /// Подключает снимок физики без привязок; нужен тестам, которые проверяют наличие callbacks.
+    #[cfg(test)]
+    pub(crate) fn attach_physics_for_tests(
+        &mut self,
+        snapshot: std::sync::Arc<engine_physics::QuerySnapshot>,
+    ) {
+        self.physics.borrow_mut().set_snapshot(snapshot, &[]);
+    }
+
+    fn require_writable(&self, action: &str) -> Result<(), String> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(format!(
+                "{action} is only available during writable script callbacks"
+            ))
+        }
+    }
+
+    fn clear_component_writes(&mut self) {
+        self.pending_colliders.clear();
+        self.pending_rigid_bodies.clear();
+        self.pending_controllers.clear();
+        self.pending_bindings.clear();
+        self.pending_vertical.clear();
+    }
+
+    fn has_component_writes(&self) -> bool {
+        !(self.pending_colliders.is_empty()
+            && self.pending_rigid_bodies.is_empty()
+            && self.pending_controllers.is_empty())
+    }
+
+    /// Коллайдер с учётом заявок этого вызова.
+    pub(crate) fn collider_component(
+        &self,
+        object: ObjectHandle,
+    ) -> Result<ColliderComponent, String> {
+        if let Some(collider) = self.pending_colliders.get(&object) {
+            return Ok(collider.clone());
+        }
+        self.world()
+            .and_then(|world| world.object(object))
+            .and_then(|object| object.collider.clone())
+            .ok_or_else(|| "object has no collider".to_owned())
+    }
+
+    /// Заменяет коллайдер существующего объекта. Форма и смещение запекаются по масштабу объекта,
+    /// как при загрузке сцены; trigger меняется отдельной командой, чтобы пары дали нужные события.
+    pub(crate) fn set_collider_component(
+        &mut self,
+        object: ObjectHandle,
+        collider: ColliderComponent,
+    ) -> Result<(), String> {
+        self.require_writable("collider changes")?;
+        let body = self.physics.borrow().binding(object)?.body;
+        let previous_trigger = self.collider_component(object)?.trigger;
+        let world = self.world().ok_or("collider changes need a live world")?;
+        let scale = object_world_transform(world, object)
+            .map_err(|error| error.to_string())?
+            .scale;
+        let shape =
+            primitive_collider_shape(collider.clone(), scale).map_err(|error| error.to_string())?;
+        let shape = PrimitiveShape::from_shape(&shape)
+            .ok_or_else(|| "collider must be a box, sphere or capsule".to_owned())?;
+        let offset = Vec3::from_array(collider.offset) * scale;
+        if !offset.is_finite() {
+            return Err("collider offset must be finite".to_owned());
+        }
+        self.pending_physics_commands
+            .push(PhysicsCommand::SetCollider {
+                body,
+                shape,
+                offset,
+            });
+        if collider.trigger != previous_trigger {
+            self.pending_physics_commands
+                .push(PhysicsCommand::SetTrigger {
+                    body,
+                    trigger: collider.trigger,
+                });
+        }
+        self.pending_colliders.insert(object, collider);
+        Ok(())
+    }
+
+    pub(crate) fn rigid_body_component(
+        &self,
+        object: ObjectHandle,
+    ) -> Result<RigidBodyComponent, String> {
+        if let Some(body) = self.pending_rigid_bodies.get(&object) {
+            return Ok(*body);
+        }
+        self.world()
+            .and_then(|world| world.object(object))
+            .and_then(|object| object.rigid_body)
+            .ok_or_else(|| "object has no rigid body".to_owned())
+    }
+
+    /// Заменяет rigid body существующего объекта. Невалидные значения отклоняются до команды, потому
+    /// что физический шаг не должен получать тело, которое не может создать.
+    pub(crate) fn set_rigid_body_component(
+        &mut self,
+        object: ObjectHandle,
+        component: RigidBodyComponent,
+    ) -> Result<(), String> {
+        self.require_writable("rigid body changes")?;
+        let binding = self.physics.borrow().binding(object)?;
+        let kind = match component.kind {
+            RigidBodyKind::Static => BodyKind::Static,
+            RigidBodyKind::Kinematic => BodyKind::Kinematic,
+            RigidBodyKind::Dynamic => BodyKind::Dynamic,
+        };
+        let finite = [
+            component.mass,
+            component.linear_damping,
+            component.angular_damping,
+            component.gravity_scale,
+        ]
+        .into_iter()
+        .all(f32::is_finite);
+        if !finite
+            || component.linear_damping < 0.0
+            || component.angular_damping < 0.0
+            || (kind == BodyKind::Dynamic && component.mass <= 0.0)
+        {
+            return Err(
+                "rigid body values must be finite, damping >= 0 and dynamic mass > 0".to_owned(),
+            );
+        }
+        if binding.character_controller.is_some() && kind != BodyKind::Kinematic {
+            return Err("character controller body must stay kinematic".to_owned());
+        }
+        if kind == BodyKind::Dynamic {
+            let collider = self.collider_component(object)?;
+            if collider.shape == ColliderShape::TriangleMesh {
+                return Err("dynamic rigid body cannot use a triangle mesh collider".to_owned());
+            }
+            let parent = self
+                .world()
+                .and_then(|world| world.object(object))
+                .and_then(|o| o.parent);
+            if parent.is_some() {
+                return Err("dynamic rigid body must be a root object".to_owned());
+            }
+        }
+        self.pending_physics_commands
+            .push(PhysicsCommand::SetBodyProperties {
+                body: binding.body,
+                kind,
+                mass: component.mass,
+                linear_damping: component.linear_damping,
+                angular_damping: component.angular_damping,
+                gravity_scale: component.gravity_scale,
+                lock_rotation: component.lock_rotation,
+            });
+        self.pending_rigid_bodies.insert(object, component);
+        self.pending_bindings.entry(object).or_default().kind = Some(kind);
+        Ok(())
+    }
+
+    pub(crate) fn controller_component(
+        &self,
+        object: ObjectHandle,
+    ) -> Result<CharacterControllerComponent, String> {
+        if let Some(controller) = self.pending_controllers.get(&object) {
+            return Ok(*controller);
+        }
+        self.world()
+            .and_then(|world| world.object(object))
+            .and_then(|object| object.character_controller)
+            .ok_or_else(|| "object does not have a character controller".to_owned())
+    }
+
+    /// Заменяет параметры контроллера. Радиус и высота меняют капсулу командой `SetCollider`.
+    pub(crate) fn set_controller_component(
+        &mut self,
+        object: ObjectHandle,
+        component: CharacterControllerComponent,
+    ) -> Result<(), String> {
+        self.require_writable("character controller changes")?;
+        let binding = self.physics.borrow().binding(object)?;
+        if binding.character_controller.is_none() {
+            return Err("object does not have a character controller".to_owned());
+        }
+        let world = self.world().ok_or("controller changes need a live world")?;
+        let scale = object_world_transform(world, object)
+            .map_err(|error| error.to_string())?
+            .scale;
+        let controller =
+            character_controller_scaled(component, scale).map_err(|error| error.to_string())?;
+        let capsule = controller.capsule().map_err(|error| error.to_string())?;
+        let shape = PrimitiveShape::from_shape(&capsule)
+            .ok_or_else(|| "character capsule must be a capsule".to_owned())?;
+        self.pending_physics_commands
+            .push(PhysicsCommand::SetCollider {
+                body: binding.body,
+                shape,
+                offset: Vec3::ZERO,
+            });
+        self.pending_controllers.insert(object, component);
+        self.pending_bindings.entry(object).or_default().controller = Some(controller);
+        Ok(())
+    }
+
+    /// Вертикальная скорость контроллера с учётом заявок этого вызова.
+    pub(crate) fn vertical_velocity(&self, object: ObjectHandle) -> Result<f32, String> {
+        self.controller_component(object)?;
+        if let Some(vertical) = self.pending_vertical.get(&object) {
+            return Ok(*vertical);
+        }
+        Ok(self.physics.borrow().vertical_velocity(object))
+    }
+
+    fn gravity(&self) -> Result<Vec3, String> {
+        let physics = self.physics.borrow();
+        Ok(physics.snapshot()?.gravity())
+    }
+
+    /// Горизонтальное движение по `velocity.x/z` с гравитацией контроллера. Вертикальная скорость
+    /// хранится хостом; `velocity.y` не используется, прыжок задаёт `jump`.
+    pub(crate) fn simple_move(
+        &mut self,
+        object: ObjectHandle,
+        velocity: Vec3,
+    ) -> Result<CharacterMoveResult, String> {
+        if !velocity.is_finite() {
+            return Err("character velocity must be finite".to_owned());
+        }
+        let dt = self
+            .physics_phase_dt
+            .filter(|dt| dt.is_finite() && *dt > 0.0)
+            .ok_or_else(|| "simple_move is only available during update".to_owned())?;
+        let settings = self.controller_component(object)?;
+        let mut vertical = self.vertical_velocity(object)?;
+        if settings.use_gravity {
+            let gravity = self.gravity()?;
+            if self.is_grounded(object)? && vertical < 0.0 {
+                vertical = 0.0;
+            }
+            vertical += gravity.y * settings.gravity_scale * dt;
+        } else {
+            vertical = 0.0;
+        }
+        let displacement = Vec3::new(velocity.x, 0.0, velocity.z) * dt + Vec3::Y * (vertical * dt);
+        let result = self.move_character(object, displacement)?;
+        if result.grounded && vertical < 0.0 {
+            vertical = 0.0;
+        }
+        self.pending_vertical.insert(object, vertical);
+        Ok(result)
+    }
+
+    /// Прыжок с земли: `v = sqrt(2·g·h)`. Возвращает `false`, если контроллер не на земле.
+    pub(crate) fn jump(&mut self, object: ObjectHandle) -> Result<bool, String> {
+        self.require_writable("jump")?;
+        let settings = self.controller_component(object)?;
+        if !settings.use_gravity {
+            return Err("jump requires use_gravity on the character controller".to_owned());
+        }
+        if !self.is_grounded(object)? {
+            return Ok(false);
+        }
+        let gravity = self.gravity()?;
+        let weight = (-gravity.y * settings.gravity_scale).max(0.0);
+        let speed = (2.0 * weight * settings.jump_height).sqrt();
+        self.pending_vertical.insert(object, speed);
+        Ok(true)
+    }
+
+    /// Объекты, которые пересекаются с триггером или контроллером `object` по активным парам.
+    pub(crate) fn overlaps(&self, object: ObjectHandle) -> Result<Vec<ObjectHandle>, String> {
+        let physics = self.physics.borrow();
+        let body = physics.binding(object)?.body;
+        let snapshot = physics.snapshot()?;
+        Ok(snapshot
+            .trigger_pairs()
+            .iter()
+            .filter_map(|(first, second)| {
+                let other = if *first == body {
+                    *second
+                } else if *second == body {
+                    *first
+                } else {
+                    return None;
+                };
+                physics.object(other)
+            })
+            .collect())
+    }
+
+    fn query_parts(&self, filter: &ScriptQueryFilter) -> Result<QueryParts, String> {
+        let physics = self.physics.borrow();
+        let snapshot = physics.shared_snapshot()?;
+        let excluded = filter
+            .ignore
+            .iter()
+            .filter_map(|object| {
+                physics
+                    .optional_binding(*object)
+                    .map(|binding| binding.body)
+            })
+            .collect();
+        let mut overrides = physics.enabled_overrides();
+        overrides.extend(
+            self.pending_collider_enabled
+                .iter()
+                .map(|(body, enabled)| (*body, *enabled)),
+        );
+        let overrides = merge_enabled_overrides(overrides);
+        let query = QueryFilter {
+            ignore: None,
+            include_triggers: filter.include_triggers,
+            layer_mask: filter.layer_mask,
+        };
+        Ok((snapshot, query, excluded, overrides))
+    }
+
+    /// Объекты, чьи коллайдеры пересекают выпуклую форму в позе `pose`.
+    pub(crate) fn overlap_shape(
+        &self,
+        shape: &Shape,
+        pose: Pose,
+        filter: &ScriptQueryFilter,
+    ) -> Result<Vec<ObjectHandle>, String> {
+        let (snapshot, query, excluded, overrides) = self.query_parts(filter)?;
+        let bodies = snapshot
+            .overlap(
+                shape,
+                pose,
+                query,
+                QueryOverrides {
+                    excluded: &excluded,
+                    enabled: &overrides,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(bodies
+            .into_iter()
+            .filter_map(|body| self.physics_object(body))
+            .collect())
+    }
+
+    /// Все первые попадания луча по коллайдерам, по возрастанию расстояния.
+    pub(crate) fn raycast_all(
+        &self,
+        ray: Ray,
+        filter: &ScriptQueryFilter,
+    ) -> Result<Vec<QueryHit>, String> {
+        let (snapshot, query, excluded, overrides) = self.query_parts(filter)?;
+        snapshot
+            .raycast_all(
+                &ray,
+                query,
+                QueryOverrides {
+                    excluded: &excluded,
+                    enabled: &overrides,
+                },
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn shape_cast(
+        &self,
+        shape: &Shape,
+        pose: Pose,
+        displacement: Vec3,
+        skin: f32,
+        filter: &ScriptQueryFilter,
+    ) -> Result<Option<QueryHit>, String> {
+        let (snapshot, query, excluded, overrides) = self.query_parts(filter)?;
+        snapshot
+            .shape_cast_with_overrides(
+                shape,
+                pose,
+                displacement,
+                skin,
+                query,
+                QueryOverrides {
+                    excluded: &excluded,
+                    enabled: &overrides,
+                },
+            )
+            .map_err(|error| error.to_string())
     }
 
     fn world(&self) -> Option<&World> {
@@ -1087,6 +1492,15 @@ impl ScriptTransaction {
         {
             return false;
         }
+        if let ObjectEdit::SetLayer { object, layer } = &edit
+            && let Some(binding) = self.physics.borrow().optional_binding(*object)
+        {
+            self.pending_physics_commands
+                .push(PhysicsCommand::SetLayer {
+                    body: binding.body,
+                    layer: u32::from(*layer),
+                });
+        }
         self.pending_edits.push(edit);
         true
     }
@@ -1099,15 +1513,18 @@ impl ScriptTransaction {
     /// порядке, что и коммит. Собственные трансформы объектов от этого не зависят. Смена активной
     /// камеры конфликтует только с активностью и родителем, поэтому сама копию не требует.
     fn probe_edits(&self, world: &World) -> Result<(), String> {
-        if self.pending_edits.is_empty() {
+        if self.pending_edits.is_empty() && !self.has_component_writes() {
             return Ok(());
         }
-        let local_only = self.pending_edits.iter().all(|edit| {
-            !matches!(
-                edit,
-                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
-            )
-        }) && self.pose_edits_are_local(world);
+        // Компоненты проверяет мир при записи, поэтому их заявки идут через копию мира.
+        let local_only = !self.has_component_writes()
+            && self.pending_edits.iter().all(|edit| {
+                !matches!(
+                    edit,
+                    ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
+                )
+            })
+            && self.pose_edits_are_local(world);
         if !local_only {
             let mut probe = world.clone();
             return self.apply_world_writes(&mut probe);
@@ -1177,6 +1594,21 @@ impl ScriptTransaction {
         for (handle, settings) in &self.pending_post_process {
             world
                 .set_post_process(*handle, *settings)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, collider) in &self.pending_colliders {
+            world
+                .set_collider(*handle, collider.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, body) in &self.pending_rigid_bodies {
+            world
+                .set_rigid_body(*handle, *body)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, controller) in &self.pending_controllers {
+            world
+                .set_character_controller(*handle, *controller)
                 .map_err(|error| error.to_string())?;
         }
         if let Some(handle) = self.pending_active_camera {
@@ -1706,11 +2138,18 @@ impl ScriptTransaction {
         }
         self.commit_lifecycle(events);
 
+        self.physics
+            .borrow_mut()
+            .apply_binding_updates(std::mem::take(&mut self.pending_bindings));
         self.physics.borrow_mut().commit(
             physics_commands,
             std::mem::take(&mut self.pending_grounded),
             std::mem::take(&mut self.pending_collider_enabled),
+            std::mem::take(&mut self.pending_vertical),
         );
+        self.pending_colliders.clear();
+        self.pending_rigid_bodies.clear();
+        self.pending_controllers.clear();
 
         if !self.pending_messages.is_empty() || self.overflowed_messages != 0 {
             let mut dropped = self.overflowed_messages;
@@ -1815,6 +2254,7 @@ impl ScriptTransaction {
         self.pending_grounded.clear();
         self.pending_collider_enabled.clear();
         self.pending_pushes.clear();
+        self.clear_component_writes();
         self.pending_bytes = 0;
         self.queued_message_count = 0;
         self.queued_message_bytes = 0;
@@ -1846,6 +2286,22 @@ fn merge_enabled_overrides(
     merged.into_iter().collect()
 }
 
+/// Снимок, фильтр и исключения тел, которые нужны любому запросу физики из скрипта.
+type QueryParts = (
+    std::sync::Arc<engine_physics::QuerySnapshot>,
+    QueryFilter,
+    Vec<BodyHandle>,
+    Vec<(BodyHandle, bool)>,
+);
+
+/// Фильтр запросов физики из скрипта: слои, триггеры и объекты-исключения.
+#[derive(Default)]
+pub(crate) struct ScriptQueryFilter {
+    pub(crate) layer_mask: u32,
+    pub(crate) include_triggers: bool,
+    pub(crate) ignore: Vec<ObjectHandle>,
+}
+
 fn physics_command_is_finite(command: PhysicsCommand) -> bool {
     match command {
         PhysicsCommand::SetVelocity { velocity, .. } => velocity.is_finite(),
@@ -1858,7 +2314,19 @@ fn physics_command_is_finite(command: PhysicsCommand) -> bool {
         PhysicsCommand::Teleport { pose, .. } | PhysicsCommand::KinematicTarget { pose, .. } => {
             pose.position.is_finite() && pose.rotation.is_finite()
         }
-        PhysicsCommand::SetColliderEnabled { .. } => true,
+        PhysicsCommand::SetColliderEnabled { .. }
+        | PhysicsCommand::SetTrigger { .. }
+        | PhysicsCommand::SetLayer { .. } => true,
+        PhysicsCommand::SetCollider { offset, .. } => offset.is_finite(),
+        PhysicsCommand::SetBodyProperties {
+            mass,
+            linear_damping,
+            angular_damping,
+            gravity_scale,
+            ..
+        } => [mass, linear_damping, angular_damping, gravity_scale]
+            .into_iter()
+            .all(f32::is_finite),
     }
 }
 

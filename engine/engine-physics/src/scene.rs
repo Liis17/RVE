@@ -545,6 +545,16 @@ pub fn primitive_collider_shape(
     }
 }
 
+/// Параметры character controller с размерами, запечёнными по масштабу объекта. Тот же расчёт,
+/// что у тела при загрузке сцены, поэтому смена параметров скриптом совпадает с построением.
+pub fn character_controller_scaled(
+    component: CharacterControllerComponent,
+    scale: Vec3,
+) -> Result<CharacterController, PhysicsSceneError> {
+    let radial_scale = scale.x.abs().max(scale.z.abs());
+    Ok(scale_character(component, radial_scale, scale)?)
+}
+
 /// Капсула character controller с размерами, запечёнными по масштабу объекта.
 pub fn character_capsule_shape(
     component: CharacterControllerComponent,

@@ -1,13 +1,15 @@
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
-    RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams,
-    RveCameraSettings, RveCharacterMoveResult, RveCursorState, RveGamepadState, RveHeader, RveHost,
-    RveModule, RveParamEntry, RveParams, RvePlayAnimationParams, RveRaycastHit, RveScriptDesc,
-    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_LOG_WARN, RVE_QUERY_BOX, RVE_QUERY_CAPSULE, RVE_QUERY_SPHERE, RVE_SCRIPT_ABI_VERSION,
+    RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams, RveCameraSettings,
+    RveCharacterMoveResult, RveCursorState, RveGamepadState, RveHeader, RveHost, RveModule,
+    RveParamEntry, RveParams, RvePlayAnimationParams, RveQueryOptions, RveQueryShape,
+    RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use crate::{
     AntiAliasing, CameraSettings, ConsoleLevel, Context, GamepadAxis, GamepadButton, GamepadState,
-    GamepadStick, Key, MouseButton, Object, Params, PhysicalInput, Script, Tonemapper, Value,
+    GamepadStick, Key, MouseButton, Object, Params, PhysicalInput, QueryOptions, Script,
+    Tonemapper, Value,
 };
 use std::ffi::c_void;
 
@@ -202,6 +204,7 @@ struct HostState {
     physics_velocity: [f32; 3],
     physics_enabled: bool,
     physics_vectors: Vec<(u64, [f32; 3])>,
+    physics_query_calls: Vec<String>,
     cursor_visible: bool,
     cursor_locked: bool,
     audio_calls: Vec<String>,
@@ -569,6 +572,19 @@ fn host(state: &mut HostState) -> RveHost {
         find_objects_by_tag: None,
         script_set_enabled: None,
         script_enabled: None,
+        physics_get_collider: None,
+        physics_set_collider: None,
+        physics_get_rigid_body: None,
+        physics_set_rigid_body: None,
+        physics_get_controller: None,
+        physics_set_controller: None,
+        physics_simple_move: None,
+        physics_jump: None,
+        physics_vertical_velocity: None,
+        physics_overlaps: None,
+        physics_overlap: None,
+        physics_raycast_all: None,
+        physics_shape_cast: None,
     }
 }
 
@@ -679,6 +695,74 @@ unsafe extern "C" fn physics_get_enabled(ctx: *mut c_void, _: u64, out: *mut boo
     true
 }
 
+unsafe extern "C" fn physics_overlap_query(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    options: *const RveQueryOptions,
+    _: *mut u64,
+    _: usize,
+    count: *mut usize,
+) -> bool {
+    if shape.is_null() || center.is_null() || options.is_null() || count.is_null() {
+        return false;
+    }
+    // SAFETY: pointers are valid for this host callback and optional ignore storage is borrowed.
+    let (shape, center, options) = unsafe { (*shape, *center, *options) };
+    let ignored = if options.ignore_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(options.ignore, options.ignore_count) }.to_vec()
+    };
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.physics_query_calls.push(format!(
+        "overlap:{}:{:?}:{:?}:{}:{}:{}:{ignored:?}",
+        shape.kind, shape.size, center, shape.radius, options.layer_mask, options.include_triggers
+    ));
+    unsafe { *count = 0 };
+    true
+}
+
+unsafe extern "C" fn physics_shape_cast_query(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    displacement: *const [f32; 3],
+    skin: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+) -> bool {
+    if shape.is_null()
+        || center.is_null()
+        || displacement.is_null()
+        || options.is_null()
+        || out.is_null()
+    {
+        return false;
+    }
+    // SAFETY: pointers are valid for this host callback and optional ignore storage is borrowed.
+    let (shape, center, displacement, options) =
+        unsafe { (*shape, *center, *displacement, *options) };
+    let ignored = if options.ignore_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(options.ignore, options.ignore_count) }.to_vec()
+    };
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.physics_query_calls.push(format!(
+        "cast:{}:{:?}:{:?}:{:?}:{}:{}:{}:{ignored:?}",
+        shape.kind,
+        shape.size,
+        center,
+        displacement,
+        skin,
+        options.layer_mask,
+        options.include_triggers
+    ));
+    unsafe { *out = RveRaycastHit::default() };
+    true
+}
+
 fn physics_host(state: &mut HostState) -> RveHost {
     let mut host = host(state);
     host.raycast = Some(physics_raycast);
@@ -690,6 +774,8 @@ fn physics_host(state: &mut HostState) -> RveHost {
     host.is_grounded = Some(physics_get_grounded);
     host.set_collider_enabled = Some(physics_set_enabled);
     host.is_collider_enabled = Some(physics_get_enabled);
+    host.physics_overlap = Some(physics_overlap_query);
+    host.physics_shape_cast = Some(physics_shape_cast_query);
     host
 }
 
@@ -889,6 +975,99 @@ fn sdk_physics_api_reports_absent_optional_callbacks() {
     assert_eq!(
         object.set_velocity(&mut context, [0.0; 3]),
         Err(crate::PhysicsError::Unavailable)
+    );
+}
+
+#[test]
+fn sdk_named_shape_queries_forward_the_requested_shapes_and_filters() {
+    let mut state = HostState::default();
+    let host = physics_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let ignored = [context.find("camera").unwrap()];
+    let options = QueryOptions {
+        layer_mask: 1 << 3,
+        include_triggers: true,
+        ignore: &ignored,
+    };
+    let physics = context.physics();
+
+    assert!(
+        physics
+            .overlap_sphere([1.0, 2.0, 3.0], 0.5, options)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        physics
+            .overlap_box([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], options)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        physics
+            .overlap_capsule([1.0, 2.0, 3.0], 0.5, 2.0, options)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        physics
+            .sphere_cast([1.0, 2.0, 3.0], 0.5, [7.0, 8.0, 9.0], 0.03, options)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        physics
+            .box_cast(
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [7.0, 8.0, 9.0],
+                0.03,
+                options
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        physics
+            .capsule_cast([1.0, 2.0, 3.0], 0.5, 2.0, [7.0, 8.0, 9.0], 0.03, options)
+            .unwrap()
+            .is_none()
+    );
+
+    let sphere_overlap = format!(
+        "overlap:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:0.5:8:true:[1]",
+        RVE_QUERY_SPHERE
+    );
+    let box_overlap = format!(
+        "overlap:{}:[4.0, 5.0, 6.0]:[1.0, 2.0, 3.0]:0:8:true:[1]",
+        RVE_QUERY_BOX
+    );
+    let capsule_overlap = format!(
+        "overlap:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:0.5:8:true:[1]",
+        RVE_QUERY_CAPSULE
+    );
+    assert_eq!(
+        state.physics_query_calls,
+        [
+            sphere_overlap.clone(),
+            sphere_overlap,
+            box_overlap.clone(),
+            box_overlap,
+            capsule_overlap.clone(),
+            capsule_overlap,
+            format!(
+                "cast:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:[7.0, 8.0, 9.0]:0.03:8:true:[1]",
+                RVE_QUERY_SPHERE
+            ),
+            format!(
+                "cast:{}:[4.0, 5.0, 6.0]:[1.0, 2.0, 3.0]:[7.0, 8.0, 9.0]:0.03:8:true:[1]",
+                RVE_QUERY_BOX
+            ),
+            format!(
+                "cast:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:[7.0, 8.0, 9.0]:0.03:8:true:[1]",
+                RVE_QUERY_CAPSULE
+            ),
+        ]
     );
 }
 
@@ -2022,7 +2201,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2292,7 +2471,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
 }
 
 #[test]
@@ -2325,7 +2504,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDesc>(),
         size_of::<crate::abi::RveScriptDescV14>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 16);
 }
 
 #[test]
@@ -2336,9 +2515,30 @@ fn object_hierarchy_callbacks_are_appended_after_the_v14_network_tail() {
         offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
     );
     assert_eq!(
-        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>(),
+        offset_of!(RveHost, physics_get_collider),
+        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, physics_shape_cast)
+            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>(),
         size_of::<RveHost>()
     );
+}
+
+#[test]
+fn runtime_physics_value_types_are_c_layout_in_v16() {
+    use crate::abi::{
+        RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
+    };
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<RveColliderValue>(), 40);
+    assert_eq!(offset_of!(RveColliderValue, size), 8);
+    assert_eq!(offset_of!(RveColliderValue, offset), 28);
+    assert_eq!(size_of::<RveRigidBodyValue>(), 24);
+    assert_eq!(size_of::<RveControllerValue>(), 40);
+    assert_eq!(size_of::<RveQueryShape>(), 24);
+    assert_eq!(offset_of!(RveQueryOptions, ignore), 8);
+    assert_eq!(size_of::<RveQueryOptions>(), 24);
 }
 
 unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {

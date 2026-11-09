@@ -163,6 +163,16 @@ pub enum PrimitiveShape {
 }
 
 impl PrimitiveShape {
+    /// Примитив, из которого построена форма; `None` для выпуклых оболочек и mesh.
+    pub fn from_shape(shape: &Shape) -> Option<Self> {
+        match *shape {
+            Shape::Box { half_extents } => Some(Self::Box { half_extents }),
+            Shape::Sphere { radius } => Some(Self::Sphere { radius }),
+            Shape::Capsule { radius, height } => Some(Self::Capsule { radius, height }),
+            _ => None,
+        }
+    }
+
     pub fn to_shape(self) -> Result<Shape, GeometryError> {
         match self {
             Self::Box { half_extents } => Shape::cuboid(half_extents),
@@ -666,6 +676,7 @@ impl PhysicsWorld {
         Ok(Arc::new(QuerySnapshot::from_colliders(
             colliders,
             trigger_pairs,
+            self.gravity,
         )?))
     }
 

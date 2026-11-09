@@ -1570,6 +1570,42 @@ fn v14_module() -> &'static RveModule {
     }))
 }
 
+/// Модуль ABI v15: тот же descriptor, что у v16; новые callbacks v16 хост не предлагает.
+fn v15_module() -> &'static RveModule {
+    let current = sdk_module();
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 15,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: current.scripts,
+        script_count: current.script_count,
+    }))
+}
+
+#[test]
+fn abi_v15_modules_load_on_the_v16_host() {
+    let _lock = test_lock();
+    let module = v15_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v15" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v15"),
+        "guest ABI v15 runs on the v16 host"
+    );
+}
+
 #[test]
 fn abi_v14_modules_load_on_the_v15_host_without_enable_callbacks() {
     let _lock = test_lock();

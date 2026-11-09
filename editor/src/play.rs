@@ -700,7 +700,7 @@ impl PlaySession {
         }
         watchdog.set_deadline(None);
         host.set_cursor(ScriptCursor::from(world.active_camera_cursor()));
-        let desc = PhysicsSceneDesc::from_world(
+        let mut desc = PhysicsSceneDesc::from_world(
             &world,
             &model_geometry,
             glam::Vec3::from_array(physics_settings.gravity),
@@ -708,6 +708,7 @@ impl PlaySession {
             physics_settings.max_substeps as usize,
         )
         .map_err(|error| error.to_string())?;
+        desc.collision_matrix = physics_settings.collision_matrix.masks;
         let (driver, bindings) = desc.build().map_err(|error| error.to_string())?;
         let (physics, initial_snapshot) =
             PlayPhysics::start(&world, driver, bindings, model_geometry)?;

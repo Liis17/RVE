@@ -24,6 +24,7 @@ mod parity;
 
 #[path = "tests/activity.rs"]
 mod activity;
+mod script_physics;
 
 fn world(source: &str) -> World {
     let source = if source.contains("[objects.camera]") {

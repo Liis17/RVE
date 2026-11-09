@@ -15,6 +15,8 @@ pub struct TagsLayersDraft {
     layers: Vec<String>,
     saved_tags: Vec<String>,
     saved_layers: Vec<String>,
+    masks: [u32; MAX_LAYERS],
+    saved_masks: [u32; MAX_LAYERS],
     /// Причина последнего неудачного сохранения; сбрасывается при следующем сохранении или откате.
     pub error: Option<String>,
 }
@@ -28,6 +30,8 @@ impl TagsLayersDraft {
             layers: settings.layers.names.clone(),
             saved_tags: settings.tags.names.clone(),
             saved_layers: settings.layers.names.clone(),
+            masks: settings.physics.collision_matrix.masks,
+            saved_masks: settings.physics.collision_matrix.masks,
             error: None,
         }
     }
@@ -42,6 +46,26 @@ impl TagsLayersDraft {
 
     pub fn layers_mut(&mut self) -> &mut Vec<String> {
         &mut self.layers
+    }
+
+    pub fn layers(&self) -> &[String] {
+        &self.layers
+    }
+
+    /// Сталкиваются ли слои `first` и `second`: обе маски должны разрешать пару.
+    pub fn pair_enabled(&self, first: usize, second: usize) -> bool {
+        (self.masks[first] >> second) & 1 != 0 && (self.masks[second] >> first) & 1 != 0
+    }
+
+    /// Разрешает или запрещает пару симметрично, чтобы обе маски оставались согласованными.
+    pub fn set_pair(&mut self, first: usize, second: usize, enabled: bool) {
+        for (row, column) in [(first, second), (second, first)] {
+            if enabled {
+                self.masks[row] |= 1 << column;
+            } else {
+                self.masks[row] &= !(1 << column);
+            }
+        }
     }
 
     /// Удаляет тег из списка и возвращает его имя. Объекты сцены с этим тегом сохраняют значение,
@@ -63,13 +87,16 @@ impl TagsLayersDraft {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.tags != self.saved_tags || self.layers != self.saved_layers
+        self.tags != self.saved_tags
+            || self.layers != self.saved_layers
+            || self.masks != self.saved_masks
     }
 
-    /// Возвращает списки к сохранённым значениям.
+    /// Возвращает списки и матрицу к сохранённым значениям.
     pub fn revert(&mut self) {
         self.tags = self.saved_tags.clone();
         self.layers = self.saved_layers.clone();
+        self.masks = self.saved_masks;
         self.error = None;
     }
 
@@ -80,6 +107,7 @@ impl TagsLayersDraft {
         let mut next = settings.clone();
         next.tags.names = self.tags.clone();
         next.layers.names = self.layers.clone();
+        next.physics.collision_matrix.masks = self.masks;
         let text = next
             .to_toml()
             .inspect_err(|error| self.error = Some(error.clone()))?;
@@ -93,6 +121,7 @@ impl TagsLayersDraft {
         })?;
         self.saved_tags = self.tags.clone();
         self.saved_layers = self.layers.clone();
+        self.saved_masks = self.masks;
         self.error = None;
         Ok(next)
     }
@@ -270,5 +299,37 @@ mod tests {
         assert_eq!(draft.remove_tag(0).as_deref(), Some("Player"));
         assert_eq!(draft.tags_mut().clone(), ["Enemy"]);
         assert_eq!(draft.remove_tag(5), None);
+    }
+
+    #[test]
+    fn collision_matrix_pairs_are_symmetric_saved_and_revertible() {
+        let temp = TempProject::new("matrix");
+        std::fs::write(temp.0.join("project.rveproject"), PROJECT).unwrap();
+        let mut draft = TagsLayersDraft::open(&temp.0, &settings());
+        assert!(draft.pair_enabled(0, 1), "default is all pairs");
+        assert!(!draft.is_dirty());
+
+        draft.set_pair(0, 1, false);
+        assert!(!draft.pair_enabled(0, 1));
+        assert!(
+            !draft.pair_enabled(1, 0),
+            "the pair is cleared on both sides"
+        );
+        assert!(draft.is_dirty());
+
+        draft.revert();
+        assert!(draft.pair_enabled(0, 1));
+        assert!(!draft.is_dirty());
+
+        draft.set_pair(2, 3, false);
+        let saved = draft.save(&settings()).unwrap();
+        let reloaded = ProjectSettings::load(temp.0.join("project.rveproject")).unwrap();
+        assert_eq!(
+            reloaded.physics.collision_matrix,
+            saved.physics.collision_matrix
+        );
+        assert_ne!(reloaded.physics.collision_matrix.masks[2], u32::MAX);
+        assert_eq!(reloaded.physics.collision_matrix.masks[2] & (1 << 3), 0);
+        assert_eq!(reloaded.physics.collision_matrix.masks[3] & (1 << 2), 0);
     }
 }

@@ -34,6 +34,19 @@ enum HostCapability {
     Components,
     ScriptSetEnabled,
     ScriptEnabled,
+    GetCollider,
+    SetCollider,
+    GetRigidBody,
+    SetRigidBody,
+    GetController,
+    SetController,
+    SimpleMove,
+    Jump,
+    VerticalVelocity,
+    Overlaps,
+    PhysicsOverlap,
+    PhysicsRaycastAll,
+    PhysicsShapeCast,
 }
 
 // Add each script-facing capability to this shared inventory so Lua and ABI stay in parity.
@@ -87,6 +100,27 @@ const CAPABILITIES: &[(&str, &str, HostCapability)] = &[
     ("object", "components", HostCapability::Components),
     ("script", "set_enabled", HostCapability::ScriptSetEnabled),
     ("script", "enabled", HostCapability::ScriptEnabled),
+    ("object", "get_collider", HostCapability::GetCollider),
+    ("object", "set_collider", HostCapability::SetCollider),
+    ("object", "get_rigid_body", HostCapability::GetRigidBody),
+    ("object", "set_rigid_body", HostCapability::SetRigidBody),
+    ("object", "get_controller", HostCapability::GetController),
+    ("object", "set_controller", HostCapability::SetController),
+    ("object", "simple_move", HostCapability::SimpleMove),
+    ("object", "jump", HostCapability::Jump),
+    (
+        "object",
+        "vertical_velocity",
+        HostCapability::VerticalVelocity,
+    ),
+    ("object", "get_overlaps", HostCapability::Overlaps),
+    ("physics", "overlap_sphere", HostCapability::PhysicsOverlap),
+    ("physics", "overlap_box", HostCapability::PhysicsOverlap),
+    ("physics", "overlap_capsule", HostCapability::PhysicsOverlap),
+    ("physics", "raycast_all", HostCapability::PhysicsRaycastAll),
+    ("physics", "sphere_cast", HostCapability::PhysicsShapeCast),
+    ("physics", "box_cast", HostCapability::PhysicsShapeCast),
+    ("physics", "capsule_cast", HostCapability::PhysicsShapeCast),
 ];
 
 #[test]
@@ -122,6 +156,11 @@ path = "/api.lua"
     assert_eq!(object.get::<String>("name").unwrap(), "Parity Camera");
     let events = Rc::new(RefCell::new(ScriptEventQueue::default()));
     let mut transaction = ScriptTransaction::default();
+    // Physics callbacks exist only while a physics snapshot is attached.
+    let snapshot = engine_physics::PhysicsWorld::default()
+        .query_snapshot()
+        .unwrap();
+    transaction.attach_physics_for_tests(snapshot);
     let mut call = AbiCallContext::new(0, &mut transaction, &events, "scene");
     let abi = call.host(ScriptTime::default());
     for (table, name, capability) in CAPABILITIES {
@@ -129,6 +168,7 @@ path = "/api.lua"
             "rve" => rve.get(*name).unwrap(),
             "object" => object.get(*name).unwrap(),
             "script" => script.get(*name).unwrap(),
+            "physics" => rve.get::<Table>("physics").unwrap().get(*name).unwrap(),
             _ => unreachable!(),
         };
         assert!(
@@ -163,6 +203,19 @@ path = "/api.lua"
             }
             HostCapability::ScriptSetEnabled => abi.script_set_enabled.is_some(),
             HostCapability::ScriptEnabled => abi.script_enabled.is_some(),
+            HostCapability::GetCollider => abi.physics_get_collider.is_some(),
+            HostCapability::SetCollider => abi.physics_set_collider.is_some(),
+            HostCapability::GetRigidBody => abi.physics_get_rigid_body.is_some(),
+            HostCapability::SetRigidBody => abi.physics_set_rigid_body.is_some(),
+            HostCapability::GetController => abi.physics_get_controller.is_some(),
+            HostCapability::SetController => abi.physics_set_controller.is_some(),
+            HostCapability::SimpleMove => abi.physics_simple_move.is_some(),
+            HostCapability::Jump => abi.physics_jump.is_some(),
+            HostCapability::VerticalVelocity => abi.physics_vertical_velocity.is_some(),
+            HostCapability::Overlaps => abi.physics_overlaps.is_some(),
+            HostCapability::PhysicsOverlap => abi.physics_overlap.is_some(),
+            HostCapability::PhysicsRaycastAll => abi.physics_raycast_all.is_some(),
+            HostCapability::PhysicsShapeCast => abi.physics_shape_cast.is_some(),
         };
         assert!(available, "ABI callback missing for {table}.{name}");
     }

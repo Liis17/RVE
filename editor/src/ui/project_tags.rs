@@ -79,6 +79,40 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         commands.push(Command::AddLayer);
     }
 
+    ui.separator();
+    ui.strong("Collision Matrix");
+    ui.label("Пара слоёв сталкивается, если отмечена в обе стороны. По умолчанию все со всеми.");
+    let named: Vec<usize> = draft
+        .layers()
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(index, _)| index)
+        .collect();
+    if named.is_empty() {
+        ui.label("Назначьте имена слоям, чтобы редактировать матрицу.");
+    } else {
+        egui::ScrollArea::both().max_height(360.0).show(ui, |ui| {
+            egui::Grid::new("collision_matrix").show(ui, |ui| {
+                ui.label("");
+                for &column in &named {
+                    ui.label(format!("{column}"));
+                }
+                ui.end_row();
+                for &row in &named {
+                    ui.label(format!("{row} {}", draft.layers()[row]));
+                    for &column in &named {
+                        let mut enabled = draft.pair_enabled(row, column);
+                        if ui.checkbox(&mut enabled, "").changed() {
+                            draft.set_pair(row, column, enabled);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+    }
+
     for command in commands {
         match command {
             Command::AddTag => {

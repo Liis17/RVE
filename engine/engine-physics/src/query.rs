@@ -116,6 +116,7 @@ pub struct QuerySnapshot {
     x_order: Vec<usize>,
     /// Активные пары триггера с хотя бы одним trigger-коллайдером; порядок по хендлам.
     trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
+    gravity: Vec3,
 }
 
 #[derive(Clone)]
@@ -202,6 +203,7 @@ impl QuerySnapshot {
     pub(crate) fn from_colliders(
         colliders: Vec<QueryCollider>,
         trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
+        gravity: Vec3,
     ) -> Result<Self, QueryError> {
         if colliders.len() > MAX_QUERY_CANDIDATES {
             return Err(QueryError::CandidateLimit);
@@ -219,12 +221,18 @@ impl QuerySnapshot {
             colliders,
             x_order,
             trigger_pairs,
+            gravity,
         })
     }
 
     /// Активные trigger-пары на момент снимка, по возрастанию ключа пары.
     pub fn trigger_pairs(&self) -> &[(BodyHandle, BodyHandle)] {
         &self.trigger_pairs
+    }
+
+    /// Гравитация мира на момент снимка; скрипты берут ее для собственной интеграции.
+    pub fn gravity(&self) -> Vec3 {
+        self.gravity
     }
 
     pub fn raycast(&self, ray: &Ray, filter: QueryFilter) -> Result<Option<QueryHit>, QueryError> {
