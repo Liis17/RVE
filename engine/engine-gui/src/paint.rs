@@ -79,6 +79,26 @@ pub struct UiPaint {
     pub atlas: Arc<FontAtlas>,
 }
 
+/// Картинка UI в premultiplied sRGB RGBA8: цвет умножен на альфу при загрузке.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiImageData {
+    pub size: [u32; 2],
+    pub rgba: Vec<u8>,
+}
+
+impl UiImageData {
+    /// Переводит straight-альфа RGBA8 в premultiplied в sRGB-значениях: так ожидает UI-текстура renderer.
+    pub fn premultiplied(size: [u32; 2], mut rgba: Vec<u8>) -> Self {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            let alpha = u32::from(pixel[3]);
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * alpha + 127) / 255) as u8;
+            }
+        }
+        Self { size, rgba }
+    }
+}
+
 /// Геометрия до тесселяции: фигуры тесселируются с финальным атласом, меши уже готовы.
 enum Piece {
     Shape(Shape),
@@ -861,6 +881,14 @@ mod tests {
     use super::*;
     use crate::document::UiDocument;
     use crate::events::UiValue;
+
+    #[test]
+    fn premultiplication_scales_color_by_alpha() {
+        let image = UiImageData::premultiplied([2, 1], vec![200, 100, 0, 255, 200, 100, 0, 0]);
+        assert_eq!(image.size, [2, 1]);
+        assert_eq!(&image.rgba[..4], &[200, 100, 0, 255]);
+        assert_eq!(&image.rgba[4..], &[0, 0, 0, 0]);
+    }
     use crate::input::UiInput;
     use crate::system::UiSystem;
 
