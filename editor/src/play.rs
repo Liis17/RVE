@@ -1401,6 +1401,18 @@ impl PlaySession {
                 .changes
                 .extend(physics.sync.remove_objects(&replacement.removed));
             physics.add_scene_geometry(model_geometry);
+            // Тела новых объектов привязываются при замене, как в рантайме: пробная сборка физики
+            // выше вызывает ту же вставку для тех же объектов, поэтому отказа здесь нет.
+            let inserted = physics
+                .sync
+                .insert_objects(
+                    &self.world,
+                    &replacement.added,
+                    &physics.geometry,
+                    &mut physics.shapes,
+                )
+                .expect("scene bodies were validated by the trial physics build");
+            physics.changes.extend(inserted);
         }
         self.pending_ui_images
             .push((format!("play:scene:{path}"), prefabs.ui_images().clone()));
@@ -1411,53 +1423,20 @@ impl PlaySession {
         Ok(())
     }
 
-    /// Тела и звук объектов, добавленных заменой сцены. Удалённые уже обработаны в `apply_spawns`.
+    /// Звук объектов, добавленных заменой сцены. Их тела привязаны уже в `replace_scene`, удалённые
+    /// обработаны в `apply_spawns`.
     fn apply_scene_added(&mut self, added: &[ObjectHandle]) {
-        let live: Vec<ObjectHandle> = added
+        let requests: Vec<AudioRequest> = added
             .iter()
             .copied()
             .filter(|&object| self.world.is_alive(object))
-            .collect();
-        if let Some(physics) = &mut self.physics {
-            let fresh = physics.sync.unbound_objects(&live);
-            match physics.sync.insert_objects(
-                &self.world,
-                &fresh,
-                &physics.geometry,
-                &mut physics.shapes,
-            ) {
-                Ok(inserted) => physics.changes.extend(inserted),
-                Err(error) => {
-                    let roots: Vec<ObjectHandle> = live
-                        .iter()
-                        .copied()
-                        .filter(|&object| {
-                            self.world
-                                .object(object)
-                                .and_then(|scene_object| scene_object.parent)
-                                .is_none_or(|parent| !live.contains(&parent))
-                        })
-                        .collect();
-                    for root in roots {
-                        self.host.revert_spawn(
-                            &mut self.world,
-                            root,
-                            &format!("физика отклонила объекты сцены: {error}"),
-                        );
-                    }
-                    return;
-                }
-            }
-        }
-        let requests: Vec<AudioRequest> = live
-            .iter()
-            .filter(|&&object| {
+            .filter(|&object| {
                 self.world
                     .audio_source(object)
                     .is_some_and(|audio| audio.play_on_start)
                     && self.world.active_in_hierarchy(object) == Some(true)
             })
-            .map(|&object| AudioRequest::PlaySource {
+            .map(|object| AudioRequest::PlaySource {
                 object,
                 voice: VoiceId::allocate(),
             })

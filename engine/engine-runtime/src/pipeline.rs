@@ -34,7 +34,7 @@ use engine_gui::paint::UiPaint;
 use engine_network::SpawnedRoot;
 use engine_physics::{
     BodyChange, BodyHandle, ModelGeometry, PhysicsClient, PhysicsCommand, PhysicsInitialization,
-    PhysicsReceive, PhysicsSceneSync, PhysicsStepResult, ShapeCache,
+    PhysicsReceive, PhysicsSceneSync, PhysicsSceneSyncError, PhysicsStepResult, ShapeCache,
 };
 use engine_render::UiTextureId;
 use engine_render::{
@@ -1798,6 +1798,7 @@ fn scripts_thread(
             scripts: &mut scripts,
             gpu_scene: &mut gpu_scene,
             spawn_physics: &mut spawn_physics,
+            physics: physics_sync.as_mut(),
             prefabs: &mut prefab_loads,
             audio: audio.as_mut(),
             animation: &mut animation,
@@ -2047,6 +2048,19 @@ impl SpawnPhysics {
     /// Добавляет геометрию тяжёлого префаба. Путь, уже занятый сценой или другим префабом,
     /// не заменяется: содержимое одной модели одинаково.
     /// Геометрия моделей замены сцены. Без счётчика ссылок: её не выгружают тяжёлые префабы.
+    /// Вставляет тела объектов, добавленных заменой сцены. Пробная сборка физики сцены проверила
+    /// те же объекты до замены (`SceneLoader::prepare`), поэтому отказ здесь нарушает инвариант.
+    pub(crate) fn insert_scene_bodies(
+        &mut self,
+        sync: &mut PhysicsSceneSync,
+        world: &World,
+        objects: &[ObjectHandle],
+    ) -> Result<(), PhysicsSceneSyncError> {
+        let inserted = sync.insert_objects(world, objects, &self.geometry, &mut self.shapes)?;
+        self.changes.extend(inserted);
+        Ok(())
+    }
+
     pub(crate) fn add_scene_geometry(&mut self, models: Vec<ModelGeometry>) {
         for model in models {
             if !self.geometry.iter().any(|known| known.path == model.path) {
@@ -2270,16 +2284,7 @@ fn apply_changes(
         );
     }
     if let Some(replacement) = &changes.scene_replaced {
-        apply_scene_added(
-            world,
-            scripts,
-            physics,
-            spawn_physics,
-            gpu_scene,
-            prefabs,
-            &replacement.added,
-            &mut requests,
-        );
+        apply_scene_added(world, &replacement.added, &mut requests);
     }
     apply_prefab_requests(
         world,
@@ -2294,66 +2299,20 @@ fn apply_changes(
     }
 }
 
-/// Физика и звук объектов, добавленных заменой сцены. Удалённые объекты уже обработаны по
-/// `despawned`. Если физика отвергла добавленные тела, откатываются корни как неудачный spawn.
-#[allow(clippy::too_many_arguments)]
-fn apply_scene_added(
-    world: &mut World,
-    scripts: &mut ScriptHost,
-    physics: Option<&mut PhysicsSceneSync>,
-    spawn_physics: &mut SpawnPhysics,
-    gpu_scene: &mut GpuSceneTable,
-    prefabs: &mut PrefabLoads,
-    added: &[ObjectHandle],
-    requests: &mut Vec<AudioRequest>,
-) {
-    let live: Vec<ObjectHandle> = added
-        .iter()
-        .copied()
-        .filter(|&object| world.is_alive(object))
-        .collect();
-    if let Some(sync) = physics {
-        let fresh = sync.unbound_objects(&live);
-        match sync.insert_objects(
-            world,
-            &fresh,
-            &spawn_physics.geometry,
-            &mut spawn_physics.shapes,
-        ) {
-            Ok(inserted) => spawn_physics.changes.extend(inserted),
-            Err(error) => {
-                let roots: Vec<ObjectHandle> = live
-                    .iter()
-                    .copied()
-                    .filter(|&object| {
-                        world
-                            .object(object)
-                            .and_then(|scene_object| scene_object.parent)
-                            .is_none_or(|parent| !live.contains(&parent))
-                    })
-                    .collect();
-                for root in roots {
-                    scripts.revert_spawn(
-                        world,
-                        root,
-                        &format!("физика отклонила объекты сцены: {error}"),
-                    );
-                }
-                detach_object_render_data(gpu_scene, &live);
-                prefabs.send_particles(ParticleRequest::Destroy(live));
-                print_script_events(scripts.drain_events());
-                return;
-            }
-        }
-    }
+/// Звук объектов, добавленных заменой сцены: источники с `play_on_start`. Физика вставляется в
+/// коммите замены (`SceneSwitch::commit`), удалённые объекты уже обработаны по `despawned`.
+fn apply_scene_added(world: &World, added: &[ObjectHandle], requests: &mut Vec<AudioRequest>) {
     requests.extend(
-        live.iter()
-            .filter(|&&object| {
+        added
+            .iter()
+            .copied()
+            .filter(|&object| world.is_alive(object))
+            .filter(|&object| {
                 world
                     .audio_source(object)
                     .is_some_and(|audio| audio.play_on_start)
             })
-            .map(|&object| AudioRequest::PlaySource {
+            .map(|object| AudioRequest::PlaySource {
                 object,
                 voice: VoiceId::allocate(),
             }),

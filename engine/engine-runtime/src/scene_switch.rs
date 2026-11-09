@@ -165,6 +165,8 @@ pub(crate) struct SceneCommit<'a> {
     pub scripts: &'a mut ScriptHost,
     pub gpu_scene: &'a mut GpuSceneTable,
     pub spawn_physics: &'a mut SpawnPhysics,
+    /// Физика сцены; `None` без физики (headless без тел).
+    pub physics: Option<&'a mut engine_physics::PhysicsSceneSync>,
     pub prefabs: &'a mut PrefabLoads,
     pub audio: Option<&'a mut engine_audio::AudioBridge>,
     pub animation: &'a mut AnimationBridge,
@@ -327,6 +329,15 @@ impl SceneSwitch {
             .collect();
         ctx.spawn_physics
             .add_scene_geometry(pending.physics_geometry);
+        // Тела новых объектов привязываются здесь, а не после коммита, поэтому отказ вставки
+        // не может оставить мир уже замененным. Отказа не бывает: пробная сборка физики в
+        // `SceneLoader::prepare` вызывает ту же `scene_body` и `insert_body` для тех же объектов
+        // сцены, а новые хендлы никогда не привязаны. Поэтому вставка здесь только `expect`.
+        if let Some(sync) = ctx.physics.as_deref_mut() {
+            ctx.spawn_physics
+                .insert_scene_bodies(sync, &*ctx.world, &replacement.added)
+                .expect("scene bodies were validated by the trial physics build");
+        }
         let gpu = &mut *ctx.gpu_scene;
         gpu.by_object.extend(rekey(&mut table.by_object, &handles));
         gpu.material_sources
@@ -532,6 +543,9 @@ return Script
 [[objects]]\nid = \"camera_c\"\n[objects.camera]\nactive = true\n\
 [[objects]]\nid = \"c_crate\"\n";
 
+    /// Сцена с коллайдером: его тело вставляется физикой сразу при замене.
+    const PHYSICS_SCENE: &str = "[[objects]]\nid = \"camera_p\"\n[objects.camera]\nactive = true\n\
+[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n";
     /// Сцена с префабом `z`, чей скрипт не компилируется.
     const PREFAB_SCENE_BROKEN: &str = "[[assets]]\npath = \"prefabs/z.rveprefab\"\n\
 [[objects]]\nid = \"camera_bad\"\n[objects.camera]\nactive = true\n\
@@ -578,6 +592,7 @@ return Script
         host: ScriptHost,
         gpu: GpuSceneTable,
         spawn_physics: SpawnPhysics,
+        physics: Option<engine_physics::PhysicsSceneSync>,
         prefabs: PrefabLoads,
         _render_rx: flume::Receiver<RenderResourceRequest>,
         animation: AnimationBridge,
@@ -604,6 +619,7 @@ return Script
             dir.write("levels/pb.rvescene", PREFAB_SCENE_B);
             dir.write("levels/pbad.rvescene", PREFAB_SCENE_BROKEN);
             dir.write("levels/pc.rvescene", PREFAB_SCENE_C);
+            dir.write("levels/pphys.rvescene", PHYSICS_SCENE);
             dir.write("scripts/player.lua", PLAYER);
             dir.write("scripts/enemy.lua", ENEMY);
             dir.write("scripts/boss.lua", BOSS);
@@ -620,7 +636,11 @@ return Script
             })
             .unwrap();
             let loader = SceneLoader::new(resources.handle(), PhysicsSettings::default(), false);
-            let (prepared, _) = loader.prepare(start).unwrap();
+            let (prepared, geometry) = loader.prepare(start).unwrap();
+            let (_, bindings) = prepared
+                .build_physics(&geometry, &PhysicsSettings::default())
+                .unwrap();
+            let physics = engine_physics::PhysicsSceneSync::new(&prepared.world, bindings).unwrap();
             let PreparedScene {
                 mut world,
                 sources,
@@ -653,6 +673,7 @@ return Script
                 host,
                 gpu: GpuSceneTable::default(),
                 spawn_physics: SpawnPhysics::default(),
+                physics: Some(physics),
                 prefabs: PrefabLoads::new(loader_tx, render_tx),
                 _render_rx: render_rx,
                 animation: AnimationBridge::default(),
@@ -689,6 +710,7 @@ return Script
                 scripts: &mut self.host,
                 gpu_scene: &mut self.gpu,
                 spawn_physics: &mut self.spawn_physics,
+                physics: self.physics.as_mut(),
                 prefabs: &mut self.prefabs,
                 audio: None,
                 animation: &mut self.animation,
@@ -963,6 +985,25 @@ return Script
 
         rig.frame_update();
         assert!(rig.names().contains(&"spawned_x".to_owned()));
+    }
+
+    #[test]
+    fn switch_inserts_the_bodies_of_the_new_scene_during_the_commit() {
+        let mut rig = Rig::new();
+
+        rig.load("levels/pphys.rvescene").unwrap();
+        let failures = rig.commit();
+
+        assert!(failures.is_empty(), "{failures:?}");
+        let ball = rig.world.handle("ball").unwrap();
+        let physics = rig.physics.as_ref().unwrap();
+        assert!(
+            physics
+                .bindings()
+                .iter()
+                .any(|binding| binding.object == ball),
+            "тело новой сцены привязано к физике сразу при замене"
+        );
     }
 
     #[test]
