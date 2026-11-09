@@ -19,8 +19,8 @@ use abi::{
     RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
     RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult,
     RveColliderValue, RveControllerValue, RveHost, RveParams, RvePostProcessSettings,
-    RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue, RveStr, RveTime,
-    RveTransform, RveValue, RveValueData,
+    RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue, RveScreenShaderState, RveStr,
+    RveTime, RveTransform, RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -504,7 +504,7 @@ pub struct CharacterMove {
 }
 
 /// Collider shape of a script collider component. Mesh shapes can be read but not written.
-/// Appended in ABI v16.
+/// Appended in ABI v17.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColliderShape {
     Box,
@@ -515,7 +515,7 @@ pub enum ColliderShape {
 }
 
 /// Collider component read or written by scripts. `size` is the full box extent; `radius` and
-/// `height` apply to spheres and capsules. Appended in ABI v16.
+/// `height` apply to spheres and capsules. Appended in ABI v17.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Collider {
     pub shape: ColliderShape,
@@ -526,7 +526,7 @@ pub struct Collider {
     pub trigger: bool,
 }
 
-/// Rigid body kind. Appended in ABI v16.
+/// Rigid body kind. Appended in ABI v17.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
     Static,
@@ -534,7 +534,7 @@ pub enum BodyKind {
     Dynamic,
 }
 
-/// Rigid body component values. Appended in ABI v16.
+/// Rigid body component values. Appended in ABI v17.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RigidBody {
     pub kind: BodyKind,
@@ -546,7 +546,7 @@ pub struct RigidBody {
 }
 
 /// Character controller component values. `jump_height` and `use_gravity` drive
-/// `Object::simple_move` and `Object::jump`. Appended in ABI v16.
+/// `Object::simple_move` and `Object::jump`. Appended in ABI v17.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CharacterController {
     pub radius: f32,
@@ -561,7 +561,7 @@ pub struct CharacterController {
     pub use_gravity: bool,
 }
 
-/// Shape of an overlap or cast query. Appended in ABI v16.
+/// Shape of an overlap or cast query. Appended in ABI v17.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum QueryShape {
     Sphere { radius: f32 },
@@ -569,7 +569,7 @@ pub enum QueryShape {
     Capsule { radius: f32, height: f32 },
 }
 
-/// Options of overlap, raycast-all and shape-cast queries. Appended in ABI v16.
+/// Options of overlap, raycast-all and shape-cast queries. Appended in ABI v17.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryOptions<'a> {
     /// Bit `n` enables collider layer `n`.
@@ -1883,6 +1883,46 @@ impl Object {
         };
         // SAFETY: host callback and settings are valid during this guest callback.
         unsafe { callback(ctx.host.ctx, self.handle, settings) }
+    }
+
+    /// Number of screen shader slots of this camera; `None` when the object is not a camera or the
+    /// host does not provide ABI v14 callbacks.
+    pub fn screen_shader_count(&self, ctx: &Context<'_>) -> Option<u32> {
+        let callback = ctx.host.screen_shader_count?;
+        let mut count = 0;
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut count) } {
+            Some(count)
+        } else {
+            None
+        }
+    }
+
+    /// Returns one screen shader slot (zero-based). `None` when the slot does not exist.
+    pub fn screen_shader(&self, ctx: &Context<'_>, slot: u32) -> Option<RveScreenShaderState> {
+        let callback = ctx.host.get_screen_shader?;
+        let mut state = RveScreenShaderState::default();
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, slot, &mut state) } {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    /// Stages enabled flag and parameters of one screen shader slot (zero-based). Returns false when
+    /// the host lacks ABI v14 callbacks, the object is not a camera or the slot does not exist.
+    pub fn set_screen_shader(
+        &self,
+        ctx: &mut Context<'_>,
+        slot: u32,
+        state: &RveScreenShaderState,
+    ) -> bool {
+        let Some(callback) = ctx.host.set_screen_shader else {
+            return false;
+        };
+        // SAFETY: host callback and state are valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, slot, state) }
     }
 
     /// Stages this object as the active scene camera.

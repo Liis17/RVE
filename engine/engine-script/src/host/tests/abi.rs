@@ -14,7 +14,7 @@ use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
     RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParamDescV13, RveParams,
     RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6,
-    RveScriptDescV13, RveScriptDescV14, RveSpawnOptions, RveStatus, RveStr, RveTransform,
+    RveScriptDescV13, RveScriptDescV15, RveSpawnOptions, RveStatus, RveStr, RveTransform,
     RveUpdateFn, RveValue,
 };
 use rve_sdk::{
@@ -1424,9 +1424,9 @@ name = "AudioRejected"
     assert_eq!(host.drain_audio_requests().len(), 1);
 }
 
-/// Copies the pre-v14 parameter prefix into a process-lifetime table.
+/// Copies the pre-v15 parameter prefix into a process-lifetime table.
 ///
-/// Scripts that declare v14-only parameter kinds are omitted from legacy fixtures.
+/// Scripts that declare v15-only parameter kinds are omitted from legacy fixtures.
 fn legacy_params(descriptor: &RveScriptDesc) -> Option<(*const RveParamDescV13, usize)> {
     if descriptor.param_count == 0 {
         return Some((std::ptr::null(), 0));
@@ -1497,8 +1497,8 @@ fn v6_module(abi_version: u32) -> &'static RveModule {
     }))
 }
 
-/// Table for ABI v13 with its original script and parameter descriptor layouts.
-fn v13_module() -> &'static RveModule {
+/// Table for ABI v13 or v14: the v13 script descriptor layout with pre-v15 parameter descriptors.
+fn v13_module(abi_version: u32) -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
     let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
@@ -1527,7 +1527,7 @@ fn v13_module() -> &'static RveModule {
     );
     Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version: 13,
+            abi_version,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: legacy.as_ptr().cast(),
@@ -1535,15 +1535,15 @@ fn v13_module() -> &'static RveModule {
     }))
 }
 
-/// Модуль ABI v14: descriptor без `on_enable` и `on_disable`, но с параметрами v14.
-fn v14_module() -> &'static RveModule {
+/// Модуль ABI v15: descriptor без `on_enable` и `on_disable`, но с параметрами v15.
+fn v15_module() -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
     let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
-    let legacy: &'static [RveScriptDescV14] = Box::leak(
+    let legacy: &'static [RveScriptDescV15] = Box::leak(
         descriptors
             .iter()
-            .map(|descriptor| RveScriptDescV14 {
+            .map(|descriptor| RveScriptDescV15 {
                 name: descriptor.name,
                 create: descriptor.create,
                 start: descriptor.start,
@@ -1562,7 +1562,7 @@ fn v14_module() -> &'static RveModule {
     );
     Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version: 14,
+            abi_version: 15,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: legacy.as_ptr().cast(),
@@ -1570,12 +1570,12 @@ fn v14_module() -> &'static RveModule {
     }))
 }
 
-/// Модуль ABI v15: тот же descriptor, что у v16; новые callbacks v16 хост не предлагает.
-fn v15_module() -> &'static RveModule {
+/// Модуль ABI v16: тот же descriptor, что у v17; новые callbacks v17 хост не предлагает.
+fn v16_module() -> &'static RveModule {
     let current = sdk_module();
     Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version: 15,
+            abi_version: 16,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: current.scripts,
@@ -1584,7 +1584,30 @@ fn v15_module() -> &'static RveModule {
 }
 
 #[test]
-fn abi_v15_modules_load_on_the_v16_host() {
+fn abi_v16_modules_load_on_the_v17_host() {
+    let _lock = test_lock();
+    let module = v16_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v16" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v16"),
+        "guest ABI v16 runs on the v17 host"
+    );
+}
+
+#[test]
+fn abi_v15_modules_load_on_the_v17_host_without_enable_callbacks() {
     let _lock = test_lock();
     let module = v15_module();
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1602,30 +1625,7 @@ fn abi_v15_modules_load_on_the_v16_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v15"),
-        "guest ABI v15 runs on the v16 host"
-    );
-}
-
-#[test]
-fn abi_v14_modules_load_on_the_v15_host_without_enable_callbacks() {
-    let _lock = test_lock();
-    let module = v14_module();
-    // SAFETY: the module and its descriptor table live for the whole test process.
-    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
-    let mut world = scripted_world("Probe", r#"{ label = "v14" }"#);
-    let mut host = load_host(&world, &library);
-    host.start(
-        &mut world,
-        ScriptTime {
-            elapsed: 3.5,
-            frame: 17,
-        },
-    );
-    assert!(
-        message_list(&mut host)
-            .iter()
-            .any(|message| message == "start:v14"),
-        "guest ABI v14 runs on the v15 host"
+        "guest ABI v15 runs on the v17 host"
     );
 }
 
@@ -1754,7 +1754,7 @@ fn abi_v6_to_v12_modules_load_without_net_callbacks_and_skip_net_events() {
 }
 
 #[test]
-fn abi_v10_modules_load_on_the_v14_host() {
+fn abi_v10_modules_load_on_the_v17_host() {
     let _lock = test_lock();
     let module = v6_module(10);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1772,12 +1772,12 @@ fn abi_v10_modules_load_on_the_v14_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v10"),
-        "guest ABI v10 runs on the v14 host"
+        "guest ABI v10 runs on the v17 host"
     );
 }
 
 #[test]
-fn abi_v11_modules_load_on_the_v14_host() {
+fn abi_v11_modules_load_on_the_v17_host() {
     let _lock = test_lock();
     let module = v6_module(11);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1795,14 +1795,14 @@ fn abi_v11_modules_load_on_the_v14_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v11"),
-        "guest ABI v11 runs on the v14 host"
+        "guest ABI v11 runs on the v17 host"
     );
 }
 
 #[test]
-fn abi_v13_modules_load_on_the_v14_host() {
+fn abi_v13_modules_load_on_the_v17_host() {
     let _lock = test_lock();
-    let module = v13_module();
+    let module = v13_module(13);
     // SAFETY: the module and its descriptor table live for the whole test process.
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
     let mut world = scripted_world("Probe", r#"{ label = "v13" }"#);
@@ -1818,7 +1818,30 @@ fn abi_v13_modules_load_on_the_v14_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v13"),
-        "guest ABI v13 runs on the v14 host"
+        "guest ABI v13 runs on the v17 host"
+    );
+}
+
+#[test]
+fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v17_host() {
+    let _lock = test_lock();
+    let module = v13_module(14);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v14" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v14"),
+        "guest ABI v14 runs on the v17 host and its parameters use the pre-v15 layout"
     );
 }
 

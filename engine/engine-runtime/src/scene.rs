@@ -58,6 +58,9 @@ pub(crate) struct PreparedRenderAssets {
     pub particles: Vec<(ObjectHandle, ParticleSource)>,
     /// Эмиттеры быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub prefab_particles: BTreeMap<String, Vec<Option<ParticleSource>>>,
+    /// Исходники `.glsl` экранных шейдеров камер по пути. Заполняются только для игрового клиента:
+    /// headless-сервер шейдеры не читает.
+    pub screen_shaders: BTreeMap<String, String>,
 }
 
 /// Эмиттер частиц объекта: параметры сцены и путь текстуры, уже загруженной в `textures`.
@@ -383,6 +386,7 @@ fn prepare_scene_with_model_loader(
         sources,
         scene_hash,
         render_assets: PreparedRenderAssets {
+            screen_shaders: BTreeMap::new(),
             models,
             textures,
             material_assets,
@@ -1064,6 +1068,68 @@ pub(crate) fn prepare_template(
     })
 }
 
+/// Создание экранных шейдеров; шов для тестов без GPU. Реализован для [`Renderer`].
+pub(crate) trait ScreenShaderGpu {
+    type Shader: Copy;
+
+    fn create_screen_shader(&mut self, source: &str) -> Result<Self::Shader, RenderError>;
+}
+
+impl ScreenShaderGpu for Renderer {
+    type Shader = engine_render::ScreenShaderId;
+
+    fn create_screen_shader(&mut self, source: &str) -> Result<Self::Shader, RenderError> {
+        Renderer::create_screen_shader(self, source)
+    }
+}
+
+/// Создаёт экранные шейдеры по исходникам. Ошибка компиляции записывается в лог, шейдер
+/// пропускается, сцена продолжает работать.
+pub(crate) fn upload_screen_shaders<G: ScreenShaderGpu>(
+    gpu: &mut G,
+    sources: &BTreeMap<String, String>,
+) -> HashMap<String, G::Shader> {
+    let mut ids = HashMap::with_capacity(sources.len());
+    for (path, source) in sources {
+        match gpu.create_screen_shader(source) {
+            Ok(id) => {
+                ids.insert(path.clone(), id);
+            }
+            Err(error) => log::error!("экранный шейдер /{path} пропущен: {error}"),
+        }
+    }
+    ids
+}
+
+/// Пути `.glsl` экранных шейдеров всех камер мира без повторов; префабные камеры раскрыты в мир.
+pub(crate) fn screen_shader_paths(world: &World) -> BTreeSet<String> {
+    world
+        .objects()
+        .iter()
+        .filter_map(|object| object.camera.as_ref())
+        .flat_map(|camera| &camera.screen_shaders)
+        .map(|shader| shader.shader.as_str().to_owned())
+        .collect()
+}
+
+/// Читает исходники экранных шейдеров камер. Файл, который не читается или не UTF-8, пропускается
+/// с записью в лог, как и ошибка компиляции.
+pub(crate) fn load_screen_shader_sources(
+    resources: &ResourceHandle,
+    world: &World,
+) -> BTreeMap<String, String> {
+    let mut sources = BTreeMap::new();
+    for path in screen_shader_paths(world) {
+        match read_utf8(resources, &path) {
+            Ok(source) => {
+                sources.insert(path, source);
+            }
+            Err(error) => log::error!("экранный шейдер не прочитан: {error}"),
+        }
+    }
+    sources
+}
+
 pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
@@ -1124,6 +1190,7 @@ pub(crate) fn upload_scene(
         animation_clips: assets.clips.clone(),
         ..GpuSceneTable::default()
     };
+    table.screen_shaders = upload_screen_shaders(renderer, &assets.screen_shaders);
     for path in &animated {
         // Мосту нужны скелет и клипы; вершины остаются только в GPU-таблице.
         if let Some(model) = assets.models.get(*path) {
@@ -1673,15 +1740,16 @@ fn upload_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, get_or_insert_gpu, load_scene,
-        material_cache_key, prepare_scene_with_model_loader, resolve_material,
-        resolve_material_asset,
+        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, ScreenShaderGpu,
+        get_or_insert_gpu, load_scene, load_screen_shader_sources, material_cache_key,
+        prepare_scene_with_model_loader, resolve_material, resolve_material_asset,
+        screen_shader_paths, upload_screen_shaders,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
     use engine_physics::BodyKind;
     use engine_project::PhysicsSettings;
-    use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
+    use engine_render::{AlphaMode, EnvironmentSource, RenderError, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{
         MaterialAlphaMode, MaterialAsset, MaterialOverride, PrefabTemplate, SceneDocument,
@@ -2277,6 +2345,68 @@ id = "camera"
             );
             assert_eq!(world.camera_settings(handle).unwrap().projection.near, 0.2);
         }
+    }
+
+    /// Сцена с двумя камерами, которые ссылаются на общий шейдер; `broken` и `missing` — плохие пути.
+    fn screen_shader_scene() -> &'static str {
+        "[[assets]]\npath = \"/fx/vhs.glsl\"\n[[assets]]\npath = \"/fx/broken.glsl\"\n[[assets]]\npath = \"/fx/missing.glsl\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects.camera.screen_shaders]]\nshader = \"/fx/vhs.glsl\"\nstage = \"after_post\"\n[[objects.camera.screen_shaders]]\nshader = \"/fx/broken.glsl\"\nstage = \"before_post\"\n[[objects]]\nid = \"second\"\n[objects.camera]\n[[objects.camera.screen_shaders]]\nshader = \"/fx/vhs.glsl\"\nstage = \"after_post\"\n[[objects.camera.screen_shaders]]\nshader = \"/fx/missing.glsl\"\nstage = \"after_post\"\n"
+    }
+
+    /// Создание шейдеров без GPU: `broken` отклоняется, остальные получают номер создания.
+    #[derive(Default)]
+    struct FakeScreenGpu {
+        created: Vec<String>,
+    }
+
+    impl ScreenShaderGpu for FakeScreenGpu {
+        type Shader = usize;
+
+        fn create_screen_shader(&mut self, source: &str) -> Result<usize, RenderError> {
+            self.created.push(source.to_owned());
+            if source.contains("broken") {
+                return Err(RenderError::InvalidConfig("тестовая ошибка компиляции"));
+            }
+            Ok(self.created.len())
+        }
+    }
+
+    #[test]
+    fn screen_shader_sources_are_read_once_per_path_and_bad_shaders_are_skipped() {
+        let project = TempProject::new();
+        project.write("scene.rvescene", screen_shader_scene().as_bytes());
+        project.write(
+            "fx/vhs.glsl",
+            b"vec3 rve_shade(vec2 uv) { return rve_sample(uv).rgb; }",
+        );
+        project.write("fx/broken.glsl", b"broken");
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        assert_eq!(
+            screen_shader_paths(&prepared.world)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["fx/broken.glsl", "fx/missing.glsl", "fx/vhs.glsl"],
+            "пути всех камер без повторов"
+        );
+        let sources = load_screen_shader_sources(&resources.system.handle(), &prepared.world);
+        assert_eq!(
+            sources.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["fx/broken.glsl", "fx/vhs.glsl"],
+            "нечитаемый файл пропущен"
+        );
+        let mut gpu = FakeScreenGpu::default();
+        let ids = upload_screen_shaders(&mut gpu, &sources);
+        assert_eq!(gpu.created.len(), 2, "каждый путь компилируется один раз");
+        assert!(ids.contains_key("fx/vhs.glsl"));
+        assert!(
+            !ids.contains_key("fx/broken.glsl"),
+            "ошибка компиляции пропускает шейдер"
+        );
     }
 
     fn post_process_scene(second_camera: bool) -> String {
