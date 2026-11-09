@@ -238,6 +238,10 @@ pub struct PhysicsSceneSync {
     removed_bodies: HashMap<BodyHandle, ObjectHandle>,
     /// Тела, удалённые до предыдущего результата шага: их `*_exit` ещё может прийти.
     retired_bodies: HashMap<BodyHandle, ObjectHandle>,
+    /// Компонент контроллера, по которому запечена капсула привязки. Капсула пересчитывается только при его смене.
+    controller_sources: HashMap<BodyHandle, CharacterControllerComponent>,
+    /// Ошибки пересчёта привязок, которые ещё не забрал `take_warnings`.
+    warnings: Vec<PhysicsSceneSyncError>,
 }
 
 impl PhysicsSceneSync {
@@ -259,6 +263,13 @@ impl PhysicsSceneSync {
             .map(|binding| binding.body.0)
             .max()
             .map_or(1, |max| max.saturating_add(1));
+        let controller_sources = bindings
+            .iter()
+            .filter_map(|binding| {
+                let controller = world.object(binding.object)?.character_controller?;
+                Some((binding.body, controller))
+            })
+            .collect();
         Ok(Self {
             bindings,
             binding_indices,
@@ -266,11 +277,19 @@ impl PhysicsSceneSync {
             next_body,
             removed_bodies: HashMap::new(),
             retired_bodies: HashMap::new(),
+            controller_sources,
+            warnings: Vec::new(),
         })
     }
 
     pub fn bindings(&self) -> &[PhysicsSceneBinding] {
         &self.bindings
+    }
+
+    /// Забирает ошибки пересчёта привязок с прошлого вызова. Привязка в этом случае сохраняет
+    /// прежние параметры контроллера.
+    pub fn take_warnings(&mut self) -> Vec<PhysicsSceneSyncError> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Объекты из `objects`, которые ещё не привязаны к телу. Привязанные пропускаются: например,
@@ -342,6 +361,9 @@ impl PhysicsSceneSync {
                 character_controller,
             } = body;
             let handle = BodyHandle(first + offset as u64);
+            if let Some(controller) = world.object(object).and_then(|o| o.character_controller) {
+                self.controller_sources.insert(handle, controller);
+            }
             self.binding_indices.insert(handle, self.bindings.len());
             self.bindings.push(PhysicsSceneBinding {
                 object,
@@ -365,6 +387,7 @@ impl PhysicsSceneSync {
         let last_synced = std::mem::take(&mut self.last_synced);
         for (binding, pose) in bindings.into_iter().zip(last_synced) {
             if doomed.contains(&binding.object) {
+                self.controller_sources.remove(&binding.body);
                 self.removed_bodies.insert(binding.body, binding.object);
                 changes.push(BodyChange::Remove {
                     handle: binding.body,
@@ -414,7 +437,9 @@ impl PhysicsSceneSync {
     ) -> Result<Vec<PhysicsCommand>, PhysicsSceneSyncError> {
         world.recalculate_world_matrices();
         for binding in &mut self.bindings {
-            reconcile_binding(world, binding)?;
+            if let Err(error) = reconcile_binding(world, binding, &mut self.controller_sources) {
+                self.warnings.push(PhysicsSceneSyncError::Scene(error));
+            }
         }
         let mut commands = Vec::new();
         for (index, binding) in self.bindings.iter().enumerate() {
@@ -443,10 +468,15 @@ impl PhysicsSceneSync {
 /// Тип тела и контроллер привязки берутся из компонентов мира. Скрипты меняют их в World при коммите,
 /// а копия в `PhysicsScriptState` не доходит до синхронизации: без этого привязка хранила бы старый
 /// тип и слала команды, которые тело отвергает.
+/// Капсула контроллера пересчитывается только при смене его компонента, по текущему масштабу, как в
+/// `set_controller_component`. Масштаб сам по себе тело не перестраивает, поэтому капсула привязки и тела
+/// не расходятся. Ошибка пересчёта не останавливает синхронизацию: компонент запоминается, чтобы та же
+/// смена не повторялась каждый кадр, а привязка сохраняет прежние параметры.
 fn reconcile_binding(
     world: &World,
     binding: &mut PhysicsSceneBinding,
-) -> Result<(), PhysicsSceneSyncError> {
+    controller_sources: &mut HashMap<BodyHandle, CharacterControllerComponent>,
+) -> Result<(), PhysicsSceneError> {
     let Some(object) = world.object(binding.object) else {
         return Ok(());
     };
@@ -457,13 +487,14 @@ fn reconcile_binding(
     let Some(settings) = object.character_controller else {
         return Ok(());
     };
+    if controller_sources.get(&binding.body) == Some(&settings) {
+        return Ok(());
+    }
+    controller_sources.insert(binding.body, settings);
     let transform = object_world_transform(world, binding.object)?;
     let radial_scale = transform.scale.x.abs().max(transform.scale.z.abs());
     binding.kind = BodyKind::Kinematic;
-    binding.character_controller = Some(
-        scale_character(settings, radial_scale, transform.scale)
-            .map_err(PhysicsSceneError::from)?,
-    );
+    binding.character_controller = Some(scale_character(settings, radial_scale, transform.scale)?);
     Ok(())
 }
 
@@ -1707,5 +1738,84 @@ mod tests {
         assert_eq!(desc.collider.material.static_friction, 0.8);
         assert_eq!(desc.collider.material.dynamic_friction, 0.6);
         assert_eq!(desc.collider.material.bounciness, 0.7);
+    }
+
+    fn controller_scene() -> (World, PhysicsSceneSync, StepDriver) {
+        let scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='player'\n[objects.transform]\nposition=[0,1,0]\n\
+             [objects.character_controller]\nradius=0.3\nheight=1.0\n"
+        ));
+        let (driver, bindings) = desc(&scene, &[]).build().unwrap();
+        let sync = PhysicsSceneSync::new(&scene, bindings).unwrap();
+        (scene, sync, driver)
+    }
+
+    fn set_scale(scene: &mut World, object: ObjectHandle, scale: Vec3) {
+        scene
+            .set_local_transform(
+                object,
+                LocalTransform {
+                    scale,
+                    ..*scene.local_transform(object).unwrap()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn controller_scaled_flat_or_to_zero_during_play_does_not_fail_the_sync() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        for scale in [Vec3::new(1.0, 0.0, 1.0), Vec3::ZERO] {
+            set_scale(&mut scene, player, scale);
+            assert!(
+                sync.sync_world_commands(&mut scene).is_ok(),
+                "scale {scale:?} must not be fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_scale_change_alone_keeps_the_binding_capsule() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        let before = sync.bindings()[0].character_controller;
+        assert!(before.is_some());
+        set_scale(&mut scene, player, Vec3::splat(2.0));
+        sync.sync_world_commands(&mut scene).unwrap();
+        assert_eq!(sync.bindings()[0].character_controller, before);
+    }
+
+    #[test]
+    fn controller_component_change_rebakes_the_capsule_with_the_current_scale() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        set_scale(&mut scene, player, Vec3::splat(2.0));
+        let mut controller = scene.object(player).unwrap().character_controller.unwrap();
+        controller.radius = 0.5;
+        scene.set_character_controller(player, controller).unwrap();
+        sync.sync_world_commands(&mut scene).unwrap();
+        let radius = sync.bindings()[0].character_controller.unwrap().radius;
+        assert!((radius - 1.0).abs() < 1.0e-6, "radius {radius}");
+    }
+
+    #[test]
+    fn failed_controller_rebake_keeps_the_previous_binding_and_warns_once() {
+        let (mut scene, mut sync, _driver) = controller_scene();
+        let player = scene.handle("player").unwrap();
+        let before = sync.bindings()[0].character_controller;
+        set_scale(&mut scene, player, Vec3::new(1.0, 0.0, 1.0));
+        let mut controller = scene.object(player).unwrap().character_controller.unwrap();
+        controller.radius = 0.5;
+        scene.set_character_controller(player, controller).unwrap();
+
+        assert!(sync.sync_world_commands(&mut scene).is_ok());
+        assert_eq!(sync.bindings()[0].character_controller, before);
+        assert_eq!(sync.take_warnings().len(), 1);
+        assert!(sync.sync_world_commands(&mut scene).is_ok());
+        assert!(
+            sync.take_warnings().is_empty(),
+            "the same component change is not reported again"
+        );
     }
 }

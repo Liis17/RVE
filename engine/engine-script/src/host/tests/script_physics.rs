@@ -6,10 +6,10 @@ use super::{event_messages, sources, world};
 use crate::ScriptTime;
 use crate::host::ScriptHost;
 use engine_physics::{
-    PhysicsSceneDesc, PhysicsSceneSync, Pose, QueryFilter, QueryOverrides, Shape, ShapeCache,
-    StepDriver,
+    ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync, Pose, QueryFilter,
+    QueryOverrides, Shape, ShapeCache, StepDriver,
 };
-use engine_scene::{ObjectEdit, ObjectHandle, World};
+use engine_scene::{LocalTransform, ObjectEdit, ObjectHandle, World};
 use glam::{Quat, Vec3};
 
 const DT: f32 = 1.0 / 60.0;
@@ -25,9 +25,13 @@ struct Loop {
 
 impl Loop {
     fn new(scene: &str, scripts: &[(&str, &str)]) -> Self {
+        Self::with_models(scene, scripts, &[])
+    }
+
+    fn with_models(scene: &str, scripts: &[(&str, &str)], models: &[ModelGeometry]) -> Self {
         let world = world(scene);
-        let desc =
-            PhysicsSceneDesc::from_world(&world, &[], Vec3::new(0.0, -9.81, 0.0), 60, 8).unwrap();
+        let desc = PhysicsSceneDesc::from_world(&world, models, Vec3::new(0.0, -9.81, 0.0), 60, 8)
+            .unwrap();
         let (driver, bindings) = desc.build().unwrap();
         let sync = PhysicsSceneSync::new(&world, bindings).unwrap();
         let mut host = ScriptHost::load(&world, "scene", &sources(scripts), None).unwrap();
@@ -840,6 +844,232 @@ return Script
         .body_state(body)
         .unwrap();
     assert_eq!(state.body_kind, engine_physics::BodyKind::Dynamic);
+}
+
+const TRIMESH_PROP_SCENE: &str = r#"
+[[assets]]
+path = "/mesh_prop.lua"
+[[assets]]
+path = "/models/quad.fbx"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "prop"
+[objects.mesh_renderer]
+model = "/models/quad.fbx"
+[objects.collider]
+shape = "triangle_mesh"
+[objects.rigid_body]
+kind = "static"
+[[objects.lite_scripts]]
+path = "/mesh_prop.lua"
+"#;
+
+fn quad_model() -> ModelGeometry {
+    ModelGeometry {
+        path: "models/quad.fbx".to_owned(),
+        meshes: vec![ModelMesh {
+            positions: vec![
+                Vec3::new(-1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(-1.0, 0.0, 1.0),
+            ],
+            indices: vec![0, 2, 1, 0, 3, 2],
+        }],
+    }
+}
+
+#[test]
+fn dynamic_body_on_triangle_mesh_prop_is_rejected_at_the_call_and_world_stays_static() {
+    let script = r#"
+local Script = {}
+local done = false
+function Script:on_update()
+  if done then return end
+  done = true
+  local ok, err = pcall(function()
+    return rve.find("prop"):set_rigid_body({kind="dynamic"})
+  end)
+  local mesh_rule = string.find(tostring(err), "triangle mesh", 1, true) ~= nil
+  rve.log("dynamic " .. tostring(ok) .. " " .. tostring(mesh_rule))
+end
+return Script
+"#;
+    let mut scene = Loop::with_models(
+        TRIMESH_PROP_SCENE,
+        &[("mesh_prop.lua", script)],
+        &[quad_model()],
+    );
+    let messages = scene.step();
+    assert!(
+        messages.contains(&"dynamic false true".to_owned()),
+        "{messages:?}"
+    );
+
+    let prop = scene.handle("prop");
+    assert_eq!(
+        scene.world.object(prop).unwrap().rigid_body.unwrap().kind,
+        engine_scene::RigidBodyKind::Static
+    );
+    let body = scene
+        .sync
+        .bindings()
+        .iter()
+        .find(|binding| binding.object == prop)
+        .unwrap()
+        .body;
+    let state = scene
+        .driver
+        .world()
+        .query_snapshot()
+        .unwrap()
+        .body_state(body)
+        .unwrap();
+    assert_eq!(state.body_kind, engine_physics::BodyKind::Static);
+}
+
+#[test]
+fn triangle_mesh_prop_becomes_a_dynamic_box_when_the_collider_changes_first_in_one_callback() {
+    let script = r#"
+local Script = {}
+local done = false
+function Script:on_update()
+  if done then return end
+  done = true
+  local prop = rve.find("prop")
+  rve.log("shape " .. tostring(pcall(function()
+    return prop:set_collider({shape="box", size={x=0.5, y=0.5, z=0.5}})
+  end)))
+  rve.log("dynamic " .. tostring(pcall(function()
+    return prop:set_rigid_body({kind="dynamic"})
+  end)))
+end
+return Script
+"#;
+    let mut scene = Loop::with_models(
+        TRIMESH_PROP_SCENE,
+        &[("mesh_prop.lua", script)],
+        &[quad_model()],
+    );
+    let messages = scene.step();
+    assert!(messages.contains(&"shape true".to_owned()), "{messages:?}");
+    assert!(
+        messages.contains(&"dynamic true".to_owned()),
+        "{messages:?}"
+    );
+
+    let prop = scene.handle("prop");
+    let object = scene.world.object(prop).unwrap();
+    assert_eq!(
+        object.collider.as_ref().unwrap().shape,
+        engine_scene::ColliderShape::Box
+    );
+    assert_eq!(
+        object.rigid_body.unwrap().kind,
+        engine_scene::RigidBodyKind::Dynamic
+    );
+    let body = scene
+        .sync
+        .bindings()
+        .iter()
+        .find(|binding| binding.object == prop)
+        .unwrap()
+        .body;
+    let state = scene
+        .driver
+        .world()
+        .query_snapshot()
+        .unwrap()
+        .body_state(body)
+        .unwrap();
+    assert_eq!(state.body_kind, engine_physics::BodyKind::Dynamic);
+}
+
+const DYNAMIC_CRATE_SCENE: &str = r#"
+[[assets]]
+path = "/crate.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "crate"
+[objects.collider]
+shape = "box"
+half_extents = [0.5, 0.5, 0.5]
+[objects.rigid_body]
+kind = "dynamic"
+[[objects.lite_scripts]]
+path = "/crate.lua"
+"#;
+
+#[test]
+fn triangle_mesh_collider_on_dynamic_body_is_rejected_and_the_box_stays() {
+    let script = r#"
+local Script = {}
+function Script:on_update()
+  rve.log("mesh " .. tostring(pcall(function()
+    return rve.find("crate"):set_collider({shape="triangle_mesh"})
+  end)))
+end
+return Script
+"#;
+    let mut scene = Loop::new(DYNAMIC_CRATE_SCENE, &[("crate.lua", script)]);
+    let messages = scene.step();
+    assert!(messages.contains(&"mesh false".to_owned()), "{messages:?}");
+
+    let crate_handle = scene.handle("crate");
+    assert_eq!(
+        scene
+            .world
+            .object(crate_handle)
+            .unwrap()
+            .collider
+            .as_ref()
+            .unwrap()
+            .shape,
+        engine_scene::ColliderShape::Box
+    );
+    let body = scene
+        .sync
+        .bindings()
+        .iter()
+        .find(|binding| binding.object == crate_handle)
+        .unwrap()
+        .body;
+    let state = scene
+        .driver
+        .world()
+        .query_snapshot()
+        .unwrap()
+        .body_state(body)
+        .unwrap();
+    assert_eq!(state.body_kind, engine_physics::BodyKind::Dynamic);
+}
+
+#[test]
+fn controller_scaled_flat_or_to_zero_mid_play_keeps_the_frame_loop_running() {
+    let script = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("player"):simple_move({x=0, y=0, z=0})
+end
+return Script
+"#;
+    let mut scene = Loop::new(PLAYER_SCENE, &[("player.lua", script)]);
+    scene.step();
+    let player = scene.handle("player");
+    let transform = *scene.world.local_transform(player).unwrap();
+    for scale in [Vec3::new(1.0, 0.0, 1.0), Vec3::ZERO] {
+        scene
+            .world
+            .set_local_transform(player, LocalTransform { scale, ..transform })
+            .unwrap();
+        for _ in 0..5 {
+            scene.step();
+        }
+    }
 }
 
 const INACTIVE_LAYER_SCENE: &str = r#"

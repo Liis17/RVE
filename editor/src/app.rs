@@ -1763,6 +1763,7 @@ impl EditorApp {
                 .drain_audio_warnings()
                 .into_iter()
                 .chain(play.drain_animation_warnings())
+                .chain(play.drain_physics_warnings())
             {
                 self.state.log.push(LogLevel::Warn, warning);
             }

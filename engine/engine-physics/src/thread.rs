@@ -31,6 +31,8 @@ pub struct PhysicsStepResult {
     pub poses: Vec<(BodyHandle, Pose)>,
     pub events: Vec<PhysicsEvent>,
     pub snapshot: Arc<QuerySnapshot>,
+    /// Команды коллайдера и свойств тела, которые солвер отверг; их тела сохранили прежние значения.
+    pub skipped_commands: usize,
 }
 
 #[derive(Clone)]
@@ -496,6 +498,7 @@ fn snapshot_result(
         poses: step.poses,
         events: step.events,
         snapshot,
+        skipped_commands: step.skipped_commands,
     })
 }
 
@@ -589,6 +592,7 @@ mod tests {
                     .unwrap()
                     .query_snapshot()
                     .unwrap(),
+                skipped_commands: 0,
             },
             bindings: Vec::new(),
         }
@@ -1064,6 +1068,41 @@ mod tests {
                 .iter()
                 .any(|(handle, _)| *handle == BodyHandle(2))
         );
+
+        client.shutdown().unwrap();
+        assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn rejected_body_property_command_is_counted_in_the_step_result() {
+        let (_, desc) = scene_with_dynamic_sphere();
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        let (_control_tx, control_rx) = flume::unbounded::<()>();
+        let server = std::thread::spawn(move || PhysicsServer::run(request_rx, reply_tx));
+        let mut client = PhysicsClient::new(request_tx, reply_rx);
+        let initialization = client.initialize(desc).unwrap();
+        let body = initialization.bindings[0].body;
+
+        client
+            .step_with_changes(
+                1.0 / 60.0,
+                Vec::new(),
+                vec![PhysicsCommand::SetBodyProperties {
+                    body,
+                    kind: crate::world::BodyKind::Dynamic,
+                    mass: 0.0,
+                    linear_damping: 0.0,
+                    angular_damping: 0.0,
+                    gravity_scale: 1.0,
+                    lock_rotation: false,
+                }],
+            )
+            .unwrap();
+        let PhysicsReceive::Step(step) = client.receive(&control_rx).unwrap().unwrap() else {
+            panic!("expected the Step result")
+        };
+        assert_eq!(step.skipped_commands, 1);
 
         client.shutdown().unwrap();
         assert!(server.join().unwrap().is_ok());
