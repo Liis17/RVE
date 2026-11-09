@@ -363,6 +363,12 @@ fn prepare_scene_with_model_loader(
         prefab_particles.insert(path.clone(), emitters);
     }
 
+    // Все объявленные `.rvemat` готовятся, а не только слоты: скрипт назначает их через set_material.
+    for path in world.asset_paths() {
+        if path.as_str().to_ascii_lowercase().ends_with(".rvemat") {
+            set.material_paths.insert(path.as_str().to_owned());
+        }
+    }
     set.load_surface_assets(resources, assets, scene_path);
 
     let RenderAssetSet {
@@ -2235,6 +2241,35 @@ id = "camera"
         format!(
             "[[assets]]\npath = \"/materials/ice.rvephysmat\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\nmaterial = \"/materials/ice.rvephysmat\"\n"
         )
+    }
+
+    #[test]
+    fn declared_rvemat_without_a_slot_is_prepared_so_set_material_can_use_it() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!(
+                "[[assets]]\npath = \"/materials/spare.rvemat\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"lamp\"\n[objects.point_light]\n"
+            )
+            .as_bytes(),
+        );
+        project.write("materials/spare.rvemat", b"");
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .render_assets
+                .material_assets
+                .get("materials/spare.rvemat")
+                .is_some_and(Result::is_ok),
+            "{:?}",
+            prepared.render_assets.material_assets.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

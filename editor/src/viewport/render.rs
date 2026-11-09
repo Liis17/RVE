@@ -1460,6 +1460,14 @@ impl SceneRenderer {
             .flat_map(|mesh| mesh.materials.iter().flatten())
             .map(|path| path.as_str().to_owned())
             .collect::<HashSet<_>>();
+        // Все объявленные `.rvemat` готовятся, а не только слоты: скрипт назначает их через set_material.
+        active_asset_paths.extend(
+            world
+                .asset_paths()
+                .iter()
+                .filter(|path| path.as_str().to_ascii_lowercase().ends_with(".rvemat"))
+                .map(|path| path.as_str().to_owned()),
+        );
         if let Some(path) = preview_asset
             && path.to_ascii_lowercase().ends_with(".rvemat")
         {
@@ -2304,11 +2312,11 @@ fn append_world_draws(
         for (mesh_index, (mesh_id, base_material, base_material_id)) in
             model.meshes.iter().enumerate()
         {
-            let assigned = mesh
-                .materials
-                .get(mesh_index)
-                .and_then(Option::as_ref)
-                .and_then(|path| resources.asset_materials.get(path.as_str()));
+            // Путь из set_material заменяет слоты всех частей, как в runtime.
+            let slot = world
+                .mesh_material_path(instance.object)
+                .or_else(|| mesh.materials.get(mesh_index).and_then(Option::as_ref));
+            let assigned = slot.and_then(|path| resources.asset_materials.get(path.as_str()));
             let (base_material, base_material_id) = assigned
                 .map_or((*base_material, *base_material_id), |(material, id)| {
                     (*material, *id)
