@@ -10,9 +10,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod environment;
 mod latency;
 mod skin;
+pub mod surface_shader;
 
 pub use latency::{LatencyHandle, LatencyMarker, LowLatencyMode};
 pub use skin::{SkinBinding, SkinId, SkinVertex};
+pub use surface_shader::{
+    CompiledSurfaceShader, ShaderCompileError, SurfaceLighting, SurfaceProperty,
+    SurfacePropertyKind, SurfaceShaderSource, SurfaceTextureFallback, compile_surface_shader,
+};
 
 use latency::{PresentIdTracker, Shared, VulkanLatency, low_latency_device_extensions};
 
@@ -147,11 +152,13 @@ const TIMESTAMP_QUERY_COUNT: u32 = OUTPUT_QUERY_FIRST + 2;
 const WHITE_SRGB_TEXTURE: usize = 0;
 const WHITE_LINEAR_TEXTURE: usize = 1;
 const FLAT_NORMAL_TEXTURE: usize = 2;
+const BLACK_TEXTURE: usize = 3;
 const DEFAULT_MATERIAL: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 3 * size_of::<[[f32; 4]; 4]>() + size_of::<[u32; 4]>();
 const FRAME_UNIFORMS_SIZE: usize =
     (5 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 9 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
+const USER_MATERIAL_UNIFORMS_SIZE: usize = 16 * size_of::<[f32; 4]>();
 const LOCAL_LIGHT_GPU_SIZE: usize = 7 * size_of::<[f32; 4]>();
 const LOCAL_SHADOW_MATRIX_BUFFER_SIZE: usize = MAX_LOCAL_SHADOW_LAYERS * size_of::<[[f32; 4]; 4]>();
 const CLUSTER_BOUNDS_GPU_SIZE: usize = 2 * size_of::<[f32; 4]>();
@@ -201,6 +208,10 @@ pub struct TextureId(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MaterialId(usize);
 
+/// Identifier for a runtime-compiled surface shader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShaderId(usize);
+
 /// Интерпретация RGBA8 texel-ов GPU-текстуры.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextureColorSpace {
@@ -223,6 +234,12 @@ pub enum AlphaMode {
 /// Неизменяемые параметры материала, отсечение граней и необязательные текстуры.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
+    /// User surface shader; `None` selects the built-in Lit surface.
+    pub shader: Option<ShaderId>,
+    /// User numeric properties packed by `engine-scene` shader layout.
+    pub user_values: [[f32; 4]; 16],
+    /// User texture properties indexed by shader texture slot.
+    pub user_textures: [Option<TextureId>; 8],
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
@@ -242,6 +259,9 @@ pub struct Material {
 impl Default for Material {
     fn default() -> Self {
         Self {
+            shader: None,
+            user_values: [[0.0; 4]; 16],
+            user_textures: [None; 8],
             base_color: [1.0; 3],
             metallic: 0.0,
             roughness: 1.0,
@@ -706,6 +726,7 @@ pub enum RenderError {
     InvalidMesh(&'static str),
     InvalidTexture(String),
     InvalidMaterial(String),
+    InvalidShader(String),
     InvalidEnvironment(String),
 }
 
@@ -730,6 +751,7 @@ impl fmt::Display for RenderError {
             Self::InvalidMesh(message) => write!(f, "некорректный меш: {message}"),
             Self::InvalidTexture(message) => write!(f, "некорректная текстура: {message}"),
             Self::InvalidMaterial(message) => write!(f, "некорректный материал: {message}"),
+            Self::InvalidShader(message) => write!(f, "некорректный surface shader: {message}"),
             Self::InvalidEnvironment(message) => write!(f, "некорректное окружение: {message}"),
         }
     }
@@ -1117,6 +1139,8 @@ pub struct Renderer {
     post_descriptor_pool: Option<vk::DescriptorPool>,
     frame_uniforms: Vec<FrameUniforms>,
     sampler: Option<vk::Sampler>,
+    /// Нулевой user-UBO, общий для материалов без шейдера; живёт, пока есть материалы, и уходит с renderer.
+    builtin_user_uniform: Option<Arc<HostBuffer>>,
     post_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
     environment_sampler: Option<vk::Sampler>,
@@ -1139,6 +1163,8 @@ pub struct Renderer {
     textures: Vec<Option<Arc<Texture>>>,
     /// Индекс — `MaterialId`; удалённые материалы остаются пустыми и не переиспользуются.
     materials: Vec<Option<GpuMaterial>>,
+    /// Индекс — `ShaderId`; surface shaders имеют отдельные pipeline variants.
+    surface_shaders: Vec<Option<GpuSurfaceShader>>,
     ui_textures: Vec<Option<UiTexture>>,
     viewports: Vec<Option<Viewport>>,
     screen_temporal: TemporalView,
@@ -1258,6 +1284,7 @@ impl Renderer {
             post_descriptor_pool: None,
             frame_uniforms: Vec::new(),
             sampler: None,
+            builtin_user_uniform: None,
             post_sampler: None,
             shadow_sampler: None,
             environment_sampler: None,
@@ -1277,6 +1304,7 @@ impl Renderer {
             meshes: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
+            surface_shaders: Vec::new(),
             ui_textures: Vec::new(),
             viewports: Vec::new(),
             screen_temporal: TemporalView::default(),
@@ -1690,9 +1718,52 @@ impl Renderer {
             .map(|texture| texture.as_ref().map(|texture| texture.color_space))
             .collect::<Vec<_>>();
         validate_material(material, &spaces)?;
+        validate_shader_material(material, &spaces, &self.surface_shaders)?;
         let gpu_material = self.upload_material(material)?;
+        if let Some(shader) = material.shader {
+            let shader = self.surface_shaders[shader.0]
+                .as_mut()
+                .expect("shader was validated before material upload");
+            shader.references = shader.references.saturating_add(1);
+        }
         self.materials.push(Some(gpu_material));
         Ok(MaterialId(self.materials.len() - 1))
+    }
+
+    /// Compiles a user surface and atomically creates its four scene pipelines.
+    pub fn create_surface_shader(
+        &mut self,
+        source: &SurfaceShaderSource,
+    ) -> Result<ShaderId, RenderError> {
+        validate_surface_shader_source(source)?;
+        let compiled = compile_surface_shader(source)
+            .map_err(|error| RenderError::InvalidShader(error.to_string()))?;
+        let pipelines = self.create_surface_pipelines(&compiled)?;
+        self.surface_shaders.push(Some(GpuSurfaceShader {
+            device: self.device()?.clone(),
+            pipelines,
+            properties: source.properties.clone(),
+            references: 0,
+        }));
+        Ok(ShaderId(self.surface_shaders.len() - 1))
+    }
+
+    /// Retires an unused shader. Materials must be destroyed before their shader.
+    pub fn destroy_surface_shader(&mut self, shader: ShaderId) -> Result<(), RenderError> {
+        let live = self
+            .surface_shaders
+            .get(shader.0)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                RenderError::InvalidShader("ShaderId не принадлежит renderer".to_owned())
+            })?;
+        validate_shader_destroyable(live.references)?;
+        let resource = self.surface_shaders[shader.0].take().ok_or_else(|| {
+            RenderError::InvalidShader("ShaderId не принадлежит renderer".to_owned())
+        })?;
+        self.retired
+            .retire(RetiredResource::SurfaceShader(Box::new(resource)), 0);
+        Ok(())
     }
 
     /// Удаляет неизменяемый материал после завершения его кадровых обращений.
@@ -1709,7 +1780,13 @@ impl Renderer {
             .ok_or_else(|| {
                 RenderError::InvalidMaterial("MaterialId не принадлежит renderer".to_owned())
             })?;
-        self.retired.retire(RetiredResource::Material(resource), 0);
+        if let Some(shader) = resource.shader
+            && let Some(Some(shader)) = self.surface_shaders.get_mut(shader.0)
+        {
+            shader.references = shader.references.saturating_sub(1);
+        }
+        self.retired
+            .retire(RetiredResource::Material(Box::new(resource)), 0);
         Ok(())
     }
 
@@ -1718,7 +1795,7 @@ impl Renderer {
         let unknown =
             || RenderError::InvalidTexture("TextureId не принадлежит renderer".to_owned());
         // Встроенная белая текстура не выдаётся наружу и нужна всем DrawCommand без текстуры.
-        if texture.0 <= FLAT_NORMAL_TEXTURE {
+        if texture.0 <= BLACK_TEXTURE {
             return Err(unknown());
         }
         let upload_serial = self
@@ -1763,7 +1840,7 @@ impl Renderer {
             Ok(resources) => resources,
             Err(error) => {
                 self.retired
-                    .retire(RetiredResource::Image(image), upload_serial);
+                    .retire(RetiredResource::Image(Box::new(image)), upload_serial);
                 return Err(error);
             }
         };
@@ -1859,8 +1936,10 @@ impl Renderer {
         let upload_serial = self.ui_texture(texture)?.upload_serial;
         self.flush_upload_serial(upload_serial)?;
         if let Some(resource) = self.ui_textures[texture.0].take() {
-            self.retired
-                .retire(RetiredResource::UiTexture(resource), upload_serial);
+            self.retired.retire(
+                RetiredResource::UiTexture(Box::new(resource)),
+                upload_serial,
+            );
         }
         Ok(())
     }
@@ -2475,6 +2554,7 @@ impl Renderer {
                 skybox,
                 meshes: &self.meshes,
                 materials: &self.materials,
+                surface_shaders: &self.surface_shaders,
                 draws: frame.draws,
                 skin_draws: skin::skin_draws_for(skin_plan.as_ref(), 0),
                 view_projection: multiply_4x4(frame.camera.projection, frame.camera.view),
@@ -3422,6 +3502,7 @@ impl Renderer {
                             skybox: *skybox,
                             meshes: &self.meshes,
                             materials: &self.materials,
+                            surface_shaders: &self.surface_shaders,
                             draws: frame.draws,
                             skin_draws: skin::skin_draws_for(skin_plan.as_ref(), index),
                             view_projection: multiply_4x4(
@@ -4475,6 +4556,9 @@ impl Renderer {
             TextureColorSpace::Linear,
         )?);
         self.textures.push(Some(flat_normal));
+        let black =
+            Arc::new(self.upload_texture(1, 1, &[0, 0, 0, 255], TextureColorSpace::Linear)?);
+        self.textures.push(Some(black));
         self.create_material(&Material::default())?;
 
         if self.output_extent.width != 0 && self.output_extent.height != 0 {
@@ -4594,6 +4678,51 @@ impl Renderer {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(6)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(9)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(10)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(11)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(12)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(13)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(14)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(15)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
@@ -4732,6 +4861,14 @@ impl Renderer {
             .max_lod(0.0);
         // SAFETY: the post sampler uses core linear filtering and clamp-to-edge addressing.
         self.post_sampler = Some(unsafe { device.create_sampler(&post_sampler_info, None) }?);
+        let builtin_user_uniform = HostBuffer::new(
+            self.instance()?,
+            &device,
+            self.physical_device,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &user_material_uniform_bytes(&Material::default()),
+        )?;
+        self.builtin_user_uniform = Some(Arc::new(builtin_user_uniform));
 
         let shadow_image = self
             .shadow_image
@@ -5769,6 +5906,11 @@ impl Renderer {
 
     fn upload_material(&self, material: &Material) -> Result<GpuMaterial, RenderError> {
         let device = self.device()?;
+        let shader_properties = material
+            .shader
+            .and_then(|shader| self.surface_shaders.get(shader.0))
+            .and_then(Option::as_ref)
+            .map_or(&[][..], |shader| shader.properties.as_slice());
         let uniform_buffer = HostBuffer::new(
             self.instance()?,
             device,
@@ -5776,13 +5918,23 @@ impl Renderer {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &material_uniform_bytes(material),
         )?;
+        let user_uniform_buffer = match &self.builtin_user_uniform {
+            Some(shared) if uses_shared_user_uniform(material) => Arc::clone(shared),
+            _ => Arc::new(HostBuffer::new(
+                self.instance()?,
+                device,
+                self.physical_device,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                &user_material_uniform_bytes(material),
+            )?),
+        };
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(2),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(5),
+                .descriptor_count(13),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
@@ -5790,7 +5942,7 @@ impl Renderer {
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
             .pool_sizes(&pool_sizes);
-        // SAFETY: the pool holds one material uniform, five images and one sampler.
+        // SAFETY: the pool holds two material uniforms, thirteen images and one sampler.
         let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
         let result = (|| {
             let layouts = [self.material_set_layout()?];
@@ -5819,9 +5971,41 @@ impl Renderer {
                 texture_for(material.emissive_texture, WHITE_SRGB_TEXTURE)?,
                 texture_for(material.occlusion_texture, WHITE_LINEAR_TEXTURE)?,
             ];
+            let user_texture_refs: [Arc<Texture>; 8] = (0..8)
+                .map(|slot| {
+                    let property = shader_properties.iter().find(|property| {
+                        property.kind == SurfacePropertyKind::Texture && property.slot == slot
+                    });
+                    let fallback = match property.map(|property| property.fallback) {
+                        Some(SurfaceTextureFallback::Black) => BLACK_TEXTURE,
+                        Some(SurfaceTextureFallback::Normal) => FLAT_NORMAL_TEXTURE,
+                        Some(SurfaceTextureFallback::White) => property
+                            .and_then(|property| property.color_space)
+                            .map_or(WHITE_LINEAR_TEXTURE, |space| match space {
+                                TextureColorSpace::Srgb => WHITE_SRGB_TEXTURE,
+                                TextureColorSpace::Linear => WHITE_LINEAR_TEXTURE,
+                            }),
+                        None => WHITE_LINEAR_TEXTURE,
+                    };
+                    self.textures
+                        .get(material.user_textures[slot].map_or(fallback, |texture| texture.0))
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or(RenderError::InvalidState(
+                            "user material texture отсутствует",
+                        ))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .try_into()
+                .map_err(|_| RenderError::InvalidState("неверное число user textures"))?;
             let image_infos: [vk::DescriptorImageInfo; 5] = std::array::from_fn(|index| {
                 vk::DescriptorImageInfo::default()
                     .image_view(texture_refs[index].image.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            });
+            let user_image_infos: [vk::DescriptorImageInfo; 8] = std::array::from_fn(|index| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(user_texture_refs[index].image.view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             });
             let sampler = self
@@ -5832,7 +6016,11 @@ impl Renderer {
                 .buffer(uniform_buffer.buffer)
                 .offset(0)
                 .range(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)];
-            let writes = [
+            let user_buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(user_uniform_buffer.buffer)
+                .offset(0)
+                .range(USER_MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)];
+            let mut writes = vec![
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(0)
@@ -5840,35 +6028,33 @@ impl Renderer {
                     .buffer_info(&buffer_info),
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&image_infos[0..1]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(2)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&image_infos[1..2]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(3)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&image_infos[2..3]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(4)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&image_infos[3..4]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(5)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&image_infos[4..5]),
+                    .dst_binding(7)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&user_buffer_info),
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(6)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&sampler_info),
             ];
+            for index in 0..5 {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(index as u32 + 1)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&image_infos[index..index + 1]),
+                );
+            }
+            for index in 0..8 {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(index as u32 + 8)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&user_image_infos[index..index + 1]),
+                );
+            }
             // SAFETY: texture_refs keep every image alive until this material descriptor pool drops.
             unsafe { device.update_descriptor_sets(&writes, &[]) };
             Ok(GpuMaterial {
@@ -5877,8 +6063,11 @@ impl Renderer {
                 set,
                 double_sided: material.double_sided,
                 _uniform_buffer: uniform_buffer,
+                _user_uniform_buffer: user_uniform_buffer,
                 _textures: texture_refs,
+                _user_textures: user_texture_refs,
                 alpha_mode: material.alpha_mode,
+                shader: material.shader,
             })
         })();
         if result.is_err() {
@@ -6343,6 +6532,224 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    fn create_surface_pipelines(
+        &self,
+        compiled: &CompiledSurfaceShader,
+    ) -> Result<SurfacePipelines, RenderError> {
+        let device = self.device()?;
+        let layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        let vertex_module = ShaderModule::new(device, MESH_VERTEX_SHADER)?;
+        let opaque_bytes = spirv_bytes(&compiled.opaque);
+        let mask_bytes = spirv_bytes(&compiled.mask);
+        let blend_bytes = spirv_bytes(&compiled.blend);
+        let opaque_module = ShaderModule::new(device, &opaque_bytes)?;
+        let mask_module = ShaderModule::new(device, &mask_bytes)?;
+        let blend_module = ShaderModule::new(device, &blend_bytes)?;
+        let vertex_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_module.handle)
+            .name(c"main");
+        let stages = |module| {
+            [
+                vertex_stage,
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(module)
+                    .name(c"main"),
+            ]
+        };
+        let opaque_stages = stages(opaque_module.handle);
+        let mask_stages = stages(mask_module.handle);
+        let blend_stages = stages(blend_module.handle);
+        let vertex_bindings = [
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(size_of::<Vertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+            vk::VertexInputBindingDescription::default()
+                .binding(1)
+                .stride(size_of::<Vertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+        ];
+        let vertex_attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, position) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, normal) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(2)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, uv) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(3)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, color) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(4)
+                .binding(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, position) as u32),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let velocity_write = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::R | vk::ColorComponentFlags::G);
+        let opaque_attachments = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+            velocity_write,
+        ];
+        let blend_attachments = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(
+                    vk::ColorComponentFlags::R
+                        | vk::ColorComponentFlags::G
+                        | vk::ColorComponentFlags::B,
+                ),
+            velocity_write,
+        ];
+        let opaque_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&opaque_attachments);
+        let transparent_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let opaque_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let equal_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let blend_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+            vk::DynamicState::FRONT_FACE,
+        ];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let color_formats = [OFFSCREEN_FORMAT, VELOCITY_FORMAT];
+        let mut opaque_rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut equal_rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut mask_rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut blend_rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let create_info = [
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&opaque_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&opaque_depth)
+                .color_blend_state(&opaque_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .push_next(&mut opaque_rendering),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&opaque_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&equal_depth)
+                .color_blend_state(&opaque_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .push_next(&mut equal_rendering),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&mask_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&opaque_depth)
+                .color_blend_state(&opaque_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .push_next(&mut mask_rendering),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&blend_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&blend_depth)
+                .color_blend_state(&transparent_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .push_next(&mut blend_rendering),
+        ];
+        // SAFETY: these pipelines reuse the validated mesh vertex interface and active render formats.
+        let mut pipelines = match unsafe {
+            device.create_graphics_pipelines(self.pipeline_cache()?, &create_info, None)
+        } {
+            Ok(pipelines) => pipelines,
+            Err((pipelines, error)) => {
+                for pipeline in pipelines {
+                    unsafe { device.destroy_pipeline(pipeline, None) };
+                }
+                return Err(RenderError::Vulkan(error));
+            }
+        };
+        if pipelines.len() != 4 {
+            for pipeline in pipelines {
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            return Err(RenderError::InvalidState(
+                "surface shader pipelines не созданы полностью",
+            ));
+        }
+        Ok(SurfacePipelines {
+            opaque: pipelines.remove(0),
+            opaque_equal: pipelines.remove(0),
+            mask: pipelines.remove(0),
+            blend: pipelines.remove(0),
+        })
     }
 
     fn create_skybox_pipeline(&mut self) -> Result<(), RenderError> {
@@ -6894,6 +7301,8 @@ impl Drop for Renderer {
         }
         self.meshes.clear();
         self.materials.clear();
+        self.builtin_user_uniform.take();
+        self.surface_shaders.clear();
         self.textures.clear();
         if let Some(device) = self.device.as_ref() {
             if let Some(pool) = self.frame_descriptor_pool.take() {
@@ -8995,9 +9404,10 @@ impl Drop for UiTexture {
 enum RetiredResource {
     Mesh(#[allow(dead_code)] Box<MeshBuffers>),
     Texture(#[allow(dead_code)] Arc<Texture>),
-    Image(#[allow(dead_code)] DeviceImage),
-    Material(#[allow(dead_code)] GpuMaterial),
-    UiTexture(#[allow(dead_code)] UiTexture),
+    Image(#[allow(dead_code)] Box<DeviceImage>),
+    Material(#[allow(dead_code)] Box<GpuMaterial>),
+    SurfaceShader(#[allow(dead_code)] Box<GpuSurfaceShader>),
+    UiTexture(#[allow(dead_code)] Box<UiTexture>),
     Viewport(#[allow(dead_code)] Box<Viewport>),
     TemporalHistory(#[allow(dead_code)] Box<TemporalHistory>),
     #[cfg(windows)]
@@ -11042,6 +11452,7 @@ struct ScenePass<'a> {
     skybox: bool,
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
+    surface_shaders: &'a [Option<GpuSurfaceShader>],
     draws: &'a [DrawCommand],
     /// Буферы вершин skinned draw'ов по индексу draw; `None` у статических.
     skin_draws: &'a [Option<skin::SkinDrawBuffers>],
@@ -11181,7 +11592,7 @@ fn record_draws(
         })
     });
     let draw_count = sorted.as_ref().map_or(scene.draws.len(), Vec::len);
-    let mut bound_pipeline = None;
+    let mut bound_pipeline: Option<PipelineChoice> = None;
     let mut rasterization_state = None;
     for position in 0..draw_count {
         let index = sorted
@@ -11191,43 +11602,44 @@ fn record_draws(
         let Some(material) = material_for_draw(scene.materials, draw) else {
             continue;
         };
-        let pipeline_kind = match pass {
-            DrawPass::Prepass => match material.alpha_mode {
-                AlphaMode::Opaque => DrawPipeline::Prepass,
-                AlphaMode::Mask { .. } | AlphaMode::Blend => continue,
-            },
-            DrawPass::Overdraw => DrawPipeline::Overdraw,
-            DrawPass::Wireframe => DrawPipeline::Wireframe,
-            DrawPass::OpaqueAndMask => match material.alpha_mode {
-                AlphaMode::Opaque => DrawPipeline::Opaque,
-                AlphaMode::Mask { .. } => DrawPipeline::Mask,
-                AlphaMode::Blend => continue,
-            },
-            DrawPass::Blend => match material.alpha_mode {
-                AlphaMode::Blend => DrawPipeline::Blend,
-                AlphaMode::Opaque | AlphaMode::Mask { .. } => continue,
-            },
+        let Some(pipeline_choice) = select_pipeline_choice(
+            material.shader,
+            material.alpha_mode,
+            pass,
+            scene.depth_prepass,
+        ) else {
+            continue;
         };
-        if bound_pipeline != Some(pipeline_kind) {
-            let pipeline = match pipeline_kind {
-                DrawPipeline::Prepass => match scene.prepass_pipeline {
-                    Some(pipeline) => pipeline,
-                    None => continue,
-                },
-                DrawPipeline::Opaque if scene.depth_prepass => {
-                    scene.opaque_equal_pipeline.unwrap_or(scene.pipeline)
+        if bound_pipeline != Some(pipeline_choice) {
+            let pipeline = match pipeline_choice {
+                PipelineChoice::Builtin(DrawPipeline::Prepass) => scene.prepass_pipeline,
+                PipelineChoice::Builtin(DrawPipeline::Opaque) if scene.depth_prepass => {
+                    Some(scene.opaque_equal_pipeline.unwrap_or(scene.pipeline))
                 }
-                DrawPipeline::Opaque => scene.pipeline,
-                DrawPipeline::Mask => scene.mask_pipeline,
-                DrawPipeline::Blend => scene.blend_pipeline,
-                DrawPipeline::Overdraw => scene.overdraw_pipeline,
-                DrawPipeline::Wireframe => scene.wireframe_pipeline.unwrap_or(scene.pipeline),
+                PipelineChoice::Builtin(DrawPipeline::Opaque) => Some(scene.pipeline),
+                PipelineChoice::Builtin(DrawPipeline::Mask) => Some(scene.mask_pipeline),
+                PipelineChoice::Builtin(DrawPipeline::Blend) => Some(scene.blend_pipeline),
+                PipelineChoice::Builtin(DrawPipeline::Overdraw) => Some(scene.overdraw_pipeline),
+                PipelineChoice::Builtin(DrawPipeline::Wireframe) => {
+                    Some(scene.wireframe_pipeline.unwrap_or(scene.pipeline))
+                }
+                PipelineChoice::Surface(shader, variant) => scene
+                    .surface_shaders
+                    .get(shader.0)
+                    .and_then(Option::as_ref)
+                    .map(|shader| match variant {
+                        SurfacePipelineVariant::Opaque => shader.pipelines.opaque,
+                        SurfacePipelineVariant::OpaqueAfterPrepass => shader.pipelines.opaque_equal,
+                        SurfacePipelineVariant::Mask => shader.pipelines.mask,
+                        SurfacePipelineVariant::Blend => shader.pipelines.blend,
+                    }),
             };
+            let Some(pipeline) = pipeline else { continue };
             // SAFETY: the selected pipeline matches the active dynamic-rendering attachments.
             unsafe {
                 device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
             };
-            bound_pipeline = Some(pipeline_kind);
+            bound_pipeline = Some(pipeline_choice);
         }
 
         // Индексы проверены validate_draws до начала кадра.
@@ -11289,7 +11701,7 @@ fn record_draws(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrawPipeline {
     Prepass,
     Opaque,
@@ -11297,6 +11709,65 @@ enum DrawPipeline {
     Blend,
     Overdraw,
     Wireframe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfacePipelineVariant {
+    Opaque,
+    OpaqueAfterPrepass,
+    Mask,
+    Blend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipelineChoice {
+    Builtin(DrawPipeline),
+    Surface(ShaderId, SurfacePipelineVariant),
+}
+
+fn select_pipeline_choice(
+    shader: Option<ShaderId>,
+    alpha: AlphaMode,
+    pass: DrawPass,
+    depth_prepass: bool,
+) -> Option<PipelineChoice> {
+    match pass {
+        DrawPass::Prepass => match alpha {
+            AlphaMode::Opaque => Some(PipelineChoice::Builtin(DrawPipeline::Prepass)),
+            AlphaMode::Mask { .. } | AlphaMode::Blend => None,
+        },
+        DrawPass::Overdraw => Some(PipelineChoice::Builtin(DrawPipeline::Overdraw)),
+        DrawPass::Wireframe => Some(PipelineChoice::Builtin(DrawPipeline::Wireframe)),
+        DrawPass::OpaqueAndMask => match alpha {
+            AlphaMode::Opaque => Some(shader.map_or(
+                PipelineChoice::Builtin(DrawPipeline::Opaque),
+                |shader| {
+                    PipelineChoice::Surface(
+                        shader,
+                        if depth_prepass {
+                            SurfacePipelineVariant::OpaqueAfterPrepass
+                        } else {
+                            SurfacePipelineVariant::Opaque
+                        },
+                    )
+                },
+            )),
+            AlphaMode::Mask { .. } => Some(
+                shader.map_or(PipelineChoice::Builtin(DrawPipeline::Mask), |shader| {
+                    PipelineChoice::Surface(shader, SurfacePipelineVariant::Mask)
+                }),
+            ),
+            AlphaMode::Blend => None,
+        },
+        DrawPass::Blend => match alpha {
+            AlphaMode::Blend => Some(
+                shader.map_or(PipelineChoice::Builtin(DrawPipeline::Blend), |shader| {
+                    PipelineChoice::Surface(shader, SurfacePipelineVariant::Blend)
+                }),
+            ),
+            AlphaMode::Opaque | AlphaMode::Mask { .. } => None,
+        },
+    }
 }
 
 fn material_for_draw<'a>(
@@ -12788,8 +13259,11 @@ struct GpuMaterial {
     set: vk::DescriptorSet,
     double_sided: bool,
     _uniform_buffer: HostBuffer,
+    _user_uniform_buffer: Arc<HostBuffer>,
     _textures: [Arc<Texture>; 5],
+    _user_textures: [Arc<Texture>; 8],
     alpha_mode: AlphaMode,
+    shader: Option<ShaderId>,
 }
 
 impl Drop for GpuMaterial {
@@ -12797,6 +13271,37 @@ impl Drop for GpuMaterial {
         if self.pool != vk::DescriptorPool::null() {
             // SAFETY: retirement waits for submitted frames; this frees the set before owned texture refs.
             unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
+        }
+    }
+}
+
+struct GpuSurfaceShader {
+    device: ash::Device,
+    pipelines: SurfacePipelines,
+    properties: Vec<SurfaceProperty>,
+    references: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SurfacePipelines {
+    opaque: vk::Pipeline,
+    opaque_equal: vk::Pipeline,
+    mask: vk::Pipeline,
+    blend: vk::Pipeline,
+}
+
+impl Drop for GpuSurfaceShader {
+    fn drop(&mut self) {
+        for pipeline in [
+            self.pipelines.opaque,
+            self.pipelines.opaque_equal,
+            self.pipelines.mask,
+            self.pipelines.blend,
+        ] {
+            if pipeline != vk::Pipeline::null() {
+                // SAFETY: a surface shader is dropped only after its frame uses are retired.
+                unsafe { self.device.destroy_pipeline(pipeline, None) };
+            }
         }
     }
 }
@@ -13377,6 +13882,16 @@ fn validate_material(
             "emissive должен содержать конечные компоненты >= 0".to_owned(),
         ));
     }
+    if material
+        .user_values
+        .iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+    {
+        return Err(RenderError::InvalidMaterial(
+            "пользовательские значения должны быть конечными".to_owned(),
+        ));
+    }
     if let AlphaMode::Mask { cutoff } = material.alpha_mode
         && !valid_factor(cutoff)
     {
@@ -13427,6 +13942,122 @@ fn validate_material(
     )
 }
 
+fn validate_surface_shader_source(source: &SurfaceShaderSource) -> Result<(), RenderError> {
+    let mut numeric_slots = HashSet::new();
+    let mut texture_slots = HashSet::new();
+    let mut names = HashSet::new();
+    for property in &source.properties {
+        let mut chars = property.name.chars();
+        let valid_identifier = chars
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && chars.all(|character| character == '_' || character.is_ascii_alphanumeric());
+        if !valid_identifier
+            || property.name.starts_with("gl_")
+            || property.name.starts_with("rve_")
+            || !names.insert(property.name.as_str())
+        {
+            return Err(RenderError::InvalidShader(format!(
+                "недопустимое или повторное имя свойства {}",
+                property.name
+            )));
+        }
+        match property.kind {
+            SurfacePropertyKind::Texture => {
+                if property.slot >= 8
+                    || !texture_slots.insert(property.slot)
+                    || property.color_space.is_none()
+                {
+                    return Err(RenderError::InvalidShader(format!(
+                        "недопустимый слот или цветовое пространство текстуры {}",
+                        property.name
+                    )));
+                }
+            }
+            _ => {
+                if property.slot >= 16 || !numeric_slots.insert(property.slot) {
+                    return Err(RenderError::InvalidShader(format!(
+                        "недопустимый слот свойства {}",
+                        property.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_shader_material(
+    material: &Material,
+    texture_spaces: &[Option<TextureColorSpace>],
+    shaders: &[Option<GpuSurfaceShader>],
+) -> Result<(), RenderError> {
+    let Some(shader_id) = material.shader else {
+        if material.user_textures.iter().any(Option::is_some) {
+            return Err(RenderError::InvalidMaterial(
+                "user textures require a surface shader".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    let properties = shaders
+        .get(shader_id.0)
+        .and_then(Option::as_ref)
+        .map(|shader| shader.properties.as_slice());
+    validate_shader_material_properties(material, texture_spaces, properties)
+}
+
+fn validate_shader_material_properties(
+    material: &Material,
+    texture_spaces: &[Option<TextureColorSpace>],
+    properties: Option<&[SurfaceProperty]>,
+) -> Result<(), RenderError> {
+    if material.shader.is_some() && properties.is_none() {
+        return Err(RenderError::InvalidShader(
+            "ShaderId не принадлежит renderer".to_owned(),
+        ));
+    }
+    let properties = properties.unwrap_or_default();
+    for (slot, texture) in material.user_textures.iter().enumerate() {
+        let Some(texture) = texture else { continue };
+        let property = properties
+            .iter()
+            .find(|property| property.kind == SurfacePropertyKind::Texture && property.slot == slot)
+            .ok_or_else(|| {
+                RenderError::InvalidMaterial(format!(
+                    "texture slot {slot} is not declared by the surface shader"
+                ))
+            })?;
+        let actual = texture_spaces
+            .get(texture.0)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                RenderError::InvalidMaterial(format!(
+                    "TextureId для {} не принадлежит renderer",
+                    property.name
+                ))
+            })?;
+        if property.color_space != Some(actual) {
+            return Err(RenderError::InvalidMaterial(format!(
+                "{} требует цветовое пространство {:?}, передано {:?}",
+                property.name, property.color_space, actual
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_shader_destroyable(references: usize) -> Result<(), RenderError> {
+    if references == 0 {
+        Ok(())
+    } else {
+        Err(RenderError::InvalidShader(format!(
+            "shader используется {references} материалами"
+        )))
+    }
+}
+
 fn material_uniform_bytes(material: &Material) -> [u8; MATERIAL_UNIFORMS_SIZE] {
     let (alpha_cutoff, alpha_mode) = match material.alpha_mode {
         AlphaMode::Opaque => (0.0, 0.0),
@@ -13455,6 +14086,24 @@ fn material_uniform_bytes(material: &Material) -> [u8; MATERIAL_UNIFORMS_SIZE] {
         alpha_mode,
         material.occlusion_strength,
     ])
+}
+
+/// Материал без шейдера с нулевыми user-значениями читает общий нулевой буфер вместо собственного.
+fn uses_shared_user_uniform(material: &Material) -> bool {
+    material.shader.is_none() && material.user_values == [[0.0; 4]; 16]
+}
+
+fn user_material_uniform_bytes(material: &Material) -> [u8; USER_MATERIAL_UNIFORMS_SIZE] {
+    let mut bytes = [0; USER_MATERIAL_UNIFORMS_SIZE];
+    for (index, value) in material.user_values.iter().flatten().enumerate() {
+        bytes[index * size_of::<f32>()..(index + 1) * size_of::<f32>()]
+            .copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn spirv_bytes(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
 fn validate_texture(
@@ -15774,11 +16423,21 @@ mod tests {
         // mapped normal and geometric fallback must both flip after TBN mapping.
         let shader = include_str!("../shaders/mesh.frag");
         let mapping = shader.find("vec3 normal = geometric_normal;").unwrap();
-        let flip = shader.find("if (!gl_FrontFacing)").unwrap();
-        assert!(flip > mapping);
-        let flip_block = shader[flip..].split('}').next().unwrap();
-        assert!(flip_block.contains("geometric_normal = -geometric_normal;"));
-        assert!(flip_block.contains("normal = -normal;"));
+        let default_surface = shader.find("Surface rve_default_surface()").unwrap();
+        assert!(default_surface > mapping);
+        let geometric_flip = shader[default_surface..]
+            .find("geometric_normal = -geometric_normal;")
+            .unwrap();
+        // Both flips are absolute offsets in the shader and must follow the TBN mapping they reverse.
+        let perturb = shader.find("vec3 rve_perturb_normal(").unwrap();
+        let perturb_mapping = perturb + shader[perturb..].find("normal = safe_normalize(").unwrap();
+        let normal_flip = perturb + shader[perturb..].find("normal = -normal;").unwrap();
+        assert!(normal_flip > perturb_mapping);
+        let surface_mapping = shader
+            .find("normal = rve_perturb_normal(tangent_normal);")
+            .unwrap();
+        let geometric_flip = default_surface + geometric_flip;
+        assert!(geometric_flip > surface_mapping);
     }
 
     fn ggx_shader_has_analytic_peak(source: &str) -> bool {
@@ -16831,6 +17490,135 @@ mod tests {
         assert_eq!(
             &floats(&material_uniform_bytes(&Material::default()))[12..16],
             &[1.0, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn user_material_uniforms_are_sixteen_vec4s_and_keep_zero_defaults() {
+        let mut material = Material::default();
+        material.user_values[3] = [1.0, 2.0, 3.0, 4.0];
+        let bytes = super::user_material_uniform_bytes(&material);
+        assert_eq!(bytes.len(), 16 * 16);
+        assert_eq!(floats(&bytes)[12..16], [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            floats(&super::user_material_uniform_bytes(&Material::default())),
+            [0.0; 64]
+        );
+    }
+
+    #[test]
+    fn only_builtin_materials_with_zero_user_values_share_the_user_uniform() {
+        let builtin = Material::default();
+        assert!(super::uses_shared_user_uniform(&builtin));
+        let mut with_values = Material::default();
+        with_values.user_values[0] = [0.5, 0.0, 0.0, 0.0];
+        assert!(!super::uses_shared_user_uniform(&with_values));
+        let custom = Material {
+            shader: Some(super::ShaderId(0)),
+            ..Material::default()
+        };
+        assert!(!super::uses_shared_user_uniform(&custom));
+    }
+
+    #[test]
+    fn shader_material_validation_checks_shader_and_texture_color_space() {
+        use super::{
+            ShaderId, SurfaceProperty, SurfacePropertyKind, validate_shader_material_properties,
+        };
+
+        let material = Material {
+            shader: Some(ShaderId(0)),
+            user_textures: [Some(TextureId(0)), None, None, None, None, None, None, None],
+            ..Material::default()
+        };
+        let properties = [SurfaceProperty {
+            name: "albedo".to_owned(),
+            kind: SurfacePropertyKind::Texture,
+            slot: 0,
+            color_space: Some(TextureColorSpace::Srgb),
+            fallback: super::SurfaceTextureFallback::White,
+        }];
+        assert!(matches!(
+            validate_shader_material_properties(
+                &material,
+                &[Some(TextureColorSpace::Linear)],
+                None
+            ),
+            Err(RenderError::InvalidShader(_))
+        ));
+        assert!(matches!(
+            validate_shader_material_properties(
+                &material,
+                &[Some(TextureColorSpace::Linear)],
+                Some(&properties)
+            ),
+            Err(RenderError::InvalidMaterial(_))
+        ));
+        assert!(
+            validate_shader_material_properties(
+                &material,
+                &[Some(TextureColorSpace::Srgb)],
+                Some(&properties)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn shader_cannot_be_destroyed_while_materials_reference_it() {
+        use super::validate_shader_destroyable;
+        assert!(validate_shader_destroyable(0).is_ok());
+        assert!(matches!(
+            validate_shader_destroyable(1),
+            Err(RenderError::InvalidShader(_))
+        ));
+    }
+
+    #[test]
+    fn surface_pipeline_selection_covers_prepass_and_builtin_debug_draws() {
+        use super::{
+            DrawPass, DrawPipeline, PipelineChoice, ShaderId, SurfacePipelineVariant,
+            select_pipeline_choice,
+        };
+        let shader = ShaderId(4);
+        let custom = Some(shader);
+        assert_eq!(
+            select_pipeline_choice(None, AlphaMode::Opaque, DrawPass::OpaqueAndMask, false),
+            Some(PipelineChoice::Builtin(DrawPipeline::Opaque))
+        );
+        assert_eq!(
+            select_pipeline_choice(custom, AlphaMode::Opaque, DrawPass::OpaqueAndMask, true),
+            Some(PipelineChoice::Surface(
+                shader,
+                SurfacePipelineVariant::OpaqueAfterPrepass
+            ))
+        );
+        assert_eq!(
+            select_pipeline_choice(
+                custom,
+                AlphaMode::Mask { cutoff: 0.5 },
+                DrawPass::OpaqueAndMask,
+                true
+            ),
+            Some(PipelineChoice::Surface(
+                shader,
+                SurfacePipelineVariant::Mask
+            ))
+        );
+        assert_eq!(
+            select_pipeline_choice(custom, AlphaMode::Blend, DrawPass::Blend, false),
+            Some(PipelineChoice::Surface(
+                shader,
+                SurfacePipelineVariant::Blend
+            ))
+        );
+        assert_eq!(
+            select_pipeline_choice(custom, AlphaMode::Opaque, DrawPass::Wireframe, false),
+            Some(PipelineChoice::Builtin(DrawPipeline::Wireframe))
+        );
+        assert_eq!(
+            select_pipeline_choice(custom, AlphaMode::Blend, DrawPass::Prepass, false),
+            None
         );
     }
 

@@ -1,5 +1,19 @@
 //! Перевод ввода окна в ввод скриптов Play-режима.
 
+/// Pending native events can move the pointer before the next egui frame updates hover flags.
+/// PointerGone must suppress the previous frame's position too.
+pub fn latest_pointer(events: &[egui::Event], previous: Option<egui::Pos2>) -> Option<egui::Pos2> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            egui::Event::PointerMoved(point) => Some(Some(*point)),
+            egui::Event::PointerGone => Some(None),
+            _ => None,
+        })
+        .unwrap_or(previous)
+}
+
 use engine_gui::input::TextInputEvent;
 use engine_script as script;
 use engine_window as window;
@@ -175,5 +189,30 @@ mod tests {
                 engine_gui::input::TextInputEvent::Backspace,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::latest_pointer;
+    use egui::{Event, pos2};
+    #[test]
+    fn pending_motion_changes_click_routing_before_a_frame_and_exit_clears_it() {
+        let game = egui::Rect::from_min_max(pos2(100.0, 100.0), pos2(600.0, 500.0));
+        let toolbar = Some(pos2(200.0, 20.0));
+        let moved = [Event::PointerMoved(pos2(250.0, 150.0))];
+        assert!(latest_pointer(&moved, toolbar).is_some_and(|p| game.contains(p)));
+        assert!(
+            !latest_pointer(
+                &[Event::PointerMoved(pos2(200.0, 20.0))],
+                Some(pos2(250.0, 150.0))
+            )
+            .is_some_and(|p| game.contains(p))
+        );
+        assert_eq!(
+            latest_pointer(&[moved[0].clone(), Event::PointerGone], toolbar),
+            None
+        );
+        assert_eq!(latest_pointer(&[], toolbar), toolbar);
     }
 }

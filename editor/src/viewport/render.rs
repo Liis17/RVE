@@ -2,7 +2,9 @@
 
 use crate::asset_watch::AssetChanges;
 use crate::console::ConsoleLog;
+use crate::materials::MaterialLibrary;
 use crate::project::OpenProject;
+use crate::state::MaterialPreviewPrimitive;
 use crate::viewport::animation::{
     AnimationPreview, EditorAnimation, PreviewStatus, project_preview_bridge,
 };
@@ -17,8 +19,9 @@ use engine_render::{
     LocalLightShadow, LocalLightShadowMatrices, Material, MaterialId, MeshId, ParticleBlend,
     ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleEmitterFrame,
     ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey, PostProcess,
-    ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, SkinBinding, SkinId, SkinVertex,
-    TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
+    ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, ShaderId, SkinBinding, SkinId,
+    SkinVertex, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings,
+    ViewportId,
 };
 use engine_scene::PostProcessSettings;
 use engine_scene::camera::Camera;
@@ -28,8 +31,10 @@ use engine_scene::light::{
 };
 use engine_scene::world::ObjectHandle;
 use engine_scene::{
-    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, ParticleBlendMode,
-    ParticleEmitterComponent, ParticleShapeComponent, SceneFrame, Tonemapper, World,
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, MaterialAlphaMode,
+    MaterialAsset, ParticleBlendMode, ParticleEmitterComponent, ParticleShapeComponent,
+    ResolvedMaterialAsset, SceneFrame, ShaderAsset, ShaderColorSpace, ShaderPropertyKind,
+    Tonemapper, World,
 };
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -49,6 +54,32 @@ struct GpuModel {
     joint_count: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AssetMaterialKey {
+    material_revision: u64,
+    shader_generation: u64,
+    texture_revisions: Vec<(String, TextureColorSpace, u64)>,
+}
+
+struct GpuAssetMaterial {
+    key: AssetMaterialKey,
+    material: Material,
+    id: MaterialId,
+}
+
+#[derive(Clone)]
+struct GpuSurfaceShader {
+    revision: u64,
+    asset: ShaderAsset,
+    id: ShaderId,
+}
+
+pub struct MaterialPreviewDraw {
+    pub draw: DrawCommand,
+    pub camera: Camera,
+    pub environment: FrameEnvironment,
+}
+
 /// Экземпляры скиннинга объекта с `animator`: путь модели, её меши и по экземпляру на меш.
 /// Типы параметризованы, чтобы планирование синхронизации тестировалось без GPU.
 struct SkinnedObject<M = MeshId, S = SkinId> {
@@ -63,6 +94,7 @@ struct SkinnedObject<M = MeshId, S = SkinId> {
 pub struct SceneRenderer {
     pub viewport: ViewportId,
     pub game_viewport: ViewportId,
+    pub material_preview_viewport: Option<ViewportId>,
     models: HashMap<String, Option<GpuModel>>,
     model_dependencies: HashMap<String, Vec<VirtualPath>>,
     failed_reloads: HashSet<String>,
@@ -70,6 +102,21 @@ pub struct SceneRenderer {
     /// пересобирается только при смене поколения модели аниматора.
     model_versions: HashMap<String, u64>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
+    texture_revisions: HashMap<(String, TextureColorSpace), u64>,
+    next_texture_revision: u64,
+    asset_materials: HashMap<String, GpuAssetMaterial>,
+    surface_shaders: HashMap<String, GpuSurfaceShader>,
+    retired_surface_shaders: Vec<ShaderId>,
+    failed_surface_shaders: HashSet<(String, u64)>,
+    failed_asset_materials: HashSet<(String, AssetMaterialKey)>,
+    error_material: Option<MaterialId>,
+    preview_default_material: Option<MaterialId>,
+    preview_asset_material: Option<(String, MaterialId)>,
+    preview_shader_material: Option<(String, AssetMaterialKey, Material, MaterialId)>,
+    preview_environment: Option<EnvironmentId>,
+    preview_meshes: HashMap<MaterialPreviewPrimitive, MeshId>,
+    reported_material_errors: HashSet<String>,
+    reported_material_warnings: HashSet<String>,
     environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
     failed_environment: Option<EditorEnvironmentKey>,
@@ -265,11 +312,27 @@ impl SceneRenderer {
         Ok(Self {
             viewport: renderer.create_viewport(1, 1)?,
             game_viewport: renderer.create_viewport(1, 1)?,
+            material_preview_viewport: None,
             models: HashMap::new(),
             model_dependencies: HashMap::new(),
             failed_reloads: HashSet::new(),
             model_versions: HashMap::new(),
             textures: HashMap::new(),
+            texture_revisions: HashMap::new(),
+            next_texture_revision: 0,
+            asset_materials: HashMap::new(),
+            surface_shaders: HashMap::new(),
+            retired_surface_shaders: Vec::new(),
+            failed_surface_shaders: HashSet::new(),
+            failed_asset_materials: HashSet::new(),
+            error_material: None,
+            preview_default_material: None,
+            preview_asset_material: None,
+            preview_shader_material: None,
+            preview_environment: None,
+            preview_meshes: HashMap::new(),
+            reported_material_errors: HashSet::new(),
+            reported_material_warnings: HashSet::new(),
             particle_emitters: HashMap::new(),
             particle_frames: Vec::new(),
             particle_step: 0.0,
@@ -301,6 +364,9 @@ impl SceneRenderer {
         if let Some((_, environment)) = self.current_environment.take() {
             renderer.destroy_environment(environment)?;
         }
+        if let Some(environment) = self.preview_environment.take() {
+            renderer.destroy_environment(environment)?;
+        }
         self.environment_sources.clear();
         self.model_dependencies.clear();
         self.failed_reloads.clear();
@@ -315,9 +381,36 @@ impl SceneRenderer {
         for (_, (_, material)) in self.object_materials.drain() {
             renderer.destroy_material(material)?;
         }
+        for (_, material) in self.asset_materials.drain() {
+            renderer.destroy_material(material.id)?;
+        }
+        self.preview_asset_material = None;
+        if let Some((_, _, _, material)) = self.preview_shader_material.take() {
+            renderer.destroy_material(material)?;
+        }
+        if let Some(material) = self.preview_default_material.take() {
+            renderer.destroy_material(material)?;
+        }
+        if let Some(material) = self.error_material.take() {
+            renderer.destroy_material(material)?;
+        }
+        for (_, shader) in self.surface_shaders.drain() {
+            renderer.destroy_surface_shader(shader.id)?;
+        }
+        for shader in self.retired_surface_shaders.drain(..) {
+            renderer.destroy_surface_shader(shader)?;
+        }
         for texture in self.textures.drain().filter_map(|(_, texture)| texture) {
             renderer.destroy_texture(texture)?;
         }
+        for mesh in self.preview_meshes.drain().map(|(_, mesh)| mesh) {
+            renderer.destroy_mesh(mesh)?;
+        }
+        self.texture_revisions.clear();
+        self.reported_material_errors.clear();
+        self.reported_material_warnings.clear();
+        self.failed_surface_shaders.clear();
+        self.failed_asset_materials.clear();
         cpu_models.clear();
         Ok(())
     }
@@ -507,6 +600,28 @@ impl SceneRenderer {
         Ok(())
     }
 
+    pub fn ensure_material_preview_viewport(
+        &mut self,
+        renderer: &mut Renderer,
+    ) -> Result<ViewportId, RenderError> {
+        if let Some(viewport) = self.material_preview_viewport {
+            return Ok(viewport);
+        }
+        let viewport = renderer.create_viewport(1, 1)?;
+        self.material_preview_viewport = Some(viewport);
+        Ok(viewport)
+    }
+
+    pub fn free_material_preview_viewport(
+        &mut self,
+        renderer: &mut Renderer,
+    ) -> Result<(), RenderError> {
+        if let Some(viewport) = self.material_preview_viewport.take() {
+            renderer.free_viewport(viewport)?;
+        }
+        Ok(())
+    }
+
     /// Перезагружает только ресурсы, совпавшие с изменёнными путями или зависимостями.
     pub fn reload_changed(
         &mut self,
@@ -553,6 +668,7 @@ impl SceneRenderer {
                     };
                     let (current, old, _) = cache_update(previous, Ok(replacement));
                     self.textures.insert(key, current);
+                    self.bump_texture_revision((path.clone(), color_space));
                     if let Some(old) = old {
                         renderer.destroy_texture(old)?;
                     }
@@ -719,6 +835,460 @@ impl SceneRenderer {
             }
         };
         self.textures.insert(key, gpu);
+        if self
+            .textures
+            .get(&(path.to_owned(), color_space))
+            .is_some_and(Option::is_some)
+        {
+            self.bump_texture_revision((path.to_owned(), color_space));
+        }
+        Ok(())
+    }
+
+    fn bump_texture_revision(&mut self, key: (String, TextureColorSpace)) {
+        self.next_texture_revision = self.next_texture_revision.wrapping_add(1).max(1);
+        self.texture_revisions
+            .insert(key, self.next_texture_revision);
+    }
+
+    fn ensure_error_material(
+        &mut self,
+        renderer: &mut Renderer,
+    ) -> Result<MaterialId, RenderError> {
+        if let Some(material) = self.error_material {
+            return Ok(material);
+        }
+        let material = renderer.create_material(&Material {
+            base_color: [1.0, 0.0, 1.0],
+            emissive: [0.08, 0.0, 0.08],
+            roughness: 1.0,
+            ..Material::default()
+        })?;
+        self.error_material = Some(material);
+        Ok(material)
+    }
+
+    fn ensure_surface_shader(
+        &mut self,
+        renderer: &mut Renderer,
+        path: &str,
+        library: &MaterialLibrary,
+        log: &mut ConsoleLog,
+    ) -> Result<Option<GpuSurfaceShader>, RenderError> {
+        let Some(cached) = library.shader(path) else {
+            self.report_material_error(log, format!("{path}: шейдер отсутствует в библиотеке"));
+            return Ok(None);
+        };
+        if let Some(error) = &cached.error {
+            self.report_material_error(log, error.clone());
+        }
+        let Some(asset) = cached.asset.as_ref() else {
+            if let Some(error) = &cached.error {
+                self.report_material_error(log, error.clone());
+            }
+            return Ok(None);
+        };
+        if let Some(shader) = self.surface_shaders.get(path)
+            && shader.revision == cached.revision
+        {
+            return Ok(Some(shader.clone()));
+        }
+        if self
+            .failed_surface_shaders
+            .contains(&(path.to_owned(), cached.revision))
+        {
+            return Ok(self.surface_shaders.get(path).cloned());
+        }
+        let source = library
+            .shader_source(path)
+            .unwrap_or_else(|| crate::materials::surface_source(asset));
+        match renderer.create_surface_shader(&source) {
+            Ok(id) => {
+                let replacement = GpuSurfaceShader {
+                    revision: cached.revision,
+                    asset: asset.clone(),
+                    id,
+                };
+                if let Some(previous) = self
+                    .surface_shaders
+                    .insert(path.to_owned(), replacement.clone())
+                {
+                    self.retired_surface_shaders.push(previous.id);
+                }
+                Ok(Some(replacement))
+            }
+            Err(RenderError::InvalidShader(error)) => {
+                self.failed_surface_shaders
+                    .insert((path.to_owned(), cached.revision));
+                let message = if self.surface_shaders.contains_key(path) {
+                    format!("{path}: {error}; сохранена прежняя версия шейдера")
+                } else {
+                    format!("{path}: {error}")
+                };
+                self.report_material_error(log, message);
+                Ok(self.surface_shaders.get(path).cloned())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn report_material_error(&mut self, log: &mut ConsoleLog, message: String) {
+        if self.reported_material_errors.insert(message.clone()) {
+            log.error(message);
+        }
+    }
+
+    fn prepare_asset_materials(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        library: &MaterialLibrary,
+        paths: &HashSet<String>,
+        preview_shader_path: Option<&str>,
+        log: &mut ConsoleLog,
+    ) -> Result<HashMap<String, (Material, MaterialId)>, RenderError> {
+        let error_id = self.ensure_error_material(renderer)?;
+        self.reload_surface_shaders_transactionally(
+            renderer,
+            project,
+            library,
+            paths,
+            preview_shader_path,
+            log,
+        )?;
+        let mut prepared = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let Some(cached) = library.material(path).cloned() else {
+                self.report_material_error(
+                    log,
+                    format!("{path}: материал отсутствует в библиотеке"),
+                );
+                prepared.insert(path.clone(), (error_material(), error_id));
+                continue;
+            };
+            if let Some(error) = cached.error.as_ref().filter(|_| cached.draft.is_none()) {
+                self.report_material_error(log, error.clone());
+                prepared.insert(path.clone(), (error_material(), error_id));
+                continue;
+            }
+            let Some(asset) = cached.effective_asset().cloned() else {
+                prepared.insert(path.clone(), (error_material(), error_id));
+                continue;
+            };
+            let shader = if let Some(shader_path) = &asset.shader {
+                self.ensure_surface_shader(renderer, shader_path.as_str(), library, log)?
+            } else {
+                None
+            };
+            if asset.shader.is_some() && shader.is_none() {
+                prepared.insert(path.clone(), (error_material(), error_id));
+                continue;
+            }
+            let (key, material) = self.resolve_asset_material(
+                renderer,
+                project,
+                path,
+                cached.revision,
+                &asset,
+                shader.as_ref(),
+                log,
+            )?;
+            let current = self.asset_materials.get(path);
+            let id = if current.is_some_and(|current| current.key == key) {
+                current.unwrap().id
+            } else if self
+                .failed_asset_materials
+                .contains(&(path.clone(), key.clone()))
+            {
+                if let Some(current) = current {
+                    prepared.insert(path.clone(), (current.material, current.id));
+                    continue;
+                }
+                prepared.insert(path.clone(), (error_material(), error_id));
+                continue;
+            } else {
+                match renderer.create_material(&material) {
+                    Ok(id) => {
+                        self.failed_asset_materials
+                            .retain(|(failed_path, _)| failed_path != path);
+                        let previous = self
+                            .asset_materials
+                            .insert(path.clone(), GpuAssetMaterial { key, material, id });
+                        if let Some(previous) = previous {
+                            renderer.destroy_material(previous.id)?;
+                        }
+                        id
+                    }
+                    Err(error) if is_resource_error(&error) => {
+                        self.failed_asset_materials
+                            .insert((path.clone(), key.clone()));
+                        let message = format!("{path}: {error}; используется материал ошибки");
+                        self.report_material_error(log, message);
+                        prepared.insert(path.clone(), (error_material(), error_id));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            prepared.insert(path.clone(), (material, id));
+        }
+        Ok(prepared)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_asset_material(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        path: &str,
+        material_revision: u64,
+        asset: &MaterialAsset,
+        shader: Option<&GpuSurfaceShader>,
+        log: &mut ConsoleLog,
+    ) -> Result<(AssetMaterialKey, Material), RenderError> {
+        let schema = shader.map_or_else(engine_scene::ShaderSchema::lit, |shader| {
+            shader.asset.layout()
+        });
+        let resolved = asset.resolve(&schema);
+        let warning_key = format!("{path}:{material_revision}");
+        for warning in &resolved.warnings {
+            let key = format!("{warning_key}:{warning}");
+            if self.reported_material_warnings.insert(key) {
+                log.push(crate::console::LogLevel::Warn, format!("{path}: {warning}"));
+            }
+        }
+        let mut texture_revisions = Vec::new();
+        let mut material = resolved_asset_material(&resolved, shader.map(|shader| shader.id));
+        for (slot, texture) in resolved.textures.iter().enumerate() {
+            let Some((texture_path, color_space)) = texture else {
+                continue;
+            };
+            let render_space = match color_space {
+                ShaderColorSpace::Srgb => TextureColorSpace::Srgb,
+                ShaderColorSpace::Linear => TextureColorSpace::Linear,
+            };
+            self.sync_texture(renderer, project, log, texture_path.as_str(), render_space)?;
+            let texture_id = self
+                .textures
+                .get(&(texture_path.as_str().to_owned(), render_space))
+                .copied()
+                .flatten();
+            if schema.builtin_lit {
+                if let Some(property) = schema.properties.iter().find(|property| {
+                    property.property.kind == ShaderPropertyKind::Texture && property.slot == slot
+                }) {
+                    set_lit_texture(&mut material, &property.property.name, texture_id);
+                }
+            } else if let Some(target) = material.user_textures.get_mut(slot) {
+                *target = texture_id;
+            }
+            let revision = self
+                .texture_revisions
+                .get(&(texture_path.as_str().to_owned(), render_space))
+                .copied()
+                .unwrap_or(0);
+            texture_revisions.push((texture_path.as_str().to_owned(), render_space, revision));
+        }
+        Ok((
+            AssetMaterialKey {
+                material_revision,
+                shader_generation: shader.map_or(0, |shader| shader.revision),
+                texture_revisions,
+            },
+            material,
+        ))
+    }
+
+    fn reload_surface_shaders_transactionally(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        library: &MaterialLibrary,
+        active_materials: &HashSet<String>,
+        preview_shader_path: Option<&str>,
+        log: &mut ConsoleLog,
+    ) -> Result<(), RenderError> {
+        let mut shader_paths = active_materials
+            .iter()
+            .filter_map(|path| library.material(path)?.effective_asset()?.shader.as_ref())
+            .map(|path| path.as_str().to_owned())
+            .collect::<HashSet<_>>();
+        if let Some(path) = preview_shader_path {
+            shader_paths.insert(path.to_owned());
+        }
+
+        for path in shader_paths {
+            let Some(cached) = library.shader(&path) else {
+                continue;
+            };
+            let Some(asset) = cached.asset.as_ref() else {
+                continue;
+            };
+            if !surface_shader_rebuild_needed(
+                self.surface_shaders
+                    .get(&path)
+                    .map(|current| current.revision),
+                &self.failed_surface_shaders,
+                &path,
+                cached.revision,
+            ) {
+                continue;
+            }
+            let source = library
+                .shader_source(&path)
+                .unwrap_or_else(|| crate::materials::surface_source(asset));
+            let shader_id = match renderer.create_surface_shader(&source) {
+                Ok(shader) => shader,
+                Err(RenderError::InvalidShader(error)) => {
+                    self.failed_surface_shaders
+                        .insert((path.clone(), cached.revision));
+                    self.report_material_error(
+                        log,
+                        if self.surface_shaders.contains_key(&path) {
+                            format!("{path}: {error}; сохранена прежняя версия шейдера")
+                        } else {
+                            format!("{path}: {error}")
+                        },
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let candidate = GpuSurfaceShader {
+                revision: cached.revision,
+                asset: asset.clone(),
+                id: shader_id,
+            };
+            let dependent_paths = materials_using_shader(
+                active_materials,
+                |material_path| {
+                    library
+                        .material(material_path)
+                        .and_then(|material| material.effective_asset())
+                        .and_then(|material| material.shader.as_ref())
+                        .map(|shader_path| shader_path.as_str().to_owned())
+                },
+                &path,
+            );
+            let mut staged = Vec::with_capacity(dependent_paths.len());
+            let mut failure = None;
+            for material_path in dependent_paths {
+                let Some(material) = library.material(&material_path) else {
+                    continue;
+                };
+                if material.error.is_some() && material.draft.is_none() {
+                    continue;
+                }
+                let Some(asset) = material.effective_asset() else {
+                    continue;
+                };
+                let (key, resolved) = match self.resolve_asset_material(
+                    renderer,
+                    project,
+                    &material_path,
+                    material.revision,
+                    asset,
+                    Some(&candidate),
+                    log,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        for (_, _, _, id) in staged.drain(..) {
+                            renderer.destroy_material(id)?;
+                        }
+                        renderer.destroy_surface_shader(shader_id)?;
+                        return Err(error);
+                    }
+                };
+                match renderer.create_material(&resolved) {
+                    Ok(id) => staged.push((material_path, key, resolved, id)),
+                    Err(error) if is_resource_error(&error) => {
+                        failure = Some((material_path, error));
+                        break;
+                    }
+                    Err(error) => {
+                        for (_, _, _, id) in staged.drain(..) {
+                            renderer.destroy_material(id)?;
+                        }
+                        renderer.destroy_surface_shader(shader_id)?;
+                        return Err(error);
+                    }
+                }
+            }
+            if let Some((failed_path, error)) = failure {
+                for (_, _, _, id) in staged.drain(..) {
+                    renderer.destroy_material(id)?;
+                }
+                renderer.destroy_surface_shader(shader_id)?;
+                self.failed_surface_shaders
+                    .insert((path.clone(), cached.revision));
+                self.report_material_error(
+                    log,
+                    format!(
+                        "{failed_path}: {error}; сохранена прежняя версия шейдера и материалов"
+                    ),
+                );
+                continue;
+            }
+
+            if let Some(previous) = self.surface_shaders.insert(path.clone(), candidate) {
+                self.retired_surface_shaders.push(previous.id);
+            }
+            self.failed_surface_shaders
+                .retain(|(failed_path, _)| failed_path != &path);
+            let mut retired_materials = Vec::new();
+            for (material_path, key, material, id) in staged {
+                if let Some(previous) = self.asset_materials.insert(
+                    material_path.clone(),
+                    GpuAssetMaterial { key, material, id },
+                ) {
+                    retired_materials.push(previous.id);
+                }
+                self.failed_asset_materials
+                    .retain(|(failed_path, _)| failed_path != &material_path);
+            }
+            for material in retired_materials {
+                renderer.destroy_material(material)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_unused_surface_shaders(
+        &mut self,
+        renderer: &mut Renderer,
+        preview_shader_path: Option<&str>,
+    ) -> Result<(), RenderError> {
+        let mut referenced = self
+            .asset_materials
+            .values()
+            .filter_map(|material| material.material.shader)
+            .collect::<HashSet<_>>();
+        if let Some((_, _, material, _)) = &self.preview_shader_material
+            && let Some(shader) = material.shader
+        {
+            referenced.insert(shader);
+        }
+        let unused = unused_surface_shaders(
+            self.surface_shaders
+                .iter()
+                .map(|(path, shader)| (path.clone(), shader.id)),
+            &referenced,
+            preview_shader_path,
+        );
+        for (path, shader) in unused {
+            renderer.destroy_surface_shader(shader)?;
+            self.surface_shaders.remove(&path);
+        }
+        let mut keep = Vec::new();
+        for shader in self.retired_surface_shaders.drain(..) {
+            if referenced.contains(&shader) {
+                keep.push(shader);
+            } else {
+                renderer.destroy_surface_shader(shader)?;
+            }
+        }
+        self.retired_surface_shaders = keep;
         Ok(())
     }
 
@@ -727,6 +1297,10 @@ impl SceneRenderer {
     pub fn build_draws(
         &mut self,
         renderer: &mut Renderer,
+        project: &OpenProject,
+        materials: &MaterialLibrary,
+        log: &mut ConsoleLog,
+        preview_asset: Option<&str>,
         world: &World,
         frame: &SceneFrame,
         scene_eye: Vec3,
@@ -734,6 +1308,35 @@ impl SceneRenderer {
         grid_camera_distance: Option<f32>,
         play_bridge: Option<&AnimationBridge>,
     ) -> Result<(), RenderError> {
+        let mut active_asset_paths = world
+            .objects()
+            .iter()
+            .filter_map(|object| object.mesh_renderer.as_ref())
+            .flat_map(|mesh| mesh.materials.iter().flatten())
+            .map(|path| path.as_str().to_owned())
+            .collect::<HashSet<_>>();
+        if let Some(path) = preview_asset
+            && path.to_ascii_lowercase().ends_with(".rvemat")
+        {
+            active_asset_paths.insert(path.to_owned());
+        }
+        let preview_shader_path =
+            preview_asset.filter(|path| path.to_ascii_lowercase().ends_with(".rveshader"));
+        let asset_materials = self.prepare_asset_materials(
+            renderer,
+            project,
+            materials,
+            &active_asset_paths,
+            preview_shader_path,
+            log,
+        )?;
+        self.preview_asset_material = preview_asset
+            .filter(|path| path.to_ascii_lowercase().ends_with(".rvemat"))
+            .and_then(|path| {
+                asset_materials
+                    .get(path)
+                    .map(|(_, material)| (path.to_owned(), *material))
+            });
         self.scene_draws.clear();
         self.game_draws.clear();
         self.sync_particles(renderer, world, frame)?;
@@ -742,6 +1345,8 @@ impl SceneRenderer {
             let mut resources = DrawResources {
                 models: &self.models,
                 textures: &self.textures,
+                asset_materials: &asset_materials,
+                error_material: self.error_material,
                 object_materials: &mut self.object_materials,
                 used_object_materials: HashSet::new(),
                 skins: &self.skins,
@@ -778,6 +1383,18 @@ impl SceneRenderer {
                 renderer.destroy_material(material)?;
             }
         }
+        let stale_assets = self
+            .asset_materials
+            .keys()
+            .filter(|path| !active_asset_paths.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in stale_assets {
+            if let Some(material) = self.asset_materials.remove(&path) {
+                renderer.destroy_material(material.id)?;
+            }
+        }
+        self.retire_unused_surface_shaders(renderer, preview_shader_path)?;
         if let Some(distance) = grid_camera_distance {
             let grid = match self.grid {
                 Some(grid) => grid,
@@ -1013,6 +1630,186 @@ impl SceneRenderer {
                     AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn material_preview_frame(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        library: &MaterialLibrary,
+        asset_path: Option<&str>,
+        primitive: MaterialPreviewPrimitive,
+        yaw: f32,
+        pitch: f32,
+        zoom: f32,
+        log: &mut ConsoleLog,
+    ) -> Result<MaterialPreviewDraw, RenderError> {
+        let mesh = if let Some(mesh) = self.preview_meshes.get(&primitive) {
+            *mesh
+        } else {
+            let (vertices, indices) = crate::viewport::primitives::mesh(primitive);
+            let mesh = renderer.create_mesh(&vertices, &indices)?;
+            self.preview_meshes.insert(primitive, mesh);
+            mesh
+        };
+        let error_id = self.ensure_error_material(renderer)?;
+        let material = if let Some(path) = asset_path {
+            if path.to_ascii_lowercase().ends_with(".rvemat") {
+                self.preview_asset_material
+                    .as_ref()
+                    .filter(|(cached_path, _)| cached_path == path)
+                    .map_or(error_id, |(_, material)| *material)
+            } else if path.to_ascii_lowercase().ends_with(".rveshader") {
+                self.preview_shader_material_id(renderer, project, library, path, log)?
+                    .unwrap_or(error_id)
+            } else {
+                error_id
+            }
+        } else if let Some(material) = self.preview_default_material {
+            material
+        } else {
+            let material = renderer.create_material(&Material::default())?;
+            self.preview_default_material = Some(material);
+            material
+        };
+        let draw = DrawCommand {
+            mesh,
+            material: Some(material),
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+            previous_model: None,
+            lod_level: 0,
+            casts_shadow: false,
+            skin: None,
+        };
+        let horizontal = pitch.cos() * zoom;
+        let position = Vec3::new(
+            yaw.sin() * horizontal,
+            pitch.sin() * zoom,
+            yaw.cos() * horizontal,
+        );
+        let camera = Camera {
+            position,
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov_narrow: std::f32::consts::FRAC_PI_4,
+            near: 0.05,
+            far: 100.0,
+        };
+        let environment = self.ensure_preview_environment(renderer)?;
+        Ok(MaterialPreviewDraw {
+            draw,
+            camera,
+            environment: FrameEnvironment {
+                id: environment,
+                intensity: 0.7,
+                rotation: Mat3::IDENTITY.to_cols_array_2d(),
+                skybox: false,
+            },
+        })
+    }
+
+    fn ensure_preview_environment(
+        &mut self,
+        renderer: &mut Renderer,
+    ) -> Result<EnvironmentId, RenderError> {
+        if let Some(environment) = self.preview_environment {
+            return Ok(environment);
+        }
+        let environment =
+            renderer.create_environment(&EnvironmentSource::Procedural(ProceduralSky {
+                zenith_color: [0.25, 0.35, 0.55],
+                horizon_color: [0.7, 0.72, 0.75],
+                ground_color: [0.14, 0.13, 0.12],
+                sun_size_deg: 2.0,
+                sun_intensity: 1.0,
+                sun_direction: [0.4, 0.8, -0.4],
+            }))?;
+        self.preview_environment = Some(environment);
+        Ok(environment)
+    }
+
+    fn preview_shader_material_id(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        library: &MaterialLibrary,
+        path: &str,
+        log: &mut ConsoleLog,
+    ) -> Result<Option<MaterialId>, RenderError> {
+        let Some(shader) = self.ensure_surface_shader(renderer, path, library, log)? else {
+            return Ok(None);
+        };
+        let schema = shader.asset.layout();
+        let mut defaults = MaterialAsset::default();
+        for layout in &schema.properties {
+            if let Some(value) = crate::materials::material_to_toml_value(&layout.property) {
+                defaults
+                    .properties
+                    .insert(layout.property.name.clone(), value);
+            }
+        }
+        let resolved = defaults.resolve(&schema);
+        let mut material = resolved_asset_material(&resolved, Some(shader.id));
+        let mut texture_revisions = Vec::new();
+        for (slot, texture) in resolved.textures.iter().enumerate() {
+            let Some((texture_path, color_space)) = texture else {
+                continue;
+            };
+            let render_space = match color_space {
+                ShaderColorSpace::Srgb => TextureColorSpace::Srgb,
+                ShaderColorSpace::Linear => TextureColorSpace::Linear,
+            };
+            self.sync_texture(renderer, project, log, texture_path.as_str(), render_space)?;
+            let texture_id = self
+                .textures
+                .get(&(texture_path.as_str().to_owned(), render_space))
+                .copied()
+                .flatten();
+            if let Some(target) = material.user_textures.get_mut(slot) {
+                *target = texture_id;
+            }
+            let revision = self
+                .texture_revisions
+                .get(&(texture_path.as_str().to_owned(), render_space))
+                .copied()
+                .unwrap_or(0);
+            texture_revisions.push((texture_path.as_str().to_owned(), render_space, revision));
+        }
+        let key = AssetMaterialKey {
+            material_revision: 0,
+            shader_generation: shader.revision,
+            texture_revisions,
+        };
+        if let Some((current_path, current_key, _, id)) = &self.preview_shader_material
+            && current_path == path
+            && current_key == &key
+        {
+            return Ok(Some(*id));
+        }
+        match renderer.create_material(&material) {
+            Ok(id) => {
+                let previous =
+                    self.preview_shader_material
+                        .replace((path.to_owned(), key, material, id));
+                if let Some((_, _, _, previous)) = previous {
+                    renderer.destroy_material(previous)?;
+                }
+                Ok(Some(id))
+            }
+            Err(error) if is_resource_error(&error) => {
+                self.report_material_error(
+                    log,
+                    format!("{path}: {error}; используется материал ошибки"),
+                );
+                Ok(self
+                    .preview_shader_material
+                    .as_ref()
+                    .filter(|(current_path, _, _, _)| current_path == path)
+                    .map(|(_, _, _, id)| *id))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1283,6 +2080,8 @@ fn lod_texture_path<'a>(
 struct DrawResources<'a> {
     models: &'a HashMap<String, Option<GpuModel>>,
     textures: &'a HashMap<(String, TextureColorSpace), Option<TextureId>>,
+    asset_materials: &'a HashMap<String, (Material, MaterialId)>,
+    error_material: Option<MaterialId>,
     object_materials: &'a mut HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     used_object_materials: HashSet<(ObjectHandle, String, usize, usize)>,
     /// Экземпляры скиннинга и индексы палитр кадра по объекту.
@@ -1336,6 +2135,17 @@ fn append_world_draws(
         for (mesh_index, (mesh_id, base_material, base_material_id)) in
             model.meshes.iter().enumerate()
         {
+            let assigned = mesh
+                .materials
+                .get(mesh_index)
+                .and_then(Option::as_ref)
+                .and_then(|path| resources.asset_materials.get(path.as_str()));
+            let (base_material, base_material_id) = assigned
+                .map_or((*base_material, *base_material_id), |(material, id)| {
+                    (*material, *id)
+                });
+            let custom_shader = base_material.shader.is_some()
+                || resources.error_material == Some(base_material_id);
             let override_material = mesh.material.as_ref();
             let mr_texture = override_material
                 .and_then(|material| material.metallic_roughness_texture.as_ref())
@@ -1373,17 +2183,21 @@ fn append_world_draws(
                         .copied()
                         .flatten()
                 });
-            let resolved = resolve_material(
-                *base_material,
-                replacement,
-                override_material,
-                mr_texture,
-                normal_texture,
-                emissive_texture,
-                occlusion_texture,
-            );
-            let material_id = if resolved == *base_material {
-                *base_material_id
+            let resolved = if custom_shader {
+                base_material
+            } else {
+                resolve_material(
+                    base_material,
+                    replacement,
+                    override_material,
+                    mr_texture,
+                    normal_texture,
+                    emissive_texture,
+                    occlusion_texture,
+                )
+            };
+            let material_id = if custom_shader || resolved == base_material {
+                base_material_id
             } else {
                 let key = object_material_key(instance.object, model_path, level, mesh_index);
                 resources.used_object_materials.insert(key.clone());
@@ -1747,6 +2561,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                 normal_scale: base.normal_scale,
                 occlusion_strength: base.occlusion_strength,
                 double_sided: base.double_sided,
+                ..Material::default()
             };
             let material_id = renderer.create_material(&material)?;
             materials.push(material_id);
@@ -1895,6 +2710,53 @@ fn resolve_material(
         }
     }
     base
+}
+
+fn error_material() -> Material {
+    Material {
+        base_color: [1.0, 0.0, 1.0],
+        emissive: [0.08, 0.0, 0.08],
+        roughness: 1.0,
+        ..Material::default()
+    }
+}
+
+fn resolved_asset_material(resolved: &ResolvedMaterialAsset, shader: Option<ShaderId>) -> Material {
+    let mut material = Material {
+        shader,
+        user_values: resolved.uniforms,
+        alpha_mode: match resolved.alpha.mode {
+            MaterialAlphaMode::Opaque => AlphaMode::Opaque,
+            MaterialAlphaMode::Mask => AlphaMode::Mask {
+                cutoff: resolved.alpha.cutoff,
+            },
+            MaterialAlphaMode::Blend => AlphaMode::Blend,
+        },
+        double_sided: resolved.double_sided,
+        ..Material::default()
+    };
+    if let Some(lit) = resolved.lit {
+        material.base_color = lit.base_color;
+        material.metallic = lit.metallic;
+        material.roughness = lit.roughness;
+        material.emissive = lit.emissive;
+        material.opacity = lit.opacity;
+        material.normal_scale = lit.normal_scale;
+        material.occlusion_strength = lit.occlusion_strength;
+    }
+    material
+}
+
+fn set_lit_texture(material: &mut Material, name: &str, texture: Option<TextureId>) {
+    let target = match name {
+        "base_color_texture" => &mut material.base_color_texture,
+        "metallic_roughness_texture" => &mut material.metallic_roughness_texture,
+        "normal_texture" => &mut material.normal_texture,
+        "emissive_texture" => &mut material.emissive_texture,
+        "occlusion_texture" => &mut material.occlusion_texture,
+        _ => return,
+    };
+    *target = texture;
 }
 
 /// Свет кадра. Сцена без directional light показывается светом renderer по умолчанию,
@@ -2186,11 +3048,95 @@ fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProc
     }
 }
 
+/// Пересоздавать ли шейдер при hot-reload: нужна ревизия, которая ещё не загружена и не падала.
+/// Провалившаяся ревизия не повторяется, пока файл не изменится; прежний шейдер остаётся активным.
+fn surface_shader_rebuild_needed(
+    loaded_revision: Option<u64>,
+    failed: &HashSet<(String, u64)>,
+    path: &str,
+    revision: u64,
+) -> bool {
+    loaded_revision != Some(revision) && !failed.contains(&(path.to_owned(), revision))
+}
+
+/// Материалы из `active`, которые ссылаются на `shader_path`; при смене шейдера их надо пересоздать.
+fn materials_using_shader(
+    active: &HashSet<String>,
+    shader_of: impl Fn(&str) -> Option<String>,
+    shader_path: &str,
+) -> Vec<String> {
+    let mut paths = active
+        .iter()
+        .filter(|material| shader_of(material).as_deref() == Some(shader_path))
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+/// Шейдеры без ссылок из материалов. Шейдер превью исключается: его материал создаётся позже
+/// в том же кадре, и уничтожение заставило бы компилировать шейдер заново.
+fn unused_surface_shaders<T: Copy + Eq + Hash>(
+    loaded: impl IntoIterator<Item = (String, T)>,
+    referenced: &HashSet<T>,
+    preview_shader_path: Option<&str>,
+) -> Vec<(String, T)> {
+    loaded
+        .into_iter()
+        .filter(|(path, id)| !referenced.contains(id) && Some(path.as_str()) != preview_shader_path)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use engine_files::VirtualPath;
     use engine_scene::{EnvironmentComponent, LodLevel, ProceduralSkyComponent};
+
+    #[test]
+    fn hot_reload_rebuilds_only_new_revisions_that_have_not_failed() {
+        let path = "/s.rveshader";
+        let mut failed = HashSet::new();
+        let needed = |loaded, failed: &HashSet<(String, u64)>, path, revision| {
+            surface_shader_rebuild_needed(loaded, failed, path, revision)
+        };
+        assert!(!needed(Some(4), &failed, path, 4));
+        assert!(needed(Some(4), &failed, path, 5));
+        assert!(needed(None, &failed, path, 1));
+        failed.insert((path.to_owned(), 5));
+        assert!(!needed(Some(4), &failed, path, 5));
+        assert!(needed(Some(4), &failed, path, 6));
+        assert!(needed(Some(4), &failed, "/other.rveshader", 5));
+    }
+
+    #[test]
+    fn shader_change_selects_only_its_dependent_materials_in_order() {
+        let active: HashSet<String> = ["/m/b.rvemat", "/m/a.rvemat", "/m/lit.rvemat"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let shader_of = |material: &str| match material {
+            "/m/a.rvemat" | "/m/b.rvemat" => Some("/s/water.rveshader".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            materials_using_shader(&active, shader_of, "/s/water.rveshader"),
+            ["/m/a.rvemat", "/m/b.rvemat"]
+        );
+        assert!(materials_using_shader(&active, shader_of, "/s/other.rveshader").is_empty());
+    }
+
+    #[test]
+    fn unreferenced_shader_is_retired_unless_it_backs_the_preview() {
+        let loaded = vec![
+            ("/s/unused.rveshader".to_owned(), 1_usize),
+            ("/s/preview.rveshader".to_owned(), 2),
+            ("/s/used.rveshader".to_owned(), 3),
+        ];
+        let referenced = HashSet::from([3_usize]);
+        let retired = unused_surface_shaders(loaded, &referenced, Some("/s/preview.rveshader"));
+        assert_eq!(retired, [("/s/unused.rveshader".to_owned(), 1)]);
+    }
 
     fn camera() -> Camera {
         Camera {
@@ -2455,6 +3401,7 @@ id = "camera"
             model: VirtualPath::parse("/models/base.fbx").unwrap(),
             texture: Some(VirtualPath::parse("/textures/base.png").unwrap()),
             material: None,
+            materials: Vec::new(),
         };
         let group = LodGroup {
             levels: vec![

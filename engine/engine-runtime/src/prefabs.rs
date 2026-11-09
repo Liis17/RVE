@@ -11,17 +11,17 @@ use crate::module_host::ModuleHost;
 use crate::pipeline::ScriptControl;
 use crate::scene::{
     MaterialTextureSource, ObjectModel, ParticleSource, ResolvedMaterial, load_prefab_template,
-    model_geometry, prepare_template, resolve_material,
+    model_geometry, prepare_template, resolve_material, resolve_material_asset,
 };
-use engine_assets::{Assets, Model, TextureData};
+use engine_assets::{Assets, Model, ModelMaterial, TextureData};
 use engine_files::VirtualPath;
 use engine_physics::ModelGeometry;
 use engine_render::{
-    MaterialId, MeshId, ParticleEmitterDesc, RenderError, Renderer, TextureColorSpace, TextureId,
-    Vertex,
+    MaterialId, MeshId, ParticleEmitterDesc, RenderError, Renderer, ShaderId, SurfaceShaderSource,
+    TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
-use engine_scene::{ObjectHandle, PrefabTemplate};
+use engine_scene::{MaterialAsset, ObjectHandle, PrefabTemplate, ShaderAsset};
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
@@ -65,6 +65,8 @@ pub(crate) struct LoadedPrefab {
     pub cpu: PrefabCpu,
     pub models: HashMap<String, Model>,
     pub textures: HashMap<String, TextureData>,
+    pub material_assets: HashMap<String, Result<MaterialAsset, String>>,
+    pub shader_assets: HashMap<String, Result<ShaderAsset, String>>,
     pub levels: Vec<Option<ObjectModel>>,
     /// Эмиттеры объектов шаблона; элемент `i` относится к объекту `i`.
     pub particles: Vec<Option<ParticleSource>>,
@@ -133,6 +135,7 @@ pub(crate) trait GpuResources {
     type Mesh: Copy + Eq + Hash + Debug;
     type Texture: Copy + Eq + Hash + Debug;
     type Material: Copy + Eq + Hash + Debug;
+    type Shader: Copy + Eq + Hash + Debug;
 
     fn create_mesh(
         &mut self,
@@ -148,7 +151,14 @@ pub(crate) trait GpuResources {
         &mut self,
         resolved: &ResolvedMaterial,
         textures: MaterialTextures<Self::Texture>,
+        shader: Option<Self::Shader>,
+        user_textures: [Option<Self::Texture>; 8],
     ) -> Result<Self::Material, RenderError>;
+    fn create_surface_shader(
+        &mut self,
+        source: &SurfaceShaderSource,
+    ) -> Result<Self::Shader, RenderError>;
+    fn destroy_surface_shader(&mut self, shader: Self::Shader) -> Result<(), RenderError>;
     fn destroy_mesh(&mut self, mesh: Self::Mesh) -> Result<(), RenderError>;
     fn destroy_texture(&mut self, texture: Self::Texture) -> Result<(), RenderError>;
     fn destroy_material(&mut self, material: Self::Material) -> Result<(), RenderError>;
@@ -158,6 +168,7 @@ impl GpuResources for Renderer {
     type Mesh = MeshId;
     type Texture = TextureId;
     type Material = MaterialId;
+    type Shader = ShaderId;
 
     fn create_mesh(&mut self, vertices: &[Vertex], indices: &[u32]) -> Result<MeshId, RenderError> {
         Renderer::create_mesh(self, vertices, indices)
@@ -181,10 +192,15 @@ impl GpuResources for Renderer {
         &mut self,
         resolved: &ResolvedMaterial,
         textures: MaterialTextures<TextureId>,
+        shader: Option<ShaderId>,
+        user_textures: [Option<TextureId>; 8],
     ) -> Result<MaterialId, RenderError> {
         Renderer::create_material(
             self,
             &engine_render::Material {
+                shader,
+                user_values: resolved.user_values,
+                user_textures,
                 base_color: resolved.base_color,
                 metallic: resolved.metallic,
                 roughness: resolved.roughness,
@@ -201,6 +217,17 @@ impl GpuResources for Renderer {
                 occlusion_strength: resolved.occlusion_strength,
             },
         )
+    }
+
+    fn create_surface_shader(
+        &mut self,
+        source: &SurfaceShaderSource,
+    ) -> Result<ShaderId, RenderError> {
+        Renderer::create_surface_shader(self, source)
+    }
+
+    fn destroy_surface_shader(&mut self, shader: ShaderId) -> Result<(), RenderError> {
+        Renderer::destroy_surface_shader(self, shader)
     }
 
     fn destroy_mesh(&mut self, mesh: MeshId) -> Result<(), RenderError> {
@@ -248,6 +275,8 @@ struct TokenGpu<G: GpuResources> {
     models: Vec<String>,
     materials: Vec<G::Material>,
     textures: Vec<TextureKey>,
+    shaders: Vec<String>,
+    error_material: Option<G::Material>,
 }
 
 impl<G: GpuResources> Default for TokenGpu<G> {
@@ -256,6 +285,8 @@ impl<G: GpuResources> Default for TokenGpu<G> {
             models: Vec::new(),
             materials: Vec::new(),
             textures: Vec::new(),
+            shaders: Vec::new(),
+            error_material: None,
         }
     }
 }
@@ -288,6 +319,7 @@ struct UploadJob<G: GpuResources> {
 pub(crate) struct PrefabGpu<G: GpuResources> {
     models: HashMap<String, SharedModel<G>>,
     textures: HashMap<TextureKey, SharedTexture<G>>,
+    shaders: HashMap<String, Result<SharedShader<G::Shader>, String>>,
     tokens: HashMap<PrefabToken, TokenGpu<G>>,
     queue: VecDeque<UploadJob<G>>,
 }
@@ -297,10 +329,16 @@ impl<G: GpuResources> Default for PrefabGpu<G> {
         Self {
             models: HashMap::new(),
             textures: HashMap::new(),
+            shaders: HashMap::new(),
             tokens: HashMap::new(),
             queue: VecDeque::new(),
         }
     }
+}
+
+struct SharedShader<S> {
+    id: S,
+    refs: usize,
 }
 
 impl<G: GpuResources> PrefabGpu<G> {
@@ -435,10 +473,12 @@ impl<G: GpuResources> PrefabGpu<G> {
                     continue;
                 }
                 let count = prefab.models[model_path].meshes.len();
-                steps.extend((0..count).map(|mesh| UploadStep::Override {
-                    object: object_index,
-                    level: level_index,
-                    mesh,
+                steps.extend((0..count).filter_map(|mesh| {
+                    needs_mesh_override(object, replacement, mesh).then_some(UploadStep::Override {
+                        object: object_index,
+                        level: level_index,
+                        mesh,
+                    })
                 }));
             }
         }
@@ -467,7 +507,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                     scene: &prefab.textures,
                 };
                 let mut keys = Vec::new();
-                match self.build_material(gpu, &resolved, &sources, &mut keys) {
+                match self.build_material(gpu, &resolved, &sources, &mut job.token, &mut keys) {
                     Ok(material) => {
                         let entry =
                             self.models
@@ -514,32 +554,68 @@ impl<G: GpuResources> PrefabGpu<G> {
                     .ok_or(RenderError::InvalidState(
                         "меш модели не создан до материала переопределения",
                     ))?;
-                let resolved = resolve_material(
-                    &source.material,
-                    replacement.as_deref(),
-                    object_model.material.as_ref(),
-                );
+                let slot_path = object_model
+                    .material_slots
+                    .get(mesh)
+                    .and_then(Option::as_ref);
+                if slot_path.is_none() && object_model.material.is_none() && replacement.is_none() {
+                    return Ok(());
+                }
+                let resolved = match slot_path {
+                    Some(path) => resolve_prefab_material(
+                        prefab,
+                        path,
+                        &source.material,
+                        replacement.as_deref(),
+                        object_model.material.as_ref(),
+                    ),
+                    None => Ok(resolve_material(
+                        &source.material,
+                        replacement.as_deref(),
+                        object_model.material.as_ref(),
+                    )),
+                };
                 let sources = TextureSources {
                     model_path,
                     model: model_cpu,
                     scene: &prefab.textures,
                 };
                 let mut keys = Vec::new();
-                match self.build_material(gpu, &resolved, &sources, &mut keys) {
-                    Ok(material) => {
-                        job.token.materials.push(material);
-                        job.token.textures.extend(keys);
-                        job.overrides
-                            .entry((object, level))
-                            .or_default()
-                            .push((mesh_id, material));
-                        Ok(())
+                let built = resolved
+                    .map_err(RenderError::InvalidMaterial)
+                    .and_then(|resolved| {
+                        self.build_material(gpu, &resolved, &sources, &mut job.token, &mut keys)
+                    });
+                let material = match built {
+                    Ok(material) => material,
+                    Err(error) if slot_path.is_some() => {
+                        self.release_keys(gpu, &keys);
+                        if let Some(path) = slot_path {
+                            log::error!(
+                                "[material] /{path}: {error}; используется материал ошибки"
+                            );
+                        }
+                        self.error_material(gpu, &mut job.token)?
                     }
                     Err(error) => {
                         self.release_keys(gpu, &keys);
-                        Err(error)
+                        return Err(error);
                     }
+                };
+                if job.token.error_material != Some(material) {
+                    job.token.materials.push(material);
                 }
+                job.token.textures.extend(keys);
+                let draws = job.overrides.entry((object, level)).or_insert_with(|| {
+                    self.models
+                        .get(model_path)
+                        .map(|entry| entry.meshes.clone())
+                        .unwrap_or_default()
+                });
+                if let Some(draw) = draws.get_mut(mesh) {
+                    *draw = (mesh_id, material);
+                }
+                Ok(())
             }
         }
     }
@@ -551,6 +627,7 @@ impl<G: GpuResources> PrefabGpu<G> {
         gpu: &mut G,
         resolved: &ResolvedMaterial,
         sources: &TextureSources<'_>,
+        token: &mut TokenGpu<G>,
         keys: &mut Vec<TextureKey>,
     ) -> Result<G::Material, RenderError> {
         let textures = MaterialTextures {
@@ -590,7 +667,98 @@ impl<G: GpuResources> PrefabGpu<G> {
                 keys,
             )?,
         };
-        gpu.create_material(resolved, textures)
+        let mut user_textures = [None; 8];
+        for (slot, source) in resolved.user_texture_sources.iter().enumerate() {
+            let Some(source) = source else { continue };
+            user_textures[slot] = self.acquire_slot(
+                gpu,
+                sources,
+                Some(&MaterialTextureSource::Scene(source.path.clone())),
+                source.color_space,
+                keys,
+            )?;
+        }
+        let shader = match (&resolved.shader_path, &resolved.shader_source) {
+            (Some(path), Some(source)) => Some(self.acquire_shader(gpu, path, source, token)?),
+            _ => None,
+        };
+        match gpu.create_material(resolved, textures, shader, user_textures) {
+            Ok(material) => Ok(material),
+            Err(error) => {
+                if let Some(path) = &resolved.shader_path {
+                    if token.shaders.last().is_some_and(|last| last == path) {
+                        token.shaders.pop();
+                    }
+                    self.release_shader(gpu, path);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn acquire_shader(
+        &mut self,
+        gpu: &mut G,
+        path: &str,
+        source: &SurfaceShaderSource,
+        token: &mut TokenGpu<G>,
+    ) -> Result<G::Shader, RenderError> {
+        if !self.shaders.contains_key(path) {
+            let shader = gpu
+                .create_surface_shader(source)
+                .map(|id| SharedShader { id, refs: 0 })
+                .map_err(|error| error.to_string());
+            self.shaders.insert(path.to_owned(), shader);
+        }
+        let entry = self
+            .shaders
+            .get_mut(path)
+            .ok_or(RenderError::InvalidState("shader cache insertion failed"))?;
+        let shader = entry
+            .as_mut()
+            .map_err(|error| RenderError::InvalidShader(format!("/{}: {}", path, error)))?;
+        shader.refs += 1;
+        token.shaders.push(path.to_owned());
+        Ok(shader.id)
+    }
+
+    fn release_shader(&mut self, gpu: &mut G, path: &str) {
+        let Some(Ok(entry)) = self.shaders.get_mut(path) else {
+            return;
+        };
+        entry.refs = entry.refs.saturating_sub(1);
+        if entry.refs != 0 {
+            return;
+        }
+        if let Some(Ok(entry)) = self.shaders.remove(path) {
+            report(gpu.destroy_surface_shader(entry.id));
+        }
+    }
+
+    fn error_material(
+        &mut self,
+        gpu: &mut G,
+        token: &mut TokenGpu<G>,
+    ) -> Result<G::Material, RenderError> {
+        if let Some(material) = token.error_material {
+            return Ok(material);
+        }
+        let mut resolved = resolve_material(&ModelMaterial::default(), None, None);
+        resolved.base_color = [1.0, 0.0, 1.0];
+        let material = gpu.create_material(
+            &resolved,
+            MaterialTextures {
+                base_color: None,
+                metallic_roughness: None,
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            },
+            None,
+            [None; 8],
+        )?;
+        token.error_material = Some(material);
+        Ok(material)
     }
 
     fn acquire_slot(
@@ -664,7 +832,12 @@ impl<G: GpuResources> PrefabGpu<G> {
                         levels.push(
                             overrides
                                 .remove(&(object_index, level_index))
-                                .unwrap_or_default(),
+                                .unwrap_or_else(|| {
+                                    self.models
+                                        .get(model_path)
+                                        .map(|entry| entry.meshes.clone())
+                                        .unwrap_or_default()
+                                }),
                         );
                     } else {
                         levels.push(
@@ -692,11 +865,17 @@ impl<G: GpuResources> PrefabGpu<G> {
         for material in token.materials {
             report(gpu.destroy_material(material));
         }
+        if let Some(material) = token.error_material {
+            report(gpu.destroy_material(material));
+        }
         for key in token.textures {
             self.release_texture(gpu, &key);
         }
         for path in token.models {
             self.release_model(gpu, &path);
+        }
+        for path in token.shaders {
+            self.release_shader(gpu, &path);
         }
     }
 
@@ -742,7 +921,50 @@ impl<G: GpuResources> PrefabGpu<G> {
 
 /// Материал переопределения нужен, если у объекта задана замена материала или текстуры уровня.
 fn needs_override(object: &ObjectModel, replacement: &Option<String>) -> bool {
-    object.material.is_some() || replacement.is_some()
+    object.material.is_some()
+        || replacement.is_some()
+        || object.material_slots.iter().any(Option::is_some)
+}
+
+fn needs_mesh_override(object: &ObjectModel, replacement: &Option<String>, mesh: usize) -> bool {
+    object.material.is_some()
+        || replacement.is_some()
+        || object.material_slots.get(mesh).is_some_and(Option::is_some)
+}
+
+fn resolve_prefab_material(
+    prefab: &LoadedPrefab,
+    path: &str,
+    model: &ModelMaterial,
+    replacement_texture: Option<&str>,
+    override_material: Option<&engine_scene::MaterialOverride>,
+) -> Result<ResolvedMaterial, String> {
+    let material = prefab
+        .material_assets
+        .get(path)
+        .ok_or_else(|| format!("материал /{path} не был подготовлен"))?
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let shader = material
+        .shader
+        .as_ref()
+        .map(|shader_path| {
+            prefab
+                .shader_assets
+                .get(shader_path.as_str())
+                .ok_or_else(|| format!("шейдер /{} не был подготовлен", shader_path))?
+                .as_ref()
+                .map_err(Clone::clone)
+        })
+        .transpose()?;
+    resolve_material_asset(
+        model,
+        path,
+        material,
+        shader,
+        replacement_texture,
+        override_material,
+    )
 }
 
 /// Пути данных текстур для одного материала: текстуры модели и текстуры сцены.
@@ -827,6 +1049,8 @@ pub(crate) fn load_prefab(
         },
         models: prepared.models,
         textures: prepared.textures,
+        material_assets: prepared.material_assets,
+        shader_assets: prepared.shader_assets,
         levels: prepared.levels,
         particles: prepared.particles,
     })
@@ -1002,6 +1226,7 @@ mod tests {
         type Mesh = u32;
         type Texture = u32;
         type Material = u32;
+        type Shader = u32;
 
         fn create_mesh(&mut self, _: &[Vertex], _: &[u32]) -> Result<u32, RenderError> {
             self.created += 1;
@@ -1021,6 +1246,8 @@ mod tests {
             &mut self,
             _: &ResolvedMaterial,
             _: MaterialTextures<u32>,
+            _: Option<u32>,
+            _: [Option<u32>; 8],
         ) -> Result<u32, RenderError> {
             self.materials_created += 1;
             if self.fail_material_at == Some(self.materials_created) {
@@ -1028,6 +1255,19 @@ mod tests {
             }
             self.created += 1;
             Ok(self.id())
+        }
+
+        fn create_surface_shader(&mut self, _: &SurfaceShaderSource) -> Result<u32, RenderError> {
+            self.created += 1;
+            Ok(self.id())
+        }
+
+        fn destroy_surface_shader(&mut self, shader: u32) -> Result<(), RenderError> {
+            assert!(
+                self.live.remove(&shader),
+                "двойное освобождение шейдера {shader}"
+            );
+            Ok(())
         }
 
         fn destroy_mesh(&mut self, mesh: u32) -> Result<(), RenderError> {
@@ -1115,6 +1355,7 @@ mod tests {
                 .map(|(path, _)| ((*path).to_owned(), overridden.then(|| "tex.png".to_owned())))
                 .collect(),
             material: None,
+            material_slots: Vec::new(),
             animated: false,
         })];
         LoadedPrefab {
@@ -1137,6 +1378,8 @@ mod tests {
                     rgba: vec![255; 4],
                 },
             )]),
+            material_assets: HashMap::new(),
+            shader_assets: HashMap::new(),
             levels,
             particles: Vec::new(),
         }
@@ -1244,6 +1487,33 @@ mod tests {
             gpu.live.is_empty(),
             "частично созданные ресурсы должны быть освобождены"
         );
+    }
+
+    #[test]
+    fn corrupt_material_slot_uses_a_reusable_magenta_fallback_without_failing_prefab() {
+        let mut gpu = FakeGpu::default();
+        let mut state = PrefabGpu::default();
+        let load = token("prefabs/broken-material.rveprefab", 1);
+        let mut loaded = prefab(load.clone(), &[("m.fbx", model(1))], false);
+        loaded.levels[0].as_mut().unwrap().material_slots =
+            vec![Some("materials/broken.rvemat".to_owned())];
+        loaded.material_assets.insert(
+            "materials/broken.rvemat".to_owned(),
+            Err("разбор материала завершился ошибкой".to_owned()),
+        );
+        state.submit(loaded);
+
+        let replies = run_to_completion(&mut state, &mut gpu);
+        let [PrefabReplyOf::Ready(ready)] = replies.as_slice() else {
+            panic!("повреждённый материал не должен прерывать загрузку префаба");
+        };
+        assert_eq!(ready.gpu[0][0].len(), 1);
+        assert_eq!(
+            gpu.materials_created, 2,
+            "FBX материал и fallback создаются один раз"
+        );
+        state.release(&mut gpu, &load);
+        assert!(gpu.live.is_empty(), "fallback и ресурсы модели освобождены");
     }
 
     #[test]

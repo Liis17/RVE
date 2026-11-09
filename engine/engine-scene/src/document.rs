@@ -3,6 +3,7 @@
 use crate::CameraSettings;
 use crate::animation::{AnimatorComponent, validate_animator};
 use crate::audio::{AudioSourceComponent, validate_audio_source};
+use crate::material_slots_serde;
 use crate::network::{
     NetworkIdentityComponent, NetworkTransformComponent, validate_network_object,
     validate_scene_net_ids,
@@ -336,6 +337,22 @@ impl SceneDocument {
                 if let Some(texture) = &mesh.texture {
                     require_asset_path(source, &object.id, &asset_paths, texture, "текстура")?;
                     require_extension(source, &object.id, texture, "png", "текстура")?;
+                }
+                for material in mesh.materials.iter().flatten() {
+                    require_asset_path(
+                        source,
+                        &object.id,
+                        &asset_paths,
+                        material,
+                        "материал части меша",
+                    )?;
+                    require_extension(
+                        source,
+                        &object.id,
+                        material,
+                        "rvemat",
+                        "материал части меша",
+                    )?;
                 }
                 if let Some(material) = &mesh.material {
                     validate_material_override(source, &object.id, &asset_paths, material)?;
@@ -757,6 +774,13 @@ pub struct MeshRenderer {
     pub texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialOverride>,
+    /// Material asset per FBX part; empty entries keep the part's FBX material.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "material_slots_serde"
+    )]
+    pub materials: Vec<Option<VirtualPath>>,
 }
 
 /// Модель, геометрия которой нужна мешевому коллайдеру: `model` меш-рендерера, если форма
@@ -1500,6 +1524,16 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, key, path))
             }));
+            paths.extend(
+                renderer
+                    .get("materials")
+                    .and_then(toml::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(toml::Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| (object_id, "materials", path)),
+            );
             if let Some(material) = renderer.get("material").and_then(toml::Value::as_table) {
                 paths.extend(
                     [
@@ -2483,6 +2517,58 @@ scale=[1.0,1.0,0.0]
                 .unwrap()
                 .material
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn mesh_material_slots_round_trip_empty_entries_and_validate_paths() {
+        let input = format!(
+            "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/materials/a.rvemat\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\nmaterials=[\"\", \"/materials/a.rvemat\", \"\"]\n"
+        );
+        let document = parse(&input).unwrap();
+        let slots = &document.objects[1]
+            .mesh_renderer
+            .as_ref()
+            .unwrap()
+            .materials;
+        assert_eq!(slots.len(), 3);
+        assert!(slots[0].is_none());
+        assert_eq!(slots[1].as_ref().unwrap().as_str(), "materials/a.rvemat");
+        assert!(slots[2].is_none());
+
+        let serialized = document.to_toml().unwrap();
+        let serialized_value: toml::Value = toml::from_str(&serialized).unwrap();
+        let serialized_slots = serialized_value["objects"][1]["mesh_renderer"]["materials"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            serialized_slots
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .unwrap(),
+            ["", "/materials/a.rvemat", ""]
+        );
+        assert_eq!(
+            parse(&serialized).unwrap().objects[1]
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .materials,
+            *slots
+        );
+
+        error(
+            &format!(
+                "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\nmaterials=[\"/materials/missing.rvemat\"]\n"
+            ),
+            "отсутствует в [[assets]]",
+        );
+        error(
+            &format!(
+                "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/materials/a.toml\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\nmaterials=[\"/materials/a.toml\"]\n"
+            ),
+            "расширение .rvemat",
         );
     }
 

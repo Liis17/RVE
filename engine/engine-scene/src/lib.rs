@@ -6,12 +6,15 @@ pub mod camera;
 pub mod camera_settings;
 pub mod document;
 pub mod light;
+pub mod material_asset;
+pub(crate) mod material_slots_serde;
 pub mod network;
 pub mod params;
 pub mod particles;
 pub mod physics_material;
 pub mod post_process;
 pub mod prefab;
+pub mod shader_asset;
 pub mod transform;
 pub mod ui_canvas;
 pub mod world;
@@ -26,6 +29,9 @@ pub use audio::{
     AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
 };
 pub use light::ShadowSettings;
+pub use material_asset::{
+    LitValues, MaterialAsset, MaterialAssetError, ResolvedAlpha, ResolvedMaterialAsset,
+};
 pub use network::{
     MAX_INTERPOLATION_DELAY_MS, MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
     MAX_SEND_RATE_HZ, NetAuthority, NetEvent, NetId, NetMode, NetRequest, NetTarget,
@@ -38,6 +44,11 @@ pub use particles::{
     ParticleSizeKeyComponent,
 };
 pub use physics_material::{CombineMode, PhysicsMaterialError, PhysicsMaterialSettings};
+pub use shader_asset::{
+    MAX_NUMERIC_SHADER_PROPERTIES, MAX_TEXTURE_SHADER_PROPERTIES, ShaderAsset, ShaderAssetError,
+    ShaderColorSpace, ShaderLighting, ShaderProperty, ShaderPropertyDefault, ShaderPropertyKind,
+    ShaderPropertyLayout, ShaderSchema, TextureFallback,
+};
 pub use ui_canvas::UiCanvasComponent;
 
 pub use camera_settings::{

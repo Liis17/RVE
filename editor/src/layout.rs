@@ -19,10 +19,11 @@ pub enum Tab {
     ProjectPrefabs,
     Profiler,
     UiEditor,
+    MaterialPreview,
 }
 
 impl Tab {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
@@ -33,6 +34,7 @@ impl Tab {
         Self::ProjectPrefabs,
         Self::Profiler,
         Self::UiEditor,
+        Self::MaterialPreview,
     ];
 
     pub fn title(self) -> &'static str {
@@ -47,6 +49,7 @@ impl Tab {
             Self::ProjectPrefabs => "Project Prefabs",
             Self::Profiler => "Profiler",
             Self::UiEditor => "UI Editor",
+            Self::MaterialPreview => "Material Preview",
         }
     }
 }
@@ -55,7 +58,8 @@ impl Tab {
 pub fn default_layout() -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Scene, Tab::Game]);
     let surface = dock.main_surface_mut();
-    let [center, _inspector] = surface.split_right(NodeIndex::root(), 0.78, vec![Tab::Inspector]);
+    let [center, inspector] = surface.split_right(NodeIndex::root(), 0.78, vec![Tab::Inspector]);
+    surface.split_below(inspector, 0.62, vec![Tab::MaterialPreview]);
     let [center, _hierarchy] = surface.split_left(center, 0.22, vec![Tab::Hierarchy]);
     surface.split_below(center, 0.68, vec![Tab::Project, Tab::Console]);
     dock
@@ -112,6 +116,7 @@ impl TabViewer for EditorTabs<'_> {
                 self.state.ui_editor_rect = Some(ui.max_rect());
                 crate::ui_editor::show(ui, self.state);
             }
+            Tab::MaterialPreview => ui::material_preview::show(ui, self.state),
         }
     }
 

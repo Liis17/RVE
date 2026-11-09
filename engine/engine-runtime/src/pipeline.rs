@@ -4601,6 +4601,8 @@ return Script
             },
             models: HashMap::new(),
             textures: HashMap::new(),
+            material_assets: HashMap::new(),
+            shader_assets: HashMap::new(),
             levels: Vec::new(),
             particles: Vec::new(),
         };
@@ -6928,6 +6930,8 @@ return Gun
             },
             models: HashMap::new(),
             textures: HashMap::new(),
+            material_assets: HashMap::new(),
+            shader_assets: HashMap::new(),
             levels: Vec::new(),
             particles: Vec::new(),
         };
