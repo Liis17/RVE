@@ -456,3 +456,124 @@ fn undeclared_scene_paths_are_rejected_by_the_host() {
     );
     assert_eq!(host.take_scene_request(), None);
 }
+
+/// Сохраняемый игрок: его `on_destroy` не должен вызываться, а объект должен пережить замену.
+const TEARDOWN_PLAYER: &str = r#"
+local Script = {}
+function Script:on_update(dt)
+  rve.log("player update")
+end
+function Script:on_destroy()
+  rve.log("player destroy")
+end
+return Script
+"#;
+
+/// Удаляемый объект делает структурную правку сохраняемой части в `on_disable` или `on_destroy`.
+const TEARDOWN_MUTATOR: &str = r#"
+local Script = {}
+function Script:on_disable()
+  DISABLE_BODY
+end
+function Script:on_destroy()
+  DESTROY_BODY
+  rve.log("doomed destroy")
+end
+return Script
+"#;
+
+/// Запускает замену сцены, в которой удаляемый объект выполняет `body` в `callback`.
+/// Возвращает мир, хост, сообщения хоста и исход замены.
+fn teardown_mutation(
+    callback: &str,
+    body: &str,
+) -> (
+    World,
+    ScriptHost,
+    Vec<String>,
+    Result<SceneReplacement, String>,
+) {
+    let (disable, destroy) = match callback {
+        "on_disable" => (body, ""),
+        "on_destroy" => ("", body),
+        other => panic!("unknown callback {other}"),
+    };
+    let mutator = TEARDOWN_MUTATOR
+        .replace("DISABLE_BODY", disable)
+        .replace("DESTROY_BODY", destroy);
+    let mut sources = sources();
+    sources.insert("player.lua".to_owned(), TEARDOWN_PLAYER.to_owned());
+    sources.insert("mutator.lua".to_owned(), mutator);
+    let document = SceneDocument::parse(
+        "old.rvescene",
+        concat!(
+            "[[assets]]\npath = \"/mutator.lua\"\n[[assets]]\npath = \"/player.lua\"\n",
+            "[[objects]]\nid = \"player\"\nkeep_on_load = true\n",
+            "[[objects.lite_scripts]]\npath = \"/player.lua\"\n",
+            "[[objects]]\nid = \"doomed\"\n[[objects.lite_scripts]]\npath = \"/mutator.lua\"\n",
+            "[[objects]]\nid = \"cam_old\"\n[objects.camera]\nactive = true\n",
+        ),
+    )
+    .unwrap();
+    let mut world = World::from_document(&document).unwrap();
+    let mut host = ScriptHost::load(&world, "old", &sources, None).unwrap();
+    host.start(&mut world, at_frame(1));
+    host.update(&mut world, 1.0 / 60.0, at_frame(1));
+    let mut events = messages(&mut host);
+    let result = host.replace_scene(&mut world, new_scene(""), &sources, "new", at_frame(2));
+    events.extend(messages(&mut host));
+    (world, host, events, result)
+}
+
+#[test]
+fn structural_edits_of_persistent_objects_are_refused_in_teardown_callbacks() {
+    let bodies = [
+        (
+            "set_parent under the doomed object",
+            "rve.log(\"mutation \" .. tostring(rve.find(\"player\"):set_parent(self.object, true)))",
+        ),
+        (
+            "set_keep_on_load false on the persistent player",
+            "rve.log(\"mutation \" .. tostring(rve.find(\"player\"):set_keep_on_load(false)))",
+        ),
+        (
+            "set_keep_on_load true on the doomed root",
+            "rve.log(\"mutation \" .. tostring(self.object:set_keep_on_load(true)))",
+        ),
+    ];
+    for callback in ["on_disable", "on_destroy"] {
+        for (name, body) in bodies {
+            let (mut world, mut host, events, result) = teardown_mutation(callback, body);
+            let context = format!("{callback}: {name}");
+            result.unwrap_or_else(|error| panic!("{context}: replacement failed: {error}"));
+            assert_eq!(
+                events.iter().filter(|m| *m == "mutation false").count(),
+                1,
+                "{context}: the edit is refused as a rejected call: {events:?}"
+            );
+            let player = world.handle("player");
+            assert!(player.is_some(), "{context}: persistent player survives");
+            let player = player.unwrap();
+            assert_eq!(world.object(player).unwrap().parent, None, "{context}");
+            assert_eq!(world.keep_on_load(player), Some(true), "{context}");
+            assert!(
+                world.handle("doomed").is_none(),
+                "{context}: the doomed object is removed"
+            );
+            assert_eq!(
+                events.iter().filter(|m| *m == "doomed destroy").count(),
+                1,
+                "{context}: {events:?}"
+            );
+            assert!(
+                !events.contains(&"player destroy".to_owned()),
+                "{context}: {events:?}"
+            );
+            host.update(&mut world, 1.0 / 60.0, at_frame(3));
+            assert!(
+                messages(&mut host).contains(&"player update".to_owned()),
+                "{context}: the persistent instance keeps running"
+            );
+        }
+    }
+}

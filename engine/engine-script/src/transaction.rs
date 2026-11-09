@@ -2130,8 +2130,17 @@ impl ScriptTransaction {
             ObjectEdit::SetLayer { layer, .. } => *layer < LAYER_COUNT,
             _ => true,
         };
+        // Структурные правки меняют состав сохраняемых корней и поддеревьев удаляемых. Замена
+        // сцены строит план на этом составе до teardown, поэтому в `on_disable` и `on_destroy`
+        // они отказываются. Остальные правки на план не влияют и остаются разрешёнными.
+        let structural_in_teardown = !self.lifecycle_writes
+            && matches!(
+                edit,
+                ObjectEdit::SetParent { .. } | ObjectEdit::SetKeepOnLoad { .. }
+            );
         if !self.writable
             || !value_valid
+            || structural_in_teardown
             || self
                 .world()
                 .and_then(|world| world.object(target))
