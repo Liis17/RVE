@@ -30,13 +30,16 @@ engine-resources = { path = "../engine/engine-resources" }
 engine-scene = { path = "../engine/engine-scene" }
 engine-script = { path = "../engine/engine-script" }
 engine-window = { path = "../engine/engine-window" }
+engine-mcp = { path = "../engine/engine-mcp" }
 notify.workspace = true
 glam.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+png.workspace = true
 toml.workspace = true
 flume.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 rve-sdk = { path = "../engine/rve-sdk" }
