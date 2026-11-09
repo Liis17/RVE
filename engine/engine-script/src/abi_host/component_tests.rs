@@ -31,6 +31,19 @@ sun_size_deg = 1.0
 sun_intensity = 3.0
 "#;
 
+const HDR_SCENE: &str = r#"
+[[assets]]
+path = "/sky.hdr"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "sky"
+[objects.environment]
+hdr = "/sky.hdr"
+intensity = 1.0
+"#;
+
 fn world(source: &str) -> World {
     World::from_document(&SceneDocument::parse("scene.rvescene", source).unwrap()).unwrap()
 }
@@ -86,6 +99,39 @@ fn environment_set_with_an_invalid_sky_stages_nothing_even_with_a_valid_intensit
         let mut after = RveEnvironmentState::default();
         assert!(get(host.ctx, sky, &mut after));
         assert_eq!(after, before, "отказ не оставляет частичной записи");
+    }
+}
+
+#[test]
+fn environment_set_rejecting_a_procedural_sky_preserves_hdr_intensity() {
+    let world = world(HDR_SCENE);
+    let sky = world.handle("sky").unwrap().to_abi().unwrap();
+    let events = EventQueue::default();
+    let mut transaction = writable_transaction(&world);
+    let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+    let host = context.host(ScriptTime::default());
+    let get = host.environment_get.unwrap();
+    let set = host.environment_set.unwrap();
+    // SAFETY: state pointers are valid for each synchronous callback.
+    unsafe {
+        let mut before = RveEnvironmentState::default();
+        assert!(get(host.ctx, sky, &mut before));
+        assert!(!before.has_sky);
+        let rejected = RveEnvironmentState {
+            intensity: 2.5,
+            has_sky: true,
+            sky: RveProceduralSky {
+                zenith_color: [0.1, 0.2, 0.8],
+                horizon_color: [0.6, 0.6, 0.6],
+                ground_color: [0.1, 0.1, 0.1],
+                sun_size_deg: 1.0,
+                sun_intensity: 3.0,
+            },
+        };
+        assert!(!set(host.ctx, sky, &rejected));
+        let mut after = RveEnvironmentState::default();
+        assert!(get(host.ctx, sky, &mut after));
+        assert_eq!(after, before, "HDR rejection must not stage the intensity");
     }
 }
 

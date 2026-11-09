@@ -729,6 +729,8 @@ pub(crate) struct MaterialUploadCaches {
     pub(crate) textures: GpuTextureCache<TextureId>,
     pub(crate) shaders: HashMap<String, Result<ShaderId, String>>,
     pub(crate) error_material: Option<MaterialId>,
+    ownership: MaterialResourceOwnership<MaterialId, TextureId, ShaderId>,
+    pinned_shader_paths: HashSet<String>,
 }
 
 pub(crate) struct GpuTextureCache<T> {
@@ -741,6 +743,240 @@ impl<T> Default for GpuTextureCache<T> {
         Self {
             model: HashMap::new(),
             scene: HashMap::new(),
+        }
+    }
+}
+
+pub(crate) struct MaterialResourceDependencies<T, S> {
+    textures: HashSet<T>,
+    shader: Option<S>,
+}
+
+pub(crate) type MaterialDependencyMap =
+    HashMap<MaterialId, MaterialResourceDependencies<TextureId, ShaderId>>;
+
+struct MaterialResourceOwnership<M, T, S> {
+    pinned_textures: HashSet<T>,
+    pinned_shaders: HashSet<S>,
+    materials: HashMap<M, MaterialResourceDependencies<T, S>>,
+    texture_refs: HashMap<T, usize>,
+    shader_refs: HashMap<S, usize>,
+}
+
+impl<M, T, S> Default for MaterialResourceOwnership<M, T, S> {
+    fn default() -> Self {
+        Self {
+            pinned_textures: HashSet::new(),
+            pinned_shaders: HashSet::new(),
+            materials: HashMap::new(),
+            texture_refs: HashMap::new(),
+            shader_refs: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MaterialResourceReleases<T: Eq + Hash, S: Eq + Hash> {
+    textures: HashSet<T>,
+    shaders: HashSet<S>,
+}
+
+impl<M, T, S> MaterialResourceOwnership<M, T, S>
+where
+    M: Copy + Eq + Hash,
+    T: Copy + Eq + Hash,
+    S: Copy + Eq + Hash,
+{
+    fn pin_texture(&mut self, texture: T) {
+        self.pinned_textures.insert(texture);
+    }
+
+    fn pin_shader(&mut self, shader: S) {
+        self.pinned_shaders.insert(shader);
+    }
+
+    fn retain_material(&mut self, material: M, dependencies: MaterialResourceDependencies<T, S>) {
+        if self.materials.contains_key(&material) {
+            return;
+        }
+        for texture in &dependencies.textures {
+            *self.texture_refs.entry(*texture).or_default() += 1;
+        }
+        if let Some(shader) = dependencies.shader {
+            *self.shader_refs.entry(shader).or_default() += 1;
+        }
+        self.materials.insert(material, dependencies);
+    }
+
+    fn release_materials(
+        &mut self,
+        materials: impl IntoIterator<Item = M>,
+    ) -> MaterialResourceReleases<T, S> {
+        let mut released = MaterialResourceReleases::default();
+        for material in materials {
+            let Some(dependencies) = self.materials.remove(&material) else {
+                continue;
+            };
+            for texture in dependencies.textures {
+                let exhausted = if let Some(refs) = self.texture_refs.get_mut(&texture) {
+                    *refs = refs.saturating_sub(1);
+                    *refs == 0
+                } else {
+                    false
+                };
+                if exhausted {
+                    self.texture_refs.remove(&texture);
+                    if !self.pinned_textures.contains(&texture) {
+                        released.textures.insert(texture);
+                    }
+                }
+            }
+            if let Some(shader) = dependencies.shader {
+                let exhausted = if let Some(refs) = self.shader_refs.get_mut(&shader) {
+                    *refs = refs.saturating_sub(1);
+                    *refs == 0
+                } else {
+                    false
+                };
+                if exhausted {
+                    self.shader_refs.remove(&shader);
+                    if !self.pinned_shaders.contains(&shader) {
+                        released.shaders.insert(shader);
+                    }
+                }
+            }
+        }
+        released
+    }
+
+    fn keeps_texture(&self, texture: T) -> bool {
+        self.pinned_textures.contains(&texture) || self.texture_refs.contains_key(&texture)
+    }
+
+    fn keeps_shader(&self, shader: S) -> bool {
+        self.pinned_shaders.contains(&shader) || self.shader_refs.contains_key(&shader)
+    }
+}
+
+impl<T> GpuTextureCache<T>
+where
+    T: Copy + Eq + Hash,
+{
+    fn ids(&self) -> HashSet<T> {
+        self.model
+            .values()
+            .chain(self.scene.values())
+            .copied()
+            .collect()
+    }
+
+    fn remove_id(&mut self, id: T) {
+        self.model.retain(|_, cached| *cached != id);
+        self.scene.retain(|_, cached| *cached != id);
+    }
+}
+
+impl<T: Eq + Hash, S: Eq + Hash> Default for MaterialResourceReleases<T, S> {
+    fn default() -> Self {
+        Self {
+            textures: HashSet::new(),
+            shaders: HashSet::new(),
+        }
+    }
+}
+
+impl MaterialUploadCaches {
+    pub(crate) fn pin_scene_resources(&mut self) {
+        for texture in self.textures.ids() {
+            self.ownership.pin_texture(texture);
+        }
+        for shader in self
+            .shaders
+            .values()
+            .filter_map(|result| result.as_ref().ok())
+        {
+            self.ownership.pin_shader(*shader);
+        }
+        self.pinned_shader_paths = self.shaders.keys().cloned().collect();
+    }
+
+    pub(crate) fn retain_materials(
+        &mut self,
+        dependencies: HashMap<MaterialId, MaterialResourceDependencies<TextureId, ShaderId>>,
+    ) {
+        for (material, dependencies) in dependencies {
+            self.ownership.retain_material(material, dependencies);
+        }
+    }
+
+    pub(crate) fn release_materials(&mut self, renderer: &mut Renderer, materials: &[MaterialId]) {
+        let released = self.ownership.release_materials(materials.iter().copied());
+        for texture in released.textures {
+            match renderer.destroy_texture(texture) {
+                Ok(()) => self.textures.remove_id(texture),
+                Err(error) => log::error!("текстура материала не уничтожена: {error}"),
+            }
+        }
+        for shader in released.shaders {
+            let path = self.shaders.iter().find_map(|(path, result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .filter(|cached| **cached == shader)
+                    .map(|_| path.clone())
+            });
+            let Some(path) = path else { continue };
+            match renderer.destroy_surface_shader(shader) {
+                Ok(()) => {
+                    self.shaders.remove(&path);
+                }
+                Err(error) => log::error!("шейдер материала /{path} не уничтожен: {error}"),
+            }
+        }
+    }
+
+    pub(crate) fn prune_unowned(&mut self, renderer: &mut Renderer) {
+        let textures = self
+            .textures
+            .ids()
+            .into_iter()
+            .filter(|texture| !self.ownership.keeps_texture(*texture))
+            .collect::<Vec<_>>();
+        for texture in textures {
+            match renderer.destroy_texture(texture) {
+                Ok(()) => self.textures.remove_id(texture),
+                Err(error) => log::error!("текстура материала не уничтожена: {error}"),
+            }
+        }
+
+        let shaders = self
+            .shaders
+            .iter()
+            .filter_map(|(path, result)| match result {
+                Ok(shader)
+                    if self.pinned_shader_paths.contains(path)
+                        || self.ownership.keeps_shader(*shader) =>
+                {
+                    None
+                }
+                Ok(_) | Err(_) => Some(path.clone()),
+            })
+            .collect::<Vec<_>>();
+        for path in shaders {
+            let destroy = match self.shaders.get(&path) {
+                Some(Ok(shader)) => match renderer.destroy_surface_shader(*shader) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!("шейдер материала /{path} не уничтожен: {error}");
+                        false
+                    }
+                },
+                Some(Err(_)) => true,
+                None => false,
+            };
+            if destroy {
+                self.shaders.remove(&path);
+            }
         }
     }
 }
@@ -1275,6 +1511,7 @@ pub(crate) fn upload_scene(
                 &mut texture_cache,
                 &mut material_cache,
                 None,
+                None,
             )?;
             gpu_meshes.push((mesh_id, material_id));
         }
@@ -1320,6 +1557,7 @@ pub(crate) fn upload_scene(
             &mut shader_cache,
             &mut material_cache,
             &mut error_material,
+            None,
             object,
         )?;
         if object.animated
@@ -1353,6 +1591,7 @@ pub(crate) fn upload_scene(
                     &mut shader_cache,
                     &mut material_cache,
                     &mut error_material,
+                    None,
                     object,
                 )?,
                 None => Vec::new(),
@@ -1513,6 +1752,7 @@ pub(crate) fn upload_object_levels(
     shader_cache: &mut HashMap<String, Result<ShaderId, String>>,
     material_cache: &mut HashMap<String, MaterialId>,
     error_material: &mut Option<MaterialId>,
+    mut material_dependencies: Option<&mut MaterialDependencyMap>,
     object: &ObjectModel,
 ) -> Result<Vec<Vec<(MeshId, MaterialId)>>, RenderError> {
     let mut levels = Vec::with_capacity(object.levels.len());
@@ -1556,6 +1796,7 @@ pub(crate) fn upload_object_levels(
                     shader_cache,
                     material_cache,
                     error_material,
+                    material_dependencies.as_deref_mut(),
                 )?,
                 None => {
                     let resolved = resolve_material(
@@ -1572,6 +1813,7 @@ pub(crate) fn upload_object_levels(
                         texture_cache,
                         material_cache,
                         None,
+                        material_dependencies.as_deref_mut(),
                     )?
                 }
             };
@@ -1582,8 +1824,8 @@ pub(crate) fn upload_object_levels(
     Ok(levels)
 }
 
-/// Создаёт GPU-материал или возвращает уже созданный для тех же входных данных. Материалы живут
-/// до завершения рендера вместе со сценой, поэтому кэш владения не меняет.
+/// Создаёт GPU-материал или возвращает уже созданный для тех же входных данных. Короткоживущие
+/// материалы записывают зависимости, чтобы вызывающий код мог освободить их вместе с материалом.
 #[allow(clippy::too_many_arguments)]
 fn upload_resolved_material(
     renderer: &mut Renderer,
@@ -1594,6 +1836,7 @@ fn upload_resolved_material(
     texture_cache: &mut GpuTextureCache<TextureId>,
     material_cache: &mut HashMap<String, MaterialId>,
     shader: Option<ShaderId>,
+    material_dependencies: Option<&mut MaterialDependencyMap>,
 ) -> Result<MaterialId, RenderError> {
     let key = material_cache_key(model_path, resolved);
     if let Some(&material) = material_cache.get(&key) {
@@ -1682,6 +1925,20 @@ fn upload_resolved_material(
         normal_scale: resolved.normal_scale,
         occlusion_strength: resolved.occlusion_strength,
     })?;
+    if let Some(material_dependencies) = material_dependencies {
+        let textures = [
+            base_color_texture,
+            metallic_roughness_texture,
+            normal_texture,
+            emissive_texture,
+            occlusion_texture,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(user_textures.iter().flatten().copied())
+        .collect();
+        material_dependencies.insert(material, MaterialResourceDependencies { textures, shader });
+    }
     material_cache.insert(key, material);
     Ok(material)
 }
@@ -1711,6 +1968,7 @@ fn upload_material_slot(
     shader_cache: &mut HashMap<String, Result<ShaderId, String>>,
     material_cache: &mut HashMap<String, MaterialId>,
     error_material: &mut Option<MaterialId>,
+    material_dependencies: Option<&mut MaterialDependencyMap>,
 ) -> Result<MaterialId, RenderError> {
     let resolved = assets
         .material_asset(path)
@@ -1773,6 +2031,7 @@ fn upload_material_slot(
         texture_cache,
         material_cache,
         shader,
+        material_dependencies,
     ) {
         Ok(material) => Ok(material),
         Err(error) => {
@@ -3407,5 +3666,62 @@ mod particle_mapping_tests {
         assert_eq!(desc.blend, ParticleBlend::Additive);
         assert!(desc.collision.is_none());
         assert!(desc.texture.is_none());
+    }
+}
+
+#[cfg(test)]
+mod material_resource_ownership_tests {
+    use super::{
+        MaterialResourceDependencies, MaterialResourceOwnership, MaterialResourceReleases,
+    };
+    use std::collections::HashSet;
+
+    fn dependencies(
+        textures: impl IntoIterator<Item = u32>,
+        shader: Option<u32>,
+    ) -> MaterialResourceDependencies<u32, u32> {
+        MaterialResourceDependencies {
+            textures: textures.into_iter().collect(),
+            shader,
+        }
+    }
+
+    #[test]
+    fn dynamic_material_dependencies_are_shared_and_retired_with_the_last_material() {
+        let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
+        ownership.pin_texture(1);
+        ownership.pin_shader(11);
+        ownership.retain_material(100, dependencies([1, 2], Some(11)));
+        ownership.retain_material(200, dependencies([2], Some(12)));
+
+        assert_eq!(
+            ownership.release_materials([100]),
+            MaterialResourceReleases::default()
+        );
+        assert!(ownership.keeps_texture(1));
+        assert!(ownership.keeps_texture(2));
+        assert!(ownership.keeps_shader(11));
+        assert!(ownership.keeps_shader(12));
+
+        let released = ownership.release_materials([200]);
+        assert_eq!(released.textures, HashSet::from([2]));
+        assert_eq!(released.shaders, HashSet::from([12]));
+        assert_eq!(
+            ownership.release_materials([200]),
+            MaterialResourceReleases::default()
+        );
+    }
+
+    #[test]
+    fn stale_material_replies_release_resources_and_failed_uploads_do_not_pin_them() {
+        let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
+        ownership.retain_material(300, dependencies([3], Some(13)));
+        let stale = ownership.release_materials([300]);
+        assert_eq!(stale.textures, HashSet::from([3]));
+        assert_eq!(stale.shaders, HashSet::from([13]));
+
+        // A failed upload can cache dependencies before material creation, but no material owns them.
+        assert!(!ownership.keeps_texture(4));
+        assert!(!ownership.keeps_shader(14));
     }
 }

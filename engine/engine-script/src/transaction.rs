@@ -3052,6 +3052,14 @@ impl ScriptTransaction {
         intensity: Option<f32>,
         sky: Option<ProceduralSkyComponent>,
     ) -> Result<(), String> {
+        self.require_writable("environment changes")?;
+        match self.environment_state(handle) {
+            None => return Err("object has no environment".to_owned()),
+            Some((_, None)) if sky.is_some() => {
+                return Err("environment uses HDR, not a procedural sky".to_owned());
+            }
+            Some(_) => {}
+        }
         if let Some(problem) =
             intensity.and_then(engine_scene::world::environment_intensity_problem)
         {

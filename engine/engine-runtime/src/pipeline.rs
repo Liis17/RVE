@@ -546,8 +546,9 @@ impl VulkanBackend {
     pub fn with_material_uploads(
         mut self,
         assets: Arc<PreparedRenderAssets>,
-        caches: MaterialUploadCaches,
+        mut caches: MaterialUploadCaches,
     ) -> Self {
+        caches.pin_scene_resources();
         self.material_assets = Some(assets);
         self.material_caches = caches;
         self
@@ -585,6 +586,7 @@ impl VulkanBackend {
             .map(|((model_path, _), meshes)| (model_path.clone(), meshes.clone()))
             .collect();
         let mut material_cache = HashMap::new();
+        let mut material_dependencies = HashMap::new();
         let uploaded = upload_object_levels(
             &mut self.renderer,
             assets,
@@ -593,13 +595,19 @@ impl VulkanBackend {
             &mut self.material_caches.shaders,
             &mut material_cache,
             &mut self.material_caches.error_material,
+            Some(&mut material_dependencies),
             &model,
         );
         let created: Vec<MaterialId> = material_cache.into_values().collect();
         match uploaded {
-            Ok(levels) => Ok(MaterialLevels { levels, created }),
+            Ok(levels) => {
+                self.material_caches.retain_materials(material_dependencies);
+                self.material_caches.prune_unowned(&mut self.renderer);
+                Ok(MaterialLevels { levels, created })
+            }
             Err(error) => {
                 self.destroy_materials(&created);
+                self.material_caches.prune_unowned(&mut self.renderer);
                 Err(error.to_string())
             }
         }
@@ -773,6 +781,7 @@ impl RenderBackend for VulkanBackend {
         if let Some(entry) = self.prefab_particles.remove(token) {
             release_prefab_particles(&mut self.renderer, entry.textures);
         }
+        self.material_caches.prune_unowned(&mut self.renderer);
     }
 
     fn submit_material(&mut self, request: MaterialRequest) -> MaterialReply {
@@ -788,6 +797,8 @@ impl RenderBackend for VulkanBackend {
 
     fn release_materials(&mut self, materials: &[MaterialId]) {
         self.destroy_materials(materials);
+        self.material_caches
+            .release_materials(&mut self.renderer, materials);
     }
 
     fn apply_particle_commands(&mut self, commands: &[engine_scene::world::ParticleCommand]) {
@@ -3697,12 +3708,12 @@ mod tests {
     use super::execute_console_commands;
     use super::{
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
-        GpuSceneTable, MotionHistory, PhysicsWait, RenderBackend, RenderControl,
-        RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, apply_physics_step, drop_mismatched_skins, log_script_events_with,
-        make_snapshot, procedural_environment_key, receive_physics_interruptibly,
-        render_local_lights, render_loop, render_snapshot, render_thread, selected_level,
-        send_snapshot, sync_input_background, wait_background_tick,
+        GpuSceneTable, MotionHistory, PendingRelease, PhysicsWait, ReleaseTarget, RenderBackend,
+        RenderControl, RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl,
+        ScriptStartupError, ScriptThreadConfig, apply_physics_step, drop_mismatched_skins,
+        finish_releases, log_script_events_with, make_snapshot, procedural_environment_key,
+        receive_physics_interruptibly, render_local_lights, render_loop, render_snapshot,
+        render_thread, selected_level, send_snapshot, sync_input_background, wait_background_tick,
     };
     use super::{FrameLatency, publish_script_cursor, set_initial_cursor};
     use super::{MaterialSync, ScriptReply};
@@ -4070,6 +4081,7 @@ distance=2.0
         prefab_uploads: VecDeque<LoadedPrefab>,
         /// Куда сообщать об освобождении токенов: тест ждёт событие, а не опрашивает состояние.
         released: Option<mpsc::Sender<PrefabToken>>,
+        released_materials: Option<mpsc::Sender<Vec<MaterialId>>>,
         /// Куда сообщать о смене debug view: тест ждёт, что цикл уже обработал её.
         #[cfg(feature = "dev-console")]
         debug_views: Option<mpsc::Sender<engine_render::DebugView>>,
@@ -4113,6 +4125,12 @@ distance=2.0
         fn release_prefab(&mut self, token: &PrefabToken) {
             if let Some(released) = &self.released {
                 let _ = released.send(token.clone());
+            }
+        }
+
+        fn release_materials(&mut self, materials: &[MaterialId]) {
+            if let Some(released) = &self.released_materials {
+                let _ = released.send(materials.to_vec());
             }
         }
 
@@ -8006,6 +8024,33 @@ return Gun
         assert_eq!(render.renders.load(Ordering::SeqCst), 2);
         render.controls.send(RenderControl::Shutdown).unwrap();
         assert!(render.worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn material_release_waits_until_the_last_snapshot_is_dropped() {
+        let (released_tx, released_rx) = mpsc::channel();
+        let mut backend = FakeBackend {
+            released_materials: Some(released_tx),
+            ..FakeBackend::default()
+        };
+        let materials = vec![fake_material_id(77)];
+        let mut snapshot = empty_snapshot();
+        snapshot.sequence = 5;
+        let mut latest = Some(Arc::new(snapshot));
+        let mut releases = vec![PendingRelease {
+            target: ReleaseTarget::Materials(materials.clone()),
+            last_seq: 5,
+        }];
+
+        finish_releases(&mut backend, &mut releases, 4, &mut latest);
+        assert!(released_rx.try_recv().is_err());
+        assert_eq!(releases.len(), 1);
+        assert!(latest.is_some());
+
+        finish_releases(&mut backend, &mut releases, 5, &mut latest);
+        assert_eq!(released_rx.try_recv().unwrap(), materials);
+        assert!(releases.is_empty());
+        assert!(latest.is_none());
     }
 
     /// Удержанный снимок с `seq ≤ last_seq` сбрасывается вместе с освобождением, поэтому

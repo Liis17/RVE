@@ -285,6 +285,54 @@ return Script
 }
 
 #[test]
+fn rejected_procedural_update_preserves_hdr_intensity() {
+    let scene = r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/sky.hdr"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "sky"
+[objects.environment]
+hdr = "/sky.hdr"
+intensity = 1.0
+[[objects.lite_scripts]]
+path = "/driver.lua"
+"#;
+    let mut world =
+        World::from_document(&SceneDocument::parse("hdr.rvescene", scene).unwrap()).unwrap();
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local sky = rve.find("sky")
+  local ok = pcall(function()
+    sky:set_environment({ intensity = 2.0, sky = { sun_size_deg = 2.0 } })
+  end)
+  assert(not ok)
+  assert(sky:get_environment().intensity == 1.0)
+end
+return Script
+"#;
+    let sources = BTreeMap::from([("driver.lua".to_owned(), source.to_owned())]);
+    let mut host = ScriptHost::load(&world, "hdr", &sources, None).unwrap();
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    assert_eq!(
+        world
+            .object(world.handle("sky").unwrap())
+            .unwrap()
+            .environment
+            .as_ref()
+            .unwrap()
+            .intensity,
+        1.0
+    );
+}
+
+#[test]
 fn a_caught_light_error_leaves_the_light_unchanged() {
     let (mut world, mut host) = load(
         r#"
