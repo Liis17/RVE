@@ -230,6 +230,7 @@ pub(crate) struct ScriptTransaction {
     action_frame: Option<Arc<ActionFrame>>,
     physics: Rc<RefCell<PhysicsScriptState>>,
     physics_phase_dt: Option<f32>,
+    physics_fixed_dt: Option<f32>,
     pending_physics_commands: Vec<PhysicsCommand>,
     pending_grounded: HashMap<ObjectHandle, bool>,
     pending_collider_enabled: HashMap<BodyHandle, bool>,
@@ -305,6 +306,10 @@ impl ScriptTransaction {
 
     pub(crate) fn set_frame_time(&mut self, frame_time: crate::types::ScriptFrameTime) {
         self.frame_time = frame_time;
+    }
+
+    pub(crate) fn set_fixed_update_dt(&mut self, dt: Option<f32>) {
+        self.physics_fixed_dt = dt;
     }
 
     pub(crate) fn time_scale(&self) -> f32 {
@@ -490,6 +495,7 @@ impl Default for ScriptTransaction {
             action_frame: None,
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
             physics_phase_dt: None,
+            physics_fixed_dt: None,
             pending_physics_commands: Vec::new(),
             pending_grounded: HashMap::new(),
             pending_collider_enabled: HashMap::new(),
@@ -592,6 +598,7 @@ impl ScriptTransaction {
         self.action_frame = Some(init.actions);
         self.physics = init.physics;
         self.physics_phase_dt = init.physics_phase_dt;
+        self.physics_fixed_dt = None;
         self.source.clear();
         self.source.push_str(init.source);
         self.pending_transforms.clear();
@@ -1025,11 +1032,20 @@ impl ScriptTransaction {
         object: ObjectHandle,
         force: Vec3,
     ) -> Result<(), String> {
-        self.push_body_command(object, force, |body| PhysicsCommand::AddForce {
-            body,
-            force,
-            point: None,
-        })
+        if let Some(dt) = self.physics_fixed_dt {
+            let impulse = force * dt;
+            self.push_body_command(object, force, |body| PhysicsCommand::AddImpulse {
+                body,
+                impulse,
+                point: None,
+            })
+        } else {
+            self.push_body_command(object, force, |body| PhysicsCommand::AddForce {
+                body,
+                force,
+                point: None,
+            })
+        }
     }
 
     fn push_body_command(
@@ -2668,7 +2684,7 @@ impl ScriptTransaction {
             || !self
                 .timeline
                 .borrow()
-                .can_add_coroutine(&self.pending_timeline)
+                .coroutines_fit(&self.pending_timeline)
         {
             self.discard();
             return Err("script timer or coroutine limit reached".to_owned());

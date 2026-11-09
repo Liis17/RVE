@@ -304,6 +304,194 @@ return Script
 }
 
 #[test]
+fn rescheduled_due_coroutines_keep_their_slots_and_release_them_after_completion() {
+    const COROUTINES: usize = 256;
+    let source = format!(
+        r#"
+local Script = {{}}
+function Script:on_start()
+  for index = 1, {COROUTINES} do
+    local id = index
+    rve.start_coroutine(function()
+      if id == 1 then
+        local accepted = pcall(function()
+          rve.start_coroutine(function() end)
+        end)
+        rve.log_info(accepted and "nested accepted" or "nested rejected")
+      end
+      rve.log_info("resumed")
+      rve.wait_frames(1)
+      rve.log_info("completed")
+    end)
+  end
+end
+function Script:on_update()
+  if rve.time.frame == 4 then
+    rve.start_coroutine(function() rve.log_info("replacement") end)
+  end
+end
+return Script
+"#
+    );
+    let (mut world, mut host) = scripted(&source);
+    let mut time = ScriptFrameTime::default();
+
+    for frame_number in 1..=5 {
+        time = frame(0.1, host.time_scale(), time, frame_number);
+        host.update_frame(&mut world, time);
+        let events = host.drain_events();
+        if frame_number == 2 {
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.level != crate::ScriptEventLevel::Error),
+                "due coroutine reschedules failed: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| {
+                    event.level == crate::ScriptEventLevel::Info
+                        && event.message == "nested rejected"
+                }),
+                "{events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.message == "resumed")
+                    .count(),
+                COROUTINES
+            );
+        } else if frame_number == 3 {
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.level != crate::ScriptEventLevel::Error),
+                "due coroutine completions failed: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.message == "completed")
+                    .count(),
+                COROUTINES
+            );
+        } else {
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.level != crate::ScriptEventLevel::Error),
+                "frame {frame_number}: {events:?}"
+            );
+        }
+        if frame_number == 5 {
+            assert!(events.iter().any(|event| event.message == "replacement"));
+        }
+    }
+}
+
+#[test]
+fn coroutine_error_and_owner_deletion_release_due_slots_and_discard_nested_starts() {
+    const COROUTINES: usize = 256;
+    for (action, expect_failure) in [
+        (
+            r#"
+      rve.start_coroutine(function() end)
+      error("expected coroutine failure")
+"#,
+            true,
+        ),
+        (
+            r#"
+      rve.destroy(self.object)
+      rve.wait_frames(1)
+"#,
+            false,
+        ),
+    ] {
+        let fault_source = format!(
+            r#"
+local Fault = {{}}
+function Fault:on_start()
+  rve.start_coroutine(function()
+{action}  end)
+end
+return Fault
+"#
+        );
+        let probe_source = format!(
+            r#"
+local Probe = {{}}
+function Probe:on_update()
+  if rve.time.frame == 3 then
+    for index = 1, {COROUTINES} do
+      rve.start_coroutine(function() end)
+    end
+    rve.log_info("all slots available")
+  end
+end
+return Probe
+"#
+        );
+        let mut world = world(
+            r#"
+[[assets]]
+path = "/fault.lua"
+[[assets]]
+path = "/probe.lua"
+[[objects]]
+id = "fault"
+[[objects.lite_scripts]]
+path = "/fault.lua"
+[[objects]]
+id = "probe"
+[[objects.lite_scripts]]
+path = "/probe.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+"#,
+        );
+        let mut host = ScriptHost::load(
+            &world,
+            "scene",
+            &sources(&[("fault.lua", &fault_source), ("probe.lua", &probe_source)]),
+            None,
+        )
+        .unwrap();
+        let mut time = ScriptFrameTime::default();
+
+        for frame_number in 1..=3 {
+            time = frame(0.1, host.time_scale(), time, frame_number);
+            host.update_frame(&mut world, time);
+            let events = host.drain_events();
+            if frame_number == 2 {
+                let saw_expected_failure = events.iter().any(|event| {
+                    event.level == crate::ScriptEventLevel::Error
+                        && event.message.contains("expected coroutine failure")
+                });
+                assert_eq!(saw_expected_failure, expect_failure, "{events:?}");
+                if !expect_failure {
+                    assert!(world.handle("fault").is_none());
+                }
+            }
+            if frame_number == 3 {
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event.level != crate::ScriptEventLevel::Error),
+                    "frame {frame_number}: {events:?}"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| { event.message == "all slots available" })
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn coroutine_thread_timeout_is_not_swallowed_by_pcall() {
     let source = r#"
 local Script = {}

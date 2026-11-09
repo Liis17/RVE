@@ -1,4 +1,5 @@
 use mlua::{Function, Thread};
+use std::collections::BTreeSet;
 
 pub(crate) const MAX_SCRIPT_TIMERS: usize = 256;
 pub(crate) const MAX_SCRIPT_COROUTINES: usize = 256;
@@ -77,6 +78,7 @@ pub(crate) struct ScriptTimeline {
     next_id: u64,
     timers: Vec<ScriptTimer>,
     coroutines: Vec<ScriptCoroutine>,
+    in_flight_coroutines: BTreeSet<(u64, u64)>,
 }
 
 impl ScriptTimeline {
@@ -99,12 +101,29 @@ impl ScriptTimeline {
     }
 
     pub(crate) fn can_add_coroutine(&self, pending: &[TimelineOp]) -> bool {
+        self.coroutine_slots_used(pending) < MAX_SCRIPT_COROUTINES
+    }
+
+    pub(crate) fn coroutines_fit(&self, pending: &[TimelineOp]) -> bool {
+        self.coroutine_slots_used(pending) <= MAX_SCRIPT_COROUTINES
+    }
+
+    fn coroutine_slots_used(&self, pending: &[TimelineOp]) -> usize {
         self.coroutines.len()
+            + self.in_flight_coroutines.len()
             + pending
                 .iter()
-                .filter(|op| matches!(&op.kind, TimelineOpKind::AddCoroutine(_)))
+                .filter_map(|op| match &op.kind {
+                    TimelineOpKind::AddCoroutine(coroutine)
+                        if !self
+                            .in_flight_coroutines
+                            .contains(&(coroutine.owner, coroutine.id)) =>
+                    {
+                        Some(())
+                    }
+                    _ => None,
+                })
                 .count()
-            < MAX_SCRIPT_COROUTINES
     }
 
     pub(crate) fn timer_exists(&self, id: u64, owner: u64) -> bool {
@@ -175,6 +194,8 @@ impl ScriptTimeline {
                         .retain(|timer| timer.id != id || timer.owner != owner);
                 }
                 TimelineOpKind::AddCoroutine(coroutine) => {
+                    self.in_flight_coroutines
+                        .remove(&(coroutine.owner, coroutine.id));
                     if self.coroutines.len() < MAX_SCRIPT_COROUTINES {
                         self.coroutines.push(coroutine);
                     }
@@ -182,6 +203,7 @@ impl ScriptTimeline {
                 TimelineOpKind::RemoveCoroutine { id, owner } => {
                     self.coroutines
                         .retain(|coroutine| coroutine.id != id || coroutine.owner != owner);
+                    self.in_flight_coroutines.remove(&(owner, id));
                 }
             }
         }
@@ -246,7 +268,10 @@ impl ScriptTimeline {
         let mut index = 0;
         while index < self.coroutines.len() {
             if self.coroutines[index].eligible {
-                out.push(self.coroutines.swap_remove(index));
+                let coroutine = self.coroutines.swap_remove(index);
+                self.in_flight_coroutines
+                    .insert((coroutine.owner, coroutine.id));
+                out.push(coroutine);
             } else {
                 index += 1;
             }
@@ -254,14 +279,22 @@ impl ScriptTimeline {
         out.sort_unstable_by_key(|entry| entry.id);
     }
 
+    pub(crate) fn finish_due_coroutine(&mut self, coroutine: &ScriptCoroutine) {
+        self.in_flight_coroutines
+            .remove(&(coroutine.owner, coroutine.id));
+    }
+
     pub(crate) fn cancel_owner(&mut self, owner: u64) {
         self.timers.retain(|timer| timer.owner != owner);
         self.coroutines.retain(|coroutine| coroutine.owner != owner);
+        self.in_flight_coroutines
+            .retain(|(coroutine_owner, _)| *coroutine_owner != owner);
     }
 
     pub(crate) fn clear(&mut self) {
         self.timers.clear();
         self.coroutines.clear();
+        self.in_flight_coroutines.clear();
     }
 }
 

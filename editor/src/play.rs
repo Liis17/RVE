@@ -621,7 +621,7 @@ pub fn editor_gamepads(
 
 impl PlaySession {
     /// Запускает сцену. Исходники Lua читаются через `read_source`; скрипты получают `on_start`
-    /// при первом обновлении.
+    /// перед продвижением часов первого незапаузенного шага.
     #[cfg(test)]
     pub fn start(
         document: &SceneDocument,
@@ -996,6 +996,21 @@ impl PlaySession {
         if let Some(network) = &mut self.network {
             network.receive(&mut self.world, &mut self.host);
         }
+        self.host.set_input(
+            self.pending_input
+                .take()
+                .unwrap_or_else(|| self.input.take_frame()),
+        );
+        self.watchdog
+            .set_deadline(Some(Instant::now() + self.time_limit));
+        self.host.start(
+            &mut self.world,
+            ScriptTime {
+                elapsed: self.elapsed,
+                frame: self.frame,
+            },
+        );
+        self.watchdog.set_deadline(None);
         let frame_time = ScriptFrameTime::advance(
             dt,
             self.host.time_scale(),
@@ -1007,11 +1022,6 @@ impl PlaySession {
         self.elapsed = frame_time.elapsed;
         self.unscaled_elapsed = frame_time.unscaled_elapsed;
         self.frame = frame_time.frame;
-        self.host.set_input(
-            self.pending_input
-                .take()
-                .unwrap_or_else(|| self.input.take_frame()),
-        );
         self.watchdog
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.update_frame(&mut self.world, frame_time);
@@ -1604,7 +1614,7 @@ fn physics_error_event(message: String) -> ScriptEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_project::{InputAction, PrefabCatalogEntry};
+    use engine_project::{InputAction, PhysicsSettings, PrefabCatalogEntry};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_script::PrefabStatus;
     use std::path::PathBuf;
@@ -1732,6 +1742,110 @@ return Clock
                 .all(|event| { event.level != engine_script::ScriptEventLevel::Error })
         );
         assert!((session.particle_dt - 0.375).abs() < 0.00001);
+    }
+
+    #[test]
+    fn play_on_start_runs_at_zero_time_before_the_first_scaled_physics_and_update() {
+        const SCENE: &str = r#"
+[[assets]]
+path = "/clock.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "ball"
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+gravity_scale = 0.0
+[[objects.lite_scripts]]
+path = "/clock.lua"
+"#;
+
+        for (scale, expected_dt, expected_elapsed, expected_fixed_count) in
+            [(0.0, 0.0, 0.0, 0), (0.5, 0.1, 0.1, 1)]
+        {
+            let script = format!(
+                r#"
+local Script = {{}}
+local starts = 0
+function Script:on_start()
+  starts = starts + 1
+  assert(starts == 1)
+  assert(rve.time.frame == 0)
+  assert(rve.time.dt == 0 and rve.time.unscaled_dt == 0)
+  assert(rve.time.elapsed == 0 and rve.time.unscaled_elapsed == 0)
+  rve.time.scale = {scale}
+  assert(rve.find("ball"):set_velocity({{x=1, y=0, z=0}}))
+end
+function Script:on_fixed_update(dt)
+  assert(math.abs(dt - rve.time.fixed_dt) < 0.00001)
+  assert(math.abs(rve.time.scale - {scale}) < 0.00001)
+  rve.log_info("fixed")
+end
+function Script:on_update(dt)
+  if rve.time.frame == 1 then
+    assert(math.abs(dt - {expected_dt}) < 0.00001)
+    assert(math.abs(rve.time.elapsed - {expected_elapsed}) < 0.00001)
+    assert(math.abs(rve.time.unscaled_elapsed - 0.2) < 0.00001)
+  else
+    assert(rve.time.frame == 2 and dt == 0)
+    assert(math.abs(rve.time.elapsed - {expected_elapsed}) < 0.00001)
+    assert(math.abs(rve.time.unscaled_elapsed - 0.2) < 0.00001)
+  end
+end
+return Script
+"#
+            );
+            let document = document(SCENE);
+            let world = World::from_document(&document).unwrap();
+            let physics_settings = PhysicsSettings {
+                fixed_hz: 10,
+                max_substeps: 8,
+                ..PhysicsSettings::default()
+            };
+            let mut session = PlaySession::start_with_world_and_physics(
+                &document,
+                world,
+                None,
+                &InputSettings::default(),
+                |_| Ok(script.clone()),
+                PlayPrefabs::default(),
+                Vec::new(),
+                &physics_settings,
+                AudioConfig::default(),
+                AnimationBridge::default(),
+            )
+            .unwrap();
+
+            session.step(0.2).unwrap();
+            session.step(0.0).unwrap();
+
+            let events = session.drain_events();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.level != engine_script::ScriptEventLevel::Error),
+                "scale {scale}: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.message == "fixed")
+                    .count(),
+                expected_fixed_count,
+                "scale {scale}"
+            );
+            let ball = session.world.handle("ball").unwrap();
+            let position = session.world.local_transform(ball).unwrap().position.x;
+            assert!(
+                (position - expected_elapsed as f32).abs() < 0.0001,
+                "scale {scale}: ball moved {position}"
+            );
+        }
     }
 
     #[test]

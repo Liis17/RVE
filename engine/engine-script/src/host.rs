@@ -1845,12 +1845,14 @@ impl ScriptHost {
                     .as_ref()
                     .is_some_and(|instance| instance.serial == coroutine.owner)
             }) else {
+                self.timeline.borrow_mut().finish_due_coroutine(coroutine);
                 continue;
             };
             if !self.instances[index]
                 .as_ref()
                 .is_some_and(|instance| instance.enabled && instance.running)
             {
+                self.timeline.borrow_mut().finish_due_coroutine(coroutine);
                 continue;
             }
             match self.call_instance(
@@ -1869,6 +1871,7 @@ impl ScriptHost {
                 CallOutcome::Interrupted => self.disable_instance(index),
                 CallOutcome::Failed(message) => self.fail_instance(index, message),
             }
+            self.timeline.borrow_mut().finish_due_coroutine(coroutine);
         }
         self.due_coroutines.clear();
         self.due_coroutines = coroutines;
@@ -2405,6 +2408,10 @@ impl ScriptHost {
             instance_serial: instance.serial,
             instance_enabled: instance.user_enabled,
             cursor: *cursor,
+        });
+        transaction.set_fixed_update_dt(match phase {
+            Phase::FixedUpdate(dt) => Some(dt),
+            _ => None,
         });
         let transaction_ptr = transaction as *mut ScriptTransaction;
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
