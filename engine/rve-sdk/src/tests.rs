@@ -604,6 +604,7 @@ fn host(state: &mut HostState) -> RveHost {
         audio_set_source: None,
         audio_play_clip_ex: None,
         audio_set_voice_position: None,
+        mesh_set_material_path: None,
     }
 }
 
@@ -2568,6 +2569,11 @@ fn object_hierarchy_callbacks_are_appended_after_the_v14_screen_shader_tail() {
     assert_eq!(
         offset_of!(RveHost, audio_set_voice_position)
             + size_of::<Option<crate::abi::RveAudioSetVoicePositionFn>>(),
+        offset_of!(RveHost, mesh_set_material_path)
+    );
+    assert_eq!(
+        offset_of!(RveHost, mesh_set_material_path)
+            + size_of::<Option<crate::abi::RveMeshSetMaterialPathFn>>(),
         size_of::<RveHost>()
     );
 }

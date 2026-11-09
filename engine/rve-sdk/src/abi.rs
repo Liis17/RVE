@@ -1720,6 +1720,9 @@ pub struct RveHost {
     pub audio_set_source: Option<RveAudioSetSourceFn>,
     pub audio_play_clip_ex: Option<RveAudioPlayClipExFn>,
     pub audio_set_voice_position: Option<RveAudioSetVoicePositionFn>,
+    /// Replaces the material of every mesh part with a `.rvemat` declared in the scene; appended
+    /// in v18 after the audio callbacks.
+    pub mesh_set_material_path: Option<RveMeshSetMaterialPathFn>,
 }
 
 /// Sets a boolean on an object (`mesh_set_visible`, `particles_set_playing`); appended in v18.
@@ -1853,6 +1856,10 @@ pub type RveMeshSetMaterialParamsFn = unsafe extern "C" fn(
     object: u64,
     params: *const RveMeshMaterialParams,
 ) -> bool;
+/// Replaces the material of every mesh part with the `.rvemat` at `path`. The path must be declared
+/// in the scene's `[[assets]]`; otherwise the call returns `false` and changes nothing.
+pub type RveMeshSetMaterialPathFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, path: RveStr) -> bool;
 /// Restarts the emitter or queues a burst; `count` is used by bursts only.
 pub type RveParticlesCommandFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, kind: u32, count: u32) -> bool;
@@ -2456,6 +2463,11 @@ mod tests {
         assert_eq!(
             offset_of!(RveHost, audio_set_voice_position)
                 + size_of::<Option<super::RveAudioSetVoicePositionFn>>(),
+            offset_of!(RveHost, mesh_set_material_path)
+        );
+        assert_eq!(
+            offset_of!(RveHost, mesh_set_material_path)
+                + size_of::<Option<super::RveMeshSetMaterialPathFn>>(),
             size_of::<RveHost>()
         );
     }

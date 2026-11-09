@@ -112,6 +112,23 @@ impl Object {
         component_status(unsafe { callback(ctx.host.ctx, self.handle, params) })
     }
 
+    /// Replaces the material of every mesh part with the scene's `.rvemat` at `path`. The path must
+    /// be declared in `[[assets]]`; otherwise the host refuses the call.
+    pub fn set_material_path(&self, ctx: &mut Context<'_>, path: &str) -> Result<(), ComponentError> {
+        let callback = ctx
+            .host
+            .mesh_set_material_path
+            .ok_or(ComponentError::Unavailable)?;
+        // SAFETY: the path string remains valid for this synchronous callback.
+        component_status(unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                abi::RveStr::from_str_ref(path),
+            )
+        })
+    }
+
     /// Whether the emitter is spawning particles; `None` without a particle emitter.
     pub fn particles_playing(&self, ctx: &Context<'_>) -> Option<bool> {
         let callback = ctx.host.particles_get_playing?;
