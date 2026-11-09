@@ -225,3 +225,87 @@ return Script
 fn sdk_and_scene_agree_on_the_volume_cap() {
     assert_eq!(rve_sdk::MAX_AUDIO_VOLUME, engine_scene::MAX_AUDIO_VOLUME);
 }
+
+#[test]
+fn set_voice_position_is_rejected_for_a_two_d_voice_and_accepted_for_a_spatial_one() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  if self.flat == nil then
+    self.flat = rve.audio.play("/audio/hum.wav")
+    self.spatial = rve.audio.play("/audio/hum.wav", {position = {x = 0, y = 0, z = 0}})
+  elseif self.phase == nil then
+    self.phase = "spatial"
+    rve.audio.set_voice_position(self.spatial, {x = 1, y = 2, z = 3})
+  else
+    rve.audio.set_voice_position(self.flat, {x = 1, y = 2, z = 3})
+  end
+end
+return Script
+"#,
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(host.drain_audio_requests().len(), 2);
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let requests = host.drain_audio_requests();
+    assert!(
+        matches!(requests.as_slice(), [AudioRequest::SetVoicePosition { .. }]),
+        "{requests:?}"
+    );
+    assert!(host.drain_events().is_empty());
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(host.drain_audio_requests().is_empty());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("spatial voice")),
+        "2D-голос должен отвергаться с ошибкой"
+    );
+}
+
+#[test]
+fn set_voice_position_on_a_voice_played_in_the_same_call_is_rejected_without_queueing() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  local voice = rve.audio.play("/audio/hum.wav")
+  rve.audio.set_voice_position(voice, {x = 1, y = 2, z = 3})
+end
+return Script
+"#,
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(host.drain_audio_requests().is_empty());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("spatial voice"))
+    );
+}
+
+#[test]
+fn play_with_both_position_and_follow_is_a_script_error_and_queues_nothing() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  rve.audio.play("/audio/hum.wav", {position = {x = 1, y = 0, z = 0}, follow = rve.find("player")})
+end
+return Script
+"#,
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(host.drain_audio_requests().is_empty());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("нельзя задать одновременно")),
+    );
+}

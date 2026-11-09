@@ -321,15 +321,26 @@ pub(crate) fn validate_audio_source(
     }
 }
 
+/// Голос пространственный, если клип задан позицией или `follow` и `spatial_blend > 0`. Без этого
+/// мост не создаёт дистанций, и `set_voice_position` на таком голосе не имеет эффекта.
+pub fn clip_is_spatial(params: &ClipParams) -> bool {
+    (params.position.is_some() || params.follow.is_some()) && params.spatial_blend > 0.0
+}
+
 /// Причина отказа для пространственных опций клипа скрипта или `None`.
+/// Дистанции проверяются только при `spatial_blend > 0`: у 2D-клипа они не используются.
 pub fn clip_spatial_problem(params: &ClipParams) -> Option<&'static str> {
     if !params.spatial_blend.is_finite() || !(0.0..=1.0).contains(&params.spatial_blend) {
         return Some("spatial_blend должен быть конечным и в диапазоне 0..=1");
     }
-    if !params.min_distance.is_finite()
-        || !params.max_distance.is_finite()
-        || params.min_distance <= 0.0
-        || params.min_distance >= params.max_distance
+    if params.position.is_some() && params.follow.is_some() {
+        return Some("position и follow нельзя задать одновременно");
+    }
+    if params.spatial_blend > 0.0
+        && (!params.min_distance.is_finite()
+            || !params.max_distance.is_finite()
+            || params.min_distance <= 0.0
+            || params.min_distance >= params.max_distance)
     {
         return Some(
             "min_distance и max_distance должны удовлетворять 0 < min_distance < max_distance",
@@ -580,5 +591,66 @@ mod tests {
             .map(|path| path.as_str())
             .collect();
         assert_eq!(paths, ["audio/hum.wav", "audio/loop.ogg", "models/box.fbx"]);
+    }
+}
+
+#[cfg(test)]
+mod clip_spatial_tests {
+    use super::{ClipParams, clip_is_spatial, clip_spatial_problem};
+    use crate::ObjectHandle;
+
+    fn two_d() -> ClipParams {
+        ClipParams {
+            spatial_blend: 0.0,
+            min_distance: 0.0,
+            max_distance: 0.0,
+            ..ClipParams::default()
+        }
+    }
+
+    #[test]
+    fn two_d_clip_ignores_distances_that_only_matter_for_spatial_mixing() {
+        assert_eq!(clip_spatial_problem(&two_d()), None);
+        let spatial_blend_without_distances = ClipParams {
+            spatial_blend: 0.5,
+            ..two_d()
+        };
+        assert!(clip_spatial_problem(&spatial_blend_without_distances).is_some());
+    }
+
+    #[test]
+    fn position_and_follow_together_are_rejected() {
+        let follow = ObjectHandle::from_abi(1).expect("живой хендл первого объекта");
+        let both = ClipParams {
+            position: Some([1.0, 0.0, 0.0]),
+            follow: Some(follow),
+            ..ClipParams::default()
+        };
+        assert_eq!(
+            clip_spatial_problem(&both),
+            Some("position и follow нельзя задать одновременно")
+        );
+    }
+
+    #[test]
+    fn clip_is_spatial_needs_a_position_or_follow_and_a_positive_blend() {
+        let follow = ObjectHandle::from_abi(1).expect("живой хендл первого объекта");
+        assert!(!clip_is_spatial(&two_d()));
+        let positioned = ClipParams {
+            position: Some([0.0; 3]),
+            ..ClipParams::default()
+        };
+        assert!(clip_is_spatial(&positioned));
+        let followed = ClipParams {
+            follow: Some(follow),
+            ..ClipParams::default()
+        };
+        assert!(clip_is_spatial(&followed));
+        let positioned_flat = ClipParams {
+            position: Some([0.0; 3]),
+            spatial_blend: 0.0,
+            ..ClipParams::default()
+        };
+        assert!(!clip_is_spatial(&positioned_flat));
     }
 }

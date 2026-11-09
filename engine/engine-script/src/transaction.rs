@@ -34,6 +34,7 @@ pub(crate) struct ScreenShaderState {
     pub(crate) params: [f32; MAX_SCREEN_SHADER_PARAMS],
 }
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -42,6 +43,8 @@ use std::sync::{Arc, OnceLock};
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
 /// Звуковых запросов за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
 pub(crate) const MAX_AUDIO_REQUESTS_PER_FRAME: usize = 256;
+/// Сколько последних голосов помнит транзакция для проверки `set_voice_position`; старые вытесняются.
+const MAX_TRACKED_VOICES: usize = 4096;
 /// Запросов аниматора за кадр, включая уже зафиксированные скриптами.
 pub(crate) const MAX_ANIMATION_REQUESTS_PER_FRAME: usize = 256;
 /// Запросов вибрации за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
@@ -241,6 +244,9 @@ pub(crate) struct ScriptTransaction {
     pending_cursor_visible: Option<bool>,
     pending_cursor_locked: Option<bool>,
     pending_audio: Vec<AudioRequest>,
+    /// Пространственность голосов по `VoiceId::get`, как её записал последний зафиксированный
+    /// `play`. Хост переиспользует транзакцию между вызовами, поэтому таблица живёт весь сеанс.
+    voice_spatial: BTreeMap<u64, bool>,
     pending_rumble: Vec<RumbleRequest>,
     pending_animation: Vec<AnimationRequest>,
     net: Rc<RefCell<NetScriptState>>,
@@ -313,6 +319,7 @@ impl Default for ScriptTransaction {
             pending_cursor_visible: None,
             pending_cursor_locked: None,
             pending_audio: Vec::new(),
+            voice_spatial: BTreeMap::new(),
             pending_rumble: Vec::new(),
             pending_animation: Vec::new(),
             net: Rc::new(RefCell::new(NetScriptState::default())),
@@ -483,6 +490,14 @@ impl ScriptTransaction {
                 return Err("clip follow object is not alive and active".to_owned());
             }
         }
+        if let AudioRequest::SetVoicePosition { voice, .. } = &request
+            && self.voice_is_flat(*voice)
+        {
+            return Err(
+                "set_voice_position needs a spatial voice: play it with position or follow and spatial_blend > 0"
+                    .to_owned(),
+            );
+        }
         if self.queued_audio.saturating_add(self.pending_audio.len())
             >= MAX_AUDIO_REQUESTS_PER_FRAME
         {
@@ -492,6 +507,20 @@ impl ScriptTransaction {
         }
         self.pending_audio.push(request);
         Ok(())
+    }
+
+    /// Голос известен как 2D: его последний `play` (в этом вызове или зафиксированный раньше) не
+    /// пространственный. Неизвестный голос (вытесненный или чужой) не отвергается.
+    fn voice_is_flat(&self, voice: engine_scene::VoiceId) -> bool {
+        let staged = self.pending_audio.iter().rev().find_map(|request| match request {
+            AudioRequest::PlayClip {
+                voice: played,
+                params,
+                ..
+            } if *played == voice => Some(!engine_scene::audio::clip_is_spatial(params)),
+            _ => None,
+        });
+        staged.unwrap_or_else(|| self.voice_spatial.get(&voice.get()) == Some(&false))
     }
 
     /// Ставит запрос вибрации до коммита. Как и звук, он отбрасывается вместе с отказавшим вызовом.
@@ -2480,6 +2509,21 @@ impl ScriptTransaction {
         }
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
+        for request in &self.pending_audio {
+            match request {
+                AudioRequest::PlayClip { voice, params, .. } => {
+                    self.voice_spatial
+                        .insert(voice.get(), engine_scene::audio::clip_is_spatial(params));
+                }
+                AudioRequest::StopVoice { voice } => {
+                    self.voice_spatial.remove(&voice.get());
+                }
+                _ => {}
+            }
+        }
+        while self.voice_spatial.len() > MAX_TRACKED_VOICES {
+            self.voice_spatial.pop_first();
+        }
         audio.append(&mut self.pending_audio);
         animation.append(&mut self.pending_animation);
         net.append(&mut self.pending_net);
