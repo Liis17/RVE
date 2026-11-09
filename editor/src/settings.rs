@@ -237,6 +237,49 @@ mod tests {
     }
 
     #[test]
+    fn layout_saved_without_material_preview_loads_and_renders() {
+        let dir = TempDir::new();
+        let store = SettingsStore::in_dir(&dir.0);
+        let ctx = egui::Context::default();
+        let mut state = EditorState::new(None);
+        let render = |layout: &mut DockState<Tab>, state: &mut EditorState| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                DockArea::new(layout).show_inside(ui, &mut EditorTabs { state });
+            });
+            output.textures_delta.clear();
+        };
+        // Сохраняется раскладка после кадров UI: без них доли панелей не вычислены.
+        let mut layout = default_layout();
+        render(&mut layout, &mut state);
+        render(&mut layout, &mut state);
+        let preview = layout.find_tab(&Tab::MaterialPreview).unwrap();
+        layout.remove_tab(preview);
+        store
+            .save(&UserSettings {
+                layout: Some(layout.clone()),
+                ..UserSettings::default()
+            })
+            .unwrap();
+
+        let (loaded, message) = store.load();
+        assert_eq!(message, None);
+        let mut loaded = loaded.layout_or_default();
+        assert_eq!(tabs(&loaded), tabs(&layout));
+        assert!(!crate::layout::is_open(&loaded, Tab::MaterialPreview));
+        // `ui::show` сбрасывает флаг каждый кадр; здесь его сбрасываем сами перед проверкой.
+        state.material_preview.visible = false;
+        render(&mut loaded, &mut state);
+        assert!(!state.material_preview.visible);
+    }
+
+    #[test]
     fn corrupt_file_or_field_falls_back_to_defaults_with_a_message() {
         let dir = TempDir::new();
         std::fs::create_dir_all(&dir.0).unwrap();

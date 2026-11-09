@@ -316,6 +316,7 @@ impl TreeContext<'_> {
 fn apply(state: &mut EditorState, command: Command) {
     match command {
         Command::Select(id, modifiers) => {
+            state.inspected_asset = None;
             if let Some(scene) = &mut state.scene {
                 let id = (!id.is_empty()).then_some(id.as_str());
                 scene_view::apply_click_selection(scene, id, modifiers);
@@ -346,6 +347,7 @@ fn apply(state: &mut EditorState, command: Command) {
         Command::EditRename(id, text) => state.hierarchy_rename = Some((id, text)),
         Command::RenameFocused => state.hierarchy_rename_focus = false,
         Command::Frame(id) => {
+            state.inspected_asset = None;
             if let Some(scene) = &mut state.scene {
                 scene.select(Some(id.as_str()));
             }
