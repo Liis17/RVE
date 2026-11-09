@@ -10,6 +10,10 @@ pub const CHARACTER_MOVE_ITERATIONS: usize = 4;
 pub const MAX_PUSH_SPEED: f32 = 10.0;
 const STEP_EXTRA_ITERATIONS: usize = 8;
 const MOVEMENT_EPSILON_SQUARED: f32 = 1.0e-10;
+const PLANE_EPSILON: f32 = 1.0e-6;
+const DEPENETRATION_ITERATIONS: usize = 4;
+/// Проникновение меньше этого считается касанием и не выталкивается.
+const DEPENETRATION_SLOP: f32 = 1.0e-4;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CharacterController {
@@ -192,15 +196,20 @@ impl CharacterController {
         if !displacement.is_finite() {
             return Err(CharacterError::NonFiniteInput);
         }
-        let start_pose = Pose::new(start_pose.position, start_pose.rotation)?;
+        // Капсула персонажа всегда вертикальна: наклон объекта (взгляд вниз) не должен
+        // заваливать её в пол и ступени. Вокруг Y капсула симметрична, поэтому поворот не нужен.
+        let origin = start_pose.position;
         let shape = self.capsule()?;
         let overrides = QueryOverrides {
             excluded,
             enabled: enabled_overrides,
         };
+        let (recovered, mut degraded) =
+            self.depenetrate(snapshot, body, &shape, origin, overrides)?;
+        let start_pose = Pose::new(recovered, Quat::IDENTITY)?;
         let mut movement =
             self.slide(snapshot, body, &shape, start_pose, displacement, overrides)?;
-        let mut degraded = movement.degraded;
+        degraded |= movement.degraded;
         if self.step_height > 0.0
             && movement.hits.iter().any(|hit| {
                 hit.blocked_displacement.length_squared() > MOVEMENT_EPSILON_SQUARED
@@ -239,7 +248,7 @@ impl CharacterController {
             hit.requested_displacement = displacement;
         }
         Ok(CharacterMoveResult {
-            translation: movement.position - start_pose.position,
+            translation: movement.position - origin,
             blocked_displacement: movement.blocked_displacement,
             grounded: movement.grounded,
             hits: movement.hits,
@@ -272,6 +281,40 @@ impl CharacterController {
         magnitude.is_finite().then_some(hit.normal * magnitude)
     }
 
+    /// Выталкивает капсулу из static и kinematic коллайдеров, в которые она уже вошла
+    /// (spawn в геометрии, наезд kinematic-тела). Sweep из пересечения берёт нормаль по центрам
+    /// форм и может пропустить стену, поэтому движение начинается из свободной позиции.
+    fn depenetrate(
+        &self,
+        snapshot: &QuerySnapshot,
+        body: BodyHandle,
+        shape: &Shape,
+        position: Vec3,
+        overrides: QueryOverrides<'_>,
+    ) -> Result<(Vec3, bool), CharacterError> {
+        let filter = QueryFilter {
+            ignore: Some(body),
+            include_triggers: false,
+            layer_mask: snapshot.collision_layer_mask(body),
+        };
+        let mut position = position;
+        for _ in 0..DEPENETRATION_ITERATIONS {
+            let pose = Pose::new(position, Quat::IDENTITY)?;
+            let (normal, depth) =
+                match snapshot.deepest_static_penetration(shape, pose, filter, overrides) {
+                    Ok(Some(penetration)) => penetration,
+                    Ok(None) => break,
+                    Err(error) if is_numeric_query_limit(&error) => return Ok((position, true)),
+                    Err(error) => return Err(error.into()),
+                };
+            if depth <= DEPENETRATION_SLOP {
+                break;
+            }
+            position -= normal * (depth + DEPENETRATION_SLOP);
+        }
+        Ok((position, false))
+    }
+
     fn slide(
         &self,
         snapshot: &QuerySnapshot,
@@ -291,6 +334,8 @@ impl CharacterController {
             include_triggers: false,
             layer_mask: snapshot.collision_layer_mask(body),
         };
+        // Нормали препятствий этого sweep (от капсулы к препятствию).
+        let mut planes = Vec::with_capacity(CHARACTER_MOVE_ITERATIONS);
 
         for _ in 0..CHARACTER_MOVE_ITERATIONS {
             if remaining.length_squared() <= MOVEMENT_EPSILON_SQUARED {
@@ -316,8 +361,10 @@ impl CharacterController {
             let unspent = remaining * (1.0 - hit.fraction);
             let into_obstacle = unspent.dot(hit.normal).max(0.0);
             if into_obstacle <= 1.0e-6 {
-                result.position += unspent;
-                break;
+                // Остаток почти касателен: проверяем его следующим sweep, а не переносим вслепую,
+                // иначе он проходит сквозь соседнюю стену угла.
+                remaining = unspent;
+                continue;
             }
             let blocked = hit.normal * into_obstacle;
             result.blocked_displacement += blocked;
@@ -328,7 +375,8 @@ impl CharacterController {
             if surface_normal.y > 1.0e-3 && !self.is_walkable(surface_normal) {
                 break;
             }
-            remaining = unspent - blocked;
+            remaining = clip_to_planes(unspent - blocked, &planes, hit.normal);
+            planes.push(hit.normal);
         }
         Ok(result)
     }
@@ -462,6 +510,26 @@ fn character_hit(hit: QueryHit, blocked_displacement: Vec3) -> CharacterHit {
         body_velocity: hit.body_velocity,
         mass: hit.mass,
     }
+}
+
+/// Срезает остаток движения, уже спроецированный на плоскость `normal`, так, чтобы он не шёл
+/// в прежние препятствия: в двугранном углу — вдоль ребра двух плоскостей, в трёх — стоп.
+/// Иначе проекция на одну плоскость возвращает капсулу в предыдущую стену.
+fn clip_to_planes(remaining: Vec3, planes: &[Vec3], normal: Vec3) -> Vec3 {
+    let Some(&previous) = planes
+        .iter()
+        .find(|plane| remaining.dot(**plane) > PLANE_EPSILON)
+    else {
+        return remaining;
+    };
+    let Some(crease) = previous.cross(normal).try_normalize() else {
+        return Vec3::ZERO;
+    };
+    let along = crease * remaining.dot(crease);
+    if planes.iter().any(|plane| along.dot(*plane) > PLANE_EPSILON) {
+        return Vec3::ZERO;
+    }
+    along
 }
 
 fn horizontal_progress(displacement: Vec3) -> f32 {
@@ -1030,3 +1098,6 @@ mod tests {
         assert!((impulse.x - 1.5).abs() < 1.0e-4, "{impulse:?}");
     }
 }
+
+#[cfg(test)]
+mod robustness_tests;
