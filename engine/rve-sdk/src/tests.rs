@@ -3132,3 +3132,43 @@ fn pressed_inputs_list_gamepad_slots_in_order_with_concrete_names() {
         vec!["Gamepad1.South".to_owned(), "Gamepad3.DPadUp".to_owned()]
     );
 }
+
+#[test]
+fn v18_component_structs_keep_their_documented_c_layout() {
+    use crate::abi::{
+        RveAudioPlayExParams, RveAudioSourceState, RveEnvironmentState, RveLightState,
+        RveMeshMaterialParams, RveProceduralSky,
+    };
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(size_of::<RveLightState>(), 52);
+    assert_eq!(offset_of!(RveLightState, ambient), 12);
+    assert_eq!(offset_of!(RveLightState, shadow_cascades), 44);
+    assert_eq!(offset_of!(RveLightState, shadows), 48);
+    assert_eq!(offset_of!(RveLightState, enabled), 49);
+
+    assert_eq!(size_of::<RveProceduralSky>(), 44);
+    assert_eq!(offset_of!(RveProceduralSky, horizon_color), 12);
+    assert_eq!(offset_of!(RveProceduralSky, sun_size_deg), 36);
+    assert_eq!(offset_of!(RveProceduralSky, sun_intensity), 40);
+
+    assert_eq!(size_of::<RveEnvironmentState>(), 52);
+    assert_eq!(offset_of!(RveEnvironmentState, has_sky), 4);
+    assert_eq!(offset_of!(RveEnvironmentState, sky), 8);
+
+    assert_eq!(size_of::<RveMeshMaterialParams>(), 36);
+    assert_eq!(offset_of!(RveMeshMaterialParams, base_color), 4);
+    assert_eq!(offset_of!(RveMeshMaterialParams, metallic), 28);
+    assert_eq!(offset_of!(RveMeshMaterialParams, roughness), 32);
+
+    assert_eq!(size_of::<RveAudioSourceState>(), 36);
+    assert_eq!(offset_of!(RveAudioSourceState, rolloff), 24);
+    assert_eq!(offset_of!(RveAudioSourceState, pitch), 28);
+    assert_eq!(offset_of!(RveAudioSourceState, force_mono), 32);
+
+    assert_eq!(size_of::<RveAudioPlayExParams>(), 48);
+    assert_eq!(offset_of!(RveAudioPlayExParams, position), 12);
+    assert_eq!(offset_of!(RveAudioPlayExParams, follow), 24);
+    assert_eq!(offset_of!(RveAudioPlayExParams, spatial_blend), 32);
+    assert_eq!(offset_of!(RveAudioPlayExParams, force_mono), 44);
+}
