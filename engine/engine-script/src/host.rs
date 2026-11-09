@@ -16,6 +16,7 @@ use crate::net::{
 };
 use crate::physics::PhysicsScriptState;
 use crate::save_writer::SaveWriter;
+use crate::script_refs::{ScriptRefEntry, ScriptRefs};
 use crate::timeline::{CoroutineWait, DueTimer, ScriptCoroutine, ScriptTimeline, TimerCallback};
 use crate::transaction::{
     MAX_MESSAGE_BYTES_PER_FRAME, MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage,
@@ -210,6 +211,8 @@ pub struct ScriptHost {
     commands: LuaCommands,
     commands_generation: CommandGeneration,
     transaction: ScriptTransaction,
+    /// Справочник экземпляров для `obj:script`; общий с транзакциями.
+    script_refs: ScriptRefs,
     save_values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
     save_flush_requested: Rc<Cell<bool>>,
     save_generation: Rc<Cell<u64>>,
@@ -451,7 +454,9 @@ impl ScriptHost {
         let loaded_library = library.and_then(ScriptLibrary::shared_library);
         let heavy = library.map(heavy_scripts).unwrap_or_default();
         let heavy_abi_version = library.map_or(0, ScriptLibrary::abi_version);
+        let script_refs = ScriptRefs::default();
         let mut transaction = ScriptTransaction::with_ui(ui.clone());
+        transaction.attach_script_refs(script_refs.clone());
         transaction.attach_time_state(timeline.clone(), time_scale.clone());
         transaction.attach_save_state(
             save_values.clone(),
@@ -479,6 +484,7 @@ impl ScriptHost {
             commands,
             commands_generation,
             transaction,
+            script_refs,
             save_values,
             save_flush_requested,
             save_generation,
@@ -604,6 +610,14 @@ impl ScriptHost {
                     message: error.to_string(),
                 })?;
                 let serial = host.next_serial();
+                host.register_script_ref(
+                    serial,
+                    object.handle,
+                    path,
+                    schema.as_ref(),
+                    &params,
+                    script.enabled,
+                );
                 host.insert_instance(ScriptInstance {
                     handle: object.handle,
                     source: event_source(scene_name, &object.id, path),
@@ -698,6 +712,14 @@ impl ScriptHost {
                             });
                         }
                     };
+                    host.register_script_ref(
+                        serial,
+                        object.handle,
+                        &script.name,
+                        schema.as_ref(),
+                        &params,
+                        script.enabled,
+                    );
                     host.instances[owner] = Some(ScriptInstance {
                         handle: object.handle,
                         source,
@@ -1898,6 +1920,7 @@ impl ScriptHost {
                 };
                 let is_target = match message.target {
                     MessageTarget::Object(handle) => instance.handle == handle,
+                    MessageTarget::Instance { serial, .. } => instance.serial == serial,
                     MessageTarget::Broadcast => true,
                 };
                 if !instance.enabled || !instance.running || !is_target {
@@ -2442,6 +2465,7 @@ impl ScriptHost {
         }
         let Self {
             instances,
+            script_refs,
             events,
             active_source,
             active_call,
@@ -2533,6 +2557,21 @@ impl ScriptHost {
                         return CallOutcome::Failed(error.to_string());
                     }
                 };
+                let pending_params = {
+                    let mut refs = script_refs.borrow_mut();
+                    refs.iter_mut()
+                        .find(|entry| entry.serial == instance.serial && entry.params_dirty)
+                        .map(|entry| {
+                            entry.params_dirty = false;
+                            entry.properties.clone()
+                        })
+                };
+                if let Some(properties) = pending_params
+                    && let Err(error) = lite_instance.write_params(lua, &properties)
+                {
+                    transaction.discard();
+                    return CallOutcome::Failed(error.to_string());
+                }
                 let has_callback = match phase {
                     Phase::Message => lite_instance.has_message_callback(),
                     Phase::Enable => lite_instance.has_callback("on_enable"),
@@ -2845,6 +2884,14 @@ impl ScriptHost {
             {
                 instance.user_enabled = enabled;
             }
+            if let Some(entry) = self
+                .script_refs
+                .borrow_mut()
+                .iter_mut()
+                .find(|entry| entry.serial == serial)
+            {
+                entry.enabled = enabled;
+            }
         }
         self.apply_queued_spawns(world);
 
@@ -3104,6 +3151,14 @@ impl ScriptHost {
                 )
                 .map_err(|error| error.to_string())?;
                 let serial = self.next_serial();
+                self.register_script_ref(
+                    serial,
+                    handle,
+                    path,
+                    schema.as_ref(),
+                    &params,
+                    script.enabled,
+                );
                 let index = self.insert_instance(ScriptInstance {
                     handle,
                     source: event_source(&self.scene_name, &id, path),
@@ -3176,6 +3231,14 @@ impl ScriptHost {
                         return Err(message);
                     }
                 };
+                self.register_script_ref(
+                    serial,
+                    handle,
+                    &script.name,
+                    schema.as_ref(),
+                    &params,
+                    script.enabled,
+                );
                 self.instances[owner] = Some(ScriptInstance {
                     handle,
                     source,
@@ -3418,10 +3481,34 @@ impl ScriptHost {
         self.free_instances.push(index);
     }
 
+    /// Регистрирует экземпляр в справочнике `obj:script`; значения свойств берутся из `params`.
+    fn register_script_ref(
+        &mut self,
+        serial: u64,
+        object: ObjectHandle,
+        key: &str,
+        schema: Option<&engine_scene::ParamSchema>,
+        properties: &BTreeMap<String, ParamValue>,
+        enabled: bool,
+    ) {
+        self.script_refs.borrow_mut().push(ScriptRefEntry {
+            serial,
+            object,
+            key: key.to_owned(),
+            schema: schema.cloned().map(Rc::new),
+            properties: properties.clone(),
+            enabled,
+            params_dirty: false,
+        });
+    }
+
     /// Снимает экземпляр: сначала его команды консоли, затем освобождает слот.
     fn remove_instance(&mut self, index: usize) {
         self.remove_commands_for_owner(index);
         if let Some(instance) = self.instances[index].take() {
+            self.script_refs
+                .borrow_mut()
+                .retain(|entry| entry.serial != instance.serial);
             self.timeline.borrow_mut().cancel_owner(instance.serial);
             self.lifecycle.borrow_mut().forget_instance(instance.serial);
             self.free_instances.push(index);
@@ -3798,6 +3885,9 @@ mod net_tests;
 #[cfg(test)]
 #[path = "host/save_tests.rs"]
 mod save_tests;
+#[cfg(test)]
+#[path = "host/script_ref_tests.rs"]
+mod script_ref_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

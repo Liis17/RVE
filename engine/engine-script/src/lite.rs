@@ -1783,6 +1783,7 @@ fn object_table(
         })?,
     )?;
     add_hierarchy_object_api(lua, &object, handle, active_call.clone())?;
+    add_script_ref_api(lua, &object, handle, active_call.clone())?;
     add_audio_object_api(lua, &object, handle, active_call.clone())?;
     component_api::add_component_methods(lua, &object, handle, active_call.clone())?;
     add_animation_object_api(lua, &object, handle, active_call.clone())?;
@@ -4999,6 +5000,126 @@ fn read_vector(table: &Table, property: &str) -> mlua::Result<[f32; 3]> {
         result[index] = converted;
     }
     Ok(result)
+}
+
+/// Ссылка на экземпляр скрипта, полученная через `obj:script(key)`. Серийный номер не повторяется,
+/// поэтому после удаления объекта или смены сцены ссылка даёт ошибку, а не чужой экземпляр.
+struct ScriptRefUserData {
+    serial: u64,
+    active_call: ActiveCall,
+}
+
+impl mlua::UserData for ScriptRefUserData {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, name: LuaString| {
+            let name = lua_text_key(Value::String(name), "script.get")?;
+            let value = with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_get(this.serial, &name)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })?;
+            param_value(lua, &value, &this.active_call, None)
+        });
+        methods.add_method("set", |lua, this, (name, value): (LuaString, Value)| {
+            let name = lua_text_key(Value::String(name), "script.set")?;
+            let (value, _) = lua_message_param_value_with_size(lua, &this.active_call, value)?;
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_set(this.serial, &name, &value)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })
+        });
+        methods.add_method("send", |lua, this, (name, value): (LuaString, Value)| {
+            let name = lua_message_name(name)?;
+            let (value, value_size) =
+                lua_message_param_value_with_size(lua, &this.active_call, value)?;
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_send(this.serial, &name, value, value_size)
+                    .map_err(|error| LuaError::runtime(format!("script.send: {error:?}")))
+            })
+        });
+        methods.add_method("enabled", |_, this, ()| {
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_enabled_of(this.serial)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })
+        });
+        methods.add_method("set_enabled", |_, this, value: Value| {
+            let enabled = lua_boolean(value, "script.set_enabled")?;
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .set_script_enabled_of(this.serial, enabled)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })
+        });
+    }
+}
+
+/// `obj:script(key)`: ссылка на экземпляр объекта по виртуальному пути lite-скрипта или имени
+/// heavy-скрипта; `nil`, если такого экземпляра нет.
+fn add_script_ref_api(
+    lua: &Lua,
+    object: &Table,
+    handle: ObjectHandle,
+    active_call: ActiveCall,
+) -> mlua::Result<()> {
+    object.set(
+        "script",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let key = lua_text_key(
+                values.into_iter().next().unwrap_or(Value::Nil),
+                "object.script",
+            )?;
+            // Пути принимаются с ведущим слешем и без него, как в сценах: ключ канонический.
+            let key = VirtualPath::parse(&key).map_or(key, |path| path.as_str().to_owned());
+            let serial = with_active_call(&active_call, |transaction| {
+                Ok(transaction.script_ref(handle, &key))
+            })?;
+            match serial {
+                Some(serial) => Ok(Value::UserData(lua.create_userdata(ScriptRefUserData {
+                    serial,
+                    active_call: active_call.clone(),
+                })?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )
+}
+
+impl LuaInstance {
+    /// Записывает объявленные свойства в Lua-таблицу `params`. Вызывается перед вызовом экземпляра,
+    /// если другой скрипт изменил его свойства.
+    pub(crate) fn write_params(
+        &self,
+        lua: &Lua,
+        properties: &std::collections::BTreeMap<String, ParamValue>,
+    ) -> mlua::Result<()> {
+        let params: Table = self.instance.get("params")?;
+        for (name, value) in properties {
+            params.set(
+                name.as_str(),
+                param_value(lua, value, &self.active_call, None)?,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Текст ключа свойства или скрипта: любая UTF-8 строка, без ограничения длины имени сообщения.
+fn lua_text_key(value: Value, function: &str) -> mlua::Result<String> {
+    match value {
+        Value::String(text) => text
+            .to_str()
+            .map(|text| text.to_owned())
+            .map_err(|_| LuaError::runtime(format!("{function} expects valid UTF-8 text"))),
+        other => Err(LuaError::runtime(format!(
+            "{function} expects a string, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 #[cfg(test)]

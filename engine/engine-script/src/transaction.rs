@@ -7,6 +7,7 @@ use crate::lifecycle::{
 use crate::lite::EventQueue;
 use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::{BindingUpdate, PhysicsScriptState};
+use crate::script_refs::{ScriptRefError, ScriptRefs, coerce_property, find_entry, find_serial};
 use crate::timeline::{CoroutineWait, ScriptCoroutine, ScriptTimeline, TimelineOp, TimerCallback};
 use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
@@ -114,7 +115,20 @@ impl MessageValueBudget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MessageTarget {
     Object(ObjectHandle),
+    /// Один экземпляр скрипта (`obj:script(key):send`); остальные экземпляры объекта не получают.
+    Instance {
+        object: ObjectHandle,
+        serial: u64,
+    },
     Broadcast,
+}
+
+/// Заявка записи объявленного свойства экземпляра, применяется после успешного коммита.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PropertyWrite {
+    pub(crate) serial: u64,
+    pub(crate) name: String,
+    pub(crate) value: ParamValue,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -285,6 +299,12 @@ pub(crate) struct ScriptTransaction {
     component_writes: ComponentWrites,
     /// Новое значение `set_enabled` экземпляра; применяется в `commit_lifecycle`.
     pending_script_enabled: Option<bool>,
+    /// Справочник экземпляров хоста; читается для `obj:script`, меняется только при коммите.
+    script_refs: ScriptRefs,
+    /// Записи свойств чужих и своих экземпляров; применяются при коммите и синхронизируют Lua.
+    pending_properties: Vec<PropertyWrite>,
+    /// Заявки `enabled` для экземпляров по серийному номеру; применяются на границе фазы.
+    pending_remote_enabled: Vec<(u64, bool)>,
     instance_enabled: bool,
     timeline: Rc<RefCell<ScriptTimeline>>,
     time_scale: Rc<Cell<f32>>,
@@ -686,6 +706,9 @@ impl Default for ScriptTransaction {
             pending_edits: Vec::new(),
             component_writes: ComponentWrites::default(),
             pending_script_enabled: None,
+            script_refs: ScriptRefs::default(),
+            pending_properties: Vec::new(),
+            pending_remote_enabled: Vec::new(),
             instance_enabled: true,
             timeline: Rc::new(RefCell::new(ScriptTimeline::default())),
             time_scale: Rc::new(Cell::new(1.0)),
@@ -2532,6 +2555,118 @@ impl ScriptTransaction {
         true
     }
 
+    pub(crate) fn attach_script_refs(&mut self, refs: ScriptRefs) {
+        self.script_refs = refs;
+    }
+
+    /// Серийный номер экземпляра `key` на объекте по справочнику хоста.
+    pub(crate) fn script_ref(&self, object: ObjectHandle, key: &str) -> Option<u64> {
+        find_serial(&self.script_refs.borrow(), object, key)
+    }
+
+    /// Значение объявленного свойства с учётом записей этого вызова.
+    pub(crate) fn script_get(&self, serial: u64, name: &str) -> Result<ParamValue, ScriptRefError> {
+        if let Some(write) = self
+            .pending_properties
+            .iter()
+            .rev()
+            .find(|write| write.serial == serial && write.name == name)
+        {
+            return Ok(write.value.clone());
+        }
+        let refs = self.script_refs.borrow();
+        let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+        entry
+            .properties
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ScriptRefError::Undeclared(name.to_owned()))
+    }
+
+    /// Ставит запись свойства после проверки по схеме экземпляра; применяется при коммите.
+    pub(crate) fn script_set(
+        &mut self,
+        serial: u64,
+        name: &str,
+        value: &ParamValue,
+    ) -> Result<(), ScriptRefError> {
+        if !self.writable {
+            return Err(ScriptRefError::Invalid(
+                "script properties can only be set from update callbacks".to_owned(),
+            ));
+        }
+        let value = {
+            let refs = self.script_refs.borrow();
+            let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+            coerce_property(entry, name, value)?
+        };
+        self.pending_properties.push(PropertyWrite {
+            serial,
+            name: name.to_owned(),
+            value,
+        });
+        Ok(())
+    }
+
+    /// Адресное сообщение одному экземпляру; остальные экземпляры объекта его не получают.
+    pub(crate) fn script_send(
+        &mut self,
+        serial: u64,
+        name: &str,
+        value: ParamValue,
+        value_size: usize,
+    ) -> Result<(), QueueMessageError> {
+        if !self.writable {
+            return Err(QueueMessageError::ReadOnly);
+        }
+        let object = {
+            let refs = self.script_refs.borrow();
+            find_entry(&refs, serial)
+                .map(|entry| entry.object)
+                .ok_or(QueueMessageError::UnknownTarget)?
+        };
+        self.push_message(
+            MessageTarget::Instance { object, serial },
+            name,
+            value,
+            value_size,
+        )
+    }
+
+    /// `enabled` экземпляра с учётом заявок этого вызова.
+    pub(crate) fn script_enabled_of(&self, serial: u64) -> Result<bool, ScriptRefError> {
+        if let Some((_, enabled)) = self
+            .pending_remote_enabled
+            .iter()
+            .rev()
+            .find(|(pending, _)| *pending == serial)
+        {
+            return Ok(*enabled);
+        }
+        let refs = self.script_refs.borrow();
+        find_entry(&refs, serial)
+            .map(|entry| entry.enabled)
+            .ok_or(ScriptRefError::Dead)
+    }
+
+    /// Заявка `enabled` для экземпляра по серийному номеру; применяется на границе фазы.
+    pub(crate) fn set_script_enabled_of(
+        &mut self,
+        serial: u64,
+        enabled: bool,
+    ) -> Result<(), ScriptRefError> {
+        if !self.writable {
+            return Err(ScriptRefError::Invalid(
+                "script enabled state can only be set from update callbacks".to_owned(),
+            ));
+        }
+        if find_entry(&self.script_refs.borrow(), serial).is_none() {
+            return Err(ScriptRefError::Dead);
+        }
+        self.pending_remote_enabled.push((serial, enabled));
+        Ok(())
+    }
+
     pub(crate) fn object_id(&self, handle: ObjectHandle) -> Option<&str> {
         self.world()?
             .object(handle)
@@ -2896,6 +3031,20 @@ impl ScriptTransaction {
             self.discard();
             return Err("script wrote a transform for an unknown object".to_owned());
         }
+        let script_targets_alive = {
+            let refs = self.script_refs.borrow();
+            self.pending_properties
+                .iter()
+                .all(|write| find_entry(&refs, write.serial).is_some())
+                && self
+                    .pending_remote_enabled
+                    .iter()
+                    .all(|(serial, _)| find_entry(&refs, *serial).is_some())
+        };
+        if !script_targets_alive {
+            self.discard();
+            return Err(ScriptRefError::Dead.message());
+        }
         if let Some(error) = self
             .pending_camera_settings
             .values()
@@ -3006,6 +3155,7 @@ impl ScriptTransaction {
         }
         self.commit_ui();
         self.commit_lifecycle(events);
+        self.commit_script_refs();
 
         self.physics
             .borrow_mut()
@@ -3134,8 +3284,30 @@ impl ScriptTransaction {
         }
     }
 
+    /// Применяет записи свойств и заявки `enabled` чужих экземпляров. Цели проверены до коммита.
+    fn commit_script_refs(&mut self) {
+        let writes = std::mem::take(&mut self.pending_properties);
+        {
+            let mut refs = self.script_refs.borrow_mut();
+            for write in &writes {
+                if let Some(entry) = refs.iter_mut().find(|entry| entry.serial == write.serial) {
+                    entry
+                        .properties
+                        .insert(write.name.clone(), write.value.clone());
+                    entry.params_dirty = true;
+                }
+            }
+        }
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        lifecycle
+            .enabled_writes
+            .append(&mut self.pending_remote_enabled);
+    }
+
     pub(crate) fn discard(&mut self) {
         self.discard_ui();
+        self.pending_properties.clear();
+        self.pending_remote_enabled.clear();
         if !self.world.is_null() {
             // SAFETY: `world` is the live reference from `begin`, cleared only below; releasing a
             // reservation needs just a shared borrow and touches no other state of the world.
