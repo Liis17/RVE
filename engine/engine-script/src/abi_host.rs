@@ -357,13 +357,20 @@ impl<'a> AbiCallContext<'a> {
 pub(crate) struct AbiScriptInstance {
     instance: *mut c_void,
     descriptor: &'static RveScriptDesc,
+    /// ABI версия модуля; старые модули не понимают `RVE_TRIGGER_STAY`.
+    abi_version: u32,
     events: EventQueue,
     source: String,
 }
 
 impl AbiScriptInstance {
+    pub(crate) fn abi_version(&self) -> u32 {
+        self.abi_version
+    }
+
     pub(crate) fn create(
         descriptor: &'static RveScriptDesc,
+        abi_version: u32,
         params: &BTreeMap<String, ParamValue>,
         object_refs: &std::collections::HashMap<String, ScriptObjectRef>,
         call: AbiScriptCall<'_>,
@@ -385,6 +392,7 @@ impl AbiScriptInstance {
                 drop(Self {
                     instance,
                     descriptor,
+                    abi_version,
                     events: call.events.clone(),
                     source: call.source.to_owned(),
                 });
@@ -404,6 +412,7 @@ impl AbiScriptInstance {
         Ok(Self {
             instance,
             descriptor,
+            abi_version,
             events: call.events.clone(),
             source: call.source.to_owned(),
         })

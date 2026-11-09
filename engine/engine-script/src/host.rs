@@ -185,6 +185,8 @@ pub struct ScriptHost {
     classes: HashMap<String, (Table, Option<ParamSchema>)>,
     /// Heavy-скрипты библиотеки по имени: дескриптор и схема параметров.
     heavy: HashMap<String, (&'static RveScriptDesc, Option<ParamSchema>)>,
+    /// ABI версия библиотеки `heavy`; определяет, какие виды событий модуль может получить.
+    heavy_abi_version: u32,
     lifecycle: Rc<RefCell<Lifecycle>>,
     /// Spawn-объектов, уже созданных в текущем кадре; сбрасывается в начале update.
     frame_spawned: usize,
@@ -409,6 +411,7 @@ impl ScriptHost {
         let base_environment = lua_state.base_environment;
         let loaded_library = library.and_then(ScriptLibrary::shared_library);
         let heavy = library.map(heavy_scripts).unwrap_or_default();
+        let heavy_abi_version = library.map_or(0, ScriptLibrary::abi_version);
         let mut host = Self {
             lua,
             base_environment,
@@ -417,6 +420,7 @@ impl ScriptHost {
             next_serial: 0,
             classes: HashMap::new(),
             heavy,
+            heavy_abi_version,
             lifecycle: Rc::new(RefCell::new(lifecycle)),
             frame_spawned: 0,
             _loaded_library: loaded_library,
@@ -607,6 +611,7 @@ impl ScriptHost {
                     });
                     let result = AbiScriptInstance::create(
                         descriptor,
+                        host.heavy_abi_version,
                         &params,
                         &object_refs,
                         AbiScriptCall {
@@ -1792,8 +1797,8 @@ impl ScriptHost {
         };
         for &(first, second) in snapshot.trigger_pairs() {
             let (Some(first_object), Some(second_object)) = (
-                self.body_object(world, first),
-                self.body_object(world, second),
+                self.live_body_object(world, first),
+                self.live_body_object(world, second),
             ) else {
                 continue;
             };
@@ -1811,6 +1816,18 @@ impl ScriptHost {
                 );
             }
         }
+    }
+
+    /// Объект тела для `on_trigger_stay`: только живой и активный в иерархии. Удалённые и неактивные
+    /// партнёры остаются в снимке до следующего шага, но стой им не доставляется.
+    fn live_body_object(
+        &self,
+        world: &World,
+        body: engine_physics::BodyHandle,
+    ) -> Option<ObjectHandle> {
+        let object = self.physics.borrow().object(body)?;
+        (world.is_alive(object) && world.active_in_hierarchy(object) == Some(true))
+            .then_some(object)
     }
 
     /// Объект тела, если он ещё известен: живой или удалённый, но в окне удаления. Для объекта вне
@@ -1840,7 +1857,10 @@ impl ScriptHost {
                 instance
                     .as_ref()
                     .filter(|instance| {
-                        instance.enabled && instance.running && instance.handle == object
+                        instance.enabled
+                            && instance.running
+                            && instance.handle == object
+                            && accepts_physics_event(&instance.kind, event.kind)
                     })
                     .map(|_| index)
             })
@@ -2448,6 +2468,7 @@ impl ScriptHost {
                 });
                 let result = AbiScriptInstance::create(
                     descriptor,
+                    self.heavy_abi_version,
                     &params,
                     &object_refs,
                     AbiScriptCall {
@@ -3000,6 +3021,17 @@ pub fn lite_properties(
             message,
         }
     })
+}
+
+/// `RVE_TRIGGER_STAY` появился в ABI v17. Модуль старше отвергает неизвестный вид события ошибкой,
+/// поэтому ему stay не доставляется.
+fn accepts_physics_event(kind: &ScriptKind, event: ScriptPhysicsEventKind) -> bool {
+    match kind {
+        ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
+            !matches!(event, ScriptPhysicsEventKind::TriggerStay) || script.abi_version() >= 17
+        }
+        _ => true,
+    }
 }
 
 /// Heavy-скрипты библиотеки: дескриптор и схема по имени.

@@ -6,7 +6,8 @@ use super::{event_messages, sources, world};
 use crate::ScriptTime;
 use crate::host::ScriptHost;
 use engine_physics::{
-    PhysicsSceneDesc, PhysicsSceneSync, Pose, QueryFilter, QueryOverrides, Shape, StepDriver,
+    PhysicsSceneDesc, PhysicsSceneSync, Pose, QueryFilter, QueryOverrides, Shape, ShapeCache,
+    StepDriver,
 };
 use engine_scene::{ObjectEdit, ObjectHandle, World};
 use glam::{Quat, Vec3};
@@ -550,4 +551,221 @@ return Script
             "missing {expected:?} in {messages:?}"
         );
     }
+}
+
+const REJECT_SCENE: &str = r#"
+[[assets]]
+path = "/reject.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.0, 5.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+[[objects.lite_scripts]]
+path = "/reject.lua"
+"#;
+
+#[test]
+fn degenerate_collider_and_mass_writes_are_rejected_at_the_call() {
+    let script = r#"
+local Script = {}
+function Script:on_update()
+  local ball = rve.find("ball")
+  rve.log("collider " .. tostring(pcall(function()
+    return ball:set_collider({shape = "box", size = {1e-20, 1e-20, 1e-20}})
+  end)))
+  rve.log("body " .. tostring(pcall(function()
+    return ball:set_rigid_body({mass = 1e-39})
+  end)))
+end
+return Script
+"#;
+    let mut scene = Loop::new(REJECT_SCENE, &[("reject.lua", script)]);
+    let messages = scene.step();
+    assert_eq!(messages, ["collider false", "body false"]);
+
+    let ball = scene.world.object(scene.handle("ball")).unwrap();
+    assert_eq!(ball.collider.as_ref().unwrap().radius, 0.5);
+    assert_eq!(ball.rigid_body.unwrap().mass, 1.0);
+}
+
+const INACTIVE_SCENE: &str = r#"
+[[assets]]
+path = "/inactive.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "crate"
+active = false
+[objects.transform]
+position = [0.0, 5.0, 0.0]
+[objects.collider]
+shape = "box"
+half_extents = [0.5, 0.5, 0.5]
+[objects.rigid_body]
+kind = "dynamic"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/inactive.lua"
+"#;
+
+#[test]
+fn component_writes_on_inactive_object_apply_when_it_activates() {
+    let script = r#"
+local Script = {}
+local done = false
+function Script:on_update()
+  if done then return end
+  done = true
+  local crate = rve.find("crate")
+  rve.log("set " .. tostring(pcall(function()
+    return crate:set_collider({shape = "sphere", radius = 0.25})
+  end)))
+end
+return Script
+"#;
+    let mut scene = Loop::new(INACTIVE_SCENE, &[("inactive.lua", script)]);
+    assert_eq!(scene.step(), ["set true"]);
+
+    let crate_handle = scene.handle("crate");
+    scene
+        .world
+        .apply_edit(&ObjectEdit::SetActive {
+            object: crate_handle,
+            active: true,
+        })
+        .unwrap();
+    let changes = scene
+        .sync
+        .insert_objects(
+            &scene.world,
+            &[crate_handle],
+            &[],
+            &mut ShapeCache::default(),
+        )
+        .unwrap();
+    scene
+        .driver
+        .advance_step_with_changes(DT, changes, [])
+        .unwrap();
+
+    assert!(
+        !scene.overlaps_sphere(Vec3::new(0.4, 5.0, 0.0), 0.05),
+        "the activated body uses the sphere written while inactive, not the box"
+    );
+}
+
+const CEILING_SCENE: &str = r#"
+[[assets]]
+path = "/player.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "floor"
+[objects.transform]
+position = [0.0, -0.5, 0.0]
+[objects.collider]
+shape = "box"
+half_extents = [10.0, 0.5, 10.0]
+[[objects]]
+id = "ceiling"
+[objects.transform]
+position = [0.0, 1.75, 0.0]
+[objects.collider]
+shape = "box"
+half_extents = [10.0, 0.1, 10.0]
+[[objects]]
+id = "player"
+[objects.transform]
+position = [0.0, 0.8, 0.0]
+[objects.character_controller]
+radius = 0.3
+height = 1.0
+step_height = 0.0
+use_gravity = true
+jump_height = 1.0
+[[objects.lite_scripts]]
+path = "/player.lua"
+"#;
+
+#[test]
+fn ceiling_hit_zeroes_upward_speed_so_the_character_falls_back() {
+    let script = r#"
+local Script = {}
+local jumped = false
+local last_collided = false
+function Script:on_update()
+  local player = rve.find("player")
+  if not jumped and player:is_grounded() then
+    assert(player:jump())
+    jumped = true
+    rve.log("jump")
+  end
+  rve.log(string.format("c %s v %.3f", tostring(last_collided), player:vertical_velocity()))
+  last_collided = player:simple_move({x=0, y=0, z=0}).collided
+end
+return Script
+"#;
+    let mut scene = Loop::new(CEILING_SCENE, &[("player.lua", script)]);
+    let mut log = Vec::new();
+    for _ in 0..10 {
+        log.extend(scene.step());
+    }
+
+    assert!(log.iter().any(|m| m == "jump"), "jump happens: {log:?}");
+    // Под потолком тело упирается каждый кадр. Без обнуления скорость вверх копилась бы
+    // (4.429 и выше), а с обнулением к концу окна она не положительна.
+    let last = log.last().unwrap();
+    let speed: f32 = last.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(speed <= 0.0, "still rising under the ceiling: {log:?}");
+}
+
+#[test]
+fn trigger_stay_skips_partners_deactivated_or_destroyed_while_the_snapshot_is_stale() {
+    let mut deactivated = Loop::new(ZONE_SCENE, &[("zone.lua", ZONE)]);
+    assert_eq!(deactivated.step(), Vec::<String>::new());
+    assert!(deactivated.step().contains(&"stay".to_owned()));
+    let ball = deactivated.handle("ball");
+    deactivated
+        .world
+        .apply_edit(&ObjectEdit::SetActive {
+            object: ball,
+            active: false,
+        })
+        .unwrap();
+    // Снимок прошлого шага ещё держит пару: стой для неактивного партнёра быть не должно.
+    assert!(
+        !deactivated.step().contains(&"stay".to_owned()),
+        "inactive partner must not get on_trigger_stay"
+    );
+
+    let mut destroyed = Loop::new(ZONE_SCENE, &[("zone.lua", ZONE)]);
+    destroyed.step();
+    assert!(destroyed.step().contains(&"stay".to_owned()));
+    let ball = destroyed.handle("ball");
+    destroyed.world.despawn_many(&[ball]).unwrap();
+    // Тело удалённого объекта ещё в снимке до следующего шага: проверяем сам кадр обновления.
+    destroyed.host.update(
+        &mut destroyed.world,
+        DT,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 99,
+        },
+    );
+    assert!(
+        !event_messages(&mut destroyed.host).contains(&"stay".to_owned()),
+        "destroyed partner must not get on_trigger_stay"
+    );
 }

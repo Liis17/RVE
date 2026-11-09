@@ -10,9 +10,9 @@ use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
 };
 use engine_physics::{
-    BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, PrimitiveShape,
-    QueryFilter, QueryHit, QueryOverrides, Ray, Shape, character_controller_scaled,
-    object_world_transform, primitive_collider_shape,
+    BodyDesc, BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, ColliderDesc,
+    PhysicsCommand, Pose, PrimitiveShape, QueryFilter, QueryHit, QueryOverrides, Ray, Shape,
+    character_controller_scaled, object_world_transform, primitive_collider_shape,
 };
 use engine_scene::{
     AnimationRequest, AudioRequest, CameraSettings, CharacterControllerComponent,
@@ -916,6 +916,40 @@ impl ScriptTransaction {
         }
     }
 
+    /// Проверяет тело, которое получит объект после заявок вызова, теми же правилами, что `BodyDesc`
+    /// при активации. Отказ возвращается вызову до заявки, поэтому шаг физики не получает тело,
+    /// которое не может создать. Меши не проверяются: их геометрия приходит от модели.
+    fn validate_body_candidate(
+        &self,
+        object: ObjectHandle,
+        collider: &ColliderComponent,
+        rigid: Option<RigidBodyComponent>,
+    ) -> Result<(), String> {
+        if matches!(
+            collider.shape,
+            ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+        ) {
+            return Ok(());
+        }
+        let world = self.world().ok_or("physics changes need a live world")?;
+        let transform = object_world_transform(world, object).map_err(|error| error.to_string())?;
+        let shape = primitive_collider_shape(collider.clone(), transform.scale)
+            .map_err(|error| error.to_string())?;
+        let mut desc = BodyDesc::new(BodyKind::Static, transform.pose, ColliderDesc::new(shape));
+        desc.collider.offset = Vec3::from_array(collider.offset) * transform.scale;
+        desc.collider.trigger = collider.trigger;
+        desc.layer = u32::from(self.layer(object).unwrap_or(0));
+        if let Some(rigid) = rigid {
+            desc.kind = physics_kind(rigid.kind);
+            desc.mass = rigid.mass;
+            desc.linear_damping = rigid.linear_damping;
+            desc.angular_damping = rigid.angular_damping;
+            desc.gravity_scale = rigid.gravity_scale;
+            desc.lock_rotation = rigid.lock_rotation;
+        }
+        desc.validate().map_err(|error| error.to_string())
+    }
+
     fn clear_component_writes(&mut self) {
         self.pending_colliders.clear();
         self.pending_rigid_bodies.clear();
@@ -952,7 +986,11 @@ impl ScriptTransaction {
         collider: ColliderComponent,
     ) -> Result<(), String> {
         self.require_writable("collider changes")?;
-        let body = self.physics.borrow().binding(object)?.body;
+        let body = self
+            .physics
+            .borrow()
+            .optional_binding(object)
+            .map(|binding| binding.body);
         let previous_trigger = self.collider_component(object)?.trigger;
         let world = self.world().ok_or("collider changes need a live world")?;
         let scale = object_world_transform(world, object)
@@ -966,18 +1004,22 @@ impl ScriptTransaction {
         if !offset.is_finite() {
             return Err("collider offset must be finite".to_owned());
         }
-        self.pending_physics_commands
-            .push(PhysicsCommand::SetCollider {
-                body,
-                shape,
-                offset,
-            });
-        if collider.trigger != previous_trigger {
+        self.validate_body_candidate(object, &collider, self.rigid_body_component(object).ok())?;
+        // Объект без тела (неактивный или ещё не привязанный) получит коллайдер из компонента при активации.
+        if let Some(body) = body {
             self.pending_physics_commands
-                .push(PhysicsCommand::SetTrigger {
+                .push(PhysicsCommand::SetCollider {
                     body,
-                    trigger: collider.trigger,
+                    shape,
+                    offset,
                 });
+            if collider.trigger != previous_trigger {
+                self.pending_physics_commands
+                    .push(PhysicsCommand::SetTrigger {
+                        body,
+                        trigger: collider.trigger,
+                    });
+            }
         }
         self.pending_colliders.insert(object, collider);
         Ok(())
@@ -1004,12 +1046,8 @@ impl ScriptTransaction {
         component: RigidBodyComponent,
     ) -> Result<(), String> {
         self.require_writable("rigid body changes")?;
-        let binding = self.physics.borrow().binding(object)?;
-        let kind = match component.kind {
-            RigidBodyKind::Static => BodyKind::Static,
-            RigidBodyKind::Kinematic => BodyKind::Kinematic,
-            RigidBodyKind::Dynamic => BodyKind::Dynamic,
-        };
+        let binding = self.physics.borrow().optional_binding(object);
+        let kind = physics_kind(component.kind);
         let finite = [
             component.mass,
             component.linear_damping,
@@ -1027,7 +1065,7 @@ impl ScriptTransaction {
                 "rigid body values must be finite, damping >= 0 and dynamic mass > 0".to_owned(),
             );
         }
-        if binding.character_controller.is_some() && kind != BodyKind::Kinematic {
+        if kind != BodyKind::Kinematic && self.controller_component(object).is_ok() {
             return Err("character controller body must stay kinematic".to_owned());
         }
         if kind == BodyKind::Dynamic {
@@ -1043,18 +1081,23 @@ impl ScriptTransaction {
                 return Err("dynamic rigid body must be a root object".to_owned());
             }
         }
-        self.pending_physics_commands
-            .push(PhysicsCommand::SetBodyProperties {
-                body: binding.body,
-                kind,
-                mass: component.mass,
-                linear_damping: component.linear_damping,
-                angular_damping: component.angular_damping,
-                gravity_scale: component.gravity_scale,
-                lock_rotation: component.lock_rotation,
-            });
+        if let Ok(collider) = self.collider_component(object) {
+            self.validate_body_candidate(object, &collider, Some(component))?;
+        }
+        if let Some(binding) = binding {
+            self.pending_physics_commands
+                .push(PhysicsCommand::SetBodyProperties {
+                    body: binding.body,
+                    kind,
+                    mass: component.mass,
+                    linear_damping: component.linear_damping,
+                    angular_damping: component.angular_damping,
+                    gravity_scale: component.gravity_scale,
+                    lock_rotation: component.lock_rotation,
+                });
+            self.pending_bindings.entry(object).or_default().kind = Some(kind);
+        }
         self.pending_rigid_bodies.insert(object, component);
-        self.pending_bindings.entry(object).or_default().kind = Some(kind);
         Ok(())
     }
 
@@ -1078,10 +1121,8 @@ impl ScriptTransaction {
         component: CharacterControllerComponent,
     ) -> Result<(), String> {
         self.require_writable("character controller changes")?;
-        let binding = self.physics.borrow().binding(object)?;
-        if binding.character_controller.is_none() {
-            return Err("object does not have a character controller".to_owned());
-        }
+        self.controller_component(object)?;
+        let binding = self.physics.borrow().optional_binding(object);
         let world = self.world().ok_or("controller changes need a live world")?;
         let scale = object_world_transform(world, object)
             .map_err(|error| error.to_string())?
@@ -1091,14 +1132,16 @@ impl ScriptTransaction {
         let capsule = controller.capsule().map_err(|error| error.to_string())?;
         let shape = PrimitiveShape::from_shape(&capsule)
             .ok_or_else(|| "character capsule must be a capsule".to_owned())?;
-        self.pending_physics_commands
-            .push(PhysicsCommand::SetCollider {
-                body: binding.body,
-                shape,
-                offset: Vec3::ZERO,
-            });
+        if let Some(binding) = binding {
+            self.pending_physics_commands
+                .push(PhysicsCommand::SetCollider {
+                    body: binding.body,
+                    shape,
+                    offset: Vec3::ZERO,
+                });
+            self.pending_bindings.entry(object).or_default().controller = Some(controller);
+        }
         self.pending_controllers.insert(object, component);
-        self.pending_bindings.entry(object).or_default().controller = Some(controller);
         Ok(())
     }
 
@@ -1144,6 +1187,10 @@ impl ScriptTransaction {
         let displacement = Vec3::new(velocity.x, 0.0, velocity.z) * dt + Vec3::Y * (vertical * dt);
         let result = self.move_character(object, displacement)?;
         if result.grounded && vertical < 0.0 {
+            vertical = 0.0;
+        }
+        // Потолок срезал подъём: скорость вверх гаснет, иначе она копилась бы, пока тело упирается.
+        if vertical > 0.0 && result.translation.y < displacement.y - 1.0e-4 {
             vertical = 0.0;
         }
         self.pending_vertical.insert(object, vertical);
@@ -2408,6 +2455,14 @@ fn physics_command_is_finite(command: PhysicsCommand) -> bool {
         } => [mass, linear_damping, angular_damping, gravity_scale]
             .into_iter()
             .all(f32::is_finite),
+    }
+}
+
+fn physics_kind(kind: RigidBodyKind) -> BodyKind {
+    match kind {
+        RigidBodyKind::Static => BodyKind::Static,
+        RigidBodyKind::Kinematic => BodyKind::Kinematic,
+        RigidBodyKind::Dynamic => BodyKind::Dynamic,
     }
 }
 
