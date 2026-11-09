@@ -16,6 +16,7 @@ mod net;
 mod physics;
 mod save_file;
 mod save_writer;
+mod scene_state;
 mod script_refs;
 mod timeline;
 mod transaction;

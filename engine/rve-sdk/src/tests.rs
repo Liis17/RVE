@@ -789,6 +789,8 @@ fn host(state: &mut HostState) -> RveHost {
         script_ref_send: None,
         script_ref_enabled: None,
         script_ref_set_enabled: None,
+        scene_load: None,
+        scene_current: None,
     }
 }
 

@@ -82,6 +82,8 @@ enum HostCapability {
     ScriptRefSend,
     ScriptRefEnabled,
     ScriptRefSetEnabled,
+    SceneLoad,
+    SceneCurrent,
 }
 
 // Add each script-facing capability to this shared inventory so Lua and ABI stay in parity.
@@ -151,6 +153,8 @@ const CAPABILITIES: &[(&str, &str, HostCapability)] = &[
         "set_enabled",
         HostCapability::ScriptRefSetEnabled,
     ),
+    ("scene", "load", HostCapability::SceneLoad),
+    ("scene", "current", HostCapability::SceneCurrent),
     ("save", "set", HostCapability::SaveSet),
     ("save", "get", HostCapability::SaveGet),
     ("save", "delete", HostCapability::SaveDelete),
@@ -277,6 +281,7 @@ path = "/api.lua"
             "timer" => rve.get::<Table>("timer").unwrap().get(*name).unwrap(),
             "time" => rve.get::<Table>("time").unwrap().get(*name).unwrap(),
             "save" => rve.get::<Table>("save").unwrap().get(*name).unwrap(),
+            "scene" => rve.get::<Table>("scene").unwrap().get(*name).unwrap(),
             "script_ref" => match rve.get::<LuaValue>("__parity_ref").unwrap() {
                 LuaValue::UserData(reference) => reference.get(*name).unwrap(),
                 other => panic!("script reference is {}", other.type_name()),
@@ -371,6 +376,8 @@ path = "/api.lua"
             HostCapability::ScriptRefSend => abi.script_ref_send.is_some(),
             HostCapability::ScriptRefEnabled => abi.script_ref_enabled.is_some(),
             HostCapability::ScriptRefSetEnabled => abi.script_ref_set_enabled.is_some(),
+            HostCapability::SceneLoad => abi.scene_load.is_some(),
+            HostCapability::SceneCurrent => abi.scene_current.is_some(),
         };
         assert!(available, "ABI callback missing for {table}.{name}");
     }

@@ -5351,6 +5351,8 @@ impl Script for ScriptRefProbe {
         assert_eq!(reference.enabled(ctx), Some(true));
         assert!(reference.set_enabled(ctx, true));
         assert_eq!(reference.enabled(ctx), Some(true));
+        assert_eq!(ctx.current_scene().as_deref(), Some("scene"));
+        assert!(ctx.load_scene("levels/next.rvescene"));
         ctx.log_info("script ref ok");
     }
 }
@@ -5376,6 +5378,8 @@ path = "/target.lua"
     let sources = BTreeMap::from([("target.lua".to_owned(), SCRIPT_REF_TARGET.to_owned())]);
     let library = library();
     let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+    host.set_enabled_scenes(&["levels/next.rvescene".to_owned()])
+        .unwrap();
 
     host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
     let first = host.drain_events();
@@ -5386,6 +5390,10 @@ path = "/target.lua"
         "{first:?}"
     );
     assert!(first.iter().any(|event| event.message == "script ref ok"));
+    assert_eq!(
+        host.take_scene_request().as_deref(),
+        Some("levels/next.rvescene")
+    );
     host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
 
     // The start-phase message is delivered in the first update, after the probe logged its result.

@@ -1931,6 +1931,10 @@ pub struct RveHost {
     pub script_ref_enabled: Option<RveObjectBoolQueryFn>,
     /// Stages the enabled flag of a script instance found by [`Self::object_script`].
     pub script_ref_set_enabled: Option<RveObjectSetBoolFn>,
+    /// Requests loading a project scene at the end of the frame; the path must be enabled in the project. Appended in ABI v21.
+    pub scene_load: Option<RveSceneLoadFn>,
+    /// Writes the current scene name as a call-scoped string value. Appended in ABI v21.
+    pub scene_current: Option<RveSceneCurrentFn>,
 }
 
 /// Copies one save value into the output; the value is valid until the calling script callback ends.
@@ -2197,6 +2201,10 @@ pub type RveScriptRefSetFn = unsafe extern "C" fn(
     name: RveStr,
     value: *const RveValue,
 ) -> bool;
+/// Requests a scene load for the end of the frame. Appended in ABI v21.
+pub type RveSceneLoadFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
+/// Copies the current scene name into `out`; valid until the calling guest callback ends.
+pub type RveSceneCurrentFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveValue) -> bool;
 
 /// Guest factory callback.
 pub type RveCreateFn = unsafe extern "C" fn(
@@ -2919,9 +2927,18 @@ mod tests {
                 + size_of::<Option<super::RveObjectBoolQueryFn>>()
         );
         assert_eq!(
-            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, scene_load),
             offset_of!(super::RveHost, script_ref_set_enabled)
                 + size_of::<Option<super::RveObjectSetBoolFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, scene_current),
+            offset_of!(super::RveHost, scene_load) + size_of::<Option<super::RveSceneLoadFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, scene_current)
+                + size_of::<Option<super::RveSceneCurrentFn>>()
         );
     }
 }

@@ -1714,6 +1714,32 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Requests loading a project scene. The request is checked against the project's enabled
+    /// scenes now and runs after this frame; the current scene changes only if that load succeeds.
+    /// Returns `false` for an undeclared path or a call that cannot request scenes.
+    pub fn load_scene(&mut self, path: &str) -> bool {
+        let Some(callback) = self.host.scene_load else {
+            return false;
+        };
+        // SAFETY: the path bytes live through this synchronous host call.
+        unsafe { callback(self.host.ctx, RveStr::from_str_ref(path)) }
+    }
+
+    /// Returns the name of the current scene, or `None` if the host does not report one.
+    pub fn current_scene(&self) -> Option<String> {
+        let callback = self.host.scene_current?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the host keeps the string alive until this guest callback ends.
+        if !unsafe { callback(self.host.ctx, &mut value) } {
+            return None;
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        match unsafe { value.into_owned() } {
+            Ok(Value::String(name)) => Some(name),
+            _ => None,
+        }
+    }
+
     /// Stages a message for every enabled script instance.
     pub fn broadcast(&mut self, name: &str, value: &Value) -> bool {
         let value = BorrowedAbiValue::new(value);

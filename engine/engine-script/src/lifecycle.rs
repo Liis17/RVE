@@ -6,7 +6,7 @@
 
 use engine_files::VirtualPath;
 use engine_physics::BodyHandle;
-use engine_scene::{ObjectHandle, PrefabTemplate, SpawnOptions, World};
+use engine_scene::{ObjectHandle, PrefabTemplate, SceneReplacement, SpawnOptions, World};
 use glam::Vec3;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -128,6 +128,8 @@ pub struct WorldChanges {
     /// Все удалённые хендлы, включая потомков; потомки идут раньше родителей.
     pub despawned: Vec<ObjectHandle>,
     pub prefab_requests: Vec<PrefabRequest>,
+    /// Замена несохраняемой части сцены: удалённые и добавленные объекты, если замена прошла.
+    pub scene_replaced: Option<SceneReplacement>,
 }
 
 /// Состояние объекта для ABI и Lua: живой, pending (зарезервированный) или мёртвый.

@@ -16,6 +16,7 @@ use crate::net::{
 };
 use crate::physics::PhysicsScriptState;
 use crate::save_writer::SaveWriter;
+use crate::scene_state::{SceneState, SharedSceneState, canonical_scene_path};
 use crate::script_refs::{ScriptRefEntry, ScriptRefs};
 use crate::timeline::{CoroutineWait, DueTimer, ScriptCoroutine, ScriptTimeline, TimerCallback};
 use crate::transaction::{
@@ -39,7 +40,7 @@ use engine_project::InputSettings;
 use engine_scene::{
     AnimationRequest, AudioRequest, ComponentKind, LocalTransform, NetEvent, NetId, NetMode,
     NetRequest, ObjectHandle, ParamKind, ParamSchema, ParamValue, PeerId, PrefabTemplate,
-    RigidBodyKind, SpawnOptions, World,
+    RigidBodyKind, SceneReplacement, SpawnOptions, World,
 };
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use rve_sdk::abi::RveScriptDesc;
@@ -213,6 +214,8 @@ pub struct ScriptHost {
     transaction: ScriptTransaction,
     /// Справочник экземпляров для `obj:script`; общий с транзакциями.
     script_refs: ScriptRefs,
+    /// Объявленные сцены проекта, текущая сцена и запрос `rve.scene.load`; общие с транзакциями.
+    scene_state: SharedSceneState,
     save_values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
     save_flush_requested: Rc<Cell<bool>>,
     save_generation: Rc<Cell<u64>>,
@@ -457,6 +460,11 @@ impl ScriptHost {
         let script_refs = ScriptRefs::default();
         let mut transaction = ScriptTransaction::with_ui(ui.clone());
         transaction.attach_script_refs(script_refs.clone());
+        let scene_state = Rc::new(RefCell::new(SceneState {
+            current: scene_name.to_owned(),
+            ..SceneState::default()
+        }));
+        transaction.attach_scene_state(scene_state.clone());
         transaction.attach_time_state(timeline.clone(), time_scale.clone());
         transaction.attach_save_state(
             save_values.clone(),
@@ -485,6 +493,7 @@ impl ScriptHost {
             commands_generation,
             transaction,
             script_refs,
+            scene_state,
             save_values,
             save_flush_requested,
             save_generation,
@@ -996,6 +1005,177 @@ impl ScriptHost {
                 &request,
                 format!("prefab {:?} failed to load: {error}", prefab_display(&key)),
             );
+        }
+    }
+
+    /// Задаёт включённые сцены проекта: только они могут стать целью `rve.scene.load`.
+    /// Пути принимаются с ведущим слешем и без него; неверный путь возвращает ошибку и список
+    /// не меняет.
+    pub fn set_enabled_scenes(&mut self, paths: &[String]) -> Result<(), String> {
+        let canonical = paths
+            .iter()
+            .map(|path| canonical_scene_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.scene_state.borrow_mut().enabled = canonical;
+        Ok(())
+    }
+
+    /// Запрос `rve.scene.load` или `ctx.load_scene`, принятый последним кадром. Его должен
+    /// выполнить вызывающий код после кадра: загрузить сцену и передать её в [`Self::replace_scene`].
+    pub fn take_scene_request(&mut self) -> Option<String> {
+        self.scene_state.borrow_mut().request.take()
+    }
+
+    /// Пишет Error, если вызывающий код не смог загрузить запрошенную сцену. Текущая сцена не меняется.
+    pub fn report_scene_failure(&mut self, path: &str, message: &str) {
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Error,
+            source: self.scene_name.clone(),
+            message: format!("failed to load scene {path:?}: {message}"),
+        });
+    }
+
+    /// Заменяет несохраняемую часть текущей сцены сценой `scene` (см. [`World::replace_nonpersistent`]).
+    ///
+    /// Порядок: проверка мира и классов новой сцены, затем создание её экземпляров на копии мира.
+    /// Любой отказ до этого шага оставляет текущую сцену без изменений. Затем `on_disable` и
+    /// `on_destroy` получают несохраняемые экземпляры, мир заменяется, учёт удалённых объектов
+    /// обновляется. Сохраняемые объекты и их экземпляры сохраняют хендлы, таймеры, корутины,
+    /// свойства и звук.
+    pub fn replace_scene(
+        &mut self,
+        world: &mut World,
+        scene: World,
+        sources: &BTreeMap<String, String>,
+        scene_name: &str,
+        time: ScriptTime,
+    ) -> Result<SceneReplacement, String> {
+        world
+            .check_scene_replacement(&scene)
+            .map_err(|error| error.to_string())?;
+        for object in scene.objects() {
+            for script in &object.heavy_scripts {
+                if !self.heavy.contains_key(&script.name) {
+                    return Err(format!(
+                        "object {:?}: heavy script {:?} is not registered",
+                        object.id, script.name
+                    ));
+                }
+            }
+            for script in &object.lite_scripts {
+                let path = script.path.as_str();
+                if self.classes.contains_key(path) {
+                    continue;
+                }
+                let source = sources
+                    .get(path)
+                    .ok_or_else(|| format!("lite script {path:?} source was not provided"))?;
+                let class = self.compile_registered_class(world, path, source)?;
+                self.classes.insert(path.to_owned(), class);
+            }
+        }
+
+        // Экземпляры новой сцены создаются на копии, где несохраняемая часть уже заменена:
+        // их хендлы совпадают с теми, что получит настоящий мир при замене ниже.
+        let previous_name = std::mem::replace(&mut self.scene_name, scene_name.to_owned());
+        let mut trial = world.clone();
+        let planned = match trial.replace_nonpersistent(scene.clone()) {
+            Ok(planned) => planned,
+            Err(error) => {
+                self.scene_name = previous_name;
+                return Err(error.to_string());
+            }
+        };
+        if let Err(message) = self.create_instances(&mut trial, &planned.added) {
+            self.scene_name = previous_name;
+            return Err(message);
+        }
+
+        let roots = world
+            .objects()
+            .iter()
+            .filter(|object| !object.keep_on_load && object.parent.is_none())
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let doomed: HashSet<ObjectHandle> = world.subtree(&roots).into_iter().collect();
+        let doomed_ids: HashSet<String> = doomed
+            .iter()
+            .filter_map(|handle| world.object(*handle))
+            .map(|object| object.id.clone())
+            .collect();
+        self.retire_bodies(world, &doomed);
+        self.call_destroy_instances(world, &doomed, time);
+        let replacement = world
+            .replace_nonpersistent(scene)
+            .map_err(|error| error.to_string())?;
+        debug_assert_eq!(replacement.added, planned.added);
+        self.cancel_requests_of(world, &previous_name, &doomed, &doomed_ids);
+        self.forget_despawned(&replacement.removed);
+        self.rename_script_sources(&previous_name, scene_name);
+        {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            lifecycle
+                .changes
+                .despawned
+                .extend(replacement.removed.iter().copied());
+            lifecycle.changes.scene_replaced = Some(replacement.clone());
+        }
+        self.scene_state.borrow_mut().current = scene_name.to_owned();
+        Ok(replacement)
+    }
+
+    /// Снимает заявки spawn и destroy, поставленные скриптами удаляемых объектов. Источник заявки
+    /// имеет вид `сцена/объект/скрипт`; заявки сохраняемых объектов остаются в очереди.
+    fn cancel_requests_of(
+        &mut self,
+        world: &World,
+        previous: &str,
+        doomed: &HashSet<ObjectHandle>,
+        doomed_ids: &HashSet<String>,
+    ) {
+        let owned = |source: &str| {
+            source
+                .strip_prefix(previous)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .and_then(|rest| rest.split('/').next())
+                .is_some_and(|id| doomed_ids.contains(id))
+        };
+        let (cancelled, kept_queued, kept_waiting) = {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            let (queued_cancelled, queued_kept): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut lifecycle.queued)
+                    .into_iter()
+                    .partition(|request| owned(&request.source));
+            let (waiting_cancelled, waiting_kept): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut lifecycle.waiting)
+                    .into_iter()
+                    .partition(|request| owned(&request.source));
+            lifecycle
+                .destroys
+                .retain(|request| !doomed.contains(&request.handle));
+            let cancelled = queued_cancelled
+                .into_iter()
+                .chain(waiting_cancelled)
+                .collect::<Vec<_>>();
+            (cancelled, queued_kept, waiting_kept)
+        };
+        {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            lifecycle.queued = kept_queued.into_iter().collect();
+            lifecycle.waiting = kept_waiting;
+        }
+        for request in cancelled {
+            self.release_spawn(world, &request);
+        }
+    }
+
+    /// Переименовывает источники экземпляров сохраняемых объектов на имя новой сцены.
+    fn rename_script_sources(&mut self, previous: &str, next: &str) {
+        let prefix = format!("{previous}/");
+        for instance in self.instances.iter_mut().flatten() {
+            if let Some(rest) = instance.source.strip_prefix(&prefix) {
+                instance.source = format!("{next}/{rest}");
+            }
         }
     }
 
@@ -3316,7 +3496,25 @@ impl ScriptHost {
         time: ScriptTime,
     ) -> Option<Vec<ObjectHandle>> {
         let doomed: HashSet<ObjectHandle> = world.subtree(targets).into_iter().collect();
+        self.retire_bodies(world, &doomed);
+        self.call_destroy_instances(world, &doomed, time);
+        let removed = match world.despawn_many(targets) {
+            Ok(removed) => removed,
+            Err(error) => {
+                self.events.borrow_mut().push(ScriptEvent {
+                    level: ScriptEventLevel::Error,
+                    source: self.scene_name.clone(),
+                    message: error.to_string(),
+                });
+                return None;
+            }
+        };
+        self.forget_despawned(&removed);
+        Some(removed)
+    }
 
+    /// Физические тела удаляемых объектов уходят в очередь retire до удаления из мира.
+    fn retire_bodies(&mut self, world: &World, doomed: &HashSet<ObjectHandle>) {
         let retired = doomed
             .iter()
             .filter_map(|&handle| {
@@ -3325,13 +3523,19 @@ impl ScriptHost {
                 Some((handle, binding.body, object.id.clone(), object.name.clone()))
             })
             .collect::<Vec<_>>();
-        {
-            let mut lifecycle = self.lifecycle.borrow_mut();
-            for (handle, body, id, name) in retired {
-                lifecycle.retire(handle, body, id, name);
-            }
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        for (handle, body, id, name) in retired {
+            lifecycle.retire(handle, body, id, name);
         }
+    }
 
+    /// `on_destroy` стартовавших включённых экземпляров удаляемых объектов; ошибка отключает экземпляр.
+    fn call_destroy_instances(
+        &mut self,
+        world: &mut World,
+        doomed: &HashSet<ObjectHandle>,
+        time: ScriptTime,
+    ) {
         let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
@@ -3349,23 +3553,16 @@ impl ScriptHost {
                 CallOutcome::Failed(message) => self.fail_instance(index, message),
             }
         }
+    }
 
-        let removed = match world.despawn_many(targets) {
-            Ok(removed) => removed,
-            Err(error) => {
-                self.events.borrow_mut().push(ScriptEvent {
-                    level: ScriptEventLevel::Error,
-                    source: self.scene_name.clone(),
-                    message: error.to_string(),
-                });
-                return None;
-            }
-        };
+    /// Учёт объектов, уже удалённых из мира: таймеры удаления, корни префабов, экземпляры, сеть,
+    /// канвасы UI.
+    fn forget_despawned(&mut self, removed: &[ObjectHandle]) {
         let removed_set: HashSet<ObjectHandle> = removed.iter().copied().collect();
         {
             let mut lifecycle = self.lifecycle.borrow_mut();
             let mut prefabs = Vec::new();
-            for handle in &removed {
+            for handle in removed {
                 lifecycle.scheduled.remove(handle);
                 if let Some(prefab) = lifecycle.roots.remove(handle)
                     && let Some(slot) = lifecycle.prefabs.get_mut(&prefab)
@@ -3389,11 +3586,10 @@ impl ScriptHost {
                 self.remove_instance(index);
             }
         }
-        for handle in &removed {
+        for handle in removed {
             self.net.borrow_mut().clear_object(*handle);
         }
-        self.close_owned_canvases(&removed);
-        Some(removed)
+        self.close_owned_canvases(removed);
     }
 
     fn take_waiting(&mut self, root: ObjectHandle) -> Option<SpawnRequest> {
@@ -3885,6 +4081,9 @@ mod net_tests;
 #[cfg(test)]
 #[path = "host/save_tests.rs"]
 mod save_tests;
+#[cfg(test)]
+#[path = "host/scene_replace_tests.rs"]
+mod scene_replace_tests;
 #[cfg(test)]
 #[path = "host/script_ref_tests.rs"]
 mod script_ref_tests;

@@ -569,6 +569,7 @@ pub(crate) fn create_lua(
     )?;
     rve.set("spawn", spawn_function(&lua, active_call.clone())?)?;
     rve.set("destroy", destroy_function(&lua, active_call.clone())?)?;
+    rve.set("scene", scene_table(&lua, active_call.clone())?)?;
     rve.set("prefabs", prefabs_table(&lua, active_call.clone())?)?;
     rve.set("send", send_function(&lua, active_call.clone())?)?;
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
@@ -5122,6 +5123,32 @@ fn lua_text_key(value: Value, function: &str) -> mlua::Result<String> {
     }
 }
 
+/// `rve.scene`: `load(path)` ставит запрос загрузки сцены проекта, `current()` возвращает имя
+/// текущей сцены. Запрос выполняется после конца кадра, если сцена объявлена и включена.
+fn scene_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let scene = lua.create_table()?;
+    let load_call = active_call.clone();
+    scene.set(
+        "load",
+        lua.create_function(move |_, path: LuaString| {
+            let path = lua_text_key(Value::String(path), "rve.scene.load")?;
+            with_active_call(&load_call, |transaction| {
+                transaction
+                    .request_scene_load(&path)
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    scene.set(
+        "current",
+        lua.create_function(move |lua, ()| {
+            let current =
+                with_active_call(&active_call, |transaction| Ok(transaction.current_scene()))?;
+            Ok(Value::String(lua.create_string(&current)?))
+        })?,
+    )?;
+    Ok(scene)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

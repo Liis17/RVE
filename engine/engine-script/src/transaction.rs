@@ -7,6 +7,7 @@ use crate::lifecycle::{
 use crate::lite::EventQueue;
 use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::{BindingUpdate, PhysicsScriptState};
+use crate::scene_state::{SharedSceneState, check_scene_request};
 use crate::script_refs::{ScriptRefError, ScriptRefs, coerce_property, find_entry, find_serial};
 use crate::timeline::{CoroutineWait, ScriptCoroutine, ScriptTimeline, TimelineOp, TimerCallback};
 use crate::types::{
@@ -301,6 +302,10 @@ pub(crate) struct ScriptTransaction {
     pending_script_enabled: Option<bool>,
     /// Справочник экземпляров хоста; читается для `obj:script`, меняется только при коммите.
     script_refs: ScriptRefs,
+    /// Состояние смены сцен хоста: список сцен проекта и запрос на загрузку.
+    scene_state: SharedSceneState,
+    /// Запрос `rve.scene.load` этого вызова; переносится в состояние хоста при коммите.
+    pending_scene_request: Option<String>,
     /// Записи свойств чужих и своих экземпляров; применяются при коммите и синхронизируют Lua.
     pending_properties: Vec<PropertyWrite>,
     /// Заявки `enabled` для экземпляров по серийному номеру; применяются на границе фазы.
@@ -707,6 +712,8 @@ impl Default for ScriptTransaction {
             component_writes: ComponentWrites::default(),
             pending_script_enabled: None,
             script_refs: ScriptRefs::default(),
+            scene_state: SharedSceneState::default(),
+            pending_scene_request: None,
             pending_properties: Vec::new(),
             pending_remote_enabled: Vec::new(),
             instance_enabled: true,
@@ -2667,6 +2674,26 @@ impl ScriptTransaction {
         Ok(())
     }
 
+    pub(crate) fn attach_scene_state(&mut self, state: SharedSceneState) {
+        self.scene_state = state;
+    }
+
+    /// Запрос загрузки сцены: путь должен быть объявлен и включён в проекте. Запрос последнего
+    /// успешного вызова кадра отдаёт хост после конца кадра.
+    pub(crate) fn request_scene_load(&mut self, path: &str) -> Result<(), String> {
+        if !self.writable || !self.lifecycle_writes {
+            return Err("scenes can only be loaded from update callbacks".to_owned());
+        }
+        let canonical = check_scene_request(&self.scene_state.borrow(), path)?;
+        self.pending_scene_request = Some(canonical);
+        Ok(())
+    }
+
+    /// Имя текущей сцены.
+    pub(crate) fn current_scene(&self) -> String {
+        self.scene_state.borrow().current.clone()
+    }
+
     pub(crate) fn object_id(&self, handle: ObjectHandle) -> Option<&str> {
         self.world()?
             .object(handle)
@@ -3286,6 +3313,9 @@ impl ScriptTransaction {
 
     /// Применяет записи свойств и заявки `enabled` чужих экземпляров. Цели проверены до коммита.
     fn commit_script_refs(&mut self) {
+        if let Some(path) = self.pending_scene_request.take() {
+            self.scene_state.borrow_mut().request = Some(path);
+        }
         let writes = std::mem::take(&mut self.pending_properties);
         {
             let mut refs = self.script_refs.borrow_mut();
@@ -3308,6 +3338,7 @@ impl ScriptTransaction {
         self.discard_ui();
         self.pending_properties.clear();
         self.pending_remote_enabled.clear();
+        self.pending_scene_request = None;
         if !self.world.is_null() {
             // SAFETY: `world` is the live reference from `begin`, cleared only below; releasing a
             // reservation needs just a shared borrow and touches no other state of the world.
