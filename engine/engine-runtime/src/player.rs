@@ -819,6 +819,8 @@ impl WindowHandler for PlayerWindow<'_> {
             lock_input(&self.input).console_open(false, self.window_focused);
         }
         let size = window.inner_size();
+        // UI раскладывается по размеру окна до первого события `resized`.
+        lock_input(&self.input).set_window_size(size.width, size.height);
         let phase_started = Instant::now();
         let mut renderer = match Renderer::new(
             Arc::clone(&window),
