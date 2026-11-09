@@ -116,28 +116,38 @@ pub enum AudioGroup {
     Ambient,
 }
 
+/// Кривая затухания пространственного источника. `Inverse` — прежняя кривая сцен без этого ключа.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioRolloff {
+    #[default]
+    Inverse,
+    Linear,
+}
+
 /// Звуковой источник на объекте сцены: клип и параметры воспроизведения.
+///
+/// В файле `spatial = true|false` (прежний ключ) задаёт `spatial_blend` 1 или 0; дробная доля
+/// пишется ключом `spatial_blend`. Остальные ключи пишутся только при отличии от умолчания,
+/// поэтому сцены без новых возможностей сохраняются как раньше.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "AudioSourceWire", into = "AudioSourceWire")]
 pub struct AudioSourceComponent {
     /// Виртуальный путь `.wav` или `.ogg`; обязан быть объявлен в `[[assets]]`.
-    #[serde(with = "virtual_path_serde")]
     pub clip: VirtualPath,
-    #[serde(default)]
     pub group: AudioGroup,
-    #[serde(default = "default_volume")]
     pub volume: f32,
-    #[serde(default)]
     pub looping: bool,
-    #[serde(default)]
     pub play_on_start: bool,
-    /// Пространственное затухание и панорама по позиции объекта относительно активной камеры.
-    #[serde(default)]
-    pub spatial: bool,
-    #[serde(default = "default_min_distance")]
+    /// Доля пространственного микширования `0..=1`: `0` — 2D, `1` — полностью по позиции объекта.
+    pub spatial_blend: f32,
     pub min_distance: f32,
-    #[serde(default = "default_max_distance")]
     pub max_distance: f32,
+    pub rolloff: AudioRolloff,
+    /// Множитель скорости и высоты тона, больше нуля.
+    pub pitch: f32,
+    /// Сводит клип к моно до панорамы.
+    pub force_mono: bool,
 }
 
 impl AudioSourceComponent {
@@ -149,12 +159,109 @@ impl AudioSourceComponent {
             volume: default_volume(),
             looping: false,
             play_on_start: false,
-            spatial: false,
+            spatial_blend: 0.0,
             min_distance: default_min_distance(),
             max_distance: default_max_distance(),
+            rolloff: AudioRolloff::default(),
+            pitch: default_pitch(),
+            force_mono: false,
         }
     }
 }
+
+/// Файловое представление источника: порядок полей совпадает с прежним форматом.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioSourceWire {
+    #[serde(with = "virtual_path_serde")]
+    clip: VirtualPath,
+    #[serde(default)]
+    group: AudioGroup,
+    #[serde(default = "default_volume")]
+    volume: f32,
+    #[serde(default)]
+    looping: bool,
+    #[serde(default)]
+    play_on_start: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spatial: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spatial_blend: Option<f32>,
+    #[serde(default = "default_min_distance")]
+    min_distance: f32,
+    #[serde(default = "default_max_distance")]
+    max_distance: f32,
+    #[serde(default, skip_serializing_if = "is_default_rolloff")]
+    rolloff: AudioRolloff,
+    #[serde(default = "default_pitch", skip_serializing_if = "is_default_pitch")]
+    pitch: f32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    force_mono: bool,
+}
+
+impl From<AudioSourceComponent> for AudioSourceWire {
+    fn from(audio: AudioSourceComponent) -> Self {
+        let blend = audio.spatial_blend;
+        let binary = blend == 0.0 || blend == 1.0;
+        Self {
+            clip: audio.clip,
+            group: audio.group,
+            volume: audio.volume,
+            looping: audio.looping,
+            play_on_start: audio.play_on_start,
+            spatial: binary.then_some(blend == 1.0),
+            spatial_blend: (!binary).then_some(blend),
+            min_distance: audio.min_distance,
+            max_distance: audio.max_distance,
+            rolloff: audio.rolloff,
+            pitch: audio.pitch,
+            force_mono: audio.force_mono,
+        }
+    }
+}
+
+impl TryFrom<AudioSourceWire> for AudioSourceComponent {
+    type Error = String;
+
+    fn try_from(wire: AudioSourceWire) -> Result<Self, Self::Error> {
+        let spatial_blend = match (wire.spatial, wire.spatial_blend) {
+            (Some(_), Some(_)) => {
+                return Err("audio_source: задайте только одно из spatial и spatial_blend".into());
+            }
+            (Some(spatial), None) => f32::from(u8::from(spatial)),
+            (None, Some(blend)) => blend,
+            (None, None) => 0.0,
+        };
+        Ok(Self {
+            clip: wire.clip,
+            group: wire.group,
+            volume: wire.volume,
+            looping: wire.looping,
+            play_on_start: wire.play_on_start,
+            spatial_blend,
+            min_distance: wire.min_distance,
+            max_distance: wire.max_distance,
+            rolloff: wire.rolloff,
+            pitch: wire.pitch,
+            force_mono: wire.force_mono,
+        })
+    }
+}
+
+fn is_default_rolloff(rolloff: &AudioRolloff) -> bool {
+    *rolloff == AudioRolloff::Inverse
+}
+
+fn is_default_pitch(pitch: &f32) -> bool {
+    *pitch == 1.0
+}
+
+fn default_pitch() -> f32 {
+    1.0
+}
+
+/// Наибольший множитель скорости клипа. Ниже нуля и выше этого значения значения отклоняются.
+pub const MAX_AUDIO_PITCH: f32 = 4.0;
 
 fn default_volume() -> f32 {
     1.0
@@ -208,6 +315,20 @@ pub(crate) fn validate_audio_source(
             "audio_source.volume должен быть конечным и в диапазоне 0..=4",
         ));
     }
+    if !audio.spatial_blend.is_finite() || !(0.0..=1.0).contains(&audio.spatial_blend) {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "audio_source.spatial_blend должен быть конечным и в диапазоне 0..=1",
+        ));
+    }
+    if !audio.pitch.is_finite() || audio.pitch <= 0.0 || audio.pitch > MAX_AUDIO_PITCH {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "audio_source.pitch должен быть конечным и в диапазоне (0..=4]",
+        ));
+    }
     if !audio.min_distance.is_finite()
         || !audio.max_distance.is_finite()
         || audio.min_distance <= 0.0
@@ -224,7 +345,7 @@ pub(crate) fn validate_audio_source(
 
 #[cfg(test)]
 mod tests {
-    use crate::{AudioGroup, SceneDocument, World};
+    use crate::{AudioGroup, AudioRolloff, SceneDocument, World};
 
     const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
     const ASSETS: &str = "[[assets]]\npath = \"/audio/hum.wav\"\n[[assets]]\npath = \"/audio/loop.ogg\"\n[[assets]]\npath = \"/models/box.fbx\"\n";
@@ -249,9 +370,84 @@ mod tests {
         assert_eq!(audio.volume, 1.0);
         assert!(!audio.looping);
         assert!(!audio.play_on_start);
-        assert!(!audio.spatial);
+        assert_eq!(audio.spatial_blend, 0.0);
         assert_eq!(audio.min_distance, 1.0);
         assert_eq!(audio.max_distance, 30.0);
+        assert_eq!(audio.rolloff, AudioRolloff::Inverse);
+        assert_eq!(audio.pitch, 1.0);
+        assert!(!audio.force_mono);
+    }
+
+    #[test]
+    fn legacy_spatial_bool_maps_to_blend_and_back() {
+        let fields = "clip = \"/audio/hum.wav\"\nspatial = true";
+        let document = parse(&source(fields)).unwrap();
+        assert_eq!(
+            document.objects[1]
+                .audio_source
+                .as_ref()
+                .unwrap()
+                .spatial_blend,
+            1.0
+        );
+        let text = toml::to_string_pretty(&document).unwrap();
+        assert!(text.contains("spatial = true"), "{text}");
+        assert!(!text.contains("spatial_blend"), "{text}");
+
+        let off = parse(&source("clip = \"/audio/hum.wav\"\nspatial = false")).unwrap();
+        let text = toml::to_string_pretty(&off).unwrap();
+        assert!(text.contains("spatial = false"), "{text}");
+    }
+
+    #[test]
+    fn fractional_blend_is_written_under_its_own_key() {
+        let document = parse(&source("clip = \"/audio/hum.wav\"\nspatial_blend = 0.25")).unwrap();
+        let audio = document.objects[1].audio_source.clone().unwrap();
+        assert_eq!(audio.spatial_blend, 0.25);
+        let text = toml::to_string_pretty(&document).unwrap();
+        assert!(text.contains("spatial_blend = 0.25"), "{text}");
+        assert!(!text.contains("spatial = "), "{text}");
+        assert_eq!(parse(&text).unwrap().objects[1].audio_source, Some(audio));
+    }
+
+    #[test]
+    fn spatial_and_blend_together_are_rejected() {
+        let fields = "clip = \"/audio/hum.wav\"\nspatial = true\nspatial_blend = 0.5";
+        assert!(parse(&source(fields)).is_err());
+    }
+
+    #[test]
+    fn new_fields_round_trip_and_stay_out_of_default_output() {
+        let fields =
+            "clip = \"/audio/hum.wav\"\nrolloff = \"linear\"\npitch = 1.5\nforce_mono = true";
+        let document = parse(&source(fields)).unwrap();
+        let audio = document.objects[1].audio_source.clone().unwrap();
+        assert_eq!(audio.rolloff, AudioRolloff::Linear);
+        assert_eq!((audio.pitch, audio.force_mono), (1.5, true));
+        let text = toml::to_string_pretty(&document).unwrap();
+        assert_eq!(parse(&text).unwrap().objects[1].audio_source, Some(audio));
+
+        let plain =
+            toml::to_string_pretty(&parse(&source("clip = \"/audio/hum.wav\"")).unwrap()).unwrap();
+        assert!(
+            !plain.contains("rolloff") && !plain.contains("pitch") && !plain.contains("force_mono")
+        );
+    }
+
+    #[test]
+    fn blend_and_pitch_must_be_in_range() {
+        for case in [
+            "spatial_blend = 1.5",
+            "spatial_blend = -0.1",
+            "spatial_blend = nan",
+        ] {
+            let fields = format!("clip = \"/audio/hum.wav\"\n{case}");
+            assert!(error_for(&fields).contains("spatial_blend"), "{case}");
+        }
+        for case in ["pitch = 0.0", "pitch = -1.0", "pitch = 4.5", "pitch = inf"] {
+            let fields = format!("clip = \"/audio/hum.wav\"\n{case}");
+            assert!(error_for(&fields).contains("pitch"), "{case}");
+        }
     }
 
     #[test]
@@ -260,7 +456,8 @@ mod tests {
         let document = parse(&source(fields)).unwrap();
         let audio = document.objects[1].audio_source.clone().unwrap();
         assert_eq!(audio.group, AudioGroup::Ambient);
-        assert!(audio.looping && audio.play_on_start && audio.spatial);
+        assert!(audio.looping && audio.play_on_start);
+        assert_eq!(audio.spatial_blend, 1.0);
         assert_eq!(audio.volume, 0.5);
         assert_eq!((audio.min_distance, audio.max_distance), (2.0, 40.0));
 
@@ -282,7 +479,7 @@ mod tests {
     #[test]
     fn unknown_group_and_fields_are_rejected_by_the_schema() {
         assert!(parse(&source("clip = \"/audio/hum.wav\"\ngroup = \"sfx\"")).is_err());
-        assert!(parse(&source("clip = \"/audio/hum.wav\"\npitch = 2.0")).is_err());
+        assert!(parse(&source("clip = \"/audio/hum.wav\"\ndoppler = 2.0")).is_err());
         assert!(parse(&source("volume = 1.0")).is_err(), "clip is required");
     }
 
@@ -351,7 +548,7 @@ mod tests {
         let speaker = world.handle("speaker").unwrap();
         let audio = world.audio_source(speaker).unwrap();
         assert_eq!(audio.clip.as_str(), "audio/hum.wav");
-        assert!(audio.spatial);
+        assert_eq!(audio.spatial_blend, 1.0);
         assert!(
             world
                 .audio_source(world.handle("camera").unwrap())

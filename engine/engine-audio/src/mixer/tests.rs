@@ -16,6 +16,10 @@ fn request(looping: bool) -> PlayRequest {
         volume: 1.0,
         looping,
         spatial: None,
+        spatial_blend: 0.0,
+        rolloff: Rolloff::Inverse,
+        pitch: 1.0,
+        force_mono: false,
     }
 }
 
@@ -25,6 +29,7 @@ fn spatial_request(looping: bool) -> PlayRequest {
             min: 1.0,
             max: 30.0,
         }),
+        spatial_blend: 1.0,
         ..request(looping)
     }
 }
@@ -152,7 +157,7 @@ fn attenuation_is_full_inside_min_zero_at_max_and_beyond() {
 #[test]
 fn spatial_voice_pans_toward_its_side_and_is_silent_past_max() {
     let spatial = Arc::new(Spatial::new());
-    spatial.set_listener([0.0; 3], [1.0, 0.0, 0.0]);
+    spatial.set_listener([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
     let mut mixer = Mixer::new(RATE, Arc::clone(&spatial));
 
     spatial.set_emitter(0, [-5.0, 0.0, 0.0]);
@@ -185,7 +190,7 @@ fn spatial_voice_pans_toward_its_side_and_is_silent_past_max() {
 #[test]
 fn spatial_emitter_at_listener_is_centred() {
     let spatial = Arc::new(Spatial::new());
-    spatial.set_listener([1.0, 2.0, 3.0], [1.0, 0.0, 0.0]);
+    spatial.set_listener([1.0, 2.0, 3.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
     spatial.set_emitter(0, [1.0, 2.0, 3.0]);
     let mut mixer = Mixer::new(RATE, spatial);
     play(
@@ -464,4 +469,162 @@ fn device_output_stays_within_unit_range_and_non_finite_samples_become_silence()
     });
     let broken = render_mono(&mut mixer, 256);
     assert!(broken.iter().all(|value| *value == 0.0), "{broken:?}");
+}
+
+/// Пространственный голос с постоянным сигналом (или заданным клипом) и передним слушателем.
+fn spatial_mixer(emitter: [f32; 3], blend: f32, rolloff: Rolloff, samples: Vec<f32>) -> Mixer {
+    let spatial = Arc::new(Spatial::new());
+    spatial.set_listener([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+    spatial.set_emitter(0, emitter);
+    let mut mixer = Mixer::new(RATE, spatial);
+    let request = PlayRequest {
+        spatial: Some(Distances {
+            min: 1.0,
+            max: 30.0,
+        }),
+        spatial_blend: blend,
+        rolloff,
+        ..request(true)
+    };
+    play(&mut mixer, 1, 0, clip(RATE, 1, samples), request);
+    mixer
+}
+
+#[test]
+fn zero_blend_matches_a_plain_2d_voice_wherever_the_emitter_is() {
+    let mut flat = mixer();
+    play(&mut flat, 1, 0, clip(RATE, 1, vec![1.0; 4]), request(true));
+    let mut blended = spatial_mixer([-5.0, 0.0, 0.0], 0.0, Rolloff::Inverse, vec![1.0; 4]);
+    let a = render_stereo(&mut flat, 256);
+    let b = render_stereo(&mut blended, 256);
+    assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-6));
+}
+
+#[test]
+fn half_blend_pans_less_than_full_blend() {
+    let mut full = spatial_mixer([-5.0, 0.0, 0.0], 1.0, Rolloff::Inverse, vec![1.0; 4]);
+    let mut half = spatial_mixer([-5.0, 0.0, 0.0], 0.5, Rolloff::Inverse, vec![1.0; 4]);
+    let f = render_stereo(&mut full, 128);
+    let h = render_stereo(&mut half, 128);
+    // Полная панорама: правый канал молчит. Смесь 0.5: правый канал звучит, но тише левого.
+    assert!(f[241].abs() < 1e-6, "полная панорама: правый {}", f[241]);
+    let ratio = h[241] / h[240];
+    assert!(
+        ratio > 0.2 && ratio < 0.8,
+        "смесь 0.5 даёт соотношение {ratio}"
+    );
+}
+
+#[test]
+fn sound_behind_the_listener_is_quieter_and_darker() {
+    // Слушатель смотрит в -Z: излучатель на +Z находится за спиной на том же расстоянии.
+    let rms = |emitter: [f32; 3], samples: Vec<f32>| {
+        let mut mixer = spatial_mixer(emitter, 1.0, Rolloff::Inverse, samples);
+        let out = render_stereo(&mut mixer, 2048);
+        let tail = &out[1024..];
+        (tail.iter().map(|value| value * value).sum::<f32>() / tail.len() as f32).sqrt()
+    };
+    let front = [0.0, 0.0, -5.0];
+    let behind = [0.0, 0.0, 5.0];
+    let steady_front = rms(front, vec![1.0; 4]);
+    let steady_behind = rms(behind, vec![1.0; 4]);
+    assert!(
+        steady_behind < steady_front * 0.8,
+        "за спиной тише: {steady_behind} >= {steady_front}"
+    );
+
+    // Высокая частота (Найквист) гасится фильтром за спиной сильнее, чем постоянный сигнал.
+    let high = vec![1.0, -1.0];
+    let front_high = rms(front, high.clone());
+    let behind_high = rms(behind, high);
+    assert!(
+        behind_high < front_high * 0.5,
+        "за спиной не приглушено: {behind_high} >= {front_high}"
+    );
+}
+
+#[test]
+fn mono_output_mixes_both_channels_to_the_same_value() {
+    let stereo = || clip(RATE, 2, [1.0f32, 0.0].repeat(8));
+    let mut normal = mixer();
+    play(&mut normal, 1, 0, stereo(), request(true));
+    let apart = render_stereo(&mut normal, 64);
+    assert!(
+        apart
+            .chunks(2)
+            .any(|frame| (frame[0] - frame[1]).abs() > 1e-3)
+    );
+
+    let mut mono = mixer();
+    mono.apply(MixerCommand::SetMonoOutput(true));
+    play(&mut mono, 1, 0, stereo(), request(true));
+    let together = render_stereo(&mut mono, 64);
+    assert!(
+        together
+            .chunks(2)
+            .all(|frame| (frame[0] - frame[1]).abs() < 1e-6)
+    );
+    assert!(together[100] > 0.0, "звук не должен пропасть при сведении");
+}
+
+#[test]
+fn force_mono_collapses_one_stereo_voice_only() {
+    let stereo = clip(RATE, 2, [1.0f32, 0.0].repeat(8));
+    let mut mixer = mixer();
+    play(
+        &mut mixer,
+        1,
+        0,
+        stereo,
+        PlayRequest {
+            force_mono: true,
+            ..request(true)
+        },
+    );
+    let out = render_stereo(&mut mixer, 64);
+    assert!(
+        out.chunks(2)
+            .all(|frame| (frame[0] - frame[1]).abs() < 1e-6)
+    );
+}
+
+#[test]
+fn pitch_scales_playback_speed_and_invalid_pitch_plays_at_normal_speed() {
+    let ten = || clip(RATE, 1, vec![0.5; 10]);
+    let pitched = |pitch: f32| PlayRequest {
+        pitch,
+        ..request(false)
+    };
+
+    let mut fast = mixer();
+    play(&mut fast, 1, 0, ten(), pitched(2.0));
+    render_mono(&mut fast, 6);
+    assert_eq!(
+        drain(&mut fast),
+        vec![voice(1)],
+        "вдвое быстрее: 10 кадров за 5"
+    );
+
+    let mut normal = mixer();
+    play(&mut normal, 1, 0, ten(), pitched(1.0));
+    render_mono(&mut normal, 6);
+    assert!(drain(&mut normal).is_empty());
+
+    // NaN не должен сделать шаг бесконечным: голос завершается за длину клипа.
+    let mut broken = mixer();
+    play(&mut broken, 1, 0, ten(), pitched(f32::NAN));
+    render_mono(&mut broken, 12);
+    assert_eq!(drain(&mut broken), vec![voice(1)]);
+}
+
+#[test]
+fn linear_rolloff_reaches_silence_at_max_and_differs_from_inverse() {
+    let distances = Distances {
+        min: 1.0,
+        max: 30.0,
+    };
+    assert_eq!(linear_attenuation(1.0, distances), 1.0);
+    assert!((linear_attenuation(15.5, distances) - 0.5).abs() < 1e-6);
+    assert_eq!(linear_attenuation(30.0, distances), 0.0);
+    assert!((attenuation(15.5, distances) - linear_attenuation(15.5, distances)).abs() > 0.1);
 }

@@ -1431,6 +1431,7 @@ impl EditorApp {
                 engine_audio::AudioConfig {
                     resources: Some(project.resource_handle()),
                     output: true,
+                    mono_output: project.settings.audio.mono_output,
                 },
                 animation,
             )?;

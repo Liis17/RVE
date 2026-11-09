@@ -3,9 +3,9 @@
 //! Используется и runtime, и редактором в Play-режиме. Мир передаётся по ссылке в каждый вызов;
 //! объектный id бридж хранит как [`ObjectHandle`], поэтому после замены мира его нужно создать заново.
 
-use crate::{AudioError, AudioEvent, AudioHandle, Distances, PlayRequest};
+use crate::{AudioError, AudioEvent, AudioHandle, Distances, PlayRequest, Rolloff};
 use engine_scene::world::ObjectHandle;
-use engine_scene::{AudioRequest, AudioSourceComponent, VoiceId, World};
+use engine_scene::{AudioRequest, AudioRolloff, AudioSourceComponent, VoiceId, World};
 use std::collections::{HashMap, HashSet};
 
 /// Расстояния клипов скриптов, запущенных с позицией.
@@ -127,6 +127,10 @@ impl AudioBridge {
                         volume: params.volume,
                         looping: params.looping,
                         spatial: params.position.map(|_| SCRIPT_DISTANCES),
+                        spatial_blend: 1.0,
+                        rolloff: Rolloff::Inverse,
+                        pitch: 1.0,
+                        force_mono: false,
                     };
                     let result = match params.position {
                         Some(position) => {
@@ -168,12 +172,7 @@ impl AudioBridge {
             self.sources.remove(&object);
         }
         let volume = self.volumes.get(&object).copied().unwrap_or(audio.volume);
-        let request = PlayRequest {
-            group: audio.group,
-            volume,
-            looping: audio.looping,
-            spatial: spatial_distances(audio),
-        };
+        let request = source_request(audio, volume);
         let result = match source_position(world, object, audio) {
             Some(position) => self
                 .handle
@@ -237,9 +236,15 @@ impl AudioBridge {
         if let Some(camera) = world.world_matrix(world.active_camera()) {
             let position = camera.w_axis.truncate();
             let right = camera.x_axis.truncate().normalize_or_zero();
-            if position.is_finite() && right.is_finite() && right.length_squared() > 0.0 {
+            // Камера смотрит вдоль -Z своей системы координат.
+            let forward = -camera.z_axis.truncate().normalize_or_zero();
+            if position.is_finite()
+                && right.is_finite()
+                && right.length_squared() > 0.0
+                && forward.length_squared() > 0.0
+            {
                 self.handle
-                    .set_listener(position.to_array(), right.to_array());
+                    .set_listener(position.to_array(), right.to_array(), forward.to_array());
             }
         }
 
@@ -249,7 +254,7 @@ impl AudioBridge {
                 stale.push(object);
                 continue;
             };
-            if !audio.spatial {
+            if audio.spatial_blend <= 0.0 {
                 continue;
             }
             match world.world_matrix(object) {
@@ -300,15 +305,32 @@ fn source_position(
     object: ObjectHandle,
     audio: &AudioSourceComponent,
 ) -> Option<[f32; 3]> {
-    if !audio.spatial {
+    if audio.spatial_blend <= 0.0 {
         return None;
     }
     let position = world.world_matrix(object)?.w_axis.truncate();
     position.is_finite().then(|| position.to_array())
 }
 
+/// Параметры голоса источника. `spatial_blend` 0 даёт 2D-голос без дистанций.
+fn source_request(audio: &AudioSourceComponent, volume: f32) -> PlayRequest {
+    PlayRequest {
+        group: audio.group,
+        volume,
+        looping: audio.looping,
+        spatial: spatial_distances(audio),
+        spatial_blend: audio.spatial_blend,
+        rolloff: match audio.rolloff {
+            AudioRolloff::Inverse => Rolloff::Inverse,
+            AudioRolloff::Linear => Rolloff::Linear,
+        },
+        pitch: audio.pitch,
+        force_mono: audio.force_mono,
+    }
+}
+
 fn spatial_distances(audio: &AudioSourceComponent) -> Option<Distances> {
-    audio.spatial.then_some(Distances {
+    (audio.spatial_blend > 0.0).then_some(Distances {
         min: audio.min_distance,
         max: audio.max_distance,
     })

@@ -2087,6 +2087,7 @@ spatial = true
         let audio = AudioConfig {
             resources: Some(resources.handle()),
             output: false,
+            mono_output: false,
         };
         let mut session = PlaySession::start_with_world_limit(
             &scene,

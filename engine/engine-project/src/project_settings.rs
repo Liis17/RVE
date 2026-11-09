@@ -22,6 +22,9 @@ pub struct ProjectSettings {
     pub runtime: RuntimeSettings,
     #[serde(default)]
     pub physics: PhysicsSettings,
+    /// Звуковой вывод проекта: `[audio]`. Значения по умолчанию не сериализуются.
+    #[serde(default, skip_serializing_if = "AudioSettings::is_default")]
+    pub audio: AudioSettings,
     /// Значения по умолчанию не сериализуются, поэтому проекты без `[network]` не меняются.
     #[serde(default, skip_serializing_if = "NetworkSettings::is_default")]
     pub network: NetworkSettings,
@@ -155,6 +158,19 @@ impl Default for RuntimeSettings {
             dlss_application_id: None,
             dlss_engine_version: None,
         }
+    }
+}
+
+/// Звуковые настройки проекта: `[audio] mono_output = true` сводит весь вывод к моно.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AudioSettings {
+    pub mono_output: bool,
+}
+
+impl AudioSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
