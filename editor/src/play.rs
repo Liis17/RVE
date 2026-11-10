@@ -3319,8 +3319,13 @@ path = \"boss.lua\"
 
     impl EmptyAssets {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("rve-play-switch-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "rve-play-switch-{}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir_all(&root).unwrap();
             let resources = ResourceSystem::start(ResourceConfig {
                 root: root.clone(),
@@ -3342,6 +3347,16 @@ path = \"boss.lua\"
             let _ = self.resources.shutdown();
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn scene_switch_assets_have_isolated_lifetimes() {
+        let first = EmptyAssets::new();
+        let second = EmptyAssets::new();
+        assert_ne!(first.root, second.root);
+        assert!(first.root.is_dir());
+        drop(second);
+        assert!(first.root.is_dir());
     }
 
     fn start_session() -> PlaySession {
