@@ -124,6 +124,10 @@ Cursor — физические пиксели окна; до первого `Cu
 
 Звуковой API гостя: `Object::play_sound`, `stop_sound`, `set_sound_volume` и `Context::play_clip(path, ClipOptions)`, `stop_voice`, `set_group_volume`. `play_clip` возвращает id голоса. Ошибки — `AudioError`: `Unavailable` для хоста без audio callbacks (ABI до v7), `Rejected` при отказе хоста, `InvalidInput` для неконечных значений и громкости вне `0..=4` (`MAX_AUDIO_VOLUME`, совпадает с `engine_scene::MAX_AUDIO_VOLUME`). Клип объявляется в `[[assets]]` сцены, см. [[Engine/EngineAudio]].
 
+## Окно и диалоги (ABI v23)
+
+ABI v23 дописывает в хвост `RveHost` nullable `window_fullscreen`, `window_set_fullscreen`, `window_screenshot` (пустой путь — папка по умолчанию), `file_dialog_open` (`RveFileDialog` с видом `RVE_FILE_DIALOG_*`, заголовком, папкой, именем файла и массивом `RveFileDialogFilter`) и `file_dialog_poll` (двухшаговое чтение путей как `save_keys`, флаг `done`). Дескриптор скрипта не меняется. Гостевой API — `Context::is_fullscreen`, `set_fullscreen`, `take_screenshot`, `open_file_dialog(&FileDialog) -> Option<FileDialogId>` и `poll_file_dialog -> Option<FileDialogPoll>` (`src/platform.rs`). Файлы тяжёлые скрипты читают и пишут через `std::fs`: отдельного файлового ABI нет. Пути передаются как UTF-8 (`to_string_lossy` на стороне хоста).
+
 ## Источники
 
 `engine/rve-sdk/Cargo.toml`, `engine/rve-sdk/src/abi.rs`, `engine/rve-sdk/src/lib.rs`.

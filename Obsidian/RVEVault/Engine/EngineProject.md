@@ -171,6 +171,8 @@ identifier проверяется при разборе проекта. В dev-p
 SDK/backend или подходящая поддержка Vulkan недоступны, запрос `anti_aliasing =
 "dlss"` переходит на TAA с одним предупреждением.
 
+Секция `[window]` (`WindowSettings`, `deny_unknown_fields`) включает встроенные горячие клавиши игрока: `fullscreen_hotkey` (F11 — полноэкранный режим без рамки и обратно) и `screenshot_hotkey` (F12 — PNG-скриншот окна). Оба по умолчанию `true`; секция со значениями по умолчанию не сериализуется. Поведение клавиш — [[Engine/EngineRuntime]].
+
 Пути загрузки проекта и коды выхода `rve-player` описаны в
 [[Engine/EngineRuntime]]. `rve-build` сериализует настройки через
 `ProjectSettings::to_toml` и кладёт их в `base.rvepak`; для отсутствующего,
