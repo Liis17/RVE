@@ -1,4 +1,4 @@
-//! ABI-функции смены сцен: `scene_load` ставит запрос, `scene_current` читает имя текущей сцены.
+//! ABI-функции для сцены и приложения.
 
 use super::*;
 
@@ -37,5 +37,11 @@ pub(super) unsafe extern "C" fn host_scene_current(ctx: *mut c_void, out: *mut R
         // SAFETY: `save_values` owns all nested buffers until this ABI call context is dropped.
         unsafe { *out = value.value };
         true
+    })
+}
+
+pub(super) unsafe extern "C" fn host_app_quit(ctx: *mut c_void) -> bool {
+    guarded(ctx, false, |context| {
+        context.transaction.request_quit().is_ok()
     })
 }

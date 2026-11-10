@@ -1181,6 +1181,12 @@ impl ScriptHost {
         self.scene_state.borrow_mut().request.take()
     }
 
+    /// Returns whether a successful script callback requested graceful application shutdown.
+    /// The request is consumed once by the runtime or editor Play host.
+    pub fn take_quit_request(&mut self) -> bool {
+        std::mem::take(&mut self.scene_state.borrow_mut().quit_requested)
+    }
+
     /// Пишет Error, если вызывающий код не смог загрузить запрошенную сцену. Текущая сцена не меняется.
     pub fn report_scene_failure(&mut self, path: &str, message: &str) {
         self.events.borrow_mut().push(ScriptEvent {
