@@ -13,9 +13,11 @@ Parent: [[Index]]
 | Файл | Значимые символы | Роль |
 |---|---|---|
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Формат начальных настроек, значения по умолчанию и проверки |
-| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
+| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings`, `PhysicsSettings`, `NetworkSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
+| `engine/engine-project/src/input_settings.rs` | `InputSettings`, `InputAction` | Схема игровых действий, проверка физических имён вводов и ограничений |
+| `engine/engine-project/src/prefab_catalog.rs` | `PrefabCatalogFile`, `PrefabCatalogEntry`, `PREFAB_CATALOG_FILE_NAME`, `PREFAB_CATALOG_RELEASE_PATH` | Список тяжёлых префабов проекта: разбор, проверка, сериализация |
 | `engine/engine-project/src/lib.rs` | публичные реэкспорты | API крейта |
-| `engine/engine-project/Cargo.toml` | зависимости | `engine-files`, `serde`, `toml` |
+| `engine/engine-project/Cargo.toml` | зависимости | `engine-files`, `rve-sdk`, `serde`, `toml` |
 | `engine/sandbox/src/main.rs` | загрузка bootstrap | Настройки sandbox из текущего каталога |
 | `engine/engine-runtime/src/layout.rs`, `engine/engine-runtime/src/lib.rs` | `Layout`, `load_project_settings` | Dev/release расположение файлов и загрузка проекта в `rve-player` |
 | `tools/rve-build/src/project.rs`, `tools/rve-build/src/archives.rs` | `prepare_project`, сборка архивов | Проверка входного проекта и упаковка настроек для release |
@@ -35,6 +37,7 @@ Parent: [[Index]]
 | `AllowMultipleInstances` | Только `true` или `false`; default `true`. При `false` player использует `ProjectSettings.id` как ключ singleton lock |
 | `AppIcon` | Необязательный virtual path в `Assets`; bootstrap проверяет только корректность пути |
 | `PresentMode` | Необязательный `Fifo`, `Mailbox` или `Immediate`; при отсутствии используется FIFO |
+| `Reflex` | Необязательный `Off`, `On` или `Boost` (`BootstrapReflexMode`); при отсутствии равен `Off`. Передаётся в `RendererConfig::low_latency` игрока, редактора и sandbox; на устройствах без поддержки Reflex работает как `Off` (см. [[Engine/EngineRender]]) |
 
 `BootstrapConfig::load` трактует отсутствующий файл как настройки по умолчанию.
 Пути bootstrap и применение `WindowTitle`/`AppIcon` в player, а также его коды
@@ -53,6 +56,7 @@ Parent: [[Index]]
 | `id` | Стабильный ключ `[A-Za-z0-9_-]{1,64}`. Используется как singleton lock key, если в bootstrap запрещены несколько экземпляров |
 | `name` | Непустое имя игры |
 | `version` | Непустая строка; отдельной проверки SemVer нет |
+| `input` | Необязательные именованные действия и контексты; без секции остаётся пустая карта без активного контекста. Формат описан ниже |
 | `heavy_scripts` | Необязательный непустой относительный путь к crate Rust-скриптов внутри проекта; абсолютные пути и выход через `..` запрещены |
 | `scenes` | Упорядоченный список `{ path, enabled }`; `enabled` по умолчанию `true`. Пути — уникальные virtual paths `.rvescene`; должна быть хотя бы одна включённая сцена, и первая включённая становится стартовой |
 | `requirements.min_ram_mb`, `requirements.min_cpu_threads` | Минимум RAM и число логических CPU; default обоих значений — 0, то есть минимум не ограничен |
@@ -61,6 +65,92 @@ Parent: [[Index]]
 | `runtime.dlss_library` | Необязательный относительный путь внутри проекта к `nvngx_dlss.dll`; default отсутствует. Идентификатор NGX задаётся ровно одним из `dlss_project_id` или `dlss_application_id` |
 | `runtime.dlss_project_id`, `runtime.dlss_engine_version` | GUID-подобный project ID и версия RVE engine; оба требуются при выборе project ID и запрещены с application ID |
 | `runtime.dlss_application_id` | Необязательный положительный NVIDIA application ID; взаимоисключается с project ID и engine version |
+| `physics.gravity` | Конечный вектор ускорения; default `[0, -9.81, 0]` |
+| `physics.fixed_hz` | Частота фиксированного шага, `1..=1000`; default `60` |
+| `physics.max_substeps` | Максимум подшагов за один update, `1..=64`; default `8` |
+
+Секция `[physics]` необязательна. Сейчас `ProjectSettings` разбирает, проверяет и
+сериализует эти значения; runtime ещё не использует их для симуляции.
+
+```toml
+[physics]
+gravity = [0.0, -9.81, 0.0]
+fixed_hz = 60
+max_substeps = 8
+```
+
+### Звук `[audio]`
+
+Секция `[audio]` необязательна. `mono_output = true` сводит весь звуковой вывод к моно в runtime и Play; значение по умолчанию (`false`) не сериализуется. Тип `AudioSettings` (`engine-project`) передаётся в `AudioConfig.mono_output` при запуске движка.
+
+### Сеть `[network]`
+
+Необязательная секция `NetworkSettings`. `enabled` (по умолчанию `false`) разрешает сетевые флаги player и сервера; без него флаги дают код 2. `port` — порт сервера по умолчанию, `1..=65535`, по умолчанию `7777`. `max_clients` — `1..=64`, по умолчанию `8`. `tick_hz` — частота сетевого тика и серверных меток, `1..=240`, по умолчанию `30`. `timeout_ms` — молчание пира до разрыва соединения, `1000..=120000`, по умолчанию `10000`.
+
+Секреты в секцию не входят: неизвестные поля отклоняются (`deny_unknown_fields`), а пароль и ключ сервера задаются флагами и переменной окружения ([[Engine/EngineNetwork]]). При значениях по умолчанию секция не сериализуется, поэтому проекты без сети не меняются. Round-trip через `to_toml` сохраняет секцию, потому что `rve-build` переписывает `project.toml` в релиз.
+
+### Игровой ввод `[input]`
+
+`ProjectSettings.input` хранит `InputSettings`; конфигурация сериализуется и обратно
+разбирается через `ProjectSettings::to_toml`. Если секции `[input]` нет, проект
+получает пустые настройки и неактивный контекст, сохраняя совместимость со старыми
+проектами.
+
+```toml
+[input]
+default_context = "game"
+
+[input.contexts.game.Jump]
+kind = "button"
+inputs = ["Space", "Mouse.Left"]
+
+[input.contexts.game.Move]
+kind = "vector2"
+up = ["W"]
+down = ["S"]
+left = ["A"]
+right = ["D"]
+
+[input.contexts.game.Throttle]
+kind = "axis"
+negative = ["Q"]
+positive = ["E"]
+analog = "WheelY"
+scale = 1.0
+```
+
+Контекст содержит действия с видами `button`, `axis` или `vector2`. Кнопка
+использует слот `inputs`; ось — `negative`, `positive`, optional `analog`, `scale`;
+вектор — `up`, `down`, `left`, `right`, optional `analog`, `scale`. Для оси
+аналоговый источник принимает `MouseX`, `MouseY`, `WheelX` или `WheelY`; для
+вектора — `MouseDelta` или `Wheel`, а также геймпадные источники из раздела ниже. `scale` по умолчанию равен `1.0` и должен быть
+конечным. Поля другого вида и любые неизвестные поля запрещены.
+
+Имена контекстов и действий соответствуют `[A-Za-z0-9_]{1,64}`. Если задан хотя бы
+один контекст, `default_context` обязателен и должен указывать на существующий
+контекст. Одно действие сохраняет одинаковый вид во всех контекстах. Физический ввод
+задаётся именем клавиши `Key` из [[Engine/RveSdk]] или именем кнопки с префиксом
+`Mouse.`, например `Mouse.Left`. В одном слоте нельзя повторять имя; пустые слоты
+разрешены для последующего переназначения. Ограничения: до 32 контекстов, 128
+действий в контексте и 16 вводов в слоте. Проверка физических имён использует
+`rve_sdk::PhysicalInput`.
+
+### Геймпады `[input.gamepad]`
+
+`stick_deadzone` задаёт радиальную мёртвую зону стика в [0, 1), по умолчанию 0.15. `trigger_threshold` задаёт порог триггера в (0, 1), по умолчанию 0.5; кнопка от триггера срабатывает при значении строго больше порога. NaN, бесконечности и значения вне диапазона отклоняются при проверке проекта. Без секции действуют значения по умолчанию.
+
+Физические имена геймпада: `Gamepad.<Button>` — любой пад, `Gamepad1`–`Gamepad4` — конкретный слот. Аналоговые источники: для оси `Gamepad[N].LeftX|LeftY|RightX|RightY|LeftTrigger|RightTrigger`, для вектора `Gamepad[N].LeftStick|RightStick`. Без `N` ось берёт слот с наибольшим модулем, вектор — слот с самым длинным вектором. Полный порядок обработки описан в [[Engine/EngineInput]].
+
+### Матрица столкновений `[physics.collision_matrix]`
+
+- `masks` — ровно 32 маски, индекс массива — индекс слоя из `[layers]`. Пара слоёв сталкивается и даёт триггеры, только если каждый из слоёв разрешает другой: поэтому маски задаются симметрично. Значения по умолчанию (`u32::MAX` у каждого слоя, все со всеми) не сериализуются; редактор записывает матрицу вместе со списками. Передача в физику: `PhysicsSceneDesc::collision_matrix`, см. [[Engine/EnginePhysics]].
+
+### Теги и слои `[tags]` и `[layers]`
+
+- `[tags] names = [...]` и `[layers] names = [...]` — необязательные списки. Имена соответствуют `[A-Za-z0-9_-]{1,64}` и не повторяются; слоёв не больше 32, индекс имени совпадает со значением `layer` объекта. Для `[layers]` пустая строка — слот без имени: индекс остаётся занятым и не сдвигает другие слои; в `[tags]` пустых имён нет. Пустые списки не сериализуются.
+- `ProjectSettings::to_toml` записывает файл целиком, поэтому комментарии исходного `project.rveproject` при сохранении из редактора теряются.
+
+### Runtime plugins и сериализация
 
 Например, при наличии официальных FSR DLL в `vendor/` Windows-проект может задать:
 
@@ -81,11 +171,45 @@ identifier проверяется при разборе проекта. В dev-p
 SDK/backend или подходящая поддержка Vulkan недоступны, запрос `anti_aliasing =
 "dlss"` переходит на TAA с одним предупреждением.
 
+Секция `[window]` (`WindowSettings`, `deny_unknown_fields`) включает встроенные горячие клавиши игрока: `fullscreen_hotkey` (F11 — полноэкранный режим без рамки и обратно) и `screenshot_hotkey` (F12 — PNG-скриншот окна). Оба по умолчанию `true`; секция со значениями по умолчанию не сериализуется. Поведение клавиш — [[Engine/EngineRuntime]].
+
 Пути загрузки проекта и коды выхода `rve-player` описаны в
 [[Engine/EngineRuntime]]. `rve-build` сериализует настройки через
 `ProjectSettings::to_toml` и кладёт их в `base.rvepak`; для отсутствующего,
 неверно закодированного или невалидного файла проекта он возвращает код 2, а
 прочая ошибка чтения считается операционной и даёт код 1.
+
+## `prefabs.rveprefabs`
+
+Необязательный TOML-файл в корне проекта со списком тяжёлых префабов: это
+`.rveprefab`, которые грузятся с диска во время игры, а не живут в памяти вместе со
+сценой. Схема строгая, неизвестные поля запрещены; отсутствующий файл означает пустой
+список. Пустой файл тоже допустим.
+
+| Поле | Смысл и проверка |
+|---|---|
+| `[[prefabs]].path` | Виртуальный путь `.rveprefab` в `Assets`; путь должен быть валидным и уникальным. Расширение проверяется без учёта регистра |
+| `[[prefabs]].archive` | Необязательный явный архив файла префаба и его зависимостей. Имя проверяется по правилу `SceneAsset::archive` из [[Engine/EngineScene]]: `[A-Za-z0-9_-]{1,64}`, `base` и `shared` запрещены в любом регистре |
+| `[[prefabs]].max_instances` | Необязательный лимит живых spawn-экземпляров; должен быть больше нуля |
+
+```toml
+[[prefabs]]
+path = "/prefabs/house.rveprefab"
+archive = "buildings"
+max_instances = 4
+
+[[prefabs]]
+path = "/prefabs/rock.rveprefab"
+```
+
+Порядок записей сохраняется. `PrefabCatalogFile::to_toml` проверяет список и выдаёт
+детерминированный TOML, который редактор записывает обратно без изменения порядка.
+Отсутствующий файл в `PrefabCatalogFile::load` даёт пустой список; ошибки формата
+и ошибки чтения содержат путь к файлу.
+
+В release список хранится как `/rve/prefabs.toml` в `base`; `rve-build` всегда пишет
+этот файл, даже пустой. Путь зарезервирован: `Assets` его содержать не может. Что
+именно упаковывается и как выбирается архив, описано в [[Engine/RveBuild]].
 
 ## Потребители и границы
 
@@ -93,6 +217,7 @@ SDK/backend или подходящая поддержка Vulkan недосту
 - `engine-runtime` использует `BootstrapConfig` и `ProjectSettings`; бинарник
   `rve-player` получает их поведение через runtime.
 - `rve-build` проверяет обе конфигурации, сцены и связанные ресурсы перед сборкой.
+- `rve-editor` читает и сохраняет `prefabs.rveprefabs` в подокне «Префабы проекта» ([[Engine/RveEditor#Префабы]]).
 
 Формат `.rvescene` описан в [[Engine/EngineScene]], пути и layout player — в
 [[Engine/EngineRuntime]] и [[Engine/RveBuild]].

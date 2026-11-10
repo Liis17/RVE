@@ -1,10 +1,18 @@
 [package]
 name = "engine-ui"
-version.workspace = true
+version = "0.8.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["egui"]
+# Мост egui для редактора и dev-консоли. Без него доступен только игровой UI (`game`).
+egui = ["dep:egui"]
+
 [dependencies]
-egui = { workspace = true, features = ["bytemuck"] }
+egui = { workspace = true, features = ["bytemuck"], optional = true }
+engine-core = { path = "../engine-core" }
 engine-console = { path = "../engine-console" }
+engine-gui = { path = "../engine-gui" }
 engine-render = { path = "../engine-render" }
+log.workspace = true

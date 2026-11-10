@@ -1,7 +1,11 @@
-use engine_scene::ParamValue;
-use rve_sdk::{Key, MouseButton};
+use engine_scene::{CameraCursor, ParamValue};
+use rve_sdk::abi::{RVE_GAMEPAD_SLOTS, RveGamepadState};
+use rve_sdk::{GamepadAxis, GamepadButton, GamepadStick, Key, MouseButton};
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// Bits of every valid gamepad button code.
+const PAD_BUTTON_MASK: u32 = (1 << GamepadButton::ALL.len()) - 1;
 
 /// Script parameters in deterministic key order.
 pub type ScriptParams = BTreeMap<String, ParamValue>;
@@ -11,6 +15,140 @@ pub type ScriptParams = BTreeMap<String, ParamValue>;
 pub struct ScriptTime {
     pub elapsed: f64,
     pub frame: u64,
+}
+
+/// Full clock snapshot exposed to callbacks while keeping the original `ScriptTime` layout stable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScriptFrameTime {
+    pub dt: f32,
+    pub unscaled_dt: f32,
+    pub elapsed: f64,
+    pub unscaled_elapsed: f64,
+    pub fixed_dt: f32,
+    pub scale: f32,
+    pub frame: u64,
+}
+
+impl Default for ScriptFrameTime {
+    fn default() -> Self {
+        Self {
+            dt: 0.0,
+            unscaled_dt: 0.0,
+            elapsed: 0.0,
+            unscaled_elapsed: 0.0,
+            fixed_dt: 1.0 / 60.0,
+            scale: 1.0,
+            frame: 0,
+        }
+    }
+}
+
+impl ScriptFrameTime {
+    /// Maximum unscaled delta accepted from runtime clocks.
+    pub const MAX_UNSCALED_DELTA: f32 = 0.25;
+
+    /// Advances accumulated scaled and unscaled time from one unscaled frame delta.
+    pub fn advance(
+        unscaled_dt: f32,
+        scale: f32,
+        elapsed: f64,
+        unscaled_elapsed: f64,
+        fixed_dt: f32,
+        frame: u64,
+    ) -> Self {
+        let unscaled_dt = if unscaled_dt.is_finite() {
+            unscaled_dt.clamp(0.0, Self::MAX_UNSCALED_DELTA)
+        } else {
+            0.0
+        };
+        let scale = if scale.is_finite() && scale >= 0.0 {
+            scale
+        } else {
+            0.0
+        };
+        let dt = unscaled_dt * scale;
+        Self {
+            dt,
+            unscaled_dt,
+            elapsed: elapsed + f64::from(dt),
+            unscaled_elapsed: unscaled_elapsed + f64::from(unscaled_dt),
+            fixed_dt,
+            scale,
+            frame,
+        }
+    }
+}
+
+/// Состояние курсора окна, которое скрипты задают через `rve.input` или Rust SDK.
+///
+/// По умолчанию курсор видим и не удерживается. Значения применяет хост: engine-script
+/// не зависит от окна и не вызывает winit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptCursor {
+    pub visible: bool,
+    pub locked: bool,
+}
+
+impl Default for ScriptCursor {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            locked: false,
+        }
+    }
+}
+
+impl From<CameraCursor> for ScriptCursor {
+    fn from(cursor: CameraCursor) -> Self {
+        Self {
+            visible: !cursor.hide_on_start,
+            locked: cursor.lock_on_start,
+        }
+    }
+}
+
+/// One gamepad slot inside a [`ScriptInput`] snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct PadState {
+    pub(crate) connected: bool,
+    down: u32,
+    pressed: u32,
+    released: u32,
+    /// Axis values in [`GamepadAxis`] code order.
+    axes: [f32; 6],
+}
+
+impl PadState {
+    pub(crate) fn button_state(&self, button: GamepadButton) -> u32 {
+        let bit = 1_u32 << button as u32;
+        state_flags(
+            self.down & bit != 0,
+            self.pressed & bit != 0,
+            self.released & bit != 0,
+        )
+    }
+
+    pub(crate) fn axis(&self, axis: GamepadAxis) -> f32 {
+        self.axes[axis as usize]
+    }
+
+    pub(crate) fn stick(&self, stick: GamepadStick) -> [f32; 2] {
+        let (x, y) = match stick {
+            GamepadStick::Left => (GamepadAxis::LeftX, GamepadAxis::LeftY),
+            GamepadStick::Right => (GamepadAxis::RightX, GamepadAxis::RightY),
+        };
+        [self.axis(x), self.axis(y)]
+    }
+
+    fn to_abi(self) -> RveGamepadState {
+        RveGamepadState {
+            connected: u32::from(self.connected),
+            down: self.down,
+            pressed: self.pressed,
+            released: self.released,
+            axes: self.axes,
+        }
+    }
 }
 
 /// Copyable input snapshot shared by every script during one update.
@@ -25,6 +163,7 @@ pub struct ScriptInput {
     cursor: [f32; 2],
     mouse_delta: [f32; 2],
     wheel: [f32; 2],
+    pads: [PadState; RVE_GAMEPAD_SLOTS],
 }
 
 impl ScriptInput {
@@ -144,17 +283,135 @@ impl ScriptInput {
         self.wheel
     }
 
-    /// Adds released edges for every held key and button.
+    /// Applies one gamepad slot's level snapshot. `index` is 0..=3 for pads 1..=4; other indices
+    /// are ignored. Button edges come from the change against the previous level; axes are
+    /// replaced as given.
+    pub fn set_pad(&mut self, index: usize, connected: bool, buttons: u32, axes: [f32; 6]) {
+        let Some(pad) = self.pads.get_mut(index) else {
+            return;
+        };
+        let buttons = buttons & PAD_BUTTON_MASK;
+        pad.connected = connected;
+        pad.pressed |= buttons & !pad.down;
+        pad.released |= pad.down & !buttons;
+        pad.down = buttons;
+        pad.axes = axes;
+    }
+
+    /// Returns the gamepad state for ABI slot `pad`: 0 is the aggregate of all slots, 1..=4 is one
+    /// slot. Returns `None` for other numbers.
+    pub fn gamepad_state(&self, pad: u32) -> Option<RveGamepadState> {
+        match pad {
+            0 => Some(self.aggregate_gamepad()),
+            1..=4 => Some(self.pads[pad as usize - 1].to_abi()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pad(&self, index: usize) -> PadState {
+        self.pads[index]
+    }
+
+    /// Aggregate of all slots: buttons are ORed, triggers take the largest magnitude, and each
+    /// stick is the whole vector of the slot with the longest stick.
+    fn aggregate_gamepad(&self) -> RveGamepadState {
+        let mut total = RveGamepadState::default();
+        for pad in &self.pads {
+            total.connected |= u32::from(pad.connected);
+            total.down |= pad.down;
+            total.pressed |= pad.pressed;
+            total.released |= pad.released;
+        }
+        for (axis, value) in [GamepadAxis::LeftTrigger, GamepadAxis::RightTrigger]
+            .into_iter()
+            .map(|axis| {
+                let value = self
+                    .pads
+                    .iter()
+                    .map(|pad| pad.axis(axis))
+                    .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+                    .unwrap_or(0.0);
+                (axis, value)
+            })
+        {
+            total.axes[axis as usize] = value;
+        }
+        for stick in [GamepadStick::Left, GamepadStick::Right] {
+            let vector = self
+                .pads
+                .iter()
+                .map(|pad| pad.stick(stick))
+                .max_by(|a, b| (a[0] * a[0] + a[1] * a[1]).total_cmp(&(b[0] * b[0] + b[1] * b[1])))
+                .unwrap_or([0.0; 2]);
+            let (x, y) = match stick {
+                GamepadStick::Left => (GamepadAxis::LeftX, GamepadAxis::LeftY),
+                GamepadStick::Right => (GamepadAxis::RightX, GamepadAxis::RightY),
+            };
+            total.axes[x as usize] = vector[0];
+            total.axes[y as usize] = vector[1];
+        }
+        total
+    }
+
+    /// Adds released edges for every held key, button, and gamepad button; zeroes gamepad axes.
     pub fn release_all(&mut self) {
         self.key_released |= self.key_down;
         self.key_down = 0;
         self.mouse_released |= self.mouse_down;
         self.mouse_down = 0;
+        self.release_pads();
+    }
+
+    fn release_pads(&mut self) {
+        for pad in &mut self.pads {
+            pad.released |= pad.down;
+            pad.down = 0;
+            pad.axes = [0.0; 6];
+        }
     }
 
     /// Clears accumulated pointer motion while preserving the last cursor position.
     pub fn clear_pointer(&mut self) {
         self.mouse_delta = [0.0; 2];
+        self.wheel = [0.0; 2];
+    }
+
+    /// Hides a key from scripts in this frame: its press, hold and release all disappear.
+    /// Used by the runtime to mask input that the game UI consumed.
+    pub fn hide_key(&mut self, key: Key) {
+        let bit = 1_u128 << (key as u32);
+        self.key_down &= !bit;
+        self.key_pressed &= !bit;
+        self.key_released &= !bit;
+    }
+
+    /// Hides a mouse button from scripts in this frame: its press, hold and release all disappear.
+    pub fn hide_mouse_button(&mut self, button: MouseButton) {
+        let bit = 1_u8 << (button as u32);
+        self.mouse_down &= !bit;
+        self.mouse_pressed &= !bit;
+        self.mouse_released &= !bit;
+    }
+
+    /// Hides gamepad buttons (ABI button bits) of the pad at zero-based `index` in this frame.
+    pub fn hide_pad_buttons(&mut self, index: usize, buttons: u32) {
+        if let Some(pad) = self.pads.get_mut(index) {
+            pad.down &= !buttons;
+            pad.pressed &= !buttons;
+            pad.released &= !buttons;
+        }
+    }
+
+    /// Hides the left stick of the pad at zero-based `index` in this frame: its axes read as zero.
+    pub fn hide_pad_left_stick(&mut self, index: usize) {
+        if let Some(pad) = self.pads.get_mut(index) {
+            pad.axes[GamepadAxis::LeftX as usize] = 0.0;
+            pad.axes[GamepadAxis::LeftY as usize] = 0.0;
+        }
+    }
+
+    /// Hides the wheel delta of this frame.
+    pub fn hide_wheel(&mut self) {
         self.wheel = [0.0; 2];
     }
 
@@ -166,6 +423,10 @@ impl ScriptInput {
         self.mouse_released |= self.mouse_down;
         self.mouse_pressed = 0;
         self.mouse_down = 0;
+        self.release_pads();
+        for pad in &mut self.pads {
+            pad.pressed = 0;
+        }
         self.clear_pointer();
     }
 
@@ -184,7 +445,43 @@ impl ScriptInput {
         self.mouse_released = 0;
         self.mouse_delta = [0.0; 2];
         self.wheel = [0.0; 2];
+        for pad in &mut self.pads {
+            pad.pressed = 0;
+            pad.released = 0;
+        }
     }
+}
+
+/// Longest rumble duration a script can request, in seconds.
+pub const MAX_RUMBLE_SECONDS: f32 = 5.0;
+
+/// Force-feedback request committed by a script. `pad` is 0 for every connected gamepad or 1..=4.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RumbleRequest {
+    pub pad: u8,
+    pub strong: f32,
+    pub weak: f32,
+    pub seconds: f32,
+}
+
+impl RumbleRequest {
+    /// Normalizes script arguments: NaN and infinities become zero, intensities clamp to [0, 1],
+    /// and the duration clamps to [0, `MAX_RUMBLE_SECONDS`]. Returns `None` for an unknown slot.
+    pub fn new(pad: u32, strong: f32, weak: f32, seconds: f32) -> Option<Self> {
+        let pad = u8::try_from(pad)
+            .ok()
+            .filter(|pad| usize::from(*pad) <= RVE_GAMEPAD_SLOTS)?;
+        Some(Self {
+            pad,
+            strong: finite_or_zero(strong).clamp(0.0, 1.0),
+            weak: finite_or_zero(weak).clamp(0.0, 1.0),
+            seconds: finite_or_zero(seconds).clamp(0.0, MAX_RUMBLE_SECONDS),
+        })
+    }
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
 }
 
 fn state_flags(down: bool, pressed: bool, released: bool) -> u32 {
@@ -230,5 +527,169 @@ pub struct ScriptEvent {
 impl fmt::Display for ScriptEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.source, self.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rve_sdk::abi::RVE_INPUT_DOWN;
+
+    const SOUTH: u32 = 1 << GamepadButton::South as u32;
+    const EAST: u32 = 1 << GamepadButton::East as u32;
+
+    fn pad_flags(input: &ScriptInput, index: usize, button: GamepadButton) -> u32 {
+        input.pad(index).button_state(button)
+    }
+
+    #[test]
+    fn set_pad_derives_button_edges_from_level_changes() {
+        let mut input = ScriptInput::default();
+        input.set_pad(0, true, SOUTH, [0.0; 6]);
+        assert_eq!(
+            pad_flags(&input, 0, GamepadButton::South),
+            RVE_INPUT_DOWN | rve_sdk::abi::RVE_INPUT_PRESSED
+        );
+
+        input.clear_frame_transients();
+        input.set_pad(0, true, SOUTH, [0.0; 6]);
+        assert_eq!(pad_flags(&input, 0, GamepadButton::South), RVE_INPUT_DOWN);
+
+        input.set_pad(0, true, 0, [0.0; 6]);
+        assert_eq!(
+            pad_flags(&input, 0, GamepadButton::South),
+            rve_sdk::abi::RVE_INPUT_RELEASED
+        );
+    }
+
+    #[test]
+    fn set_pad_ignores_unknown_slots_and_bits_outside_the_button_table() {
+        let mut input = ScriptInput::default();
+        input.set_pad(4, true, u32::MAX, [1.0; 6]);
+        assert_eq!(input, ScriptInput::default());
+
+        input.set_pad(1, true, u32::MAX, [0.0; 6]);
+        assert_eq!(input.gamepad_state(2).unwrap().down, PAD_BUTTON_MASK);
+    }
+
+    #[test]
+    fn clearing_frame_transients_twice_keeps_held_buttons_and_axes_but_drops_edges() {
+        let mut input = ScriptInput::default();
+        input.set_pad(0, true, SOUTH, [0.5, -0.25, 0.0, 0.0, 0.75, 0.0]);
+        input.clear_frame_transients();
+        input.clear_frame_transients();
+
+        assert_eq!(pad_flags(&input, 0, GamepadButton::South), RVE_INPUT_DOWN);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftX), 0.5);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftTrigger), 0.75);
+    }
+
+    #[test]
+    fn hiding_left_stick_zeroes_only_that_sticks_axes_of_one_pad() {
+        let mut input = ScriptInput::default();
+        input.set_pad(0, true, 0, [0.5, -0.25, 0.75, 0.125, 0.25, 0.0]);
+        input.set_pad(1, true, 0, [0.1, 0.2, 0.0, 0.0, 0.0, 0.0]);
+        input.hide_pad_left_stick(0);
+
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftX), 0.0);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftY), 0.0);
+        assert_eq!(input.pad(0).axis(GamepadAxis::RightX), 0.75);
+        assert_eq!(input.pad(0).axis(GamepadAxis::RightY), 0.125);
+        assert_eq!(input.pad(0).axis(GamepadAxis::LeftTrigger), 0.25);
+        assert_eq!(input.pad(1).axis(GamepadAxis::LeftX), 0.1);
+    }
+
+    #[test]
+    fn release_all_and_background_release_pads_and_zero_axes() {
+        let mut input = ScriptInput::default();
+        input.set_pad(2, true, SOUTH | EAST, [0.3; 6]);
+        input.clear_frame_transients();
+        input.release_all();
+        assert_eq!(
+            pad_flags(&input, 2, GamepadButton::South),
+            rve_sdk::abi::RVE_INPUT_RELEASED
+        );
+        assert_eq!(input.pad(2).axis(GamepadAxis::RightY), 0.0);
+
+        input.set_pad(2, true, SOUTH, [0.3; 6]);
+        input.reset_for_background();
+        assert_eq!(
+            pad_flags(&input, 2, GamepadButton::South),
+            rve_sdk::abi::RVE_INPUT_RELEASED
+        );
+        assert_eq!(input.pad(2).axis(GamepadAxis::LeftX), 0.0);
+    }
+
+    #[test]
+    fn gamepad_state_reports_slots_and_rejects_other_numbers() {
+        let mut input = ScriptInput::default();
+        input.set_pad(0, true, SOUTH, [0.2, 0.0, 0.0, 0.0, 0.1, 0.0]);
+        input.set_pad(1, true, EAST, [-0.4, 0.0, 0.0, 0.0, 0.9, 0.0]);
+
+        let slot_two = input.gamepad_state(2).unwrap();
+        assert_eq!(slot_two.connected, 1);
+        assert_eq!(slot_two.down, EAST);
+        assert_eq!(input.gamepad_state(3).unwrap().connected, 0);
+        assert!(input.gamepad_state(5).is_none());
+
+        let aggregate = input.gamepad_state(0).unwrap();
+        assert_eq!(aggregate.connected, 1);
+        assert_eq!(aggregate.down, SOUTH | EAST);
+        assert_eq!(aggregate.axes[GamepadAxis::LeftTrigger as usize], 0.9);
+    }
+
+    #[test]
+    fn aggregate_stick_is_the_whole_vector_of_the_longest_stick() {
+        let mut input = ScriptInput::default();
+        input.set_pad(0, true, 0, [0.3, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        input.set_pad(1, true, 0, [0.0, 0.5, 0.0, 0.0, 0.0, 0.0]);
+        let aggregate = input.gamepad_state(0).unwrap();
+        assert_eq!(aggregate.axes[GamepadAxis::LeftX as usize], 0.0);
+        assert_eq!(aggregate.axes[GamepadAxis::LeftY as usize], 0.5);
+    }
+
+    #[test]
+    fn rumble_requests_normalize_non_finite_and_out_of_range_arguments() {
+        assert_eq!(
+            RumbleRequest::new(0, f32::NAN, f32::INFINITY, -1.0),
+            Some(RumbleRequest {
+                pad: 0,
+                strong: 0.0,
+                weak: 0.0,
+                seconds: 0.0,
+            })
+        );
+        assert_eq!(
+            RumbleRequest::new(4, 2.0, -1.0, 9.0),
+            Some(RumbleRequest {
+                pad: 4,
+                strong: 1.0,
+                weak: 0.0,
+                seconds: MAX_RUMBLE_SECONDS,
+            })
+        );
+        assert_eq!(RumbleRequest::new(5, 0.5, 0.5, 1.0), None);
+    }
+
+    #[test]
+    fn hidden_keys_buttons_pad_buttons_and_wheel_leave_no_edges() {
+        let mut input = ScriptInput::default();
+        input.set_key(Key::Enter, true);
+        input.set_key(Key::A, true);
+        input.set_mouse_button(MouseButton::Left, true);
+        input.set_pad(0, true, 1 << 13, [0.0; 6]);
+        input.add_wheel(0.0, 2.0);
+
+        input.hide_key(Key::Enter);
+        input.hide_mouse_button(MouseButton::Left);
+        input.hide_pad_buttons(0, 1 << 13);
+        input.hide_wheel();
+
+        assert_eq!(input.key_state(Key::Enter as u32), 0);
+        assert!(input.key_down(Key::A) && input.key_pressed(Key::A));
+        assert!(!input.mouse_down(MouseButton::Left) && !input.mouse_pressed(MouseButton::Left));
+        assert_eq!(input.gamepad_state(1).unwrap().pressed, 0);
+        assert_eq!(input.gamepad_state(1).unwrap().down, 0);
+        assert_eq!(input.wheel(), [0.0; 2]);
     }
 }

@@ -4,16 +4,28 @@
 //! `[[instances]]` вставляет раскрытое дерево префаба: корень получает id экземпляра,
 //! остальные объекты — `<экземпляр>.<id в префабе>`, у вложенных — `a.b.c`.
 
+use crate::animation::{AnimatorComponent, validate_animator_fields};
+use crate::audio::{AudioSourceComponent, validate_audio_source};
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, DocumentKind, EnvironmentComponent,
-    MaterialAlphaMode, MaterialOverride, ParamValue, PointLightComponent, SceneAsset,
-    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
-    option_virtual_path_serde, require_asset_path, require_extension, valid_ascii_name,
-    validate_environment, validate_material_override, virtual_path_serde,
+    CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
+    DocumentKind, EnvironmentComponent, MaterialAlphaMode, MaterialOverride, ParamValue,
+    PointLightComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform, SpotLightComponent, mesh_collider_model, option_virtual_path_serde,
+    require_asset_path, require_extension, valid_ascii_name, validate_environment,
+    validate_material_override, validate_screen_shaders, virtual_path_serde,
 };
+use crate::material_slots_serde;
+use crate::network::{
+    NetworkIdentityComponent, NetworkTransformComponent, validate_network_transform,
+};
+use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
+use crate::physics_material::resolve_collider_material;
+use crate::ui_canvas::{UiCanvasComponent, validate_ui_canvas};
+use crate::world::topological_order;
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 use std::rc::Rc;
 
 /// Наибольшая глубина вложенности префабов.
@@ -65,6 +77,23 @@ pub struct PrefabOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spot_light: Option<SpotLightComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collider: Option<ColliderComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rigid_body: Option<RigidBodyComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_controller: Option<CharacterControllerComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_source: Option<AudioSourceComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animator: Option<AnimatorComponent>,
+    pub particle_emitter: Option<ParticleEmitterComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_identity: Option<NetworkIdentityComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_transform: Option<NetworkTransformComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_canvas: Option<UiCanvasComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lite_params: Vec<LiteParamsOverride>,
@@ -102,6 +131,12 @@ pub struct MeshRendererOverride {
     pub texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialOverride>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "material_slots_serde::optional"
+    )]
+    pub materials: Option<Vec<Option<VirtualPath>>>,
 }
 
 /// Слияние `params` lite-скриптов с этим путём по ключам.
@@ -222,6 +257,9 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
                 .get_or_insert_with(MaterialOverride::default);
             merge_material(merged, material);
         }
+        if let Some(materials) = &mesh.materials {
+            target.materials = materials.clone();
+        }
     }
     if let Some(camera) = &change.camera {
         let target = object
@@ -250,6 +288,69 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .as_mut()
             .ok_or("override spot_light: у объекта нет spot_light")?;
         *target = light;
+    }
+    if let Some(collider) = change.collider.clone() {
+        let target = object
+            .collider
+            .as_mut()
+            .ok_or("override collider: у объекта нет collider")?;
+        *target = collider;
+    }
+    if let Some(body) = change.rigid_body {
+        let target = object
+            .rigid_body
+            .as_mut()
+            .ok_or("override rigid_body: у объекта нет rigid_body")?;
+        *target = body;
+    }
+    if let Some(controller) = change.character_controller {
+        let target = object
+            .character_controller
+            .as_mut()
+            .ok_or("override character_controller: у объекта нет character_controller")?;
+        *target = controller;
+    }
+    if let Some(audio) = &change.audio_source {
+        let target = object
+            .audio_source
+            .as_mut()
+            .ok_or("override audio_source: у объекта нет audio_source")?;
+        *target = audio.clone();
+    }
+    if let Some(animator) = &change.animator {
+        let target = object
+            .animator
+            .as_mut()
+            .ok_or("override animator: у объекта нет animator")?;
+        *target = animator.clone();
+    }
+    if let Some(emitter) = &change.particle_emitter {
+        let target = object
+            .particle_emitter
+            .as_mut()
+            .ok_or("override particle_emitter: у объекта нет particle_emitter")?;
+        *target = emitter.clone();
+    }
+    if let Some(identity) = change.network_identity {
+        let target = object
+            .network_identity
+            .as_mut()
+            .ok_or("override network_identity: у объекта нет network_identity")?;
+        *target = identity;
+    }
+    if let Some(transform) = change.network_transform {
+        let target = object
+            .network_transform
+            .as_mut()
+            .ok_or("override network_transform: у объекта нет network_transform")?;
+        *target = transform;
+    }
+    if let Some(canvas) = &change.ui_canvas {
+        let target = object
+            .ui_canvas
+            .as_mut()
+            .ok_or("override ui_canvas: у объекта нет ui_canvas")?;
+        *target = canvas.clone();
     }
     if let Some(environment) = &change.environment {
         let target = object
@@ -339,6 +440,205 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
     }
 }
 
+/// Синтетический экземпляр, через который раскрывается шаблон spawn.
+const TEMPLATE_INSTANCE: &str = "template";
+
+/// Префаб, готовый к [`crate::World::spawn`]. Объекты хранятся с id относительно корня:
+/// корень — пустой id, дети — `a.b`.
+#[derive(Clone, Debug)]
+pub struct PrefabTemplate {
+    pub(crate) stem: String,
+    assets: Vec<SceneAsset>,
+    pub(crate) objects: Vec<SceneObject>,
+    /// Индекс родителя каждого объекта в `objects`.
+    pub(crate) parents: Vec<Option<usize>>,
+    /// Индексы `objects` в порядке «родитель раньше потомка».
+    pub(crate) order: Vec<usize>,
+    pub(crate) root: usize,
+    /// Причина, по которой префаб нельзя заспавнить; `None`, если ограничений нет.
+    spawn_rejection: Option<SceneError>,
+}
+
+impl PrefabTemplate {
+    /// Раскрывает префаб `path` и проверяет его структуру. `read_text` читает текст
+    /// `.rveprefab` по виртуальному пути, в том числе вложенных префабов.
+    ///
+    /// Ошибка возвращается только для префаба, который не читается, не разбирается или
+    /// структурно неверен. Ограничения spawn-префаба проверяет [`Self::check_spawnable`]:
+    /// префаб с камерой или окружением допустим как экземпляр сцены.
+    pub fn load(
+        path: &VirtualPath,
+        read_text: &mut dyn FnMut(&VirtualPath) -> Result<String, String>,
+    ) -> Result<Self, SceneError> {
+        let document = SceneDocument {
+            assets: vec![SceneAsset {
+                path: path.clone(),
+                archive: None,
+                max_instances: None,
+            }],
+            objects: Vec::new(),
+            instances: vec![PrefabInstance {
+                id: TEMPLATE_INSTANCE.to_owned(),
+                name: None,
+                parent: None,
+                prefab: path.clone(),
+                transform: None,
+                overrides: Vec::new(),
+            }],
+            source_label: format!("/{}", path.as_str()),
+            kind: DocumentKind::Prefab,
+            expanded: false,
+        };
+        let mut load = |child: &VirtualPath| -> Result<SceneDocument, SceneError> {
+            let label = format!("/{}", child.as_str());
+            let text =
+                read_text(child).map_err(|message| SceneError::new(&label, None, message))?;
+            SceneDocument::parse_prefab(label, &text)
+        };
+        let expanded = expand(&document, &mut load)?.document;
+        let label = expanded.source_label().to_owned();
+        let spawn_rejection = spawn_rejection(&expanded.objects, &label);
+
+        let index_of = expanded
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| (object.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let parents = expanded
+            .objects
+            .iter()
+            .map(|object| object.parent.as_deref().map(|parent| index_of[parent]))
+            .collect::<Vec<_>>();
+        let ids = expanded
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>();
+        let order = topological_order(&parents, &ids, &label)?;
+        let root = parents
+            .iter()
+            .position(Option::is_none)
+            .expect("проверенный префаб имеет корень");
+        let objects = expanded
+            .objects
+            .iter()
+            .map(|object| {
+                let mut object = SceneObject {
+                    id: local_id(&object.id).to_owned(),
+                    parent: object
+                        .parent
+                        .as_deref()
+                        .map(|parent| local_id(parent).to_owned()),
+                    ..object.clone()
+                };
+                remap_object_param_refs(&mut object, |reference| {
+                    reference
+                        .strip_prefix(TEMPLATE_INSTANCE)
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .map(|local| format!("__template.{local}"))
+                        .or_else(|| {
+                            (reference == TEMPLATE_INSTANCE).then(|| "__template".to_owned())
+                        })
+                });
+                object
+            })
+            .collect();
+        let stem = Path::new(path.as_str())
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        Ok(Self {
+            stem,
+            assets: expanded.assets,
+            objects,
+            parents,
+            order,
+            root,
+            spawn_rejection,
+        })
+    }
+
+    /// Проверяет, что префаб допустим для spawn: в нём нет camera, directional_light и
+    /// environment. Dynamic rigid body и character controller допускаются только у корня:
+    /// это уже проверяет валидация документа при [`Self::load`]. Ошибка не означает, что
+    /// префаб нельзя использовать как экземпляр сцены.
+    pub fn check_spawnable(&self) -> Result<(), SceneError> {
+        self.spawn_rejection.clone().map_or(Ok(()), Err)
+    }
+
+    /// Читает `.rvephysmat` коллайдеров объектов шаблона и заполняет их разрешённые материалы.
+    pub fn resolve_physics_materials(
+        &mut self,
+        read: &mut dyn FnMut(&VirtualPath) -> Result<String, String>,
+    ) -> Result<(), SceneError> {
+        let mut cache = BTreeMap::new();
+        for object in &mut self.objects {
+            if let Some(collider) = object.collider.as_mut() {
+                resolve_collider_material(collider, &self.stem, &object.id, read, &mut cache)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ресурсы шаблона, включая ресурсы вложенных префабов.
+    pub fn assets(&self) -> &[SceneAsset] {
+        &self.assets
+    }
+
+    /// Объекты шаблона с id относительно корня; корень — объект без `parent`.
+    pub fn objects(&self) -> &[SceneObject] {
+        &self.objects
+    }
+
+    /// Пути моделей мешевых коллайдеров объектов шаблона: без повторов, по возрастанию пути.
+    /// Остальные модели шаблона нужны только для отрисовки.
+    pub fn mesh_collider_models(&self) -> BTreeSet<&str> {
+        self.objects
+            .iter()
+            .filter_map(|object| {
+                mesh_collider_model(object.collider.clone(), object.mesh_renderer.as_ref())
+            })
+            .collect()
+    }
+
+    /// Имя файла префаба без расширения: основа для генерируемых id.
+    pub(crate) fn stem(&self) -> &str {
+        &self.stem
+    }
+}
+
+/// Id объекта относительно корня шаблона: корень — пустой, дети — `a.b`.
+fn local_id(expanded: &str) -> &str {
+    expanded
+        .strip_prefix(TEMPLATE_INSTANCE)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or("")
+}
+
+/// Первый объект раскрытого префаба, который запрещён для spawn: camera, directional_light или
+/// environment.
+fn spawn_rejection(objects: &[SceneObject], label: &str) -> Option<SceneError> {
+    objects.iter().find_map(|object| {
+        let forbidden = if object.camera.is_some() {
+            "camera"
+        } else if object.directional_light.is_some() {
+            "directional_light"
+        } else if object.environment.is_some() {
+            "environment"
+        } else {
+            return None;
+        };
+        let local = local_id(&object.id);
+        Some(SceneError::new(
+            label,
+            (!local.is_empty()).then_some(local),
+            format!("spawn-префаб не может содержать {forbidden}"),
+        ))
+    })
+}
+
 /// Раскрытый id: сегменты `[A-Za-z0-9_-]{1,64}` через точку, всего до 255 байт.
 pub fn valid_expanded_id(id: &str) -> bool {
     id.len() <= MAX_EXPANDED_ID_BYTES
@@ -397,6 +697,22 @@ pub(crate) fn validate_instances(
                     require_asset_path(source, id, assets, texture, "текстура override")?;
                     require_extension(source, id, texture, "png", "текстура override")?;
                 }
+                for material in mesh.materials.iter().flatten().flatten() {
+                    require_asset_path(
+                        source,
+                        id,
+                        assets,
+                        material,
+                        "материал части меша override",
+                    )?;
+                    require_extension(
+                        source,
+                        id,
+                        material,
+                        "rvemat",
+                        "материал части меша override",
+                    )?;
+                }
                 if let Some(material) = &mesh.material {
                     validate_material_override(source, id, assets, material)?;
                 }
@@ -415,8 +731,60 @@ pub(crate) fn validate_instances(
                     "настройки камеры override",
                 )?;
             }
+            if let Some(post_process) = change
+                .camera
+                .as_ref()
+                .and_then(|camera| camera.post_process.as_ref())
+            {
+                require_asset_path(
+                    source,
+                    id,
+                    assets,
+                    post_process,
+                    "постобработка камеры override",
+                )?;
+                require_extension(
+                    source,
+                    id,
+                    post_process,
+                    "postprocess",
+                    "постобработка камеры override",
+                )?;
+            }
+            if let Some(camera) = change.camera.as_ref() {
+                validate_screen_shaders(source, id, assets, &camera.screen_shaders)?;
+            }
+            if let Some(material) = change
+                .collider
+                .as_ref()
+                .and_then(|collider| collider.material.as_ref())
+            {
+                require_asset_path(source, id, assets, material, "физический материал override")?;
+                require_extension(
+                    source,
+                    id,
+                    material,
+                    "rvephysmat",
+                    "физический материал override",
+                )?;
+            }
             if let Some(environment) = &change.environment {
                 validate_environment(source, id, assets, environment)?;
+            }
+            if let Some(audio) = &change.audio_source {
+                validate_audio_source(source, id, assets, audio)?;
+            }
+            if let Some(animator) = &change.animator {
+                validate_animator_fields(source, id, assets, animator)?;
+            }
+            if let Some(emitter) = &change.particle_emitter {
+                validate_particle_emitter(source, id, assets, emitter)?;
+            }
+            if let Some(transform) = &change.network_transform {
+                validate_network_transform(source, id, transform)?;
+            }
+            if let Some(canvas) = &change.ui_canvas {
+                validate_ui_canvas(source, id, assets, canvas)?;
             }
         }
     }
@@ -458,6 +826,17 @@ impl Expander<'_, '_> {
             let prefab = self.prefab(&instance.prefab, source)?;
             assets.merge(&prefab.assets, source)?;
             let mut local = prefab.objects.clone();
+            let local_ids = local
+                .iter()
+                .map(|object| object.id.clone())
+                .collect::<HashSet<_>>();
+            for object in &mut local {
+                remap_object_param_refs(object, |reference| {
+                    local_ids
+                        .contains(reference)
+                        .then(|| map_id(&instance.id, &prefab.root, reference))
+                });
+            }
             if skip_overrides != Some(instance.id.as_str()) {
                 for change in &instance.overrides {
                     let object = local
@@ -589,6 +968,41 @@ impl Expander<'_, '_> {
     }
 }
 
+fn remap_object_param_refs(
+    object: &mut SceneObject,
+    mut remap: impl FnMut(&str) -> Option<String>,
+) {
+    fn remap_params(
+        params: &mut BTreeMap<String, crate::ParamValue>,
+        remap: &mut impl FnMut(&str) -> Option<String>,
+    ) {
+        fn visit(value: &mut crate::ParamValue, remap: &mut impl FnMut(&str) -> Option<String>) {
+            match value {
+                crate::ParamValue::Object(id) if !id.is_empty() => {
+                    if let Some(mapped) = remap(id) {
+                        *id = mapped;
+                    }
+                }
+                crate::ParamValue::Array(values) => {
+                    for value in values {
+                        visit(value, remap);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for value in params.values_mut() {
+            visit(value, remap);
+        }
+    }
+    for script in &mut object.lite_scripts {
+        remap_params(&mut script.params, &mut remap);
+    }
+    for script in &mut object.heavy_scripts {
+        remap_params(&mut script.params, &mut remap);
+    }
+}
+
 /// Id объекта префаба в документе экземпляра: корень — id экземпляра, остальные —
 /// `<экземпляр>.<локальный id>`.
 fn map_id(instance: &str, root: &str, local: &str) -> String {
@@ -600,7 +1014,8 @@ fn map_id(instance: &str, root: &str, local: &str) -> String {
 }
 
 /// Объединение `[[assets]]` по пути. Явный архив документа с экземпляром побеждает;
-/// разные явные архивы из разных префабов — ошибка.
+/// разные явные архивы из разных префабов — ошибка. Записи вложенных префабов не несут
+/// `max_instances`: лимит берётся только из записи самого документа.
 struct AssetMerge {
     entries: Vec<SceneAsset>,
     /// Индекс записи и признак, что её архив задан самим документом.
@@ -626,7 +1041,11 @@ impl AssetMerge {
                 None => {
                     self.index
                         .insert(asset.path.clone(), (self.entries.len(), false));
-                    self.entries.push(asset.clone());
+                    // Лимит экземпляров задаёт только запись самого документа, не вложенного префаба.
+                    self.entries.push(SceneAsset {
+                        max_instances: None,
+                        ..asset.clone()
+                    });
                 }
                 Some((_, true)) => {}
                 Some((position, false)) => {

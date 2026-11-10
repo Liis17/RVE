@@ -3,6 +3,7 @@
 use crate::RenderError;
 use ash::vk;
 use std::collections::VecDeque;
+use std::ops::Range;
 
 /// Вершина UI pass.
 ///
@@ -53,56 +54,74 @@ pub(crate) struct UiDraw {
     pub index_count: u32,
 }
 
-/// Вершины и индексы всех примитивов кадра для копирования в буферы слота.
+/// Вершины и индексы UI всех видов кадра и swapchain для копирования в буферы слота.
+///
+/// Все части кадра лежат в одних буферах; смещения накапливаются между вызовами `append`.
 #[derive(Debug, Default)]
 pub(crate) struct PackedUi {
     pub vertices: Vec<u8>,
     pub indices: Vec<u8>,
     pub draws: Vec<UiDraw>,
+    /// Число уже упакованных вершин и индексов: база смещений следующего примитива.
+    vertex_count: usize,
+    index_count: usize,
 }
 
-/// Проверяет примитивы и складывает видимые в общие буферы.
-///
-/// Примитив без геометрии или с пустым после обрезки `clip_rect` не попадает в кадр.
-pub(crate) fn pack_ui(
-    primitives: &[UiPrimitive<'_>],
-    extent: vk::Extent2D,
-) -> Result<PackedUi, RenderError> {
-    let mut packed = PackedUi::default();
-    let mut vertex_count = 0_usize;
-    let mut index_count = 0_usize;
-    for primitive in primitives {
-        validate_ui_geometry(primitive.vertices.len(), primitive.indices)?;
-        if primitive.indices.is_empty() {
-            continue;
+impl PackedUi {
+    /// Проверяет примитивы и добавляет видимые в конец буферов.
+    ///
+    /// Возвращает диапазон добавленных вызовов в `draws`. Примитив без геометрии или с пустым
+    /// после обрезки `clip_rect` не попадает в кадр.
+    pub(crate) fn append(
+        &mut self,
+        primitives: &[UiPrimitive<'_>],
+        extent: vk::Extent2D,
+    ) -> Result<Range<usize>, RenderError> {
+        let start = self.draws.len();
+        for primitive in primitives {
+            validate_ui_geometry(primitive.vertices.len(), primitive.indices)?;
+            if primitive.indices.is_empty() {
+                continue;
+            }
+            let Some(scissor) = clip_to_extent(primitive.clip_rect, extent) else {
+                continue;
+            };
+            let vertex_offset = i32::try_from(self.vertex_count)
+                .map_err(|_| RenderError::InvalidMesh("слишком много вершин UI"))?;
+            let first_index = u32::try_from(self.index_count)
+                .map_err(|_| RenderError::InvalidMesh("слишком много индексов UI"))?;
+            self.draws.push(UiDraw {
+                image: primitive.image,
+                scissor,
+                first_index,
+                vertex_offset,
+                // Длина среза не может превысить u32: индексы проверены и их сумма тоже.
+                index_count: primitive.indices.len() as u32,
+            });
+            self.vertices
+                .extend_from_slice(ui_vertex_bytes(primitive.vertices));
+            self.indices
+                .extend_from_slice(crate::index_bytes(primitive.indices));
+            self.vertex_count += primitive.vertices.len();
+            self.index_count += primitive.indices.len();
         }
-        let Some(scissor) = clip_to_extent(primitive.clip_rect, extent) else {
-            continue;
-        };
-        let vertex_offset = i32::try_from(vertex_count)
-            .map_err(|_| RenderError::InvalidMesh("слишком много вершин UI"))?;
-        let first_index = u32::try_from(index_count)
+        u32::try_from(self.index_count)
             .map_err(|_| RenderError::InvalidMesh("слишком много индексов UI"))?;
-        packed.draws.push(UiDraw {
-            image: primitive.image,
-            scissor,
-            first_index,
-            vertex_offset,
-            // Длина среза не может превысить u32: индексы проверены и их сумма тоже.
-            index_count: primitive.indices.len() as u32,
-        });
-        packed
-            .vertices
-            .extend_from_slice(ui_vertex_bytes(primitive.vertices));
-        packed
-            .indices
-            .extend_from_slice(crate::index_bytes(primitive.indices));
-        vertex_count += primitive.vertices.len();
-        index_count += primitive.indices.len();
+        Ok(start..self.draws.len())
     }
-    u32::try_from(index_count)
-        .map_err(|_| RenderError::InvalidMesh("слишком много индексов UI"))?;
-    Ok(packed)
+}
+
+/// `Frame::ui` рисуется внутри output pass вида, поэтому результат другого viewport там недоступен.
+pub(crate) fn validate_frame_ui(primitives: &[UiPrimitive<'_>]) -> Result<(), RenderError> {
+    if primitives
+        .iter()
+        .any(|primitive| matches!(primitive.image, UiImage::Viewport(_)))
+    {
+        return Err(RenderError::InvalidTexture(
+            "UI вида ссылается на viewport; разрешены только текстуры".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ui_geometry(vertex_count: usize, indices: &[u32]) -> Result<(), RenderError> {
@@ -377,11 +396,17 @@ mod tests {
         assert_eq!(std::mem::offset_of!(UiVertex, color), 16);
     }
 
+    fn pack(primitives: &[UiPrimitive<'_>], extent: vk::Extent2D) -> Result<PackedUi, RenderError> {
+        let mut packed = PackedUi::default();
+        packed.append(primitives, extent)?;
+        Ok(packed)
+    }
+
     #[test]
     fn packing_concatenates_primitives_with_offsets() {
         let first = vertices(3);
         let second = vertices(4);
-        let packed = pack_ui(
+        let packed = pack(
             &[
                 primitive(&first, &[0, 1, 2]),
                 primitive(&second, &[0, 1, 2, 1, 2, 3]),
@@ -398,25 +423,100 @@ mod tests {
     }
 
     #[test]
-    fn packing_skips_empty_and_fully_clipped_primitives() {
+    fn batch_slices_pack_exactly_their_own_vertices() {
+        // Три батча одного draw list: каждый несёт только свои вершины, индексы локальны.
+        let all = vertices(9);
+        let packed = pack(
+            &[
+                primitive(&all[0..3], &[0, 1, 2]),
+                primitive(&all[3..7], &[0, 1, 2, 1, 2, 3]),
+                primitive(&all[7..9], &[1, 0, 1]),
+            ],
+            EXTENT,
+        )
+        .unwrap();
+        assert_eq!(packed.vertices.len(), 9 * size_of::<UiVertex>());
+        assert_eq!(packed.indices.len(), 12 * size_of::<u32>());
+        let offsets: Vec<i32> = packed.draws.iter().map(|draw| draw.vertex_offset).collect();
+        assert_eq!(offsets, vec![0, 3, 7]);
+    }
+
+    #[test]
+    fn several_views_share_buffers_with_continuing_offsets() {
+        let view_a = vertices(3);
+        let view_b = vertices(4);
+        let swapchain = vertices(3);
+        let mut packed = PackedUi::default();
+        let range_a = packed
+            .append(&[primitive(&view_a, &[0, 1, 2])], EXTENT)
+            .unwrap();
+        let range_b = packed
+            .append(&[primitive(&view_b, &[0, 1, 2, 1, 2, 3])], EXTENT)
+            .unwrap();
+        let range_ui = packed
+            .append(&[primitive(&swapchain, &[0, 1, 2])], EXTENT)
+            .unwrap();
+        assert_eq!((range_a, range_b, range_ui.clone()), (0..1, 1..2, 2..3));
+        assert_eq!(packed.draws[1].first_index, 3);
+        assert_eq!(packed.draws[1].vertex_offset, 3);
+        assert_eq!(packed.draws[range_ui.start].first_index, 9);
+        assert_eq!(packed.draws[range_ui.start].vertex_offset, 7);
+        assert_eq!(packed.vertices.len(), 10 * size_of::<UiVertex>());
+        assert_eq!(packed.indices.len(), 12 * size_of::<u32>());
+    }
+
+    #[test]
+    fn packing_skips_empty_zero_sized_and_fully_clipped_primitives() {
         let triangle = vertices(3);
         let mut clipped = primitive(&triangle, &[0, 1, 2]);
         clipped.clip_rect = [200.0, 0.0, 300.0, 50.0];
-        let packed = pack_ui(&[clipped, primitive(&triangle, &[])], EXTENT).unwrap();
+        let packed = pack(&[clipped, primitive(&triangle, &[])], EXTENT).unwrap();
         assert!(packed.draws.is_empty());
         assert!(packed.vertices.is_empty());
         assert!(packed.indices.is_empty());
+
+        // Вид нулевого размера (свёрнутое окно) не даёт вызовов, но геометрия валидируется.
+        let zero = vk::Extent2D {
+            width: 0,
+            height: 0,
+        };
+        let mut packed = PackedUi::default();
+        let range = packed
+            .append(&[primitive(&triangle, &[0, 1, 2])], zero)
+            .unwrap();
+        assert!(range.is_empty());
+        assert!(packed.vertices.is_empty());
+        assert!(matches!(
+            packed.append(&[primitive(&triangle, &[0, 1])], zero),
+            Err(RenderError::InvalidMesh(_))
+        ));
+    }
+
+    #[test]
+    fn frame_ui_rejects_viewport_images_and_accepts_textures() {
+        let triangle = vertices(3);
+        let texture = primitive(&triangle, &[0, 1, 2]);
+        assert!(validate_frame_ui(&[texture]).is_ok());
+        assert!(validate_frame_ui(&[]).is_ok());
+        let viewport = UiPrimitive {
+            image: UiImage::Viewport(ViewportId(0)),
+            ..texture
+        };
+        assert!(matches!(
+            validate_frame_ui(&[texture, viewport]),
+            Err(RenderError::InvalidTexture(_))
+        ));
     }
 
     #[test]
     fn packing_rejects_partial_triangles_and_out_of_range_indices() {
         let triangle = vertices(3);
         assert!(matches!(
-            pack_ui(&[primitive(&triangle, &[0, 1])], EXTENT),
+            pack(&[primitive(&triangle, &[0, 1])], EXTENT),
             Err(RenderError::InvalidMesh(_))
         ));
         assert!(matches!(
-            pack_ui(&[primitive(&triangle, &[0, 1, 3])], EXTENT),
+            pack(&[primitive(&triangle, &[0, 1, 3])], EXTENT),
             Err(RenderError::InvalidMesh(_))
         ));
     }

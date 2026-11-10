@@ -1,0 +1,36 @@
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+# Башня для тяжёлого префаба: корень без компонентов и два статических блока-ребёнка.
+# Нижний блок занимает высоту 0…1.2 м, верхний — 1.2…2.1 м.
+[[objects]]
+id = "tower"
+name = "Tower"
+
+[[objects]]
+id = "tower-base"
+name = "Tower Base"
+parent = "tower"
+[objects.transform]
+position = [0.0, 0.6, 0.0]
+scale = [0.6, 0.6, 0.6]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+[[objects]]
+id = "tower-top"
+name = "Tower Top"
+parent = "tower"
+[objects.transform]
+position = [0.0, 1.65, 0.0]
+scale = [0.45, 0.45, 0.45]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.mesh_renderer.material]
+base_color = [0.8, 0.45, 0.2]
+metallic = 0.0
+roughness = 0.6
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]

@@ -2,21 +2,29 @@
 //! выполняет главный поток, когда модель готова.
 
 use engine_assets::{Assets, Model};
+use engine_files::VirtualPath;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-type LoadFn = Arc<dyn Fn(&str) -> Result<Model, String> + Send + Sync>;
-type LoadResult = (u64, String, Result<Model, String>);
+type LoadFn = Arc<dyn Fn(&str) -> Result<LoadedModel, String> + Send + Sync>;
+type LoadResult = (u64, String, Result<LoadedModel, String>);
 
-/// Очередь загрузки моделей. Поколение растёт при сбросе: результаты, начатые до Refresh
-/// или смены проекта, отбрасываются.
+#[derive(Debug)]
+pub struct LoadedModel {
+    pub model: Model,
+    pub dependencies: Vec<VirtualPath>,
+    pub dependency_warning: Option<String>,
+}
+
+/// Очередь загрузки моделей. Поколение растёт только при смене проекта.
 #[derive(Default)]
 pub struct ModelLoader {
     load: Option<LoadFn>,
     worker: Option<Worker>,
     generation: u64,
     pending: HashSet<String>,
+    stale: HashSet<String>,
 }
 
 struct Worker {
@@ -50,7 +58,25 @@ impl ModelLoader {
     /// Загружает модели из ресурсов проекта; прежняя очередь сбрасывается.
     pub fn restart(&mut self, assets: Assets) {
         self.restart_with(Arc::new(move |path: &str| {
-            assets.load_model(path).map_err(|error| error.to_string())
+            let model = assets.load_model(path).map_err(|error| error.to_string())?;
+            let (dependencies, dependency_warning) = match assets
+                .model_dependencies(path)
+                .map_err(|error| error.to_string())
+            {
+                Ok(paths) => (
+                    paths
+                        .into_iter()
+                        .filter_map(|path| VirtualPath::parse(&path).ok())
+                        .collect(),
+                    None,
+                ),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            Ok(LoadedModel {
+                model,
+                dependencies,
+                dependency_warning,
+            })
         }));
     }
 
@@ -59,6 +85,7 @@ impl ModelLoader {
         self.worker = None;
         self.generation += 1;
         self.pending.clear();
+        self.stale.clear();
     }
 
     /// Ставит модель в очередь, если она ещё не загружается. `false` — загрузка невозможна:
@@ -89,13 +116,32 @@ impl ModelLoader {
         self.pending.contains(path)
     }
 
+    /// Перезагружает модель; незавершённый результат помечается устаревшим.
+    pub fn reload(&mut self, path: &str) -> bool {
+        if self.pending.contains(path) {
+            self.stale.insert(path.to_owned());
+            true
+        } else {
+            self.request(path)
+        }
+    }
+
+    /// Помечает все незавершённые разборы устаревшими после изменения PNG или каталога.
+    pub fn stale_pending(&mut self) {
+        self.stale.extend(self.pending.iter().cloned());
+    }
+
+    pub fn pending_paths(&self) -> impl Iterator<Item = &str> {
+        self.pending.iter().map(String::as_str)
+    }
+
     /// Есть незавершённые загрузки: окно должно проснуться, чтобы показать результат.
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 
     /// Готовые модели текущего поколения; не блокирует.
-    pub fn finished(&mut self) -> Vec<(String, Result<Model, String>)> {
+    pub fn finished(&mut self) -> Vec<(String, Result<LoadedModel, String>)> {
         let results = self
             .worker
             .as_ref()
@@ -104,14 +150,19 @@ impl ModelLoader {
         self.accept(results)
     }
 
-    fn accept(&mut self, results: Vec<LoadResult>) -> Vec<(String, Result<Model, String>)> {
-        results
-            .into_iter()
-            .filter(|(generation, path, _)| {
-                *generation == self.generation && self.pending.remove(path)
-            })
-            .map(|(_, path, model)| (path, model))
-            .collect()
+    fn accept(&mut self, results: Vec<LoadResult>) -> Vec<(String, Result<LoadedModel, String>)> {
+        let mut accepted = Vec::new();
+        for (generation, path, result) in results {
+            if generation != self.generation || !self.pending.remove(&path) {
+                continue;
+            }
+            if self.stale.remove(&path) {
+                self.request(&path);
+                continue;
+            }
+            accepted.push((path, result));
+        }
+        accepted
     }
 }
 
@@ -123,7 +174,7 @@ mod tests {
 
     impl ModelLoader {
         /// Ждёт хотя бы один результат потока; без `sleep`, блокирующим приёмом.
-        fn wait_finished(&mut self) -> Vec<(String, Result<Model, String>)> {
+        fn wait_finished(&mut self) -> Vec<(String, Result<LoadedModel, String>)> {
             let worker = self.worker.as_ref().unwrap();
             let first = worker.results.recv().unwrap();
             let mut results = vec![first];
@@ -136,6 +187,19 @@ mod tests {
         Model {
             meshes: Vec::new(),
             textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
+        }
+    }
+
+    fn loaded_model(dependencies: &[&str]) -> LoadedModel {
+        LoadedModel {
+            model: empty_model(),
+            dependencies: dependencies
+                .iter()
+                .map(|path| VirtualPath::parse(path).unwrap())
+                .collect(),
+            dependency_warning: None,
         }
     }
 
@@ -150,7 +214,7 @@ mod tests {
             if path == "bad.fbx" {
                 Err("broken".to_owned())
             } else {
-                Ok(empty_model())
+                Ok(loaded_model(&[]))
             }
         }));
         assert!(loader.request("a.fbx"));
@@ -175,7 +239,7 @@ mod tests {
             if path == "crash.fbx" {
                 panic!("broken parser");
             }
-            Ok(empty_model())
+            Ok(loaded_model(&[]))
         }));
         assert!(loader.request("crash.fbx"));
         let done = loader.wait_finished();
@@ -199,8 +263,22 @@ mod tests {
             done.extend(loader.wait_finished());
         }
         done.sort_by(|a, b| a.0.cmp(&b.0));
-        assert!(done[0].1.as_ref().unwrap().bounds().is_some());
+        assert!(done[0].1.as_ref().unwrap().model.bounds().is_some());
         assert!(done[1].1.is_err());
+    }
+
+    #[test]
+    fn loaded_demo_model_returns_its_external_png_dependencies() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let project = crate::project::OpenProject::open(std::path::Path::new(dir)).unwrap();
+        let mut loader = ModelLoader::default();
+        loader.restart(project.assets.clone());
+        assert!(loader.request("models/props-cube.fbx"));
+        let loaded = loader.wait_finished().remove(0).1.unwrap();
+        assert_eq!(
+            loaded.dependencies,
+            [VirtualPath::parse("textures/props.png").unwrap()]
+        );
     }
 
     #[test]
@@ -212,12 +290,12 @@ mod tests {
         let old_gate = Arc::clone(&gate);
         loader.restart_with(Arc::new(move |_: &str| {
             old_gate.lock().unwrap().recv().unwrap();
-            Ok(empty_model())
+            Ok(loaded_model(&[]))
         }));
         assert!(loader.request("old.fbx"));
         // Старый поток остаётся у теста, чтобы дождаться его опоздавшего результата.
         let stale = loader.worker.take().unwrap();
-        loader.restart_with(Arc::new(|_: &str| Ok(empty_model())));
+        loader.restart_with(Arc::new(|_: &str| Ok(loaded_model(&[]))));
         assert!(!loader.has_pending());
         release.send(()).unwrap();
         // Результат старого поколения не принимается, даже если пришёл.
@@ -230,5 +308,65 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].0, "new.fbx");
         assert!(!loader.has_pending());
+    }
+
+    #[test]
+    fn reload_during_pending_discards_the_old_result_and_repeats() {
+        let (release, gate) = channel::<()>();
+        let gate = Arc::new(Mutex::new(gate));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut loader = ModelLoader::default();
+        let worker_gate = Arc::clone(&gate);
+        let worker_calls = Arc::clone(&calls);
+        loader.restart_with(Arc::new(move |_: &str| {
+            if worker_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                worker_gate.lock().unwrap().recv().unwrap();
+                Ok(loaded_model(&["old.png"]))
+            } else {
+                Ok(loaded_model(&["new.png"]))
+            }
+        }));
+        assert!(loader.request("ship.fbx"));
+        assert!(loader.reload("ship.fbx"));
+        release.send(()).unwrap();
+        let mut done = Vec::new();
+        while loader.has_pending() {
+            done.extend(loader.wait_finished());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].1.as_ref().unwrap().dependencies[0].as_str(),
+            "new.png"
+        );
+    }
+
+    #[test]
+    fn changed_png_marks_initial_pending_model_stale_and_returns_dependencies() {
+        let (release, gate) = channel::<()>();
+        let gate = Arc::new(Mutex::new(gate));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut loader = ModelLoader::default();
+        let worker_gate = Arc::clone(&gate);
+        let worker_calls = Arc::clone(&calls);
+        loader.restart_with(Arc::new(move |_: &str| {
+            if worker_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                worker_gate.lock().unwrap().recv().unwrap();
+            }
+            Ok(loaded_model(&["textures/ship.png"]))
+        }));
+        assert!(loader.request("ship.fbx"));
+        loader.stale_pending();
+        release.send(()).unwrap();
+        let mut done = Vec::new();
+        while loader.has_pending() {
+            done.extend(loader.wait_finished());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].1.as_ref().unwrap().dependencies[0].as_str(),
+            "textures/ship.png"
+        );
     }
 }

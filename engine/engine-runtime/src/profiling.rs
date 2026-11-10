@@ -1,0 +1,669 @@
+//! CPU- и GPU-замеры потоков runtime: окна по фазам и публикация отчётов в `ProfileBoard`.
+//!
+//! Потоки записывают замеры в кольцевые окна без аллокаций в кадре. Окно строит
+//! отчёт и публикует его не чаще [`PUBLISH_INTERVAL`]: эти аллокации происходят
+//! с частотой показа, а не на горячем пути.
+
+use engine_core::profile::{
+    ProfileBoard, ProfileGroup, ProfileReport, ProfileRow, ProfileValue, RollingStat, StatSummary,
+};
+use engine_render::{DrawStats, FrameProfile, GpuPass};
+use engine_resources::{ResourceHandle, ResourceSampler};
+use engine_script::ScriptUpdateProfile;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+pub(crate) const SOURCE_SCRIPTS: &str = "scripts";
+pub(crate) const SOURCE_RENDER: &str = "render";
+pub(crate) const SOURCE_RESOURCES: &str = "resources";
+pub(crate) const SOURCE_STARTUP: &str = "startup";
+
+/// Заголовок группы счётчиков draw'ов последнего кадра в отчёте потока рендера.
+pub(crate) const DRAWS_GROUP: &str = "Draws (last frame)";
+
+/// Число последних замеров, по которым считаются last, avg и max.
+const SAMPLE_WINDOW: usize = 240;
+/// Частота публикации отчёта одного потока.
+pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Группы и фазы, которые записывает поток сцены.
+pub(crate) mod script_phase {
+    pub const LOOP: usize = 0;
+    pub const UPDATE: usize = 1;
+
+    pub const PHYSICS_WAIT: usize = 0;
+    pub const CONSOLE_COMMANDS: usize = 1;
+    pub const SCRIPTS_UPDATE: usize = 2;
+    pub const PHYSICS_SYNC: usize = 3;
+    pub const BUILD_FRAME: usize = 4;
+    pub const MAKE_SNAPSHOT: usize = 5;
+    pub const SNAPSHOT_SEND_WAIT: usize = 6;
+    pub const WORLD_CHANGES: usize = 7;
+    pub const PREFAB_REPLIES: usize = 8;
+    pub const UI: usize = 9;
+
+    pub const UPDATE_TOTAL: usize = 0;
+    pub const UPDATE_WORLD_MATRICES: usize = 1;
+    pub const UPDATE_MESSAGES: usize = 2;
+    pub const UPDATE_PHYSICS_EVENTS: usize = 3;
+    pub const UPDATE_LUA: usize = 4;
+    pub const UPDATE_RUST: usize = 5;
+    pub const UPDATE_OTHER: usize = 6;
+}
+
+/// Группы и фазы, которые записывает поток рендера.
+pub(crate) mod render_phase {
+    pub const LOOP: usize = 0;
+    pub const RENDERER: usize = 1;
+    pub const GPU: usize = 2;
+
+    pub const FRAME_WAIT: usize = 0;
+    pub const RENDER_BACKEND: usize = 1;
+    pub const RESOURCE_REQUESTS: usize = 2;
+
+    pub const PREPARE: usize = 0;
+    pub const FENCE_WAIT: usize = 1;
+    pub const UPLOADS: usize = 2;
+    pub const ACQUIRE: usize = 3;
+    pub const RECORD: usize = 4;
+    pub const SUBMIT: usize = 5;
+    pub const PRESENT: usize = 6;
+}
+
+/// Названия групп и меток окна потока сцены.
+pub(crate) fn scripts_groups() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (
+            "Scripts thread",
+            vec![
+                "physics wait",
+                "console commands",
+                "scripts update",
+                "physics sync",
+                "build frame",
+                "make snapshot",
+                "snapshot send wait",
+                "world changes",
+                "prefab replies",
+                "ui",
+            ],
+        ),
+        (
+            "Script update",
+            vec![
+                "total",
+                "world matrices",
+                "messages",
+                "physics events",
+                "Lua instances",
+                "Rust instances",
+                "other",
+            ],
+        ),
+    ]
+}
+
+/// Названия групп и меток окна потока рендера, включая GPU-проходы первого вида.
+pub(crate) fn render_groups() -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut gpu: Vec<&'static str> = GpuPass::ALL.iter().map(|pass| pass.label()).collect();
+    gpu.extend(["total", "output + UI"]);
+    vec![
+        (
+            "Render thread",
+            vec!["frame wait", "render backend", "resource requests"],
+        ),
+        (
+            "Renderer CPU",
+            vec![
+                "prepare",
+                "fence wait",
+                "uploads",
+                "acquire",
+                "record",
+                "submit",
+                "present",
+            ],
+        ),
+        ("GPU (first view)", gpu),
+    ]
+}
+
+/// Источник статистики ресурсов: снимок берётся вместе с окнами фаз и публикуется отдельным отчётом.
+struct ResourceFeed {
+    handle: ResourceHandle,
+    sampler: ResourceSampler,
+}
+
+struct PhaseGroup {
+    title: &'static str,
+    labels: Vec<&'static str>,
+    stats: Vec<RollingStat>,
+    /// Была ли запись метки с последней публикации. Метка без записей за интервал сбрасывается.
+    touched: Vec<bool>,
+}
+
+/// Окна одного потока по группам фаз. Публикует отчёт в доску не чаще [`PUBLISH_INTERVAL`].
+pub(crate) struct PhaseWindow {
+    source: &'static str,
+    board: Arc<ProfileBoard>,
+    groups: Vec<PhaseGroup>,
+    next_publish: Option<Instant>,
+    resources: Option<ResourceFeed>,
+    /// Счётчики draw'ов последнего кадра интервала; `None`, если кадров не было.
+    draws: Option<DrawStats>,
+}
+
+impl PhaseWindow {
+    /// Создаёт окна на весь набор групп; память выделяется здесь, а не в кадре.
+    pub(crate) fn new(
+        source: &'static str,
+        board: Arc<ProfileBoard>,
+        groups: Vec<(&'static str, Vec<&'static str>)>,
+    ) -> Self {
+        let groups = groups
+            .into_iter()
+            .map(|(title, labels)| PhaseGroup {
+                title,
+                stats: labels
+                    .iter()
+                    .map(|_| RollingStat::new(SAMPLE_WINDOW))
+                    .collect(),
+                touched: vec![false; labels.len()],
+                labels,
+            })
+            .collect();
+        Self {
+            source,
+            board,
+            groups,
+            next_publish: None,
+            resources: None,
+            draws: None,
+        }
+    }
+
+    /// Добавляет статистику запросов ресурсов: она публикуется в [`SOURCE_RESOURCES`] при каждой публикации окон.
+    pub(crate) fn with_resources(mut self, handle: Option<ResourceHandle>) -> Self {
+        self.resources = handle.map(|handle| ResourceFeed {
+            handle,
+            sampler: ResourceSampler::default(),
+        });
+        self
+    }
+
+    /// Записывает замер метки `phase` группы `group`.
+    pub(crate) fn record(&mut self, group: usize, phase: usize, elapsed: Duration) {
+        let group = &mut self.groups[group];
+        group.stats[phase].push(elapsed);
+        group.touched[phase] = true;
+    }
+
+    /// Записывает замер, если он есть; `None` оставляет окно без изменений.
+    pub(crate) fn record_optional(
+        &mut self,
+        group: usize,
+        phase: usize,
+        elapsed: Option<Duration>,
+    ) {
+        if let Some(elapsed) = elapsed {
+            self.record(group, phase, elapsed);
+        }
+    }
+
+    /// Запоминает счётчики draw'ов кадра; в отчёт попадают счётчики последнего кадра интервала.
+    pub(crate) fn record_draws(&mut self, draws: DrawStats) {
+        self.draws = Some(draws);
+    }
+
+    /// Публикует отчёт, если с прошлой публикации прошёл интервал. Первый вызов публикует сразу.
+    pub(crate) fn publish_if_due(&mut self, now: Instant) {
+        if self.next_publish.is_some_and(|next| now < next) {
+            return;
+        }
+        self.next_publish = Some(now + PUBLISH_INTERVAL);
+        self.retire_untouched();
+        self.board.publish(self.source, self.report());
+        // Интервал без кадров не показывает счётчики прошлого интервала.
+        self.draws = None;
+        if let Some(resources) = &mut self.resources {
+            resources.sampler.sample(resources.handle.stats());
+            self.board.publish(
+                SOURCE_RESOURCES,
+                ProfileReport {
+                    groups: vec![resources.sampler.profile_group()],
+                },
+            );
+        }
+    }
+
+    /// Сбрасывает окна меток, которых не было в интервале, и начинает новый интервал.
+    fn retire_untouched(&mut self) {
+        for group in &mut self.groups {
+            for (stat, touched) in group.stats.iter_mut().zip(group.touched.iter_mut()) {
+                if !*touched {
+                    stat.clear();
+                }
+                *touched = false;
+            }
+        }
+    }
+
+    /// Строит отчёт по текущим окнам. Метки без замеров, в том числе сброшенные, получают `None`.
+    pub(crate) fn report(&self) -> ProfileReport {
+        let draws = self.draws.map(|draws| ProfileGroup {
+            name: DRAWS_GROUP,
+            rows: DrawStats::LABELS
+                .iter()
+                .zip(draws.values())
+                .map(|(&label, value)| ProfileRow {
+                    label,
+                    value: ProfileValue::Count(u64::from(value)),
+                })
+                .collect(),
+        });
+        ProfileReport {
+            groups: self
+                .groups
+                .iter()
+                .map(|group| ProfileGroup {
+                    name: group.title,
+                    rows: group
+                        .labels
+                        .iter()
+                        .zip(&group.stats)
+                        .map(|(&label, stat)| ProfileRow {
+                            label,
+                            value: ProfileValue::from_summary(stat.summary()),
+                        })
+                        .collect(),
+                })
+                .chain(draws)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn board(&self) -> &Arc<ProfileBoard> {
+        &self.board
+    }
+}
+
+/// Переносит профиль кадра renderer в окна потока рендера.
+pub(crate) fn record_frame_profile(window: &mut PhaseWindow, frame: &FrameProfile) {
+    use render_phase::{ACQUIRE, FENCE_WAIT, PREPARE, PRESENT, RECORD, RENDERER, SUBMIT, UPLOADS};
+    let cpu = frame.cpu;
+    window.record(RENDERER, PREPARE, cpu.prepare);
+    window.record(RENDERER, FENCE_WAIT, cpu.fence_wait);
+    window.record(RENDERER, UPLOADS, cpu.uploads);
+    window.record(RENDERER, ACQUIRE, cpu.acquire);
+    window.record(RENDERER, RECORD, cpu.record);
+    window.record(RENDERER, SUBMIT, cpu.submit);
+    window.record(RENDERER, PRESENT, cpu.present);
+    window.record_draws(frame.draws);
+    let Some(gpu) = frame.gpu else {
+        return;
+    };
+    if let Some(view) = gpu.views[0] {
+        for (pass, elapsed) in view.passes.iter().enumerate() {
+            window.record_optional(render_phase::GPU, pass, *elapsed);
+        }
+        window.record(render_phase::GPU, GpuPass::COUNT, view.total);
+    }
+    window.record_optional(render_phase::GPU, GpuPass::COUNT + 1, gpu.output_ui);
+}
+
+/// Переносит замеры одного `update` скриптов в окна потока сцены.
+pub(crate) fn record_update_profile(window: &mut PhaseWindow, profile: ScriptUpdateProfile) {
+    use script_phase::{
+        UPDATE, UPDATE_LUA, UPDATE_MESSAGES, UPDATE_OTHER, UPDATE_PHYSICS_EVENTS, UPDATE_RUST,
+        UPDATE_TOTAL, UPDATE_WORLD_MATRICES,
+    };
+    window.record(UPDATE, UPDATE_TOTAL, profile.total);
+    window.record(UPDATE, UPDATE_WORLD_MATRICES, profile.world_matrices);
+    window.record(UPDATE, UPDATE_MESSAGES, profile.messages);
+    window.record(UPDATE, UPDATE_PHYSICS_EVENTS, profile.physics_events);
+    window.record(UPDATE, UPDATE_LUA, profile.lua);
+    window.record(UPDATE, UPDATE_RUST, profile.rust);
+    window.record(UPDATE, UPDATE_OTHER, profile.other());
+}
+
+/// Замеры старта по фазам в порядке выполнения.
+#[derive(Default)]
+pub(crate) struct StartupProfile {
+    phases: Vec<(&'static str, Duration)>,
+}
+
+impl StartupProfile {
+    pub(crate) fn record(&mut self, label: &'static str, elapsed: Duration) {
+        self.phases.push((label, elapsed));
+    }
+
+    /// Публикует отчёт старта с итогом в конце. Вызывается один раз после подготовки.
+    pub(crate) fn publish(&self, board: &ProfileBoard) {
+        let total: Duration = self.phases.iter().map(|(_, elapsed)| *elapsed).sum();
+        let mut rows: Vec<ProfileRow> = self
+            .phases
+            .iter()
+            .map(|&(label, elapsed)| ProfileRow {
+                label,
+                value: ProfileValue::Timing(StatSummary::once(elapsed)),
+            })
+            .collect();
+        rows.push(ProfileRow {
+            label: "total",
+            value: ProfileValue::Timing(StatSummary::once(total)),
+        });
+        board.publish(
+            SOURCE_STARTUP,
+            ProfileReport {
+                groups: vec![ProfileGroup {
+                    name: "Startup",
+                    rows,
+                }],
+            },
+        );
+    }
+}
+
+/// Строки команды `profile`: отчёты всех источников подряд или подсказка, если данных ещё нет.
+#[cfg(any(feature = "dev-console", test))]
+pub(crate) fn profile_command_lines(reports: &[(&'static str, Arc<ProfileReport>)]) -> Vec<String> {
+    if reports.is_empty() {
+        return vec!["данных профайлера ещё нет".to_owned()];
+    }
+    reports
+        .iter()
+        .flat_map(|(_, report)| {
+            report
+                .to_string()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Пишет опубликованный отчёт старта в лог одной записью. Пустой отчёт ничего не пишет.
+pub(crate) fn log_startup_profile(board: &ProfileBoard) {
+    if let Some((_, report)) = board
+        .reports()
+        .into_iter()
+        .find(|(source, _)| *source == SOURCE_STARTUP)
+    {
+        log::info!("startup profile:\n{report}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine_render::{GpuFrameTimings, GpuViewTimings, ProfiledView, RenderCpuTimings};
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    fn row(report: &ProfileReport, group: usize, label: &str) -> Option<StatSummary> {
+        report.groups[group]
+            .rows
+            .iter()
+            .find(|row| row.label == label)
+            .and_then(|row| match row.value {
+                ProfileValue::Timing(summary) => Some(summary),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn publication_happens_at_most_once_per_interval() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        let start = Instant::now();
+
+        window.publish_if_due(start);
+        let first = board.reports()[0].1.clone();
+        window.publish_if_due(start + PUBLISH_INTERVAL - ms(1));
+        assert!(Arc::ptr_eq(&first, &board.reports()[0].1));
+
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+        assert!(!Arc::ptr_eq(&first, &board.reports()[0].1));
+    }
+
+    #[test]
+    fn resource_stats_are_published_with_each_phase_interval() {
+        let resources =
+            engine_resources::ResourceSystem::start(engine_resources::ResourceConfig::default())
+                .unwrap();
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER, SOURCE_RESOURCES]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups())
+            .with_resources(Some(resources.handle()));
+        let start = Instant::now();
+
+        window.publish_if_due(start);
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        let reports = board.reports();
+        let (_, report) = reports
+            .iter()
+            .find(|(source, _)| *source == SOURCE_RESOURCES)
+            .expect("статистика ресурсов опубликована вместе с окнами фаз");
+        assert_eq!(report.groups[0].name, "Resources");
+        let completed = report.groups[0]
+            .rows
+            .iter()
+            .find(|row| row.label == "completed / interval")
+            .map(|row| row.value);
+        assert_eq!(completed, Some(ProfileValue::Count(0)));
+    }
+
+    #[test]
+    fn label_missing_for_a_whole_interval_is_reported_as_missing() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        let start = Instant::now();
+        let clusters = GpuPass::Clusters as usize;
+        let tonemap = GpuPass::Tonemap as usize;
+        window.record(render_phase::GPU, clusters, ms(2));
+        window.publish_if_due(start);
+        assert!(gpu_row(&board, "Clusters").is_some());
+
+        window.record(render_phase::GPU, tonemap, ms(1));
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        assert_eq!(gpu_row(&board, "Clusters"), None);
+        assert!(gpu_row(&board, "Tonemap").is_some());
+    }
+
+    #[test]
+    fn label_seen_within_an_interval_keeps_its_window() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        let start = Instant::now();
+        let clusters = GpuPass::Clusters as usize;
+        window.record(render_phase::GPU, clusters, ms(2));
+        window.publish_if_due(start);
+
+        window.record(render_phase::GPU, clusters, ms(4));
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        assert_eq!(gpu_row(&board, "Clusters").map(|s| s.samples), Some(2));
+    }
+
+    fn gpu_row(board: &ProfileBoard, label: &str) -> Option<StatSummary> {
+        let reports = board.reports();
+        row(&reports[0].1, render_phase::GPU, label)
+    }
+
+    #[test]
+    fn labels_without_samples_are_reported_as_missing() {
+        let mut window = PhaseWindow::new(
+            SOURCE_RENDER,
+            Arc::new(ProfileBoard::new(&[SOURCE_RENDER])),
+            render_groups(),
+        );
+        window.record(render_phase::RENDERER, render_phase::PREPARE, ms(2));
+
+        let report = window.report();
+        assert_eq!(
+            row(&report, render_phase::RENDERER, "prepare").map(|s| s.samples),
+            Some(1)
+        );
+        assert_eq!(row(&report, render_phase::RENDERER, "fence wait"), None);
+    }
+
+    #[test]
+    fn frame_profile_maps_first_view_passes_and_keeps_missing_ones_empty() {
+        let mut window = PhaseWindow::new(
+            SOURCE_RENDER,
+            Arc::new(ProfileBoard::new(&[SOURCE_RENDER])),
+            render_groups(),
+        );
+        let mut passes = [None; GpuPass::COUNT];
+        passes[GpuPass::Clusters as usize] = Some(ms(2));
+        passes[GpuPass::Tonemap as usize] = Some(ms(1));
+        let frame = FrameProfile {
+            cpu: RenderCpuTimings {
+                prepare: ms(1),
+                ..RenderCpuTimings::default()
+            },
+            gpu: Some(GpuFrameTimings {
+                views: [
+                    Some(GpuViewTimings {
+                        key: ProfiledView::Screen,
+                        passes,
+                        total: ms(3),
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                output_ui: None,
+            }),
+            draws: DrawStats {
+                scene_draw_calls: 7,
+                scene_culled: 2,
+                shadow_draw_calls: 5,
+                shadow_culled: 1,
+            },
+        };
+
+        record_frame_profile(&mut window, &frame);
+
+        let report = window.report();
+        assert!(row(&report, render_phase::GPU, "Clusters").is_some());
+        assert_eq!(row(&report, render_phase::GPU, "Shadow directional"), None);
+        assert_eq!(
+            row(&report, render_phase::GPU, "total").map(|s| s.last),
+            Some(ms(3))
+        );
+        assert_eq!(row(&report, render_phase::GPU, "output + UI"), None);
+        assert_eq!(
+            row(&report, render_phase::RENDERER, "prepare").map(|s| s.last),
+            Some(ms(1))
+        );
+    }
+
+    fn draw_counts(report: &ProfileReport) -> Option<Vec<(&'static str, ProfileValue)>> {
+        report
+            .groups
+            .iter()
+            .find(|group| group.name == DRAWS_GROUP)
+            .map(|group| {
+                group
+                    .rows
+                    .iter()
+                    .map(|row| (row.label, row.value))
+                    .collect()
+            })
+    }
+
+    #[test]
+    fn frame_draw_stats_are_reported_as_counts_of_the_last_frame() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        assert_eq!(draw_counts(&window.report()), None);
+
+        let frame = |scene_draw_calls| FrameProfile {
+            draws: DrawStats {
+                scene_draw_calls,
+                scene_culled: 3,
+                shadow_draw_calls: 9,
+                shadow_culled: 0,
+            },
+            ..FrameProfile::default()
+        };
+        record_frame_profile(&mut window, &frame(4));
+        record_frame_profile(&mut window, &frame(6));
+
+        assert_eq!(
+            draw_counts(&window.report()),
+            Some(vec![
+                ("scene draw calls", ProfileValue::Count(6)),
+                ("scene culled", ProfileValue::Count(3)),
+                ("shadow draw calls", ProfileValue::Count(9)),
+                ("shadow culled", ProfileValue::Count(0)),
+            ])
+        );
+    }
+
+    #[test]
+    fn draw_stats_disappear_after_an_interval_without_frames() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        let start = Instant::now();
+        record_frame_profile(&mut window, &FrameProfile::default());
+        window.publish_if_due(start);
+        assert!(draw_counts(&board.reports()[0].1).is_some());
+
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        assert_eq!(draw_counts(&board.reports()[0].1), None);
+    }
+
+    #[test]
+    fn profile_command_lists_every_published_group() {
+        let board = ProfileBoard::new(&[SOURCE_STARTUP, SOURCE_RENDER]);
+        let mut startup = StartupProfile::default();
+        startup.record("scene load", ms(1));
+        startup.publish(&board);
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::new(board), render_groups());
+        window.record(render_phase::RENDERER, render_phase::PREPARE, ms(2));
+        window.publish_if_due(Instant::now());
+        let board = window.board().clone();
+
+        let lines = profile_command_lines(&board.reports());
+
+        assert!(lines.iter().any(|line| line == "Startup"));
+        assert!(lines.iter().any(|line| line == "Renderer CPU"));
+        assert!(lines.iter().any(|line| line.contains("scene load")));
+        assert!(lines.iter().any(|line| line.contains("total")));
+        assert!(lines.iter().any(|line| line.contains("prepare")));
+    }
+
+    #[test]
+    fn profile_command_without_reports_says_there_is_no_data_yet() {
+        let board = ProfileBoard::new(&[SOURCE_STARTUP]);
+
+        assert_eq!(
+            profile_command_lines(&board.reports()),
+            ["данных профайлера ещё нет"]
+        );
+    }
+
+    #[test]
+    fn startup_report_lists_phases_in_order_and_ends_with_total() {
+        let board = ProfileBoard::new(&[SOURCE_STARTUP]);
+        let mut startup = StartupProfile::default();
+        startup.record("scene load", ms(1));
+        startup.record("renderer", ms(2));
+        startup.record("GPU upload", ms(3));
+
+        startup.publish(&board);
+
+        let reports = board.reports();
+        let report = &reports[0].1;
+        let labels: Vec<&str> = report.groups[0].rows.iter().map(|row| row.label).collect();
+        assert_eq!(labels, ["scene load", "renderer", "GPU upload", "total"]);
+        assert_eq!(row(report, 0, "total"), Some(StatSummary::once(ms(6))));
+        assert!(report.to_string().contains("6.000 ms"));
+    }
+}

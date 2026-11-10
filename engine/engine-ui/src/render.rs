@@ -1,46 +1,10 @@
 //! Мост между выводом egui и UI pass в `engine-render`.
 
+pub use crate::game::UiTextures;
 use egui::epaint::{ClippedPrimitive, Primitive, Vertex};
 use egui::{ImageData, Rect, TextureId, TexturesDelta};
-use engine_render::{
-    RenderError, Renderer, UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId,
-};
+use engine_render::{RenderError, UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 use std::collections::HashMap;
-
-/// Операции с UI-текстурами; отделены от `Renderer` для проверки без GPU.
-pub trait UiTextures {
-    type Id: Copy;
-
-    fn create(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Self::Id, RenderError>;
-    fn update(
-        &mut self,
-        texture: Self::Id,
-        region: [u32; 4],
-        rgba: &[u8],
-    ) -> Result<(), RenderError>;
-    fn free(&mut self, texture: Self::Id) -> Result<(), RenderError>;
-}
-
-impl UiTextures for Renderer {
-    type Id = UiTextureId;
-
-    fn create(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<UiTextureId, RenderError> {
-        self.create_ui_texture(width, height, rgba)
-    }
-
-    fn update(
-        &mut self,
-        texture: UiTextureId,
-        region: [u32; 4],
-        rgba: &[u8],
-    ) -> Result<(), RenderError> {
-        self.update_ui_texture(texture, region, rgba)
-    }
-
-    fn free(&mut self, texture: UiTextureId) -> Result<(), RenderError> {
-        self.free_ui_texture(texture)
-    }
-}
 
 /// Текстуры, которыми управляет сам egui: шрифты и загруженные через него изображения.
 pub struct ManagedTextures<T> {

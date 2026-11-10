@@ -1,27 +1,40 @@
-use super::world;
-use crate::ScriptTime;
+use super::{sources, world};
 use crate::host::{ScriptHost, ScriptLoadError};
-use crate::transaction::{
-    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_STRING_BYTES,
-    MAX_MESSAGES_PER_FRAME,
-};
+use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec};
+use crate::transaction::{MAX_MESSAGE_NAME_BYTES, MAX_MESSAGES_PER_FRAME};
 use crate::types::ScriptEventLevel;
-use engine_scene::World;
+use crate::ui::owner_key;
+use crate::{ScriptFrameTime, ScriptTime};
+use engine_files::VirtualPath;
+use engine_gui::document::UiDocument;
+use engine_gui::system::UiCanvasHandle;
+use engine_physics::{PhysicsSceneDesc, PhysicsSceneSync};
+use engine_project::{InputAction, InputSettings};
+use engine_scene::{
+    AudioRequest, MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
+    PrefabTemplate, World,
+};
 use rve_sdk::abi::{
-    RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
-    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveStatus, RveStr,
-    RveTransform, RveValue,
+    RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
+    RVE_SPAWN_HAS_PARENT, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCreateFn, RveHeader, RveHost,
+    RveModule, RveParamDescV13, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3,
+    RveScriptDescV4, RveScriptDescV6, RveScriptDescV13, RveScriptDescV15, RveScriptDescV16,
+    RveScriptDescV17, RveScriptDescV19, RveScriptDescV20, RveSpawnOptions, RveStatus, RveStr,
+    RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
-    AntiAliasing, CameraSettings, ConsoleLevel, Key, MouseButton, Params, Script, Tonemapper, Value,
+    AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
+    NetTarget, Object, Params, PhysicalInput, Script, ScriptRef, Tonemapper, UiEvent, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static PROBE_DROPS: AtomicUsize = AtomicUsize::new(0);
+static REJECTED_PROPERTY_SPEED_BITS: AtomicU64 = AtomicU64::new(0);
+static PROPERTY_SETTER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CREATE_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static ERROR_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static BULK_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
@@ -43,6 +56,19 @@ struct Probe {
 }
 
 struct InputProbe;
+struct PhysicsProbe;
+struct InputActionsProbe(u8);
+struct ReferenceProbe {
+    target: Object,
+    camera: Object,
+}
+struct ReferenceReceiver;
+struct InvalidScriptRefProbe;
+struct StaleScriptRefProbe {
+    target: Option<Object>,
+    script: Option<ScriptRef>,
+    destroyed: bool,
+}
 
 struct CameraControl {
     panic_update: bool,
@@ -53,11 +79,117 @@ struct AbiConsoleCommand {
 }
 
 struct AbiConsoleForeign;
+struct QuitProbe {
+    fail_after_quit: bool,
+}
 
 fn camera_control_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(CameraControl {
         panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
     }))
+}
+
+fn quit_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(QuitProbe {
+        fail_after_quit: matches!(params.get("fail_after_quit"), Some(Value::Bool(true))),
+    }))
+}
+
+impl Script for QuitProbe {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        assert!(ctx.quit());
+        if self.fail_after_quit {
+            panic!("quit probe failed after requesting exit");
+        }
+        ctx.log_info("quit probe succeeded");
+    }
+}
+
+fn reference_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let Some(Value::Object(target)) = params.get("target") else {
+        return Err("target parameter is not an object handle".to_owned());
+    };
+    let Some(Value::Object(camera)) = params.get("camera") else {
+        return Err("camera parameter is not an object handle".to_owned());
+    };
+    Ok(Box::new(ReferenceProbe {
+        target: *target,
+        camera: *camera,
+    }))
+}
+
+fn reference_receiver_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ReferenceReceiver))
+}
+
+fn invalid_script_ref_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(InvalidScriptRefProbe))
+}
+
+fn stale_script_ref_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(StaleScriptRefProbe {
+        target: None,
+        script: None,
+        destroyed: false,
+    }))
+}
+
+impl Script for ReferenceProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        assert_eq!(self.target.id(ctx).as_deref(), Some("target"));
+        assert_eq!(self.target.name(ctx).as_deref(), Some("Target Camera"));
+        assert_eq!(self.camera.id(ctx).as_deref(), Some("target"));
+        assert_eq!(ctx.object().id(ctx).as_deref(), Some("camera"));
+        assert!(ctx.send("target", "object", &Value::Object(ctx.object())));
+    }
+}
+
+impl Script for ReferenceReceiver {
+    fn on_message(&mut self, ctx: &mut rve_sdk::Context<'_>, _: &str, name: &str, value: &Value) {
+        if name == "dead_ref" {
+            let Value::Object(object) = value else {
+                panic!("ABI object message was not decoded as an object handle");
+            };
+            assert_eq!(object.id(ctx), None);
+            ctx.log_info("ABI missing object message became null");
+            return;
+        }
+        if name == "object" {
+            let Value::Object(object) = value else {
+                panic!("object message was not decoded as a handle");
+            };
+            assert_eq!(object.id(ctx).as_deref(), Some("camera"));
+            ctx.log_info("ABI object message received");
+        }
+    }
+}
+
+impl Script for InvalidScriptRefProbe {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        let target = ctx.find("target").expect("target exists");
+        let script = target.script(ctx, "PropertyProbe").expect("script exists");
+        assert!(script.get(ctx, "missing").is_none());
+        panic!("invalid property should retain host error details");
+    }
+}
+
+impl Script for StaleScriptRefProbe {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let target = ctx.find("target").expect("target exists");
+        self.script = target.script(ctx, "PropertyProbe");
+        self.target = Some(target);
+    }
+
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        if !self.destroyed {
+            assert!(self.target.expect("target was captured").destroy(ctx, 0.0));
+            self.destroyed = true;
+            return;
+        }
+        let script = self.script.expect("script was captured");
+        assert!(script.get(ctx, "speed").is_none());
+        panic!("stale script reference should retain host error details");
+    }
 }
 
 impl Script for CameraControl {
@@ -138,6 +270,10 @@ fn input_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(InputProbe))
 }
 
+fn physics_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PhysicsProbe))
+}
+
 impl Script for InputProbe {
     fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
         let input = ctx.input();
@@ -151,6 +287,167 @@ impl Script for InputProbe {
         assert_eq!(input.mouse_delta(), [2.5, -3.0]);
         assert_eq!(input.wheel(), [1.0, 0.5]);
         ctx.log_info("ABI input snapshot");
+    }
+}
+
+impl Script for PhysicsProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let actor = ctx.find("actor").expect("actor exists");
+        let crate_object = ctx.find("crate").expect("crate exists");
+        let hit = ctx
+            .physics()
+            .raycast([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 10.0)
+            .expect("raycast succeeds")
+            .expect("crate hit");
+        assert_eq!(hit.object.id(ctx).as_deref(), Some("crate"));
+        assert!(hit.distance > 4.0);
+        assert_eq!(crate_object.get_velocity(ctx).unwrap(), [0.0; 3]);
+        crate_object.set_velocity(ctx, [1.0, 0.0, 0.0]).unwrap();
+        crate_object.add_impulse(ctx, [0.0, 1.0, 0.0]).unwrap();
+        crate_object.add_force(ctx, [0.0, 0.0, 2.0]).unwrap();
+        let movement = actor.move_character(ctx, [0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(movement.translation, [0.0; 3]);
+        assert!(!movement.grounded);
+        assert!(!actor.is_grounded(ctx).unwrap());
+        crate_object.set_collider_enabled(ctx, false).unwrap();
+        assert!(!crate_object.is_collider_enabled(ctx).unwrap());
+        assert!(
+            ctx.physics()
+                .raycast([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 10.0)
+                .unwrap()
+                .is_none()
+        );
+        ctx.log_info("ABI physics API committed");
+    }
+}
+
+struct AudioProbe;
+
+struct AudioRejected;
+
+fn audio_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AudioProbe))
+}
+
+fn audio_rejected_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AudioRejected))
+}
+
+impl Script for AudioProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let actor = ctx.find("actor").expect("actor exists");
+        actor.play_sound(ctx).unwrap();
+        actor.set_sound_volume(ctx, 0.5).unwrap();
+        let options = rve_sdk::ClipOptions {
+            position: Some([1.0, 0.0, 0.0]),
+            ..rve_sdk::ClipOptions::default()
+        };
+        let voice = ctx.play_clip("/audio/hum.wav", options).unwrap();
+        ctx.stop_voice(voice).unwrap();
+        ctx.set_group_volume(rve_sdk::AudioGroup::Music, 0.5)
+            .unwrap();
+        ctx.log_info("ABI audio API staged");
+    }
+}
+
+impl Script for AudioRejected {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let actor = ctx.find("actor").expect("actor exists");
+        actor.play_sound(ctx).unwrap();
+        // The guest ignores the status; the host must still report the reason.
+        assert_eq!(
+            ctx.play_clip("../escape.wav", rve_sdk::ClipOptions::default()),
+            Err(rve_sdk::AudioError::Rejected)
+        );
+    }
+}
+
+struct RumbleProbe {
+    panic_after: bool,
+}
+
+fn rumble_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(RumbleProbe {
+        panic_after: matches!(params.get("panic_after"), Some(Value::Bool(true))),
+    }))
+}
+
+impl Script for RumbleProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let input = ctx.input();
+        let accepted = (0..300).filter(|_| input.rumble(1, 0.5, 0.25, 0.1)).count();
+        ctx.log_info(format!("rumble accepted {accepted}"));
+        if self.panic_after {
+            panic!("rumble panic");
+        }
+    }
+}
+
+fn input_actions_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(InputActionsProbe(0)))
+}
+
+impl Script for InputActionsProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        match self.0 {
+            0 => {
+                {
+                    let input = ctx.input();
+                    assert_eq!(input.context().as_deref(), Some("game"));
+                    assert!(input.action_down("Jump"));
+                    assert!(input.action_pressed("Jump"));
+                    assert!(!input.action_released("Jump"));
+                    assert_eq!(input.axis("MoveX"), Some(1.5));
+                    let [x, y] = input.vector("Move").unwrap();
+                    assert!((x - 1.7071068).abs() < 0.0001);
+                    assert!((y - 0.20710677).abs() < 0.0001);
+                    assert_eq!(input.axis("Jump"), None);
+                    assert_eq!(input.vector("Missing"), None);
+                    assert!(!input.action_down("Confirm"));
+                    assert_eq!(
+                        input.bindings("game", "Jump", "inputs"),
+                        Some(vec!["Space".to_owned(), "W".to_owned()])
+                    );
+                    assert_eq!(input.bindings("game", "Empty", "inputs"), Some(Vec::new()));
+                    assert_eq!(input.bindings("missing", "Jump", "inputs"), None);
+                    let presses = input.pressed_inputs();
+                    assert!(presses.contains(&"Space".to_owned()));
+                    assert!(presses.contains(&"W".to_owned()));
+                    assert!(presses.contains(&"D".to_owned()));
+                    assert!(presses.contains(&"Mouse.Left".to_owned()));
+                }
+                assert!(ctx.set_input_context("menu"));
+                assert!(ctx.rebind("game", "Jump", "inputs", &[PhysicalInput::Key(Key::Enter)],));
+                ctx.log_info("ABI v5 action snapshot");
+                self.0 = 1;
+            }
+            1 => {
+                {
+                    let input = ctx.input();
+                    assert_eq!(input.context().as_deref(), Some("menu"));
+                    assert!(!input.action_down("Jump"));
+                    assert!(input.action_released("Jump"));
+                    assert_eq!(
+                        input.bindings("game", "Jump", "inputs"),
+                        Some(vec!["Enter".to_owned()])
+                    );
+                    assert!(input.pressed_inputs().is_empty());
+                }
+                assert!(ctx.reset_bindings());
+                ctx.log_info("ABI v5 action mutations");
+                self.0 = 2;
+            }
+            _ => {
+                let input = ctx.input();
+                assert_eq!(input.context().as_deref(), Some("menu"));
+                assert_eq!(
+                    input.bindings("game", "Jump", "inputs"),
+                    Some(vec!["Space".to_owned(), "W".to_owned()])
+                );
+                assert!(!input.action_released("Jump"));
+                ctx.log_info("ABI v5 action reset");
+            }
+        }
     }
 }
 
@@ -200,6 +497,24 @@ impl Script for Probe {
         if self.panic_destroy {
             panic!("destroy panic");
         }
+    }
+
+    fn on_collision_enter(
+        &mut self,
+        ctx: &mut rve_sdk::Context<'_>,
+        other: rve_sdk::Object,
+        contact: CollisionContact,
+    ) {
+        let id = other.id(ctx).expect("physics event object is readable");
+        ctx.log_info(format!(
+            "abi collision:{id}:{}:{}",
+            contact.point[0], contact.normal[0]
+        ));
+    }
+
+    fn on_trigger_stay(&mut self, ctx: &mut rve_sdk::Context<'_>, other: rve_sdk::Object) {
+        let id = other.id(ctx).expect("trigger event object is readable");
+        ctx.log_info(format!("abi stay:{id}"));
     }
 }
 
@@ -390,6 +705,254 @@ impl Script for LimitMessage {
     }
 }
 
+/// Spawns one bolt from `on_update` and then drives its handle one step per update.
+#[derive(Default)]
+struct SpawnDriver {
+    step: u32,
+    bolt: Option<rve_sdk::Object>,
+}
+
+fn spawn_driver_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(SpawnDriver::default()))
+}
+
+impl Script for SpawnDriver {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let step = self.step;
+        self.step += 1;
+        match step {
+            0 => {
+                let options = rve_sdk::SpawnOptions::new()
+                    .position([1.0, 0.0, 0.0])
+                    .id("bolt")
+                    .name("Bolt");
+                let bolt = ctx.spawn("prefabs/bolt.rveprefab", &options);
+                self.bolt = bolt;
+                ctx.log_info(format!("spawned={}", bolt.is_some()));
+                if let Some(bolt) = bolt {
+                    let pending = bolt.is_pending(ctx);
+                    let alive = bolt.is_alive(ctx);
+                    ctx.log_info(format!("pending={pending} alive={alive}"));
+                }
+                // The target is still pending, so only the transaction's pending ids can resolve it.
+                let sent = ctx.send("bolt", "ping", &rve_sdk::Value::Bool(true));
+                ctx.log_info(format!("sent={sent}"));
+            }
+            1 => {
+                self.log_state(ctx);
+                let destroyed = self.bolt_handle().destroy(ctx, 1.0);
+                ctx.log_info(format!("destroy={destroyed}"));
+            }
+            2 | 3 => self.log_state(ctx),
+            4 => {
+                self.log_state(ctx);
+                let first = self.bolt_handle().destroy(ctx, 0.0);
+                let second = self.bolt_handle().destroy(ctx, 0.0);
+                ctx.log_info(format!("dead_destroy={first}"));
+                ctx.log_info(format!("dead_destroy={second}"));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SpawnDriver {
+    fn bolt_handle(&self) -> rve_sdk::Object {
+        self.bolt.expect("bolt was spawned in the first update")
+    }
+
+    fn log_state(&self, ctx: &mut rve_sdk::Context<'_>) {
+        let bolt = self.bolt_handle();
+        let alive = bolt.is_alive(ctx);
+        let pending = bolt.is_pending(ctx);
+        ctx.log_info(format!("alive={alive} pending={pending}"));
+    }
+}
+
+/// Destroys `victim` on its first update, then calls every handle-taking object API on the dead
+/// object. The guest must see no-op results and no error, and keep running.
+#[derive(Default)]
+struct DeadHandleProbe {
+    step: u32,
+    victim: Option<rve_sdk::Object>,
+}
+
+fn dead_handle_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(DeadHandleProbe::default()))
+}
+
+impl Script for DeadHandleProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        self.step += 1;
+        if self.step == 1 {
+            let victim = ctx.find("victim").expect("victim exists");
+            self.victim = Some(victim);
+            let destroyed = victim.destroy(ctx, 0.0);
+            ctx.log_info(format!("destroy={destroyed}"));
+            return;
+        }
+        let victim = self.victim.expect("victim was found in the first update");
+        let alive = victim.is_alive(ctx);
+        let velocity = victim.get_velocity(ctx).err();
+        let set_velocity = victim.set_velocity(ctx, [1.0, 0.0, 0.0]).err();
+        let movement = victim.move_character(ctx, [0.0; 3]).err();
+        let matrix_none = victim.world_matrix(ctx).is_none();
+        let transform = rve_sdk::Transform {
+            position: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+        };
+        let set_transform = victim.set_transform(ctx, transform);
+        ctx.log_info(format!("alive={alive}"));
+        ctx.log_info(format!("velocity_err={velocity:?}"));
+        ctx.log_info(format!("set_velocity_err={set_velocity:?}"));
+        ctx.log_info(format!("move_err={movement:?}"));
+        ctx.log_info(format!("matrix_none={matrix_none}"));
+        ctx.log_info(format!("set_transform={set_transform}"));
+        ctx.log_info("still running");
+    }
+}
+
+/// Destroys `victim` on its first update, then reports each collision exit it receives and keeps
+/// logging its update number.
+#[derive(Default)]
+struct ExitWatcher {
+    step: u32,
+}
+
+fn exit_watcher_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ExitWatcher::default()))
+}
+
+impl Script for ExitWatcher {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        self.step += 1;
+        if self.step == 1 {
+            let victim = ctx.find("victim").expect("victim exists");
+            let destroyed = victim.destroy(ctx, 0.0);
+            ctx.log_info(format!("destroy={destroyed}"));
+        }
+        ctx.log_info(format!("update {}", self.step));
+    }
+
+    fn on_collision_exit(&mut self, ctx: &mut rve_sdk::Context<'_>, other: rve_sdk::Object) {
+        ctx.log_info(format!("exit alive={}", other.is_alive(ctx)));
+    }
+}
+
+/// Heavy script of the spawned bolt: reports its start, the message sent to its id, and its end.
+struct BoltProbe;
+
+fn bolt_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(BoltProbe))
+}
+
+impl Script for BoltProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let id = ctx.object_id().unwrap_or_default();
+        ctx.log_info(format!("start:{id}"));
+    }
+
+    fn on_message(&mut self, ctx: &mut rve_sdk::Context<'_>, _: &str, name: &str, _: &Value) {
+        ctx.log_info(format!("hit:{name}"));
+    }
+
+    fn on_destroy(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("bolt destroyed");
+    }
+}
+
+/// Logs its lifecycle callbacks so tests can check their order.
+struct TeardownProbe;
+
+fn teardown_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(TeardownProbe))
+}
+
+impl Script for TeardownProbe {
+    fn on_enable(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("enable");
+    }
+
+    fn on_disable(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("disable");
+    }
+
+    fn on_destroy(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("destroy");
+    }
+}
+
+/// Reads prefab states and requests from `on_start`.
+struct PrefabProbe;
+struct ClockProbe;
+
+fn prefab_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PrefabProbe))
+}
+
+impl Script for PrefabProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let prefabs = ctx.prefabs();
+        let resident = prefabs.state("prefabs/bolt.rveprefab");
+        let unknown = prefabs.state("prefabs/missing.rveprefab");
+        let heavy = prefabs.state("prefabs/heavy.rveprefab");
+        let loaded = prefabs.load("prefabs/heavy.rveprefab");
+        let rejected = prefabs.load("prefabs/missing.rveprefab");
+        ctx.log_info(format!(
+            "resident={resident:?} unknown={unknown:?} heavy={heavy:?} load={loaded} rejected={rejected}"
+        ));
+    }
+}
+
+fn clock_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ClockProbe))
+}
+
+impl Script for ClockProbe {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let time = ctx.script_time();
+        assert_eq!(time.dt, 0.25);
+        assert_eq!(time.unscaled_dt, 0.25);
+        assert_eq!(time.elapsed, 0.25);
+        assert_eq!(time.unscaled_elapsed, 0.25);
+        assert_eq!(time.fixed_dt, 0.1);
+        assert_eq!(time.scale, 1.0);
+        assert_eq!(time.frame, 1);
+        assert!(ctx.send("runner", "snapshot", &Value::Bool(true)));
+        ctx.schedule(0.0, None, "pulse").unwrap();
+    }
+
+    fn on_fixed_update(&mut self, ctx: &mut Context<'_>, dt: f32) {
+        assert_eq!(dt, 0.1);
+        assert_eq!(ctx.script_time().dt, dt);
+        ctx.log_info("fixed");
+    }
+
+    fn on_update(&mut self, ctx: &mut Context<'_>, dt: f32) {
+        assert_eq!(dt, 0.25);
+        assert_eq!(ctx.script_time().dt, dt);
+        ctx.log_info("update");
+        ctx.set_time_scale(0.0).unwrap();
+    }
+
+    fn on_message(&mut self, ctx: &mut Context<'_>, _: &str, name: &str, _: &Value) {
+        assert_eq!(name, "snapshot");
+        ctx.log_info("message");
+    }
+
+    fn on_timer(&mut self, ctx: &mut Context<'_>, tag: &str) {
+        assert_eq!(tag, "pulse");
+        ctx.log_info("timer");
+    }
+
+    fn on_late_update(&mut self, ctx: &mut Context<'_>, dt: f32) {
+        assert_eq!(dt, 0.25);
+        assert_eq!(ctx.script_time().dt, dt);
+        ctx.log_info("late");
+    }
+}
+
 fn sdk_module() -> &'static RveModule {
     rve_sdk::script_module! {
         "Probe" => probe_factory,
@@ -399,9 +962,50 @@ fn sdk_module() -> &'static RveModule {
         "Message" => message_factory,
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
+        "PhysicsProbe" => physics_probe_factory,
+        "JumpProbe" => jump_probe_factory,
+        "AudioProbe" => audio_probe_factory,
+        "AudioRejected" => audio_rejected_factory,
+        "RumbleProbe" => rumble_probe_factory,
+        "InputActionsProbe" => input_actions_probe_factory,
+        "SpawnDriver" => spawn_driver_factory,
+        "BoltProbe" => bolt_probe_factory,
+        "TeardownProbe" => teardown_probe_factory,
+        "PrefabProbe" => prefab_probe_factory,
+        "ClockProbe" => clock_probe_factory,
+        "DeadHandleProbe" => dead_handle_probe_factory,
+        "ExitWatcher" => exit_watcher_factory,
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
         "AbiConsoleForeign" => abi_console_foreign_factory,
+        "ReferenceProbe" => reference_probe_factory {
+            target: Option<Object> = None,
+            camera: component(camera) = None,
+        },
+        "ReferenceReceiver" => reference_receiver_factory,
+        "InvalidScriptRefProbe" => invalid_script_ref_factory,
+        "StaleScriptRefProbe" => stale_script_ref_factory,
+        "ScriptRefProbe" => script_ref_probe_factory,
+        "PlatformProbe" => platform_probe_factory,
+        "QuitProbe" => quit_probe_factory {
+            fail_after_quit: bool = false,
+        },
+        "PropertyProbe" => property_probe_factory {
+            speed: f32 = 1.5 (0.0..=10.0),
+        },
+        "StatefulPropertyProbe" => stateful_property_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+        },
+        "RejectingPropertyProbe" => rejecting_property_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+        },
+        "AdvancingRejectingPropertyProbe" => advancing_rejecting_property_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+        },
+        "LaterPropertyValidationProbe" => later_property_validation_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+            later: f64 = 2.5,
+        },
     }
 }
 
@@ -410,6 +1014,59 @@ fn library() -> crate::ScriptLibrary {
     match unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(sdk_module())) } {
         Ok(library) => library,
         Err(error) => panic!("invalid test ABI module: {error}"),
+    }
+}
+
+fn input_action_settings() -> InputSettings {
+    InputSettings {
+        gamepad: Default::default(),
+        default_context: Some("game".to_owned()),
+        contexts: BTreeMap::from([
+            (
+                "game".to_owned(),
+                BTreeMap::from([
+                    (
+                        "Jump".to_owned(),
+                        InputAction::Button {
+                            inputs: vec!["Space".to_owned(), "W".to_owned()],
+                        },
+                    ),
+                    (
+                        "MoveX".to_owned(),
+                        InputAction::Axis {
+                            negative: vec!["A".to_owned()],
+                            positive: vec!["D".to_owned()],
+                            analog: Some("MouseX".to_owned()),
+                            scale: 0.25,
+                        },
+                    ),
+                    (
+                        "Move".to_owned(),
+                        InputAction::Vector2 {
+                            up: vec!["W".to_owned()],
+                            down: vec!["S".to_owned()],
+                            left: vec!["A".to_owned()],
+                            right: vec!["D".to_owned()],
+                            analog: Some("MouseDelta".to_owned()),
+                            scale: 0.5,
+                        },
+                    ),
+                    (
+                        "Empty".to_owned(),
+                        InputAction::Button { inputs: Vec::new() },
+                    ),
+                ]),
+            ),
+            (
+                "menu".to_owned(),
+                BTreeMap::from([(
+                    "Confirm".to_owned(),
+                    InputAction::Button {
+                        inputs: vec!["Enter".to_owned()],
+                    },
+                )]),
+            ),
+        ]),
     }
 }
 
@@ -482,6 +1139,1055 @@ fn abi_v3_descriptor_loads_without_reading_a_command_tail() {
     assert!(descriptor.command.is_none());
 }
 
+#[test]
+fn abi_v4_descriptor_loads_without_reading_the_v6_collision_tail() {
+    let module = command_probe_module(4);
+    // SAFETY: the v4 module and exact-sized descriptor table are leaked for the test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let descriptor = library.script("Probe").unwrap();
+    assert!(descriptor.command.is_some());
+    assert!(descriptor.collision.is_none());
+}
+
+#[test]
+fn abi_v5_descriptor_uses_the_command_layout_without_collision() {
+    let module = command_probe_module(5);
+    // SAFETY: the v5 module and its two exact-sized descriptors are leaked for the test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    // The second entry checks that the loader strides by the v4/v5 descriptor size.
+    for name in ["Probe", "ProbeSecond"] {
+        let descriptor = library.script(name).unwrap();
+        assert!(descriptor.command.is_some());
+        assert!(descriptor.collision.is_none());
+    }
+}
+
+#[test]
+fn abi_v3_v4_and_v5_normalized_descriptors_run_without_appended_callbacks() {
+    let _lock = test_lock();
+    for module in [
+        v3_probe_module(),
+        command_probe_module(4),
+        command_probe_module(5),
+    ] {
+        // SAFETY: each module and its version-specific descriptor table live for this test.
+        let library =
+            unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+        let mut world = scripted_world("Probe", r#"{ label = "legacy" }"#);
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == "start:legacy")
+        );
+    }
+}
+
+/// Builds a module with the `RveScriptDescV4` layout (no collision tail) for ABI 4 or 5.
+fn command_probe_module(abi_version: u32) -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let probe = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("Probe"))
+        .expect("Probe descriptor exists");
+    let entry = |name| RveScriptDescV4 {
+        name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+        params: probe.params.cast(),
+        param_count: probe.param_count,
+        command: probe.command,
+    };
+    let scripts = Box::leak(Box::new([
+        entry(probe.name),
+        entry(RveStr::from_static("ProbeSecond")),
+    ]));
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
+    }))
+}
+
+#[test]
+fn abi_v6_collision_callback_receives_other_and_contact() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "Probe"
+[[objects]]
+id = "second"
+"#,
+    );
+    let camera = world.handle("camera").unwrap();
+    let second = world.handle("second").unwrap();
+    let physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    let bindings = [
+        engine_physics::PhysicsSceneBinding {
+            object: camera,
+            body: engine_physics::BodyHandle(101),
+            kind: engine_physics::BodyKind::Static,
+            character_controller: None,
+        },
+        engine_physics::PhysicsSceneBinding {
+            object: second,
+            body: engine_physics::BodyHandle(102),
+            kind: engine_physics::BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let mut host = load_host(&world, &library());
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.queue_physics_events([engine_physics::PhysicsEvent::CollisionEnter {
+        first: engine_physics::BodyHandle(101),
+        second: engine_physics::BodyHandle(102),
+        point: glam::Vec3::X,
+        normal: glam::Vec3::X,
+    }]);
+
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "abi collision:second:1:1")
+    );
+}
+
+#[test]
+fn abi_v6_physics_host_callbacks_query_and_stage_commands() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "PhysicsProbe"
+[[objects]]
+id = "crate"
+"#,
+    );
+    let actor = world.handle("actor").unwrap();
+    let crate_object = world.handle("crate").unwrap();
+    let controller =
+        engine_physics::CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+    let mut physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    let actor_body = physics
+        .insert_body({
+            let mut desc = engine_physics::BodyDesc::new(
+                engine_physics::BodyKind::Kinematic,
+                engine_physics::Pose::IDENTITY,
+                engine_physics::ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let crate_body = physics
+        .insert_body(engine_physics::BodyDesc::dynamic(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::new(glam::Vec3::X * 5.0, glam::Quat::IDENTITY).unwrap(),
+            1.0,
+        ))
+        .unwrap();
+    let bindings = [
+        engine_physics::PhysicsSceneBinding {
+            object: actor,
+            body: actor_body,
+            kind: engine_physics::BodyKind::Kinematic,
+            character_controller: Some(controller),
+        },
+        engine_physics::PhysicsSceneBinding {
+            object: crate_object,
+            body: crate_body,
+            kind: engine_physics::BodyKind::Dynamic,
+            character_controller: None,
+        },
+    ];
+    let mut host = load_host(&world, &library());
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let commands = host.drain_physics_commands();
+    assert_eq!(commands.len(), 4);
+    assert!(
+        matches!(commands[0], engine_physics::PhysicsCommand::SetVelocity { body, velocity }
+        if body == crate_body && velocity == glam::Vec3::X)
+    );
+    assert!(
+        matches!(commands[1], engine_physics::PhysicsCommand::AddImpulse { body, impulse, .. }
+        if body == crate_body && impulse == glam::Vec3::Y)
+    );
+    assert!(
+        matches!(commands[2], engine_physics::PhysicsCommand::AddForce { body, force, .. }
+        if body == crate_body && force == glam::Vec3::Z * 2.0)
+    );
+    assert!(
+        matches!(commands[3], engine_physics::PhysicsCommand::SetColliderEnabled { body, enabled: false }
+        if body == crate_body)
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "ABI physics API committed")
+    );
+}
+
+#[test]
+fn abi_dead_object_handles_are_noops_with_one_warning() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "DeadHandleProbe"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    // Physics callbacks are offered only while physics is attached, so attach an empty world.
+    let physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &[]);
+    host.update(&mut world, 1.0 / 60.0, at(0.1, 1));
+    assert!(world.handle("victim").is_none());
+    assert_eq!(info_messages(&mut host), ["destroy=true"]);
+
+    host.update(&mut world, 1.0 / 60.0, at(0.2, 2));
+    let events = host.drain_events();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(
+        infos,
+        [
+            "alive=false",
+            "velocity_err=Some(Rejected)",
+            "set_velocity_err=Some(Rejected)",
+            "move_err=Some(Rejected)",
+            "matrix_none=true",
+            "set_transform=false",
+            "still running",
+        ],
+        "every handle-taking call on the dead object is a no-op"
+    );
+    let mut warnings = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+
+    host.update(&mut world, 1.0 / 60.0, at(0.3, 3));
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "no callback error"
+    );
+    warnings += events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+    assert_eq!(warnings, 1, "one warning per script and dead object");
+}
+
+#[test]
+fn abi_exit_with_a_destroyed_other_is_delivered_only_inside_the_retired_window() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "sensor"
+[[objects.heavy_scripts]]
+name = "ExitWatcher"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let sensor = world.handle("sensor").unwrap();
+    let victim = world.handle("victim").unwrap();
+    let mut physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    let sensor_body = physics
+        .insert_body(engine_physics::BodyDesc::static_collider(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::IDENTITY,
+        ))
+        .unwrap();
+    let victim_body = physics
+        .insert_body(engine_physics::BodyDesc::static_collider(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::new(glam::Vec3::X * 2.0, glam::Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let binding = |object, body| engine_physics::PhysicsSceneBinding {
+        object,
+        body,
+        kind: engine_physics::BodyKind::Static,
+        character_controller: None,
+    };
+    let both = [binding(sensor, sensor_body), binding(victim, victim_body)];
+    let sensor_only = [binding(sensor, sensor_body)];
+    let snapshot = physics.query_snapshot().unwrap();
+    let exit = engine_physics::PhysicsEvent::CollisionExit {
+        first: sensor_body,
+        second: victim_body,
+    };
+    let mut host = load_host(&world, &library());
+
+    host.set_physics_snapshot(snapshot.clone(), &both);
+    host.update(&mut world, 1.0 / 60.0, at(0.1, 1));
+    assert!(world.handle("victim").is_none());
+    host.drain_events();
+
+    host.set_physics_snapshot(snapshot.clone(), &sensor_only);
+    host.queue_physics_events([exit.clone()]);
+    host.update(&mut world, 1.0 / 60.0, at(0.2, 2));
+    assert!(
+        info_messages(&mut host).contains(&"exit alive=false".to_owned()),
+        "the survivor receives the exit inside the window"
+    );
+
+    // The window closes with the second result; the stale binding must not reach the guest.
+    host.set_physics_snapshot(snapshot, &both);
+    host.queue_physics_events([exit]);
+    host.update(&mut world, 1.0 / 60.0, at(0.3, 3));
+    let after = info_messages(&mut host);
+    assert!(
+        !after.iter().any(|message| message.starts_with("exit ")),
+        "{after:?}"
+    );
+    assert!(after.contains(&"update 3".to_owned()), "{after:?}");
+    assert!(error_messages(&mut host).is_empty());
+}
+
+#[test]
+fn abi_v7_audio_callbacks_stage_requests_in_guest_order() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/audio/hum.wav"
+[[objects]]
+id = "actor"
+[objects.audio_source]
+clip = "/audio/hum.wav"
+[[objects.heavy_scripts]]
+name = "AudioProbe"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let requests = host.drain_audio_requests();
+    assert_eq!(requests.len(), 5, "{requests:?}");
+    assert!(matches!(requests[0], AudioRequest::PlaySource { .. }));
+    assert!(matches!(
+        requests[1],
+        AudioRequest::SetSourceVolume { volume, .. } if volume == 0.5
+    ));
+    let played = match &requests[2] {
+        AudioRequest::PlayClip {
+            voice,
+            path,
+            params,
+        } => {
+            assert_eq!(path.as_str(), "audio/hum.wav");
+            assert_eq!(params.position, Some([1.0, 0.0, 0.0]));
+            *voice
+        }
+        other => panic!("ожидался PlayClip: {other:?}"),
+    };
+    assert!(matches!(
+        requests[3],
+        AudioRequest::StopVoice { voice } if voice == played
+    ));
+    assert!(matches!(
+        requests[4],
+        AudioRequest::SetGroupVolume {
+            group: engine_scene::AudioGroup::Music,
+            volume
+        } if volume == 0.5
+    ));
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "ABI audio API staged")
+    );
+}
+
+#[test]
+fn abi_v7_rejected_audio_reason_is_reported_even_when_the_guest_ignores_the_status() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/audio/hum.wav"
+[[objects]]
+id = "actor"
+[objects.audio_source]
+clip = "/audio/hum.wav"
+[[objects.heavy_scripts]]
+name = "AudioRejected"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.starts_with("play_clip:")),
+        "{events:?}"
+    );
+    // The call itself succeeded, so its earlier play_sound is still committed.
+    assert_eq!(host.drain_audio_requests().len(), 1);
+}
+
+/// Copies the pre-v15 parameter prefix into a process-lifetime table.
+///
+/// Scripts that declare v15-only parameter kinds are omitted from legacy fixtures.
+fn legacy_params(descriptor: &RveScriptDesc) -> Option<(*const RveParamDescV13, usize)> {
+    if descriptor.param_count == 0 {
+        return Some((std::ptr::null(), 0));
+    }
+    if descriptor.params.is_null() {
+        return None;
+    }
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor and parameter table.
+    let current = unsafe { std::slice::from_raw_parts(descriptor.params, descriptor.param_count) };
+    if current
+        .iter()
+        .any(|param| param.kind > rve_sdk::abi::RVE_PARAM_VEC3)
+    {
+        return None;
+    }
+    let legacy = Box::leak(
+        current
+            .iter()
+            .map(|param| RveParamDescV13 {
+                name: param.name,
+                kind: param.kind,
+                default: param.default,
+                min: param.min,
+                max: param.max,
+                flags: param.flags,
+                label: param.label,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Some((legacy.as_ptr(), legacy.len()))
+}
+
+/// Table for ABI versions 6–12 in the `RveScriptDescV6` layout.
+fn v6_module(abi_version: u32) -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV6] = Box::leak(
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some(RveScriptDescV6 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params,
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+/// Table for ABI v13 or v14: the v13 script descriptor layout with pre-v15 parameter descriptors.
+fn v13_module(abi_version: u32) -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV13] = Box::leak(
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some(RveScriptDescV13 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: params.cast(),
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+/// ABI v15 table: typed reference parameters and net events, without UI callbacks.
+fn v15_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV15] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV15 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 15,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+#[test]
+fn abi_v15_modules_load_on_the_v19_host_without_enable_callbacks() {
+    let _lock = test_lock();
+    let module = v15_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v15" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v15"),
+        "guest ABI v15 runs on the v19 host"
+    );
+}
+
+/// The UI branch temporarily used ABI v15 with the old parameter prefix and a descriptor UI tail.
+#[repr(C)]
+struct RveScriptDescV15Ui {
+    descriptor: RveScriptDescV15,
+    ui_event: Option<rve_sdk::abi::RveUiEventFn>,
+}
+
+unsafe extern "C" fn unused_v15_ui_event(
+    _: *mut c_void,
+    _: *const RveHost,
+    _: rve_sdk::abi::RveUiEvent,
+) -> RveStatus {
+    RveStatus::Ok
+}
+
+fn v15_ui_module() -> &'static RveModule {
+    let params: &'static [RveParamDescV13] = Box::leak(
+        vec![
+            RveParamDescV13 {
+                name: RveStr::from_static("enabled"),
+                kind: rve_sdk::abi::RVE_PARAM_BOOL,
+                default: RveValue::boolean(true),
+                min: 0.0,
+                max: 0.0,
+                flags: 0,
+                label: RveStr::empty(),
+            },
+            RveParamDescV13 {
+                name: RveStr::from_static("amount"),
+                kind: rve_sdk::abi::RVE_PARAM_INT,
+                default: RveValue::integer(2),
+                min: 0.0,
+                max: 0.0,
+                flags: 0,
+                label: RveStr::empty(),
+            },
+        ]
+        .into_boxed_slice(),
+    );
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let scripts = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let probe = scripts
+        .iter()
+        .find(|descriptor| unsafe {
+            std::slice::from_raw_parts(descriptor.name.ptr, descriptor.name.len) == b"Probe"
+        })
+        .expect("Probe descriptor");
+    let descriptor = |name| RveScriptDescV15 {
+        name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+        params: params.as_ptr().cast(),
+        param_count: params.len(),
+        command: probe.command,
+        collision: probe.collision,
+        net_event: probe.net_event,
+    };
+    let legacy: &'static [RveScriptDescV15Ui] = Box::leak(
+        vec![
+            RveScriptDescV15Ui {
+                descriptor: descriptor(RveStr::from_static("Probe")),
+                ui_event: Some(unused_v15_ui_event),
+            },
+            RveScriptDescV15Ui {
+                descriptor: descriptor(RveStr::from_static("ProbeTwo")),
+                ui_event: Some(unused_v15_ui_event),
+            },
+        ]
+        .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 15,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+fn v16_ui_module() -> &'static RveModule {
+    let current = ui_module();
+    // SAFETY: ui_module returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV16] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV16 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 16,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+#[test]
+fn abi_v16_ui_modules_load_on_v19_host_and_keep_ui_callbacks() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v16_ui_module())) }.unwrap();
+    let mut world = ui_world(
+        "[[objects]]\nid = \"hud\"\n[[objects.heavy_scripts]]\nname = \"UiGuest\"\nparams = {}\n",
+    );
+    let mut host = load_host(&world, &library);
+    register_ui_menu(&mut host);
+    host.start(&mut world, ScriptTime::default());
+    assert_eq!(abi_ui_callbacks(&host), [true]);
+    assert!(message_list(&mut host).contains(&"readback Ok(\"hello\")".to_owned()));
+    let hud = world.handle("hud").unwrap();
+    let canvas = open_ui_canvases(&host)
+        .into_iter()
+        .find(|canvas| host.ui().owner(*canvas) == Ok(owner_key(hud)))
+        .expect("guest-opened canvas");
+    let label = host.ui().find(canvas, "label").unwrap();
+    host.queue_ui_events([engine_gui::events::UiEvent {
+        canvas,
+        element: label,
+        kind: engine_gui::events::UiEventKind::Click,
+        value: None,
+    }]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"ui label Click None".to_owned()));
+}
+
+#[test]
+fn abi_v11_rumble_requests_are_capped_per_frame_and_keep_guest_order() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.starts_with("rumble requests limit")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rumble accepted 256")
+    );
+    let rumble = host.take_rumble_requests();
+    assert_eq!(rumble.len(), 256);
+    assert!(rumble.iter().all(|request| request.pad == 1));
+}
+
+#[test]
+fn abi_v11_rumble_is_rolled_back_when_the_guest_panics() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+params = { panic_after = true }
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message.contains("rumble panic"))
+    );
+    assert!(host.take_rumble_requests().is_empty());
+}
+
+#[test]
+fn abi_v6_to_v8_modules_load_on_the_v9_host() {
+    let _lock = test_lock();
+    for abi_version in [6, 7, 8] {
+        let module = v6_module(abi_version);
+        // SAFETY: the module and its descriptor table live for the whole test process.
+        let library =
+            unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+        let mut world = scripted_world("Probe", r#"{ label = "v6" }"#);
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == "start:v6"),
+            "guest ABI v{abi_version} runs on the v9 host"
+        );
+    }
+}
+
+#[test]
+fn abi_v6_to_v12_modules_load_without_net_callbacks_and_skip_net_events() {
+    let _lock = test_lock();
+    for abi_version in 6..=12 {
+        let module = v6_module(abi_version);
+        // SAFETY: the module and its descriptor table live for the whole test process.
+        let library =
+            unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+        let mut world = scripted_world("Probe", r#"{ label = "v6" }"#);
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == "start:v6"),
+            "guest ABI v{abi_version} runs on the current host"
+        );
+        // Модуль без сетевого callback пропускает сетевые события без ошибки и без счётчика.
+        host.queue_network_events(&world, [engine_scene::NetEvent::PeerConnected { peer: 2 }]);
+        host.update(
+            &mut world,
+            1.0 / 60.0,
+            ScriptTime {
+                elapsed: 4.0,
+                frame: 18,
+            },
+        );
+        assert!(host.drain_peer_faults().is_empty());
+        assert!(
+            host.drain_events()
+                .iter()
+                .all(|event| event.level != ScriptEventLevel::Error),
+            "guest ABI v{abi_version} skips net events silently"
+        );
+    }
+}
+
+#[test]
+fn abi_v10_modules_load_on_the_v16_host() {
+    let _lock = test_lock();
+    let module = v6_module(10);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v10" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v10"),
+        "guest ABI v10 runs on the v16 host"
+    );
+}
+
+#[test]
+fn abi_v11_modules_load_on_the_v16_host() {
+    let _lock = test_lock();
+    let module = v6_module(11);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v11" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v11"),
+        "guest ABI v11 runs on the v16 host"
+    );
+}
+
+#[test]
+fn abi_v13_modules_load_on_the_v16_host() {
+    let _lock = test_lock();
+    let module = v13_module(13);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v13" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v13"),
+        "guest ABI v13 runs on the v16 host"
+    );
+}
+
+#[test]
+fn abi_v14_modules_with_old_parameter_descriptors_load_on_the_v19_host() {
+    let _lock = test_lock();
+    let module = v13_module(14);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v14" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v14"),
+        "guest ABI v14 runs on the v19 host and its parameters use the pre-v15 layout"
+    );
+}
+
+#[test]
+fn abi_v15_modules_keep_typed_reference_params_without_ui_callbacks() {
+    let _lock = test_lock();
+    let module = v15_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let schema = library.schema("ReferenceProbe").unwrap();
+    assert_eq!(
+        schema.get("target").unwrap().kind,
+        engine_scene::ParamKind::Object
+    );
+    assert!(matches!(
+        schema.get("camera").unwrap().kind,
+        engine_scene::ParamKind::Component(_)
+    ));
+
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ReferenceProbe"
+params = { target = { object = "target" }, camera = { object = "target" } }
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+"#,
+    );
+    let mut host = load_host(&world, &library);
+    assert_eq!(abi_ui_callbacks(&host), [false, false]);
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+}
+
+#[test]
+fn abi_v15_ui_descriptor_keeps_legacy_parameter_layout() {
+    let _lock = test_lock();
+    let module = v15_ui_module();
+    // SAFETY: the module and both descriptor tables live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert!(library.contains_script("ProbeTwo"));
+    let schema = library.schema("Probe").unwrap();
+    assert_eq!(
+        schema.get("enabled").unwrap().kind,
+        engine_scene::ParamKind::Bool
+    );
+    assert_eq!(
+        schema.get("amount").unwrap().kind,
+        engine_scene::ParamKind::Int
+    );
+
+    let mut world = scripted_world("Probe", r#"{ enabled = true, amount = 2 }"#);
+    let mut host = load_host(&world, &library);
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|event| event == "start:default")
+    );
+}
+
 fn v3_probe_module() -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
@@ -497,12 +2203,43 @@ fn v3_probe_module() -> &'static RveModule {
         message: probe.message,
         destroy: probe.destroy,
         drop: probe.drop,
-        params: probe.params,
+        params: probe.params.cast(),
         param_count: probe.param_count,
     }]));
     Box::leak(Box::new(RveModule {
         header: RveHeader {
             abi_version: 3,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
+    }))
+}
+
+/// Presents the `AbiConsoleCommand` descriptor as an ABI 4 table. The v6 table cannot be reused
+/// directly because its stride is larger than the v4 descriptor layout.
+fn v4_sdk_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let command = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("AbiConsoleCommand"))
+        .expect("AbiConsoleCommand descriptor exists");
+    let scripts = Box::leak(Box::new([RveScriptDescV4 {
+        name: command.name,
+        create: command.create,
+        start: command.start,
+        update: command.update,
+        message: command.message,
+        destroy: command.destroy,
+        drop: command.drop,
+        params: command.params.cast(),
+        param_count: command.param_count,
+        command: command.command,
+    }]));
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 4,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: scripts.as_ptr().cast(),
@@ -606,6 +2343,32 @@ name = "AbiConsoleForeign"
 }
 
 #[test]
+fn abi_v4_guest_commands_still_load_and_execute() {
+    let _lock = test_lock();
+    let mut world = scripted_world("AbiConsoleCommand", "{}");
+    // SAFETY: the test module and its SDK descriptor table are process-lifetime allocations.
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v4_sdk_module())) }.unwrap();
+    let owner = world.handle("camera").unwrap();
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    assert!(
+        host.commands()
+            .iter()
+            .any(|command| command.name == "abi.echo")
+    );
+
+    let command = engine_console::parse_command_line("abi.echo v4").unwrap();
+    host.execute_command(&mut world, &command).unwrap();
+    assert_eq!(world.local_transform(owner).unwrap().position[0], 1.0);
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "echo:v4")
+    );
+}
+
+#[test]
 fn abi_console_command_panic_rolls_back_and_removes_owner_commands() {
     let _lock = test_lock();
     let mut world = scripted_world("AbiConsoleCommand", "{}");
@@ -690,10 +2453,10 @@ id = "second"
                 clear_color: [0.2, 0.3, 0.4],
                 anti_aliasing: engine_scene::AntiAliasing::None,
             },
-            color: engine_scene::CameraColorSettings {
+            color: Some(engine_scene::CameraColorSettings {
                 exposure_ev: 2.0,
                 tonemapper: engine_scene::Tonemapper::Neutral,
-            },
+            }),
         }
     );
     assert!(host.drain_events().is_empty());
@@ -771,6 +2534,94 @@ fn matching_version_rejects_an_invalid_header_size_before_reading_the_table() {
 }
 
 #[test]
+fn abi_v19_module_uses_its_exact_descriptor_layout_on_a_v20_host() {
+    let current = sdk_module();
+    // SAFETY: the SDK macro owns an immutable descriptor table for the process lifetime.
+    let current_descriptors =
+        unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV19] = Box::leak(
+        current_descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV19 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 19,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }));
+    // SAFETY: the module and exact-sized v19 descriptor array are leaked for the test lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert_eq!(library.abi_version(), 19);
+    let descriptor = library.script("Probe").unwrap();
+    assert!(descriptor.on_fixed_update.is_none());
+    assert!(descriptor.on_late_update.is_none());
+    assert!(descriptor.on_timer.is_none());
+
+    let mut world = scripted_world("Probe", r#"{ label = "abi19" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:abi19"),
+        "ABI v19 descriptors remain readable on the ABI v20 host"
+    );
+}
+
+#[test]
+fn abi_v20_fixed_update_message_timer_and_late_update_share_lua_phase_order() {
+    let library = library();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "runner"
+[[objects.heavy_scripts]]
+name = "ClockProbe"
+params = {}
+"#,
+    );
+    let mut host = load_host(&world, &library);
+    host.set_fixed_step_config(10, 2).unwrap();
+    host.update_frame(
+        &mut world,
+        ScriptFrameTime::advance(0.25, 1.0, 0.0, 0.0, 0.1, 1),
+    );
+
+    assert_eq!(
+        message_list(&mut host),
+        ["fixed", "fixed", "update", "message", "timer", "late"]
+    );
+    assert_eq!(host.time_scale(), 0.0);
+}
+
+#[test]
 fn abi_guest_reads_the_script_input_snapshot_from_a_module() {
     let _lock = test_lock();
     let mut world = scripted_world("InputProbe", "{}");
@@ -798,6 +2649,41 @@ fn abi_guest_reads_the_script_input_snapshot_from_a_module() {
     );
 
     assert_eq!(message_list(&mut host), ["ABI input snapshot"]);
+}
+
+#[test]
+fn abi_v5_input_actions_read_snapshots_and_stage_mutations() {
+    let _lock = test_lock();
+    let mut world = scripted_world("InputActionsProbe", "{}");
+    let library = library();
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &empty_sources(),
+        Some(&library),
+        crate::ScriptLoadOptions {
+            input: input_action_settings(),
+            ..crate::ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    let mut input = crate::ScriptInput::default();
+    input.set_key(Key::Space, true);
+    input.set_key(Key::W, true);
+    input.set_key(Key::D, true);
+    input.set_mouse_button(MouseButton::Left, true);
+    input.add_mouse_delta(2.0, -1.0);
+    host.set_input(input.take_frame());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(message_list(&mut host), ["ABI v5 action snapshot"]);
+
+    host.set_input(input.take_frame());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(message_list(&mut host), ["ABI v5 action mutations"]);
+
+    host.set_input(input.take_frame());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(message_list(&mut host), ["ABI v5 action reset"]);
 }
 
 fn invalid_name_module() -> &'static RveModule {
@@ -898,6 +2784,15 @@ fn null_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
+        net_event: None,
+        ui_event: None,
+        on_enable: None,
+        on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -918,6 +2813,15 @@ fn null_name_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
+        net_event: None,
+        ui_event: None,
+        on_enable: None,
+        on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -939,6 +2843,15 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
+        net_event: None,
+        ui_event: None,
+        on_enable: None,
+        on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1200,7 +3113,7 @@ params = { role = "target" }
     assert!(
         message_list(&mut host)
             .iter()
-            .any(|message| message.contains("non-finite transform"))
+            .any(|message| message.contains("script produced a non-finite transform"))
     );
     host.update(&mut world, 0.5, time);
     assert!(
@@ -1340,6 +3253,15 @@ fn error_message_module() -> &'static RveModule {
             params: std::ptr::null(),
             param_count: 0,
             command: None,
+            collision: None,
+            net_event: None,
+            ui_event: None,
+            on_enable: None,
+            on_disable: None,
+            on_fixed_update: None,
+            on_late_update: None,
+            on_timer: None,
+            set_property: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -1352,6 +3274,15 @@ fn error_message_module() -> &'static RveModule {
             params: std::ptr::null(),
             param_count: 0,
             command: None,
+            collision: None,
+            net_event: None,
+            ui_event: None,
+            on_enable: None,
+            on_disable: None,
+            on_fixed_update: None,
+            on_late_update: None,
+            on_timer: None,
+            set_property: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -1380,6 +3311,15 @@ fn set_local_during_create_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
+        net_event: None,
+        ui_event: None,
+        on_enable: None,
+        on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1397,6 +3337,15 @@ fn poisoned_create_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
+        net_event: None,
+        ui_event: None,
+        on_enable: None,
+        on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1513,13 +3462,13 @@ params = { role = "observer" }
     assert_eq!(
         message_list(&mut host),
         [
+            "sender:update",
+            "receiver:update",
+            "observer:update",
             "receiver:ping:sender",
             "sender:fan:sender",
             "receiver:fan:sender",
             "observer:fan:sender",
-            "sender:update",
-            "receiver:update",
-            "observer:update",
         ]
     );
     assert_eq!(
@@ -1542,10 +3491,10 @@ params = { role = "observer" }
     assert_eq!(
         message_list(&mut host),
         [
-            "sender:reply:receiver",
             "sender:update",
             "receiver:update",
             "observer:update",
+            "sender:reply:receiver",
         ]
     );
 }
@@ -1897,6 +3846,126 @@ fn heavy_defaults_are_filled_and_scene_values_coerced_before_create() {
 }
 
 #[test]
+fn abi_object_and_component_params_are_resolved_to_handles_before_create() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "ReferenceProbe"
+params = { target = { object = "target" }, camera = { object = "target" } }
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+"#,
+    );
+    let library = library();
+    let mut host = load_host(&world, &library);
+
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+    assert!(events.iter().any(|event| {
+        event.message == "ABI object message received" && event.level == ScriptEventLevel::Info
+    }));
+}
+
+#[test]
+fn missing_object_message_references_are_nil_for_lua_and_abi_receivers() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/refs.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/refs.lua"
+[[objects]]
+id = "lua_receiver"
+[[objects.lite_scripts]]
+path = "/refs.lua"
+[[objects]]
+id = "abi_receiver"
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let lua = r#"
+local Script = {}
+function Script:on_start()
+  if self.object.id == "sender" then
+    local victim = rve.find("victim")
+    rve.send("lua_receiver", "dead_ref", victim)
+    rve.send("abi_receiver", "dead_ref", victim)
+    assert(rve.destroy("victim"))
+  end
+end
+function Script:on_message(_, name, value)
+  if name == "dead_ref" then
+    assert(value == nil)
+    rve.log_info("Lua missing object message became nil")
+  end
+end
+return Script
+"#;
+    let library = library();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("refs.lua", lua)]),
+        Some(&library),
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    assert!(world.handle("victim").is_none());
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+
+    let events = host.drain_events();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message.clone())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert!(
+        infos.contains(&"Lua missing object message became nil"),
+        "{infos:?}"
+    );
+    assert!(
+        infos.contains(&"ABI missing object message became null"),
+        "{infos:?}"
+    );
+}
+
+#[test]
 fn heavy_params_that_violate_the_schema_fail_loading() {
     let library = typed_library();
     for params in ["{ speed = 11.0 }", "{ enabled = 1 }", "{ unknown = 1 }"] {
@@ -1923,6 +3992,15 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         params: params.as_ptr(),
         param_count: params.len(),
         command: None,
+        collision: None,
+        net_event: None,
+        ui_event: None,
+        on_enable: None,
+        on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
+        set_property: None,
     }]));
     RveModule::new(scripts)
 }
@@ -1941,6 +4019,7 @@ fn malformed_parameter_tables_are_rejected() {
             max: 0.0,
             flags,
             label: RveStr::empty(),
+            argument: RveStr::empty(),
         }
     }
     static BAD_UTF8: [u8; 1] = [0xff];
@@ -1999,6 +4078,15 @@ fn malformed_parameter_tables_are_rejected() {
             params: std::ptr::null(),
             param_count: 1,
             command: None,
+            collision: None,
+            net_event: None,
+            ui_event: None,
+            on_enable: None,
+            on_disable: None,
+            on_fixed_update: None,
+            on_late_update: None,
+            on_timer: None,
+            set_property: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -2009,4 +4097,2522 @@ fn malformed_parameter_tables_are_rejected() {
         result,
         Err(crate::ScriptLibraryError::InvalidParams { .. })
     ));
+}
+
+fn at(elapsed: f64, frame: u64) -> ScriptTime {
+    ScriptTime { elapsed, frame }
+}
+
+fn info_messages(host: &mut ScriptHost) -> Vec<String> {
+    host.drain_events()
+        .into_iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message)
+        .collect()
+}
+
+fn error_messages(host: &mut ScriptHost) -> Vec<String> {
+    host.drain_events()
+        .into_iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message)
+        .collect()
+}
+
+const BOLT_PREFAB: &str =
+    "[[objects]]\nid = \"root\"\n[[objects.heavy_scripts]]\nname = \"BoltProbe\"\n";
+/// A prefab with no heavy script, for tests whose guest module does not define the bolt script.
+const RAW_PREFAB: &str = "[[objects]]\nid = \"root\"\n";
+const SPAWNER_SCENE: &str =
+    "[[objects]]\nid = \"spawner\"\n[[objects.heavy_scripts]]\nname = \"SpawnDriver\"\n";
+
+/// Loads a scene with the bolt prefab registered as a fast prefab from `template_text` and
+/// `prefabs/heavy.rveprefab` in the project list.
+fn spawn_host(world: &World, library: &crate::ScriptLibrary, template_text: &str) -> ScriptHost {
+    let mut prefabs = PrefabCatalog::default();
+    prefabs.insert(
+        "prefabs/bolt.rveprefab",
+        PrefabSpec {
+            kind: PrefabKind::Fast,
+            max_instances: None,
+        },
+    );
+    prefabs.insert(
+        "prefabs/heavy.rveprefab",
+        PrefabSpec {
+            kind: PrefabKind::Heavy,
+            max_instances: None,
+        },
+    );
+    let mut host = ScriptHost::load_with_options(
+        world,
+        "scene",
+        &empty_sources(),
+        Some(library),
+        crate::ScriptLoadOptions {
+            prefabs,
+            ..crate::ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    let path = VirtualPath::parse("prefabs/bolt.rveprefab").unwrap();
+    let mut read = |_: &VirtualPath| -> Result<String, String> { Ok(template_text.to_owned()) };
+    let template = Arc::new(PrefabTemplate::load(&path, &mut read).unwrap());
+    host.register_prefab(world, "prefabs/bolt.rveprefab", template, &empty_sources())
+        .unwrap();
+    host
+}
+
+#[test]
+fn abi_spawn_is_pending_then_applied_and_starts_before_messages() {
+    let _lock = test_lock();
+    let mut world = world(SPAWNER_SCENE);
+    let mut host = spawn_host(&world, &library(), BOLT_PREFAB);
+
+    host.update(&mut world, 0.1, at(0.1, 1));
+    assert!(
+        world.handle("bolt").is_some(),
+        "applied at the end of the phase"
+    );
+    assert_eq!(
+        info_messages(&mut host),
+        ["spawned=true", "pending=true alive=false", "sent=true"],
+        "the pending handle reads as pending and the pending id accepts the message"
+    );
+
+    host.update(&mut world, 0.1, at(0.2, 2));
+    assert_eq!(
+        info_messages(&mut host),
+        [
+            "start:bolt",
+            "alive=true pending=false",
+            "destroy=true",
+            "hit:ping"
+        ],
+        "the spawned object starts in the next frame, then update precedes its queued message"
+    );
+}
+
+#[test]
+fn abi_destroy_with_delay_keeps_the_object_until_due_and_dead_handles_warn_once() {
+    let _lock = test_lock();
+    let mut world = world(SPAWNER_SCENE);
+    let mut host = spawn_host(&world, &library(), BOLT_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+    host.update(&mut world, 0.1, at(0.2, 2));
+    assert!(info_messages(&mut host).contains(&"destroy=true".to_owned()));
+    let _ = host.drain_world_changes();
+
+    // The delay is 1.0 seconds from elapsed 0.2, so the object is still in the world at 0.5.
+    host.update(&mut world, 0.1, at(0.5, 3));
+    assert!(world.handle("bolt").is_some());
+    assert_eq!(info_messages(&mut host), ["alive=true pending=false"]);
+
+    // Due removal is applied after update and before this frame's queued messages.
+    host.update(&mut world, 0.1, at(1.3, 4));
+    assert_eq!(
+        info_messages(&mut host),
+        ["bolt destroyed", "alive=false pending=false"]
+    );
+    assert!(world.handle("bolt").is_none());
+    let changes = host.drain_world_changes();
+    assert_eq!(changes.despawned.len(), 1);
+
+    host.update(&mut world, 0.1, at(1.4, 5));
+    let events = host.drain_events();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(
+        infos,
+        [
+            "alive=false pending=false",
+            "dead_destroy=false",
+            "dead_destroy=false"
+        ],
+        "a dead handle reads as dead and destroy refuses it"
+    );
+    let warnings = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+    assert_eq!(warnings, 1, "one warning per script and dead object");
+}
+
+#[test]
+fn abi_prefab_api_reports_states_and_queues_heavy_loads() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "PrefabProbe"
+"#,
+    );
+    let mut host = spawn_host(&world, &library(), BOLT_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+
+    let events = host.drain_events();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(
+        infos,
+        ["resident=Resident unknown=Unknown heavy=Unloaded load=true rejected=false"]
+    );
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message.clone())
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("prefabs/missing.rveprefab")),
+        "{errors:?}"
+    );
+    assert_eq!(
+        host.drain_world_changes().prefab_requests,
+        [PrefabRequest::Load("prefabs/heavy.rveprefab".to_owned())]
+    );
+}
+
+unsafe fn spawn_options_from_host(host: *const RveHost, flags: u32, id: RveStr) -> u64 {
+    // SAFETY: callers pass the live host of a running guest callback.
+    let host = unsafe { &*host };
+    let Some(spawn) = host.spawn else {
+        return 0;
+    };
+    let options = RveSpawnOptions {
+        flags,
+        position: [0.0; 3],
+        rotation_deg: [0.0; 3],
+        scale: [1.0; 3],
+        velocity: [0.0; 3],
+        parent: 0,
+        name: RveStr::empty(),
+        id,
+    };
+    // SAFETY: the prefab path and options stay valid for this host call.
+    unsafe {
+        spawn(
+            host.ctx,
+            RveStr::from_static("prefabs/bolt.rveprefab"),
+            &options,
+        )
+    }
+}
+
+/// Builds a one-script module whose callbacks are supplied by the test.
+fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
+    let scripts = Box::leak(Box::new([RveScriptDesc {
+        name: RveStr::from_static("RawProbe"),
+        create,
+        start: no_op,
+        update,
+        message: no_op_message,
+        destroy: no_op,
+        drop: free_byte,
+        params: std::ptr::null(),
+        param_count: 0,
+        command: None,
+        collision: None,
+        net_event: None,
+        ui_event: None,
+        on_enable: None,
+        on_disable: None,
+        on_fixed_update: None,
+        on_late_update: None,
+        on_timer: None,
+        set_property: None,
+    }]));
+    Box::leak(Box::new(RveModule::new(scripts)))
+}
+
+unsafe extern "C" fn spawn_during_create(
+    host: *const RveHost,
+    _: *const RveParams,
+    out: *mut *mut c_void,
+) -> RveStatus {
+    if host.is_null() || out.is_null() {
+        return RveStatus::Error;
+    }
+    // SAFETY: the host is valid for this create callback.
+    if unsafe { spawn_options_from_host(host, 0, RveStr::empty()) } != 0 {
+        return RveStatus::Error;
+    }
+    // The refusal is reported as a script event; the instance itself is created normally.
+    // SAFETY: the caller supplies a live output slot; `free_byte` releases the allocation.
+    unsafe { *out = Box::into_raw(Box::new(0_u8)).cast() };
+    RveStatus::Ok
+}
+
+#[test]
+fn abi_spawn_during_create_is_refused_without_queueing() {
+    let _lock = test_lock();
+    let module = raw_module(spawn_during_create, no_op_update);
+    // SAFETY: the test module and its callbacks have process lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world =
+        world("[[objects]]\nid = \"raw\"\n[[objects.heavy_scripts]]\nname = \"RawProbe\"\n");
+    let mut host = spawn_host(&world, &library, RAW_PREFAB);
+    assert!(
+        error_messages(&mut host)
+            .iter()
+            .any(|message| message == "spawn is unavailable during script creation"),
+    );
+    host.update(&mut world, 0.1, at(0.1, 1));
+    assert!(host.drain_world_changes().spawned.is_empty());
+    assert!(world.handle("bolt").is_none());
+}
+
+unsafe extern "C" fn spawn_then_error(_: *mut c_void, host: *const RveHost, _: f32) -> RveStatus {
+    if host.is_null() {
+        return RveStatus::Error;
+    }
+    // SAFETY: the host is valid for this callback.
+    let host_ref = unsafe { &*host };
+    // SAFETY: the host is valid for this callback.
+    let handle =
+        unsafe { spawn_options_from_host(host, RVE_SPAWN_HAS_ID, RveStr::from_static("rolled")) };
+    if handle == 0 {
+        return RveStatus::Error;
+    }
+    // SAFETY: the host callback copies the static message during this call.
+    unsafe { (host_ref.set_error)(host_ref.ctx, RveStr::from_static("injected spawn error")) };
+    RveStatus::Error
+}
+
+#[test]
+fn abi_spawn_is_rolled_back_when_the_callback_returns_error() {
+    let _lock = test_lock();
+    let module = raw_module(create_byte_instance, spawn_then_error);
+    // SAFETY: the test module and its callbacks have process lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world =
+        world("[[objects]]\nid = \"raw\"\n[[objects.heavy_scripts]]\nname = \"RawProbe\"\n");
+    let mut host = spawn_host(&world, &library, RAW_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+
+    let errors = error_messages(&mut host);
+    assert!(
+        errors
+            .iter()
+            .any(|message| message == "injected spawn error"),
+        "{errors:?}"
+    );
+    assert!(world.handle("rolled").is_none());
+    assert!(host.drain_world_changes().spawned.is_empty());
+}
+
+unsafe extern "C" fn spawn_invalid_options(
+    _: *mut c_void,
+    host: *const RveHost,
+    _: f32,
+) -> RveStatus {
+    if host.is_null() {
+        return RveStatus::Error;
+    }
+    // Unknown presence bit 7 and a parent handle that names no slot are both refused.
+    // SAFETY: the host is valid for this callback.
+    let unknown = unsafe { spawn_options_from_host(host, 1 << 7, RveStr::empty()) };
+    // SAFETY: the host is valid for this callback.
+    let no_parent = unsafe { spawn_options_from_host(host, RVE_SPAWN_HAS_PARENT, RveStr::empty()) };
+    if unknown != 0 || no_parent != 0 {
+        return RveStatus::Error;
+    }
+    RveStatus::Ok
+}
+
+#[test]
+fn abi_spawn_refuses_unknown_option_flags_and_bad_parents() {
+    let _lock = test_lock();
+    let module = raw_module(create_byte_instance, spawn_invalid_options);
+    // SAFETY: the test module and its callbacks have process lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world =
+        world("[[objects]]\nid = \"raw\"\n[[objects.heavy_scripts]]\nname = \"RawProbe\"\n");
+    let mut host = spawn_host(&world, &library, RAW_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+    let errors = error_messages(&mut host);
+    assert!(
+        errors
+            .iter()
+            .any(|message| message == "spawn received unknown option flags 0x80"),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message == "spawn parent is not an object handle"),
+        "{errors:?}"
+    );
+    assert!(host.drain_world_changes().spawned.is_empty());
+}
+
+/// Гость ABI v13: читает сеть на старте, пишет запросы и откликается на сетевые события.
+struct NetGuest;
+
+impl Script for NetGuest {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let net = ctx.net();
+        ctx.log_info(format!(
+            "mode {:?} local {:?} peers {:?}",
+            net.mode(),
+            net.local_peer(),
+            net.peers()
+        ));
+        ctx.log_info(format!(
+            "send {:?}",
+            ctx.net()
+                .send(NetTarget::Server, "hello", &Value::Int(1), true)
+        ));
+        if let Some(player) = ctx.find("player") {
+            ctx.log_info(format!(
+                "id {:?} owner {:?} is_owner {:?} authority {:?}",
+                player.net_id(ctx),
+                player.net_owner(ctx),
+                player.is_owner(ctx),
+                player.has_authority(ctx)
+            ));
+            let owner = player.set_net_owner(ctx, 4);
+            ctx.log_info(format!("set_owner {owner:?}"));
+            let sent = player.net_send(ctx, "ping", &Value::Bool(true), NetTarget::Peer(2), false);
+            ctx.log_info(format!("object_send {sent:?}"));
+        }
+    }
+
+    fn on_net_message(&mut self, ctx: &mut Context<'_>, peer: u32, name: &str, value: &Value) {
+        if name == "fail" {
+            panic!("net callback exploded");
+        }
+        if name == "missing_ref" {
+            let Value::Object(object) = value else {
+                panic!("missing network reference was not decoded as an object handle");
+            };
+            assert_eq!(object.id(ctx), None);
+            ctx.log_info("missing network object became null");
+            return;
+        }
+        ctx.log_info(format!("message {peer} {name} {value:?}"));
+    }
+
+    fn on_peer_connected(&mut self, ctx: &mut Context<'_>, peer: u32) {
+        ctx.log_info(format!("connected {peer}"));
+    }
+
+    fn on_peer_disconnected(&mut self, ctx: &mut Context<'_>, peer: u32, reason: &str) {
+        ctx.log_info(format!("disconnected {peer} {reason}"));
+    }
+}
+
+fn net_guest_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(NetGuest))
+}
+
+fn net_module() -> &'static RveModule {
+    rve_sdk::script_module! { "NetGuest" => net_guest_factory }
+}
+
+fn net_world() -> World {
+    world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+
+[[objects]]
+id = "player"
+[objects.network_identity]
+authority = "owner"
+[[objects.heavy_scripts]]
+name = "NetGuest"
+params = {}
+"#,
+    )
+}
+
+#[test]
+fn abi_v13_net_guest_reads_state_and_stages_requests_through_the_sdk() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    let player = world.handle("player").unwrap();
+    host.set_network_state(engine_scene::NetMode::Client, Some(5), vec![0]);
+    host.set_object_net(player, engine_scene::NetId::scene(42).unwrap(), Some(5));
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 1,
+        },
+    );
+    let logs: Vec<String> = message_list(&mut host);
+    assert!(
+        logs.contains(&"mode Ok(Client) local Ok(5) peers Ok([0])".to_owned()),
+        "{logs:?}"
+    );
+    assert!(logs.contains(&"send Ok(())".to_owned()), "{logs:?}");
+    assert!(
+        logs.contains(
+            &"id Ok(Some(42)) owner Ok(Some(5)) is_owner Ok(true) authority Ok(true)".to_owned()
+        ),
+        "{logs:?}"
+    );
+    assert!(
+        logs.contains(&"set_owner Err(Rejected)".to_owned()),
+        "{logs:?}"
+    );
+    assert!(
+        logs.contains(&"object_send Err(Rejected)".to_owned()),
+        "{logs:?}"
+    );
+    // Клиент отправляет только серверу: запрос к серверу ставится, остальные отказы — нет.
+    assert_eq!(
+        host.drain_network_requests(),
+        vec![engine_scene::NetRequest::Send {
+            target: engine_scene::NetTarget::Server,
+            name: "hello".to_owned(),
+            value: engine_scene::ParamValue::Int(1),
+            reliable: true,
+        }]
+    );
+
+    host.set_network_state(engine_scene::NetMode::Server, Some(0), vec![5]);
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    let player = world.handle("player").unwrap();
+    host.set_object_net(player, engine_scene::NetId::scene(42).unwrap(), Some(5));
+    host.set_network_state(engine_scene::NetMode::Server, Some(0), vec![5]);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 1,
+        },
+    );
+    let logs: Vec<String> = message_list(&mut host);
+    assert!(logs.contains(&"send Ok(())".to_owned()), "{logs:?}");
+    assert!(logs.contains(&"set_owner Ok(())".to_owned()), "{logs:?}");
+    let requests = host.drain_network_requests();
+    assert_eq!(
+        requests,
+        vec![
+            engine_scene::NetRequest::Send {
+                target: engine_scene::NetTarget::Server,
+                name: "hello".to_owned(),
+                value: engine_scene::ParamValue::Int(1),
+                reliable: true,
+            },
+            engine_scene::NetRequest::SetOwner {
+                object: player,
+                peer: 4,
+            },
+            engine_scene::NetRequest::ObjectSend {
+                object: player,
+                name: "ping".to_owned(),
+                value: engine_scene::ParamValue::Bool(true),
+                target: engine_scene::NetTarget::Peer(2),
+                reliable: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 1,
+        },
+    );
+    message_list(&mut host);
+    host.queue_network_events(
+        &world,
+        [
+            engine_scene::NetEvent::Message {
+                peer: 3,
+                object: None,
+                name: "fail".to_owned(),
+                value: engine_scene::ParamValue::Int(0),
+            },
+            engine_scene::NetEvent::Message {
+                peer: 3,
+                object: None,
+                name: "ok".to_owned(),
+                value: engine_scene::ParamValue::String("x".to_owned()),
+            },
+            engine_scene::NetEvent::Message {
+                peer: 4,
+                object: None,
+                name: "missing_ref".to_owned(),
+                value: engine_scene::ParamValue::Object("unknown_from_peer".to_owned()),
+            },
+            engine_scene::NetEvent::PeerConnected { peer: 8 },
+            engine_scene::NetEvent::PeerDisconnected {
+                peer: 8,
+                reason: "timeout".to_owned(),
+            },
+        ],
+    );
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message.clone())
+        .collect();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.clone())
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("net callback exploded"), "{errors:?}");
+    assert_eq!(
+        infos,
+        [
+            "message 3 ok String(\"x\")",
+            "missing network object became null",
+            "connected 8",
+            "disconnected 8 timeout",
+        ]
+    );
+    assert_eq!(host.drain_peer_faults(), [(3, 1)]);
+}
+
+#[test]
+fn shutdown_runs_abi_on_disable_before_on_destroy_only_for_running_instances() {
+    let _lock = test_lock();
+    let library = library();
+    let scene = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "TeardownProbe"
+"#;
+
+    let mut running = world(scene);
+    let mut host = load_host(&running, &library);
+    host.update(&mut running, 0.1, at(0.1, 1));
+    assert_eq!(info_messages(&mut host), ["enable"]);
+    host.destroy(&mut running, at(0.2, 2));
+    assert_eq!(info_messages(&mut host), ["disable", "destroy"]);
+
+    let mut hidden = world(scene);
+    let probe = hidden.handle("probe").unwrap();
+    let mut host = load_host(&hidden, &library);
+    host.update(&mut hidden, 0.1, at(0.1, 1));
+    info_messages(&mut host);
+    hidden.set_active(probe, false).unwrap();
+    host.update(&mut hidden, 0.1, at(0.2, 2));
+    assert_eq!(info_messages(&mut host), ["disable"]);
+    host.destroy(&mut hidden, at(0.3, 3));
+    assert_eq!(info_messages(&mut host), ["destroy"]);
+}
+
+const UI_MENU: &str = r#"
+[[elements]]
+id = "label"
+text = { string = "Hi" }
+"#;
+
+struct UiGuest;
+
+impl Script for UiGuest {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let ui = ctx.ui();
+        match ui.open("ui/menu.rveui") {
+            Ok(canvas) => {
+                if let Ok(Some(label)) = ui.find(canvas, "label") {
+                    ctx.log_info(format!("write {:?}", ui.set_text(label, "hello")));
+                    ctx.log_info(format!("readback {:?}", ui.text(label)));
+                }
+            }
+            Err(error) => ctx.log_error(format!("open failed: {error}")),
+        }
+    }
+
+    fn on_ui_event(&mut self, ctx: &mut Context<'_>, event: UiEvent) {
+        ctx.log_info(format!(
+            "ui {} {:?} {:?}",
+            event.element_id, event.kind, event.value
+        ));
+    }
+}
+
+/// Пишет в метку собственного канваса и падает: запись должна откатиться.
+struct UiPanicGuest;
+
+impl Script for UiPanicGuest {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        let ui = ctx.ui();
+        let object = ctx.find("hud").expect("hud object");
+        let canvas = ui.canvas_of(object).expect("component canvas");
+        let label = ui.find(canvas, "label").unwrap().unwrap();
+        ui.set_text(label, "changed").unwrap();
+        panic!("guest exploded after a ui write");
+    }
+}
+
+fn ui_guest_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(UiGuest))
+}
+
+fn ui_panic_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(UiPanicGuest))
+}
+
+fn ui_module() -> &'static RveModule {
+    rve_sdk::script_module! {
+        "UiGuest" => ui_guest_factory,
+        "UiPanic" => ui_panic_factory,
+    }
+}
+
+/// Таблица версии 13 в layout `RveScriptDescV13` из двух дескрипторов: `NetGuest` и его псевдоним
+/// `NetAlias` с тем же фабрикой. Оба должны сохранить `net_event` и не получить `ui_event`.
+fn v13_net_module() -> &'static RveModule {
+    let current = net_module();
+    // SAFETY: `net_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV13] = Box::leak(
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some((descriptor, params, param_count))
+            })
+            .flat_map(|(descriptor, params, param_count)| {
+                let alias = RveScriptDescV13 {
+                    name: RveStr::from_static("NetAlias"),
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params,
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                };
+                [
+                    RveScriptDescV13 {
+                        name: descriptor.name,
+                        create: descriptor.create,
+                        start: descriptor.start,
+                        update: descriptor.update,
+                        message: descriptor.message,
+                        destroy: descriptor.destroy,
+                        drop: descriptor.drop,
+                        params,
+                        param_count,
+                        command: descriptor.command,
+                        collision: descriptor.collision,
+                        net_event: descriptor.net_event,
+                    },
+                    alias,
+                ]
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 13,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+fn ui_world(objects: &str) -> World {
+    world(&format!(
+        "[[assets]]\npath = \"/ui/menu.rveui\"\n{objects}\n[[objects]]\nid = \"camera\"\n[objects.camera]\n"
+    ))
+}
+
+fn register_ui_menu(host: &mut ScriptHost) {
+    host.register_ui_document(
+        VirtualPath::parse("ui/menu.rveui").unwrap(),
+        Arc::new(UiDocument::parse("ui/menu.rveui", UI_MENU).unwrap()),
+    );
+}
+
+/// Есть ли у каждого ABI-экземпляра callback `on_ui_event`, в порядке экземпляров.
+fn abi_ui_callbacks(host: &ScriptHost) -> Vec<bool> {
+    host.instances
+        .iter()
+        .flatten()
+        .filter_map(|instance| match &instance.kind {
+            crate::host::ScriptKind::Heavy(crate::host::HeavyInstance::Abi(script)) => {
+                Some(script.has_ui_event())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn open_ui_canvases(host: &ScriptHost) -> Vec<UiCanvasHandle> {
+    let ui = host.ui();
+    (0..64)
+        .flat_map(|index| (0..4).map(move |generation| UiCanvasHandle::from_raw(index, generation)))
+        .filter(|canvas| ui.layer(*canvas).is_ok())
+        .collect()
+}
+
+#[test]
+fn abi_ui_guest_opens_writes_and_receives_events_for_its_canvas() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(ui_module())) }.unwrap();
+    let mut world = ui_world(
+        "[[objects]]\nid = \"hud\"\n[[objects.heavy_scripts]]\nname = \"UiGuest\"\nparams = {}\n",
+    );
+    let mut host = load_host(&world, &library);
+    register_ui_menu(&mut host);
+    host.start(&mut world, ScriptTime::default());
+    let events = message_list(&mut host);
+    assert!(events.contains(&"write Ok(())".to_owned()), "{events:?}");
+    assert!(
+        events.contains(&"readback Ok(\"hello\")".to_owned()),
+        "{events:?}"
+    );
+
+    assert_eq!(abi_ui_callbacks(&host), [true]);
+    let hud = world.handle("hud").unwrap();
+    let canvas = open_ui_canvases(&host)
+        .into_iter()
+        .find(|canvas| host.ui().owner(*canvas) == Ok(owner_key(hud)))
+        .expect("guest-opened canvas");
+    let label = host.ui().find(canvas, "label").unwrap();
+    host.queue_ui_events([engine_gui::events::UiEvent {
+        canvas,
+        element: label,
+        kind: engine_gui::events::UiEventKind::Click,
+        value: None,
+    }]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"ui label Click None".to_owned()));
+}
+
+#[test]
+fn abi_ui_writes_roll_back_when_the_guest_panics() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(ui_module())) }.unwrap();
+    let mut world = ui_world(
+        "[[objects]]\nid = \"hud\"\n[objects.ui_canvas]\ndocument = \"/ui/menu.rveui\"\n\
+         [[objects.heavy_scripts]]\nname = \"UiPanic\"\nparams = {}\n",
+    );
+    let mut host = load_host(&world, &library);
+    register_ui_menu(&mut host);
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error && event.message.contains("guest exploded")
+        }),
+        "{events:?}"
+    );
+    let hud = world.handle("hud").unwrap();
+    let canvas = open_ui_canvases(&host)
+        .into_iter()
+        .find(|canvas| host.ui().owner(*canvas) == Ok(owner_key(hud)))
+        .expect("scene canvas");
+    let label = host.ui().find(canvas, "label").unwrap();
+    assert_eq!(host.ui().text(label), Ok("Hi".to_owned()));
+}
+
+#[test]
+fn abi_v13_modules_load_without_ui_callbacks_and_keep_net_events() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v13_net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    message_list(&mut host);
+    host.queue_network_events(&world, [engine_scene::NetEvent::PeerConnected { peer: 8 }]);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| event.message == "connected 8"),
+        "{events:?}"
+    );
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    let names = library.script_names();
+    assert!(
+        names.contains(&"NetGuest") && names.contains(&"NetAlias"),
+        "{names:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+fn v14_net_module() -> &'static RveModule {
+    let old = v13_net_module();
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 14,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: old.scripts,
+        script_count: old.script_count,
+    }))
+}
+#[test]
+fn abi_v14_screen_shader_layout_keeps_legacy_descriptors_without_ui() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v14_net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    message_list(&mut host);
+    host.queue_network_events(&world, [engine_scene::NetEvent::PeerConnected { peer: 8 }]);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| event.message == "connected 8"),
+        "{events:?}"
+    );
+    assert_eq!(abi_ui_callbacks(&host), [false]);
+    let names = library.script_names();
+    assert!(
+        names.contains(&"NetGuest") && names.contains(&"NetAlias"),
+        "{names:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+/// ABI v17 guests predate trigger-stay events and must not receive that new event kind.
+static LEGACY_STAYS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn legacy_collision(
+    _instance: *mut c_void,
+    _host: *const RveHost,
+    event: RveCollisionEvent,
+) -> RveStatus {
+    if event.kind > RVE_TRIGGER_EXIT {
+        LEGACY_STAYS.fetch_add(1, Ordering::SeqCst);
+        return RveStatus::Error;
+    }
+    RveStatus::Ok
+}
+
+fn v17_legacy_collision_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV17] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV17 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: Some(legacy_collision),
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 17,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+#[test]
+fn abi_v17_modules_get_no_trigger_stay_and_keep_running() {
+    let _lock = test_lock();
+    LEGACY_STAYS.store(0, Ordering::SeqCst);
+    let module = v17_legacy_collision_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[objects.collider]
+shape = "sphere"
+radius = 1.0
+trigger = true
+[[objects.heavy_scripts]]
+name = "Probe"
+params = { label = "v17" }
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.5, 0.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+"#,
+    );
+    let (mut driver, bindings) = PhysicsSceneDesc::from_world(&world, &[], glam::Vec3::ZERO, 60, 8)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v17"),
+        "ABI v17 modules still load on the v20 host"
+    );
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    for frame in 1..=5_u64 {
+        host.update(
+            &mut world,
+            1.0 / 60.0,
+            ScriptTime {
+                elapsed: frame as f64 / 60.0,
+                frame,
+            },
+        );
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+        host.queue_physics_events(result.events);
+    }
+    assert_eq!(LEGACY_STAYS.load(Ordering::SeqCst), 0);
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "ABI v17 instance must keep running"
+    );
+}
+
+/// Прыжок и вертикальная скорость через ABI; та же последовательность, что у Lua-скрипта
+/// `JUMP_LUA` в паритете прыжка.
+struct JumpProbe {
+    jumped: bool,
+}
+
+#[test]
+fn abi_v18_modules_load_on_the_v20_host_with_ui_and_lifecycle_descriptor_tail() {
+    let _lock = test_lock();
+    let current = sdk_module();
+    // ABI v18 keeps the exact v17 descriptor size while adding host capabilities.
+    let current_descriptors = unsafe {
+        std::slice::from_raw_parts(
+            current.scripts.cast::<RveScriptDesc>(),
+            current.script_count,
+        )
+    };
+    let legacy: &'static [RveScriptDescV17] = Box::leak(
+        current_descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV17 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 18,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }));
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert_eq!(library.abi_version(), 18);
+
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[objects.collider]
+shape = "sphere"
+radius = 1.0
+trigger = true
+[[objects.heavy_scripts]]
+name = "Probe"
+params = { label = "v18" }
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.5, 0.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+"#,
+    );
+    let (mut driver, bindings) = PhysicsSceneDesc::from_world(&world, &[], glam::Vec3::ZERO, 60, 8)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v18"),
+        "guest ABI v18 runs on the v20 host"
+    );
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    let mut saw_stay = false;
+    for frame in 1..=5_u64 {
+        host.update(
+            &mut world,
+            1.0 / 60.0,
+            ScriptTime {
+                elapsed: frame as f64 / 60.0,
+                frame,
+            },
+        );
+        saw_stay |= message_list(&mut host)
+            .iter()
+            .any(|message| message == "abi stay:ball");
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+        host.queue_physics_events(result.events);
+    }
+    assert!(saw_stay, "ABI v18 must receive active trigger stay events");
+}
+fn jump_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(JumpProbe { jumped: false }))
+}
+
+impl Script for JumpProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let player = ctx.find("player").expect("player exists");
+        if !self.jumped && player.is_grounded(ctx).unwrap() {
+            assert!(player.jump(ctx).unwrap());
+            self.jumped = true;
+            ctx.log_info("jump");
+        }
+        let vertical = player.vertical_velocity(ctx).unwrap();
+        ctx.log_info(format!("v {vertical:.4}"));
+        player.simple_move(ctx, [0.0; 3]).unwrap();
+    }
+}
+
+const JUMP_LUA: &str = r#"
+local Script = {}
+local jumped = false
+function Script:on_update()
+  local player = rve.find("player")
+  if not jumped and player:is_grounded() then
+    assert(player:jump())
+    jumped = true
+    rve.log("jump")
+  end
+  rve.log(string.format("v %.4f", player:vertical_velocity()))
+  player:simple_move({x=0, y=0, z=0})
+end
+return Script
+"#;
+
+fn jump_parity_scene(assets: &str, attach: &str) -> String {
+    format!(
+        r#"
+{assets}[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "floor"
+[objects.transform]
+position = [0.0, -0.5, 0.0]
+[objects.collider]
+shape = "box"
+half_extents = [10.0, 0.5, 10.0]
+[[objects]]
+id = "player"
+[objects.transform]
+position = [0.0, 0.8, 0.0]
+[objects.character_controller]
+radius = 0.3
+height = 1.0
+step_height = 0.0
+use_gravity = true
+jump_height = 1.0
+{attach}
+"#
+    )
+}
+
+fn run_jump_parity(
+    scene: &str,
+    lua: &[(&str, &str)],
+    library: Option<&crate::ScriptLibrary>,
+) -> Vec<String> {
+    let mut world = world(scene);
+    let (mut driver, bindings) =
+        PhysicsSceneDesc::from_world(&world, &[], glam::Vec3::new(0.0, -9.81, 0.0), 60, 8)
+            .unwrap()
+            .build()
+            .unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host = ScriptHost::load(&world, "scene", &sources(lua), library).unwrap();
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 0,
+        },
+    );
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    let mut messages = Vec::new();
+    for frame in 1..=240_u64 {
+        let time = ScriptTime {
+            elapsed: frame as f64 / 60.0,
+            frame,
+        };
+        host.update(&mut world, 1.0 / 60.0, time);
+        messages.extend(message_list(&mut host));
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(1.0 / 60.0, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+        host.queue_physics_events(result.events);
+    }
+    messages
+}
+
+#[test]
+fn lua_and_abi_jump_and_vertical_velocity_follow_the_same_trace() {
+    let _lock = test_lock();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(sdk_module())) }.unwrap();
+    let lua = run_jump_parity(
+        &jump_parity_scene(
+            "[[assets]]
+path = \"/jump.lua\"
+",
+            "[[objects.lite_scripts]]\npath = \"/jump.lua\"",
+        ),
+        &[("jump.lua", JUMP_LUA)],
+        None,
+    );
+    let abi = run_jump_parity(
+        &jump_parity_scene(
+            "",
+            "[[objects.heavy_scripts]]\nname = \"JumpProbe\"\nparams = {}",
+        ),
+        &[],
+        Some(&library),
+    );
+    let trace = |messages: &[String]| {
+        messages
+            .iter()
+            .filter(|message| *message == "jump" || message.starts_with("v "))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(lua.iter().any(|message| message == "jump"), "{lua:?}");
+    assert_eq!(trace(&lua), trace(&abi));
+}
+
+const SCRIPT_REF_TARGET: &str = r#"
+local Script = {}
+Script.properties = {
+  speed = { type = "float", default = 1.5, min = 0, max = 10 },
+}
+function Script:on_update(dt)
+  rve.log("target update " .. string.format("%g", self.params.speed))
+end
+function Script:on_message(sender, name, value)
+  rve.log("target got " .. name .. " " .. tostring(value))
+end
+return Script
+"#;
+
+/// Heavy probe: reads, writes, messages, and toggles a lite instance found by object and path.
+struct ScriptRefProbe;
+
+fn script_ref_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ScriptRefProbe))
+}
+
+impl Script for ScriptRefProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let target = ctx.find("target").expect("target object");
+        let reference = target
+            .script(ctx, "/target.lua")
+            .expect("lite script reference");
+        assert!(target.script(ctx, "/missing.lua").is_none());
+        assert_eq!(reference.get(ctx, "speed"), Some(Value::Float(1.5)));
+        assert!(reference.set(ctx, "speed", &Value::Int(4)));
+        assert_eq!(reference.get(ctx, "speed"), Some(Value::Float(4.0)));
+        assert!(reference.send(ctx, "ping", &Value::Int(7)));
+        assert_eq!(reference.enabled(ctx), Some(true));
+        assert!(reference.set_enabled(ctx, true));
+        assert_eq!(reference.enabled(ctx), Some(true));
+        assert_eq!(ctx.current_scene().as_deref(), Some("scene"));
+        assert!(ctx.load_scene("levels/next.rvescene"));
+        ctx.log_info("script ref ok");
+    }
+}
+
+#[test]
+fn abi_script_reference_reads_writes_sends_and_toggles_a_lite_instance() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/target.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ScriptRefProbe"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/target.lua"
+"#,
+    );
+    let sources = BTreeMap::from([("target.lua".to_owned(), SCRIPT_REF_TARGET.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+    host.set_enabled_scenes(&["levels/next.rvescene".to_owned()])
+        .unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let first = host.drain_events();
+    assert!(
+        first
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{first:?}"
+    );
+    assert!(first.iter().any(|event| event.message == "script ref ok"));
+    assert_eq!(
+        host.take_scene_request().as_deref(),
+        Some("levels/next.rvescene")
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    // The start-phase message is delivered in the first update, after the probe logged its result.
+    let mut messages: Vec<String> = first.iter().map(|event| event.message.clone()).collect();
+    messages.extend(message_list(&mut host));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "target got ping 7"),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| message == "target update 4"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn abi_context_quit_is_committed_only_after_a_successful_callback() {
+    let _guard = test_lock();
+    for (fail_after_quit, expected) in [(true, false), (false, true)] {
+        let mut world = world(&format!(
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+             [[objects.heavy_scripts]]\nname = \"QuitProbe\"\n\
+             [objects.heavy_scripts.params]\nfail_after_quit = {fail_after_quit}\n"
+        ));
+        let mut host = load_host(&world, &library());
+
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+        assert_eq!(host.take_quit_request(), expected);
+        assert!(!host.take_quit_request());
+        let events = host.drain_events();
+        if fail_after_quit {
+            assert!(events.iter().any(|event| {
+                event.level == ScriptEventLevel::Error
+                    && event.message.contains("failed after requesting exit")
+            }));
+        } else {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.message == "quit probe succeeded")
+            );
+        }
+    }
+}
+
+/// Heavy probe with one declared property; logs the value its callbacks observe.
+struct PropertyProbe;
+
+fn property_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PropertyProbe))
+}
+
+impl Script for PropertyProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        let speed = match self.get_property(ctx, "speed") {
+            Some(Value::Float(speed)) => speed,
+            other => panic!("speed is not a float: {other:?}"),
+        };
+        ctx.log_info(format!("probe speed {speed}"));
+    }
+}
+
+struct StatefulPropertyProbe {
+    speed: f64,
+}
+
+fn stateful_property_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(StatefulPropertyProbe { speed }))
+}
+
+impl Script for StatefulPropertyProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        (name == "speed").then_some(Value::Float(self.speed))
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+
+    fn on_update(&mut self, _ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        self.speed += 1.0;
+    }
+}
+
+struct RejectingPropertyProbe {
+    speed: f64,
+}
+
+struct AdvancingRejectingPropertyProbe {
+    speed: f64,
+}
+
+struct LaterPropertyValidationProbe {
+    speed: f64,
+}
+
+impl Drop for RejectingPropertyProbe {
+    fn drop(&mut self) {
+        REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
+    }
+}
+
+fn rejecting_property_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(RejectingPropertyProbe { speed }))
+}
+
+impl Script for RejectingPropertyProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        (name == "speed").then_some(Value::Float(self.speed))
+    }
+
+    fn validate_property(
+        &self,
+        _ctx: &rve_sdk::Context<'_>,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        if name == "speed" && matches!(value, Value::Float(speed) if *speed > 3.0) {
+            return Err("speed above 3 is rejected".to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+}
+
+impl Drop for AdvancingRejectingPropertyProbe {
+    fn drop(&mut self) {
+        REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
+    }
+}
+
+fn advancing_rejecting_property_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(AdvancingRejectingPropertyProbe { speed }))
+}
+
+fn later_property_validation_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(LaterPropertyValidationProbe { speed }))
+}
+
+impl Script for AdvancingRejectingPropertyProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        (name == "speed").then_some(Value::Float(self.speed))
+    }
+
+    fn validate_property(
+        &self,
+        _ctx: &rve_sdk::Context<'_>,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        if name == "speed" && matches!(value, Value::Float(speed) if *speed > 7.0) {
+            return Err("speed above 7 is rejected".to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+
+    fn on_update(&mut self, _ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        self.speed += 1.0;
+    }
+}
+
+impl Script for LaterPropertyValidationProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        match name {
+            "speed" => Some(Value::Float(self.speed)),
+            "later" => Some(Value::String("invalid".to_owned())),
+            _ => None,
+        }
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+}
+
+impl Drop for LaterPropertyValidationProbe {
+    fn drop(&mut self) {
+        REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
+    }
+}
+
+const PROPERTY_DRIVER: &str = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("camera"):script("PropertyProbe"):set("speed", 4)
+end
+return Script
+"#;
+
+const PROPERTY_OWNER_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("StatefulPropertyProbe")
+  rve.log_info("owner property " .. tostring(target:get("speed")))
+end
+return Script
+"#;
+
+const STATEFUL_PROPERTY_DRIVER: &str = r#"
+local Script = {}
+local did_set = false
+function Script:on_update()
+  if not did_set then
+    local target = rve.find("target"):script("StatefulPropertyProbe")
+    target:set("speed", 4)
+    did_set = true
+  end
+end
+return Script
+"#;
+
+const REJECTING_PROPERTY_DRIVER: &str = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("target"):script("RejectingPropertyProbe"):set("speed", 4)
+end
+return Script
+"#;
+
+const REJECTING_PROPERTY_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("RejectingPropertyProbe")
+  rve.log_info("rejected owner property " .. tostring(target:get("speed")))
+end
+return Script
+"#;
+
+const ADVANCING_REJECTING_PROPERTY_DRIVER: &str = r#"
+local Script = {}
+local frame = 0
+function Script:on_update()
+  frame = frame + 1
+  if frame == 1 then
+    rve.find("target"):script("AdvancingRejectingPropertyProbe"):set("speed", 4)
+  elseif frame == 2 then
+    rve.find("target"):script("AdvancingRejectingPropertyProbe"):set("speed", 8)
+  end
+end
+return Script
+"#;
+
+const ADVANCING_REJECTING_PROPERTY_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("AdvancingRejectingPropertyProbe")
+  rve.log_info("rollback owner property " .. tostring(target:get("speed")))
+end
+return Script
+"#;
+
+const LUA_PROPERTY_OWNER: &str = r#"
+local Script = {
+  properties = { speed = { type = "float", default = 1.5, min = 0, max = 10 } },
+}
+function Script:on_update()
+  self.params.speed = self.params.speed + 1
+  self.params.internal = "private"
+end
+return Script
+"#;
+
+const LUA_PROPERTY_OWNER_INTEGER: &str = r#"
+local Script = {
+  properties = { speed = { type = "float", default = 1.5, min = 0, max = 10 } },
+}
+local initialized = false
+function Script:on_update()
+  if initialized then
+    rve.log_info("lua stored property " .. tostring(self.params.speed))
+  else
+    self.params.speed = 2
+    initialized = true
+  end
+end
+return Script
+"#;
+
+const LUA_PROPERTY_OWNER_FAILS: &str = r#"
+local Script = {
+  properties = { speed = { type = "float", default = 1.5, min = 0, max = 10 } },
+}
+local did_fail = false
+function Script:on_update()
+  if not did_fail then
+    self.params.speed = 4
+    did_fail = true
+    error("reject after staging property")
+  end
+end
+return Script
+"#;
+
+const LUA_PROPERTY_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("/owner.lua")
+  rve.log_info("lua owner property " .. tostring(target:get("speed")))
+  local ok, message = pcall(function() return target:get("internal") end)
+  rve.log_info("lua undeclared " .. tostring(ok) .. " " .. tostring(message))
+end
+return Script
+"#;
+
+#[test]
+fn abi_property_write_reaches_the_heavy_instance_before_its_next_callback() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+"#,
+    );
+    let sources = BTreeMap::from([("driver.lua".to_owned(), PROPERTY_DRIVER.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let messages = message_list(&mut host);
+    assert!(
+        messages.iter().any(|message| message == "probe speed 4"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn script_ref_get_observes_rust_owner_changes_after_the_callback_commits() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "StatefulPropertyProbe"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([("reader.lua".to_owned(), PROPERTY_OWNER_READER.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "owner property 2.5"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn external_property_write_and_rust_owner_getter_share_one_value() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "StatefulPropertyProbe"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        ("driver.lua".to_owned(), STATEFUL_PROPERTY_DRIVER.to_owned()),
+        ("reader.lua".to_owned(), PROPERTY_OWNER_READER.to_owned()),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "owner property 5.0"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn rejected_heavy_property_write_runs_no_setter_and_preserves_owner_and_mirror() {
+    let _guard = test_lock();
+    REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "RejectingPropertyProbe"
+params = { speed = 1.5 }
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            REJECTING_PROPERTY_DRIVER.to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            REJECTING_PROPERTY_READER.to_owned(),
+        ),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message.contains("speed above 3 is rejected")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rejected owner property 1.5"),
+        "{events:?}"
+    );
+
+    drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
+        1.5_f64.to_bits(),
+        "rejected validation leaves the Rust owner's state unchanged"
+    );
+}
+
+#[test]
+fn failed_heavy_property_setter_restores_the_last_committed_owner_value() {
+    let _guard = test_lock();
+    REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "AdvancingRejectingPropertyProbe"
+params = { speed = 1.5 }
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            ADVANCING_REJECTING_PROPERTY_DRIVER.to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            ADVANCING_REJECTING_PROPERTY_READER.to_owned(),
+        ),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    for _ in 0..3 {
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    }
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message.contains("speed above 7 is rejected")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rollback owner property 5.0"),
+        "{events:?}"
+    );
+
+    drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
+        5.0_f64.to_bits(),
+        "the rejected second write leaves the last accepted value"
+    );
+}
+
+#[test]
+fn later_property_schema_failure_happens_before_any_custom_setter() {
+    let _guard = test_lock();
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
+    REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "LaterPropertyValidationProbe"
+params = { speed = 1.5, later = 2.5 }
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_start()
+  rve.find("target"):script("LaterPropertyValidationProbe"):set("speed", 4)
+end
+return Script"#
+                .to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("LaterPropertyValidationProbe")
+  rve.log_info("preflight properties " .. tostring(target:get("speed")) .. " " .. tostring(target:get("later")))
+end
+return Script"#
+                .to_owned(),
+        ),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    for _ in 0..3 {
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    }
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message.contains("later")
+                && event.message.contains("тип float")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "preflight properties 1.5 2.5"),
+        "{events:?}"
+    );
+    drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
+        1.5_f64.to_bits()
+    );
+}
+
+#[test]
+fn script_ref_get_observes_declared_lua_params_after_the_callback_commits() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/owner.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/owner.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        ("owner.lua".to_owned(), LUA_PROPERTY_OWNER.to_owned()),
+        ("reader.lua".to_owned(), LUA_PROPERTY_READER.to_owned()),
+    ]);
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua owner property 2.5"),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.message.contains("lua undeclared false")
+                && event.message.contains("is not declared by the script")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn lua_owner_params_use_the_schema_coerced_value_after_commit() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/owner.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/owner.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "owner.lua".to_owned(),
+            LUA_PROPERTY_OWNER_INTEGER.to_owned(),
+        ),
+        ("reader.lua".to_owned(), LUA_PROPERTY_READER.to_owned()),
+    ]);
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua owner property 2.0"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua stored property 2.0"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn failed_lua_callback_rolls_back_declared_params_before_script_ref_reads() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/owner.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/owner.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        ("owner.lua".to_owned(), LUA_PROPERTY_OWNER_FAILS.to_owned()),
+        ("reader.lua".to_owned(), LUA_PROPERTY_READER.to_owned()),
+    ]);
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua owner property 1.5"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("reject after staging property")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn abi_script_ref_reports_undeclared_property_details_to_failed_callbacks() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+[[objects]]
+id = "reader"
+[[objects.heavy_scripts]]
+name = "InvalidScriptRefProbe"
+"#,
+    );
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message == "property \"missing\" is not declared by the script"
+        }),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn abi_script_ref_reports_stale_instance_details_to_failed_callbacks() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+[[objects]]
+id = "reader"
+[[objects.heavy_scripts]]
+name = "StaleScriptRefProbe"
+"#,
+    );
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message == "script instance is no longer alive"
+        }),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn legacy_heavy_property_writes_are_rejected_before_they_change_the_mirror() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+params = { speed = 1.5 }
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_update()
+  local accepted, result = pcall(function()
+    return rve.find("target"):script("PropertyProbe"):set("speed", 4)
+  end)
+  rve.log_info("legacy property write " .. tostring(accepted) .. " " .. tostring(result))
+end
+return Script"#
+                .to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_update()
+  local speed = rve.find("target"):script("PropertyProbe"):get("speed")
+  rve.log_info("legacy property value " .. tostring(speed))
+end
+return Script"#
+                .to_owned(),
+        ),
+    ]);
+    let legacy = legacy_library(21);
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&legacy)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let messages = message_list(&mut host);
+    assert!(
+        messages.iter().any(|message| {
+            message.starts_with("legacy property write false")
+                && message.contains("target script does not support external property writes")
+        }),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "legacy property value 1.5")
+    );
+    assert!(
+        messages.iter().all(|message| message == "probe speed 1.5"
+            || message.starts_with("legacy property write false")
+            || message == "legacy property value 1.5"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn abi_v20_module_loads_on_the_v23_host_and_runs_without_property_writes() {
+    let _guard = test_lock();
+    run_legacy_descriptor_module_without_property_writes(20);
+}
+
+/// ABI v21 (save callbacks, historical descriptor layout) must not be read as the wide v23
+/// descriptor: its exact-sized table would be overread otherwise.
+#[test]
+fn abi_v21_module_loads_on_the_v23_host_and_runs_without_property_writes() {
+    let _guard = test_lock();
+    run_legacy_descriptor_module_without_property_writes(21);
+}
+
+fn run_legacy_descriptor_module_without_property_writes(abi_version: u32) {
+    let library = legacy_library(abi_version);
+    assert!(library.script("Probe").unwrap().set_property.is_none());
+
+    let mut world = scripted_world("Probe", "{}");
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    let messages = message_list(&mut host);
+    assert!(
+        messages.iter().any(|message| message == "start:default"),
+        "ABI v{abi_version} descriptors load and run on the ABI v23 host: {messages:?}"
+    );
+}
+
+fn legacy_library(abi_version: u32) -> crate::ScriptLibrary {
+    let current = sdk_module();
+    // SAFETY: the SDK macro owns an immutable descriptor table for the process lifetime.
+    let current_descriptors =
+        unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV20] = Box::leak(
+        current_descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV20 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+                on_fixed_update: descriptor.on_fixed_update,
+                on_late_update: descriptor.on_late_update,
+                on_timer: descriptor.on_timer,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }));
+    // SAFETY: the module and exact-sized v20 descriptor array are leaked for the test lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert_eq!(library.abi_version(), abi_version);
+    library
+}
+
+/// Heavy probe for window requests and file dialogs.
+struct PlatformProbe {
+    frame: u32,
+    dialog: Option<rve_sdk::FileDialogId>,
+}
+
+fn platform_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PlatformProbe {
+        frame: 0,
+        dialog: None,
+    }))
+}
+
+impl Script for PlatformProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        self.frame += 1;
+        if self.frame == 1 {
+            assert!(!ctx.is_fullscreen());
+            assert!(ctx.set_fullscreen(true));
+            assert!(ctx.is_fullscreen());
+            assert!(ctx.take_screenshot(None));
+            self.dialog = ctx.open_file_dialog(
+                &rve_sdk::FileDialog::new(rve_sdk::FileDialogKind::OpenFiles)
+                    .title("Open")
+                    .filter("Maps", &["map"]),
+            );
+            let id = self.dialog.expect("dialog id");
+            assert_eq!(
+                ctx.poll_file_dialog(id),
+                Some(rve_sdk::FileDialogPoll::Pending)
+            );
+        } else if let Some(id) = self.dialog.take() {
+            match ctx.poll_file_dialog(id) {
+                Some(rve_sdk::FileDialogPoll::Done(paths)) => {
+                    ctx.log_info(format!("picked {}", paths.len()));
+                }
+                other => ctx.log_info(format!("unexpected {other:?}")),
+            }
+        } else {
+            ctx.log_info(format!("fullscreen {}", ctx.is_fullscreen()));
+        }
+    }
+}
+
+#[test]
+fn abi_window_and_dialog_requests_round_trip_through_the_host() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "PlatformProbe"
+"#,
+    );
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let first = host.drain_events();
+    assert!(
+        first
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{first:?}"
+    );
+    let requests = host.take_platform_requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert_eq!(requests[0], crate::PlatformRequest::SetFullscreen(true));
+    assert_eq!(requests[1], crate::PlatformRequest::Screenshot(None));
+    let crate::PlatformRequest::FileDialog { id, request } = &requests[2] else {
+        panic!("expected a file dialog: {requests:?}");
+    };
+    assert_eq!(request.kind, crate::FileDialogKind::OpenFiles);
+    assert_eq!(request.filters[0].extensions, ["map"]);
+
+    host.complete_file_dialog(
+        *id,
+        vec![
+            std::path::PathBuf::from("a.map"),
+            std::path::PathBuf::from("b.map"),
+        ],
+    );
+    host.set_window_fullscreen(true);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"picked 2".to_owned()));
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"fullscreen true".to_owned()));
 }

@@ -13,16 +13,31 @@ pub enum Tab {
     Inspector,
     Project,
     Console,
+    /// Подокно `.rveprefab` в `[[assets]]` сцены.
+    SceneAssets,
+    /// Подокно списка тяжёлых префабов `prefabs.rveprefabs` проекта.
+    ProjectPrefabs,
+    /// Подокно тегов и слоёв `[tags]` и `[layers]` в `project.rveproject`.
+    ProjectSettings,
+    Profiler,
+    UiEditor,
+    MaterialPreview,
 }
 
 impl Tab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 12] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
         Self::Inspector,
         Self::Project,
         Self::Console,
+        Self::SceneAssets,
+        Self::ProjectPrefabs,
+        Self::ProjectSettings,
+        Self::Profiler,
+        Self::UiEditor,
+        Self::MaterialPreview,
     ];
 
     pub fn title(self) -> &'static str {
@@ -33,6 +48,12 @@ impl Tab {
             Self::Inspector => "Inspector",
             Self::Project => "Project",
             Self::Console => "Console",
+            Self::SceneAssets => "Scene Assets",
+            Self::ProjectPrefabs => "Project Prefabs",
+            Self::ProjectSettings => "Project Settings",
+            Self::Profiler => "Profiler",
+            Self::UiEditor => "UI Editor",
+            Self::MaterialPreview => "Material Preview",
         }
     }
 }
@@ -41,7 +62,8 @@ impl Tab {
 pub fn default_layout() -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Scene, Tab::Game]);
     let surface = dock.main_surface_mut();
-    let [center, _inspector] = surface.split_right(NodeIndex::root(), 0.78, vec![Tab::Inspector]);
+    let [center, inspector] = surface.split_right(NodeIndex::root(), 0.78, vec![Tab::Inspector]);
+    surface.split_below(inspector, 0.62, vec![Tab::MaterialPreview]);
     let [center, _hierarchy] = surface.split_left(center, 0.22, vec![Tab::Hierarchy]);
     surface.split_below(center, 0.68, vec![Tab::Project, Tab::Console]);
     dock
@@ -60,7 +82,17 @@ impl TabViewer for EditorTabs<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        if *tab == Tab::UiEditor
+            && self
+                .state
+                .ui_document
+                .as_ref()
+                .is_some_and(crate::ui_editor::CanvasEditor::is_dirty)
+        {
+            "UI Editor *".into()
+        } else {
+            tab.title().into()
+        }
     }
 
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
@@ -71,10 +103,25 @@ impl TabViewer for EditorTabs<'_> {
         match tab {
             Tab::Scene => ui::scene_view::show(ui, self.state),
             Tab::Game => ui::game_view::show(ui, self.state),
+            Tab::Hierarchy if self.state.ui_authoring => {
+                crate::ui_editor::show_hierarchy(ui, self.state)
+            }
             Tab::Hierarchy => ui::hierarchy::show(ui, self.state),
+            Tab::Inspector if self.state.ui_authoring => {
+                crate::ui_editor::show_inspector(ui, self.state)
+            }
             Tab::Inspector => ui::inspector::show(ui, self.state),
             Tab::Project => ui::project_panel::show(ui, self.state),
             Tab::Console => ui::console::show(ui, self.state),
+            Tab::SceneAssets => ui::scene_assets::show(ui, self.state),
+            Tab::ProjectPrefabs => ui::project_prefabs::show(ui, self.state),
+            Tab::ProjectSettings => ui::project_tags::show(ui, self.state),
+            Tab::Profiler => ui::profiler::show(ui, self.state),
+            Tab::UiEditor => {
+                self.state.ui_editor_rect = Some(ui.max_rect());
+                crate::ui_editor::show(ui, self.state);
+            }
+            Tab::MaterialPreview => ui::material_preview::show(ui, self.state),
         }
     }
 
@@ -95,13 +142,21 @@ mod tests {
     #[test]
     fn default_layout_contains_every_panel_once() {
         let dock = default_layout();
-        for tab in Tab::ALL {
+        // Profiler открывается из меню вкладок и по умолчанию закрыт.
+        for tab in Tab::ALL.into_iter().filter(|tab| *tab != Tab::Profiler) {
             let count = dock
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
                 .count();
-            assert_eq!(count, 1, "{tab:?}");
+            // Scene Assets, Project Prefabs, Project Settings and UI Editor open from menus.
+            let optional = matches!(
+                tab,
+                Tab::SceneAssets | Tab::ProjectPrefabs | Tab::ProjectSettings | Tab::UiEditor
+            );
+            let expected = usize::from(!optional);
+            assert_eq!(count, expected, "{tab:?}");
         }
+        assert!(!is_open(&dock, Tab::Profiler));
     }
 
     #[test]

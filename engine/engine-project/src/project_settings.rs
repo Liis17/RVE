@@ -1,3 +1,4 @@
+use crate::input_settings::InputSettings;
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -19,6 +20,98 @@ pub struct ProjectSettings {
     pub requirements: ProjectRequirements,
     #[serde(default)]
     pub runtime: RuntimeSettings,
+    #[serde(default)]
+    pub physics: PhysicsSettings,
+    /// Звуковой вывод проекта: `[audio]`. Значения по умолчанию не сериализуются.
+    #[serde(default, skip_serializing_if = "AudioSettings::is_default")]
+    pub audio: AudioSettings,
+    /// Горячие клавиши окна игры: `[window]`. Значения по умолчанию не сериализуются.
+    #[serde(default, skip_serializing_if = "WindowSettings::is_default")]
+    pub window: WindowSettings,
+    /// Значения по умолчанию не сериализуются, поэтому проекты без `[network]` не меняются.
+    #[serde(default, skip_serializing_if = "NetworkSettings::is_default")]
+    pub network: NetworkSettings,
+    #[serde(default)]
+    pub input: InputSettings,
+    /// Теги объектов: `[tags] names = [...]`. Пустой список не сериализуется.
+    #[serde(default, skip_serializing_if = "TagSettings::is_default")]
+    pub tags: TagSettings,
+    /// Слои объектов: `[layers] names = [...]`. Индекс имени — значение `layer` объекта.
+    #[serde(default, skip_serializing_if = "LayerSettings::is_default")]
+    pub layers: LayerSettings,
+}
+
+/// Наибольшее число слоёв проекта; `layer` объекта меньше этого значения.
+pub const MAX_LAYERS: usize = 32;
+
+/// Теги проекта, которые можно назначить объектам сцены.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TagSettings {
+    /// Имена тегов `[A-Za-z0-9_-]{1,64}`, без повторов.
+    pub names: Vec<String>,
+}
+
+impl TagSettings {
+    fn is_default(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_names("tags", &self.names, usize::MAX, false)
+    }
+}
+
+/// Слои проекта: до 32 имён, индекс имени совпадает со значением `layer` объекта.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayerSettings {
+    /// Имена слоёв `[A-Za-z0-9_-]{1,64}`, без повторов; не более [`MAX_LAYERS`]. Пустая строка —
+    /// слот без имени: индексы остальных слоёв от этого не меняются.
+    pub names: Vec<String>,
+}
+
+impl LayerSettings {
+    fn is_default(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_names("layers", &self.names, MAX_LAYERS, true)
+    }
+}
+
+fn validate_names(
+    section: &str,
+    names: &[String],
+    limit: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if names.len() > limit {
+        return Err(format!(
+            "[{section}] names допускает не больше {limit} имён"
+        ));
+    }
+    let mut seen = HashSet::with_capacity(names.len());
+    for name in names {
+        if allow_empty && name.is_empty() {
+            continue;
+        }
+        let valid = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        if !valid {
+            return Err(format!(
+                "имя в [{section}] {name:?} должно соответствовать [A-Za-z0-9_-]{{1,64}}"
+            ));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(format!("имя в [{section}] {name:?} указано повторно"));
+        }
+    }
+    Ok(())
 }
 
 /// A scene listed by a project, in project order.
@@ -68,6 +161,145 @@ impl Default for RuntimeSettings {
             dlss_application_id: None,
             dlss_engine_version: None,
         }
+    }
+}
+
+/// Звуковые настройки проекта: `[audio] mono_output = true` сводит весь вывод к моно.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AudioSettings {
+    pub mono_output: bool,
+}
+
+impl AudioSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Встроенные горячие клавиши окна игры. Обе включены по умолчанию.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowSettings {
+    /// F11 переключает полноэкранный режим без рамки и обратно.
+    pub fullscreen_hotkey: bool,
+    /// F12 сохраняет PNG-скриншот окна в пользовательскую папку данных проекта.
+    pub screenshot_hotkey: bool,
+}
+
+impl Default for WindowSettings {
+    fn default() -> Self {
+        Self {
+            fullscreen_hotkey: true,
+            screenshot_hotkey: true,
+        }
+    }
+}
+
+impl WindowSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Fixed-step simulation settings for a project.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PhysicsSettings {
+    pub gravity: [f32; 3],
+    pub fixed_hz: u32,
+    pub max_substeps: u32,
+    /// Матрица слоёв: `[physics.collision_matrix] masks = [32 чисел]`. Значения по умолчанию
+    /// не сериализуются, поэтому проекты без таблицы сталкиваются все со всеми.
+    #[serde(default, skip_serializing_if = "is_default_collision_matrix")]
+    pub collision_matrix: CollisionMatrixSettings,
+}
+
+/// Маски слоёв для столкновений. Слой `a` и слой `b` сталкиваются, только если бит `b` есть в
+/// маске `a` и бит `a` есть в маске `b`; поэтому маски задаются симметрично.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollisionMatrixSettings {
+    /// Ровно [`MAX_LAYERS`] значений; индекс массива — индекс слоя из `[layers]`.
+    #[serde(default = "default_collision_masks")]
+    pub masks: [u32; MAX_LAYERS],
+}
+
+impl Default for CollisionMatrixSettings {
+    fn default() -> Self {
+        Self {
+            masks: default_collision_masks(),
+        }
+    }
+}
+
+impl PartialEq for PhysicsSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.gravity
+            .into_iter()
+            .zip(other.gravity)
+            .all(|(left, right)| {
+                left == right
+                    || (left.is_nan() && right.is_nan() && left.to_bits() == right.to_bits())
+            })
+            && self.fixed_hz == other.fixed_hz
+            && self.max_substeps == other.max_substeps
+            && self.collision_matrix == other.collision_matrix
+    }
+}
+
+impl Eq for PhysicsSettings {}
+
+impl Default for PhysicsSettings {
+    fn default() -> Self {
+        Self {
+            gravity: [0.0, -9.81, 0.0],
+            fixed_hz: 60,
+            max_substeps: 8,
+            collision_matrix: CollisionMatrixSettings::default(),
+        }
+    }
+}
+
+fn default_collision_masks() -> [u32; MAX_LAYERS] {
+    [u32::MAX; MAX_LAYERS]
+}
+
+fn is_default_collision_matrix(matrix: &CollisionMatrixSettings) -> bool {
+    *matrix == CollisionMatrixSettings::default()
+}
+
+/// Сетевые настройки проекта: `[network]`. Пароль и ключ сервера в проект не записываются.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkSettings {
+    /// Включает сетевой режим в player; без флагов сети приложение работает offline.
+    pub enabled: bool,
+    /// Порт сервера по умолчанию, 1..=65535.
+    pub port: u16,
+    /// Наибольшее число подключённых клиентов, 1..=64.
+    pub max_clients: u32,
+    /// Частота сетевого тика, 1..=240 Гц.
+    pub tick_hz: u32,
+    /// Тайм-аут молчащего пира, 1000..=120000 мс.
+    pub timeout_ms: u32,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 7777,
+            max_clients: 8,
+            tick_hz: 30,
+            timeout_ms: 10_000,
+        }
+    }
+}
+
+impl NetworkSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -125,6 +357,9 @@ impl ProjectSettings {
         if self.version.trim().is_empty() {
             return Err("version не должен быть пустым".to_owned());
         }
+        self.input.validate()?;
+        self.tags.validate()?;
+        self.layers.validate()?;
         if let Some(path) = &self.heavy_scripts
             && !is_relative_project_path(path)
         {
@@ -155,6 +390,27 @@ impl ProjectSettings {
         }
         if self.runtime.background_tick_hz == 0 {
             return Err("runtime.background_tick_hz должен быть больше нуля".to_owned());
+        }
+        if !self.physics.gravity.into_iter().all(f32::is_finite) {
+            return Err("physics.gravity должен содержать конечные числа".to_owned());
+        }
+        if !(1..=1000).contains(&self.physics.fixed_hz) {
+            return Err("physics.fixed_hz должен быть в диапазоне 1..=1000".to_owned());
+        }
+        if !(1..=64).contains(&self.physics.max_substeps) {
+            return Err("physics.max_substeps должен быть в диапазоне 1..=64".to_owned());
+        }
+        if self.network.port == 0 {
+            return Err("network.port должен быть в диапазоне 1..=65535".to_owned());
+        }
+        if !(1..=64).contains(&self.network.max_clients) {
+            return Err("network.max_clients должен быть в диапазоне 1..=64".to_owned());
+        }
+        if !(1..=240).contains(&self.network.tick_hz) {
+            return Err("network.tick_hz должен быть в диапазоне 1..=240".to_owned());
+        }
+        if !(1000..=120_000).contains(&self.network.timeout_ms) {
+            return Err("network.timeout_ms должен быть в диапазоне 1000..=120000".to_owned());
         }
         if let Some(path) = &self.runtime.fsr_library
             && (!is_relative_project_path(path)
@@ -258,7 +514,7 @@ fn default_background_tick_hz() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectSettings, RuntimeSettings};
+    use super::{NetworkSettings, PhysicsSettings, ProjectSettings, RuntimeSettings};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -278,13 +534,107 @@ mod tests {
     }
 
     #[test]
+    fn tags_and_layers_parse_round_trip_and_stay_out_of_default_files() {
+        let plain =
+            ProjectSettings::parse(&project("[[scenes]]\npath = \"scene.rvescene\"\n")).unwrap();
+        assert!(plain.tags.names.is_empty());
+        assert!(plain.layers.names.is_empty());
+        let serialized = plain.to_toml().unwrap();
+        assert!(!serialized.contains("tags"), "{serialized}");
+        assert!(!serialized.contains("layers"), "{serialized}");
+
+        let settings = ProjectSettings::parse(&format!(
+            "{}\n[tags]\nnames = [\"Player\", \"enemy_1\"]\n[layers]\nnames = [\"Default\", \"UI\"]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(settings.tags.names, ["Player", "enemy_1"]);
+        assert_eq!(settings.layers.names, ["Default", "UI"]);
+        let again = ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap();
+        assert_eq!(again, settings);
+    }
+
+    #[test]
+    fn cleared_layer_slots_are_allowed_but_empty_tags_and_duplicates_are_not() {
+        let scene = "[[scenes]]\npath = \"scene.rvescene\"\n";
+        let settings = ProjectSettings::parse(&project(&format!(
+            "{scene}[layers]\nnames = [\"Default\", \"\", \"UI\", \"\"]\n"
+        )))
+        .unwrap();
+        assert_eq!(settings.layers.names, ["Default", "", "UI", ""]);
+        let text = settings.to_toml().unwrap();
+        assert_eq!(
+            ProjectSettings::parse(&text).unwrap().layers.names,
+            settings.layers.names
+        );
+
+        let error = ProjectSettings::parse(&project(&format!("{scene}[tags]\nnames = [\"\"]\n")))
+            .unwrap_err();
+        assert!(error.contains("[tags]"), "{error}");
+        let error = ProjectSettings::parse(&project(&format!(
+            "{scene}[layers]\nnames = [\"UI\", \"UI\"]\n"
+        )))
+        .unwrap_err();
+        assert!(error.contains("[layers]"), "{error}");
+    }
+
+    #[test]
+    fn layers_accept_exactly_32_names_and_reject_more() {
+        let names = (0..32)
+            .map(|index| format!("\"layer{index}\""))
+            .collect::<Vec<_>>();
+        let accepted = format!(
+            "{}\n[layers]\nnames = [{}]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n"),
+            names.join(", ")
+        );
+        assert_eq!(
+            ProjectSettings::parse(&accepted)
+                .unwrap()
+                .layers
+                .names
+                .len(),
+            32
+        );
+
+        let rejected = format!(
+            "{}\n[layers]\nnames = [{}, \"layer32\"]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n"),
+            names.join(", ")
+        );
+        let error = ProjectSettings::parse(&rejected).unwrap_err();
+        assert!(error.contains("[layers]"), "{error}");
+    }
+
+    #[test]
+    fn tag_and_layer_names_must_be_unique_identifiers() {
+        let scene = project("[[scenes]]\npath = \"scene.rvescene\"\n");
+        let long_name = "x".repeat(65);
+        let sections = [
+            "[tags]\nnames = [\"Player\", \"Player\"]\n".to_owned(),
+            "[tags]\nnames = [\"bad name\"]\n".to_owned(),
+            "[tags]\nnames = [\"\"]\n".to_owned(),
+            "[layers]\nnames = [\"UI\", \"UI\"]\n".to_owned(),
+            format!("[layers]\nnames = [\"{long_name}\"]\n"),
+        ];
+        for section in sections {
+            let error = ProjectSettings::parse(&format!("{scene}\n{section}")).unwrap_err();
+            assert!(
+                error.contains("[tags]") || error.contains("[layers]"),
+                "{section}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_project_scenes_settings_and_startup_scene() {
         let settings = ProjectSettings::parse(
             "id = \"demo-game\"\nname = \"Demo Game\"\nversion = \"1.2.3\"\nheavy_scripts = \"HeavyScripts\"\n\
              [[scenes]]\npath = \"/levels/menu.rvescene\"\nenabled = false\n\
              [[scenes]]\npath = \"levels/main.rvescene\"\n\
              [requirements]\nmin_ram_mb = 512\nmin_cpu_threads = 4\n\
-             [runtime]\nbackground_tick_hz = 45\n",
+             [runtime]\nbackground_tick_hz = 45\n\
+             [physics]\ngravity = [0.0, -4.0, 0.0]\nfixed_hz = 120\nmax_substeps = 6\n",
         )
         .unwrap();
 
@@ -299,6 +649,15 @@ mod tests {
         assert_eq!(settings.requirements.min_ram_mb, 512);
         assert_eq!(settings.requirements.min_cpu_threads, 4);
         assert_eq!(settings.runtime.background_tick_hz, 45);
+        assert_eq!(
+            settings.physics,
+            PhysicsSettings {
+                gravity: [0.0, -4.0, 0.0],
+                fixed_hz: 120,
+                max_substeps: 6,
+                collision_matrix: Default::default(),
+            }
+        );
     }
 
     #[test]
@@ -318,7 +677,70 @@ mod tests {
         assert_eq!(settings.runtime.dlss_project_id, None);
         assert_eq!(settings.runtime.dlss_application_id, None);
         assert_eq!(settings.runtime.dlss_engine_version, None);
+        assert_eq!(settings.physics, PhysicsSettings::default());
         assert_eq!(settings.starting_scene(), Some("scenes/start.rvescene"));
+    }
+
+    #[test]
+    fn collision_matrix_defaults_to_all_pairs_and_stays_out_of_default_files() {
+        let settings =
+            ProjectSettings::parse(&project("[[scenes]]\npath = \"scene.rvescene\"\n")).unwrap();
+
+        assert_eq!(
+            settings.physics.collision_matrix.masks,
+            [u32::MAX; super::MAX_LAYERS]
+        );
+        assert!(!settings.to_toml().unwrap().contains("collision_matrix"));
+    }
+
+    #[test]
+    fn collision_matrix_parses_and_round_trips() {
+        let mut masks = [u32::MAX; super::MAX_LAYERS];
+        masks[0] = 0b01;
+        masks[1] = 0b10;
+        let list = masks
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let contents = format!(
+            "{}\n[physics.collision_matrix]\nmasks = [{list}]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        );
+
+        let settings = ProjectSettings::parse(&contents).unwrap();
+        assert_eq!(settings.physics.collision_matrix.masks, masks);
+        let reparsed = ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap();
+        assert_eq!(reparsed.physics, settings.physics);
+    }
+
+    #[test]
+    fn collision_matrix_requires_exactly_one_mask_per_layer() {
+        let contents = format!(
+            "{}\n[physics.collision_matrix]\nmasks = [1, 2]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        );
+
+        let error = ProjectSettings::parse(&contents).unwrap_err();
+        assert!(error.contains("array of length 32"), "{error}");
+    }
+
+    #[test]
+    fn rejects_invalid_physics_settings() {
+        for (field, value) in [
+            ("gravity", "[0.0, nan, 0.0]"),
+            ("fixed_hz", "0"),
+            ("fixed_hz", "1001"),
+            ("max_substeps", "0"),
+            ("max_substeps", "65"),
+        ] {
+            let contents = format!(
+                "{}\n[physics]\n{field} = {value}\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            );
+            let error = ProjectSettings::parse(&contents).unwrap_err();
+            assert!(error.contains("physics"), "{field}={value}: {error}");
+        }
     }
 
     #[test]
@@ -435,6 +857,31 @@ mod tests {
     }
 
     #[test]
+    fn window_hotkeys_default_on_and_can_be_disabled() {
+        const SCENE: &str = "[[scenes]]\npath = \"scene.rvescene\"\n";
+        let defaults = ProjectSettings::parse(&project(SCENE)).unwrap();
+        assert!(defaults.window.fullscreen_hotkey);
+        assert!(defaults.window.screenshot_hotkey);
+        assert!(!defaults.to_toml().unwrap().contains("[window]"));
+
+        let custom = ProjectSettings::parse(&format!(
+            "{}\n[window]\nfullscreen_hotkey = false\n",
+            project(SCENE)
+        ))
+        .unwrap();
+        assert!(!custom.window.fullscreen_hotkey);
+        assert!(custom.window.screenshot_hotkey);
+        assert_eq!(
+            ProjectSettings::parse(&custom.to_toml().unwrap()).unwrap(),
+            custom
+        );
+
+        let unknown =
+            ProjectSettings::parse(&format!("{}\n[window]\nvsync = true\n", project(SCENE)));
+        assert!(unknown.unwrap_err().contains("vsync"));
+    }
+
+    #[test]
     fn serializes_and_reloads_project_settings() {
         let settings =
             ProjectSettings::parse(&project("[[scenes]]\npath = \"scene/start.rvescene\"\n"))
@@ -447,6 +894,15 @@ mod tests {
                 background_tick_hz: 0,
                 fsr_library: None,
                 ..RuntimeSettings::default()
+            },
+            ..settings.clone()
+        };
+        assert!(invalid.to_toml().is_err());
+
+        let invalid = ProjectSettings {
+            physics: PhysicsSettings {
+                fixed_hz: 0,
+                ..PhysicsSettings::default()
             },
             ..settings
         };
@@ -532,6 +988,81 @@ mod tests {
             let error = ProjectSettings::parse(&contents).unwrap_err();
             assert!(error.to_ascii_lowercase().contains("dlss"), "{runtime:?}");
         }
+    }
+
+    #[test]
+    fn network_section_has_documented_defaults_and_is_not_serialized_when_default() {
+        let settings =
+            ProjectSettings::parse(&project("[[scenes]]\npath = \"scene.rvescene\"\n")).unwrap();
+        assert_eq!(settings.network, NetworkSettings::default());
+        assert!(!settings.network.enabled);
+        assert_eq!(settings.network.port, 7777);
+        assert_eq!(settings.network.max_clients, 8);
+        assert_eq!(settings.network.tick_hz, 30);
+        assert_eq!(settings.network.timeout_ms, 10_000);
+
+        let serialized = settings.to_toml().unwrap();
+        assert!(!serialized.contains("network"), "{serialized}");
+        let again = ProjectSettings::parse(&serialized).unwrap();
+        assert_eq!(again, settings);
+    }
+
+    #[test]
+    fn network_section_round_trips_and_checks_ranges() {
+        let settings = ProjectSettings::parse(&format!(
+            "{}\n[network]\nenabled = true\nport = 9000\nmax_clients = 64\ntick_hz = 240\ntimeout_ms = 120000\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.network,
+            NetworkSettings {
+                enabled: true,
+                port: 9000,
+                max_clients: 64,
+                tick_hz: 240,
+                timeout_ms: 120_000,
+            }
+        );
+        let serialized = settings.to_toml().unwrap();
+        assert!(serialized.contains("[network]"), "{serialized}");
+        assert_eq!(ProjectSettings::parse(&serialized).unwrap(), settings);
+
+        for (field, value) in [
+            ("port", "0"),
+            ("max_clients", "0"),
+            ("max_clients", "65"),
+            ("tick_hz", "0"),
+            ("tick_hz", "241"),
+            ("timeout_ms", "999"),
+            ("timeout_ms", "120001"),
+        ] {
+            let contents = format!(
+                "{}\n[network]\n{field} = {value}\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            );
+            let error = ProjectSettings::parse(&contents).unwrap_err();
+            assert!(
+                error.contains(&format!("network.{field}")),
+                "{field}={value}: {error}"
+            );
+        }
+
+        // Порт вне u16 отсекает разбор TOML до проверки диапазона.
+        assert!(
+            ProjectSettings::parse(&format!(
+                "{}\n[network]\nport = 65536\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            ))
+            .is_err()
+        );
+
+        let unknown = ProjectSettings::parse(&format!(
+            "{}\n[network]\nsecret = \"x\"\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap_err();
+        assert!(unknown.contains("secret"), "{unknown}");
     }
 
     #[test]

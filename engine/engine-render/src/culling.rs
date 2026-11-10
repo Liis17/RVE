@@ -344,6 +344,7 @@ mod tests {
             previous_model: None,
             lod_level: 0,
             casts_shadow: true,
+            skin: None,
         }
     }
 

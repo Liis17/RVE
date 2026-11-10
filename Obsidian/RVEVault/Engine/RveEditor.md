@@ -19,26 +19,39 @@ Parent: [[Index]]
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject` | Команды над документом, undo/redo, атомарное сохранение, раскрытие префабов |
 | `editor/src/scene_edit/prefabs.rs` | `OverrideField`, `object_override` | Instantiate, Create Prefab, Unpack, overrides и Apply to Prefab |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject`, `Component` | Команды над документом, выделение, undo/redo, буфер обмена объектов, атомарное сохранение |
-| `editor/src/settings.rs` | `SettingsStore`, `UserSettings` | Настройки пользователя: недавние проекты и раскладка панелей |
+| `editor/src/settings.rs` | `SettingsStore`, `UserSettings`, `McpSettings` | Настройки пользователя: недавние проекты, раскладка панелей и настройки MCP-сервера |
+| `editor/src/mcp/` | `McpHost`, `dispatch`, `capture`, `paths` | MCP-сервер редактора: применение настроек, выполнение инструментов на главном потоке, политика путей и `capture_view` |
+| `editor/src/ui/preferences.rs` | `Preferences`, `show` | Окно Edit → Preferences… с настройками MCP-сервера |
 | `editor/src/autosave.rs` | `AutosaveStore` | Копии несохранённых сцен и их восстановление |
 | `editor/src/assets_fs.rs` | `AssetsDir` | Файловые операции в `Assets/` с проверкой путей |
+| `editor/src/asset_watch.rs` | `AssetWatcher`, `AssetChanges`, `ChangeBatch` | Watcher `Assets/`, классификация путей, debounce и выборочная обработка изменений |
+| `editor/src/play_network.rs` | `PlayNetwork`, `PlayNetworkForm`, `PlayNetworkPlan`, `PlayNetworkMode` | Сетевой Play: выбор Offline/Host/Client, проверка полей и мост к миру сессии |
 | `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` |
+| `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` и `.postprocess`; создание, сохранение и загрузка `.rvephysmat` для Play |
 | `editor/src/new_project.rs` | `create_project` | Встроенный starter template и атомарное создание нового проекта |
 | `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG/Radiance HDR, tone mapping HDR thumbnails и LRU-кэш UI-текстур |
+| editor/src/materials.rs | MaterialLibrary | Кэш parsed .rvemat/.rveshader, file revisions, shader generations и transactional reload |
+| editor/src/ui/asset_inspector.rs, editor/src/ui/material_preview.rs | material/shader inspector и Material Preview tab | Редактирование свойств, open in system editor и preview controls для plane/cube/sphere |
+| `editor/src/icons.rs` | `IconCache`, `folder_icon`, `file_icon`, `component_icon`, `object_icon` | Иконки из `IconsPack`: выбор для папок, файлов Project, заголовков компонентов Inspector и строк Hierarchy, загрузка UI-текстур один раз |
+| `editor/build.rs` | — | Растеризация `IconsPack/**/*.svg` через resvg в RGBA 128×128 на этапе сборки |
 | `editor/src/build.rs` | `BuildJob`, `ScriptsJob`, `ScriptGeneration`, `locate_build_tool` | File → Build Player и автоматическая сборка heavy scripts через дочерний `rve-build`; вывод идёт в Console |
-| `editor/src/play.rs` | `PlaySession`, `Watchdog` | Копия мира и скрипты на главном потоке, прерывание зависшего Lua |
+| `editor/src/play.rs` | `PlaySession`, `PlayPhysics`, `PlayAudio`, `HeavyLoads`, `Watchdog` | Копия мира, скрипты, per-Play physics thread, звуковой поток, фоновая загрузка тяжёлых префабов, прерывание зависшего Lua и мост анимации Play |
+| `editor/src/viewport/animation.rs` | `EditorAnimation`, `AnimationPreview`, `PreviewStatus`, `project_bridge`, `project_preview_bridge` | Мост превью выбранного аниматора, его настройки и сведения для инспектора; Play-мост строится через `project_bridge` |
+| `editor/src/play_cursor.rs` | `PlayCursor`, `play_cursor_captured`, `sync`, `focus_game_tab` | Захват курсора панелью Game во время Play и состояние, отправляемое в окно |
 | `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
-| `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
+| `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `scene_assets`, `project_prefabs`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
+| `editor/src/project_prefabs.rs` | `ProjectPrefabs` | Редактируемый список `prefabs.rveprefabs` подокна Project Prefabs: проверка правок, явное сохранение |
 
 ## Публичные контракты
 
 | Контракт | Поведение |
 |---|---|
-| CLI | `rve-editor [--project <dir>] [--scripts <library>]`. Без `--project` показывается стартовый экран. Если `--scripts` задан, эта ABI-библиотека заменяет autobuild; иначе проект с `heavy_scripts` собирается при открытии и перед Play |
+| CLI | `rve-editor [--project <dir>] [--scripts <library>] [--mcp]`. Без `--project` показывается стартовый экран. `--mcp` включает MCP-сервер на этот запуск и не меняет сохранённую настройку. Если `--scripts` задан, эта ABI-библиотека заменяет autobuild; иначе проект с `heavy_scripts` собирается при открытии и перед Play |
 | Коды завершения | 0 — успех; 2 — неверные аргументы, настройки проекта или `bootstrap.rves`; 1 — ошибка окна или renderer |
+| Консоль Windows | Release-сборка использует подсистему `windows`, как `rve-player`: окно консоли не открывается, а stderr ошибок CLI и запуска при старте из терминала не виден; коды завершения сохраняются. Debug-сборка остаётся консольной. Дочерние процессы сборки запускаются с `CREATE_NO_WINDOW` |
 | Окно | Размер из `bootstrap.rves` проекта, иначе 1600×900; заголовок содержит проект, сцену и признак несохранённых правок |
-| Раскладка проекта | Как dev-запуск player: `project.rveproject`, `bootstrap.rves`, `Assets/`; ресурсы читаются в `SourceMode::Loose`, поэтому новые файлы видны сразу. Камеры читают общие `.camerasettings` по объявленным scene asset paths |
-| Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов, раскладка egui_dock и режим `scroll_navigation` (Auto/Trackpad/Mouse). Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |
+| Раскладка проекта | Как dev-запуск player: `project.rveproject`, `bootstrap.rves`, `Assets/`; ресурсы читаются в `SourceMode::Loose`. `AssetWatcher` автоматически наблюдает за `Assets/`. Камеры читают общие `.camerasettings` и `.postprocess` по объявленным scene asset paths |
+| Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов, раскладка egui_dock, режим `scroll_navigation` (Auto/Trackpad/Mouse) и настройки MCP-сервера в поле `mcp` (не зависят от проекта). Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |
 | Pipeline cache | `RendererConfig` всегда запрашивает FIFO; pipeline cache хранится отдельно в каталоге пользователя ОС для `rve-editor`, загружается до создания renderer и атомарно сохраняется после оконного цикла ([[Engine/EnginePlatform]], [[Engine/EngineRender]]) |
 | Автосохранение | `<проект>/.rve/editor/autosave/<сцена>.autosave`, где `~` и `/` пути экранированы как `~7E` и `~2F`, а новая сцена — `~untitled`. Каталог вне `Assets/`, поэтому копии не попадают в ресурсы и сборку |
 | Буфер обмена | Ctrl/Cmd+C кладёт в буфер ОС JSON с ключом `rve_editor_objects` (выделенные поддеревья `SceneObject`); вставка чужого текста игнорируется |
@@ -49,9 +62,32 @@ Parent: [[Index]]
 
 Каждый viewport получает собственный список draws, `FrameCamera`, environment, локальные lights, local shadow requests/matrices и camera-relative directional shadow cascades. Runtime helpers из `engine-scene::light` строят матрицы из мирового состояния lights; renderer независимо распределяет 32 слоя с учётом camera distance для каждой панели. Scene использует камеру редактора вне Play и камеру сцены в Play; Game использует выбранную игровую камеру, поэтому проекция, cluster lists, environment transform, выбор локальных источников/теней и каскады считаются отдельно для каждой панели. Общий local shadow array перерисовывается последовательно перед каждым viewport opaque pass; матрицы лежат в per-frame viewport buffers. Сетка добавляется только к списку Scene. Обе панели используют общие кэши FBX/PNG/HDR и могут независимо выбрать разные LOD одного объекта.
 
-Окно работает в `RedrawMode::OnDemand`: кадр запрашивают события egui-winit, отложенный repaint egui через `WindowHandler::next_wakeup`, незавершённые превью и модели и пропущенный кадр. В Play вне паузы кадр запрашивается постоянно. Срок автосохранения тоже входит в `next_wakeup`, а копия пишется в `WindowHandler::update`, поэтому последняя правка перед простоем записывается без перерисовки.
+Окно работает в `RedrawMode::OnDemand`: кадр запрашивают события egui-winit, отложенный repaint egui через `WindowHandler::next_wakeup`, незавершённые превью и модели и пропущенный кадр. В Play вне паузы кадр запрашивается постоянно. Срок автосохранения тоже входит в `next_wakeup`, а копия пишется в `WindowHandler::update`, поэтому последняя правка перед простоем записывается без перерисовки. Вызовы MCP будят окно через `WindowProxy::wake`; пока `capture_view` активен, `next_wakeup` возвращает опрос каждые 16 мс (см. «MCP-сервер» ниже и [[Engine/EngineMcp]]).
 
-Модели FBX разбирает `ModelLoader` в потоке `rve-editor-models`, а загрузку готовой модели в GPU выполняет `SceneRenderer::sync_assets` на главном потоке; до готовности объект не рисуется и не выбирается, ошибка пишется в Console один раз. Refresh и смена проекта перезапускают очередь с новым поколением, и результаты, начатые раньше, отбрасываются. Наведение камеры на новую модель (`pending_frame`) ждёт окончания её загрузки.
+Модели FBX разбирает `ModelLoader` в потоке `rve-editor-models`, а загрузку готовой модели в GPU выполняет `SceneRenderer::sync_assets` на главном потоке; до готовности объект не рисуется и не выбирается, ошибка пишется в Console. Смена проекта перезапускает очередь с новым поколением, и результаты, начатые раньше, отбрасываются. Наведение камеры на новую модель (`pending_frame`) ждёт окончания её загрузки.
+
+## Автообновление ресурсов
+
+При открытии проекта `EditorApp` создаёт `AssetWatcher` для канонического корня `Assets/`; при смене проекта watcher заменяется, при выходе освобождается. Ошибка создания оставляет редактор рабочим без автообновления и выводит предупреждение в Console. Callback watcher передаёт события в канал и вызывает `WindowProxy::wake()`. `EditorApp::update` собирает их в `ChangeBatch`: пакет готов после 250 мс тишины, а `deadline()` участвует в `WindowHandler::next_wakeup`. Файловые операции самого редактора отдельно обновляют только дерево Project; последующие события watcher безопасны и идемпотентны.
+
+`classify` преобразует абсолютные пути под корнем ресурсов в `VirtualPath`, учитывая канонический и исходный пути корня; пути вне `Assets/` и не-UTF-8 пути игнорируются. События Create/Remove/Rename обновляют дерево. Все типы событий передают пути для точечной перезагрузки; ошибка watcher или `need_rescan()` помечает все закэшированные ресурсы изменёнными.
+
+- Project tree перечитывается только для структурных событий и rescan. Внешнее изменение `.rvescene` само по себе обновляет список файлов, но не заменяет открытую сцену.
+- PreviewCache помечает затронутые записи для повторного декодирования. Результат устаревшего запроса отбрасывается; ошибка декодирования сохраняет прежнюю UI-текстуру, а после исправления файла запрос повторяется по следующему событию.
+- Изменённые Lua-схемы перечитываются при следующем показе. Ошибка оставляет ранее успешную схему и пишет сообщение в Console; без прежней схемы сохраняется текущее поведение с ошибкой.
+- `PrefabCache` перечитывает изменённые документы и затем повторно раскрывает открытую сцену. Ошибка разбора или раскрытия сохраняет прежние документы в кэше и текущую версию раскрытия.
+- Изменение `.camerasettings` или `.postprocess` перестраивает edit-world. Preview использует последнюю валидную настройку и пишет ошибку в Console; если валидной версии не было, остаются defaults. Play по-прежнему читает настройки строго и завершается ошибкой на невалидном файле.
+- Инспектор камеры выбирает `.postprocess` из ассетов проекта (`Default` убирает ссылку) и показывает секции эффектов с черновиком. Save записывает файл через `EditorState::save_post_process` и обновляет все камеры, которые его используют; Revert отбрасывает черновик. В Scene-виде depth of field и motion blur отключены.
+- Секция «Screen Shaders» инспектора камеры редактирует до четырёх `.glsl`: стадию, включение, порядок и шестнадцать параметров; правки идут через `edit_scene` и отменяются undo. Изменённый файл перекомпилируется при горячей перезагрузке, ошибка оставляет прежний шейдер и показывается под записью. Game-вид применяет шейдеры выбранной Game-камеры, Scene-вид — нет ([[Engine/EngineScreenShaders]]).
+- `SceneRenderer::reload_changed` выбирает модели, текстуры и HDR по `VirtualPath`, включая внешние PNG-зависимости загруженных FBX. Успех сначала создаёт замену, затем переключает кэш и освобождает прежний GPU-ресурс; ошибка чтения или валидации модели и текстуры сохраняет прежнюю версию, а без прежней версии ресурс остаётся отсутствующим. Ошибка перезагрузки HDR сохраняет прежний источник в кэше; уже рабочее GPU-окружение сохраняется только при повторной загрузке того же пути. При ошибке первого выбора HDR или смены ключа окружение не наследуется от прежнего источника: старый GPU-ресурс освобождается, renderer использует default. Ошибки пишутся в Console; прочие ошибки `RenderError` остаются фатальными. Пока FBX разбирается, изменение делает результат устаревшим и запускает новый запрос. Для неизвестных PNG-зависимостей повторно запрашиваются все ожидающие и модели с неудачной последней перезагрузкой.
+
+- MaterialLibrary перечитывает .rvemat/.rveshader по revisions из watcher; успешный reload material повышает revision, успешный shader reload повышает generation и запускает транзакционную замену GPU-зависимостей. Ошибка разбора или компиляции сохраняет последнюю валидную схему и поколение GPU; новый повреждённый материал показывает magenta fallback.
+
+### Материалы и шейдеры
+
+Project → Create и контекстное меню папки создают .rvemat и .rveshader; новые файлы не перезаписывают существующие. Двойной щелчок по текстовому asset открывает системный редактор; ненулевой код его выхода пишется в Console. Project показывает отдельные SVG icons для Material и Shader. Inspector разбирает shader schema, предлагает Material asset picker, alpha/cutoff/double-sided, numeric и texture properties, отображает compile/parse diagnostics; material drafts записываются при завершении drag, а не на каждом кадре.
+
+Кнопка Preview фокусирует уже открытую вкладку Material Preview или создаёт её. Preview отображает выбранный материал на plane, cube или sphere с orbit/zoom. Без выбранного ресурса вкладка показывает подсказку, и проход превью не выполняется. Mesh Renderer Inspector редактирует .rvemat slots отдельно для каждой FBX part; добавление ссылки добавляет asset в сцену, очистка оставляет FBX material.
 
 Действия, блокирующие кадр или заменяющие заимствованные панелями данные (диалоги ОС, смена сцены и проекта, Play), откладываются в `EditorState::actions` и выполняются вне построения UI.
 
@@ -59,26 +95,29 @@ Parent: [[Index]]
 
 Каждая команда `EditorScene` применяется к копии `SceneDocument` и принимается только после `SceneDocument::validate`; при ошибке документ не меняется, а сообщение уходит в Console. Undo/redo — снимки документа с глубиной 128. Правки с одинаковым ключом подряд (перетаскивание значения или гизмо) занимают одну запись истории до `end_continuous_edit`. Смена родителя сохраняет локальную трансформацию.
 
-Палитра цвета не сообщает об окончании перетаскивания, поэтому её правки объединяются по отдельному ключу, пока нажата кнопка мыши (`end_continuous_edit_for`). Поля цвета света не ограничены сверху (HDR), а палитра правит копию значения и не трогает их без выбора. Inspector Point Light задаёт цвет, интенсивность, range и `shadows`; Spot Light дополнительно задаёт inner/outer angles. Включённый local-light `shadows` теперь запрашивает реальное отбрасывание тени; renderer может оставить источник освещённым без тени, когда он вне camera frustum, матрица невалидна или общий бюджет 32 слоёв исчерпан. Scene material override правится в Mesh Renderer флажками полей: HDR emissive, opacity, alpha mode и mask cutoff, occlusion strength и текстуры; override без заданных полей удаляется. Reset/Copy/Paste в контекстном меню заголовка компонента работают с Transform, Camera, Mesh Renderer, LOD Group, Directional Light, Point Light и Spot Light; light components копируются целиком, вставка добавляет ресурсы компонента в список сцены, Reset Mesh Renderer сохраняет модель, а у LOD Group сброса нет. Toolbar и Add Component создают Point/Spot Light; prefab components поддерживают full-component override и Revert.
+Палитра цвета не сообщает об окончании перетаскивания, поэтому её правки объединяются по отдельному ключу, пока нажата кнопка мыши (`end_continuous_edit_for`). Поля цвета света не ограничены сверху (HDR), а палитра правит копию значения и не трогает их без выбора. Inspector Point Light задаёт цвет, интенсивность, range и `shadows`; Spot Light дополнительно задаёт inner/outer angles. Включённый local-light `shadows` теперь запрашивает реальное отбрасывание тени; renderer может оставить источник освещённым без тени, когда он вне camera frustum, матрица невалидна или общий бюджет 32 слоёв исчерпан. Scene material override правится в Mesh Renderer флажками полей: HDR emissive, opacity, alpha mode и mask cutoff, occlusion strength и текстуры; override без заданных полей удаляется. Reset/Copy/Paste в контекстном меню заголовка компонента работают с Transform, Camera, Mesh Renderer, LOD Group, Directional Light, Point Light, Spot Light и Audio Source; light components копируются целиком, вставка добавляет ресурсы компонента в список сцены, Reset Mesh Renderer сохраняет модель, Reset Audio Source сохраняет клип, а у LOD Group сброса нет. Add Component → Audio Source выбирает `.wav` или `.ogg` из проекта; Inspector Audio Source задаёт clip, group, volume, loop, play on start, spatial blend (0..1), rolloff, pitch, force mono и min/max distance. Toolbar и Add Component создают Point/Spot Light; prefab components поддерживают full-component override и Revert.
 
 Выделение — упорядоченный набор, последний объект активный: его показывает Inspector, по нему наводится камера (F). Ctrl/Cmd-щелчок в Scene и Hierarchy переключает объект, Shift-щелчок добавляет. Групповые удаление, дублирование, копирование и гизмо применяются к поддеревьям выделенных объектов без потомков уже выделенного предка и занимают одну запись истории; при ошибке валидации не меняется ни один объект. Вставка и дублирование дают копиям свободные id, переназначают `parent` внутри набора, оставляют корень под прежним родителем, если он есть в сцене, и добавляют ресурсы объектов в список сцены, поэтому объекты можно вставить в другую сцену.
 
-Схема сцены требует хотя бы одну камеру и не более одного directional light; Point/Spot Light допускаются множественно и независимо от directional. При нескольких камерах ровно одна должна быть активной; добавление, дублирование и удаление камер сохраняют это правило. Inspector задаёт camera settings asset и активность; AA picker меняет `render.anti_aliasing` выбранного `.camerasettings` и сразу сохраняет ресурс через `CameraSettings::to_toml`, обновляя все камеры текущего мира, которые его используют. Без назначенного ресурса AA недоступен. Старые поля FOV/near/far в компоненте больше не поддерживаются. Для directional light Inspector задаёт конечную положительную `shadow_distance` и число `shadow_cascades` от 1 до 4. Сохранение сцены: `to_toml`, проверочный `parse`, запись во временный файл рядом и `rename`. Комментарии и форматирование исходных TOML не сохраняются.
+Схема сцены требует хотя бы одну камеру и не более одного directional light; Point/Spot Light допускаются множественно и независимо от directional. При нескольких камерах ровно одна должна быть активной; добавление, дублирование и удаление камер сохраняют это правило. Inspector задаёт camera settings asset и активность; раскрывающийся пункт Cursor (по умолчанию свёрнут) задаёт флаги `Hide on start` и `Lock on start` через `scene_edit::set_camera_cursor` с общим undo. Флаги действуют при старте сцены только у активной камеры, поэтому подсказка у чекбоксов это уточняет; AA picker меняет `render.anti_aliasing` выбранного `.camerasettings` и сразу сохраняет ресурс через `CameraSettings::to_toml`, обновляя все камеры текущего мира, которые его используют. Без назначенного ресурса AA недоступен. Старые поля FOV/near/far в компоненте больше не поддерживаются. Для directional light Inspector задаёт конечную положительную `shadow_distance` и число `shadow_cascades` от 1 до 4. Сохранение сцены: `to_toml`, проверочный `parse`, запись во временный файл рядом и `rename`. Комментарии и форматирование исходных TOML не сохраняются.
 
 Модель, брошенная на Scene, ложится на пол `y = 0` под курсором, а при промахе мимо пола — в цель камеры; брошенная в корень Hierarchy или созданная из меню появляется в цели камеры, дочерняя — в начале координат родителя. После загрузки новой модели камера наводится на неё только если объект почти не виден: занимает единицы пикселей или камера внутри него (`EditorCamera::needs_framing`). Модели FBX читаются в метрах по единице файла, поэтому файл без `UnitScaleFactor` считается сантиметровым.
 
-`SceneRenderer` кэширует GPU-материалы FBX и загружает base-color/emissive карты как sRGB, normal/metallic-roughness/occlusion — как linear. `MeshRenderer.texture` заменяет base-color map, а optional scene material override заменяет только заданные факторы, alpha mode/cutoff и карты; материалы замен при этом кэшируются отдельно для каждой object part. Scene и Game viewport показывают mask/blend материалы тем же renderer; alpha-cutout поверхности сохраняют форму в shadow map.
+Для встроенного Lit material SceneRenderer сохраняет FBX PBR maps; назначенный .rvemat заменяет факторы и карты, после него применяются MeshRenderer.texture и заданные поля legacy MaterialOverride. Custom .rveshader получает свои значения и текстуры, но пропускает эти legacy overrides. Material cache key включает revision .rvemat, generation shader и revisions всех участвующих текстур. Hot reload сначала строит новый shader и все зависимые materials, затем атомарно переключает cache; если любая стадия не проходит, прежние GPU resources остаются активны, а ошибка уходит в Console. Для нового повреждённого slot показывается magenta Lit error material. Scene/Game viewport и Material Preview используют один material path. Scene и Game показывают mask/blend материалы тем же renderer; alpha-cutout поверхности сохраняют форму в shadow map. Контракты в [[Engine/EngineMaterials]].
 
-Компонент `Environment` создаётся из toolbar и редактируется в Inspector: HDR asset picker или процедурные цвета/солнце, intensity и skybox. На сцену допускается один environment; его HDR path включается в `[[assets]]`, prefab overrides заменяют компонент целиком, а copy/paste и undo/redo сохраняют весь компонент. `SceneRenderer` читает `.hdr` и кэширует запечённый GPU environment по источнику и procedural inputs; направление солнца квантуется для cache key. Изменение source или параметров заменяет ресурс и просит renderer отложить его уничтожение. Project panel показывает `.hdr` и формирует фоновое tone-mapped thumbnail.
+Компонент `Environment` создаётся из toolbar и редактируется в Inspector: HDR asset picker или процедурные цвета/солнце, intensity и skybox. На сцену допускается один environment; его HDR path включается в `[[assets]]`, prefab overrides заменяют компонент целиком, а copy/paste и undo/redo сохраняют весь компонент. `SceneRenderer` читает `.hdr` и кэширует запечённый GPU environment по источнику и procedural inputs; направление солнца квантуется для cache key. Успешная смена источника или параметров создаёт замену до освобождения прежнего ресурса. Ошибка hot-reload того же HDR пути сохраняет последнее рабочее GPU-окружение, если оно загружено; ошибка выбора другого HDR или procedural key очищает прежнее и оставляет renderer default. Project panel показывает `.hdr` и формирует фоновое tone-mapped thumbnail.
 
 `LOD Group` доступна только объекту с `Mesh Renderer`. Inspector позволяет выбрать FBX-модель и optional PNG-текстуру каждого уровня, задать возрастающие origin-distance thresholds и optional cull distance; пустая текстура наследует mesh texture или FBX material. `EditorScene::set_lod_group` добавляет пути уровней в assets сцены, а полная валидация перед каждой правкой откатывает невалидный порядок/число уровней с сообщением в Console. Удаление `Mesh Renderer` вместе с группой является одной undo/redo правкой.
 
 ### Параметры скриптов
 
+Inspector показывает флаг `Static` собственных объектов сцены (у частей и корней экземпляров префаба флаг недоступен: он задаётся в самом префабе). `scene_edit::set_static` меняет его одной записью истории: включение затрагивает объект, а кнопка `Apply to children` — и потомков; выключение снимает флаг со всего поддерева, потому что предки статического объекта должны быть статическими. В режиме редактирования статический объект двигается как обычно; запрет действует в Play и runtime.
+
 Inspector показывает `params` скрипта по его схеме ([[Engine/EngineScene#Схема параметров скриптов]]), если схема есть.
 
-- Lua: схема `properties` читается `engine_script::lite_properties` при первом показе компонента и кэшируется в `EditorState::lite_schemas`. Чтение ограничено 5 секундами, после этого chunk прерывается. Кэш сбрасывается в Refresh. Ошибка схемы пишется в Console один раз, а у компонента появляется пометка, и остаётся свободный редактор.
+- Lua: схема `properties` читается `engine_script::lite_properties` при первом показе компонента и кэшируется в `EditorState::lite_schemas`. Чтение ограничено 5 секундами, после этого chunk прерывается. Изменение исходного `.lua` помечает запись для перечитывания при следующем показе; при ошибке прежняя успешная схема остаётся активной.
 - Rust: схема берётся из `ScriptLibrary::schema`. При автоматической сборке редактор копирует новый cdylib в `<project>/.rve/editor/scripts/` и перезагружает его вне Play, поэтому новая схема сразу доступна Inspector. С явным `--scripts` используется указанная пользователем библиотека. При загруженной библиотеке Add Component → Rust Script предлагает имена из `script_names()`, без неё — текстовое поле.
+- Inspector редактирует enum, RGB color `[0, 1]`, массивы и object/component/asset refs. Объект можно перетащить из Hierarchy или выбрать из списка с фильтром компонента; asset — перетащить из Project или выбрать по типу. Пустая ссылка оставляет параметр отсутствующим, asset selection добавляет путь в `[[assets]]` в той же правке. Переименование и копирование/раскрытие переписывают внутренние object refs, а удалённые цели остаются dangling и отображаются как `Missing`.
 - Со схемой:
   - поля идут в порядке объявления, виджет выбирается по типу, диапазон DragValue — по `min`/`max`;
   - ключ, которого нет в сцене, показывается со значением по умолчанию бледной подписью и записывается в документ только после правки;
@@ -94,6 +133,24 @@ Inspector показывает `params` скрипта по его схеме ([
 
 ## Play
 
+Play начинает с первой включённой `[[scenes]]` записи проекта (`ProjectSettings::starting_scene`): editor читает её в отдельный `EditorScene`, не заменяя открытую edit-сцену или prefab. Сохранения этой сессии изолированы в `<project>/.rve/playersave/save.toml`; runtime-user path редактора не использует.
+
+`rve.app.quit()`/`Context::quit()` после Play шага останавливают `PlaySession` через обычный Stop: вызывается `on_destroy`, запрос логируется с уровнем Info, редактор возвращается в edit mode. Запрос не закрывает окно редактора.
+
+Системные диалоги скриптов (`rve.dialog`, `ctx.open_file_dialog`) редактор открывает синхронным `rfd::FileDialog` после кадра (`apply_play_platform_requests`) и возвращает результат сессии; `rve.window.set_fullscreen` и `screenshot` в Play не выполняются и пишут предупреждение в лог.
+
+Spawn и destroy в Play идут тем же путём, что в runtime. Быстрые шаблоны регистрируются до старта сессии. Тяжёлые префабы из `prefabs.rveprefabs` загружает фоновый поток `rve-editor-prefab-load` тем же CPU-путём подготовки; ответ возвращается в сессию. После каждого `step` и команды консоли сессия применяет `drain_world_changes`: вставляет тела новых объектов, снимает тела удалённых и откатывает spawn, который физика отвергла. Остановка Play не ждёт незавершённую загрузку.
+
+Перед созданием `PlaySession` редактор передаёт настройки `[input]` открытого проекта
+в `ScriptHost`; player runtime использует тот же evaluator действий. `clear_input`
+освобождает удерживаемые клавиши и сбрасывает mouse/wheel delta при открытии Console и
+потере фокуса, чтобы прошлое движение не превращалось в analog action после блокировки.
+Переключения контекста и переназначения ограничены текущей Play-сессией.
+
+Геймпады редактора: один `GilrsBackend` на процесс редактора, он хранится в `EditorState::gamepads` и создаётся при первом Play. Каждый Play стартует с `begin_session` и настройками `[input.gamepad]` открытого проекта. Пады опрашиваются на каждом кадре окна, пока Play запущен, в том числе на паузе: пауза не останавливает опрос. Ввод принимается только при фокусе окна и закрытой консоли; иначе пады читаются как отпущенные, а вибрация останавливается и отбрасывается. Вибрация скриптов доставляется в следующем опросе через `rumble_frame`, то есть на один кадр позже, чем в runtime. Остановка Play (Stop или ошибка скрипта) вызывает `end_session`: пады отпускаются и вибрация останавливается, но `gilrs` остаётся открытым для следующей сессии. Вне Play, после первого Play, backend раз в секунду дренирует очередь без доставки (см. [[Engine/EngineInput]]). Проверка указателя над видом для пада не нужна: у геймпада нет указателя.
+
+Аниматоры Play: `PlaySession` держит `AnimationBridge`, который строится при старте из проектных ассетов (`project_bridge`) с `play_on_start` как в runtime. Каждый шаг применяет запросы скриптов, продвигает мост и ставит `animation_finished` в очередь скриптов; предупреждения моста попадают в журнал вместе с предупреждениями звука. Кадр получает мир и мост одной парой (`world_and_animation`): палитры берутся из моста, экземпляры skinning синхронизируются с миром Play.
+
 Developer console рисуется поверх Game прямоугольника после dock UI; существующая
 вкладка Console остаётся журналом `EditorState::log`, куда поступают script events.
 Backquote открывает overlay только без modal, а открытая консоль блокирует Play input и
@@ -102,7 +159,11 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 в Play`. Выполнение использует Play watchdog; Lua может быть прервана, Rust callback —
 нет. Полный контракт shared UI и logger см. в [[Engine/EngineConsole]].
 
-`PlaySession` создаёт `World` с проверенными `.camerasettings` и `ScriptHost` из документа и работает на главном потоке. Документ не меняется: Stop вызывает `on_destroy` и удаляет сессию, поэтому правки скриптов отбрасываются. Во время Play панели отключены, `EditorState::edit_scene` не выполняет правки, а панель Scene использует активную камеру сцены вместо камеры редактора. Ввод скриптов принимается над изображением Scene и Game. Выпадающий список Game меняет только preview панели; активную игровую камеру задаёт camera component сцены (`active = true`, либо единственная камера).
+Быстрые префабы сцены (`.rveprefab` из `[[assets]]`) строит `PlayPrefabs::load` тем же `PrefabTemplate::load`, что и runtime. Префаб, который не читается или не может быть заспавнен, пропускается с предупреждением в лог Play; префаб с камерой или светом, раскрытый экземпляром, предупреждения не даёт. Геометрия мешевых коллайдеров шаблонов входит в `load_model_geometry`. После каждого `update` и каждой консольной команды `apply_world_changes` применяет spawn и destroy: удаляет тела, вставляет тела новых объектов, ставит скорости, запускает `play_on_start` звук, при отказе физики откатывает spawn. Затем `step_with_changes` отправляет изменения тел вместе с командами. Модели spawn-объектов подгружаются ленивым `sync_assets` по путям, как и объекты сцены.
+
+Тяжёлые префабы — записи `<project>/prefabs.rveprefabs` (`PrefabCatalogFile::load`), кроме путей, которые сцена объявила в `[[assets]]`. Ошибка формата списка не даёт начать Play: сообщение уходит в лог. При старте Play документ каждой записи списка читается только для проверки heavy-скриптов (ассеты и Lua не открываются); если хотя бы один такой скрипт объявлен, `has_heavy_scripts` требует библиотеку Rust-скриптов, как и для сцены. Ошибка чтения такого документа здесь не сообщается: её выведет загрузка префаба. Заявка хоста `Load` запускает поток `rve-editor-prefab-load` (`HeavyLoads`): он читает ресурсы проекта через `ResourceHandle` и готовит шаблон, Lua-исходники и геометрию мешевых коллайдеров, GPU не трогает. Ответ забирается без ожидания в начале каждого `step`, в том числе на паузе, и регистрируется через `register_prefab`; геометрия добавляется в физику с подсчётом ссылок, модели сцены не удаляются. Ответ устаревшей загрузки (по `load_id`) отбрасывается. Ошибка чтения или регистрации переводит префаб в `failed`, и его ожидающие spawn получают Error. `Unload` снимает геометрию и вызывает `prefab_released`. Потоки не join-ятся: Stop и Drop выставляют флаг остановки, а ответы уходят в канал без получателя.
+
+`PlaySession` создаёт `World` с проверенными `.camerasettings`, разрешёнными `.rvephysmat` коллайдеров и `ScriptHost` из документа и выполняет callbacks на главном потоке. Для Play из проекта редактор строит `PhysicsSceneDesc` по настройкам проекта и CPU-геометрии базовых моделей, затем запускает отдельный `PhysicsServer` thread. Sequence 0 snapshot доступен скриптам до `on_start`. Перед каждым активным update Play получает предыдущий Step, применяет dynamic poses и передаёт snapshot/events скриптам; после update изменения мира и команды отправляются со следующим Step с тем же scaled, capped `dt`. Пауза не делает update или Step; после возобновления Play сначала получает только ранее outstanding результат. Stop, ошибка шага и Drop отправляют Shutdown и join-ят physics thread; ошибки построения или шага показываются в Console. Документ не меняется: Stop вызывает `on_destroy` и удаляет сессию, поэтому правки скриптов отбрасываются. Во время Play панели отключены, `EditorState::edit_scene` не выполняет правки, а панель Scene использует активную камеру сцены вместо камеры редактора. Ввод скриптов принимается над изображением Scene и Game. Выпадающий список Game меняет только preview панели; активную игровую камеру задаёт camera component сцены (`active = true`, либо единственная камера). Звук Play: `PlayAudio` создаёт собственный `AudioEngine` с ресурсами проекта, выводом на устройство и `mono_output` из `[audio]` проекта; команды частиц из скриптов забираются `PlaySession::take_particle_commands` и применяются вьюпортом в `build_draws`; `bridge.start` вызывается при старте, запросы скриптов применяются после `update`, позиции синхронизируются в `step` после пересчёта мировых матриц (build_frame здесь не вызывается). Пауза посылает `set_paused`; Stop и Drop глушат звук, останавливают поток и ждут его завершения. Подробности — [[Engine/EngineAudio]].
 
 Если не передан `--scripts`, открытие проекта с `heavy_scripts` запускает `rve-build scripts`. Play, запрошенный во время сборки, ждёт её результата; неуспех не создаёт `PlaySession`. При завершении редактор разбирает последний stdout путь, загружает библиотеку и только после этого выполняет ожидающий Play. Для отсутствующего `heavy_scripts` сборщик успешно возвращает пустой путь. Явный `--scripts` пропускает autobuild и используется напрямую.
 
@@ -112,6 +173,55 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 
 Сетка редактора рисуется с `casts_shadow = false`: иначе её линии попадают в shadow map и ложатся тенями на объекты.
 
+### Курсор в Game
+
+`play_cursor.rs` решает, держит ли панель Game курсор во время Play. Захват действует, только если одновременно выполнены условия: Play не на паузе; окно в фокусе; консоль и модальные окна закрыты; панель Game видна и является активной вкладкой фокусного листа dock; Esc не снял захват. Панель Scene и остальные панели курсор не захватывают.
+
+- Старт Play делает вкладку Game активной и фокусной (`focus_game_tab`), иначе захват начался бы только после клика в Game. Старт также сбрасывает признак Esc.
+- Esc снимает захват, но клавиша продолжает передаваться скриптам. Захват возвращается кликом ЛКМ в панели Game.
+- Если захват активен и скрипт заблокировал курсор (`PlaySession::cursor().locked`), окно получает состояние с удержанием и точкой в центре панели Game в физических пикселях. В остальных случаях окно получает обычное состояние. Запрос отправляется только при изменении и после построения кадра в `EditorApp::draw_frame`.
+- Скрытие курсора внутри панели делает egui: при активном захвате, скрытом скриптом курсоре и указателе над Game кадр получает `CursorIcon::None`. Запрос в окно всегда несёт `visible: true`, поэтому не перебивает это скрытие.
+- Источник дельты мыши: при захвате с удержанием (`captured && locked`) и указателе над Scene или Game скрипты получают raw-дельту `DeviceEvent::MouseMotion` через `EditorApp::mouse_motion`, а дельта egui над Game и Scene не добавляется, чтобы не было двойного счёта. Выбор источника один для обоих путей (`PlayCursor::motion_source`), поэтому двойной счёт исключён по построению. Во всех остальных случаях, включая скрытый, но не заблокированный курсор, действует дельта egui над панелью в физических пикселях. Единицы различаются: raw-дельта — точки на macOS (с системным ускорением) и mickeys без ускорения на Windows, как в player; дельта egui — физические пиксели.
+- Stop, пауза, выход из Play и потеря фокуса окна делают условие ложным, и окно получает обычное состояние.
+
+Перед продвижением часов первого незапаузенного шага `PlaySession::step` обновляет ввод и вызывает `ScriptHost::start` после получения physics и network state. Поэтому `on_start` видит подготовленные bindings и режим сети, получает нулевые время и frame и может задать scale для первого кадра; lifecycle запускается один раз. Затем `PlaySession::step` использует `ScriptFrameTime::advance` с теми же 0.25-секундным unscaled clamp, проектными `fixed_hz`/`max_substeps` и текущим `ScriptHost::time_scale`, что и runtime. Scaled `dt` двигает ScriptHost, physics, `AnimationBridge` и накопленное время GPU-частиц; unscaled elapsed сохраняется отдельно. Pause не вызывает callbacks или physics Step, а tick продолжает обновлять `last_tick`, поэтому resume не включает паузу в delta. При time scale 0 Play продолжает frame callbacks с `dt = 0`, при этом physics substeps, анимация, частицы и time-based timers стоят; frame waits продолжают идти. Детали Lua/Rust timer policy: [[Engine/EngineScript#Время, фазы и расписания (ABI v20)]].
+
+Play передаёт хосту включённые сцены проекта (`PlayPrefabs::with_enabled_scenes`). Запрос `rve.scene.load` обрабатывает `apply_play_scene_request` в `app.rs`: `prepare_play_scene` читает сцену из файлов проекта, применяет настройки камеры и физические материалы, готовит UI и ресурсы аниматоров (`PlayScene::prepare`), затем `PlaySession::replace_scene` заменяет только мир сессии. Документ редактора не меняется. Префабы сцены проверяются `ScriptHost::check_scene_prefabs` до регистрации UI и замены, применяются `apply_scene_prefabs` после успешного `ScriptHost::replace_scene`; регистрация документов UI аддитивна. Пробная сборка физики и `replace_scene` проверяют сцену до изменения сессии. Тела удалённых объектов снимаются сразу при замене, потому что результат шага, отправленного до неё, применяет позы в начале следующего шага. Тела добавленных объектов привязываются в том же `replace_scene` после замены; пробная сборка физики до неё вызывает ту же вставку для тех же объектов. Вьюпорт получает GPU-данные нового мира через обычную синхронизацию ассетов по миру кадра. Смена сцены при активной сети отклоняется ([[Engine/EngineScript]]).
+
+## Сеть в Play
+
+- Компоненты `network_identity` и `network_transform` добавляются и удаляются в Inspector (значки `network-identity` и `network-transform`). Правки идут тем же путём, что у остальных компонентов: проверка `SceneDocument::validate`, undo и prefab overrides. Удаление `network_identity` уносит и `network_transform`.
+- Меню `Network: <режим>` в строке инструментов доступно только вне работающей сессии. Режимы — `Offline`, `Host` (порт, по умолчанию `[network].port` проекта) и `Client` (адрес, отпечаток 64 hex-символа или флаг «Insecure: no pin», пароль). `Host` и `Client` недоступны, пока `[network].enabled` выключен, и подсказка указывает на эту настройку.
+- `PlayNetwork` (`editor/src/play_network.rs`) владеет сетевым потоком, мостом и `WorldSink` сессии, как `PlayAudio`. Мост вызывается в тех же точках шага, что и в runtime: `receive` до `update`, `apply` и `tick` после него. Stop отправляет отключения и дожидается завершения потока.
+- Host генерирует эфемерный ключ сервера и выводит его отпечаток в Console. Клиент вводит этот отпечаток либо подключается с флагом «no pin».
+- Пароль живёт только в полях формы и сессии. В настройки редактора, layout и проект он не записывается и в отладочный вывод не попадает.
+- Пауза Play пропускает шаг сети целиком: мост не получает и не отправляет сообщения. Поток `rve-network` при этом продолжает работать, поэтому таймауты пиров могут сработать во время паузы. Пауза дольше ~10 с при полной очереди событий может привести к разрыву соединения (см. [[Engine/EngineNetwork]]).
+- Хэш сцены для проверки версии считается от текущего документа редактора, возможно несохранённого (см. [[Engine/EngineNetwork]]).
+
+## Аниматор и превью
+
+- Инспектор показывает секцию `Animator` для объекта с `mesh_renderer`. Компонент добавляется пунктом `Animator` в меню Add Component; удаление и копирование — через заголовок секции. Поля: `Default motion`, `Play on start`, `Loop`, `Speed`, список клипов и blend trees с точками. Каждая правка идёт через ту же историю Undo/Redo, что и остальные компоненты; клип из поля `Add clip` объявляется в `[[assets]]` через `set_component`, а не прямой правкой.
+- Превью выбранного аниматора доступно вне Play: кнопка Play/Pause, выбор движения (по умолчанию `Bind pose`), ползунок времени для выбранного движения (перемотка через `Animator::seek`) и значения параметров каждого blend tree. Настройки превью не попадают в документ и историю; смена выбора сбрасывает их.
+- Мост превью (`project_preview_bridge`) начинает со стоп всех аниматоров, поэтому без выбранного движения вьюпорт показывает позу покоя, а клип запускает только превью. `play_on_start` документа на редактор не влияет.
+- Мост превью берёт модели из кэша вьюпорта (`cpu_models`), а не с диска. Клипы перечитываются при смене счётчика `SceneRenderer::model_generation`, который растёт при любой загрузке или ошибке модели и при сбросе кэша. Сам мост пересобирается только при смене поколения модели, которую использует аниматор (`model_versions`): дозагрузка модели без аниматора не сбрасывает клип превью. Пока модель аниматора грузится в фоне, мост не строится и сборка повторяется в следующих кадрах. Модель, которая не загрузилась, не задерживает мост: её объект пропускается с предупреждением. Объект, чья палитра не совпала с числом костей меша, рисуется без скиннинга с одним предупреждением на объект; предупреждение повторяется, только если несоответствие исчезло и появилось снова. Та же проверка выполняется в Play по мосту сессии. При закрытии окна экземпляры скиннинга освобождаются до уничтожения renderer.
+- Кадр синхронизирует экземпляры skinning по парам (объект, часть меша): создаёт недостающие, освобождает устаревшие и пересоздаёт при смене модели. Это же касается удаления компонента, объекта и Undo/Redo. Планирование синхронизации проверено тестом без GPU.
+- Пока превью проигрывается, редактор запрашивает кадры, чтобы анимация шла; вне превью окно простаивает как раньше.
+- Ограничения: превью работает только для выбранного объекта; LOD для skinned не применяется; состояние превью не сохраняется между сессиями редактора.
+
+## Инспектор, Hierarchy и Project Settings
+
+- Inspector: галочка `Active` (неактивный объект и его поддерево серые в Hierarchy и не рисуются в видовом экране), `Tag` и `Layer` из списков проекта. У каждого Lua- и Rust-скрипта есть галочка `Enabled` — начальный флаг `script:set_enabled`. Правки проходят через общий undo.
+- Inspector: `Character Controller` редактирует `Gravity Scale`, `Jump Height` и `Use Gravity`. Вкладка `Project Settings` дополнительно показывает матрицу `Collision Matrix` для именованных слоёв: пара отмечается симметрично и сохраняется вместе со списками тем же атомарным путём.
+- Вкладка `Project Settings` (меню Window) редактирует `[tags]` и `[layers]` проекта. `Save` пишет `project.rveproject` через временный файл и переименование, но отказывается, если файл на диске расходится с настройками редактора (правка вне редактора, в том числе до открытия вкладки). Слои — фиксированные слоты: ✕ очищает имя и оставляет индекс занятым, поэтому `layer` объектов не сдвигается. Удаление тега пишет предупреждение в консоль: объекты с ним сохраняют тег, но он больше не записан в `[tags]`.
+
+## Физика
+
+- Инспектор редактирует `collider`, `rigid_body` и `character_controller` через общий undo. Формы коллайдера: Box, Sphere, Capsule, Convex Mesh и Triangle Mesh; hull и trimesh берут геометрию базовой модели `mesh_renderer`, ошибка hull показывается в инспекторе.
+- Поле `Layer` объекта в Inspector задаёт слой его collider/body; оно использует индекс слота `[layers]` и отображает имя слоя, если оно задано.
+- Add Component предлагает `Collider` и `Character Controller`, если у объекта нет конфликтующего компонента, и `Rigid Body` только при наличии коллайдера.
+- Префаб переопределяет `collider`, `rigid_body` и `character_controller` целиком, как и `point_light`.
+- Флажок `Colliders` во вьюпорте Scene рисует рёбра коллайдеров всех объектов; без него рисуются только выделенные. Геометрия строится функциями `engine-physics` в `editor/src/viewport/colliders.rs`. Trimesh с более чем `MAX_MESH_WIRE_EDGES` = 4096 рёбрами рисуется своим AABB.
+
 ## Префабы
 
 Формат и раскрытие описаны в [[Engine/EngineScene#Префабы]].
@@ -119,13 +229,19 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 **Модель.** `EditorScene` хранит авторский документ (`document()`) и его раскрытие (`view()`, `origin(id)`).
 - Раскрытие пересчитывается после каждой правки: правка принимается только при успешном `expand`.
 - Hierarchy, Inspector, мир вида и Play работают с раскрытием; команды меняют авторский документ.
-- Префабы читает `OpenProject::prefab_loader` через ресурсы проекта с кэшем разобранных документов. Кэш сбрасывают Refresh, сохранение префаба, Create Prefab и Apply.
+- Префабы читает `OpenProject::prefab_loader` через ресурсы проекта с кэшем разобранных документов. Внешние изменения выборочно перечитывают кэшированные документы; ошибочный документ не заменяет прежнюю версию. Сохранение префаба, Create Prefab и Apply сбрасывают кэш для следующего раскрытия.
+
+**Подокно Scene Assets** (`ui/scene_assets.rs`). Показывает `.rveprefab` из `[[assets]]` открытой сцены. Пометка «используется экземпляром» означает, что в `[[instances]]` есть экземпляр этого префаба; иначе показывается «нет экземпляра в сцене» с подсказкой, что префаб может спавниться скриптами. Добавление — кнопкой из списка `.rveprefab` в Assets или перетаскиванием из Project. Удалить можно только неиспользуемый префаб: модель `EditorScene::remove_scene_prefab` отказывает в остальных случаях. Поля `archive` и `max_instances` правятся через модель правок с undo; пустой `max_instances` означает отсутствие лимита. Имя архива и значение лимита проверяет `SceneDocument::validate`, как и при загрузке сцены.
+
+**Подокно Project Prefabs** (`ui/project_prefabs.rs`, `project_prefabs.rs`). Редактирует `<project>/prefabs.rveprefabs`. Каждая правка проверяется тем же разбором, что и при Play (дубликаты путей, расширение `.rveprefab`, имя архива, лимит больше нуля), и отклонённая правка не меняет список. Undo у списка нет: изменения записываются кнопкой Save атомарно; она активна только при несохранённых правках. Файл с ошибкой формата открывается с сообщением и не перезаписывается; Reload перечитывает файл и отбрасывает несохранённые правки. Оба подокна открываются из меню Window, в раскладку по умолчанию не входят.
 
 **Hierarchy.**
 - Корень экземпляра помечен значком и цветом, объекты внутри — цветом.
 - Объекты внутри экземпляра выделяются и выбираются picking, но не перетаскиваются; удалить, дублировать, переименовать id и сменить им родителя нельзя.
 - Корень экземпляра переносится, удаляется и дублируется как объект. Ссылки `parent` на объекты внутри него (`door1.handle`) переименовываются вместе с ним.
 - Префаб размещается перетаскиванием `.rveprefab` в Scene или Hierarchy (`NewObject::Prefab`), путь попадает в `[[assets]]`.
+- Переименование начинается пунктом Rename контекстного меню или F2; двойной щелчок его не запускает. Поле получает фокус один раз в начале: Enter или уход фокуса завершают переименование, Esc отменяет. Play отменяет активное переименование (`EditorState::enter_play`), во время Play оно недоступно.
+- Двойной щелчок по строке заменяет выделение этим объектом и наводит на него камеру Scene, как клавиша F (`scene_view::focus_selection`).
 
 **Create Prefab** (контекстное меню собственного объекта):
 - поддерево вместе с вложенными экземплярами и используемыми ресурсами сохраняется атомарно в `Assets/prefabs/<id>.rveprefab`; существующий файл — ошибка;
@@ -143,7 +259,7 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 - Мир вида без камеры получает скрытую камеру под корнем, потому что `World` требует камеру.
 - Префаб сохраняется только в `.rveprefab`, сцена — только в `.rvescene`.
 - Ссылка префаба на собственный путь, в том числе несохранённая, отклоняется как цикл.
-- Открытые сцены видят изменения префаба после повторного открытия или Refresh.
+- Открытая сцена видит внешнее изменение префаба после успешного перечитывания и повторного раскрытия.
 
 **Overrides в Inspector.** Правка объекта экземпляра идёт через обычные команды (`commit`, гизмо, `set_mesh`, параметры скриптов).
 - `EditorScene` применяет команду к раскрытому объекту и сравнивает результат с `expand_without_overrides` этого экземпляра.
@@ -164,7 +280,7 @@ File → New Project… принимает имя проекта и родите
 
 ## Build Player
 
-File → Build Player… собирает релиз через [[Engine/RveBuild]] командой `rve-build build <project> --output <папка>/<id проекта>`. `rve-build` запускается дочерним процессом, а не библиотекой: он ищет player рядом со своим exe, загружает cdylib скриптов в свой процесс, а паника сборки не должна ронять редактор.
+File → Build Player… собирает релиз через [[Engine/RveBuild]] командой `rve-build build <project> --output <папка>/<id проекта>`; File → Build Player with Server… и MCP-аргумент `with_server` у `build_player` добавляют `--with-server`. `rve-build` запускается дочерним процессом, а не библиотекой: он ищет player рядом со своим exe, загружает cdylib скриптов в свой процесс, а паника сборки не должна ронять редактор.
 
 - Перед сборкой несохранённая сцена проходит обычный запрос Save/Discard: сборщик читает сцены с диска.
 - `rve-build` ищется рядом с exe редактора, иначе в checkout, из которого собран редактор, запускается `cargo run -p rve-build --locked --` (cargo из `CARGO`, иначе из PATH) с рабочим каталогом в корне workspace. Поэтому старый `rve-build` в `build/debug` побеждает `cargo run`.
@@ -172,23 +288,99 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - Отмена сборки завершает принадлежащее ей дерево процессов: Windows использует Job Object, macOS — отдельную process group. Потоки чтения вывода присоединяются после остановки дерева.
 - Пункт недоступен в Play и пока идёт сборка: одновременно возможна одна. Существующий каталог вывода отклоняется до запуска.
 
+## Вкладка Profiler
+
+- `Tab::Profiler` закрыта по умолчанию и открывается из меню вкладок toolbar. Показывает CPU-фазы renderer, GPU-проходы видов Scene и Game (сопоставляются по `ViewportId`) и фазы шага Play: скрипты, ожидание и шаг физики, а также применение изменений мира и регистрацию префабов. Группа `Draws (last frame)` показывает `DrawStats` последнего кадра renderer по всем видам; до первого кадра — `n/a`.
+- Замеры копятся в `EditorProfile` (`editor/src/profile.rs`) окнами по последним кадрам и шагам; отчёт строится при показе вкладки.
+- Группа `Resources` показывает ту же дельту `ResourceStats` проекта, что и runtime. Снимок берётся не чаще раза в 500 мс (`EditorProfile::record_resources`).
+
 ## Панель Game
 
 `ui/game_view.rs` показывает сцену глазами камеры из документа, без сетки и маркеров. При нескольких камерах над изображением есть выпадающий список; выбор хранится в `EditorState::game_camera`, сбрасывается при смене сцены, а удалённая камера заменяется активной, затем первой. Preview использует settings выбранной камеры. Панель не сохраняется в файл сцены и не меняет активную камеру.
 
 `SceneRenderer` строит Scene и Game draw lists с одной картой предыдущих мировых матриц по `ObjectHandle`. Оба списка читают предыдущий кадр до общей фиксации новых матриц после renderer-вызова; объекты, не попавшие ни в один draw list, удаляются из карты. Переход Play и смена выбранной Game-камеры сбрасывают карту и temporal history обоих preview.
 
+## Иконки папок
+
+Плитки папок в Project показывают иконки из `IconsPack/Folders`. Растеризация идёт в `editor/build.rs` (resvg как build-dependency, в рантайм не попадает): каждый `IconsPack/**/*.svg` превращается в предумноженный RGBA8 128×128 и получает имя без расширения (`Folders/folder-git`). Добавленный или изменённый SVG попадает в следующую сборку редактора. Отсутствующий каталог даёт пустой список, и папки рисуются заглушкой `DIR`; пока каталога нет, build script выполняется при каждой сборке. Ошибка разбора SVG валит сборку. UI-текстуры загружаются один раз после создания renderer и живут до выхода.
+
+Выбор иконки (`icons::folder_icon`): `.git` → `folder-git`, `settings` без учёта регистра → `folder-settings`, остальные папки → `folder-files`. Папка без содержимого (пустой `AssetEntry::children`) получает суффикс `-empty` (`folder-git-empty`, `folder-settings-empty`, `folder-empty`). Файлы выбирают иконку через `icons::file_icon`: `.camerasettings` → `camera-settings`; у PNG/HDR превью важнее иконки, остальные типы без иконки показывают заглушку по типу. Заголовки компонентов Inspector выводят иконку из `icons::component_icon` перед подписью (высота равна высоте строки): Transform → `rve-gizmo`, Camera → `camera`, Mesh Renderer → `mesh`, Directional/Point/Spot Light → `directional-light`/`point-light`/`spot-light`, Collider → `collider`, Audio Source → `audio-component`; у остальных компонентов и скриптов иконки нет. Строки Hierarchy выводят иконку из `icons::object_icon` по компонентам объекта с приоритетом: камера → `camera`, свет → иконка его типа, Mesh Renderer → `cube`; объект только с Transform (без компонентов и скриптов) → `empty-object`; объект с другими компонентами показывает одну подпись. `object_icon` полностью деструктурирует `SceneObject`, поэтому новый компонент сцены требует явно решить, делает ли он объект непустым. Подписи плиток центрируются. Дерево папок выводит ту же иконку перед подписью (высота равна высоте строки); без загруженной текстуры остаётся одна подпись.
+
 ## Автосохранение
 
 Изменённая сцена копируется не чаще раза в 30 секунд и только при новой ревизии и только после успешной записи считается записанной; в Play и пока открыто окно восстановления копия не пишется, а горячие клавиши за модальными окнами не правят сцену. Копия удаляется после успешного Save (для прежнего и нового пути) и после Discard в окне несохранённых изменений, включая выход. При открытии сцены или создании новой оставшаяся копия означает незавершённый прошлый сеанс: окно предлагает Restore (сцена открывается из копии с прежним путём и признаком правок) или Discard (копия удаляется).
 
+## NVIDIA Reflex
+
+`Reflex` из bootstrap проекта читается только при запуске с `--project` (`main.rs`) и передаётся в `RendererConfig::low_latency` при `init`. Открытие другого проекта через `open_project` его не меняет: renderer уже создан, и настройка применится при следующем запуске.
+
+- Редактор перерисовывает по запросу, поэтому `sleep()` выполняется только при непрерывной перерисовке. Признак `continuous_redraw` — `playing_now || previewing`, сохранённое с прошлого кадра; в простое кадр не ждёт Reflex.
+- Маркеры ставятся всегда, когда есть handle: `SimulationStart` до сбора egui `raw_input`, `InputSample` перед `play.tick()`, `SimulationEnd` перед рендером. Локальный счётчик кадров задаёт id и вызывает `set_latency_frame` перед `render_scene_frame`.
+
+## MCP-сервер
+
+Редактор запускает локальный MCP-сервер ([[Engine/EngineMcp]]) для агентов: он читает ассеты, файлы, сцену и лог, правит сцену и ассеты, управляет Play и сборкой и делает скриншоты. Сервер живёт вместе с редактором и не зависит от открытого проекта.
+
+**Настройки.** Edit → Preferences… → «MCP Server» (`editor/src/ui/preferences.rs`): вкл/выкл, порт (1024–65535, по умолчанию 47615), статус, токен (скрыт; кнопки Copy и Regenerate), флажки прав «Edit scene», «Write assets», «Control Play», «Build» и кнопка «Copy connection command» (`claude mcp add --transport http rve-editor http://127.0.0.1:<порт>/mcp --header "Authorization: Bearer <токен>"`). Изменения применяются по Apply и сохраняются в поле `mcp` файла `settings.json` пользователя (`McpSettings` в `editor/src/settings.rs`). Токен создаётся при первом включении. Regenerate заменяет токен в черновике; новый токен действует после Apply, и клиенты со старым получают 401. Право Read всегда доступно; остальные выключены по умолчанию.
+
+**Флаг `--mcp`.** Включает сервер на этот запуск. В памяти `mcp.enabled` становится `true`, но при записи `settings.json` записывается сохранённое значение. Apply в Preferences сохраняет выбранное пользователем значение `enabled`, даже при `--mcp`.
+
+**Хозяин сервера.** `McpHost` (`editor/src/mcp/mod.rs`) создаётся в `EditorApp` и стартует в обработчике создания окна, где есть `WindowProxy`. Каждый `update` передаёт ему текущие настройки: listener перезапускается только при смене enabled, порта или токена, а права и поколение обновляются на лету. Если порт занят, bind повторяется каждые 100 мс в течение 2 с (статус «Starting»), затем сервер переходит в состояние ошибки. Ошибки пишутся в Console с префиксом `[MCP]`, редактор продолжает работать.
+
+**Выполнение вызовов.** `McpHost::drain` вызывается из `EditorApp::update` вне построения UI. Он пропускает вызовы, которые уже брошены клиентом или истекли, повторно проверяет право и поколение, затем выполняет инструмент на главном потоке через `dispatch` над `EditorState` и `EditorScene`. Вызовы, меняющие состояние (всё, кроме Read и `build_status`), пишутся в Console как `[MCP] <tool>`. Поколение растёт при открытии проекта (`open_project`) и при любой замене сцены (`set_scene`): вызов, поставленный до этого, завершается ошибкой «project or scene changed while request was queued» и не меняет новую сцену.
+
+**Инструменты по правам.**
+
+| Право | Инструменты |
+|---|---|
+| Read (всегда) | `editor_status`, `list_assets`, `list_project_files`, `read_text_file`, `get_project_settings`, `get_scene_hierarchy` (`source`: `edit` или `play`), `get_object`, `get_component`, `describe_components`, `get_asset_settings`, `get_script_params_schema`, `get_console_log`, `capture_view` |
+| Edit scene | `select_objects`, `create_object`, `delete_objects`, `duplicate_objects`, `set_parent`, `rename_object`, `change_id`, `set_transform`, `set_component` (по умолчанию слияние с текущим значением), `remove_component`, `set_script_param`, `set_camera_active`, `set_static` (`children` также помечает потомков), `undo`, `redo` |
+| Write assets | `save_scene`, `open_scene`, `new_scene`, `open_project`, `write_asset_settings`, `create_folder`, `write_text_file`, `rename_asset`, `delete_asset`, `import_files`, `create_prefab`, `apply_to_prefab` |
+| Play | `play_start`, `play_stop`, `play_pause`, `play_resume`, `console_command` |
+| Build | `build_scripts`, `build_player`, `build_status` |
+
+Правки сцены отклоняются во время Play, как и в Inspector. Каждая правка проходит через `EditorScene` с `SceneDocument::validate` и становится отдельным шагом undo: перед ней закрывается непрерывная правка (`end_continuous_edit`). Открытие проекта или сцены и `new_scene` при несохранённых изменениях требуют `discard_changes=true`; модальный диалог при этом не открывается. При `discard_changes=true` автосохранение изменённой сцены удаляется только после успешного открытия проекта или сцены либо создания новой сцены; при ошибке копия остаётся на месте. Инструменты, которым нужен проект, без открытого проекта возвращают ошибку.
+
+**Файловые правила инструментов Assets.**
+
+- `open_project` с правом Build вызывает авто-сборку `heavy_scripts` (cargo). Без Build проект открывается без сборки, а ответ содержит `scripts_build` с пометкой «skipped». UI-путь открытия не меняется и собирает скрипты всегда.
+- `import_files` принимает только обычные файлы известного типа ассета (`AssetKind` не `Other`). Symlink и junction в конечном элементе пути отклоняются; проверка парентов пути не выполняется. Если хотя бы один источник отклонён, импорт не начинается и возвращается `isError` с именами файлов.
+- `rename_asset` не перезаписывает существующую цель. `save_scene` с `path` принимает только расширение `.rvescene`.
+- `play_start` при праве Build работает как UI: если Play нужна сборка `heavy_scripts`, он запускает `rve-build scripts` и ждёт результата. Без Build, когда старт требует сборки (есть `heavy_scripts` и не подключена ручная библиотека `--scripts`), возвращается `isError` «starting Play requires building scripts…»; сборка и Play не запускаются. Без `heavy_scripts` или с ручной библиотекой поведение прежнее.
+
+**Политика путей** (`editor/src/mcp/paths.rs`):
+
+- Чтение (`read_text_file`, `list_project_files`, `get_project_settings`) разрешено внутри канонического корня проекта. Скрыты и запрещены все элементы корня, чьё имя начинается с точки (`.rve`, `.git`, `.env` и др.): `list_project_files` их не показывает, `read_text_file` отказывает. Проверка скрытости смотрит только на путь относительно корня, поэтому проект внутри каталога с точкой (например `~/.t3/...`) читается. Списки и настройки ассетов (`list_assets`, `get_asset_settings`) — только внутри `Assets/`. `get_project_settings` без `bootstrap.rves` возвращает `bootstrap: null`.
+- Запись, создание, переименование, удаление и сохранение сцены — только внутри `Assets/`. Для существующей цели проверяется `canonicalize` и префикс каталога; для новой — канонический родитель. Компонент пути, являющийся symlink или junction, отклоняется; `..`, абсолютные пути вне проекта и `.rve` тоже отклоняются.
+- Вне этих правил три исключения: `open_project` принимает любой каталог с `project.rveproject` (право Assets), `import_files` копирует файлы известных типов из произвольных путей-источников в папку `Assets/` (право Assets), `build_player` пишет в произвольный `output_dir` (право Build). Поэтому право Assets позволяет скопировать внешний ассет-файл в проект и затем прочитать его через `read_text_file`.
+- Предупреждения в Preferences: при включённом «Write assets» и «Build» под флажками выводятся предупреждения о перечисленных исключениях.
+
+**Скриншоты `capture_view`.**
+
+- Аргументы: `view` (`scene` или `game`, обязательный), `camera_id` (объект с компонентом `camera`), `width` и `height` (от 1 до `min(4096, max_texture_size)`), `warmup_frames` (от 1 до 64, по умолчанию 8).
+- Панельный режим выбирается, если панель видна, а `camera_id`, `width` и `height` не заданы. Renderer запрашивает readback viewport панели, и ответ — тот кадр, который видит пользователь.
+- Иначе используется offscreen-режим. Создаётся один offscreen viewport с камерой редактора (`scene`), игровой камерой (`game`) или камерой объекта. Размер по умолчанию — последний размер панели, а при его отсутствии 1280×720. Кадр рисуется `warmup_frames` раз (первый с `reset_history`), затем запрашивается readback. Такой кадр строится, даже если обе панели скрыты.
+- `SceneRenderer` (`editor/src/viewport/render.rs`) строит для capture-камеры отдельный третий список отрисовки: отсечение и LOD считаются по её позиции. Материалы берутся из тех же ресурсов кадра (`.rvemat`/`.rveshader` и материалы объектов), что и панели. Для вида `scene` применяются постобработка и DebugView панели Scene, сетка не добавляется. Экранные шейдеры берутся так же, как у панелей: объект-камера — свои, Game — шейдеры Game-камеры, Scene их не применяет.
+- Задача живёт в `EditorState` до готового кадра. Пока она активна, `update` запрашивает redraw, а `next_wakeup` возвращает опрос каждые 16 мс. Ответ — PNG, кодируемый на главном потоке, и JSON с полями `view`, `source` (`panel` или `offscreen`), `camera`, `width`, `height` и `warmup_frames` (для offscreen).
+- Срок ожидания — 10 с. Задача также отменяется при смене поколения, остановке сервера или закрытии редактора, а также когда вызов уже брошен (`is_abandoned`). Отключение клиента этим не определяется (см. [[Engine/EngineMcp]]). Отмена вызывает `cancel_capture` и освобождает offscreen viewport, клиент получает `isError` с причиной.
+
+**Ограничения MCP.**
+
+- Одновременно выполняется только один `capture_view`; второй вызов получает ошибку.
+- Readback и кодирование PNG выполняются на главном потоке и могут задерживать UI на большом разрешении.
+- Свёрнутое окно не получает кадров (`FrameStatus::Skipped`), поэтому захват не завершается и заканчивается ошибкой по 10-секундному сроку.
+- Возможный риск: offscreen-кадр может не успеть стабилизировать auto-exposure и TAA за `warmup_frames`. Панельный захват этого не требует.
+- Токен хранится в `settings.json` открытым текстом. Права Assets и Build открывают внешние пути (см. политику путей).
+- `read_text_file` читает UTF-8 текст размером до 1 МиБ.
+
 ## Ограничения
 
+- Захват курсора в Game и raw-дельта на Windows не проверены вручную; на macOS проверка требует запуска редактора с Play и Cmd+Tab.
 - Закрытые панели возвращает меню Window; Reset Layout возвращает раскладку по умолчанию.
-- Нет file watcher: список ресурсов обновляется кнопкой Refresh и после операций самого редактора. Refresh также сбрасывает GPU-кэш моделей и текстур.
-- Edit-world кэшируется по revision сцены. Если asset настроек камеры отсутствует или невалиден, редактор один раз за revision сообщает ошибку и оставляет все камеры с defaults, сохраняя доступность viewport; Play и runtime продолжают считать такую ошибку фатальной. После исправления файла настройки подхватятся при перестроении edit-world (например, при повторном открытии сцены), так как file watcher нет.
-- Переименование и удаление файла в Project не обновляют ссылки в сценах, включая префабы.
-- Текстуры PNG сцены и HDR environments загружаются синхронно при первом появлении, модели FBX и превью PNG/HDR — в фоне. Начатый разбор FBX нельзя прервать: после Refresh он доводится до конца, а результат отбрасывается.
+- Несохранённый список Project Prefabs учитывается в окне несохранённых изменений наравне со сценой: Save сохраняет и список, Discard его отбрасывает. Список сбрасывается при открытии другого проекта и при Reload; Play читает `prefabs.rveprefabs` с диска при старте, поэтому несохранённые правки в него не попадают.
+- Внешнее изменение `.rvescene` обновляет дерево Project, но не перечитывает открытую сцену. Переименование и удаление файла в Project не обновляют ссылки в сценах, включая префабы.
+- Edit-world кэшируется по revision сцены. Если `.camerasettings` отсутствует или невалиден, редактор сообщает ошибку один раз за revision сцены и использует последнюю валидную версию, если она есть; иначе остаются defaults. Play и runtime продолжают считать такую ошибку фатальной.
+- Текстуры PNG сцены и HDR environments загружаются синхронно при первом появлении, модели FBX и превью PNG/HDR — в фоне. Начатый разбор FBX нельзя прервать; после изменения файла устаревший результат отбрасывается и модель запрашивается снова.
 - Автосохранение работает в цикле кадра: зависший ABI-скрипт останавливает и его, поэтому последняя копия может отставать от документа до 30 секунд.
 - Egui смешивает цвета в гамма-пространстве; при sRGB swapchain смешивание идёт в линейном, поэтому полупрозрачные элементы выглядят немного иначе, чем в типичных приложениях egui.
 - Панели можно вынести в плавающие окна внутри главного окна; отдельные системные окна не поддерживаются.
@@ -199,6 +391,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - egui, egui-winit и egui_dock закреплены на 0.36.2, 0.36.2 и 0.21.1: egui_dock 0.21.1 требует egui ^0.36, поэтому более новый egui 0.37 недоступен.
 - UI рисуется собственным проходом в `engine-render` по решению пользователя: renderer принимает готовые примитивы и не зависит от egui.
 - Логика кадра сцены (`upload_scene`) перенесена в редактор, а не вынесена в общий крейт: в runtime она `pub(crate)`, и общий крейт ради одного потребителя не создавался.
+- MCP-сервер живёт в процессе редактора и не привязан к проекту, его настройки лежат в `settings.json` пользователя; по умолчанию сервер выключен, а права только на чтение: решения пользователя. Протокол, транспорт и причины ограничений — в [[Engine/EngineMcp]].
 
 ## Навигация Scene
 
@@ -207,3 +400,23 @@ Edit → Scene Navigation выбирает Auto (по умолчанию), Track
 Свайп вращает камеру, Shift+свайп переносит её, pinch и Cmd/Ctrl+свайп масштабируют, rotation меняет yaw. Сырые MouseWheel из `input.raw.events` сохраняют обе оси Shift, которые InputState сворачивает в горизонтальную прокрутку. Command wheel пропускается: egui уже включает его в zoom_delta. Alt+Cmd/Ctrl+ЛКМ переносит камеру раньше проверки Alt+ЛКМ orbit. Play сохраняет прежний ввод.
 
 Smart zoom доступен на macOS: DoubleTapGesture взводит однокадровый флаг и запрашивает redraw; над доступной Scene вне Play он вызывает Frame выделения. Флаг сбрасывается в конце UI даже при скрытой Scene. На macOS Ctrl+ЛКМ преобразуется в ПКМ до egui; отпускание сохраняет преобразование после отпускания Ctrl. Ввод скриптов Play через WindowHandler не меняется.
+
+Numpad в Scene повторяет раскладку Blender. `app.rs` (`numpad_command`) распознаёт физические коды `Numpad*`, а команды копятся в `EditorState::view_commands` и выполняются в `toolbar::handle_shortcuts` через `scene_view::apply_view_command`. Клавиша `.` — Frame выделения; 1/3/7 — Front/Right/Top, с Ctrl — Back/Left/Bottom; 4/6/2/8 — поворот глаза вокруг цели на 15° (4 — влево, 8 — вверх), повторяется при удержании; 9 — противоположный вид; 0 — камера Scene совпадает с камерой вкладки Game (без камеры ничего не делает). Виды задают `EditorCamera::set_view`, глаз Front на +Z, взгляд вдоль -Z. Top и Bottom упираются в `MAX_PITCH`, то есть около 88°. Команды отбрасываются при модальном окне, открытой консоли или вводе текста. В Play они действуют, только если Scene показана и курсор не над Game.
+
+## Эмиттеры частиц
+
+- Инспектор (`ui/inspector.rs`, `show_particle_emitter`): blend, текстура, ёмкость, rate, длительность, цикл, диапазоны жизни, скорости, размера и вращения, гравитация, затухание, soft distance, форма, flipbook, коллизия. Кривые цвета и выбросы (`bursts`) правятся в файле сцены; инспектор их не показывает.
+- `Component::ParticleEmitter` поддерживает add, remove, copy, paste и reset; reset сохраняет текстуру. Правки идут через `edit()` и `edit_object()` и попадают в undo. Текстура регистрируется в `[[assets]]` через `register_object_assets`.
+- Prefab override: `OverrideField::ParticleEmitter` заменяет компонент целиком и откатывается через `revert_field`.
+- Viewport (`viewport/render.rs`): GPU-эмиттеры кэшируются по `ObjectHandle`. Они пересоздаются при изменении компонента или текстуры и удаляются вместе с объектом. Шаг считается по wall-clock между кадрами. В редактировании симулирует Scene view, во время Play — Game view. Переключение Play перезапускает эмиттеры. Преобразование компонента в описание дублирует `particle_emitter_desc` из [[Engine/EngineRuntime]], потому что редактор не зависит от engine-runtime.
+- Play: spawn и destroy покрыты тем же diff-ом по `frame.particle_emitters`: новые объекты получают эмиттер, удалённые освобождают его; текстура подгружается из `world.objects()` каждый кадр. Активный `World::mesh_material_path` подготавливается на каждом кадре вместе с материалами слотов, поэтому `set_material` работает и на spawned-объектах.
+
+## UI Editor
+
+Project → New UI Canvas создаёт файл `.rveui` в текущей папке Assets и открывает его в единственной вкладке UI Editor; двойной щелчок `.rveui` открывает тот же документ. Создание файла само по себе не добавляет компонент в сцену: добавь `UI Canvas` через Inspector выбранного объекта и выбери документ. Inspector компонента задаёт документ, видимость и необязательный layer override. MCP-инструменты компонентов также читают, задают и удаляют `ui_canvas`; пути проходят обычную валидацию сцены.
+
+UI Editor открывается рядом со Scene/Game; пока его вкладка видна, общие панели Hierarchy и Inspector редактируют документ UI. Можно добавить любой поддерживаемый тип элемента, перетащить элемент под родителя, изменить порядок среди соседей, дублировать элемент вместе с потомками или удалить поддерево. Удаление очищает ссылки навигации и default focus. Preview использует layout и paint `engine-gui`, показывает фактическую геометрию/clip и загружает объявленные PNG/шрифты в egui-managed textures. Выбор в hierarchy или canvas синхронизирован; выбранный элемент перемещается перетаскиванием, а восемь handles изменяют размер. Средняя кнопка мыши панорамирует preview; zoom gesture или ползунок масштаба масштабирует canvas, Fit сбрасывает pan и подбирает масштаб. Можно менять preview resolution.
+
+Inspector редактирует Canvas settings, видимость/interactability, родителя, anchors, pivot, offsets, pivot position/size и anchor presets. Shift при выборе preset задаёт pivot; Alt задаёт position у выбранного anchor. Структурированные поля покрывают базовую схему; optional/редкие свойства доступны через Advanced element JSON и исходный TOML редактора. PNG/TTF/OTF можно объявить в UI assets; Add image создаёт image element и добавляет путь в assets документа. Недопустимые изменения отклоняются валидацией документа. Undo/redo и Save/Ctrl+S работают на уровне документа. При внешнем изменении файла на чистом документе редактор перечитывает файл; при грязном показывает конфликт и предлагает Reload from disk или Keep edits. Перед открытием другого документа Save/Discard/Cancel защищает несохранённые правки.
+
+Во время Play Game view подаёт pointer/text input в тот же UI bridge, который использует runtime, и отрисовывает полученный paint через `GameUi` вместе с кадром камеры. UI принимает ввод, только когда Game tab активна, окно редактора в фокусе и console закрыта; pointer переводится в координаты viewport Game. При потере этого гейта bridge сбрасывает UI interaction/focus. Документ игрового UI и его runtime-ограничения описаны в [[Engine/EngineGui]]. Реализация editor — `editor/src/ui_editor.rs`, создание/открытие документа — `editor/src/ui/project_panel.rs`, присоединение scene component — `editor/src/ui/inspector.rs`, Play input/render — `editor/src/{app,play}.rs`.

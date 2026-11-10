@@ -1,0 +1,15 @@
+[package]
+name = "rve-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rve-server"
+path = "src/main.rs"
+
+[dependencies]
+engine-runtime = { path = "../engine-runtime" }

@@ -7,15 +7,19 @@ use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets, ModelAlphaMode};
 use engine_core::Time;
 use engine_files::VirtualPath;
-use engine_project::{BootstrapConfig, BootstrapPresentMode};
+use engine_project::{BootstrapConfig, BootstrapPresentMode, BootstrapReflexMode};
 use engine_render::{
-    AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId,
-    MeshId, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
+    AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, DrawStats,
+    EnvironmentId, EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameProfile,
+    FrameStatus, LatencyHandle, LatencyMarker, LowLatencyMode, Material, MaterialId, MeshId,
+    ParticleBlend, ParticleCollision, ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape,
+    PostProcess, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
     Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
-use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
+use engine_scene::{
+    AntiAliasing, CameraSettings, PostProcessSettings, Tonemapper, resolve_post_process,
+};
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use glam::{Mat4, Vec3};
 use scene::Scene;
@@ -26,7 +30,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials|clustered] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--post-process /путь.postprocess] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles|stress] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -34,6 +40,7 @@ struct Options {
     frames: Option<u64>,
     render_scale: Option<f32>,
     camera_settings: Option<String>,
+    post_process: Option<String>,
     resize_test: bool,
     scene: Scene,
     /// Путь модели внутри `assets`, например `/model/cube.fbx`.
@@ -60,6 +67,7 @@ where
     let mut frames = None;
     let mut render_scale = None;
     let mut camera_settings = None;
+    let mut post_process = None;
     let mut resize_test = false;
     let mut scene = None;
     let mut model = None;
@@ -118,6 +126,26 @@ where
                 }
                 camera_settings = Some(path.as_str().to_owned());
             }
+            "--post-process" => {
+                if post_process.is_some() {
+                    return Err("флаг --post-process указан повторно".to_owned());
+                }
+                let value = args.next().ok_or_else(|| {
+                    "после --post-process требуется путь к .postprocess".to_owned()
+                })?;
+                let path = VirtualPath::parse(&value)
+                    .map_err(|error| format!("некорректный путь --post-process: {error}"))?;
+                let is_post_process = path
+                    .as_str()
+                    .rsplit('/')
+                    .next()
+                    .and_then(|name| name.rsplit_once('.'))
+                    .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("postprocess"));
+                if !is_post_process {
+                    return Err("--post-process должен указывать на .postprocess".to_owned());
+                }
+                post_process = Some(path.as_str().to_owned());
+            }
             "--resize-test" => {
                 if resize_test {
                     return Err("флаг --resize-test указан повторно".to_owned());
@@ -135,7 +163,7 @@ where
                     return Err("флаг --scene указан повторно".to_owned());
                 }
                 let value = args.next().ok_or_else(|| {
-                    "после --scene требуется triangle, cube, shadows, materials или clustered"
+                    "после --scene требуется triangle, cube, shadows, materials, clustered, particles или stress"
                         .to_owned()
                 })?;
                 scene = Some(Scene::parse(&value).ok_or_else(|| {
@@ -201,6 +229,7 @@ where
         frames,
         render_scale,
         camera_settings,
+        post_process,
         resize_test,
         scene: scene.unwrap_or_default(),
         model,
@@ -208,6 +237,128 @@ where
         environment,
         debug_overlay,
     })
+}
+
+/// Загружает `.postprocess` из `--post-process`; без флага постобработка берётся из камеры.
+fn load_post_process(
+    options: &Options,
+    resources: &ResourceHandle,
+) -> Result<Option<PostProcessSettings>, String> {
+    let Some(path) = &options.post_process else {
+        return Ok(None);
+    };
+    let bytes = resources
+        .read_all(path)
+        .map_err(|error| format!("{path}: {error}"))?
+        .wait()
+        .map_err(|error| format!("{path}: {error}"))?;
+    let source = String::from_utf8(bytes)
+        .map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))?;
+    PostProcessSettings::parse(path, &source)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Переводит постобработку в настройки renderer; выключенные exposure и tonemapping дают
+/// тождественные значения. Совпадает с маппингом runtime (`render_post_process`).
+fn render_post_process(post: &PostProcessSettings) -> PostProcess {
+    let exposure = if post.exposure.enabled {
+        Exposure {
+            mode: match post.exposure.mode {
+                engine_scene::ExposureMode::Manual => engine_render::ExposureMode::Manual,
+                engine_scene::ExposureMode::Auto => engine_render::ExposureMode::Auto,
+            },
+            ev: post.exposure.ev,
+            min_ev: post.exposure.min_ev,
+            max_ev: post.exposure.max_ev,
+            speed_up: post.exposure.speed_up,
+            speed_down: post.exposure.speed_down,
+            low_percent: post.exposure.low_percent,
+            high_percent: post.exposure.high_percent,
+        }
+    } else {
+        Exposure::default()
+    };
+    let tonemapper = if post.tonemapping.enabled {
+        match post.tonemapping.tonemapper {
+            Tonemapper::Aces => RenderTonemapper::Aces,
+            Tonemapper::Neutral => RenderTonemapper::Neutral,
+            Tonemapper::None => RenderTonemapper::None,
+        }
+    } else {
+        RenderTonemapper::None
+    };
+    let (bloom, ao, grading) = (post.bloom, post.ambient_occlusion, post.color_grading);
+    let (vignette, aberration, grain) = (post.vignette, post.chromatic_aberration, post.film_grain);
+    let (dof, motion) = (post.depth_of_field, post.motion_blur);
+    PostProcess {
+        exposure,
+        tonemapper,
+        bloom: engine_render::Bloom {
+            enabled: bloom.enabled,
+            intensity: bloom.intensity,
+            threshold: bloom.threshold,
+            knee: bloom.knee,
+            scatter: bloom.scatter,
+            tint: bloom.tint,
+        },
+        ambient_occlusion: engine_render::AmbientOcclusion {
+            enabled: ao.enabled,
+            radius: ao.radius,
+            intensity: ao.intensity,
+            falloff: ao.falloff,
+            quality: match ao.quality {
+                engine_scene::AmbientOcclusionQuality::Low => {
+                    engine_render::AmbientOcclusionQuality::Low
+                }
+                engine_scene::AmbientOcclusionQuality::Medium => {
+                    engine_render::AmbientOcclusionQuality::Medium
+                }
+                engine_scene::AmbientOcclusionQuality::High => {
+                    engine_render::AmbientOcclusionQuality::High
+                }
+            },
+        },
+        color_grading: engine_render::ColorGrading {
+            enabled: grading.enabled,
+            temperature: grading.temperature,
+            tint: grading.tint,
+            contrast: grading.contrast,
+            saturation: grading.saturation,
+            lift: grading.lift,
+            gamma: grading.gamma,
+            gain: grading.gain,
+        },
+        vignette: engine_render::Vignette {
+            enabled: vignette.enabled,
+            intensity: vignette.intensity,
+            smoothness: vignette.smoothness,
+            roundness: vignette.roundness,
+            color: vignette.color,
+        },
+        chromatic_aberration: engine_render::ChromaticAberration {
+            enabled: aberration.enabled,
+            intensity: aberration.intensity,
+        },
+        film_grain: engine_render::FilmGrain {
+            enabled: grain.enabled,
+            intensity: grain.intensity,
+            response: grain.response,
+        },
+        depth_of_field: engine_render::DepthOfField {
+            enabled: dof.enabled,
+            focus_distance: dof.focus_distance,
+            aperture: dof.aperture,
+            focal_length_mm: dof.focal_length_mm,
+            max_blur_px: dof.max_blur_px,
+        },
+        motion_blur: engine_render::MotionBlur {
+            enabled: motion.enabled,
+            shutter_angle_deg: motion.shutter_angle_deg,
+            samples: motion.samples,
+            max_blur_px: motion.max_blur_px,
+        },
+    }
 }
 
 fn load_camera_settings(
@@ -287,13 +438,77 @@ struct ResizeTest {
     complete: bool,
 }
 
+/// Процедурный аддитивный фонтан над кубом для ручной проверки путя частиц.
+fn create_particle_emitters(renderer: &mut Renderer) -> Result<Vec<ParticleEmitterFrame>, String> {
+    let fountain = ParticleEmitterDesc {
+        capacity: 8192,
+        blend: ParticleBlend::Additive,
+        shape: ParticleShape::Cone {
+            angle: 0.35,
+            radius: 0.05,
+        },
+        rate: 900.0,
+        lifetime: [1.2, 2.2],
+        speed: [2.5, 3.5],
+        size: [0.12, 0.2],
+        gravity: [0.0, -3.0, 0.0],
+        drag: 0.3,
+        collision: Some(ParticleCollision {
+            restitution: 0.4,
+            friction: 0.2,
+            thickness: 0.05,
+        }),
+        ..ParticleEmitterDesc::default()
+    };
+    let smoke = ParticleEmitterDesc {
+        capacity: 2048,
+        blend: ParticleBlend::Alpha,
+        shape: ParticleShape::Box {
+            half_extents: [0.4, 0.1, 0.4],
+        },
+        rate: 120.0,
+        lifetime: [2.0, 3.0],
+        speed: [0.3, 0.6],
+        size: [0.6, 0.9],
+        gravity: [0.0, 0.4, 0.0],
+        drag: 0.5,
+        soft_distance: 0.5,
+        ..ParticleEmitterDesc::default()
+    };
+    [
+        (fountain, Vec3::new(0.0, 1.0, 0.0)),
+        (smoke, Vec3::new(-1.6, 0.5, 0.0)),
+    ]
+    .into_iter()
+    .map(|(desc, position)| {
+        let emitter = renderer
+            .create_particle_emitter(desc)
+            .map_err(|error| format!("ошибка создания эмиттера частиц: {error}"))?;
+        Ok(ParticleEmitterFrame {
+            emitter,
+            transform: Mat4::from_translation(position).to_cols_array_2d(),
+            emitting: true,
+        })
+    })
+    .collect()
+}
+
 struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
     environment_source: Option<EnvironmentSource>,
     environment: Option<EnvironmentId>,
     camera_settings: CameraSettings,
+    /// Постобработка камеры, разрешённая из `--post-process` или устаревшего `[color]`.
+    post_process: PostProcessSettings,
     present_mode: Option<BootstrapPresentMode>,
+    reflex: Option<BootstrapReflexMode>,
+    /// Reflex-handle renderer; `None`, если Reflex выключен или не поддержан.
+    latency: Option<LatencyHandle>,
+    /// Счётчик кадров песочницы: id маркеров Reflex и `set_latency_frame`.
+    latency_frame: u64,
+    /// Предыдущий кадр не был показан: следующий кадр не ждёт Reflex, чтобы не блокироваться.
+    previous_skipped: bool,
     pipeline_cache_path: Option<PathBuf>,
     pipeline_cache: Vec<u8>,
     meshes: Vec<(MeshId, MaterialId, bool)>,
@@ -304,7 +519,46 @@ struct Sandbox {
     presented_frames: u64,
     resize_test: ResizeTest,
     debug_overlay: Option<DebugOverlay>,
+    particle_emitters: Vec<ParticleEmitterFrame>,
+    profile_summary: ProfileSummary,
     failure: Option<String>,
+}
+
+/// Итог прогона для сравнения замеров: средние CPU-фазы renderer и draw'ы последнего кадра.
+#[derive(Debug, Default)]
+struct ProfileSummary {
+    frames: u32,
+    prepare: Duration,
+    record: Duration,
+    last_draws: DrawStats,
+}
+
+impl ProfileSummary {
+    fn add(&mut self, frame: &FrameProfile) {
+        self.frames += 1;
+        self.prepare += frame.cpu.prepare;
+        self.record += frame.cpu.record;
+        self.last_draws = frame.draws;
+    }
+
+    /// Строка итога; `None`, если renderer не отдал ни одного профиля.
+    fn line(&self) -> Option<String> {
+        if self.frames == 0 {
+            return None;
+        }
+        let average_ms = |total: Duration| total.as_secs_f64() * 1000.0 / f64::from(self.frames);
+        let draws = self.last_draws;
+        Some(format!(
+            "profile: {} frames, renderer CPU avg prepare {:.3} ms, record {:.3} ms; last frame draws scene {} (culled {}), shadow {} (culled {})",
+            self.frames,
+            average_ms(self.prepare),
+            average_ms(self.record),
+            draws.scene_draw_calls,
+            draws.scene_culled,
+            draws.shadow_draw_calls,
+            draws.shadow_culled,
+        ))
+    }
 }
 
 impl Sandbox {
@@ -326,7 +580,12 @@ impl Sandbox {
             environment_source,
             environment: None,
             camera_settings,
+            post_process: PostProcessSettings::default(),
             present_mode,
+            reflex: None,
+            latency: None,
+            latency_frame: 0,
+            previous_skipped: false,
             pipeline_cache_path,
             pipeline_cache,
             meshes: Vec::new(),
@@ -337,6 +596,8 @@ impl Sandbox {
             presented_frames: 0,
             resize_test: ResizeTest::default(),
             debug_overlay: None,
+            particle_emitters: Vec::new(),
+            profile_summary: ProfileSummary::default(),
             failure: None,
         }
     }
@@ -489,6 +750,9 @@ impl Sandbox {
                 .transpose()?;
             let material_id = renderer
                 .create_material(&Material {
+                    shader: None,
+                    user_values: [[0.0; 4]; 16],
+                    user_textures: [None; 8],
                     base_color: mesh.material.base_color,
                     metallic: mesh.material.metallic,
                     roughness: mesh.material.roughness,
@@ -544,11 +808,17 @@ impl WindowHandler for Sandbox {
                     BootstrapPresentMode::Immediate => engine_render::PresentMode::Immediate,
                 })
                 .unwrap_or_default(),
+            low_latency: match self.reflex {
+                Some(BootstrapReflexMode::On) => LowLatencyMode::On,
+                Some(BootstrapReflexMode::Boost) => LowLatencyMode::Boost,
+                Some(BootstrapReflexMode::Off) | None => LowLatencyMode::Off,
+            },
             pipeline_cache: self.pipeline_cache.clone(),
             ..RendererConfig::default()
         };
         match Renderer::new(Arc::clone(&window), size.width, size.height, config) {
             Ok(mut renderer) => {
+                self.latency = renderer.latency_handle();
                 let capabilities = renderer.capabilities();
                 let api_major = (capabilities.api_version >> 22) & 0x7f;
                 let api_minor = (capabilities.api_version >> 12) & 0x3ff;
@@ -561,6 +831,15 @@ impl WindowHandler for Sandbox {
                     capabilities.discrete,
                     capabilities.tessellation_shader
                 );
+                if self.content.motion == Scene::Particles {
+                    match create_particle_emitters(&mut renderer) {
+                        Ok(emitters) => self.particle_emitters = emitters,
+                        Err(error) => {
+                            self.failure = Some(error);
+                            return false;
+                        }
+                    }
+                }
                 if let Err(error) = self.upload_content(&mut renderer) {
                     self.failure = Some(error);
                     return false;
@@ -595,39 +874,69 @@ impl WindowHandler for Sandbox {
         if window.is_minimized() == Some(true) {
             return true;
         }
+        // Reflex: сон перед сэмплированием времени; после пропущенного кадра не ждём.
+        self.latency_frame = self.latency_frame.saturating_add(1);
+        let frame_id = self.latency_frame;
+        if let Some(latency) = self.latency.as_ref() {
+            if !self.previous_skipped {
+                latency.sleep();
+            }
+            latency.marker(frame_id, LatencyMarker::SimulationStart);
+            latency.marker(frame_id, LatencyMarker::InputSample);
+            latency.marker(frame_id, LatencyMarker::SimulationEnd);
+        }
         let elapsed = self.time.elapsed().as_secs_f32();
         let Some(renderer) = self.renderer.as_mut() else {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
         };
-        let model = self.content.model(elapsed).to_cols_array_2d();
-        let previous_model = self
+        let models = self
             .content
-            .model(self.previous_elapsed.unwrap_or(elapsed))
-            .to_cols_array_2d();
+            .models(elapsed)
+            .zip(
+                self.content
+                    .models(self.previous_elapsed.unwrap_or(elapsed)),
+            )
+            .map(|(model, previous)| (model.to_cols_array_2d(), previous.to_cols_array_2d()))
+            .collect::<Vec<_>>();
+        let identity = [(
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+        )];
         let draws = self
             .meshes
             .iter()
-            .map(|&(mesh, material, environment)| DrawCommand {
-                mesh,
-                material: Some(material),
-                model: if environment {
-                    glam::Mat4::IDENTITY.to_cols_array_2d()
+            .flat_map(|&(mesh, material, environment)| {
+                let transforms = if environment {
+                    &identity[..]
                 } else {
-                    model
-                },
-                previous_model: Some(if environment {
-                    glam::Mat4::IDENTITY.to_cols_array_2d()
-                } else {
-                    previous_model
-                }),
-                lod_level: 0,
-                casts_shadow: true,
+                    &models[..]
+                };
+                transforms
+                    .iter()
+                    .map(move |&(model, previous_model)| DrawCommand {
+                        mesh,
+                        material: Some(material),
+                        model,
+                        previous_model: Some(previous_model),
+                        lod_level: 0,
+                        casts_shadow: true,
+                        skin: None,
+                    })
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();
+        let frame_profile = renderer.take_frame_profile();
+        if let Some(profile) = &frame_profile {
+            self.profile_summary.add(profile);
+        }
         let overlay = match self.debug_overlay.as_mut() {
-            Some(overlay) => overlay.update(Instant::now(), gpu_time),
+            Some(overlay) => {
+                if let Some(profile) = &frame_profile {
+                    overlay.record_frame_profile(profile);
+                }
+                overlay.update(Instant::now(), gpu_time)
+            }
             None => &[],
         };
         let shadow_cascades = self.content.shadow_cascades(
@@ -662,7 +971,11 @@ impl WindowHandler for Sandbox {
             });
         let local_lights = self.content.local_lights();
         let local_light_shadows = self.content.local_light_shadows();
+        let particle_step = self
+            .previous_elapsed
+            .map_or(0.0, |previous| (elapsed - previous).max(0.0));
         let frame = Frame {
+            joint_palettes: &[],
             clear_color: [
                 self.camera_settings.render.clear_color[0],
                 self.camera_settings.render.clear_color[1],
@@ -686,15 +999,12 @@ impl WindowHandler for Sandbox {
             local_light_shadows: &local_light_shadows,
             draws: &draws,
             overlay,
+            ui: &[],
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
-                exposure_ev: self.camera_settings.color.exposure_ev,
-                tonemapper: match self.camera_settings.color.tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
-                },
+                post: render_post_process(&self.post_process),
+                screen_shaders: engine_render::ScreenShaders::default(),
                 anti_aliasing: match self.camera_settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -704,9 +1014,13 @@ impl WindowHandler for Sandbox {
                 },
             },
             reset_history: false,
+            particles: &self.particle_emitters,
+            particle_step,
         };
+        renderer.set_latency_frame(frame_id);
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {
+                self.previous_skipped = false;
                 self.previous_elapsed = Some(elapsed);
                 self.presented_frames += 1;
                 if let Some(overlay) = self.debug_overlay.as_mut() {
@@ -729,7 +1043,10 @@ impl WindowHandler for Sandbox {
                 }
                 true
             }
-            Ok(FrameStatus::Skipped) => true,
+            Ok(FrameStatus::Skipped) => {
+                self.previous_skipped = true;
+                true
+            }
             Err(error) => {
                 self.failure = Some(format!("ошибка Vulkan render_frame: {error}"));
                 false
@@ -813,6 +1130,7 @@ fn main_after_vulkan_environment() -> ExitCode {
         }
     };
     let present_mode = bootstrap.present_mode;
+    let reflex = bootstrap.reflex;
     let default_window = WindowConfig::default();
     let config = WindowConfig {
         title: bootstrap.window_title.unwrap_or(default_window.title),
@@ -855,6 +1173,14 @@ fn main_after_vulkan_environment() -> ExitCode {
     };
     let pipeline_cache_path = engine_platform::pipeline_cache_path("sandbox");
     let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
+    let post_file = match load_post_process(&options, &resources.handle()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("Ошибка постобработки: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let post_process = resolve_post_process(&camera_settings, post_file.as_ref());
     let mut app = Sandbox::new(
         options,
         content,
@@ -864,6 +1190,8 @@ fn main_after_vulkan_environment() -> ExitCode {
         pipeline_cache_path,
         pipeline_cache,
     );
+    app.post_process = post_process;
+    app.reflex = reflex;
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
     let mut exit_code = match (run_result, failure) {
@@ -877,6 +1205,9 @@ fn main_after_vulkan_environment() -> ExitCode {
         }
         (Ok(()), None) => 0,
     };
+    if let Some(line) = app.profile_summary.line() {
+        println!("{line}");
+    }
     app.save_pipeline_cache();
     drop(app);
     if let Err(error) = resources.shutdown() {
@@ -891,11 +1222,13 @@ fn main_after_vulkan_environment() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraSettings, Content, EnvironmentMode, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox,
-        Scene, parse_args, with_executable_directory,
+        CameraSettings, Content, EnvironmentMode, Options, ProfileSummary, RESIZE_SIZE,
+        RESTORE_SIZE, Sandbox, Scene, parse_args, with_executable_directory,
     };
     use engine_assets::Assets;
+    use engine_render::{DrawStats, FrameProfile};
     use engine_resources::{ResourceConfig, ResourceSystem};
+    use std::time::Duration;
 
     fn sandbox(options: Options) -> Sandbox {
         let content = Content::from_scene(options.scene);
@@ -908,6 +1241,32 @@ mod tests {
             None,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn profile_summary_averages_cpu_phases_and_keeps_last_frame_draws() {
+        let mut summary = ProfileSummary::default();
+        assert_eq!(summary.line(), None);
+        for (record_ms, scene_draw_calls) in [(2, 10), (4, 12)] {
+            let mut frame = FrameProfile {
+                draws: DrawStats {
+                    scene_draw_calls,
+                    scene_culled: 3,
+                    shadow_draw_calls: 7,
+                    shadow_culled: 1,
+                },
+                ..FrameProfile::default()
+            };
+            frame.cpu.record = Duration::from_millis(record_ms);
+            summary.add(&frame);
+        }
+
+        assert_eq!(
+            summary.line().as_deref(),
+            Some(
+                "profile: 2 frames, renderer CPU avg prepare 0.000 ms, record 3.000 ms; last frame draws scene 12 (culled 3), shadow 7 (culled 1)"
+            )
+        );
     }
 
     #[test]
@@ -1011,6 +1370,7 @@ mod tests {
             frames: None,
             render_scale: Some(1.0),
             camera_settings: None,
+            post_process: None,
             resize_test: true,
             scene: Scene::Cube,
             model: None,
@@ -1069,6 +1429,8 @@ mod tests {
             "0.5",
             "--camera-settings",
             "/camera/default.camerasettings",
+            "--post-process",
+            "/post/bloom.postprocess",
             "--resize-test",
             "--scene",
             "triangle",
@@ -1077,6 +1439,10 @@ mod tests {
             "--debug-overlay",
         ])
         .expect("valid arguments should parse");
+        assert_eq!(
+            options.post_process.as_deref(),
+            Some("post/bloom.postprocess")
+        );
         assert_eq!(options.frames, Some(120));
         assert_eq!(options.render_scale, Some(0.5));
         assert_eq!(
@@ -1100,7 +1466,7 @@ mod tests {
         let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
         assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         assert_eq!(options.texture, None);
-        for scene in ["shadows", "cube", "materials", "clustered"] {
+        for scene in ["shadows", "cube", "materials", "clustered", "stress"] {
             let options = parse_args(["--scene", scene, "--model", "/model/cube.fbx"])
                 .expect("non-triangle scenes may load a model");
             assert_eq!(options.scene, Scene::parse(scene).unwrap());
@@ -1128,6 +1494,14 @@ mod tests {
             vec!["--render-scale", "2"],
             vec!["--render-scale", "0.5", "--render-scale", "0.25"],
             vec!["--camera-settings"],
+            vec!["--post-process"],
+            vec!["--post-process", "/camera/default.camerasettings"],
+            vec![
+                "--post-process",
+                "/a.postprocess",
+                "--post-process",
+                "/b.postprocess",
+            ],
             vec!["--camera-settings", "../camera.camerasettings"],
             vec!["--camera-settings", "/camera/default.toml"],
             vec![

@@ -1,34 +1,44 @@
 //! Приложение редактора: окно, цикл кадра egui + renderer и выполнение действий.
 
+use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
-use crate::play::PlaySession;
+use crate::mcp::{McpHost, capture};
+use crate::play::{PlayPrefabs, PlayScene, PlaySession, editor_gamepads, gamepad_tuning};
+use crate::play_cursor;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
 use crate::settings::{SettingsStore, UserSettings};
-use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt};
+use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt, ViewCommand};
 use crate::ui;
+use crate::ui::game_view;
+use crate::ui::preferences::Preferences;
 use crate::ui::scene_view::bounding_sphere;
+use crate::viewport::camera::View;
 use crate::viewport::render::{SceneRenderer, render_local_lights};
 use egui_dock::DockState;
 use engine_console::{
     CommandCatalog, ConsoleBuffer, ConsoleLevel, ConsoleLine, install_logger, parse_command_line,
 };
 use engine_files::VirtualPath;
+use engine_project::{BootstrapReflexMode, PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
 use engine_render::{
-    FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
+    DebugView, DirectionalLight, Frame, FrameCamera, FrameStatus, LatencyHandle, LatencyMarker,
+    LowLatencyMode, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewSettings,
+    ViewportId,
 };
 use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
+use engine_script::UiTick;
 use engine_ui::console::ConsoleOverlay;
 use engine_ui::render::{ConvertedMesh, UiBridge};
-use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
+use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler, WindowProxy};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use winit::event::ElementState;
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
 /// Цвет окна за панелями; всё окно закрыто UI, поэтому заметен только при первом кадре.
 const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
@@ -36,13 +46,160 @@ const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
 /// Как часто забирать вывод идущей сборки.
 const BUILD_POLL: Duration = Duration::from_millis(50);
+/// Как часто дренировать очередь геймпадов вне Play: без этого события копятся до следующего Play.
+const IDLE_GAMEPAD_POLL: Duration = Duration::from_secs(1);
+/// Как часто забирать готовый захват `capture_view`, пока задача активна.
+const CAPTURE_POLL: Duration = Duration::from_millis(16);
+
+fn player_save_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(".rve")
+        .join("playersave")
+        .join("save.toml")
+}
+
+fn load_project_starting_scene(project: &OpenProject) -> Result<EditorScene, String> {
+    let starting_scene = project
+        .settings
+        .starting_scene()
+        .ok_or_else(|| "В проекте не указана стартовая сцена".to_owned())?;
+    project.read_text(starting_scene).and_then(|text| {
+        let path = VirtualPath::parse(starting_scene).map_err(|error| error.to_string())?;
+        EditorScene::parse(path, &text, project.prefab_loader())
+    })
+}
+
+/// Включённые сцены проекта: только они принимаются `rve.scene.load` в Play.
+fn enabled_scene_paths(project: &OpenProject) -> Vec<String> {
+    project
+        .settings
+        .scenes
+        .iter()
+        .filter(|scene| scene.enabled)
+        .map(|scene| scene.path.clone())
+        .collect()
+}
+
+/// Готовит сцену для `rve.scene.load` из файлов проекта. Документ редактора не читается как
+/// цель записи: сцена собирается отдельно и попадает только в сессию Play.
+fn prepare_play_scene(
+    project: &OpenProject,
+    path: &str,
+) -> Result<(PlayScene, Vec<String>), String> {
+    let text = project.read_text(path)?;
+    let virtual_path = VirtualPath::parse(path).map_err(|error| error.to_string())?;
+    let scene = EditorScene::parse(virtual_path, &text, project.prefab_loader())?;
+    let heavy = PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME))?;
+    let (prefabs, warnings) = PlayPrefabs::load(
+        scene.view(),
+        &mut |label| project.read_text(label),
+        scene.instanced_prefabs(),
+        &heavy,
+    );
+    let mut prefabs = prefabs.with_resources(project.resource_handle());
+    let mut world = World::from_document(scene.view()).map_err(|error| error.to_string())?;
+    project.apply_camera_settings(&mut world)?;
+    project.apply_physics_materials(&mut world)?;
+    prefabs.prepare_ui(&world, &project.assets)?;
+    let scene = PlayScene::prepare(
+        path,
+        world,
+        prefabs,
+        |label| project.read_text(label),
+        &project.assets,
+    )?;
+    Ok((scene, warnings))
+}
+
+/// Выполняет запросы окна и диалогов скриптов Play. Диалог открывается синхронно, как другие
+/// диалоги редактора; окно редактора скрипты не переключают и не снимают.
+fn apply_play_platform_requests(
+    state: &mut EditorState,
+    mut open_dialog: impl FnMut(&engine_script::FileDialogRequest) -> Vec<std::path::PathBuf>,
+) {
+    let Some(play) = state.play.as_mut() else {
+        return;
+    };
+    for request in play.take_platform_requests() {
+        match request {
+            engine_script::PlatformRequest::FileDialog { id, request } => {
+                let paths = open_dialog(&request);
+                play.complete_file_dialog(id, paths);
+            }
+            engine_script::PlatformRequest::SetFullscreen(_) => state.log.push(
+                LogLevel::Warn,
+                "полноэкранный режим скриптов недоступен в Play редактора".to_owned(),
+            ),
+            engine_script::PlatformRequest::Screenshot(_) => state.log.push(
+                LogLevel::Warn,
+                "скриншот окна скриптов недоступен в Play редактора".to_owned(),
+            ),
+        }
+    }
+}
+
+/// Системный диалог файлов для скриптов Play.
+fn run_play_file_dialog(request: &engine_script::FileDialogRequest) -> Vec<std::path::PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(title) = &request.title {
+        dialog = dialog.set_title(title);
+    }
+    if let Some(directory) = &request.directory {
+        dialog = dialog.set_directory(directory);
+    }
+    if let Some(file_name) = &request.file_name {
+        dialog = dialog.set_file_name(file_name);
+    }
+    for filter in &request.filters {
+        dialog = dialog.add_filter(&filter.name, &filter.extensions);
+    }
+    let single = |path: Option<std::path::PathBuf>| path.into_iter().collect();
+    match request.kind {
+        engine_script::FileDialogKind::OpenFile => single(dialog.pick_file()),
+        engine_script::FileDialogKind::OpenFiles => dialog.pick_files().unwrap_or_default(),
+        engine_script::FileDialogKind::SaveFile => single(dialog.save_file()),
+        engine_script::FileDialogKind::PickFolder => single(dialog.pick_folder()),
+    }
+}
+
+/// Выполняет запрос `rve.scene.load`, принятый в Play. Ошибка подготовки или замены не меняет
+/// сессию; текущая сцена продолжает работать.
+fn apply_play_scene_request(state: &mut EditorState) {
+    let Some(play) = state.play.as_mut() else {
+        return;
+    };
+    let Some(path) = play.take_scene_request() else {
+        return;
+    };
+    let result = match state.project.as_ref() {
+        Some(project) => prepare_play_scene(project, &path).and_then(|(scene, warnings)| {
+            for warning in warnings {
+                state.log.push(LogLevel::Warn, warning);
+            }
+            play.replace_scene(scene)
+        }),
+        None => Err("проект не открыт".to_owned()),
+    };
+    if let Err(error) = result {
+        play.report_scene_failure(&path, &error);
+    }
+}
 
 pub struct EditorApp {
     state: EditorState,
     control_click: bool,
+    /// Окно в фокусе по событиям winit; без фокуса Play не захватывает курсор.
+    window_focused: bool,
+    /// Модификаторы из `ModifiersChanged`: numpad-команды Scene различаются по Ctrl.
+    modifiers: ModifiersState,
     dock: DockState<Tab>,
     /// Файл настроек пользователя; `None`, если каталог настроек ОС неизвестен.
     settings: Option<SettingsStore>,
+    user_settings: UserSettings,
+    preferences: Preferences,
+    mcp_host: McpHost,
+    mcp_cli_enabled: bool,
+    stored_mcp_enabled: bool,
     initial_project: Option<PathBuf>,
     gpu: Option<GpuState>,
     egui_ctx: egui::Context,
@@ -51,6 +208,14 @@ pub struct EditorApp {
     bridge: UiBridge,
     engine_log: Arc<Mutex<ConsoleBuffer>>,
     repaint_at: Option<Instant>,
+    /// Режим NVIDIA Reflex из bootstrap проекта; применяется при создании renderer.
+    reflex: Option<BootstrapReflexMode>,
+    /// Reflex-handle renderer; `None`, если Reflex выключен или не поддержан.
+    latency: Option<LatencyHandle>,
+    /// Счётчик кадров редактора: id маркеров Reflex и `set_latency_frame`.
+    latency_frame: u64,
+    /// Перерисовка непрерывна (Play или превью): только тогда кадр ждёт разрешения Reflex.
+    continuous_redraw: bool,
     /// Ревизия сцены в последней копии автосохранения и время записи.
     autosaved_revision: Option<u64>,
     last_autosave: Instant,
@@ -58,6 +223,9 @@ pub struct EditorApp {
     pub exit_code: u8,
     window_title: String,
     window: Option<Arc<Window>>,
+    proxy: Option<WindowProxy>,
+    asset_watcher: Option<AssetWatcher>,
+    asset_changes: ChangeBatch,
     pipeline_cache_path: Option<PathBuf>,
     pipeline_cache: Vec<u8>,
 }
@@ -65,30 +233,89 @@ pub struct EditorApp {
 struct GpuState {
     renderer: Renderer,
     scene: SceneRenderer,
+    game_ui: engine_ui::game::GameUi<String>,
 }
 
 impl EditorApp {
-    pub fn new(project: Option<PathBuf>, scripts: Option<PathBuf>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_for_mcp_tests_with_state(state: EditorState) -> Self {
+        let user_settings = UserSettings::default();
+        Self {
+            state,
+            control_click: false,
+            window_focused: false,
+            modifiers: ModifiersState::empty(),
+            dock: user_settings.layout_or_default(),
+            settings: None,
+            user_settings,
+            preferences: Preferences::default(),
+            mcp_host: McpHost::default(),
+            mcp_cli_enabled: false,
+            stored_mcp_enabled: false,
+            initial_project: None,
+            gpu: None,
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            console_overlay: ConsoleOverlay::default(),
+            bridge: UiBridge::default(),
+            engine_log: Arc::new(Mutex::new(ConsoleBuffer::default())),
+            repaint_at: None,
+            reflex: None,
+            latency: None,
+            latency_frame: 0,
+            continuous_redraw: false,
+            autosaved_revision: None,
+            last_autosave: Instant::now(),
+            exit: false,
+            exit_code: 0,
+            window_title: String::new(),
+            window: None,
+            proxy: None,
+            asset_watcher: None,
+            asset_changes: ChangeBatch::default(),
+            pipeline_cache_path: None,
+            pipeline_cache: Vec::new(),
+        }
+    }
+
+    pub fn new(
+        project: Option<PathBuf>,
+        scripts: Option<PathBuf>,
+        reflex: Option<BootstrapReflexMode>,
+        mcp: bool,
+    ) -> Self {
         let engine_log = editor_log_buffer();
         let mut state = EditorState::new(scripts);
         let pipeline_cache_path = engine_platform::pipeline_cache_path("rve-editor");
         let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
         let settings = SettingsStore::default_location();
-        let (user, problem) = settings
+        let (mut user, problem) = settings
             .as_ref()
             .map(SettingsStore::load)
             .unwrap_or_default();
         if let Some(problem) = problem {
             state.log.push(LogLevel::Warn, problem);
         }
+        let stored_mcp_enabled = user.mcp.enabled;
+        if mcp {
+            user.mcp.enabled = true;
+        }
         let dock = user.layout_or_default();
         state.scroll_navigation = user.scroll_navigation;
-        state.recent_projects = user.recent_projects;
+        state.recent_projects = user.recent_projects.clone();
+        let preferences = Preferences::default();
         Self {
             state,
             control_click: false,
+            window_focused: false,
+            modifiers: ModifiersState::empty(),
             dock,
             settings,
+            user_settings: user,
+            preferences,
+            mcp_host: McpHost::default(),
+            mcp_cli_enabled: mcp,
+            stored_mcp_enabled,
             initial_project: project,
             gpu: None,
             egui_ctx: egui::Context::default(),
@@ -97,12 +324,19 @@ impl EditorApp {
             bridge: UiBridge::default(),
             engine_log,
             repaint_at: None,
+            reflex,
+            latency: None,
+            latency_frame: 0,
+            continuous_redraw: false,
             autosaved_revision: None,
             last_autosave: Instant::now(),
             exit: false,
             exit_code: 0,
             window_title: String::new(),
             window: None,
+            proxy: None,
+            asset_watcher: None,
+            asset_changes: ChangeBatch::default(),
             pipeline_cache_path,
             pipeline_cache,
         }
@@ -133,66 +367,291 @@ impl EditorApp {
         if self.state.console_open
             && let Some(play) = &mut self.state.play
         {
-            play.input_mut().release_all();
+            play.clear_input();
         }
         true
     }
 
-    fn open_project(&mut self, dir: &Path) {
-        match OpenProject::open(dir) {
-            Ok(project) => {
-                self.cancel_project_jobs();
-                self.stop_play();
-                let previous_generation = self.state.script_generation.take();
-                self.state.library = None;
-                if let Some(generation) = previous_generation
-                    && let Err(error) = std::fs::remove_file(&generation.path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    self.state.log.push(
-                        LogLevel::Warn,
-                        format!("{}: {error}", generation.path.display()),
-                    );
-                }
-                if self.state.scripts_path.is_none()
-                    && let Err(error) = crate::build::cleanup_script_generations(&project.root)
-                {
-                    self.state.log.push(
-                        LogLevel::Warn,
-                        format!(
-                            "{}: {error}",
-                            project.root.join(".rve/editor/scripts").display()
-                        ),
-                    );
-                }
-                self.state
-                    .log
-                    .info(format!("Открыт проект {}", project.settings.name));
-                let start = project.settings.starting_scene().map(str::to_owned);
-                UserSettings::remember_project(
-                    &mut self.state.recent_projects,
-                    project.root.clone(),
-                );
-                self.state.project = Some(project);
-                self.save_settings();
-                self.state.current_folder.clear();
-                if self.state.scripts_path.is_some() {
-                    self.load_manual_library();
-                } else if self
+    fn open_project(&mut self, dir: &Path, build_scripts: bool) -> Result<(), String> {
+        let project = OpenProject::open(dir)?;
+        self.cancel_project_jobs();
+        self.stop_play();
+        let previous_generation = self.state.script_generation.take();
+        self.state.library = None;
+        if let Some(generation) = previous_generation
+            && let Err(error) = std::fs::remove_file(&generation.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!("{}: {error}", generation.path.display()),
+            );
+        }
+        if self.state.scripts_path.is_none()
+            && let Err(error) = crate::build::cleanup_script_generations(&project.root)
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!(
+                    "{}: {error}",
+                    project.root.join(".rve/editor/scripts").display()
+                ),
+            );
+        }
+        self.state
+            .log
+            .info(format!("Открыт проект {}", project.settings.name));
+        let start = project.settings.starting_scene().map(str::to_owned);
+        UserSettings::remember_project(&mut self.state.recent_projects, project.root.clone());
+        self.state.advance_mcp_generation();
+        self.state.project = Some(project);
+        self.state.project_replaced();
+        self.save_settings();
+        self.state.current_folder.clear();
+        self.reset_project_assets();
+        self.watch_project_assets();
+        self.refresh_tree_only();
+        if let Some(project) = self.state.project.as_ref() {
+            self.state
+                .materials
+                .refresh_all(project, &self.state.asset_tree);
+        }
+        if self.state.scripts_path.is_some() {
+            self.load_manual_library();
+        } else if build_scripts
+            && self
+                .state
+                .project
+                .as_ref()
+                .is_some_and(|project| project.settings.heavy_scripts.is_some())
+        {
+            self.start_scripts_build();
+        }
+        match start {
+            Some(path) => self.open_scene(&path),
+            None => self.new_scene(),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mcp_state_mut(&mut self) -> &mut EditorState {
+        &mut self.state
+    }
+
+    /// Renderer и рендер сцены для захвата; `None`, пока окно и renderer не созданы.
+    pub(crate) fn mcp_capture_gpu(&mut self) -> Option<(&mut Renderer, &mut SceneRenderer)> {
+        self.gpu
+            .as_mut()
+            .map(|gpu| (&mut gpu.renderer, &mut gpu.scene))
+    }
+
+    pub(crate) fn mcp_execute_tool(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        permissions: engine_mcp::Permissions,
+    ) -> Result<serde_json::Value, String> {
+        crate::mcp::dispatch(self, name, arguments, permissions)
+    }
+
+    /// `build_scripts` — право Build: без него `heavy_scripts` не собирается (cargo не запускается).
+    pub(crate) fn mcp_open_project(
+        &mut self,
+        dir: &Path,
+        build_scripts: bool,
+        discard: bool,
+    ) -> Result<(), String> {
+        if self.state.is_playing() {
+            return Err("stop Play before opening a project".to_owned());
+        }
+        let discarded = self.discarded_scene_autosave(discard);
+        self.open_project(dir, build_scripts)?;
+        self.remove_discarded_autosave(discarded);
+        self.state.recovery_prompt = None;
+        Ok(())
+    }
+
+    /// Нужна ли сборка `heavy_scripts` перед Play или после открытия проекта; MCP без права Build её не запускает.
+    pub(crate) fn mcp_scripts_build_needed(&self) -> bool {
+        self.state.scripts_path.is_none()
+            && self
+                .state
+                .project
+                .as_ref()
+                .is_some_and(|project| project.settings.heavy_scripts.is_some())
+    }
+
+    pub(crate) fn mcp_open_scene(&mut self, path: &str, discard: bool) -> Result<(), String> {
+        if self.state.is_playing() {
+            return Err("stop Play before opening a scene".to_owned());
+        }
+        let discarded = self.discarded_scene_autosave(discard);
+        self.open_scene_with_recovery(path, false)?;
+        self.remove_discarded_autosave(discarded);
+        Ok(())
+    }
+
+    pub(crate) fn mcp_new_scene(&mut self, discard: bool) -> Result<(), String> {
+        if self.state.project.is_none() {
+            return Err("project is not open".to_owned());
+        }
+        if self.state.is_playing() {
+            return Err("stop Play before creating a scene".to_owned());
+        }
+        let discarded = self.discarded_scene_autosave(discard);
+        let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
+        let mut scene = EditorScene::new_untitled()?;
+        if let Some(loader) = loader {
+            scene.set_prefab_loader(loader)?;
+        }
+        self.set_scene(scene);
+        self.remove_discarded_autosave(discarded);
+        Ok(())
+    }
+
+    pub(crate) fn mcp_save_scene(&mut self, path: Option<&str>) -> Result<String, String> {
+        if self.state.is_playing() {
+            return Err("scene cannot be saved during Play".to_owned());
+        }
+        let target = match path {
+            Some(path) => {
+                VirtualPath::parse(path).map_err(|_| format!("{path}: invalid scene path"))?
+            }
+            None => self
+                .state
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.path().cloned())
+                .ok_or_else(|| "path is required for an untitled scene".to_owned())?,
+        };
+        let project = self
+            .state
+            .project
+            .as_ref()
+            .ok_or_else(|| "project is not open".to_owned())?;
+        crate::mcp::paths::resolve_write_path(&project.root, target.as_str())?;
+        self.run_explicit_path_action(Action::SaveAsAt(target.as_str().to_owned()))?;
+        Ok(target.as_str().to_owned())
+    }
+
+    /// `build_scripts` — право Build: без него Play, которому нужна сборка скриптов, не стартует.
+    pub(crate) fn mcp_start_play(
+        &mut self,
+        network: Option<bool>,
+        build_scripts: bool,
+    ) -> Result<String, String> {
+        if self.state.is_playing() || self.state.pending_play {
+            return Err("Play is already running or starting".to_owned());
+        }
+        if !build_scripts && self.mcp_scripts_build_needed() {
+            return Err(
+                "starting Play requires building scripts; enable the Build permission".to_owned(),
+            );
+        }
+        if let Some(network) = network {
+            if network {
+                let project = self
                     .state
                     .project
                     .as_ref()
-                    .is_some_and(|project| project.settings.heavy_scripts.is_some())
-                {
-                    self.start_scripts_build();
+                    .ok_or_else(|| "project is not open".to_owned())?;
+                if !project.settings.network.enabled {
+                    return Err("network play is disabled in project.rveproject".to_owned());
                 }
-                self.refresh_assets();
-                match start {
-                    Some(path) => self.open_scene(&path),
-                    None => self.new_scene(),
-                }
+                self.state.play_network.mode = crate::play_network::PlayNetworkMode::Host;
+            } else {
+                self.state.play_network.mode = crate::play_network::PlayNetworkMode::Offline;
             }
-            Err(error) => self.state.log.error(error),
+        }
+        self.start_play();
+        if self.state.is_playing() {
+            Ok("running".to_owned())
+        } else if self.state.pending_play {
+            Ok("building_scripts".to_owned())
+        } else {
+            Err("Play could not start; see Console for details".to_owned())
+        }
+    }
+
+    pub(crate) fn mcp_stop_play(&mut self) {
+        self.stop_play();
+    }
+
+    pub(crate) fn mcp_console_command(&mut self, command: &str) {
+        submit_console_command(&mut self.state, command);
+    }
+
+    pub(crate) fn mcp_start_scripts_build(&mut self) -> Result<String, String> {
+        if self.state.scripts_job.is_some() {
+            return Ok("running".to_owned());
+        }
+        let project = self
+            .state
+            .project
+            .as_ref()
+            .ok_or_else(|| "project is not open".to_owned())?;
+        if self.state.scripts_path.is_some() {
+            return Err(
+                "a manual scripts library is configured; no scripts build is needed".to_owned(),
+            );
+        }
+        if project.settings.heavy_scripts.is_none() {
+            return Err("project has no heavy_scripts configuration".to_owned());
+        }
+        if self.start_scripts_build() {
+            Ok("running".to_owned())
+        } else {
+            Err("scripts build could not start; see Console for details".to_owned())
+        }
+    }
+
+    pub(crate) fn mcp_start_build(
+        &mut self,
+        output: &Path,
+        with_server: bool,
+    ) -> Result<(), String> {
+        if self.state.is_playing() {
+            return Err("stop Play before building".to_owned());
+        }
+        if self.state.has_unsaved_changes() {
+            return Err("save or discard unsaved changes before building".to_owned());
+        }
+        self.run_explicit_path_action(Action::BuildPlayerAt {
+            output: output.to_owned(),
+            with_server,
+        })
+    }
+
+    pub(crate) fn mcp_refresh_tree(&mut self) {
+        self.refresh_tree_only();
+    }
+
+    pub(crate) fn mcp_create_prefab(&mut self, id: &str) -> Result<String, String> {
+        if self.state.is_playing() {
+            return Err("stop Play before editing the scene".to_owned());
+        }
+        self.create_prefab(id)
+    }
+
+    pub(crate) fn mcp_apply_to_prefab(&mut self, id: &str) -> Result<String, String> {
+        if self.state.is_playing() {
+            return Err("stop Play before editing the scene".to_owned());
+        }
+        self.apply_to_prefab(id)
+    }
+
+    fn run_explicit_path_action(&mut self, action: Action) -> Result<(), String> {
+        match action {
+            Action::SaveAsAt(path) => {
+                let target =
+                    VirtualPath::parse(&path).map_err(|_| format!("{path}: invalid scene path"))?;
+                self.save_target(target)
+            }
+            Action::BuildPlayerAt {
+                output,
+                with_server,
+            } => self.start_build_at(&output, with_server),
+            _ => Err("action does not carry an explicit path".to_owned()),
         }
     }
 
@@ -204,6 +663,52 @@ impl EditorApp {
             job.kill();
         }
         self.state.pending_play = false;
+    }
+
+    fn reset_project_assets(&mut self) {
+        self.asset_changes = ChangeBatch::default();
+        self.state.previews.clear();
+        self.state.clear_lite_schemas();
+        self.state.models.clear();
+        self.state.screen_shader_errors.clear();
+        self.state.materials = crate::materials::MaterialLibrary::default();
+        self.state.inspected_asset = None;
+        if let Some(texture) = self.state.material_preview_texture.take() {
+            self.bridge.unregister(texture);
+        }
+        if let Some(assets) = self
+            .state
+            .project
+            .as_ref()
+            .map(|project| project.assets.clone())
+        {
+            self.state.model_loader.restart(assets);
+        }
+        if let Some(gpu) = &mut self.gpu
+            && let Err(error) = gpu
+                .scene
+                .free_material_preview_viewport(&mut gpu.renderer)
+                .and_then(|()| {
+                    gpu.scene
+                        .clear_cache(&mut gpu.renderer, &mut self.state.models)
+                })
+        {
+            self.fail(&error);
+        }
+    }
+
+    fn watch_project_assets(&mut self) {
+        self.asset_watcher = None;
+        let (Some(proxy), Some(project)) = (&self.proxy, &self.state.project) else {
+            return;
+        };
+        match AssetWatcher::new(project.assets_dir.root(), proxy.clone()) {
+            Ok(watcher) => self.asset_watcher = Some(watcher),
+            Err(error) => self.state.log.push(
+                LogLevel::Warn,
+                format!("Автообновление ресурсов недоступно: {error}"),
+            ),
+        }
     }
 
     fn start_scripts_build(&mut self) -> bool {
@@ -234,6 +739,8 @@ impl EditorApp {
         let command = tool.scripts_command(&project_dir);
         match crate::build::ScriptsJob::spawn(command, project_dir.clone()) {
             Ok(job) => {
+                self.state.build_output_tail.clear();
+                self.state.build_succeeded = None;
                 self.state
                     .log
                     .info(format!("Build scripts: {}", project_dir.display()));
@@ -257,38 +764,118 @@ impl EditorApp {
         let Some(store) = &self.settings else {
             return;
         };
-        let settings = UserSettings {
-            recent_projects: self.state.recent_projects.clone(),
-            layout: Some(self.dock.clone()),
-            scroll_navigation: self.state.scroll_navigation,
-        };
-        if let Err(error) = store.save(&settings) {
+        self.user_settings.recent_projects = self.state.recent_projects.clone();
+        self.user_settings.layout = Some(self.dock.clone());
+        self.user_settings.scroll_navigation = self.state.scroll_navigation;
+        let runtime_enabled = self.user_settings.mcp.enabled;
+        if self.mcp_cli_enabled {
+            self.user_settings.mcp.enabled = self.stored_mcp_enabled;
+        }
+        let result = store.save(&self.user_settings);
+        if self.mcp_cli_enabled {
+            self.user_settings.mcp.enabled = runtime_enabled;
+        }
+        if let Err(error) = result {
             self.state.log.push(LogLevel::Warn, error);
         }
     }
 
-    fn refresh_assets(&mut self) {
-        let Some(project) = &self.state.project else {
+    fn apply_mcp_preferences(&mut self) {
+        let Some(mut settings) = self.preferences.take_pending() else {
             return;
         };
-        match project.assets_dir.list() {
-            Ok(tree) => self.state.asset_tree = tree,
-            Err(error) => self.state.log.error(error.to_string()),
+        if settings.enabled
+            && settings.token.is_empty()
+            && let Err(error) = settings.regenerate_token()
+        {
+            self.state
+                .log
+                .error(format!("[MCP] token generation failed: {error}"));
         }
-        self.state.previews.invalidate();
-        self.state.lite_schemas.clear();
-        project.clear_prefabs();
-        if let Some(scene) = &mut self.state.scene
+        self.user_settings.mcp = settings;
+        // Явный выбор в Preferences сохраняется, даже если сервер включён флагом `--mcp` на этот запуск.
+        self.stored_mcp_enabled = self.user_settings.mcp.enabled;
+        self.preferences.applied(&self.user_settings.mcp);
+        self.save_settings();
+    }
+
+    fn apply_asset_changes(&mut self, changes: AssetChanges) {
+        if let (Some(editor), Some(project)) = (&mut self.state.ui_document, &self.state.project) {
+            editor.refresh_external(project, &changes);
+        }
+        if changes.tree_changed || changes.rescan {
+            self.refresh_tree_only();
+        }
+        if changes.rescan {
+            self.state.previews.refresh_all();
+        } else {
+            self.state.previews.refresh_paths(&changes.paths);
+        }
+        if let Some(project) = self.state.project.as_ref() {
+            if changes.rescan || changes.tree_changed {
+                self.state
+                    .materials
+                    .refresh_all(project, &self.state.asset_tree);
+            } else {
+                self.state.materials.refresh_changed(project, &changes);
+            }
+        }
+        self.state.refresh_lite_schemas(&changes);
+
+        let prefab_reload = self.state.project.as_ref().map(|project| {
+            let cached = project.cached_prefab_paths();
+            let mut paths = changes
+                .prefab_paths()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            paths.extend(
+                cached
+                    .iter()
+                    .filter(|path| changes.rescan || changes.contains_path_or_parent(path))
+                    .cloned(),
+            );
+            let reload_scene = !paths.is_empty();
+            let (previous, errors) = project.reload_prefabs(&paths);
+            (previous, reload_scene, errors)
+        });
+        let (prefab_previous, reload_scene, prefab_errors) = prefab_reload.unwrap_or_default();
+        for error in prefab_errors {
+            self.state.log.error(error);
+        }
+        if reload_scene
+            && let Some(scene) = &mut self.state.scene
             && let Err(error) = scene.reload_prefabs()
         {
             self.state.log.error(error);
+            if let Some(project) = &self.state.project {
+                project.restore_prefabs(prefab_previous);
+            }
         }
-        // Модели, разбор которых начался до сброса, загружаются заново.
-        self.state.model_loader.restart(project.assets.clone());
-        if let Some(gpu) = &mut self.gpu
-            && let Err(error) = gpu
-                .scene
-                .clear_cache(&mut gpu.renderer, &mut self.state.models)
+
+        let camera_settings_changed = changes.rescan
+            || changes.camera_settings_paths().next().is_some()
+            || changes.post_process_paths().next().is_some()
+            || self.state.scene.as_ref().is_some_and(|scene| {
+                scene.view().assets.iter().any(|asset| {
+                    let lower = asset.path.as_str().to_ascii_lowercase();
+                    (lower.ends_with(".camerasettings") || lower.ends_with(".postprocess"))
+                        && changes.contains_path_or_parent(&asset.path)
+                })
+            });
+        if camera_settings_changed {
+            self.state.camera_settings_changed();
+        }
+
+        if let Some(project) = &self.state.project
+            && let Some(gpu) = &mut self.gpu
+            && let Err(error) = gpu.scene.reload_changed(
+                &mut gpu.renderer,
+                project,
+                &changes,
+                &mut self.state.model_loader,
+                &mut self.state.log,
+                &mut self.state.screen_shader_errors,
+            )
         {
             self.fail(&error);
         }
@@ -335,6 +922,35 @@ impl EditorApp {
     fn remove_autosave(&mut self, scene: Option<&VirtualPath>) {
         if let Some(store) = self.autosave_store()
             && let Err(error) = store.remove(scene)
+        {
+            self.state.log.push(LogLevel::Warn, error);
+        }
+    }
+
+    /// Копия изменённой сцены, которую `discard_changes` велит отбросить. Берётся до смены сцены или проекта,
+    /// потому что после смены проекта каталог копий уже другой; удаляется только после успешной смены.
+    fn discarded_scene_autosave(
+        &self,
+        discard: bool,
+    ) -> Option<(AutosaveStore, Option<VirtualPath>)> {
+        if !discard || !self.state.scene.as_ref().is_some_and(EditorScene::is_dirty) {
+            return None;
+        }
+        let store = self.autosave_store()?;
+        let scene = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.path().cloned());
+        Some((store, scene))
+    }
+
+    fn remove_discarded_autosave(
+        &mut self,
+        discarded: Option<(AutosaveStore, Option<VirtualPath>)>,
+    ) {
+        if let Some((store, scene)) = discarded
+            && let Err(error) = store.remove(scene.as_ref())
         {
             self.state.log.push(LogLevel::Warn, error);
         }
@@ -411,8 +1027,14 @@ impl EditorApp {
     }
 
     fn open_scene(&mut self, path: &str) {
+        if let Err(error) = self.open_scene_with_recovery(path, true) {
+            self.state.log.error(error);
+        }
+    }
+
+    fn open_scene_with_recovery(&mut self, path: &str, offer_recovery: bool) -> Result<(), String> {
         let Some(project) = &self.state.project else {
-            return;
+            return Err("project is not open".to_owned());
         };
         let result = VirtualPath::parse(path)
             .map_err(|_| format!("{path}: некорректный путь сцены"))
@@ -423,13 +1045,17 @@ impl EditorApp {
         match result {
             Ok(scene) => {
                 self.set_scene(scene);
-                self.offer_recovery();
+                if offer_recovery {
+                    self.offer_recovery();
+                }
+                Ok(())
             }
-            Err(error) => self.state.log.error(error),
+            Err(error) => Err(error),
         }
     }
 
     fn set_scene(&mut self, scene: EditorScene) {
+        self.state.advance_mcp_generation();
         self.state.scene = Some(scene);
         self.state.scene_replaced();
         self.state.recovery_prompt = None;
@@ -439,8 +1065,7 @@ impl EditorApp {
 
     /// Спрашивает о несохранённых изменениях перед действием, отбрасывающим сцену.
     fn run_guarded(&mut self, action: Action) {
-        let dirty = self.state.scene.as_ref().is_some_and(EditorScene::is_dirty);
-        if dirty {
+        if self.state.has_unsaved_changes() {
             self.state.unsaved_prompt = Some(UnsavedPrompt { then: action });
         } else {
             self.run_confirmed(action);
@@ -459,22 +1084,42 @@ impl EditorApp {
                 }
             }
             Action::OpenProject => {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.open_project(&dir);
+                if let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    && let Err(error) = self.open_project(&dir, true)
+                {
+                    self.state.log.error(error);
                 }
             }
-            Action::OpenProjectAt(dir) => self.open_project(&dir),
+            Action::OpenProjectAt(dir) => {
+                if let Err(error) = self.open_project(&dir, true) {
+                    self.state.log.error(error);
+                }
+            }
+            Action::SaveAsAt(path) => {
+                if let Err(error) = self.run_explicit_path_action(Action::SaveAsAt(path)) {
+                    self.state.log.error(error);
+                }
+            }
+            action @ Action::BuildPlayerAt { .. } => {
+                if let Err(error) = self.run_explicit_path_action(action) {
+                    self.state.log.error(error);
+                }
+            }
             Action::NewProject | Action::CreateProject { .. } => {}
             Action::Exit => self.exit = true,
-            Action::BuildPlayer => self.start_build(),
-            Action::CreatePrefab(id) => self.create_prefab(&id),
+            Action::BuildPlayer { with_server } => self.start_build(with_server),
+            Action::CreatePrefab(id) => {
+                if let Err(error) = self.create_prefab(&id) {
+                    self.state.log.error(error);
+                }
+            }
             _ => {}
         }
     }
 
     /// Запускает `rve-build` в выбранный каталог `<папка>/<id проекта>`; сцена уже
     /// сохранена, потому что сборщик читает её с диска.
-    fn start_build(&mut self) {
+    fn start_build(&mut self, with_server: bool) {
         if self.state.build.is_some() {
             self.state.log.error("Сборка уже идёт");
             return;
@@ -482,57 +1127,59 @@ impl EditorApp {
         let Some(project) = &self.state.project else {
             return;
         };
-        let (project_dir, id) = (project.root.clone(), project.settings.id.clone());
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_owned));
-        let tool = match crate::build::locate_build_tool(
-            exe_dir.as_deref(),
-            &crate::build::checkout_workspace(),
-            std::env::var_os("CARGO"),
-        ) {
-            Ok(tool) => tool,
-            Err(error) => {
-                self.state.log.error(error);
-                return;
-            }
-        };
+        let id = project.settings.id.clone();
         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let output = match std::path::absolute(folder.join(id)) {
-            Ok(output) => output,
-            Err(error) => {
-                self.state
-                    .log
-                    .error(format!("{}: {error}", folder.display()));
-                return;
-            }
-        };
+        let output = folder.join(id);
+        if let Err(error) = self.start_build_at(&output, with_server) {
+            self.state.log.error(error);
+        }
+    }
+
+    fn start_build_at(&mut self, output: &Path, with_server: bool) -> Result<(), String> {
+        if self.state.build.is_some() {
+            return Err("a build is already running".to_owned());
+        }
+        let project_dir = self
+            .state
+            .project
+            .as_ref()
+            .map(|project| project.root.clone())
+            .ok_or_else(|| "project is not open".to_owned())?;
+        let output = std::path::absolute(output)
+            .map_err(|error| format!("{}: {error}", output.display()))?;
         if output.exists() {
-            self.state.log.error(format!(
-                "{}: каталог уже существует, выберите другую папку",
+            return Err(format!(
+                "{}: output directory already exists",
                 output.display()
             ));
-            return;
         }
-        let command = tool.command(&project_dir, &output);
-        match crate::build::BuildJob::spawn(command, output.clone()) {
-            Ok(job) => {
-                self.state
-                    .log
-                    .info(format!("Build Player: {}", output.display()));
-                self.state.build = Some(job);
-            }
-            Err(error) => self.state.log.error(format!("rve-build: {error}")),
-        }
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_owned));
+        let tool = crate::build::locate_build_tool(
+            exe_dir.as_deref(),
+            &crate::build::checkout_workspace(),
+            std::env::var_os("CARGO"),
+        )?;
+        let command = tool.command(&project_dir, &output, with_server);
+        let job = crate::build::BuildJob::spawn(command, output.clone())
+            .map_err(|error| format!("rve-build: {error}"))?;
+        self.state.build_output_tail.clear();
+        self.state.build_succeeded = None;
+        self.state
+            .log
+            .info(format!("Build Player: {}", output.display()));
+        self.state.build = Some(job);
+        Ok(())
     }
 
     /// Сохраняет поддерево объекта в `Assets/prefabs/<id>.rveprefab` и заменяет его
     /// экземпляром. Запись файла не входит в undo: undo вернёт поддерево, файл останется.
-    fn create_prefab(&mut self, id: &str) {
+    fn create_prefab(&mut self, id: &str) -> Result<String, String> {
         let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
-            return;
+            return Err("project and scene must be open".to_owned());
         };
         let result = VirtualPath::parse(&format!("prefabs/{id}.rveprefab"))
             .map_err(|_| format!("{id}: некорректное имя префаба"))
@@ -561,16 +1208,17 @@ impl EditorApp {
                     .log
                     .info(format!("Создан префаб /{}", path.as_str()));
                 self.refresh_tree_only();
+                Ok(path.as_str().to_owned())
             }
-            Err(error) => self.state.log.error(error),
+            Err(error) => Err(error),
         }
     }
 
     /// Переносит overrides объекта экземпляра в файл префаба и убирает их из сцены.
     /// Запись файла атомарна и не входит в undo сцены.
-    fn apply_to_prefab(&mut self, id: &str) {
+    fn apply_to_prefab(&mut self, id: &str) -> Result<String, String> {
         let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
-            return;
+            return Err("project and scene must be open".to_owned());
         };
         let result = scene.prefab_with_override(id).and_then(|(path, prefab)| {
             let file = project
@@ -584,11 +1232,14 @@ impl EditorApp {
             Ok(path)
         });
         match result {
-            Ok(path) => self
-                .state
-                .log
-                .info(format!("Overrides перенесены в /{}", path.as_str())),
-            Err(error) => self.state.log.error(error),
+            Ok(path) => {
+                self.state
+                    .log
+                    .info(format!("Overrides перенесены в /{}", path.as_str()));
+                self.refresh_tree_only();
+                Ok(path.as_str().to_owned())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -598,11 +1249,18 @@ impl EditorApp {
             return false;
         };
         let lines = job.poll();
-        if job.is_finished() {
+        let finished = job.is_finished();
+        let succeeded = job.completion().map(|completion| completion.success);
+        if finished {
+            self.state.build_succeeded = succeeded;
             self.state.build = None;
         }
         let any = !lines.is_empty();
         for (level, line) in lines {
+            self.state.build_output_tail.push(line.clone());
+            if self.state.build_output_tail.len() > 100 {
+                self.state.build_output_tail.remove(0);
+            }
             self.state.log.push(level, line);
         }
         any
@@ -617,6 +1275,10 @@ impl EditorApp {
         let completion = job.completion().cloned();
         let any = !lines.is_empty();
         for (level, line) in lines {
+            self.state.build_output_tail.push(line.clone());
+            if self.state.build_output_tail.len() > 100 {
+                self.state.build_output_tail.remove(0);
+            }
             self.state.log.push(level, line);
         }
         if !finished {
@@ -648,6 +1310,7 @@ impl EditorApp {
                 false
             }
         };
+        self.state.build_succeeded = Some(succeeded);
         if self.state.finish_pending_play(succeeded) {
             self.start_play_now();
         }
@@ -734,6 +1397,14 @@ impl EditorApp {
     }
 
     fn save(&mut self, choose_path: bool) -> bool {
+        if let Err(error) = self.state.save_project_prefabs() {
+            self.state.log.error(error);
+            return false;
+        }
+        if self.state.scene.is_none() {
+            self.state.log.info("Сохранено");
+            return true;
+        }
         let existing = self
             .state
             .scene
@@ -769,29 +1440,8 @@ impl EditorApp {
                 path
             }
         };
-        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
-            return false;
-        };
-        let result = project
-            .assets_dir
-            .resolve(target.as_str())
-            .map_err(|error| error.to_string())
-            .and_then(|file| scene.save(&file, target.clone()));
-        match result {
-            Ok(()) => {
-                self.state
-                    .log
-                    .info(format!("Сохранено {}", target.as_str()));
-                // Сохранённый префаб видят следующие раскрытия.
-                if let Some(project) = &self.state.project {
-                    project.clear_prefabs();
-                }
-                self.refresh_tree_only();
-                // Копии прежнего и нового пути устарели: на диске теперь актуальная сцена.
-                self.remove_autosave(existing.as_ref());
-                self.remove_autosave(Some(&target));
-                true
-            }
+        match self.save_target(target) {
+            Ok(()) => true,
             Err(error) => {
                 self.state.log.error(error);
                 false
@@ -799,11 +1449,38 @@ impl EditorApp {
         }
     }
 
+    fn save_target(&mut self, target: VirtualPath) -> Result<(), String> {
+        let existing = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.path().cloned());
+        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
+            return Err("project and scene must be open".to_owned());
+        };
+        let file = project
+            .assets_dir
+            .resolve(target.as_str())
+            .map_err(|error| error.to_string())?;
+        scene.save(&file, target.clone())?;
+        self.state
+            .log
+            .info(format!("Сохранено {}", target.as_str()));
+        if let Some(project) = &self.state.project {
+            project.clear_prefabs();
+        }
+        self.refresh_tree_only();
+        self.remove_autosave(existing.as_ref());
+        self.remove_autosave(Some(&target));
+        Ok(())
+    }
+
     fn refresh_tree_only(&mut self) {
-        if let Some(project) = &self.state.project
-            && let Ok(tree) = project.assets_dir.list()
-        {
-            self.state.asset_tree = tree;
+        if let Some(project) = &self.state.project {
+            match project.assets_dir.list() {
+                Ok(tree) => self.state.asset_tree = tree,
+                Err(error) => self.state.log.error(error.to_string()),
+            }
         }
     }
 
@@ -827,50 +1504,133 @@ impl EditorApp {
     }
 
     fn start_play_now(&mut self) {
-        let Some(scene) = &self.state.scene else {
+        let Some(project) = &self.state.project else {
             return;
         };
-        if scene.document().is_prefab() {
-            self.state
-                .log
-                .error("Play недоступен для префаба: откройте сцену");
-            return;
-        }
-        let needs_library = scene
-            .view()
-            .objects
-            .iter()
-            .any(|object| !object.heavy_scripts.is_empty());
-        if needs_library && self.state.library.is_none() {
-            if self.state.scripts_path.is_none() {
+        let play_scene = match load_project_starting_scene(project) {
+            Ok(scene) => scene,
+            Err(error) => {
                 self.state
                     .log
-                    .error("В сцене есть Rust-скрипты, но библиотека не загружена");
+                    .error(format!("Не удалось загрузить стартовую сцену: {error}"));
+                return;
+            }
+        };
+        let heavy = match PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME)) {
+            Ok(heavy) => heavy,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let (prefabs, warnings) = PlayPrefabs::load(
+            play_scene.view(),
+            &mut |path| project.read_text(path),
+            play_scene.instanced_prefabs(),
+            &heavy,
+        );
+        let mut prefabs = prefabs
+            .with_resources(project.resource_handle())
+            .with_enabled_scenes(enabled_scene_paths(project));
+        let needs_library = prefabs.has_heavy_scripts()
+            || play_scene
+                .view()
+                .objects
+                .iter()
+                .any(|object| !object.heavy_scripts.is_empty());
+        for warning in warnings {
+            self.state.log.push(LogLevel::Warn, warning);
+        }
+        if needs_library && self.state.library.is_none() {
+            if self.state.scripts_path.is_none() {
+                self.state.log.error(
+                    "В сцене или тяжёлых префабах есть Rust-скрипты, но библиотека не загружена",
+                );
                 return;
             }
             if !self.load_manual_library() {
                 return;
             }
         }
-        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+        let Some(project) = &self.state.project else {
             return;
         };
-        let result = (|| {
+        let protocol = engine_network::protocol_id(&project.settings.id, &project.settings.version);
+        let network = match self.state.play_network.plan(
+            &project.settings.network,
+            protocol,
+            engine_network::replication::scene_hash(play_scene.view()),
+        ) {
+            Ok(network) => network,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let network_summary = network.as_ref().map(|plan| plan.summary.clone());
+        let tuning = gamepad_tuning(&project.settings.input.gamepad);
+        editor_gamepads(&mut self.state.gamepads, tuning).begin_session(tuning);
+        let mut ui_images = None;
+        let player_save_path = player_save_path(&project.root);
+        let mut save_warning = None;
+        let result: Result<PlaySession, String> = (|| {
             let mut world =
-                World::from_document(scene.view()).map_err(|error| error.to_string())?;
+                World::from_document(play_scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
-            PlaySession::start_with_world(
-                scene.view(),
+            project.apply_physics_materials(&mut world)?;
+            prefabs.prepare_ui(&world, &project.assets)?;
+            ui_images = Some(prefabs.ui_images().clone());
+            let model_geometry =
+                PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
+            let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
+            let mut session = PlaySession::start_with_world_and_physics(
+                play_scene.view(),
                 world,
                 self.state.library.as_ref(),
+                &project.settings.input,
                 |path| project.read_text(path),
-            )
+                prefabs,
+                model_geometry,
+                &project.settings.physics,
+                engine_audio::AudioConfig {
+                    resources: Some(project.resource_handle()),
+                    output: true,
+                    mono_output: project.settings.audio.mono_output,
+                },
+                animation,
+            )?;
+            if let Err(error) = session.load_save_file(&player_save_path) {
+                save_warning = Some(error);
+            }
+            if let Some(plan) = network {
+                session.attach_network(plan)?;
+            }
+            Ok(session)
         })();
+        if let Some(error) = save_warning {
+            self.state
+                .log
+                .warn(format!("Play save data is unavailable: {error}"));
+        }
         match result {
             Ok(session) => {
-                self.state.play = Some(session);
-                self.state.gizmo_drag = None;
+                if let (Some(gpu), Some(images)) = (&mut self.gpu, ui_images.as_ref())
+                    && let Err(error) =
+                        gpu.game_ui
+                            .attach(&mut gpu.renderer, "play:base".to_owned(), images)
+                {
+                    self.state
+                        .log
+                        .error(format!("не удалось загрузить игровой UI: {error}"));
+                    return;
+                }
+                self.state.enter_play(session);
+                self.state.play_cursor.reset();
+                play_cursor::focus_game_tab(&mut self.dock);
                 self.state.log.info("Play");
+                if let Some(summary) = network_summary {
+                    self.state.log.info(summary);
+                }
             }
             Err(error) => self.state.log.error(error),
         }
@@ -898,11 +1658,32 @@ impl EditorApp {
     }
 
     fn stop_play(&mut self) {
-        self.state.pending_play = false;
-        if let Some(session) = self.state.play.take() {
+        Self::stop_play_session(&mut self.state, self.gpu.as_mut());
+    }
+
+    fn stop_play_if_requested(state: &mut EditorState, gpu: Option<&mut GpuState>) -> bool {
+        let requested = state
+            .play
+            .as_mut()
+            .is_some_and(PlaySession::take_quit_request);
+        if !requested {
+            return false;
+        }
+        state.log.info("Play stopped by script request");
+        Self::stop_play_session(state, gpu);
+        true
+    }
+
+    fn stop_play_session(state: &mut EditorState, gpu: Option<&mut GpuState>) {
+        state.pending_play = false;
+        if let Some(session) = state.play.take() {
+            if let Some(gpu) = gpu {
+                gpu.game_ui.release_all(&mut gpu.renderer);
+            }
+            state.end_play_gamepads();
             let events = session.stop();
-            self.state.log.push_script_events(events);
-            self.state.log.info("Stop");
+            state.log.push_script_events(events);
+            state.log.info("Stop");
         }
     }
 
@@ -916,7 +1697,7 @@ impl EditorApp {
                 Err(error) => self.state.log.error(format!("{}: {error}", file.display())),
             }
         }
-        self.refresh_assets();
+        self.refresh_tree_only();
     }
 
     fn run_actions(&mut self) {
@@ -930,6 +1711,14 @@ impl EditorApp {
                 Action::SaveAs => {
                     if !self.state.is_playing() {
                         self.save(true);
+                    }
+                }
+                Action::SaveAsAt(path) => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else if let Err(error) = self.run_explicit_path_action(Action::SaveAsAt(path))
+                    {
+                        self.state.log.error(error);
                     }
                 }
                 Action::Play => self.start_play(),
@@ -957,12 +1746,12 @@ impl EditorApp {
                     }
                 }
                 Action::ImportFiles(files) => self.import(&files),
-                Action::RefreshAssets => self.refresh_assets(),
-                Action::BuildPlayer => {
+                Action::RefreshTree => self.refresh_tree_only(),
+                action @ (Action::BuildPlayer { .. } | Action::BuildPlayerAt { .. }) => {
                     if self.state.is_playing() {
                         self.state.log.error("Сначала остановите Play-режим");
                     } else {
-                        self.run_guarded(Action::BuildPlayer);
+                        self.run_guarded(action);
                     }
                 }
                 Action::Discard(then) => {
@@ -983,14 +1772,17 @@ impl EditorApp {
                 }
                 Action::SaveThen(then) => {
                     if self.save(false) {
-                        self.run_confirmed(*then);
+                        match self.state.save_project_prefabs() {
+                            Ok(()) => self.run_confirmed(*then),
+                            Err(error) => self.state.log.error(error),
+                        }
                     }
                 }
                 Action::ApplyToPrefab(id) => {
                     if self.state.is_playing() {
                         self.state.log.error("Сначала остановите Play-режим");
-                    } else {
-                        self.apply_to_prefab(&id);
+                    } else if let Err(error) = self.apply_to_prefab(&id) {
+                        self.state.log.error(error);
                     }
                 }
                 Action::CreatePrefab(id) => {
@@ -1045,6 +1837,9 @@ impl EditorApp {
         };
         self.state
             .previews
+            .upload(&mut gpu.renderer, &mut self.bridge, &mut self.state.log)?;
+        self.state
+            .icons
             .upload(&mut gpu.renderer, &mut self.bridge)?;
         if self.state.viewport_texture.is_none() {
             self.state.viewport_texture = Some(self.bridge.register_viewport(gpu.scene.viewport));
@@ -1053,11 +1848,33 @@ impl EditorApp {
             self.state.game_viewport_texture =
                 Some(self.bridge.register_viewport(gpu.scene.game_viewport));
         }
+        // Вкладка может быть в доке, но скрытой: viewport нужен только когда панель видна.
+        if self.state.project.is_some() && self.state.material_preview.visible {
+            let viewport = gpu
+                .scene
+                .ensure_material_preview_viewport(&mut gpu.renderer)?;
+            if self.state.material_preview_texture.is_none() {
+                self.state.material_preview_texture = Some(self.bridge.register_viewport(viewport));
+            }
+        }
 
+        self.latency_frame = self.latency_frame.saturating_add(1);
+        let frame_id = self.latency_frame;
+        if let Some(latency) = self.latency.as_ref() {
+            // Свёрнутое или нулевое окно не делает present, и сон дождался бы таймаута каждый кадр.
+            let size = window.inner_size();
+            let presentable =
+                size.width != 0 && size.height != 0 && window.is_minimized() != Some(true);
+            if self.continuous_redraw && presentable {
+                latency.sleep();
+            }
+            latency.marker(frame_id, LatencyMarker::SimulationStart);
+        }
         let mut raw_input = egui_state.take_egui_input(window);
         if cfg!(target_os = "macos") {
             crate::gestures::remap_control_click(&mut raw_input.events, &mut self.control_click);
         }
+        let egui_events = raw_input.events.clone();
         let console_lines = if self.state.console_open {
             snapshot_console_lines(&self.state)
         } else {
@@ -1070,11 +1887,17 @@ impl EditorApp {
             .map_or_else(CommandCatalog::default, |play| play.command_catalog());
         let state = &mut self.state;
         let dock = &mut self.dock;
+        let preferences = &mut self.preferences;
+        let mcp_settings = &self.user_settings.mcp;
+        let mcp_status = self.mcp_host.status().clone();
         let console_overlay = &mut self.console_overlay;
         let console_open = state.console_open;
+        let window_focused = self.window_focused;
         let mut console_output = Default::default();
+        let mut cursor_request = None;
         let mut output = self.egui_ctx.run_ui(raw_input, |ui| {
-            ui::show(ui, state, dock);
+            ui::show_with_mcp(ui, state, dock, preferences, mcp_settings, &mcp_status);
+            cursor_request = play_cursor::sync(ui.ctx(), state, dock, window_focused);
             if console_open && let Some(rect) = state.game_view.rect {
                 console_output =
                     console_overlay.show(ui.ctx(), rect, &console_lines, &command_catalog);
@@ -1087,6 +1910,9 @@ impl EditorApp {
         if let Some(command) = console_output.submitted {
             submit_console_command(&mut self.state, &command);
             window.request_redraw();
+        }
+        if let (Some(request), Some(proxy)) = (cursor_request, &self.proxy) {
+            proxy.set_cursor(request);
         }
         egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
         let repaint_delay = output
@@ -1104,16 +1930,125 @@ impl EditorApp {
         let ui_primitives: Vec<UiPrimitive<'_>> =
             meshes.iter().map(ConvertedMesh::primitive).collect();
 
-        if let Some(play) = &mut self.state.play {
-            play.tick();
+        if let Some(latency) = self.latency.as_ref() {
+            latency.marker(frame_id, LatencyMarker::InputSample);
+        }
+        let game_focused = self
+            .dock
+            .find_active_focused()
+            .is_some_and(|(_, tab)| *tab == Tab::Game);
+        let egui_text_focused = self.egui_ctx.egui_wants_keyboard_input();
+        let ui_accepting = self.window_focused
+            && game_focused
+            && !self.state.console_open
+            && self
+                .state
+                .play
+                .as_ref()
+                .is_some_and(|play| !play.is_paused());
+        let text_accepting = ui_accepting && !egui_text_focused;
+        let pointer = self
+            .egui_ctx
+            .input(|input| input.pointer.hover_pos())
+            .and_then(|pos| {
+                game_view_pointer(&self.state.game_view, pos, self.egui_ctx.pixels_per_point())
+            });
+        let text = crate::input::ui_text_events(&egui_events, text_accepting);
+        let ui_tick = UiTick {
+            accepting: ui_accepting,
+            pointer,
+            screen_px: self.state.game_view.size,
+            text,
+        };
+        let pads_accepted = ui_accepting;
+        apply_play_scene_request(&mut self.state);
+        apply_play_platform_requests(&mut self.state, run_play_file_dialog);
+        let play_error = self.state.play.as_mut().and_then(|play| {
+            if let Some(gamepads) = self.state.gamepads.as_mut() {
+                play.poll_gamepads(gamepads, pads_accepted);
+            }
+            play.update_ui_input(ui_tick);
+            play.tick().err()
+        });
+        if play_error.is_none() {
+            Self::stop_play_if_requested(&mut self.state, Some(gpu));
+        }
+        let game_ime = self
+            .state
+            .play
+            .as_ref()
+            .is_some_and(|play| ui_accepting && play.ui_text_focused());
+        window.set_ime_allowed(egui_state.allow_ime() || game_ime);
+        if play_error.is_none()
+            && let Some(play) = self.state.play.as_ref()
+            && !play.is_paused()
+        {
+            self.state.profile.record_play(play.last_step());
+        }
+        if let Some(error) = play_error {
+            self.state.log.error(error);
+            if let Some(session) = self.state.play.take() {
+                gpu.game_ui.release_all(&mut gpu.renderer);
+                self.state.end_play_gamepads();
+                self.state.log.push_script_events(session.stop());
+                self.state.log.info("Stop");
+            }
+        } else if let Some(play) = &mut self.state.play {
             let events = play.drain_events();
             self.state.log.push_script_events(events);
+            for warning in play
+                .drain_audio_warnings()
+                .into_iter()
+                .chain(play.drain_animation_warnings())
+                .chain(play.drain_physics_warnings())
+            {
+                self.state.log.push(LogLevel::Warn, warning);
+            }
+        }
+        if let Some(play) = &mut self.state.play {
+            for owner in play.drain_ui_detach() {
+                gpu.game_ui.detach(&mut gpu.renderer, &owner);
+            }
+            for (owner, images) in play.drain_ui_images() {
+                gpu.game_ui.attach(&mut gpu.renderer, owner, &images)?;
+            }
         }
 
         // Камера могла сместиться к новой модели: гизмо и маркеры нужно перестроить.
         // Пока модель загружается, кадр запросит готовность загрузки, а не этот флаг.
         let framing = self.state.pending_frame.is_some();
-        let status = render_scene_frame(gpu, &mut self.state, &ui_primitives)?;
+        if let Some(latency) = self.latency.as_ref() {
+            latency.marker(frame_id, LatencyMarker::SimulationEnd);
+        }
+        gpu.renderer.set_latency_frame(frame_id);
+        let game_paint = self
+            .state
+            .play
+            .as_mut()
+            .map(PlaySession::ui_paint)
+            .unwrap_or_else(|| engine_gui::paint::UiPaint {
+                draw_list: Arc::default(),
+                atlas: Arc::default(),
+            });
+        gpu.game_ui.sync(&mut gpu.renderer, &game_paint)?;
+        let game_ui_primitives = gpu.game_ui.primitives(&game_paint);
+        let GpuState {
+            renderer, scene, ..
+        } = gpu;
+        let status = render_scene_frame(
+            renderer,
+            scene,
+            &mut self.state,
+            &ui_primitives,
+            &game_ui_primitives,
+        )?;
+        if !self.state.material_preview.visible {
+            if let Some(texture) = self.state.material_preview_texture.take() {
+                self.bridge.unregister(texture);
+            }
+            gpu.scene
+                .free_material_preview_viewport(&mut gpu.renderer)?;
+        }
         let framing = framing && self.state.pending_frame.is_none();
 
         self.bridge
@@ -1129,7 +2064,10 @@ impl EditorApp {
             .is_some_and(|play| !play.is_paused());
         let size = window.inner_size();
         let skipped = status == FrameStatus::Skipped && size.width != 0 && size.height != 0;
-        if playing_now || skipped || framing || repaint_delay.is_zero() {
+        // Превью проигрывается без Play: кадры нужны, пока оно идёт.
+        let previewing = !self.state.is_playing() && self.state.animation_preview.is_animating();
+        self.continuous_redraw = playing_now || previewing;
+        if playing_now || previewing || skipped || framing || repaint_delay.is_zero() {
             window.request_redraw();
             self.repaint_at = None;
         } else {
@@ -1155,7 +2093,7 @@ impl EditorApp {
     }
 }
 
-fn console_modal_open(state: &EditorState) -> bool {
+pub(crate) fn console_modal_open(state: &EditorState) -> bool {
     state.unsaved_prompt.is_some()
         || state.project_dialog.is_some()
         || state.new_project_dialog.is_some()
@@ -1247,22 +2185,99 @@ fn editor_log_buffer() -> Arc<Mutex<ConsoleBuffer>> {
     buffer
 }
 
+/// Скиннинг и превью аниматоров кадра. Во время Play мост ведёт сессия, и кадр только
+/// синхронизирует экземпляры скиннинга. В режиме редактирования мост ведёт превью выбранного
+/// объекта: оно не меняет документ и не запускает скрипты.
+fn sync_animation_frame(
+    renderer: &mut Renderer,
+    scene: &mut SceneRenderer,
+    parts: &mut crate::state::FrameParts<'_>,
+    playing: bool,
+) -> Result<(), RenderError> {
+    if playing {
+        scene.sync_skins(renderer, parts.world)?;
+        let mut warnings = Vec::new();
+        scene.report_palette_mismatches(parts.animation, &mut warnings);
+        for warning in warnings {
+            parts.log.push(LogLevel::Warn, warning);
+        }
+        return Ok(());
+    }
+    parts.animation_preview.retarget(parts.selected);
+    let object = parts
+        .selected
+        .and_then(|id| parts.world.handle(id))
+        .filter(|handle| {
+            parts
+                .world
+                .object(*handle)
+                .is_some_and(|object| object.animator.is_some())
+        });
+    let mut warnings = Vec::new();
+    let preview = object.map(|handle| (handle, &mut *parts.animation_preview));
+    scene.sync_animation(
+        renderer,
+        &parts.project.assets,
+        &*parts.models,
+        &*parts.world,
+        preview,
+        &mut warnings,
+    )?;
+    for warning in warnings {
+        parts.log.push(LogLevel::Warn, warning);
+    }
+    *parts.animation_status = match object {
+        Some(handle) => {
+            let motion = parts.animation_preview.motion.as_deref();
+            let mut status = scene.preview_status(handle, motion);
+            status.object = parts.selected.map(str::to_owned);
+            status
+        }
+        None => Default::default(),
+    };
+    Ok(())
+}
+
 /// Кадр с видимыми панелями Scene и Game. Без мира сцены рисуется только интерфейс.
 fn render_scene_frame(
-    gpu: &mut GpuState,
+    renderer: &mut Renderer,
+    scene: &mut SceneRenderer,
     state: &mut EditorState,
     ui: &[UiPrimitive<'_>],
+    game_ui: &[UiPrimitive<'_>],
 ) -> Result<FrameStatus, RenderError> {
     let drawable = |view: crate::state::SceneViewInfo| {
         (view.visible && view.size[0] > 0 && view.size[1] > 0).then_some(view.size)
     };
     let scene_size = drawable(state.scene_view);
     let game_size = drawable(state.game_view);
+    let preview_size = (state.material_preview.visible
+        && state.material_preview.size[0] > 0
+        && state.material_preview.size[1] > 0)
+        .then_some(state.material_preview.size);
     let scene_debug_view = state.scene_view.debug_view;
     let game_debug_view = state.game_view.debug_view;
-    if scene_size.is_none() && game_size.is_none() {
-        return render_ui_only(&mut gpu.renderer, ui, &[]);
+    let offscreen_capture = state
+        .mcp_capture
+        .as_ref()
+        .is_some_and(|job| job.plan.is_offscreen());
+    if !capture::needs_scene_frame(scene_size.is_some(), game_size.is_some(), offscreen_capture)
+        && preview_size.is_none()
+    {
+        return render_ui_only(renderer, ui, &[]);
     }
+    let capture_frame = state
+        .mcp_capture
+        .as_ref()
+        .and_then(|job| capture::offscreen_frame(&job.plan));
+    let preview_asset = state
+        .inspected_asset
+        .clone()
+        .or_else(|| state.material_preview_asset.clone());
+    let preview_primitive = state.material_preview_primitive;
+    let preview_yaw = state.material_preview_yaw;
+    let preview_pitch = state.material_preview_pitch;
+    let preview_zoom = state.material_preview_zoom;
     let playing = state.is_playing();
     let game_camera_id = state.game_camera.clone();
     // Сетка нужна только панели Scene вне Play-режима.
@@ -1272,18 +2287,29 @@ fn render_scene_frame(
     let pending_frame = state.pending_frame.take();
     // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
     let mut still_loading = None;
-    let (scene_frame, game_camera, game_settings, game_camera_handle, has_light, frame_target) = {
-        let Some(parts) = state.frame_parts() else {
-            return render_ui_only(&mut gpu.renderer, ui, &[]);
+    let (
+        scene_frame,
+        game_camera,
+        game_settings,
+        game_post,
+        game_screen_shaders,
+        capture_screen_shaders,
+        game_camera_handle,
+        has_light,
+        frame_target,
+    ) = {
+        let Some(mut parts) = state.frame_parts() else {
+            return render_ui_only(renderer, ui, &[]);
         };
-        gpu.scene.sync_assets(
-            &mut gpu.renderer,
+        scene.sync_assets(
+            renderer,
             parts.project,
             parts.world,
             parts.models,
             parts.loader,
             parts.log,
         )?;
+        sync_animation_frame(renderer, scene, &mut parts, playing)?;
         let (scene_frame, warnings) = parts.world.build_frame();
         for warning in warnings {
             parts.log.push(
@@ -1294,10 +2320,7 @@ fn render_scene_frame(
                 ),
             );
         }
-        let game_camera_handle = game_camera_id
-            .and_then(|id| parts.world.handle(&id))
-            .filter(|handle| parts.world.camera_of(*handle).is_some())
-            .unwrap_or_else(|| parts.world.active_camera());
+        let game_camera_handle = game_view::camera_handle(parts.world, game_camera_id.as_deref());
         let game_camera = parts
             .world
             .camera_of(game_camera_handle)
@@ -1305,6 +2328,11 @@ fn render_scene_frame(
         let game_settings = parts
             .world
             .camera_settings(game_camera_handle)
+            .copied()
+            .unwrap_or_default();
+        let game_post = parts
+            .world
+            .post_process(game_camera_handle)
             .copied()
             .unwrap_or_default();
         let has_light = parts
@@ -1326,16 +2354,43 @@ fn render_scene_frame(
                 model.bounds()?,
             ))
         });
+        // Экранные шейдеры берёт камера, которую показывает Game-вид, а не активная камера сцены.
+        let game_screen_shaders = parts
+            .world
+            .screen_shaders(game_camera_handle)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        // Кадр захвата использует шейдеры своей камеры: как Game-вид, камера объекта или ничего для Scene.
+        let capture_screen_shaders = capture_frame.as_ref().map_or_else(Vec::new, |frame| {
+            capture::screen_shaders_for(&frame.camera, &game_screen_shaders, &*parts.world)
+        });
         (
             scene_frame,
             game_camera,
             game_settings,
+            game_post,
+            game_screen_shaders,
+            capture_screen_shaders,
             game_camera_handle,
             has_light,
             frame_target,
         )
     };
     state.pending_frame = still_loading;
+    if let Some(project) = state.project.as_ref() {
+        scene.sync_screen_shaders(
+            renderer,
+            project,
+            &game_screen_shaders,
+            &mut state.screen_shader_errors,
+        );
+        scene.sync_screen_shaders(
+            renderer,
+            project,
+            &capture_screen_shaders,
+            &mut state.screen_shader_errors,
+        );
+    }
     if let Some((center, radius)) = frame_target
         && state.camera.needs_framing(center, radius)
     {
@@ -1351,84 +2406,260 @@ fn render_scene_frame(
     } else {
         CameraSettings::default()
     };
-    let Some(parts) = state.frame_parts() else {
-        return render_ui_only(&mut gpu.renderer, ui, &[]);
+    let scene_post = if playing {
+        scene_frame.post_process
+    } else {
+        engine_scene::PostProcessSettings::default()
     };
+    let particle_commands = state
+        .play
+        .as_mut()
+        .map(PlaySession::take_particle_commands)
+        .unwrap_or_default();
+    let particle_dt = state.play.as_mut().map(PlaySession::take_particle_dt);
+    let Some(parts) = state.frame_parts() else {
+        // Retain particle commands when this frame has no world to consume them.
+        if let Some(play) = state.play.as_mut() {
+            play.restore_particle_commands(particle_commands);
+            if let Some(particle_dt) = particle_dt {
+                play.restore_particle_dt(particle_dt);
+            }
+        }
+        return render_ui_only(renderer, ui, &[]);
+    };
+    let capture_camera = capture_frame
+        .as_ref()
+        .and_then(|frame| match &frame.camera {
+            capture::CameraChoice::Editor => Some(capture::CaptureCamera {
+                camera: scene_camera,
+                settings: scene_settings,
+                post: scene_post,
+                scene_like: true,
+            }),
+            capture::CameraChoice::Game => Some(capture::CaptureCamera {
+                camera: game_camera,
+                settings: game_settings,
+                post: game_post,
+                scene_like: false,
+            }),
+            capture::CameraChoice::Object(id) => capture::object_camera(&*parts.world, id),
+        });
     let (local_lights, local_light_shadows) = render_local_lights(&scene_frame.local_lights);
-    gpu.scene.begin_motion_frame(game_camera_handle, playing);
-    gpu.scene.build_draws(
-        &mut gpu.renderer,
+    scene.begin_motion_frame(game_camera_handle, playing);
+    scene.build_draws(
+        renderer,
+        parts.project,
+        parts.materials,
+        parts.log,
+        preview_asset.as_deref(),
         parts.world,
         &scene_frame,
+        &particle_commands,
+        particle_dt,
         scene_camera.position,
         game_camera.position,
         grid_camera_distance,
+        parts.animation,
+        capture_camera.as_ref().map(|camera| camera.camera.position),
     )?;
-    gpu.scene
-        .sync_environment(&mut gpu.renderer, scene_frame.environment.as_ref())?;
+    scene.sync_environment(renderer, scene_frame.environment.as_ref(), parts.log)?;
     let scene_shadow_cascades = scene_size.map_or_else(Vec::new, |[width, height]| {
         SceneRenderer::shadow_cascades(scene_camera, width, height, &scene_frame.light, has_light)
     });
     let game_shadow_cascades = game_size.map_or_else(Vec::new, |[width, height]| {
         SceneRenderer::shadow_cascades(game_camera, width, height, &scene_frame.light, has_light)
     });
+    // Viewport захвата создаётся лениво; тикет запрашивается до отрисовки, чтобы копия попала в этот кадр.
+    let capture_setup = match (&capture_frame, &capture_camera) {
+        (Some(frame), Some(_)) => {
+            let viewport = scene.ensure_capture_viewport(renderer)?;
+            let [width, height] = frame.size;
+            renderer.resize_viewport(viewport, width, height)?;
+            let requested = frame
+                .request
+                .then(|| renderer.request_viewport_capture(viewport));
+            Some((viewport, requested))
+        }
+        _ => None,
+    };
+    let capture_shadow_cascades = match (&capture_frame, &capture_camera) {
+        (Some(frame), Some(camera)) => SceneRenderer::shadow_cascades(
+            camera.camera,
+            frame.size[0],
+            frame.size[1],
+            &scene_frame.light,
+            has_light,
+        ),
+        _ => Vec::new(),
+    };
     if let Some([width, height]) = scene_size {
-        gpu.renderer
-            .resize_viewport(gpu.scene.viewport, width, height)?;
+        renderer.resize_viewport(scene.viewport, width, height)?;
     }
     if let Some([width, height]) = game_size {
-        gpu.renderer
-            .resize_viewport(gpu.scene.game_viewport, width, height)?;
+        renderer.resize_viewport(scene.game_viewport, width, height)?;
     }
+    if let Some([width, height]) = preview_size
+        && let Some(viewport) = scene.material_preview_viewport
+    {
+        renderer.resize_viewport(viewport, width, height)?;
+    }
+    // Без выбранного ресурса проход не нужен: иначе каждый кадр рисовался бы дефолтный материал.
+    let preview_draw = if preview_size.is_some() && preview_asset.is_some() {
+        Some(scene.material_preview_frame(
+            renderer,
+            parts.project,
+            parts.materials,
+            preview_asset.as_deref(),
+            preview_primitive,
+            preview_yaw,
+            preview_pitch,
+            preview_zoom,
+            parts.log,
+        )?)
+    } else {
+        None
+    };
+    let joint_palettes = scene.joint_palette_refs(parts.animation);
     let scene_view = scene_size.map(|[width, height]| {
-        gpu.scene.frame(
+        scene.frame(
             scene_camera,
             width,
             height,
             scene_settings,
+            scene_post,
+            &[],
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
             has_light,
             scene_frame.environment.as_ref(),
             &scene_shadow_cascades,
+            &joint_palettes,
             true,
             scene_debug_view,
         )
     });
-    let game_view = game_size.map(|[width, height]| {
-        gpu.scene.frame(
+    let mut game_view = game_size.map(|[width, height]| {
+        scene.frame(
             game_camera,
             width,
             height,
             game_settings,
+            game_post,
+            &game_screen_shaders,
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
             has_light,
             scene_frame.environment.as_ref(),
             &game_shadow_cascades,
+            &joint_palettes,
             false,
             game_debug_view,
         )
     });
-    let mut scenes = Vec::with_capacity(2);
+    if let Some(frame) = &mut game_view {
+        frame.ui = game_ui;
+    }
+    // Кадр захвата: отдельный список без сетки, частицы не симулируются повторно.
+    let capture_view = match (&capture_frame, &capture_camera, capture_setup) {
+        (Some(frame), Some(camera), Some((viewport, requested))) => {
+            let [width, height] = frame.size;
+            let debug_view = if camera.scene_like {
+                scene_debug_view
+            } else {
+                game_debug_view
+            };
+            let mut view = scene.frame(
+                camera.camera,
+                width,
+                height,
+                camera.settings,
+                camera.post,
+                &capture_screen_shaders,
+                &scene_frame.light,
+                &local_lights,
+                &local_light_shadows,
+                has_light,
+                scene_frame.environment.as_ref(),
+                &capture_shadow_cascades,
+                &joint_palettes,
+                camera.scene_like,
+                debug_view,
+            );
+            view.draws = scene.capture_draws();
+            view.particle_step = 0.0;
+            view.reset_history |= frame.reset_history;
+            Some((viewport, requested, view))
+        }
+        _ => None,
+    };
+    let preview_view = preview_draw.as_ref().map(|preview| Frame {
+        clear_color: [0.035, 0.04, 0.05, 1.0],
+        camera: FrameCamera {
+            view: preview.camera.view().to_cols_array_2d(),
+            projection: preview
+                .camera
+                .projection(preview_size.unwrap()[0], preview_size.unwrap()[1])
+                .to_cols_array_2d(),
+            position: preview.camera.position.to_array(),
+        },
+        environment: Some(preview.environment),
+        shadow_cascades: &[],
+        light: DirectionalLight::default(),
+        lights: &[],
+        local_light_shadows: &[],
+        draws: std::slice::from_ref(&preview.draw),
+        joint_palettes: &[],
+        overlay: &[],
+        ui: &[],
+        debug_view: DebugView::Lit,
+        view: ViewSettings::default(),
+        reset_history: true,
+        particles: &[],
+        particle_step: 0.0,
+    });
+    let mut scenes = Vec::with_capacity(4);
     if let Some(frame) = &scene_view {
-        scenes.push((gpu.scene.viewport, frame));
+        scenes.push((scene.viewport, frame));
     }
     if let Some(frame) = &game_view {
-        scenes.push((gpu.scene.game_viewport, frame));
+        scenes.push((scene.game_viewport, frame));
+    }
+    if let Some((viewport, _, view)) = &capture_view {
+        scenes.push((*viewport, view));
+    }
+    let requested = capture_view
+        .as_ref()
+        .and_then(|(_, requested, _)| *requested);
+    let capture_drawn = capture_view.is_some();
+    if let (Some(frame), Some(viewport)) = (&preview_view, scene.material_preview_viewport) {
+        scenes.push((viewport, frame));
     }
     let drawn = scenes
         .iter()
         .map(|(viewport, _)| *viewport)
         .collect::<Vec<_>>();
     let primitives = visible_primitives(ui, &drawn);
-    let result = gpu
-        .renderer
-        .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR);
+    let result = renderer.render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR);
     if result.is_ok() {
-        gpu.scene.commit_motion_history();
+        scene.commit_motion_history();
+    }
+    let presented = matches!(result, Ok(FrameStatus::Presented));
+    capture::offscreen_rendered(
+        state.mcp_capture.as_mut(),
+        requested,
+        capture_drawn && presented,
+    );
+    if let Some(profile) = renderer.take_frame_profile() {
+        state
+            .profile
+            .record_frame(&profile, scene.viewport, scene.game_viewport);
+    }
+    if let Some(project) = state.project.as_ref() {
+        state
+            .profile
+            .record_resources(std::time::Instant::now(), project.resource_stats());
     }
     result
 }
@@ -1448,6 +2679,21 @@ fn visible_primitives<'a>(
         .collect()
 }
 
+fn game_view_pointer(
+    view: &crate::state::SceneViewInfo,
+    pointer: egui::Pos2,
+    pixels_per_point: f32,
+) -> Option<[f32; 2]> {
+    let rect = view.rect?;
+    if !rect.contains(pointer) {
+        return None;
+    }
+    Some([
+        ((pointer.x - rect.min.x) * pixels_per_point).clamp(0.0, view.size[0] as f32),
+        ((pointer.y - rect.min.y) * pixels_per_point).clamp(0.0, view.size[1] as f32),
+    ])
+}
+
 /// Кадр без сцены.
 fn render_ui_only(
     renderer: &mut Renderer,
@@ -1459,6 +2705,10 @@ fn render_ui_only(
 }
 
 impl WindowHandler for EditorApp {
+    fn attach_proxy(&mut self, proxy: WindowProxy) {
+        self.proxy = Some(proxy);
+    }
+
     fn init(&mut self, window: Arc<Window>) -> bool {
         let size = window.inner_size();
         let renderer = Renderer::new(
@@ -1467,6 +2717,11 @@ impl WindowHandler for EditorApp {
             size.height,
             RendererConfig {
                 present_mode: engine_render::PresentMode::Fifo,
+                low_latency: match self.reflex {
+                    Some(BootstrapReflexMode::On) => LowLatencyMode::On,
+                    Some(BootstrapReflexMode::Boost) => LowLatencyMode::Boost,
+                    Some(BootstrapReflexMode::Off) | None => LowLatencyMode::Off,
+                },
                 pipeline_cache: self.pipeline_cache.clone(),
                 ..RendererConfig::default()
             },
@@ -1494,10 +2749,37 @@ impl WindowHandler for EditorApp {
             None,
             Some(renderer.max_texture_size() as usize),
         ));
-        self.gpu = Some(GpuState { renderer, scene });
+        self.latency = renderer.latency_handle();
+        self.gpu = Some(GpuState {
+            renderer,
+            scene,
+            game_ui: engine_ui::game::GameUi::default(),
+        });
         self.window = Some(Arc::clone(&window));
-        if let Some(project) = self.initial_project.take() {
-            self.open_project(&project);
+        self.state
+            .log
+            .info(format!("RVE Editor {}", crate::VERSION));
+        if let Some(project) = self.initial_project.take()
+            && let Err(error) = self.open_project(&project, true)
+        {
+            self.state.log.error(error);
+        }
+        if self.user_settings.mcp.enabled && self.user_settings.mcp.token.is_empty() {
+            if let Err(error) = self.user_settings.mcp.regenerate_token() {
+                self.state
+                    .log
+                    .error(format!("[MCP] token generation failed: {error}"));
+            }
+            self.preferences.applied(&self.user_settings.mcp);
+            self.save_settings();
+        }
+        if let Some(proxy) = self.proxy.clone() {
+            self.mcp_host.initialize(
+                &self.user_settings.mcp,
+                self.state.mcp_generation,
+                Arc::new(move || proxy.wake()),
+                &mut self.state.log,
+            );
         }
         window.request_redraw();
         true
@@ -1523,6 +2805,25 @@ impl WindowHandler for EditorApp {
                 window.request_redraw();
             }
             return;
+        }
+        if let WindowEvent::ModifiersChanged(modifiers) = event {
+            self.modifiers = modifiers.state();
+        }
+        // Numpad приходит в egui как обычные цифры и точка, поэтому событие не прерывается:
+        // текстовое поле получает его как раньше, а команда камеры отбрасывается в обработке горячих клавиш.
+        if let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = event
+            && let PhysicalKey::Code(code) = event.physical_key
+            && let Some(command) = numpad_command(code, self.modifiers.control_key())
+            && event.state == ElementState::Pressed
+            && (!event.repeat || command.repeats())
+            && !*is_synthetic
+        {
+            self.state.view_commands.push(command);
+            window.request_redraw();
         }
         if let WindowEvent::DroppedFile(path) = event
             && self.state.project.is_some()
@@ -1561,6 +2862,45 @@ impl WindowHandler for EditorApp {
 
     fn update(&mut self, window: &Window) -> bool {
         // Здесь, а не в кадре: при простое окно просыпается к сроку без перерисовки.
+        let now = Instant::now();
+        self.apply_mcp_preferences();
+        let previous_mcp_status = self.mcp_host.status().clone();
+        self.mcp_host.apply_settings(
+            &self.user_settings.mcp,
+            self.state.mcp_generation,
+            &mut self.state.log,
+        );
+        let mut mcp_host = std::mem::take(&mut self.mcp_host);
+        let handled_mcp_calls = mcp_host.drain(self);
+        self.mcp_host = mcp_host;
+        let capture_pending = self.state.mcp_capture.is_some();
+        if handled_mcp_calls || capture_pending || *self.mcp_host.status() != previous_mcp_status {
+            window.request_redraw();
+        }
+        let watcher_errors = self
+            .asset_watcher
+            .as_mut()
+            .map(|watcher| watcher.drain(&mut self.asset_changes, now))
+            .unwrap_or_default();
+        for error in watcher_errors {
+            self.state.log.push(LogLevel::Warn, error);
+        }
+        for error in self.state.external_editor.drain_errors() {
+            self.state.log.error(error);
+        }
+        if let Some(changes) = self.asset_changes.take_ready(now) {
+            self.apply_asset_changes(changes);
+            window.request_redraw();
+        }
+        // Вне Play очередь геймпадов дренируется без доставки в скрипты; в Play опрос идёт в кадре.
+        if self.state.play.is_none()
+            && let Some(gamepads) = self.state.gamepads.as_mut()
+        {
+            gamepads.discard_events();
+        }
+        if self.exit {
+            return false;
+        }
         self.autosave_tick();
         let previews_pending = self.state.previews.has_pending();
         let build_output = self.poll_build();
@@ -1591,12 +2931,23 @@ impl WindowHandler for EditorApp {
             .scripts_job
             .is_some()
             .then(|| Instant::now() + BUILD_POLL);
+        let idle_pads = (self.state.play.is_none() && self.state.gamepads.is_some())
+            .then(|| Instant::now() + IDLE_GAMEPAD_POLL);
+        let capture = self
+            .state
+            .mcp_capture
+            .is_some()
+            .then(|| Instant::now() + CAPTURE_POLL);
         [
             self.repaint_at,
             preview,
             build,
             scripts,
+            idle_pads,
+            capture,
+            self.mcp_host.next_wakeup(),
             self.autosave_deadline(),
+            self.asset_changes.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1614,6 +2965,10 @@ impl WindowHandler for EditorApp {
 
     fn exiting(&mut self) {
         self.stop_play();
+        capture::cancel_active(self, "editor is shutting down");
+        self.mcp_host.shutdown();
+        self.asset_watcher = None;
+        self.proxy = None;
         if let Some(job) = self.state.build.take() {
             job.kill();
         }
@@ -1621,6 +2976,18 @@ impl WindowHandler for EditorApp {
             job.kill();
         }
         self.save_settings();
+        // Экземпляры скиннинга освобождаются явно до уничтожения renderer.
+        if let Some(gpu) = &mut self.gpu
+            && let Err(error) = gpu.scene.release_skins(&mut gpu.renderer)
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!("освобождение скиннинга при закрытии: {error}"),
+            );
+        }
+        if let Some(gpu) = &mut self.gpu {
+            gpu.game_ui.release_all(&mut gpu.renderer);
+        }
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;
         self.egui_state = None;
@@ -1630,6 +2997,9 @@ impl WindowHandler for EditorApp {
     fn key(&mut self, key: Key, pressed: bool) {
         if self.state.console_open {
             return;
+        }
+        if pressed && key == Key::Escape && self.state.play_cursor.captured() {
+            self.state.play_cursor.escape();
         }
         if (!pressed || self.state.pointer_over_view())
             && let Some(play) = &mut self.state.play
@@ -1643,7 +3013,25 @@ impl WindowHandler for EditorApp {
         if self.state.console_open {
             return;
         }
-        if (!pressed || self.state.pointer_over_view())
+        let events = self
+            .egui_state
+            .as_ref()
+            .map(|state| state.egui_input().events.as_slice())
+            .unwrap_or(&[]);
+        let pointer = crate::input::latest_pointer(
+            events,
+            self.egui_ctx.input(|input| input.pointer.latest_pos()),
+        );
+        let over = |view: &crate::state::SceneViewInfo| {
+            view.visible
+                && pointer.is_some_and(|point| view.rect.is_some_and(|rect| rect.contains(point)))
+        };
+        let over_game = over(&self.state.game_view);
+        let over_view = over_game || over(&self.state.scene_view);
+        if pressed && button == MouseButton::Left && over_game {
+            self.state.play_cursor.game_clicked();
+        }
+        if (!pressed || over_view)
             && let Some(play) = &mut self.state.play
         {
             play.input_mut()
@@ -1651,10 +3039,51 @@ impl WindowHandler for EditorApp {
         }
     }
 
-    fn focused(&mut self, focused: bool) {
-        if !focused && let Some(play) = &mut self.state.play {
-            play.input_mut().release_all();
+    fn mouse_motion(&mut self, dx: f64, dy: f64) {
+        let over_view = self.state.pointer_over_view();
+        if self.state.play_cursor.motion_source(over_view) != play_cursor::MotionSource::Raw {
+            return;
         }
+        if let Some(play) = &mut self.state.play {
+            play.input_mut().add_mouse_delta(dx as f32, dy as f32);
+        }
+    }
+
+    fn focused(&mut self, focused: bool) {
+        self.window_focused = focused;
+        if !focused && let Some(play) = &mut self.state.play {
+            play.clear_input();
+        }
+        // Захват пересчитывается в кадре: без перерисовки освобождение дошло бы с задержкой.
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
+/// Шаг вращения numpad: 15°.
+const NUMPAD_ROTATE_STEP: f32 = std::f32::consts::PI / 12.0;
+
+/// Раскладка numpad камеры Scene как в Blender. Ctrl переворачивает виды 1, 3 и 7,
+/// остальным клавишам с Ctrl команды не назначены.
+fn numpad_command(code: KeyCode, ctrl: bool) -> Option<ViewCommand> {
+    let look =
+        |plain: View, with_ctrl: View| ViewCommand::Look(if ctrl { with_ctrl } else { plain });
+    let rotate = |yaw: f32, pitch: f32| ViewCommand::Rotate { yaw, pitch };
+    match code {
+        KeyCode::Numpad1 => Some(look(View::Front, View::Back)),
+        KeyCode::Numpad3 => Some(look(View::Right, View::Left)),
+        KeyCode::Numpad7 => Some(look(View::Top, View::Bottom)),
+        _ if ctrl => None,
+        KeyCode::NumpadDecimal => Some(ViewCommand::Frame),
+        KeyCode::Numpad0 => Some(ViewCommand::AlignToGame),
+        KeyCode::Numpad9 => Some(ViewCommand::Opposite),
+        // Глаз уходит в сторону клавиши: 8 — вверх, 4 — влево от зрителя.
+        KeyCode::Numpad8 => Some(rotate(0.0, NUMPAD_ROTATE_STEP)),
+        KeyCode::Numpad2 => Some(rotate(0.0, -NUMPAD_ROTATE_STEP)),
+        KeyCode::Numpad4 => Some(rotate(-NUMPAD_ROTATE_STEP, 0.0)),
+        KeyCode::Numpad6 => Some(rotate(NUMPAD_ROTATE_STEP, 0.0)),
+        _ => None,
     }
 }
 
@@ -1662,6 +3091,60 @@ impl WindowHandler for EditorApp {
 mod tests {
     use super::*;
     use egui::{Event, Key, Modifiers, RawInput, Rect, pos2, vec2};
+
+    #[test]
+    fn editor_player_save_path_is_scoped_inside_the_project() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let project = std::env::temp_dir().join(format!("rve-editor-save-{id}"));
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(
+            player_save_path(&project),
+            project.join(".rve").join("playersave").join("save.toml")
+        );
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn numpad_keys_map_to_scene_commands_and_ctrl_flips_the_front_views() {
+        assert_eq!(
+            numpad_command(KeyCode::Numpad1, false),
+            Some(ViewCommand::Look(View::Front))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad1, true),
+            Some(ViewCommand::Look(View::Back))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad3, true),
+            Some(ViewCommand::Look(View::Left))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad7, true),
+            Some(ViewCommand::Look(View::Bottom))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::NumpadDecimal, false),
+            Some(ViewCommand::Frame)
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad0, false),
+            Some(ViewCommand::AlignToGame)
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad4, false),
+            Some(ViewCommand::Rotate {
+                yaw: -NUMPAD_ROTATE_STEP,
+                pitch: 0.0
+            })
+        );
+        assert_eq!(numpad_command(KeyCode::Numpad4, true), None);
+        assert_eq!(numpad_command(KeyCode::Digit4, false), None);
+        assert!(numpad_command(KeyCode::Numpad8, false).is_some_and(ViewCommand::repeats));
+        assert!(!ViewCommand::Frame.repeats());
+    }
     use engine_scene::SceneDocument;
 
     fn console_frame(
@@ -1684,24 +3167,55 @@ mod tests {
     }
 
     #[test]
-    fn pending_play_rechecks_the_current_document_after_build() {
-        let mut app = EditorApp::new(None, None);
+    fn play_loads_project_starting_scene_without_changing_open_document() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rve-editor-play-scene-{id}"));
+        std::fs::create_dir_all(root.join("Assets/scenes")).unwrap();
+        std::fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/scenes/start.rvescene\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Assets/scenes/start.rvescene"),
+            "[[objects]]\nid = \"project-camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let project = OpenProject::open(&root).unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
         app.state.scene = Some(
             EditorScene::parse(
                 VirtualPath::parse("prefabs/test.rveprefab").unwrap(),
-                "[[objects]]\nid = \"root\"\n",
+                "[[objects]]\nid = \"edit-root\"\n",
                 crate::scene_edit::no_prefabs(),
             )
             .unwrap(),
         );
-        app.start_play_now();
-        assert!(!app.state.is_playing());
-        assert!(
-            app.state
-                .log
-                .entries()
-                .any(|entry| entry.message.contains("префаба"))
+        app.state.project = Some(project);
+
+        let loaded = load_project_starting_scene(app.state.project.as_ref().unwrap()).unwrap();
+
+        assert_eq!(loaded.view().objects[0].id, "project-camera");
+        assert_eq!(
+            app.state.scene.as_ref().unwrap().view().objects[0].id,
+            "edit-root"
         );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_a_project_forgets_screen_shader_errors_of_the_previous_one() {
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.screen_shader_errors.insert(
+            "/fx/old.glsl".to_owned(),
+            "ошибка прежнего проекта".to_owned(),
+        );
+        app.reset_project_assets();
+        assert!(app.state.screen_shader_errors.is_empty());
     }
 
     #[test]
@@ -1791,7 +3305,7 @@ end
 return S
 "#;
         state.play = Some(PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap());
-        state.play.as_mut().unwrap().tick();
+        state.play.as_mut().unwrap().tick().unwrap();
         submit_console_command(&mut state, "editor.echo hello");
         assert!(
             state
@@ -1799,5 +3313,165 @@ return S
                 .entries()
                 .any(|entry| { entry.level == LogLevel::Warn && entry.message.ends_with("hello") })
         );
+    }
+
+    #[test]
+    fn play_file_dialogs_reach_scripts_and_window_requests_are_reported() {
+        let mut state = EditorState::new(None);
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/picker.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/picker.lua"
+"#,
+        )
+        .unwrap();
+        let script = r#"
+local S = {}
+function S:on_update()
+  if not self.dialog then
+    self.dialog = rve.dialog.open_file({ title = "Pick" })
+    rve.window.set_fullscreen(true)
+  else
+    local paths = rve.dialog.poll(self.dialog)
+    if paths then rve.log("picked " .. paths[1]) end
+  end
+end
+return S
+"#;
+        state.play = Some(PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap());
+        state.play.as_mut().unwrap().tick().unwrap();
+        let mut titles = Vec::new();
+        apply_play_platform_requests(&mut state, |request| {
+            titles.push(request.title.clone());
+            vec![std::path::PathBuf::from("map.json")]
+        });
+        assert_eq!(titles, [Some("Pick".to_owned())]);
+        assert!(
+            state
+                .log
+                .entries()
+                .any(|entry| entry.level == LogLevel::Warn
+                    && entry.message.contains("полноэкранный"))
+        );
+        state.play.as_mut().unwrap().tick().unwrap();
+        let events = state.play.as_mut().unwrap().drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message == "picked map.json"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn script_quit_stops_play_and_returns_to_the_editor() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/quit.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/quit.lua"
+"#,
+        )
+        .unwrap();
+        let script = r#"
+local S = {}
+function S:on_start() end
+function S:on_update()
+  rve.app.quit()
+end
+function S:on_destroy()
+  rve.log_info("quit destroy")
+end
+return S
+"#;
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.play =
+            Some(PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap());
+        app.state.play.as_mut().unwrap().tick().unwrap();
+
+        assert!(EditorApp::stop_play_if_requested(&mut app.state, None));
+
+        assert!(app.state.play.is_none());
+        assert!(!app.exit);
+        assert!(app.state.log.entries().any(|entry| {
+            entry.level == LogLevel::Info && entry.message == "Play stopped by script request"
+        }));
+        assert!(
+            app.state
+                .log
+                .entries()
+                .any(|entry| entry.message.contains("quit destroy")),
+            "{:?}",
+            app.state
+                .log
+                .entries()
+                .map(|entry| &entry.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn particle_commands_returned_by_an_unrendered_frame_stay_ahead_of_newer_ones() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/fx.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects]]
+id = "fire"
+[objects.particle_emitter]
+[[objects.lite_scripts]]
+path = "/fx.lua"
+"#,
+        )
+        .unwrap();
+        let script = r#"
+local S = {}
+function S:on_update()
+  self.ticks = (self.ticks or 0) + 1
+  if self.ticks == 1 then
+    rve.find("fire"):particles_emit(4)
+  else
+    rve.find("fire"):particles_restart()
+  end
+end
+return S
+"#;
+        let mut session = PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap();
+        session.tick().unwrap();
+        let first = session.take_particle_commands();
+        assert!(
+            matches!(
+                first.as_slice(),
+                [engine_scene::world::ParticleCommand::Burst { count: 4, .. }]
+            ),
+            "{first:?}"
+        );
+        session.tick().unwrap();
+        session.restore_particle_commands(first.clone());
+        let delivered = session.take_particle_commands();
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        assert_eq!(delivered[0], first[0], "возвращённая команда идёт первой");
+        assert!(matches!(
+            delivered[1],
+            engine_scene::world::ParticleCommand::Restart { .. }
+        ));
     }
 }

@@ -12,6 +12,10 @@ mod temporary;
 use cli::CommandLine;
 use std::process;
 
+/// Версия сборщика из `Cargo.toml`.
+#[allow(dead_code)]
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() {
     let code = match cli::parse(std::env::args_os().skip(1)) {
         Ok(CommandLine::Help) => {
@@ -35,7 +39,13 @@ fn main() {
             project_dir,
             output,
             vulkan_sdk,
-        }) => match player::build_distribution(&project_dir, &output, vulkan_sdk.as_deref()) {
+            with_server,
+        }) => match player::build_distribution(
+            &project_dir,
+            &output,
+            vulkan_sdk.as_deref(),
+            with_server,
+        ) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("rve-build: {error}");

@@ -17,7 +17,27 @@ pub enum Scene {
     Shadows,
     Materials,
     Clustered,
+    Particles,
+    /// Сетка неподвижных кубов для замеров draw calls и отсечения.
+    Stress,
 }
+
+/// Число кубов по стороне сетки `--scene stress`.
+pub const STRESS_GRID: usize = 48;
+const STRESS_SPACING: f32 = 0.35;
+const STRESS_CUBE_SIZE: f32 = 0.18;
+/// Половина стороны пола `--scene stress`; пол шире сетки, чтобы тени ложились на него.
+pub const STRESS_FLOOR_HALF_EXTENT: f32 = 9.0;
+
+const STRESS_CAMERA: OrbitCamera = OrbitCamera {
+    target: Vec3::new(0.0, -1.0, 0.0),
+    radius: 6.0,
+    height: 2.5,
+    angular_speed: std::f32::consts::TAU / 40.0,
+    fov_narrow: std::f32::consts::FRAC_PI_4,
+    near: 0.1,
+    far: 100.0,
+};
 
 const SHADOWS_CAMERA: OrbitCamera = OrbitCamera {
     target: Vec3::ZERO,
@@ -56,6 +76,8 @@ impl Scene {
             "shadows" => Some(Self::Shadows),
             "materials" => Some(Self::Materials),
             "clustered" => Some(Self::Clustered),
+            "particles" => Some(Self::Particles),
+            "stress" => Some(Self::Stress),
             _ => None,
         }
     }
@@ -63,7 +85,9 @@ impl Scene {
     pub fn mesh(self) -> (Vec<Vertex>, Vec<u32>) {
         match self {
             Self::Triangle => (TRIANGLE_VERTICES.to_vec(), TRIANGLE_INDICES.to_vec()),
-            Self::Cube | Self::Shadows | Self::Clustered => cube_mesh(),
+            Self::Cube | Self::Shadows | Self::Clustered | Self::Particles | Self::Stress => {
+                cube_mesh()
+            }
             Self::Materials => uv_sphere_mesh(Vec3::ZERO, 1.0),
         }
     }
@@ -72,7 +96,9 @@ impl Scene {
     pub fn texture(self) -> Option<TextureData> {
         match self {
             Self::Triangle => None,
-            Self::Cube | Self::Shadows | Self::Clustered => Some(checker_texture()),
+            Self::Cube | Self::Shadows | Self::Clustered | Self::Particles | Self::Stress => {
+                Some(checker_texture())
+            }
             Self::Materials => None,
         }
     }
@@ -87,17 +113,18 @@ impl Scene {
         match self {
             Self::Triangle => triangle_view_projection(width, height),
             Self::Cube => cube_view_projection(width, height),
-            Self::Shadows | Self::Materials | Self::Clustered => self
-                .camera_at(elapsed, settings)
-                .expect("lit sandbox scenes have a camera")
-                .view_projection(width, height),
+            Self::Shadows | Self::Materials | Self::Clustered | Self::Particles | Self::Stress => {
+                self.camera_at(elapsed, settings)
+                    .expect("lit sandbox scenes have a camera")
+                    .view_projection(width, height)
+            }
         }
     }
 
     pub fn camera_at(self, elapsed: f32, settings: CameraSettings) -> Option<Camera> {
         match self {
             Self::Triangle | Self::Cube => None,
-            Self::Shadows => Some(
+            Self::Shadows | Self::Particles => Some(
                 OrbitCamera {
                     fov_narrow: settings.projection.fov_deg.to_radians(),
                     near: settings.projection.near,
@@ -107,6 +134,7 @@ impl Scene {
                 .camera_at(elapsed),
             ),
             Self::Materials | Self::Clustered => Some(MATERIALS_CAMERA.camera_at(elapsed)),
+            Self::Stress => Some(STRESS_CAMERA.camera_at(elapsed)),
         }
     }
 
@@ -119,9 +147,26 @@ impl Scene {
         match self {
             Self::Triangle => Mat4::from_rotation_z(elapsed),
             Self::Cube => cube_model(elapsed),
-            Self::Shadows | Self::Clustered => Mat4::from_rotation_z(elapsed),
-            Self::Materials => Mat4::IDENTITY,
+            Self::Shadows | Self::Clustered | Self::Particles => Mat4::from_rotation_z(elapsed),
+            Self::Materials | Self::Stress => Mat4::IDENTITY,
         }
+    }
+
+    /// Мировые трансформации копий объекта сцены; кроме `Stress` объект один.
+    pub fn copies(self) -> Vec<Mat4> {
+        if self != Self::Stress {
+            return vec![Mat4::IDENTITY];
+        }
+        let offset = (STRESS_GRID - 1) as f32 * STRESS_SPACING * 0.5;
+        let y = -1.0 + STRESS_CUBE_SIZE * 0.5;
+        (0..STRESS_GRID * STRESS_GRID)
+            .map(|index| {
+                let x = (index % STRESS_GRID) as f32 * STRESS_SPACING - offset;
+                let z = (index / STRESS_GRID) as f32 * STRESS_SPACING - offset;
+                Mat4::from_translation(Vec3::new(x, y, z))
+                    * Mat4::from_scale(Vec3::splat(STRESS_CUBE_SIZE))
+            })
+            .collect()
     }
 }
 
@@ -194,21 +239,24 @@ fn uv_sphere_mesh(center: Vec3, radius: f32) -> (Vec<Vertex>, Vec<u32>) {
 
 /// Square floor beneath the material rows; UVs tile the procedural normal map.
 pub fn materials_plane_mesh() -> (Vec<Vertex>, Vec<u32>) {
-    const HALF_EXTENT: f32 = 4.0;
-    const UV_TILES: f32 = 4.0;
+    tiled_plane_mesh(4.0, 4.0)
+}
+
+/// Квадратный пол на высоте −1 с обходом CCW со стороны +Y и UV, повторёнными `uv_tiles` раз.
+pub fn tiled_plane_mesh(half_extent: f32, uv_tiles: f32) -> (Vec<Vertex>, Vec<u32>) {
     let positions = [
-        [-HALF_EXTENT, -1.0, -HALF_EXTENT],
-        [-HALF_EXTENT, -1.0, HALF_EXTENT],
-        [HALF_EXTENT, -1.0, HALF_EXTENT],
-        [HALF_EXTENT, -1.0, -HALF_EXTENT],
+        [-half_extent, -1.0, -half_extent],
+        [-half_extent, -1.0, half_extent],
+        [half_extent, -1.0, half_extent],
+        [half_extent, -1.0, -half_extent],
     ];
     let vertices = positions
         .into_iter()
         .zip([
             [0.0, 0.0],
-            [0.0, UV_TILES],
-            [UV_TILES, UV_TILES],
-            [UV_TILES, 0.0],
+            [0.0, uv_tiles],
+            [uv_tiles, uv_tiles],
+            [uv_tiles, 0.0],
         ])
         .map(|(position, uv)| Vertex {
             position,
@@ -448,6 +496,7 @@ mod tests {
         assert_eq!(Scene::parse("shadows"), Some(Scene::Shadows));
         assert_eq!(Scene::parse("materials"), Some(Scene::Materials));
         assert_eq!(Scene::parse("clustered"), Some(Scene::Clustered));
+        assert_eq!(Scene::parse("particles"), Some(Scene::Particles));
         assert_eq!(Scene::parse("Cube"), None);
         assert_eq!(Scene::parse(""), None);
         assert_eq!(Scene::default(), Scene::Shadows);

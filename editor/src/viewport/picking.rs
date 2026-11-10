@@ -105,8 +105,11 @@ mod tests {
                 vertices: vec![vertex(A), vertex(B), vertex(C)],
                 indices: vec![0, 1, 2],
                 material: Default::default(),
+                skin: None,
             }],
             textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
         }
     }
 

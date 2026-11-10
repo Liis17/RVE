@@ -1,27 +1,41 @@
 use crate::activation::PendingActivation;
 #[cfg(feature = "dev-console")]
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame, ConsoleUiSlot, snapshot_lines};
+use crate::cursor::CursorControl;
+#[cfg(feature = "dev-console")]
+use crate::dev_overlays::DevOverlays;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::ModuleHost;
 use crate::pipeline::{
     ExitRequester, FrameSnapshot, RENDER_THREAD, RenderControl, RenderThreadConfig, RuntimeStatus,
     SCRIPTS_THREAD, ScriptControl, VulkanBackend, start_render,
 };
-use crate::scene::{PreparedRenderAssets, upload_scene};
+use crate::platform::PlayerPlatform;
+use crate::prefabs::{PREFAB_LOADER_THREAD, RenderResourceRequest};
+use crate::profiling::StartupProfile;
+#[cfg(feature = "dev-console")]
+use crate::profiling::profile_command_lines;
+use crate::scene::{MaterialUploadCaches, PreparedRenderAssets, SceneParticles, upload_scene};
 #[cfg(feature = "dev-console")]
 use egui::{Context, Rect, ViewportId};
 #[cfg(feature = "dev-console")]
 use egui_winit::State as EguiWinitState;
 #[cfg(feature = "dev-console")]
 use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
-use engine_project::BootstrapPresentMode;
-use engine_render::{DebugView, PresentMode, Renderer, RendererConfig, UpscalerConfig};
+use engine_project::{BootstrapPresentMode, BootstrapReflexMode};
+use engine_render::{
+    DebugView, LowLatencyMode, PresentMode, Renderer, RendererConfig, UpscalerConfig,
+};
+use engine_resources::ResourceHandle;
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
 use engine_ui::console::ConsoleOverlay;
-use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, WindowProxy, run};
+use engine_window::{
+    Key, MouseButton, TextInputEvent, Window, WindowConfig, WindowHandler, WindowProxy, run,
+};
 use flume::{Receiver, Sender};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 #[cfg(feature = "dev-console")]
@@ -30,6 +44,7 @@ use winit::event::{ElementState, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const PREFAB_LOADER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct WindowExit(WindowProxy);
 
@@ -42,6 +57,7 @@ impl ExitRequester for WindowExit {
 pub(crate) struct PlayerConfig {
     pub window: WindowConfig,
     pub present_mode: Option<BootstrapPresentMode>,
+    pub reflex: Option<BootstrapReflexMode>,
     pub pipeline_cache_path: Option<PathBuf>,
     pub fsr_library: Option<PathBuf>,
     pub dlss_library: Option<PathBuf>,
@@ -53,14 +69,23 @@ pub(crate) struct PlayerConfig {
     pub debug_view: DebugView,
     pub render_assets: PreparedRenderAssets,
     pub activation: PendingActivation,
+    pub cursor: CursorControl,
     pub script_tx: Sender<ScriptControl>,
     pub render_tx: Sender<RenderControl>,
     pub render_rx: Receiver<RenderControl>,
     pub frame_rx: Receiver<Arc<FrameSnapshot>>,
+    pub resources: Receiver<RenderResourceRequest>,
     pub script_stopped_rx: std::sync::mpsc::Receiver<()>,
+    pub prefab_loader_stopped_rx: std::sync::mpsc::Receiver<()>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
+    pub resource_stats: ResourceHandle,
+    pub startup: StartupProfile,
     pub input: Arc<Mutex<InputAccumulator>>,
+    /// Фокус InputField из scripts thread: по нему включается IME окна.
+    pub text_focus: Arc<AtomicBool>,
+    /// Горячие клавиши окна, скриншоты и системные диалоги.
+    pub platform: PlayerPlatform,
     #[cfg(feature = "dev-console")]
     pub console_buffer: Arc<Mutex<ConsoleBuffer>>,
     #[cfg(feature = "dev-console")]
@@ -73,6 +98,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     let PlayerConfig {
         window,
         present_mode,
+        reflex,
         pipeline_cache_path,
         fsr_library,
         dlss_library,
@@ -84,14 +110,21 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         debug_view,
         render_assets,
         activation,
+        cursor,
         script_tx,
         render_tx,
         render_rx,
         frame_rx,
+        resources,
         script_stopped_rx,
+        prefab_loader_stopped_rx,
         interrupt,
         status,
+        resource_stats,
+        startup,
         input,
+        text_focus,
+        platform,
         #[cfg(feature = "dev-console")]
         console_buffer,
         #[cfg(feature = "dev-console")]
@@ -107,6 +140,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         #[cfg(feature = "dev-console")]
         f8_down: false,
         present_mode,
+        reflex,
         pipeline_cache_path,
         fsr_library,
         dlss_library,
@@ -114,22 +148,31 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         dlss_application_id,
         dlss_engine_version,
         pipeline_cache,
-        render_assets,
+        render_assets: Arc::new(render_assets),
         modules,
         activation,
+        cursor,
         script_tx,
         render_tx,
         render_rx,
         frame_rx: Some(frame_rx),
+        resource_rx: Some(resources),
         script_stopped_rx,
+        prefab_loader_stopped_rx: Some(prefab_loader_stopped_rx),
         interrupt,
         status: Arc::clone(&status),
+        resource_stats,
+        startup,
         render_stopped_rx: None,
         close_deadline: None,
         window_exit: None,
         render_started: false,
         cleaned: false,
         input,
+        text_focus,
+        text_proxy: None,
+        text_ime: false,
+        platform,
         #[cfg(feature = "dev-console")]
         console_buffer,
         #[cfg(feature = "dev-console")]
@@ -139,7 +182,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         #[cfg(feature = "dev-console")]
         console_overlay: ConsoleOverlay::default(),
         #[cfg(feature = "dev-console")]
-        console_open: false,
+        overlays: DevOverlays::default(),
         #[cfg(feature = "dev-console")]
         egui_state: None,
         #[cfg(feature = "dev-console")]
@@ -169,6 +212,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
 struct PlayerWindow<'a> {
     frame_limit: Option<u64>,
     present_mode: Option<BootstrapPresentMode>,
+    reflex: Option<BootstrapReflexMode>,
     pipeline_cache_path: Option<PathBuf>,
     fsr_library: Option<PathBuf>,
     dlss_library: Option<PathBuf>,
@@ -176,22 +220,33 @@ struct PlayerWindow<'a> {
     dlss_application_id: Option<u64>,
     dlss_engine_version: Option<String>,
     pipeline_cache: Vec<u8>,
-    render_assets: PreparedRenderAssets,
+    render_assets: Arc<PreparedRenderAssets>,
     modules: &'a mut ModuleHost,
     activation: PendingActivation,
+    cursor: CursorControl,
     script_tx: Sender<ScriptControl>,
     render_tx: Sender<RenderControl>,
     render_rx: Receiver<RenderControl>,
     frame_rx: Option<Receiver<Arc<FrameSnapshot>>>,
+    resource_rx: Option<Receiver<RenderResourceRequest>>,
     script_stopped_rx: std::sync::mpsc::Receiver<()>,
+    prefab_loader_stopped_rx: Option<std::sync::mpsc::Receiver<()>>,
     interrupt: ScriptInterruptHandle,
     status: Arc<RuntimeStatus>,
+    resource_stats: ResourceHandle,
+    startup: StartupProfile,
     render_stopped_rx: Option<Receiver<()>>,
     close_deadline: Option<Instant>,
     window_exit: Option<Arc<dyn ExitRequester>>,
     render_started: bool,
     cleaned: bool,
     input: Arc<Mutex<InputAccumulator>>,
+    text_focus: Arc<AtomicBool>,
+    /// Прокси окна для включения IME; появляется в `attach_proxy`.
+    text_proxy: Option<WindowProxy>,
+    /// Последнее состояние IME, отправленное окну.
+    text_ime: bool,
+    platform: PlayerPlatform,
     debug_view: DebugView,
     #[cfg(feature = "dev-console")]
     wireframe_supported: bool,
@@ -206,7 +261,7 @@ struct PlayerWindow<'a> {
     #[cfg(feature = "dev-console")]
     console_overlay: ConsoleOverlay,
     #[cfg(feature = "dev-console")]
-    console_open: bool,
+    overlays: DevOverlays,
     #[cfg(feature = "dev-console")]
     egui_state: Option<EguiWinitState>,
     #[cfg(feature = "dev-console")]
@@ -244,12 +299,28 @@ impl PlayerWindow<'_> {
         false
     }
 
+    /// Останавливает загрузчик префабов раньше render thread: его результаты уходят в render,
+    /// поэтому сначала он завершается, а потом останавливается рендер.
+    fn stop_prefab_loader(&mut self) {
+        let Some(stopped) = self.prefab_loader_stopped_rx.take() else {
+            return;
+        };
+        self.modules.stop_named(PREFAB_LOADER_THREAD);
+        wait_for_prefab_loader_or_detach(
+            self.modules,
+            &stopped,
+            &self.status,
+            PREFAB_LOADER_STOP_TIMEOUT,
+        );
+    }
+
     fn cleanup(&mut self) {
         if self.cleaned {
             return;
         }
         self.cleaned = true;
         let _ = self.script_tx.send(ScriptControl::Shutdown);
+        self.stop_prefab_loader();
 
         if self.render_started && !self.status.render_stopped() {
             let _ = self.render_tx.send(RenderControl::Shutdown);
@@ -274,14 +345,28 @@ impl PlayerWindow<'_> {
 
     #[cfg(feature = "dev-console")]
     fn set_console_open(&mut self, open: bool, window: &Window) {
-        if self.console_open == open {
+        if self.overlays.console_open() == open {
             return;
         }
-        self.console_open = open;
         self.console_overlay.set_open(open);
+        self.overlays = self.overlays.with_console(open);
+        self.cursor.set_console_open(open);
+        self.apply_overlays(window);
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn toggle_profile(&mut self, window: &Window) {
+        self.overlays = self.overlays.toggled_profile();
+        self.apply_overlays(window);
+    }
+
+    /// Приводит egui-состояние, ввод и последний кадр оверлеев к текущему [`DevOverlays`].
+    #[cfg(feature = "dev-console")]
+    fn apply_overlays(&mut self, window: &Window) {
+        let plan = self.overlays.plan();
         self.console_repaint_at = None;
-        lock_input(&self.input).console_open(open, self.window_focused);
-        if open {
+        lock_input(&self.input).console_open(plan.blocks_game_input, self.window_focused);
+        if plan.egui_context {
             if self.egui_state.is_none() {
                 self.egui_state = Some(new_egui_state(window));
             }
@@ -300,9 +385,21 @@ impl PlayerWindow<'_> {
         }
     }
 
+    /// Включает IME окна, пока InputField в фокусе и игра принимает ввод. Вызов только при смене.
+    fn sync_text_input(&mut self) {
+        let wanted =
+            self.text_focus.load(Ordering::Acquire) && lock_input(&self.input).accepting_input();
+        if wanted != self.text_ime
+            && let Some(proxy) = &self.text_proxy
+        {
+            proxy.set_text_input(wanted);
+            self.text_ime = wanted;
+        }
+    }
+
     #[cfg(feature = "dev-console")]
     fn update_console(&mut self, window: &Window) {
-        if !self.console_open {
+        if !self.overlays.plan().egui_context {
             return;
         }
         if self.window_occluded {
@@ -360,10 +457,27 @@ impl PlayerWindow<'_> {
             .catalog
             .clone();
         let mut console_output = Default::default();
+        let profile_open = self.overlays.profile_open();
+        let profile_reports: Vec<Arc<engine_core::profile::ProfileReport>> = if profile_open {
+            self.status
+                .profile
+                .reports()
+                .into_iter()
+                .map(|(_, report)| report)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let console_open = self.overlays.console_open();
         let output = context.run_ui(raw_input, |_ui| {
-            console_output = self
-                .console_overlay
-                .show(&context, screen_rect, &lines, &catalog);
+            if console_open {
+                console_output = self
+                    .console_overlay
+                    .show(&context, screen_rect, &lines, &catalog);
+            }
+            if profile_open {
+                engine_ui::profiler::overlay(&context, &profile_reports);
+            }
         });
         if console_output.toggled {
             self.set_console_open(self.console_overlay.is_open(), window);
@@ -381,14 +495,21 @@ impl PlayerWindow<'_> {
         if let Some(delay) = repaint_delay {
             self.console_repaint_at = Instant::now().checked_add(delay);
         }
+        if self.overlays.profile_open() {
+            let refresh = Instant::now() + crate::profiling::PUBLISH_INTERVAL;
+            self.console_repaint_at = Some(
+                self.console_repaint_at
+                    .map_or(refresh, |deadline| deadline.min(refresh)),
+            );
+        }
         if let Some(state) = self.egui_state.as_mut() {
             state.handle_platform_output(window, platform_output);
         }
 
-        let open = self.console_open;
+        let visible = self.overlays.visible();
         let frame = ConsoleUiFrame {
-            visible: open,
-            primitives: if open {
+            visible,
+            primitives: if visible {
                 context.tessellate(shapes, pixels_per_point)
             } else {
                 Vec::new()
@@ -458,6 +579,15 @@ impl PlayerWindow<'_> {
             format!("> {text}"),
         );
         match command.name.as_str() {
+            "profile" => {
+                if let Err(error) = validate_builtin_args(&command, 0, "profile") {
+                    push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
+                    return;
+                }
+                for line in profile_command_lines(&self.status.profile.reports()) {
+                    push_console_line(&self.console_buffer, ConsoleLevel::Info, "profile", line);
+                }
+            }
             "help" => {
                 if let Err(error) = validate_builtin_args(&command, 1, "help [prefix]") {
                     push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
@@ -600,6 +730,28 @@ fn wait_for_scripts_or_detach(
     }
 }
 
+/// Ждёт завершения загрузчика не дольше `timeout`. Зависший при штатном закрытии загрузчик
+/// отсоединяется с предупреждением: его результаты уже не нужны, а код выхода не меняется.
+/// Код 1 дает только паника потока, которую показывает `join`.
+fn wait_for_prefab_loader_or_detach(
+    modules: &mut impl RuntimeThreads,
+    stopped: &std::sync::mpsc::Receiver<()>,
+    status: &RuntimeStatus,
+    timeout: Duration,
+) {
+    match stopped.recv_timeout(timeout) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(error) = modules.join_named(PREFAB_LOADER_THREAD) {
+                status.record_failure(error);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            log::warn!("поток загрузки префабов не остановился за {timeout:?}; отсоединяю его");
+            modules.detach(PREFAB_LOADER_THREAD);
+        }
+    }
+}
+
 fn wait_for_render_or_detach(
     modules: &mut impl RuntimeThreads,
     status: &RuntimeStatus,
@@ -618,20 +770,32 @@ fn wait_for_render_or_detach(
 impl WindowHandler for PlayerWindow<'_> {
     fn attach_proxy(&mut self, proxy: WindowProxy) {
         self.activation.attach(proxy.clone());
+        self.cursor.attach(proxy.clone());
+        self.platform.attach(&proxy);
+        self.text_proxy = Some(proxy.clone());
         self.window_exit = Some(Arc::new(WindowExit(proxy)));
     }
 
     #[cfg(feature = "dev-console")]
     fn window_event(&mut self, window: &Window, event: &WindowEvent) {
+        #[cfg(feature = "dev-console")]
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && event.physical_key == PhysicalKey::Code(KeyCode::F3)
+        {
+            if event.state == ElementState::Pressed && !event.repeat {
+                self.toggle_profile(window);
+            }
+            return;
+        }
         if let WindowEvent::KeyboardInput { event, .. } = event
             && event.physical_key == PhysicalKey::Code(KeyCode::Backquote)
         {
             if event.state == ElementState::Pressed && !event.repeat {
-                self.set_console_open(!self.console_open, window);
+                self.set_console_open(!self.overlays.console_open(), window);
             }
             return;
         }
-        if self.console_open
+        if self.overlays.console_open()
             && self
                 .egui_state
                 .as_mut()
@@ -643,7 +807,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn next_wakeup(&mut self) -> Option<Instant> {
         #[cfg(feature = "dev-console")]
-        if self.console_open
+        if self.overlays.visible()
             && let Some(console_wakeup) = self.console_repaint_at
         {
             return Some(
@@ -662,6 +826,9 @@ impl WindowHandler for PlayerWindow<'_> {
             lock_input(&self.input).console_open(false, self.window_focused);
         }
         let size = window.inner_size();
+        // UI раскладывается по размеру окна до первого события `resized`.
+        lock_input(&self.input).set_window_size(size.width, size.height);
+        let phase_started = Instant::now();
         let mut renderer = match Renderer::new(
             Arc::clone(&window),
             size.width,
@@ -673,6 +840,14 @@ impl WindowHandler for PlayerWindow<'_> {
                         BootstrapPresentMode::Fifo => PresentMode::Fifo,
                         BootstrapPresentMode::Mailbox => PresentMode::Mailbox,
                         BootstrapPresentMode::Immediate => PresentMode::Immediate,
+                    })
+                    .unwrap_or_default(),
+                low_latency: self
+                    .reflex
+                    .map(|mode| match mode {
+                        BootstrapReflexMode::Off => LowLatencyMode::Off,
+                        BootstrapReflexMode::On => LowLatencyMode::On,
+                        BootstrapReflexMode::Boost => LowLatencyMode::Boost,
                     })
                     .unwrap_or_default(),
                 pipeline_cache: self.pipeline_cache.clone(),
@@ -689,16 +864,33 @@ impl WindowHandler for PlayerWindow<'_> {
             Ok(renderer) => renderer,
             Err(error) => return self.fail_init(format!("ошибка renderer: {error}")),
         };
+        self.startup.record("renderer", phase_started.elapsed());
+        let latency = renderer.latency_handle();
         #[cfg(feature = "dev-console")]
         {
             self.wireframe_supported = renderer.capabilities().wireframe;
         }
-        let gpu_scene = match upload_scene(&mut renderer, &self.render_assets) {
+        let phase_started = Instant::now();
+        let mut material_caches = MaterialUploadCaches::default();
+        let mut gpu_scene = match upload_scene(
+            &mut renderer,
+            &self.render_assets,
+            &mut material_caches,
+            SceneParticles::Emitters,
+            0,
+        ) {
             Ok(scene) => scene,
-            Err(error) => return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}")),
+            Err(error) => {
+                return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}"));
+            }
         };
+        self.startup.record("GPU upload", phase_started.elapsed());
+        self.startup.publish(&self.status.profile);
         let Some(frame_rx) = self.frame_rx.take() else {
             return self.fail_init("канал кадров отсутствует при запуске рендера");
+        };
+        let Some(resource_rx) = self.resource_rx.take() else {
+            return self.fail_init("канал ресурсов отсутствует при запуске рендера");
         };
         let Some(window_exit) = self.window_exit.clone() else {
             return self.fail_init("WindowProxy не прикреплён перед init");
@@ -706,7 +898,16 @@ impl WindowHandler for PlayerWindow<'_> {
         let (render_stopped_tx, render_stopped_rx) = flume::bounded(1);
         self.render_stopped_rx = Some(render_stopped_rx);
         let backend =
-            VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view);
+            VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view)
+                .with_particle_emitters(std::mem::take(&mut gpu_scene.particles))
+                .with_scene_skin_instances(gpu_scene.skin_instance_ids())
+                .with_ui_images(std::mem::take(&mut gpu_scene.ui_images))
+                .with_scene_screen_shaders(gpu_scene.screen_shader_ids())
+                .with_material_uploads(Arc::clone(&self.render_assets), material_caches);
+        let backend = match self.platform.take_screenshot_queue() {
+            Some(screenshots) => backend.with_screenshots(screenshots),
+            None => backend,
+        };
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(
@@ -717,11 +918,13 @@ impl WindowHandler for PlayerWindow<'_> {
                 height: size.height,
                 frame_limit: self.frame_limit,
                 frame_rx,
+                resources: resource_rx,
                 control_tx: self.render_tx.clone(),
                 control_rx: self.render_rx.clone(),
                 script_tx: self.script_tx.clone(),
                 interrupt: self.interrupt.clone(),
                 status: Arc::clone(&self.status),
+                resource_stats: Some(self.resource_stats.clone()),
                 stopped_tx: render_stopped_tx,
                 exit: window_exit,
             },
@@ -729,7 +932,22 @@ impl WindowHandler for PlayerWindow<'_> {
             return self.fail_init(format!("не удалось запустить поток рендера: {error}"));
         }
         self.render_started = true;
-        if self.script_tx.send(ScriptControl::Go(gpu_scene)).is_err() {
+        if let Some(latency) = latency
+            && self
+                .script_tx
+                .send(ScriptControl::Latency(Arc::new(latency)))
+                .is_err()
+        {
+            self.status
+                .record_failure("поток скриптов завершился до запуска сцены");
+            let _ = self.render_tx.send(RenderControl::Shutdown);
+            return false;
+        }
+        if self
+            .script_tx
+            .send(ScriptControl::Go(Box::new(gpu_scene)))
+            .is_err()
+        {
             self.status
                 .record_failure("поток скриптов завершился до запуска сцены");
             let _ = self.render_tx.send(RenderControl::Shutdown);
@@ -742,7 +960,7 @@ impl WindowHandler for PlayerWindow<'_> {
         true
     }
 
-    fn update(&mut self, _window: &Window) -> bool {
+    fn update(&mut self, window: &Window) -> bool {
         if close_timed_out(
             Instant::now(),
             self.close_deadline,
@@ -752,16 +970,19 @@ impl WindowHandler for PlayerWindow<'_> {
                 .record_failure("поток рендера не завершился после закрытия окна");
             false
         } else {
+            self.sync_text_input();
+            self.platform.update(window, self.text_proxy.as_ref());
             #[cfg(feature = "dev-console")]
-            self.update_console(_window);
+            self.update_console(window);
             true
         }
     }
 
     fn resized(&mut self, width: u32, height: u32) {
+        lock_input(&self.input).set_window_size(width, height);
         let _ = self.render_tx.send(RenderControl::Resize(width, height));
         #[cfg(feature = "dev-console")]
-        if width > 0 && height > 0 && self.console_open && !self.window_occluded {
+        if width > 0 && height > 0 && self.overlays.visible() && !self.window_occluded {
             self.console_needs_redraw = true;
         }
     }
@@ -781,18 +1002,19 @@ impl WindowHandler for PlayerWindow<'_> {
             self.window_occluded = occluded;
             if occluded {
                 self.console_ui.discard_geometry_preserve_texture_delta();
-            } else if self.console_open {
+            } else if self.overlays.visible() {
                 self.console_needs_redraw = true;
             }
         }
     }
 
     fn key(&mut self, key: Key, pressed: bool) {
+        self.platform.key(key, pressed);
         #[cfg(feature = "dev-console")]
         if key == Key::F8 {
             if pressed && !self.f8_down {
                 self.f8_down = true;
-                if !self.console_open && self.window_focused {
+                if !self.overlays.console_open() && self.window_focused {
                     self.debug_view = next_debug_view(self.debug_view, self.wireframe_supported);
                     let _ = self
                         .render_tx
@@ -804,7 +1026,7 @@ impl WindowHandler for PlayerWindow<'_> {
             return;
         }
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).key(key, pressed);
@@ -812,7 +1034,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).mouse_button(button, pressed);
@@ -820,7 +1042,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn cursor_moved(&mut self, x: f64, y: f64) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).cursor_moved(x, y);
@@ -828,7 +1050,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn mouse_motion(&mut self, dx: f64, dy: f64) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).mouse_motion(dx, dy);
@@ -836,7 +1058,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn mouse_wheel(&mut self, dx: f32, dy: f32) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).mouse_wheel(dx, dy);
@@ -849,10 +1071,14 @@ impl WindowHandler for PlayerWindow<'_> {
             if !focused {
                 self.f8_down = false;
             }
-            lock_input(&self.input).console_open(self.console_open, self.window_focused);
+            lock_input(&self.input).console_open(self.overlays.console_open(), self.window_focused);
         }
         #[cfg(not(feature = "dev-console"))]
         lock_input(&self.input).focused(focused);
+    }
+
+    fn text_input(&mut self, event: TextInputEvent) {
+        lock_input(&self.input).text_input(event);
     }
 
     fn exiting(&mut self) {
@@ -926,8 +1152,8 @@ mod debug_view_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeThreads, cleanup_threads, close_timed_out, wait_for_render_or_detach,
-        wait_for_scripts_or_detach,
+        RuntimeThreads, cleanup_threads, close_timed_out, wait_for_prefab_loader_or_detach,
+        wait_for_render_or_detach, wait_for_scripts_or_detach,
     };
     use crate::module_host::ModuleHost;
     use crate::pipeline::RuntimeStatus;
@@ -962,6 +1188,33 @@ mod tests {
             self.0.push(format!("detach:{name}"));
             true
         }
+    }
+
+    #[test]
+    fn unresponsive_prefab_loader_is_detached_without_failing_the_run() {
+        let (_stopped_tx, stopped_rx) = mpsc::channel::<()>();
+        let status = RuntimeStatus::default();
+        let mut modules = FakeThreads(Vec::new());
+        wait_for_prefab_loader_or_detach(&mut modules, &stopped_rx, &status, Duration::ZERO);
+        assert_eq!(modules.0, ["detach:rve-prefabs"]);
+        assert_eq!(status.exit_code(), 0);
+        assert!(status.failure_message().is_none());
+    }
+
+    #[test]
+    fn stopped_prefab_loader_is_joined_without_marking_the_run_failed() {
+        let (stopped_tx, stopped_rx) = mpsc::channel::<()>();
+        stopped_tx.send(()).unwrap();
+        let status = RuntimeStatus::default();
+        let mut modules = FakeThreads(Vec::new());
+        wait_for_prefab_loader_or_detach(
+            &mut modules,
+            &stopped_rx,
+            &status,
+            Duration::from_secs(1),
+        );
+        assert_eq!(modules.0, ["join:rve-prefabs"]);
+        assert_eq!(status.exit_code(), 0);
     }
 
     #[test]

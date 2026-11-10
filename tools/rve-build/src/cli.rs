@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build --help";
+pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build --help";
 
 pub(crate) enum CommandLine {
     Help,
@@ -12,6 +12,7 @@ pub(crate) enum CommandLine {
         project_dir: PathBuf,
         output: PathBuf,
         vulkan_sdk: Option<PathBuf>,
+        with_server: bool,
     },
     Run {
         project_dir: PathBuf,
@@ -117,6 +118,7 @@ fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, 
     let project_dir = PathBuf::from(first);
     let mut output = None;
     let mut vulkan_sdk = None;
+    let mut with_server = false;
     while let Some(argument) = args.next() {
         if is_help(&argument) {
             return Ok(CommandLine::Help);
@@ -130,6 +132,12 @@ fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, 
                     Some(PathBuf::from(args.next().ok_or_else(|| {
                         "после --output требуется каталог".to_owned()
                     })?));
+            }
+            Some("--with-server") => {
+                if with_server {
+                    return Err("параметр --with-server указан повторно".to_owned());
+                }
+                with_server = true;
             }
             Some("--vulkan-sdk") => {
                 if vulkan_sdk.is_some() {
@@ -149,6 +157,7 @@ fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, 
         project_dir,
         output,
         vulkan_sdk,
+        with_server,
     })
 }
 
@@ -221,10 +230,11 @@ mod tests {
                 "build", "my project", "--output", "out dir", "--vulkan-sdk", "sdk"
             ]))
             .unwrap(),
-            CommandLine::Build { project_dir, output, vulkan_sdk }
+            CommandLine::Build { project_dir, output, vulkan_sdk, with_server }
                 if project_dir == Path::new("my project")
                     && output == Path::new("out dir")
                     && vulkan_sdk == Some(PathBuf::from("sdk"))
+                    && !with_server
         ));
         assert!(matches!(
             parse(args(&["run", "my project", "--", "--frames", "120"]))
@@ -236,6 +246,28 @@ mod tests {
             parse(args(&["sdk", "--output", "sdk dir", "--no-rust-toolchain"])).unwrap(),
             CommandLine::Sdk { output, .. } if output == Path::new("sdk dir")
         ));
+    }
+
+    #[test]
+    fn build_includes_the_server_only_with_its_flag() {
+        assert!(matches!(
+            parse(args(&["build", "game", "--with-server", "--output", "out"])).unwrap(),
+            CommandLine::Build {
+                with_server: true,
+                ..
+            }
+        ));
+        let error = parse(args(&[
+            "build",
+            "game",
+            "--output",
+            "out",
+            "--with-server",
+            "--with-server",
+        ]))
+        .err()
+        .unwrap();
+        assert!(error.contains("--with-server"), "{error}");
     }
 
     #[test]

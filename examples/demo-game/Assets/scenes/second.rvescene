@@ -9,7 +9,19 @@ path = "/models/props-cube.fbx"
 archive = "props"
 
 [[assets]]
+path = "/prefabs/satellite.rveprefab"
+
+[[assets]]
 path = "/scripts/rotate.lua"
+
+[[assets]]
+path = "/models/worm.fbx"
+
+[[assets]]
+path = "/anims/worm_curl.fbx"
+
+[[assets]]
+path = "/scripts/worm.lua"
 
 [[objects]]
 id = "camera"
@@ -50,3 +62,22 @@ position = [1.1, 0.75, 0.0]
 scale = [0.75, 0.75, 0.75]
 [objects.mesh_renderer]
 model = "/models/props-cube.fbx"
+
+[[instances]]
+id = "satellite-demo"
+prefab = "/prefabs/satellite.rveprefab"
+[instances.transform]
+position = [0.0, 2.0, 0.0]
+
+[[objects]]
+id = "worm"
+name = "Worm"
+[objects.transform]
+position = [2.8, 0.0, -1.0]
+[objects.mesh_renderer]
+model = "/models/worm.fbx"
+[objects.animator]
+clips = ["/anims/worm_curl.fbx"]
+play_on_start = false
+[[objects.lite_scripts]]
+path = "/scripts/worm.lua"

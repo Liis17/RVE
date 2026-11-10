@@ -3,6 +3,12 @@
 //! Ресурсы лежат в каталоге [`ASSETS_DIR`] рабочего каталога и адресуются путями
 //! вида `/model/cube.fbx`: такой путь указывает на файл `assets/model/cube.fbx`.
 
+mod animation;
+mod skin;
+
+pub use animation::{ModelAnimation, ModelKey, ModelTrack};
+pub use skin::{ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelSkin, ModelTransform};
+
 use engine_resources::{ResourceError, ResourceErrorKind, ResourceHandle, ResourceStat};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -10,6 +16,9 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// Версия крейта (SemVer).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Каталог ресурсов относительно рабочего каталога приложения.
 pub const ASSETS_DIR: &str = "assets";
@@ -46,11 +55,14 @@ pub struct ModelVertex {
 }
 
 /// Часть модели с одним материалом; каждые три индекса образуют треугольник.
+///
+/// `skin` задан, если у модели есть скелет: тогда каждая вершина связана с костями.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelMesh {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
     pub material: ModelMaterial,
+    pub skin: Option<ModelSkin>,
 }
 
 /// Режим альфа-смешивания, извлечённый из FBX opacity.
@@ -107,10 +119,15 @@ impl Default for ModelMaterial {
 }
 
 /// Модель, собранная из всех мешей файла в мировом пространстве сцены.
+///
+/// `skeleton` и `animations` заданы, если в FBX есть skin или анимационные стеки;
+/// иначе модель статическая, как и раньше.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     pub meshes: Vec<ModelMesh>,
     pub textures: Vec<TextureData>,
+    pub skeleton: Option<ModelSkeleton>,
+    pub animations: Vec<ModelAnimation>,
 }
 
 impl Model {
@@ -286,6 +303,34 @@ impl Assets {
         load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self)
     }
 
+    /// Загружает клипы из FBX, в котором нет мешей, например файл Mixamo только с анимацией.
+    ///
+    /// Имя клипа — stem файла; если в файле несколько стеков, имя формируется как `stem:stack`.
+    /// Узлы сопоставляются со скелетом модели позже, по именам.
+    pub fn load_animations(&self, asset_path: &str) -> Result<Vec<ModelAnimation>, AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "fbx")?;
+        let bytes = self.read_asset(asset_path, &path)?;
+        let virtual_path = virtual_asset_path(asset_path);
+        let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("clip");
+        let clips =
+            animation::bake_clip_file(&scene, stem).map_err(|message| AssetError::Decode {
+                path: path.clone(),
+                message,
+            })?;
+        if clips.is_empty() {
+            return Err(AssetError::Decode {
+                path,
+                message: "нет анимационных стеков с ключами".to_owned(),
+            });
+        }
+        Ok(clips)
+    }
+
     /// Возвращает внешние PNG-зависимости FBX без декодирования изображений.
     ///
     /// Встроенные изображения пропускаются. Внешние пути возвращаются как
@@ -297,6 +342,10 @@ impl Assets {
         let virtual_path = virtual_asset_path(asset_path);
         let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
         if !scene_has_triangles(&scene) {
+            // Файл только с клипами (например, из Mixamo) не является моделью и зависимостей не имеет.
+            if !scene.anim_stacks.is_empty() {
+                return Ok(Vec::new());
+            }
             return Err(AssetError::Decode {
                 path,
                 message: "в модели нет треугольников".to_owned(),
@@ -729,10 +778,16 @@ fn load_fbx(
         message,
     };
     let scene = load_fbx_scene(bytes, virtual_path, path)?;
+    // Скелет нужен при skin или анимациях с ключами: тогда все части получают связи с костями.
+    let needs_skeleton = !scene.skin_deformers.is_empty()
+        || animation::has_animated_stack(&scene).map_err(decode_error)?;
+    let mut builder = needs_skeleton.then(skin::SkeletonBuilder::default);
 
     let mut model = Model {
         meshes: Vec::new(),
         textures: Vec::new(),
+        skeleton: None,
+        animations: Vec::new(),
     };
     let mut texture_cache = ModelTextureCache::default();
     let mut triangle = Vec::new();
@@ -748,9 +803,27 @@ fn load_fbx(
             &node.materials
         };
         let mirrored = ufbx::matrix_determinant(&node.geometry_to_world) < 0.0;
+        // Связи вершин с костями: rigid — узел самой части, cluster_joints — кости деформера.
+        let (rigid, deformer, cluster_joints) = match builder.as_mut() {
+            Some(builder) => {
+                let rigid = builder.rigid_joint(node);
+                match mesh.skin_deformers.first() {
+                    Some(deformer) => {
+                        let joints = builder.skin_joints(node, deformer);
+                        (Some(rigid), Some(&**deformer), joints)
+                    }
+                    None => (Some(rigid), None, Vec::new()),
+                }
+            }
+            None => (None, None, Vec::new()),
+        };
         triangle.resize(mesh.max_face_triangles * 3, 0);
         for part in mesh.material_parts.iter() {
             let mut vertices = Vec::with_capacity(part.num_triangles * 3);
+            let mut skin = rigid.map(|_| ModelSkin {
+                joints: Vec::with_capacity(part.num_triangles * 3),
+                weights: Vec::with_capacity(part.num_triangles * 3),
+            });
             for &face_index in part.face_indices.iter() {
                 let face = mesh.faces[face_index as usize];
                 let triangles = mesh.triangulate_face(&mut triangle, face) as usize;
@@ -774,6 +847,21 @@ fn load_fbx(
                         normal: normalize([normal.x as f32, normal.y as f32, normal.z as f32]),
                         uv,
                     });
+                    if let (Some(skin), Some(rigid)) = (skin.as_mut(), rigid) {
+                        // Веса берутся по контрольной точке: углы одной точки получают одинаковые веса.
+                        let control_point = mesh.vertex_indices[index] as usize;
+                        let (joints, weights) = match deformer {
+                            Some(deformer) => skin::corner_influences(
+                                deformer,
+                                &cluster_joints,
+                                control_point,
+                                rigid,
+                            ),
+                            None => ([rigid, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
+                        };
+                        skin.joints.push(joints);
+                        skin.weights.push(weights);
+                    }
                 }
             }
             if vertices.is_empty() {
@@ -797,11 +885,17 @@ fn load_fbx(
                 vertices,
                 indices: std::mem::take(&mut indices),
                 material,
+                skin,
             });
         }
     }
     if model.meshes.is_empty() {
         return Err(decode_error("в модели нет треугольников".to_owned()));
+    }
+    if let Some(builder) = builder {
+        model.animations =
+            animation::bake_model_animations(&builder, &scene).map_err(decode_error)?;
+        model.skeleton = Some(builder.finish());
     }
     Ok(model)
 }
@@ -2037,6 +2131,10 @@ mod tests {
 
         assert_eq!(model.meshes.len(), 1);
         assert!(model.textures.is_empty());
+        // Статическая модель не получает скелет, skin и клипы.
+        assert!(model.skeleton.is_none());
+        assert!(model.animations.is_empty());
+        assert!(model.meshes.iter().all(|mesh| mesh.skin.is_none()));
         let mesh = &model.meshes[0];
         assert_eq!(mesh.material.base_color_texture, None);
         assert!(!mesh.material.double_sided);
@@ -2950,6 +3048,7 @@ mod tests {
             vertices: positions.map(vertex).to_vec(),
             indices: vec![0, 1, 2],
             material: ModelMaterial::default(),
+            skin: None,
         };
         let model = Model {
             meshes: vec![
@@ -2957,11 +3056,15 @@ mod tests {
                 mesh([[-1.0, 0.0, 0.0], [0.0, -2.0, 0.0], [0.0, 0.0, -3.0]]),
             ],
             textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
         };
         assert_eq!(model.bounds(), Some(([-1.0, -2.0, -3.0], [1.0, 2.0, 3.0])));
         let empty = Model {
             meshes: Vec::new(),
             textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
         };
         assert_eq!(empty.bounds(), None);
     }

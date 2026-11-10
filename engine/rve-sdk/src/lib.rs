@@ -4,14 +4,40 @@
 //! `panic = "abort"` still terminates the process on panic because aborting panics cannot unwind.
 
 pub mod abi;
+mod components;
+mod math;
+mod platform;
 
-pub use abi::{Key, MouseButton};
+/// Version of this SDK crate, as declared in its `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub use abi::RveScriptTime;
+pub use abi::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
 use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
-    RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
-    RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveHost, RveParams, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_ANTI_ALIASING_TAA, RVE_BODY_DYNAMIC, RVE_BODY_KINEMATIC, RVE_BODY_STATIC, RVE_COLLIDER_BOX,
+    RVE_COLLIDER_CAPSULE, RVE_COLLIDER_CONVEX_MESH, RVE_COLLIDER_SPHERE,
+    RVE_COLLIDER_TRIANGLE_MESH, RVE_NET_INVALID_INPUT, RVE_NET_MODE_CLIENT, RVE_NET_MODE_HOST,
+    RVE_NET_MODE_SERVER, RVE_NET_OK, RVE_NET_TARGET_ALL, RVE_NET_TARGET_PEER,
+    RVE_NET_TARGET_SERVER, RVE_QUERY_BOX, RVE_QUERY_CAPSULE, RVE_QUERY_SPHERE, RVE_TONEMAPPER_ACES,
+    RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
+    RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult,
+    RveColliderValue, RveControllerValue, RveHost, RveParams, RvePostProcessSettings,
+    RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue, RveScreenShaderState, RveStr,
+    RveTime, RveTransform, RveValue, RveValueData,
 };
+use abi::{
+    RVE_UI_EVENT_BLUR, RVE_UI_EVENT_CANCEL, RVE_UI_EVENT_CLICK, RVE_UI_EVENT_FOCUS,
+    RVE_UI_EVENT_HOVER_ENTER, RVE_UI_EVENT_HOVER_EXIT, RVE_UI_EVENT_SUBMIT,
+    RVE_UI_EVENT_VALUE_CHANGED, RVE_UI_INVALID_INPUT, RVE_UI_OK, RVE_UI_PROP_CANVAS_LAYER,
+    RVE_UI_PROP_CANVAS_VISIBLE, RVE_UI_PROP_COLOR, RVE_UI_PROP_INTERACTABLE, RVE_UI_PROP_TEXT,
+    RVE_UI_PROP_VALUE, RVE_UI_PROP_VISIBLE, RVE_UI_VALUE_BOOL, RVE_UI_VALUE_COLOR,
+    RVE_UI_VALUE_INDEX, RVE_UI_VALUE_INTEGER, RVE_UI_VALUE_NONE, RVE_UI_VALUE_NUMBER,
+    RVE_UI_VALUE_TEXT, RveUiRect, RveUiValue,
+};
+pub use components::{ComponentError, LightKind, MAX_LOD_READ};
+pub use math::{Quat, Vec3};
+pub use platform::{FileDialog, FileDialogFilter, FileDialogId, FileDialogKind, FileDialogPoll};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -28,6 +54,10 @@ pub enum Value {
     String(String),
     /// Ordered array of values.
     Array(Vec<Value>),
+    /// A reference to a world object.
+    Object(Object),
+    /// A virtual asset path.
+    Asset(String),
 }
 
 /// Owned script parameters in deterministic key order.
@@ -94,7 +124,10 @@ impl RveParams {
 }
 
 unsafe fn owned_value(value: RveValue) -> Result<Value, ValueError> {
-    use abi::{RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR};
+    use abi::{
+        RVE_VALUE_ARRAY, RVE_VALUE_ASSET, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT,
+        RVE_VALUE_OBJECT, RVE_VALUE_STR,
+    };
     match value.tag {
         RVE_VALUE_BOOL => {
             // SAFETY: the tag selects the bool union field.
@@ -108,13 +141,23 @@ unsafe fn owned_value(value: RveValue) -> Result<Value, ValueError> {
             // SAFETY: the tag selects the f64 union field.
             Ok(Value::Float(unsafe { value.data.float }))
         }
-        RVE_VALUE_STR => {
+        RVE_VALUE_STR | RVE_VALUE_ASSET => {
             // SAFETY: the tag selects the borrowed string union field.
             let string = unsafe { value.data.string };
             // SAFETY: forwarded from the caller's contract.
             let string = unsafe { string.to_str() }
                 .map_err(|error| ValueError(format!("value string is not UTF-8: {error}")))?;
-            Ok(Value::String(string.to_owned()))
+            if value.tag == RVE_VALUE_ASSET {
+                Ok(Value::Asset(string.to_owned()))
+            } else {
+                Ok(Value::String(string.to_owned()))
+            }
+        }
+        RVE_VALUE_OBJECT => {
+            // SAFETY: the tag selects the object-handle union field.
+            Ok(Value::Object(Object {
+                handle: unsafe { value.data.object },
+            }))
         }
         RVE_VALUE_ARRAY => {
             // SAFETY: the tag selects the borrowed array union field.
@@ -336,12 +379,73 @@ pub trait Script: 'static {
     fn on_start(&mut self, _ctx: &mut Context<'_>) {}
     /// Called for each update with the frame delta in seconds.
     fn on_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
+    /// Called zero or more times before `on_update`, with the fixed simulation delta.
+    fn on_fixed_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
+    /// Called after updates, messages, timers, and coroutines for this frame.
+    fn on_late_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
+    /// Called when a timer scheduled by this instance expires.
+    fn on_timer(&mut self, _ctx: &mut Context<'_>, _tag: &str) {}
+    /// Reads a declared property of this instance. The default returns the value held in the
+    /// instance's params: the creation value, or the latest write the host delivered.
+    fn get_property(&self, ctx: &Context<'_>, name: &str) -> Option<Value> {
+        ctx.properties.get(name).cloned()
+    }
+    /// Validates a property write made by another script or the editor before any property setter
+    /// is called. This hook must be pure: it must not mutate script state, context state, or other
+    /// externally visible state. Return an error to reject the pending property batch; no setter
+    /// has run at this point.
+    fn validate_property(
+        &self,
+        _ctx: &Context<'_>,
+        _name: &str,
+        _value: &Value,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// Commits a property write after every pending write has passed validation. The default
+    /// stores the value in the instance's params. Overrides that keep their own state can return it
+    /// from `get_property`. This is an infallible commit hook: it must not reject, panic, or change
+    /// unrelated state, and should only update the backing value for this property. The host catches
+    /// panics, but cannot roll back arbitrary script state changed by a panicking or stateful setter.
+    fn set_property(&mut self, ctx: &mut Context<'_>, name: &str, value: Value) {
+        ctx.properties.insert(name.to_owned(), value);
+    }
     /// Called when a message is delivered to this script.
     fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
+    /// Called when this object begins touching another collider.
+    fn on_collision_enter(
+        &mut self,
+        _ctx: &mut Context<'_>,
+        _other: Object,
+        _contact: CollisionContact,
+    ) {
+    }
+    /// Called when this object stops touching another collider.
+    fn on_collision_exit(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called when this object begins overlapping a trigger.
+    fn on_trigger_enter(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called when this object stops overlapping a trigger.
+    fn on_trigger_exit(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called once per update frame while this object overlaps a trigger pair. Runs on every frame
+    /// of an active pair, including the frame it begins, and not per physics substep.
+    fn on_trigger_stay(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called when this instance starts running: it was enabled and its object is active.
+    /// Runs right before `on_start` on the first run.
+    fn on_enable(&mut self, _ctx: &mut Context<'_>) {}
+    /// Called when a running instance stops: it was disabled or its object became inactive.
+    fn on_disable(&mut self, _ctx: &mut Context<'_>) {}
     /// Called when the script host is destroyed after this instance has started.
     fn on_destroy(&mut self, _ctx: &mut Context<'_>) {}
     /// Called when a registered developer-console command is submitted.
     fn on_command(&mut self, _ctx: &mut Context<'_>, _name: &str, _args: &[&str]) {}
+    /// Called when a network message for this object or broadcast reaches the script.
+    fn on_net_message(&mut self, _ctx: &mut Context<'_>, _peer: u32, _name: &str, _value: &Value) {}
+    /// Called when a peer connects; delivered to every instance with this callback.
+    fn on_peer_connected(&mut self, _ctx: &mut Context<'_>, _peer: u32) {}
+    /// Called when a peer disconnects; delivered to every instance with this callback.
+    fn on_peer_disconnected(&mut self, _ctx: &mut Context<'_>, _peer: u32, _reason: &str) {}
+    /// Called for a UI event on a canvas owned by this object, at the start of update.
+    fn on_ui_event(&mut self, _ctx: &mut Context<'_>, _event: UiEvent) {}
 }
 
 /// Call-scoped access to the host and this script's object.
@@ -355,7 +459,116 @@ pub struct Context<'a> {
     pub transform: Transform,
     /// Console logging and command registration for this script instance.
     pub console: Console<'a>,
+    /// Declared property values of this instance; see [`Script::get_property`].
+    properties: &'a mut Params,
+    declared_properties: &'a [String],
+    pending_properties: Vec<(String, Value)>,
     _not_send_or_sync: PhantomData<*const ()>,
+}
+
+/// Failure of a save operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SaveError {
+    /// The host does not provide save callbacks.
+    Unavailable,
+    /// The host rejected the key, value, or current callback phase.
+    Rejected,
+    /// The host returned a malformed value.
+    InvalidValue(ValueError),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "save callbacks are unavailable in this host",
+            Self::Rejected => "the host rejected the save operation",
+            Self::InvalidValue(error) => return write!(formatter, "invalid save value: {error}"),
+        })
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+/// Call-scoped save-data access from [`Context::save`].
+pub struct Save<'a> {
+    host: &'a RveHost,
+}
+
+impl Save<'_> {
+    /// Reads a value, returning `None` when the key does not exist.
+    pub fn get(&self, key: &str) -> Result<Option<Value>, SaveError> {
+        let callback = self.host.save_get.ok_or(SaveError::Unavailable)?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the callback only borrows `key` and writes a value backed by its call context.
+        if !unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &mut value) } {
+            return Ok(None);
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        unsafe { value.into_owned() }
+            .map(Some)
+            .map_err(SaveError::InvalidValue)
+    }
+
+    /// Stages a value write for this script callback's transaction.
+    pub fn set(&self, key: &str, value: &Value) -> Result<(), SaveError> {
+        let callback = self.host.save_set.ok_or(SaveError::Unavailable)?;
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the key and recursive value buffers live through the synchronous callback.
+        if unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &value.value) } {
+            Ok(())
+        } else {
+            Err(SaveError::Rejected)
+        }
+    }
+
+    /// Removes a key. Returns `false` when it was not present.
+    pub fn delete(&self, key: &str) -> Result<bool, SaveError> {
+        let callback = self.host.save_delete.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the key bytes live through this synchronous callback.
+        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+    }
+
+    /// Checks whether a key is present.
+    pub fn has(&self, key: &str) -> Result<bool, SaveError> {
+        let callback = self.host.save_has.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the key bytes live through this synchronous callback.
+        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+    }
+
+    /// Returns save keys in sorted order.
+    pub fn keys(&self) -> Result<Vec<String>, SaveError> {
+        let callback = self.host.save_keys.ok_or(SaveError::Unavailable)?;
+        let mut count = 0;
+        // SAFETY: the zero-capacity query only writes `count`.
+        if !unsafe { callback(self.host.ctx, std::ptr::null_mut(), 0, &mut count) } {
+            return Err(SaveError::Rejected);
+        }
+        let mut keys = vec![RveStr::empty(); count];
+        // SAFETY: the host writes at most `count` borrowed strings into this buffer.
+        if !unsafe { callback(self.host.ctx, keys.as_mut_ptr(), keys.len(), &mut count) } {
+            return Err(SaveError::Rejected);
+        }
+        keys.into_iter()
+            .take(count)
+            .map(|key| {
+                // SAFETY: each key remains in the host call context until this callback returns.
+                unsafe { key.to_str() }
+                    .map(str::to_owned)
+                    .map_err(|error| SaveError::InvalidValue(ValueError(error.to_string())))
+            })
+            .collect()
+    }
+
+    /// Requests an atomic flush after this callback commits.
+    pub fn flush(&self) -> Result<(), SaveError> {
+        let callback = self.host.save_flush.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the host callback stages a write request in the active transaction.
+        if unsafe { callback(self.host.ctx) } {
+            Ok(())
+        } else {
+            Err(SaveError::Rejected)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,6 +588,855 @@ pub struct Input<'a> {
     host: &'a RveHost,
 }
 
+/// Stick side for [`GamepadState::stick`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GamepadStick {
+    Left,
+    Right,
+}
+
+/// Read-only gamepad snapshot for one slot, or for the aggregate of all slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GamepadState {
+    state: abi::RveGamepadState,
+}
+
+impl GamepadState {
+    /// Returns whether a gamepad is connected in this slot (any slot for the aggregate).
+    pub fn connected(&self) -> bool {
+        self.state.connected != 0
+    }
+
+    /// Returns whether a button is currently held.
+    pub fn down(&self, button: GamepadButton) -> bool {
+        self.state.down & (1 << button as u32) != 0
+    }
+
+    /// Returns whether a button became held since the previous script update.
+    pub fn pressed(&self, button: GamepadButton) -> bool {
+        self.state.pressed & (1 << button as u32) != 0
+    }
+
+    /// Returns whether a button became released since the previous script update.
+    pub fn released(&self, button: GamepadButton) -> bool {
+        self.state.released & (1 << button as u32) != 0
+    }
+
+    /// Returns an analog axis value: sticks in [-1, 1] and triggers in [0, 1].
+    pub fn axis(&self, axis: GamepadAxis) -> f32 {
+        self.state.axes[axis as usize]
+    }
+
+    /// Returns a stick as `[x, y]`, with positive `y` pointing up.
+    pub fn stick(&self, stick: GamepadStick) -> [f32; 2] {
+        match stick {
+            GamepadStick::Left => [self.axis(GamepadAxis::LeftX), self.axis(GamepadAxis::LeftY)],
+            GamepadStick::Right => [
+                self.axis(GamepadAxis::RightX),
+                self.axis(GamepadAxis::RightY),
+            ],
+        }
+    }
+}
+
+/// Physics query access available during one script callback.
+pub struct Physics<'a> {
+    host: &'a RveHost,
+}
+
+/// Result of a physics raycast.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhysicsRaycastHit {
+    pub object: Object,
+    pub point: [f32; 3],
+    pub normal: [f32; 3],
+    pub distance: f32,
+}
+
+/// Result of character capsule movement.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CharacterMove {
+    pub translation: [f32; 3],
+    pub grounded: bool,
+    pub collided: bool,
+}
+
+/// Collider shape of a script collider component. Mesh shapes can be read but not written.
+/// Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColliderShape {
+    Box,
+    Sphere,
+    Capsule,
+    ConvexMesh,
+    TriangleMesh,
+}
+
+/// Collider component read or written by scripts. `size` is the full box extent; `radius` and
+/// `height` apply to spheres and capsules. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Collider {
+    pub shape: ColliderShape,
+    pub size: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub offset: [f32; 3],
+    pub trigger: bool,
+}
+
+/// Rigid body kind. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyKind {
+    Static,
+    Kinematic,
+    Dynamic,
+}
+
+/// Rigid body component values. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RigidBody {
+    pub kind: BodyKind,
+    pub mass: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub gravity_scale: f32,
+    pub lock_rotation: bool,
+}
+
+/// Character controller component values. `jump_height` and `use_gravity` drive
+/// `Object::simple_move` and `Object::jump`. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharacterController {
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+    pub max_slope_deg: f32,
+    pub snap_distance: f32,
+    pub skin: f32,
+    pub push_strength: f32,
+    pub jump_height: f32,
+    pub gravity_scale: f32,
+    pub use_gravity: bool,
+}
+
+/// Shape of an overlap or cast query. Appended in ABI v18.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum QueryShape {
+    Sphere { radius: f32 },
+    Box { size: [f32; 3] },
+    Capsule { radius: f32, height: f32 },
+}
+
+/// Options of overlap, raycast-all and shape-cast queries. Appended in ABI v18.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryOptions<'a> {
+    /// Bit `n` enables collider layer `n`.
+    pub layer_mask: u32,
+    pub include_triggers: bool,
+    /// Objects whose bodies are skipped by the query.
+    pub ignore: &'a [Object],
+}
+
+impl Default for QueryOptions<'_> {
+    fn default() -> Self {
+        Self {
+            layer_mask: u32::MAX,
+            include_triggers: false,
+            ignore: &[],
+        }
+    }
+}
+
+fn collider_to_abi(value: Collider) -> RveColliderValue {
+    RveColliderValue {
+        shape: match value.shape {
+            ColliderShape::Box => RVE_COLLIDER_BOX,
+            ColliderShape::Sphere => RVE_COLLIDER_SPHERE,
+            ColliderShape::Capsule => RVE_COLLIDER_CAPSULE,
+            ColliderShape::ConvexMesh => RVE_COLLIDER_CONVEX_MESH,
+            ColliderShape::TriangleMesh => RVE_COLLIDER_TRIANGLE_MESH,
+        },
+        trigger: value.trigger,
+        size: value.size,
+        radius: value.radius,
+        height: value.height,
+        offset: value.offset,
+    }
+}
+
+fn collider_from_abi(value: RveColliderValue) -> Result<Collider, PhysicsError> {
+    let shape = match value.shape {
+        RVE_COLLIDER_BOX => ColliderShape::Box,
+        RVE_COLLIDER_SPHERE => ColliderShape::Sphere,
+        RVE_COLLIDER_CAPSULE => ColliderShape::Capsule,
+        RVE_COLLIDER_CONVEX_MESH => ColliderShape::ConvexMesh,
+        RVE_COLLIDER_TRIANGLE_MESH => ColliderShape::TriangleMesh,
+        _ => return Err(PhysicsError::InvalidInput),
+    };
+    Ok(Collider {
+        shape,
+        size: value.size,
+        radius: value.radius,
+        height: value.height,
+        offset: value.offset,
+        trigger: value.trigger,
+    })
+}
+
+fn rigid_body_to_abi(value: RigidBody) -> RveRigidBodyValue {
+    RveRigidBodyValue {
+        kind: match value.kind {
+            BodyKind::Static => RVE_BODY_STATIC,
+            BodyKind::Kinematic => RVE_BODY_KINEMATIC,
+            BodyKind::Dynamic => RVE_BODY_DYNAMIC,
+        },
+        mass: value.mass,
+        linear_damping: value.linear_damping,
+        angular_damping: value.angular_damping,
+        gravity_scale: value.gravity_scale,
+        lock_rotation: value.lock_rotation,
+    }
+}
+
+fn rigid_body_from_abi(value: RveRigidBodyValue) -> Result<RigidBody, PhysicsError> {
+    let kind = match value.kind {
+        RVE_BODY_STATIC => BodyKind::Static,
+        RVE_BODY_KINEMATIC => BodyKind::Kinematic,
+        RVE_BODY_DYNAMIC => BodyKind::Dynamic,
+        _ => return Err(PhysicsError::InvalidInput),
+    };
+    Ok(RigidBody {
+        kind,
+        mass: value.mass,
+        linear_damping: value.linear_damping,
+        angular_damping: value.angular_damping,
+        gravity_scale: value.gravity_scale,
+        lock_rotation: value.lock_rotation,
+    })
+}
+
+fn controller_to_abi(value: CharacterController) -> RveControllerValue {
+    RveControllerValue {
+        radius: value.radius,
+        height: value.height,
+        step_height: value.step_height,
+        max_slope_deg: value.max_slope_deg,
+        snap_distance: value.snap_distance,
+        skin: value.skin,
+        push_strength: value.push_strength,
+        jump_height: value.jump_height,
+        gravity_scale: value.gravity_scale,
+        use_gravity: value.use_gravity,
+    }
+}
+
+fn controller_from_abi(value: RveControllerValue) -> CharacterController {
+    CharacterController {
+        radius: value.radius,
+        height: value.height,
+        step_height: value.step_height,
+        max_slope_deg: value.max_slope_deg,
+        snap_distance: value.snap_distance,
+        skin: value.skin,
+        push_strength: value.push_strength,
+        jump_height: value.jump_height,
+        gravity_scale: value.gravity_scale,
+        use_gravity: value.use_gravity,
+    }
+}
+
+fn query_shape_to_abi(shape: QueryShape) -> Result<RveQueryShape, PhysicsError> {
+    let value = match shape {
+        QueryShape::Sphere { radius } => RveQueryShape {
+            kind: RVE_QUERY_SPHERE,
+            size: [0.0; 3],
+            radius,
+            height: 0.0,
+        },
+        QueryShape::Box { size } => RveQueryShape {
+            kind: RVE_QUERY_BOX,
+            size,
+            radius: 0.0,
+            height: 0.0,
+        },
+        QueryShape::Capsule { radius, height } => RveQueryShape {
+            kind: RVE_QUERY_CAPSULE,
+            size: [0.0; 3],
+            radius,
+            height,
+        },
+    };
+    let finite = value
+        .size
+        .into_iter()
+        .chain([value.radius, value.height])
+        .all(f32::is_finite);
+    if finite {
+        Ok(value)
+    } else {
+        Err(PhysicsError::InvalidInput)
+    }
+}
+
+/// Contact data for collision-enter callbacks.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CollisionContact {
+    pub point: [f32; 3],
+    /// Points from this script object's collider toward the other collider.
+    pub normal: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicsError {
+    Unavailable,
+    Rejected,
+    InvalidInput,
+}
+
+impl std::fmt::Display for PhysicsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "physics callback is unavailable in this host",
+            Self::Rejected => "physics operation was rejected by the host",
+            Self::InvalidInput => "physics input must be finite and valid",
+        })
+    }
+}
+
+impl std::error::Error for PhysicsError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioError {
+    /// The host predates ABI v7 and provides no audio callbacks.
+    Unavailable,
+    /// The host refused the request; the reason is reported in the host's script events.
+    Rejected,
+    /// A volume or position is not finite, or a volume is outside `0.0..=MAX_AUDIO_VOLUME`.
+    InvalidInput,
+}
+
+impl std::fmt::Display for AudioError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "audio callback is unavailable in this host",
+            Self::Rejected => "audio operation was rejected by the host",
+            Self::InvalidInput => "audio input must be finite and valid",
+        })
+    }
+}
+
+impl std::error::Error for AudioError {}
+
+/// Mixer group for clips and group volume changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioGroup {
+    Master,
+    Music,
+    Effects,
+    Ambient,
+}
+
+impl AudioGroup {
+    fn code(self) -> u32 {
+        match self {
+            Self::Master => abi::RVE_AUDIO_GROUP_MASTER,
+            Self::Music => abi::RVE_AUDIO_GROUP_MUSIC,
+            Self::Effects => abi::RVE_AUDIO_GROUP_EFFECTS,
+            Self::Ambient => abi::RVE_AUDIO_GROUP_AMBIENT,
+        }
+    }
+}
+
+/// Options for [`Context::play_clip`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipOptions {
+    pub group: AudioGroup,
+    pub volume: f32,
+    pub looping: bool,
+    /// Makes the clip spatial around this point; `None` plays it without position.
+    pub position: Option<[f32; 3]>,
+}
+
+impl Default for ClipOptions {
+    fn default() -> Self {
+        Self {
+            group: AudioGroup::Effects,
+            volume: 1.0,
+            looping: false,
+            position: None,
+        }
+    }
+}
+
+fn audio_status(status: u32) -> Result<(), AudioError> {
+    if status == abi::RveStatus::Ok as u32 {
+        Ok(())
+    } else {
+        Err(AudioError::Rejected)
+    }
+}
+
+/// Наибольшая громкость (×4). Совпадает с `engine_scene::MAX_AUDIO_VOLUME`: rve-sdk не зависит от
+/// engine-scene, поэтому константа повторяется здесь.
+pub const MAX_AUDIO_VOLUME: f32 = 4.0;
+
+fn audio_volume(volume: f32) -> Result<f32, AudioError> {
+    if volume.is_finite() && (0.0..=MAX_AUDIO_VOLUME).contains(&volume) {
+        Ok(volume)
+    } else {
+        Err(AudioError::InvalidInput)
+    }
+}
+
+impl Object {
+    /// Starts this object's `audio_source` clip.
+    pub fn play_sound(&self, ctx: &mut Context<'_>) -> Result<(), AudioError> {
+        let callback = ctx.host.audio_play_source.ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this guest callback.
+        audio_status(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
+
+    /// Stops this object's current `audio_source` voice.
+    pub fn stop_sound(&self, ctx: &mut Context<'_>) -> Result<(), AudioError> {
+        let callback = ctx.host.audio_stop_source.ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this guest callback.
+        audio_status(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
+
+    /// Sets the volume of this object's current voice and of its next starts.
+    pub fn set_sound_volume(&self, ctx: &mut Context<'_>, volume: f32) -> Result<(), AudioError> {
+        let volume = audio_volume(volume)?;
+        let callback = ctx
+            .host
+            .audio_set_source_volume
+            .ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this guest callback.
+        audio_status(unsafe { callback(ctx.host.ctx, self.handle, volume) })
+    }
+}
+
+impl Context<'_> {
+    /// Starts a clip by virtual path (`.wav` or `.ogg`, declared in the scene's `[[assets]]`) and
+    /// returns its voice id, which can later be passed to [`Context::stop_voice`].
+    pub fn play_clip(&mut self, path: &str, options: ClipOptions) -> Result<u64, AudioError> {
+        let volume = audio_volume(options.volume)?;
+        let position = match options.position {
+            Some(position) if position.iter().all(|axis| axis.is_finite()) => position,
+            Some(_) => return Err(AudioError::InvalidInput),
+            None => [0.0; 3],
+        };
+        let callback = self.host.audio_play_clip.ok_or(AudioError::Unavailable)?;
+        let params = abi::RveAudioParams {
+            group: options.group.code(),
+            volume,
+            looping: options.looping,
+            has_position: options.position.is_some(),
+            position,
+        };
+        let mut voice = 0;
+        // SAFETY: path, params and output storage remain valid during this script call.
+        audio_status(unsafe {
+            callback(
+                self.host.ctx,
+                abi::RveStr::from_str_ref(path),
+                &params,
+                &mut voice,
+            )
+        })?;
+        Ok(voice)
+    }
+
+    /// Stops one voice returned by [`Context::play_clip`]. Unknown ids are ignored by the host.
+    pub fn stop_voice(&mut self, voice: u64) -> Result<(), AudioError> {
+        let callback = self.host.audio_stop_voice.ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this script call.
+        audio_status(unsafe { callback(self.host.ctx, voice) })
+    }
+
+    /// Sets one mixer group's volume; `Master` multiplies every group.
+    pub fn set_group_volume(&mut self, group: AudioGroup, volume: f32) -> Result<(), AudioError> {
+        let volume = audio_volume(volume)?;
+        let callback = self
+            .host
+            .audio_set_group_volume
+            .ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this script call.
+        audio_status(unsafe { callback(self.host.ctx, group.code(), volume) })
+    }
+}
+
+/// Optional settings for [`Context::spawn`]. Unset fields keep the prefab's own values.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpawnOptions {
+    position: Option<[f32; 3]>,
+    rotation_deg: Option<[f32; 3]>,
+    scale: Option<[f32; 3]>,
+    velocity: Option<[f32; 3]>,
+    parent: Option<Object>,
+    name: Option<String>,
+    id: Option<String>,
+}
+
+impl SpawnOptions {
+    /// Creates options with every field unset.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the new root's local position.
+    pub fn position(mut self, value: [f32; 3]) -> Self {
+        self.position = Some(value);
+        self
+    }
+
+    /// Sets the new root's local Euler rotation in degrees.
+    pub fn rotation_deg(mut self, value: [f32; 3]) -> Self {
+        self.rotation_deg = Some(value);
+        self
+    }
+
+    /// Sets the new root's local scale.
+    pub fn scale(mut self, value: [f32; 3]) -> Self {
+        self.scale = Some(value);
+        self
+    }
+
+    /// Sets the initial velocity. The host applies it only to a dynamic root.
+    pub fn velocity(mut self, value: [f32; 3]) -> Self {
+        self.velocity = Some(value);
+        self
+    }
+
+    /// Makes the new root a child of `parent`, which must be a live object.
+    pub fn parent(mut self, parent: Object) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// Sets the new root's display name.
+    pub fn name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_owned());
+        self
+    }
+
+    /// Sets the new root's scene id, `[A-Za-z0-9_-]{1,64}`. The host refuses an id in use.
+    pub fn id(mut self, id: &str) -> Self {
+        self.id = Some(id.to_owned());
+        self
+    }
+
+    /// Builds the ABI struct. Its strings borrow from `self` and are valid for one host call.
+    fn to_abi(&self) -> abi::RveSpawnOptions {
+        let mut options = abi::RveSpawnOptions {
+            flags: 0,
+            position: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [0.0; 3],
+            velocity: [0.0; 3],
+            parent: 0,
+            name: abi::RveStr::empty(),
+            id: abi::RveStr::empty(),
+        };
+        if let Some(value) = self.position {
+            options.flags |= abi::RVE_SPAWN_HAS_POSITION;
+            options.position = value;
+        }
+        if let Some(value) = self.rotation_deg {
+            options.flags |= abi::RVE_SPAWN_HAS_ROTATION;
+            options.rotation_deg = value;
+        }
+        if let Some(value) = self.scale {
+            options.flags |= abi::RVE_SPAWN_HAS_SCALE;
+            options.scale = value;
+        }
+        if let Some(value) = self.velocity {
+            options.flags |= abi::RVE_SPAWN_HAS_VELOCITY;
+            options.velocity = value;
+        }
+        if let Some(parent) = self.parent {
+            options.flags |= abi::RVE_SPAWN_HAS_PARENT;
+            options.parent = parent.handle;
+        }
+        if let Some(name) = &self.name {
+            options.flags |= abi::RVE_SPAWN_HAS_NAME;
+            options.name = abi::RveStr::from_str_ref(name);
+        }
+        if let Some(id) = &self.id {
+            options.flags |= abi::RVE_SPAWN_HAS_ID;
+            options.id = abi::RveStr::from_str_ref(id);
+        }
+        options
+    }
+}
+
+/// Heavy-prefab state reported by [`Prefabs::state`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefabState {
+    /// The path is not in the project's prefab list.
+    Unknown,
+    /// A fast prefab of the scene; it is always in memory.
+    Resident,
+    /// A heavy prefab that is not in memory.
+    Unloaded,
+    /// A heavy prefab whose load is in progress.
+    Loading,
+    /// A heavy prefab in memory.
+    Loaded,
+    /// A heavy prefab whose unload is in progress.
+    Unloading,
+    /// A heavy prefab whose load failed.
+    Failed,
+    /// The host predates ABI v9 and provides no prefab callbacks.
+    Unavailable,
+}
+
+impl PrefabState {
+    fn from_abi(code: u32) -> Self {
+        match code {
+            abi::RVE_PREFAB_RESIDENT => Self::Resident,
+            abi::RVE_PREFAB_UNLOADED => Self::Unloaded,
+            abi::RVE_PREFAB_LOADING => Self::Loading,
+            abi::RVE_PREFAB_LOADED => Self::Loaded,
+            abi::RVE_PREFAB_UNLOADING => Self::Unloading,
+            abi::RVE_PREFAB_FAILED => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Heavy-prefab loading and state, from [`Context::prefabs`]. Load and unload requests take
+/// effect when the current phase ends; [`Prefabs::state`] reports what the host knows now.
+#[derive(Clone, Copy)]
+pub struct Prefabs<'a> {
+    host: &'a RveHost,
+}
+
+impl Prefabs<'_> {
+    /// Requests a heavy prefab load. Returns `false` for an unknown path, a refused request, or a
+    /// host without ABI v9.
+    pub fn load(&self, path: &str) -> bool {
+        self.request(self.host.prefab_load, path)
+    }
+
+    /// Requests a heavy prefab unload once its last instance and pending spawns are gone.
+    /// Returns `false` for an unknown path, a refused request, or a host without ABI v9.
+    pub fn unload(&self, path: &str) -> bool {
+        self.request(self.host.prefab_unload, path)
+    }
+
+    /// Returns the prefab's state.
+    pub fn state(&self, path: &str) -> PrefabState {
+        let Some(callback) = self.host.prefab_state else {
+            return PrefabState::Unavailable;
+        };
+        // SAFETY: the host callback and borrowed path are valid during this guest call.
+        let code = unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(path)) };
+        PrefabState::from_abi(code)
+    }
+
+    fn request(&self, callback: Option<abi::RvePrefabRequestFn>, path: &str) -> bool {
+        let Some(callback) = callback else {
+            return false;
+        };
+        // SAFETY: the host callback and borrowed path are valid during this guest call.
+        unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(path)) }
+    }
+}
+
+impl Context<'_> {
+    /// Spawns a prefab by its project path without a leading slash, for example
+    /// `prefabs/bullet.rveprefab`, and returns its pending object.
+    ///
+    /// The object enters the world when the current phase ends. Its `on_start` runs at the next
+    /// update, before messages. `None` means the host refused the request (the reason is in the
+    /// script events), an option is not finite, or the host predates ABI v9.
+    pub fn spawn(&mut self, prefab: &str, options: &SpawnOptions) -> Option<Object> {
+        let callback = self.host.spawn?;
+        let finite = [
+            options.position,
+            options.rotation_deg,
+            options.scale,
+            options.velocity,
+        ]
+        .into_iter()
+        .flatten()
+        .all(finite_vector);
+        if !finite {
+            return None;
+        }
+        let options = options.to_abi();
+        // SAFETY: the prefab path and the options, with their borrowed strings, outlive this call.
+        let handle =
+            unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(prefab), &options) };
+        (handle != 0).then_some(Object { handle })
+    }
+
+    /// Returns the heavy-prefab API for this call.
+    pub fn prefabs(&self) -> Prefabs<'_> {
+        Prefabs { host: self.host }
+    }
+}
+
+/// Animation operation failure in guest code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationError {
+    /// The host predates ABI v10 and provides no animation callbacks.
+    Unavailable,
+    /// The host refused the request; the reason is reported in the host's script events.
+    Rejected,
+    /// A fade, weight, parameter or speed is not finite, or a fade or speed is negative.
+    InvalidInput,
+}
+
+impl std::fmt::Display for AnimationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "animation callback is unavailable in this host",
+            Self::Rejected => "animation operation was rejected by the host",
+            Self::InvalidInput => "animation input must be finite and valid",
+        })
+    }
+}
+
+impl std::error::Error for AnimationError {}
+
+/// Options for [`Object::play_animation`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlayAnimationOptions<'a> {
+    /// Crossfade duration in seconds; zero switches at once.
+    pub fade: f32,
+    /// `None` keeps the component's default loop setting.
+    pub looping: Option<bool>,
+    /// Motion that starts when this one finishes.
+    pub then: Option<&'a str>,
+}
+
+fn animation_status(status: u32) -> Result<(), AnimationError> {
+    if status == abi::RveStatus::Ok as u32 {
+        Ok(())
+    } else {
+        Err(AnimationError::Rejected)
+    }
+}
+
+fn non_negative_finite(value: f32) -> Result<f32, AnimationError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(AnimationError::InvalidInput)
+    }
+}
+
+fn finite(value: f32) -> Result<f32, AnimationError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(AnimationError::InvalidInput)
+    }
+}
+
+impl Object {
+    /// Starts `motion` on this object's `animator` with a crossfade and optional loop and `then`.
+    pub fn play_animation(
+        &self,
+        ctx: &mut Context<'_>,
+        motion: &str,
+        options: PlayAnimationOptions<'_>,
+    ) -> Result<(), AnimationError> {
+        let fade = non_negative_finite(options.fade)?;
+        let callback = ctx.host.animation_play.ok_or(AnimationError::Unavailable)?;
+        let params = abi::RvePlayAnimationParams {
+            fade,
+            looping: match options.looping {
+                None => -1,
+                Some(false) => 0,
+                Some(true) => 1,
+            },
+            then: abi::RveStr::from_str_ref(options.then.unwrap_or("")),
+        };
+        // SAFETY: the host callback, the motion string and the params stay valid during this callback.
+        animation_status(unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                abi::RveStr::from_str_ref(motion),
+                &params,
+            )
+        })
+    }
+
+    /// Sets the manual weight of one motion; the other motions keep their weights.
+    pub fn set_animation_weight(
+        &self,
+        ctx: &mut Context<'_>,
+        motion: &str,
+        weight: f32,
+        fade: f32,
+    ) -> Result<(), AnimationError> {
+        let weight = finite(weight)?;
+        let fade = non_negative_finite(fade)?;
+        let callback = ctx
+            .host
+            .animation_set_weight
+            .ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback and the motion string stay valid during this callback.
+        animation_status(unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                abi::RveStr::from_str_ref(motion),
+                weight,
+                fade,
+            )
+        })
+    }
+
+    /// Sets one blend tree parameter on this object's animator.
+    pub fn set_animation_parameter(
+        &self,
+        ctx: &mut Context<'_>,
+        name: &str,
+        value: f32,
+    ) -> Result<(), AnimationError> {
+        let value = finite(value)?;
+        let callback = ctx
+            .host
+            .animation_set_parameter
+            .ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback and the parameter name stay valid during this callback.
+        animation_status(unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                abi::RveStr::from_str_ref(name),
+                value,
+            )
+        })
+    }
+
+    /// Sets the speed of this object's animator; zero freezes all motions.
+    pub fn set_animation_speed(
+        &self,
+        ctx: &mut Context<'_>,
+        speed: f32,
+    ) -> Result<(), AnimationError> {
+        let speed = non_negative_finite(speed)?;
+        let callback = ctx
+            .host
+            .animation_set_speed
+            .ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback stays valid during this callback.
+        animation_status(unsafe { callback(ctx.host.ctx, self.handle, speed) })
+    }
+
+    /// Stops every motion of this object's animator at once.
+    pub fn stop_animation(&self, ctx: &mut Context<'_>) -> Result<(), AnimationError> {
+        let callback = ctx.host.animation_stop.ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback stays valid during this callback.
+        animation_status(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
+}
+
 /// Copyable handle to a scene object. It remains stable while its scene is loaded and may be
 /// stored in a script struct. Every operation on it requires the current callback's `Context`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -382,8 +1444,148 @@ pub struct Object {
     handle: u64,
 }
 
+/// Handle to another script instance, from [`Object::script`]. It becomes stale when that instance
+/// is removed (its object was destroyed or its scene was replaced). Stale handles never reach a
+/// different instance. Refused calls (stale handle, undeclared name, out-of-range value, or a call
+/// outside update callbacks) return `None` or `false` and do not fail the calling callback; a
+/// malformed value does fail it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptRef {
+    handle: u64,
+}
+
+impl ScriptRef {
+    /// Reads a declared property. Returns `None` for a stale handle or an undeclared name.
+    pub fn get(&self, ctx: &Context<'_>, name: &str) -> Option<Value> {
+        let callback = ctx.host.script_ref_get?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the host keeps the value's nested buffers alive until this guest callback ends.
+        if !unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &mut value,
+            )
+        } {
+            return None;
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        unsafe { value.into_owned() }.ok()
+    }
+
+    /// Stages a declared property write. The value is validated and coerced by the host when the
+    /// call is made; the write commits with the calling callback.
+    pub fn set(&self, ctx: &mut Context<'_>, name: &str, value: &Value) -> bool {
+        let Some(callback) = ctx.host.script_ref_set else {
+            return false;
+        };
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the name and recursive value buffers live through the synchronous callback.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
+    }
+
+    /// Sends a message to this instance only, not to other scripts on its object.
+    pub fn send(&self, ctx: &mut Context<'_>, name: &str, value: &Value) -> bool {
+        let Some(callback) = ctx.host.script_ref_send else {
+            return false;
+        };
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the name and recursive value buffers live through the synchronous callback.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
+    }
+
+    /// Reads the enabled flag. Returns `None` for a stale handle.
+    pub fn enabled(&self, ctx: &Context<'_>) -> Option<bool> {
+        let callback = ctx.host.script_ref_enabled?;
+        let mut enabled = false;
+        // SAFETY: the output slot lives through this synchronous host call.
+        unsafe { callback(ctx.host.ctx, self.handle, &mut enabled) }.then_some(enabled)
+    }
+
+    /// Stages the enabled flag; it takes effect at the end of the current phase.
+    pub fn set_enabled(&self, ctx: &mut Context<'_>, enabled: bool) -> bool {
+        let Some(callback) = ctx.host.script_ref_set_enabled else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, enabled) }
+    }
+}
+
+impl Object {
+    /// Queues this object's subtree for removal, including a pending object from [`Context::spawn`].
+    ///
+    /// A zero delay removes it at the end of the current phase. A positive delay is measured on
+    /// the script clock; when several destroys target the same object, the earliest due time wins.
+    /// Returns `false` for a dead object, a refused request, a negative or non-finite delay, or a
+    /// host without ABI v9.
+    pub fn destroy(&self, ctx: &mut Context<'_>, delay: f32) -> bool {
+        if !delay.is_finite() || delay < 0.0 {
+            return false;
+        }
+        let Some(callback) = ctx.host.destroy else {
+            return false;
+        };
+        // SAFETY: the host callback is valid during this guest call.
+        unsafe { callback(ctx.host.ctx, self.handle, delay) }
+    }
+
+    /// Returns `true` while the object is in the world.
+    pub fn is_alive(&self, ctx: &Context<'_>) -> bool {
+        self.state_code(ctx) == Some(abi::RVE_OBJECT_ALIVE)
+    }
+
+    /// Returns `true` from [`Context::spawn`] until the phase that applies the spawn ends.
+    pub fn is_pending(&self, ctx: &Context<'_>) -> bool {
+        self.state_code(ctx) == Some(abi::RVE_OBJECT_PENDING)
+    }
+
+    /// Returns the host's state code, or `None` when the host predates ABI v9.
+    fn state_code(&self, ctx: &Context<'_>) -> Option<u32> {
+        let callback = ctx.host.object_state?;
+        // SAFETY: the host callback is valid during this guest call.
+        Some(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
+}
+
 impl<'a> Context<'a> {
-    fn new(host: &'a RveHost) -> Result<Self, String> {
+    /// Returns the object this script instance is attached to.
+    pub fn object(&self) -> Object {
+        Object {
+            handle: self.host.self_object,
+        }
+    }
+
+    /// Returns call-scoped access to project save data.
+    pub fn save(&self) -> Save<'_> {
+        Save { host: self.host }
+    }
+
+    #[cfg(test)]
+    fn new(host: &'a RveHost, properties: &'a mut Params) -> Result<Self, String> {
+        Self::new_with_declared_properties(host, properties, &[])
+    }
+
+    fn new_with_declared_properties(
+        host: &'a RveHost,
+        properties: &'a mut Params,
+        declared_properties: &'a [String],
+    ) -> Result<Self, String> {
         let mut transform = RveTransform::default();
         // SAFETY: the host object is valid for this callback and owns this output slot.
         let ok = unsafe { (host.get_local)(host.ctx, host.self_object, &mut transform) };
@@ -396,22 +1598,87 @@ impl<'a> Context<'a> {
             initial_transform,
             transform: initial_transform,
             console: Console { host },
+            properties,
+            declared_properties,
+            pending_properties: Vec::new(),
             _not_send_or_sync: PhantomData,
         })
     }
 
+    fn sync_script_properties(&mut self, script: &dyn Script) -> Result<(), String> {
+        self.sync_script_properties_except(script, None)
+    }
+
+    fn sync_script_properties_except(
+        &mut self,
+        script: &dyn Script,
+        excluded: Option<&str>,
+    ) -> Result<(), String> {
+        for index in 0..self.declared_properties.len() {
+            let name = &self.declared_properties[index];
+            if excluded == Some(name.as_str()) {
+                continue;
+            }
+            let Some(value) = script.get_property(self, name) else {
+                continue;
+            };
+            let mut canonical = value.clone();
+            if let Some(callback) = self.host.script_ref_set {
+                let borrowed = BorrowedAbiValue::new(&value);
+                // Handle zero is reserved for the calling instance's own property mirror.
+                // SAFETY: the name and recursive value buffers live through the synchronous callback.
+                if !unsafe {
+                    callback(
+                        self.host.ctx,
+                        0,
+                        RveStr::from_str_ref(name),
+                        &borrowed.value,
+                    )
+                } {
+                    return Err(format!("script property {name:?} was rejected by the host"));
+                }
+                if let Some(callback) = self.host.script_ref_get {
+                    let mut output = RveValue::integer(0);
+                    // SAFETY: the host returns a value owned by the active ABI call context.
+                    if !unsafe {
+                        callback(self.host.ctx, 0, RveStr::from_str_ref(name), &mut output)
+                    } {
+                        return Err(format!("script property {name:?} could not be read back"));
+                    }
+                    // SAFETY: the host keeps nested buffers alive through this synchronous call.
+                    canonical = unsafe { output.into_owned() }
+                        .map_err(|error| format!("script property {name:?}: {error}"))?;
+                }
+            }
+            self.pending_properties.push((name.clone(), canonical));
+        }
+        Ok(())
+    }
+
     fn commit(self) -> Result<(), String> {
-        if self.transform == self.initial_transform {
-            return Ok(());
+        if self.transform != self.initial_transform {
+            if !self
+                .transform
+                .position
+                .into_iter()
+                .chain(self.transform.rotation_deg)
+                .chain(self.transform.scale)
+                .all(f32::is_finite)
+            {
+                return Err("script produced a non-finite transform".to_owned());
+            }
+            let transform: RveTransform = self.transform.into();
+            // SAFETY: the host pointer and transform are valid for the duration of this callback.
+            let ok =
+                unsafe { (self.host.set_local)(self.host.ctx, self.host.self_object, &transform) };
+            if !ok {
+                return Err("could not write the script object's local transform".to_owned());
+            }
         }
-        let transform: RveTransform = self.transform.into();
-        // SAFETY: the host pointer and transform are valid for the duration of this callback.
-        let ok = unsafe { (self.host.set_local)(self.host.ctx, self.host.self_object, &transform) };
-        if ok {
-            Ok(())
-        } else {
-            Err("could not write the script object's local transform".to_owned())
+        for (name, value) in self.pending_properties {
+            self.properties.insert(name, value);
         }
+        Ok(())
     }
 
     /// Returns the host's time snapshot for this lifecycle call.
@@ -419,9 +1686,98 @@ impl<'a> Context<'a> {
         self.host.time
     }
 
+    /// Returns the full scaled and unscaled time snapshot for this callback.
+    pub fn script_time(&self) -> RveScriptTime {
+        self.host.script_time
+    }
+
+    /// Stages a finite nonnegative time scale for the next frame.
+    pub fn set_time_scale(&self, scale: f32) -> Result<(), String> {
+        if !scale.is_finite() || scale < 0.0 {
+            return Err("time scale must be finite and nonnegative".to_owned());
+        }
+        let callback = self
+            .host
+            .set_time_scale
+            .ok_or_else(|| "time scale is unavailable on this host".to_owned())?;
+        // SAFETY: the callback and host context are valid during this guest call.
+        if unsafe { callback(self.host.ctx, scale) } {
+            Ok(())
+        } else {
+            Err("could not stage time scale".to_owned())
+        }
+    }
+
+    /// Schedules a timer owned by this script. Repeating timers require a positive interval.
+    pub fn schedule(
+        &self,
+        delay: f64,
+        repeat: Option<f64>,
+        tag: impl AsRef<str>,
+    ) -> Result<TimerId, String> {
+        if !delay.is_finite() || delay < 0.0 {
+            return Err("timer delay must be finite and nonnegative".to_owned());
+        }
+        if repeat.is_some_and(|interval| !interval.is_finite() || interval <= 0.0) {
+            return Err("timer repeat interval must be finite and positive".to_owned());
+        }
+        let callback = self
+            .host
+            .schedule_timer
+            .ok_or_else(|| "timers are unavailable on this host".to_owned())?;
+        let mut id = 0;
+        let repeat = repeat.unwrap_or(0.0);
+        // SAFETY: the tag and output slot remain valid for this synchronous callback.
+        let status = unsafe {
+            callback(
+                self.host.ctx,
+                delay,
+                repeat,
+                RveStr::from_str_ref(tag.as_ref()),
+                &mut id,
+            )
+        };
+        if status == 0 && id != 0 {
+            Ok(TimerId(id))
+        } else {
+            Err("could not schedule script timer".to_owned())
+        }
+    }
+
+    /// Cancels a timer previously scheduled by this script instance.
+    pub fn cancel_timer(&self, id: TimerId) -> Result<bool, String> {
+        let callback = self
+            .host
+            .cancel_timer
+            .ok_or_else(|| "timers are unavailable on this host".to_owned())?;
+        let mut canceled = false;
+        // SAFETY: the output slot and host context remain valid during this callback.
+        let status = unsafe { callback(self.host.ctx, id.0, &mut canceled) };
+        if status == 0 {
+            Ok(canceled)
+        } else {
+            Err("could not cancel script timer".to_owned())
+        }
+    }
+
     /// Returns the input snapshot available during this callback.
     pub fn input(&self) -> Input<'_> {
         Input { host: self.host }
+    }
+
+    /// Network state and messaging. Methods return [`NetError::Unavailable`] without host callbacks.
+    pub fn net(&self) -> Net<'_> {
+        Net { host: self.host }
+    }
+
+    /// Game UI: canvases of preloaded `.rveui` documents and their elements.
+    pub fn ui(&self) -> Ui<'_> {
+        Ui { host: self.host }
+    }
+
+    /// Returns physics queries available during this callback.
+    pub fn physics(&self) -> Physics<'_> {
+        Physics { host: self.host }
     }
 
     /// Returns this script object's stable runtime handle.
@@ -462,6 +1818,43 @@ impl<'a> Context<'a> {
                 RveStr::from_str_ref(name),
                 &value.value,
             )
+        }
+    }
+
+    /// Requests loading a project scene. The request is checked against the project's enabled
+    /// scenes now and runs after this frame; the current scene changes only if that load succeeds.
+    /// Returns `false` for an undeclared path or a call outside update callbacks, without failing
+    /// the calling callback.
+    pub fn load_scene(&mut self, path: &str) -> bool {
+        let Some(callback) = self.host.scene_load else {
+            return false;
+        };
+        // SAFETY: the path bytes live through this synchronous host call.
+        unsafe { callback(self.host.ctx, RveStr::from_str_ref(path)) }
+    }
+
+    /// Requests graceful application shutdown after the current successful callback.
+    /// Returns `false` when this host lacks the callback or disallows writes in this phase.
+    pub fn quit(&mut self) -> bool {
+        let Some(callback) = self.host.app_quit else {
+            return false;
+        };
+        // SAFETY: the host context is valid for the duration of this guest callback.
+        unsafe { callback(self.host.ctx) }
+    }
+
+    /// Returns the name of the current scene, or `None` if the host does not report one.
+    pub fn current_scene(&self) -> Option<String> {
+        let callback = self.host.scene_current?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the host keeps the string alive until this guest callback ends.
+        if !unsafe { callback(self.host.ctx, &mut value) } {
+            return None;
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        match unsafe { value.into_owned() } {
+            Ok(Value::String(name)) => Some(name),
+            _ => None,
         }
     }
 
@@ -508,6 +1901,65 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Stages an input context change. Returns false when unavailable or invalid.
+    pub fn set_input_context(&mut self, name: &str) -> bool {
+        let Some(callback) = self.host.set_input_context else {
+            return false;
+        };
+        // SAFETY: the context name is borrowed for the duration of the callback.
+        unsafe { callback(self.host.ctx, RveStr::from_str_ref(name)) }
+    }
+
+    /// Stages cursor visibility for this callback. Returns false when the host lacks ABI v8 support.
+    pub fn set_cursor_visible(&mut self, visible: bool) -> bool {
+        self.host
+            .set_cursor_visible
+            .is_some_and(|callback| unsafe { callback(self.host.ctx, visible) })
+    }
+
+    /// Stages cursor locking for this callback. Returns false when the host lacks ABI v8 support.
+    pub fn set_cursor_locked(&mut self, locked: bool) -> bool {
+        self.host
+            .set_cursor_locked
+            .is_some_and(|callback| unsafe { callback(self.host.ctx, locked) })
+    }
+
+    /// Replaces one action binding slot. Returns false when unavailable or invalid.
+    pub fn rebind(
+        &mut self,
+        context: &str,
+        action: &str,
+        slot: &str,
+        inputs: &[PhysicalInput],
+    ) -> bool {
+        let Some(callback) = self.host.rebind_action else {
+            return false;
+        };
+        let names: Vec<_> = inputs.iter().map(|input| input.name()).collect();
+        let abi_names: Vec<_> = names
+            .iter()
+            .map(|name| RveStr::from_str_ref(name))
+            .collect();
+        // SAFETY: all strings and the array remain alive for the callback.
+        unsafe {
+            callback(
+                self.host.ctx,
+                RveStr::from_str_ref(context),
+                RveStr::from_str_ref(action),
+                RveStr::from_str_ref(slot),
+                abi_names.as_ptr(),
+                abi_names.len(),
+            )
+        }
+    }
+
+    /// Stages restoration of all input bindings to their project defaults.
+    pub fn reset_bindings(&mut self) -> bool {
+        self.host
+            .reset_bindings
+            .is_some_and(|callback| unsafe { callback(self.host.ctx) })
+    }
+
     fn object_string(&self, callback: abi::RveObjectStringFn) -> Option<String> {
         let mut value = RveStr::empty();
         // SAFETY: the host pointer and output slot are valid during this callback.
@@ -518,6 +1970,10 @@ impl<'a> Context<'a> {
         unsafe { value.to_str().ok().map(str::to_owned) }
     }
 }
+
+/// Opaque identifier returned by [`Context::schedule`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TimerId(u64);
 
 impl Console<'_> {
     pub fn write(&self, message: impl AsRef<str>, level: ConsoleLevel) {
@@ -568,6 +2024,133 @@ impl Console<'_> {
 }
 
 impl Input<'_> {
+    /// Returns whether a button action is currently down.
+    pub fn action_down(&self, name: &str) -> bool {
+        self.action_state(name) & abi::RVE_INPUT_DOWN != 0
+    }
+
+    /// Returns whether a button action became down this frame.
+    pub fn action_pressed(&self, name: &str) -> bool {
+        self.action_state(name) & abi::RVE_INPUT_PRESSED != 0
+    }
+
+    /// Returns whether a button action became released this frame.
+    pub fn action_released(&self, name: &str) -> bool {
+        self.action_state(name) & abi::RVE_INPUT_RELEASED != 0
+    }
+
+    /// Reads an axis action, or returns `None` when unavailable, unknown, or the wrong kind.
+    pub fn axis(&self, name: &str) -> Option<f32> {
+        self.action_value(name, abi::RVE_ACTION_AXIS)
+            .map(|value| value[0])
+    }
+
+    /// Reads a vector2 action, or returns `None` when unavailable, unknown, or the wrong kind.
+    pub fn vector(&self, name: &str) -> Option<[f32; 2]> {
+        self.action_value(name, abi::RVE_ACTION_VECTOR2)
+    }
+
+    /// Returns the active input context when this host exposes ABI v5 input actions.
+    pub fn context(&self) -> Option<String> {
+        let callback = self.host.input_context?;
+        let mut value = RveStr::empty();
+        // SAFETY: output storage is local and returned strings are callback-scoped.
+        if !unsafe { callback(self.host.ctx, &mut value) } {
+            return None;
+        }
+        // SAFETY: ABI v5 host keeps this borrowed string alive through the callback.
+        unsafe { value.to_str().ok().map(str::to_owned) }
+    }
+
+    /// Returns a slot's bindings, including `Some(Vec::new())` for an empty valid slot.
+    pub fn bindings(&self, context: &str, action: &str, slot: &str) -> Option<Vec<String>> {
+        let callback = self.host.action_binding?;
+        let mut values = Vec::new();
+        for index in 0..=abi::RVE_INPUT_MAX_BINDINGS {
+            let mut value = RveStr::empty();
+            // SAFETY: names and output storage are valid during the host callback.
+            if !unsafe {
+                callback(
+                    self.host.ctx,
+                    RveStr::from_str_ref(context),
+                    RveStr::from_str_ref(action),
+                    RveStr::from_str_ref(slot),
+                    index,
+                    &mut value,
+                )
+            } {
+                return if index == 0 { None } else { Some(values) };
+            }
+            // SAFETY: ABI v5 host returns callback-scoped UTF-8 strings.
+            let name = unsafe { value.to_str().ok()? };
+            if index == 0 && name.is_empty() {
+                return Some(values);
+            }
+            if index == abi::RVE_INPUT_MAX_BINDINGS {
+                return None;
+            }
+            values.push(name.to_owned());
+        }
+        unreachable!()
+    }
+
+    /// Returns physical inputs whose raw press edge occurred this frame.
+    pub fn pressed_inputs(&self) -> Vec<String> {
+        let mut pressed = Vec::new();
+        for code in 0..65 {
+            let Some(key) = Key::from_code(code) else {
+                continue;
+            };
+            if self.key_state(key) & abi::RVE_INPUT_PRESSED != 0 {
+                pressed.push(format!("{key:?}"));
+            }
+        }
+        for code in 0..5 {
+            let Some(button) = MouseButton::from_code(code) else {
+                continue;
+            };
+            if self.mouse_button_state(button) & abi::RVE_INPUT_PRESSED != 0 {
+                pressed.push(format!("Mouse.{button:?}"));
+            }
+        }
+        for pad in 1..=abi::RVE_GAMEPAD_SLOTS as u8 {
+            let state = self.gamepad(pad);
+            for button in GamepadButton::ALL {
+                if state.pressed(button) {
+                    pressed.push(format!("Gamepad{pad}.{}", button.name()));
+                }
+            }
+        }
+        pressed
+    }
+
+    /// Returns the gamepad snapshot for slot `pad` (1..=4), or the aggregate of all slots for 0.
+    /// Unknown slots and hosts without ABI v11 gamepad callbacks return a disconnected state.
+    pub fn gamepad(&self, pad: u8) -> GamepadState {
+        let Some(callback) = self.host.gamepad_state else {
+            return GamepadState::default();
+        };
+        let mut state = abi::RveGamepadState::default();
+        // SAFETY: the host pointer and output slot remain valid during this script callback.
+        if unsafe { callback(self.host.ctx, u32::from(pad), &mut state) } {
+            GamepadState { state }
+        } else {
+            GamepadState::default()
+        }
+    }
+
+    /// Queues a rumble request for slot `pad` (0 for every connected gamepad). Returns `false`
+    /// when the host does not support rumble, the slot is not 0..=4, rumble is unavailable during
+    /// script creation, or the frame already holds the maximum number of requests. A refusal is
+    /// also logged as a script error, as for audio requests, even if the guest ignores the result.
+    pub fn rumble(&self, pad: u8, strong: f32, weak: f32, seconds: f32) -> bool {
+        let Some(callback) = self.host.gamepad_rumble else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this script callback.
+        unsafe { callback(self.host.ctx, u32::from(pad), strong, weak, seconds) }
+    }
+
     /// Returns whether a key is currently held.
     pub fn key_down(&self, key: Key) -> bool {
         self.key_state(key) & abi::RVE_INPUT_DOWN != 0
@@ -598,6 +2181,26 @@ impl Input<'_> {
         self.mouse_button_state(button) & abi::RVE_INPUT_RELEASED != 0
     }
 
+    /// Returns whether the cursor is visible, or `None` when the host predates ABI v8.
+    pub fn cursor_visible(&self) -> Option<bool> {
+        self.cursor_state().map(|state| state.visible)
+    }
+
+    /// Returns whether the cursor is locked, or `None` when the host predates ABI v8.
+    pub fn cursor_locked(&self) -> Option<bool> {
+        self.cursor_state().map(|state| state.locked)
+    }
+
+    fn cursor_state(&self) -> Option<abi::RveCursorState> {
+        let callback = self.host.cursor_state?;
+        let mut state = abi::RveCursorState {
+            visible: true,
+            locked: false,
+        };
+        // SAFETY: the host pointer and output slot remain valid during this script callback.
+        unsafe { callback(self.host.ctx, &mut state) }.then_some(state)
+    }
+
     /// Returns the cursor position in physical window pixels.
     pub fn cursor(&self) -> [f32; 2] {
         self.input_vector(self.host.cursor_position)
@@ -616,6 +2219,29 @@ impl Input<'_> {
     fn key_state(&self, key: Key) -> u32 {
         // SAFETY: the host pointer remains valid during this script callback.
         unsafe { (self.host.key_state)(self.host.ctx, key as u32) }
+    }
+
+    fn action_state(&self, name: &str) -> u32 {
+        let Some(callback) = self.host.action_state else {
+            return 0;
+        };
+        // SAFETY: the name is borrowed only for the host callback.
+        unsafe {
+            callback(
+                self.host.ctx,
+                RveStr::from_str_ref(name),
+                abi::RVE_ACTION_BUTTON,
+            )
+        }
+    }
+
+    fn action_value(&self, name: &str, kind: u32) -> Option<[f32; 2]> {
+        let callback = self.host.action_value?;
+        let mut value = [0.0; 2];
+        // SAFETY: name and output storage remain valid for the host callback.
+        unsafe {
+            callback(self.host.ctx, RveStr::from_str_ref(name), kind, &mut value).then_some(value)
+        }
     }
 
     fn mouse_button_state(&self, button: MouseButton) -> u32 {
@@ -672,6 +2298,73 @@ impl Object {
         unsafe { callback(ctx.host.ctx, self.handle, &settings) }
     }
 
+    /// Returns this camera's post-process settings in the flat ABI v12 layout. `None` when the
+    /// object is not a camera or the host does not provide ABI v12 post-process callbacks.
+    pub fn post_process(&self, ctx: &Context<'_>) -> Option<RvePostProcessSettings> {
+        let callback = ctx.host.get_post_process?;
+        let mut settings = RvePostProcessSettings::default();
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut settings) } {
+            Some(settings)
+        } else {
+            None
+        }
+    }
+
+    /// Stages this camera's post-process settings. Returns false when the host lacks ABI v12
+    /// callbacks, the object is not a camera, or the settings are out of range.
+    pub fn set_post_process(
+        &self,
+        ctx: &mut Context<'_>,
+        settings: &RvePostProcessSettings,
+    ) -> bool {
+        let Some(callback) = ctx.host.set_post_process else {
+            return false;
+        };
+        // SAFETY: host callback and settings are valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, settings) }
+    }
+
+    /// Number of screen shader slots of this camera; `None` when the object is not a camera or the
+    /// host does not provide ABI v14 callbacks.
+    pub fn screen_shader_count(&self, ctx: &Context<'_>) -> Option<u32> {
+        let callback = ctx.host.screen_shader_count?;
+        let mut count = 0;
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut count) } {
+            Some(count)
+        } else {
+            None
+        }
+    }
+
+    /// Returns one screen shader slot (zero-based). `None` when the slot does not exist.
+    pub fn screen_shader(&self, ctx: &Context<'_>, slot: u32) -> Option<RveScreenShaderState> {
+        let callback = ctx.host.get_screen_shader?;
+        let mut state = RveScreenShaderState::default();
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, slot, &mut state) } {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    /// Stages enabled flag and parameters of one screen shader slot (zero-based). Returns false when
+    /// the host lacks ABI v14 callbacks, the object is not a camera or the slot does not exist.
+    pub fn set_screen_shader(
+        &self,
+        ctx: &mut Context<'_>,
+        slot: u32,
+        state: &RveScreenShaderState,
+    ) -> bool {
+        let Some(callback) = ctx.host.set_screen_shader else {
+            return false;
+        };
+        // SAFETY: host callback and state are valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, slot, state) }
+    }
+
     /// Stages this object as the active scene camera.
     pub fn activate_camera(&self, ctx: &mut Context<'_>) -> bool {
         let Some(callback) = ctx.host.set_active_camera else {
@@ -689,6 +2382,129 @@ impl Object {
             return None;
         }
         Some(matrix)
+    }
+
+    /// Reads a dynamic body's latest linear velocity.
+    pub fn get_velocity(&self, ctx: &Context<'_>) -> Result<[f32; 3], PhysicsError> {
+        let callback = ctx.host.get_velocity.ok_or(PhysicsError::Unavailable)?;
+        let mut value = [0.0; 3];
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        finite_vector(value)
+            .then_some(value)
+            .ok_or(PhysicsError::InvalidInput)
+    }
+
+    /// Stages a dynamic body's linear velocity.
+    pub fn set_velocity(
+        &self,
+        ctx: &mut Context<'_>,
+        velocity: [f32; 3],
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx.host.set_velocity;
+        self.physics_vector_command(ctx, velocity, callback)
+    }
+
+    /// Stages an impulse on a dynamic body.
+    pub fn add_impulse(
+        &self,
+        ctx: &mut Context<'_>,
+        impulse: [f32; 3],
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx.host.add_impulse;
+        self.physics_vector_command(ctx, impulse, callback)
+    }
+
+    /// Stages a force on a dynamic body for the next physics substeps.
+    pub fn add_force(&self, ctx: &mut Context<'_>, force: [f32; 3]) -> Result<(), PhysicsError> {
+        let callback = ctx.host.add_force;
+        self.physics_vector_command(ctx, force, callback)
+    }
+
+    fn physics_vector_command(
+        &self,
+        ctx: &Context<'_>,
+        value: [f32; 3],
+        callback: Option<abi::RvePhysicsSetVectorFn>,
+    ) -> Result<(), PhysicsError> {
+        if !finite_vector(value) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = callback.ok_or(PhysicsError::Unavailable)?;
+        // SAFETY: callback and vector storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Moves a character-controller capsule and returns its blocked translation and ground state.
+    pub fn move_character(
+        &self,
+        ctx: &mut Context<'_>,
+        displacement: [f32; 3],
+    ) -> Result<CharacterMove, PhysicsError> {
+        if !finite_vector(displacement) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = ctx.host.move_character.ok_or(PhysicsError::Unavailable)?;
+        let mut result = RveCharacterMoveResult::default();
+        // SAFETY: callback and input/output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &displacement, &mut result) } {
+            return Err(PhysicsError::Rejected);
+        }
+        if !finite_vector(result.translation) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        Ok(result.into())
+    }
+
+    /// Reads whether this object's character controller is grounded.
+    pub fn is_grounded(&self, ctx: &Context<'_>) -> Result<bool, PhysicsError> {
+        let callback = ctx.host.is_grounded.ok_or(PhysicsError::Unavailable)?;
+        let mut grounded = false;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut grounded) } {
+            Ok(grounded)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Stages whether this object's collider participates in queries and contacts.
+    pub fn set_collider_enabled(
+        &self,
+        ctx: &mut Context<'_>,
+        enabled: bool,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .set_collider_enabled
+            .ok_or(PhysicsError::Unavailable)?;
+        // SAFETY: callback is valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, enabled) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the collider's latest enabled state, including writes earlier in this callback.
+    pub fn is_collider_enabled(&self, ctx: &Context<'_>) -> Result<bool, PhysicsError> {
+        let callback = ctx
+            .host
+            .is_collider_enabled
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut enabled = false;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut enabled) } {
+            Ok(enabled)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
     }
 
     /// Returns this object's stable scene id.
@@ -714,6 +2530,515 @@ impl Object {
         // SAFETY: the host keeps returned strings alive through the current guest callback.
         unsafe { value.to_str().ok().map(str::to_owned) }
     }
+}
+
+impl Physics<'_> {
+    /// Casts a ray without including triggers or ignoring an object.
+    pub fn raycast(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.raycast_with_options(origin, direction, max_distance, false, None)
+    }
+
+    /// Casts a ray with trigger and self-exclusion options.
+    pub fn raycast_with_options(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+        include_triggers: bool,
+        ignore: Option<Object>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        if !finite_vector(origin)
+            || !finite_vector(direction)
+            || direction.iter().all(|component| *component == 0.0)
+            || !max_distance.is_finite()
+            || max_distance < 0.0
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = self.host.raycast.ok_or(PhysicsError::Unavailable)?;
+        let mut result = RveRaycastHit::default();
+        // SAFETY: callback and all vector/output storage remain valid through this script call.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &origin,
+                &direction,
+                max_distance,
+                include_triggers,
+                ignore.map_or(0, |object| object.handle),
+                &mut result,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        if result.object == 0 {
+            return Ok(None);
+        }
+        if !finite_vector(result.point)
+            || !finite_vector(result.normal)
+            || !result.distance.is_finite()
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        Ok(Some(PhysicsRaycastHit {
+            object: Object {
+                handle: result.object,
+            },
+            point: result.point,
+            normal: result.normal,
+            distance: result.distance,
+        }))
+    }
+}
+
+impl Object {
+    /// Reads the collider component, including writes earlier in this callback.
+    pub fn collider(&self, ctx: &Context<'_>) -> Result<Collider, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_get_collider
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut value = RveColliderValue::default();
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        collider_from_abi(value)
+    }
+
+    /// Reads the collider component. This name mirrors Lua's `get_collider` method.
+    pub fn get_collider(&self, ctx: &Context<'_>) -> Result<Collider, PhysicsError> {
+        self.collider(ctx)
+    }
+
+    /// Stages a replacement collider component; applied when the callback commits.
+    pub fn set_collider(
+        &self,
+        ctx: &mut Context<'_>,
+        collider: Collider,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_set_collider
+            .ok_or(PhysicsError::Unavailable)?;
+        let value = collider_to_abi(collider);
+        // SAFETY: callback and input storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the rigid body component, including writes earlier in this callback.
+    pub fn rigid_body(&self, ctx: &Context<'_>) -> Result<RigidBody, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_get_rigid_body
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut value = RveRigidBodyValue::default();
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        rigid_body_from_abi(value)
+    }
+
+    /// Reads the rigid body component. This name mirrors Lua's `get_rigid_body` method.
+    pub fn get_rigid_body(&self, ctx: &Context<'_>) -> Result<RigidBody, PhysicsError> {
+        self.rigid_body(ctx)
+    }
+
+    /// Stages a replacement rigid body component.
+    pub fn set_rigid_body(
+        &self,
+        ctx: &mut Context<'_>,
+        body: RigidBody,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_set_rigid_body
+            .ok_or(PhysicsError::Unavailable)?;
+        let value = rigid_body_to_abi(body);
+        // SAFETY: callback and input storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the character controller component, including writes earlier in this callback.
+    pub fn controller(&self, ctx: &Context<'_>) -> Result<CharacterController, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_get_controller
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut value = RveControllerValue::default();
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        Ok(controller_from_abi(value))
+    }
+
+    /// Reads the character controller component. This name mirrors Lua's `get_controller` method.
+    pub fn get_controller(&self, ctx: &Context<'_>) -> Result<CharacterController, PhysicsError> {
+        self.controller(ctx)
+    }
+
+    /// Stages a replacement character controller component.
+    pub fn set_controller(
+        &self,
+        ctx: &mut Context<'_>,
+        controller: CharacterController,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_set_controller
+            .ok_or(PhysicsError::Unavailable)?;
+        let value = controller_to_abi(controller);
+        // SAFETY: callback and input storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Moves a character horizontally by `velocity.x/z` per second plus gravity. `velocity.y` is
+    /// ignored. Only valid during update.
+    pub fn simple_move(
+        &self,
+        ctx: &mut Context<'_>,
+        velocity: [f32; 3],
+    ) -> Result<CharacterMove, PhysicsError> {
+        if !finite_vector(velocity) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = ctx
+            .host
+            .physics_simple_move
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut result = RveCharacterMoveResult::default();
+        // SAFETY: callback and input/output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &velocity, &mut result) } {
+            return Err(PhysicsError::Rejected);
+        }
+        Ok(result.into())
+    }
+
+    /// Starts a jump when the character is grounded; `Ok(false)` if it is airborne.
+    pub fn jump(&self, ctx: &mut Context<'_>) -> Result<bool, PhysicsError> {
+        let callback = ctx.host.physics_jump.ok_or(PhysicsError::Unavailable)?;
+        let mut jumped = false;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut jumped) } {
+            Ok(jumped)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the character's vertical velocity, including writes earlier in this callback.
+    pub fn vertical_velocity(&self, ctx: &Context<'_>) -> Result<f32, PhysicsError> {
+        let callback = ctx
+            .host
+            .physics_vertical_velocity
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut velocity = 0.0f32;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut velocity) } {
+            Ok(velocity)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Objects whose colliders overlap this object's body through an active trigger pair.
+    pub fn overlaps(&self, ctx: &Context<'_>) -> Result<Vec<Object>, PhysicsError> {
+        let callback = ctx.host.physics_overlaps.ok_or(PhysicsError::Unavailable)?;
+        // SAFETY: the host writes at most `capacity` handles into the buffer for this call.
+        Ok(host_handles(|out, capacity, count| unsafe {
+            callback(ctx.host.ctx, self.handle, out, capacity, count)
+        }))
+    }
+
+    /// Lists the objects in active trigger pairs with this object. Mirrors Lua's `get_overlaps`.
+    pub fn get_overlaps(&self, ctx: &Context<'_>) -> Result<Vec<Object>, PhysicsError> {
+        self.overlaps(ctx)
+    }
+}
+
+impl Physics<'_> {
+    /// Objects whose colliders intersect a convex shape at `center`.
+    pub fn overlap(
+        &self,
+        shape: QueryShape,
+        center: [f32; 3],
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        if !finite_vector(center) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let shape = query_shape_to_abi(shape)?;
+        let callback = self.host.physics_overlap.ok_or(PhysicsError::Unavailable)?;
+        let ignore = options
+            .ignore
+            .iter()
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let query = query_options_to_abi(options, &ignore);
+        // SAFETY: shape, center, options and the ignore buffer remain valid through this call.
+        Ok(host_handles(|out, capacity, count| unsafe {
+            callback(self.host.ctx, &shape, &center, &query, out, capacity, count)
+        }))
+    }
+
+    /// Objects intersecting a sphere centered at `center`.
+    pub fn overlap_sphere(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        self.overlap(QueryShape::Sphere { radius }, center, options)
+    }
+
+    /// Objects intersecting an axis-aligned box with full extents `size`.
+    pub fn overlap_box(
+        &self,
+        center: [f32; 3],
+        size: [f32; 3],
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        self.overlap(QueryShape::Box { size }, center, options)
+    }
+
+    /// Objects intersecting an upright capsule centered at `center`.
+    pub fn overlap_capsule(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        height: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<Object>, PhysicsError> {
+        self.overlap(QueryShape::Capsule { radius, height }, center, options)
+    }
+
+    /// Every ray hit, nearest first. Triggers and layers follow `options`.
+    pub fn raycast_all(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Vec<PhysicsRaycastHit>, PhysicsError> {
+        if !finite_vector(origin)
+            || !finite_vector(direction)
+            || direction.iter().all(|component| *component == 0.0)
+            || !max_distance.is_finite()
+            || max_distance < 0.0
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = self
+            .host
+            .physics_raycast_all
+            .ok_or(PhysicsError::Unavailable)?;
+        let ignore = options
+            .ignore
+            .iter()
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let query = query_options_to_abi(options, &ignore);
+        let mut count = 0usize;
+        // SAFETY: a null buffer with zero capacity asks only for the hit count.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &origin,
+                &direction,
+                max_distance,
+                &query,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        let mut hits = vec![RveRaycastHit::default(); count];
+        let mut written = 0usize;
+        // SAFETY: `hits` has `count` writable entries; the host writes at most that many.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &origin,
+                &direction,
+                max_distance,
+                &query,
+                hits.as_mut_ptr(),
+                count,
+                &mut written,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        hits.truncate(written.min(count));
+        hits.into_iter()
+            .filter(|hit| hit.object != 0)
+            .map(hit_from_abi)
+            .collect()
+    }
+
+    /// Sweeps a convex shape from `center` along `displacement` and returns the first hit.
+    pub fn shape_cast(
+        &self,
+        shape: QueryShape,
+        center: [f32; 3],
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        if !finite_vector(center) || !finite_vector(displacement) || !skin.is_finite() || skin < 0.0
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let shape = query_shape_to_abi(shape)?;
+        let callback = self
+            .host
+            .physics_shape_cast
+            .ok_or(PhysicsError::Unavailable)?;
+        let ignore = options
+            .ignore
+            .iter()
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let query = query_options_to_abi(options, &ignore);
+        let mut result = RveRaycastHit::default();
+        // SAFETY: shape, vectors, options and the ignore buffer remain valid through this call.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &shape,
+                &center,
+                &displacement,
+                skin,
+                &query,
+                &mut result,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        if result.object == 0 {
+            return Ok(None);
+        }
+        hit_from_abi(result).map(Some)
+    }
+
+    /// Sweeps a sphere from `center` along `displacement` and returns the first hit.
+    pub fn sphere_cast(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.shape_cast(
+            QueryShape::Sphere { radius },
+            center,
+            displacement,
+            skin,
+            options,
+        )
+    }
+
+    /// Sweeps an axis-aligned box with full extents `size` and returns the first hit.
+    pub fn box_cast(
+        &self,
+        center: [f32; 3],
+        size: [f32; 3],
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.shape_cast(
+            QueryShape::Box { size },
+            center,
+            displacement,
+            skin,
+            options,
+        )
+    }
+
+    /// Sweeps an upright capsule from `center` and returns the first hit.
+    pub fn capsule_cast(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        height: f32,
+        displacement: [f32; 3],
+        skin: f32,
+        options: QueryOptions<'_>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.shape_cast(
+            QueryShape::Capsule { radius, height },
+            center,
+            displacement,
+            skin,
+            options,
+        )
+    }
+}
+
+/// Builds the ABI options over `ignore`, which must outlive the returned value's use.
+fn query_options_to_abi(options: QueryOptions<'_>, ignore: &[u64]) -> RveQueryOptions {
+    RveQueryOptions {
+        layer_mask: options.layer_mask,
+        include_triggers: options.include_triggers,
+        ignore: if ignore.is_empty() {
+            std::ptr::null()
+        } else {
+            ignore.as_ptr()
+        },
+        ignore_count: ignore.len(),
+    }
+}
+
+fn hit_from_abi(result: RveRaycastHit) -> Result<PhysicsRaycastHit, PhysicsError> {
+    if !finite_vector(result.point) || !finite_vector(result.normal) || !result.distance.is_finite()
+    {
+        return Err(PhysicsError::InvalidInput);
+    }
+    Ok(PhysicsRaycastHit {
+        object: Object {
+            handle: result.object,
+        },
+        point: result.point,
+        normal: result.normal,
+        distance: result.distance,
+    })
+}
+
+impl From<RveCharacterMoveResult> for CharacterMove {
+    fn from(value: RveCharacterMoveResult) -> Self {
+        Self {
+            translation: value.translation,
+            grounded: value.grounded,
+            collided: value.collided,
+        }
+    }
+}
+
+fn finite_vector(value: [f32; 3]) -> bool {
+    value.into_iter().all(f32::is_finite)
 }
 
 struct BorrowedAbiValue<'a> {
@@ -744,6 +3069,13 @@ impl<'a> BorrowedAbiValue<'a> {
                     string: RveStr::from_str_ref(value),
                 },
             }),
+            Value::Asset(value) => Self::leaf(RveValue {
+                tag: abi::RVE_VALUE_ASSET,
+                data: RveValueData {
+                    string: RveStr::from_str_ref(value),
+                },
+            }),
+            Value::Object(value) => Self::leaf(RveValue::object(value.handle)),
             Value::Array(values) => {
                 let children = values.iter().map(Self::new).collect::<Vec<_>>();
                 let array = children.iter().map(|child| child.value).collect::<Vec<_>>();
@@ -776,19 +3108,1010 @@ impl<'a> BorrowedAbiValue<'a> {
     }
 }
 
+/// Network mode seen by a guest script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetMode {
+    /// No network: the local process is the only authority.
+    Offline,
+    /// Listen server: the local process is the server and also has a local player.
+    Host,
+    /// Dedicated server.
+    Server,
+    /// Client connected to a server.
+    Client,
+}
+
+/// Destination of a network message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetTarget {
+    /// The server.
+    Server,
+    /// Every connected peer.
+    All,
+    /// One peer by number.
+    Peer(u32),
+}
+
+/// Failure of a network call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetError {
+    /// The host does not provide network callbacks.
+    Unavailable,
+    /// The host refused the call in the current phase or state.
+    Rejected,
+    /// The name or value violates the message limits, or the target is not valid here.
+    InvalidInput,
+}
+
+impl std::fmt::Display for NetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "network callback is unavailable in this host",
+            Self::Rejected => "network operation was rejected by the host",
+            Self::InvalidInput => "network input violates the message limits or target rules",
+        })
+    }
+}
+
+impl std::error::Error for NetError {}
+
+fn net_status(status: u32) -> Result<(), NetError> {
+    match status {
+        RVE_NET_OK => Ok(()),
+        RVE_NET_INVALID_INPUT => Err(NetError::InvalidInput),
+        _ => Err(NetError::Rejected),
+    }
+}
+
+fn net_target(target: NetTarget) -> (u32, u32) {
+    match target {
+        NetTarget::Server => (RVE_NET_TARGET_SERVER, 0),
+        NetTarget::All => (RVE_NET_TARGET_ALL, 0),
+        NetTarget::Peer(peer) => (RVE_NET_TARGET_PEER, peer),
+    }
+}
+
+/// Call-scoped network access from [`Context::net`].
+pub struct Net<'a> {
+    host: &'a RveHost,
+}
+
+impl Net<'_> {
+    /// Returns the network mode; without host callbacks it is [`NetMode::Offline`].
+    pub fn mode(&self) -> Result<NetMode, NetError> {
+        let callback = self.host.net_mode.ok_or(NetError::Unavailable)?;
+        // SAFETY: the host context is valid for this callback.
+        Ok(match unsafe { callback(self.host.ctx) } {
+            RVE_NET_MODE_HOST => NetMode::Host,
+            RVE_NET_MODE_SERVER => NetMode::Server,
+            RVE_NET_MODE_CLIENT => NetMode::Client,
+            _ => NetMode::Offline,
+        })
+    }
+
+    /// True for offline, listen-server and dedicated-server modes.
+    pub fn is_server(&self) -> Result<bool, NetError> {
+        Ok(matches!(
+            self.mode()?,
+            NetMode::Offline | NetMode::Host | NetMode::Server
+        ))
+    }
+
+    /// True for listen-server and client modes.
+    pub fn is_client(&self) -> Result<bool, NetError> {
+        Ok(matches!(self.mode()?, NetMode::Host | NetMode::Client))
+    }
+
+    /// Returns the number of this process's peer.
+    pub fn local_peer(&self) -> Result<u32, NetError> {
+        let callback = self.host.net_local_peer.ok_or(NetError::Unavailable)?;
+        // SAFETY: the host context is valid for this callback.
+        Ok(unsafe { callback(self.host.ctx) })
+    }
+
+    /// Returns the remote peers, without the local one.
+    pub fn peers(&self) -> Result<Vec<u32>, NetError> {
+        let callback = self.host.net_peers.ok_or(NetError::Unavailable)?;
+        let mut count = 0_usize;
+        // SAFETY: a zero-capacity call writes only the total count.
+        if !unsafe { callback(self.host.ctx, std::ptr::null_mut(), 0, &mut count) } {
+            return Err(NetError::Rejected);
+        }
+        let mut peers = vec![0_u32; count];
+        let mut total = 0_usize;
+        // SAFETY: the buffer holds `count` entries; the host writes at most that many.
+        if !unsafe { callback(self.host.ctx, peers.as_mut_ptr(), peers.len(), &mut total) } {
+            return Err(NetError::Rejected);
+        }
+        peers.truncate(total.min(count));
+        Ok(peers)
+    }
+
+    /// Stages a message for `target`. `reliable` selects ordered delivery.
+    pub fn send(
+        &self,
+        target: NetTarget,
+        name: &str,
+        value: &Value,
+        reliable: bool,
+    ) -> Result<(), NetError> {
+        let callback = self.host.net_send.ok_or(NetError::Unavailable)?;
+        let (kind, peer) = net_target(target);
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
+        let status = unsafe {
+            callback(
+                self.host.ctx,
+                kind,
+                peer,
+                RveStr::from_str_ref(name),
+                &value.value,
+                reliable,
+            )
+        };
+        net_status(status)
+    }
+}
+
+impl Object {
+    /// Network number of this object, or `None` without a network identity.
+    pub fn net_id(&self, ctx: &Context<'_>) -> Result<Option<u32>, NetError> {
+        let callback = ctx.host.net_object_id.ok_or(NetError::Unavailable)?;
+        let mut id = 0_u32;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut id) }.then_some(id))
+    }
+
+    /// Owner peer of this object, or `None` when no owner is assigned.
+    pub fn net_owner(&self, ctx: &Context<'_>) -> Result<Option<u32>, NetError> {
+        let callback = ctx.host.net_object_owner.ok_or(NetError::Unavailable)?;
+        let mut owner = 0_u32;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut owner) }.then_some(owner))
+    }
+
+    /// True when the local peer owns this object.
+    pub fn is_owner(&self, ctx: &Context<'_>) -> Result<bool, NetError> {
+        let callback = ctx.host.net_object_is_owner.ok_or(NetError::Unavailable)?;
+        let mut owner = false;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut owner) } && owner)
+    }
+
+    /// True when this process may change the state of this object.
+    pub fn has_authority(&self, ctx: &Context<'_>) -> Result<bool, NetError> {
+        let callback = ctx
+            .host
+            .net_object_has_authority
+            .ok_or(NetError::Unavailable)?;
+        let mut authority = false;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut authority) } && authority)
+    }
+
+    /// Assigns the owner peer; only the server, a listen server or offline mode may do it.
+    pub fn set_net_owner(&self, ctx: &mut Context<'_>, peer: u32) -> Result<(), NetError> {
+        let callback = ctx.host.net_object_set_owner.ok_or(NetError::Unavailable)?;
+        // SAFETY: the host context is valid for this callback.
+        net_status(unsafe { callback(ctx.host.ctx, self.handle, peer) })
+    }
+
+    /// Stages a message for the same object on `target`'s side.
+    pub fn net_send(
+        &self,
+        ctx: &mut Context<'_>,
+        name: &str,
+        value: &Value,
+        target: NetTarget,
+        reliable: bool,
+    ) -> Result<(), NetError> {
+        let callback = ctx.host.net_object_send.ok_or(NetError::Unavailable)?;
+        let (kind, peer) = net_target(target);
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
+        let status = unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                kind,
+                peer,
+                RveStr::from_str_ref(name),
+                &value.value,
+                reliable,
+            )
+        };
+        net_status(status)
+    }
+}
+
+/// Reads a host handle list in two calls: the first learns the total count, the second fills a
+/// buffer of that size. Returns an empty list if the host refuses either call.
+fn host_handles(mut call: impl FnMut(*mut u64, usize, *mut usize) -> bool) -> Vec<Object> {
+    let mut count = 0usize;
+    if !call(std::ptr::null_mut(), 0, &mut count) {
+        return Vec::new();
+    }
+    let mut handles = vec![0u64; count];
+    let mut written = 0usize;
+    if !call(handles.as_mut_ptr(), count, &mut written) {
+        return Vec::new();
+    }
+    handles.truncate(written.min(count));
+    handles
+        .into_iter()
+        .filter(|&handle| handle != 0)
+        .map(|handle| Object { handle })
+        .collect()
+}
+
+impl Object {
+    /// Returns the parent object, or `None` for a root object or an unavailable one.
+    pub fn parent(&self, ctx: &mut Context<'_>) -> Option<Object> {
+        let callback = ctx.host.object_parent?;
+        let mut parent = 0u64;
+        // SAFETY: the host context and the output slot are valid for this callback.
+        let ok = unsafe { callback(ctx.host.ctx, self.handle, &mut parent) };
+        (ok && parent != 0).then_some(Object { handle: parent })
+    }
+
+    /// Returns direct children in document and spawn order; empty for an unavailable object.
+    pub fn children(&self, ctx: &mut Context<'_>) -> Vec<Object> {
+        let Some(callback) = ctx.host.object_children else {
+            return Vec::new();
+        };
+        let (host, handle) = (ctx.host.ctx, self.handle);
+        // SAFETY: the host context and output buffers are valid for each call.
+        host_handles(|out, capacity, count| unsafe { callback(host, handle, out, capacity, count) })
+    }
+
+    /// Sets the parent (`None` makes a root). `keep_world` keeps the world pose.
+    pub fn set_parent(
+        &self,
+        ctx: &mut Context<'_>,
+        parent: Option<Object>,
+        keep_world: bool,
+    ) -> bool {
+        let Some(callback) = ctx.host.object_set_parent else {
+            return false;
+        };
+        let parent = parent.map_or(0, |parent| parent.handle);
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, parent, keep_world) }
+    }
+
+    /// Returns this object's own active flag; `None` if the object is unavailable.
+    pub fn is_active(&self, ctx: &mut Context<'_>) -> Option<bool> {
+        bool_query(ctx.host.object_is_active, ctx, self.handle)
+    }
+
+    /// Returns whether this object and all its ancestors are active.
+    pub fn active_in_hierarchy(&self, ctx: &mut Context<'_>) -> Option<bool> {
+        bool_query(ctx.host.object_active_in_hierarchy, ctx, self.handle)
+    }
+
+    /// Sets this object's own active flag. Returns false if the write is refused.
+    pub fn set_active(&self, ctx: &mut Context<'_>, active: bool) -> bool {
+        let Some(callback) = ctx.host.object_set_active else {
+            return false;
+        };
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, active) }
+    }
+
+    /// Returns whether this root object persists when a scene is loaded.
+    pub fn keep_on_load(&self, ctx: &Context<'_>) -> Option<bool> {
+        let callback = ctx.host.object_keep_on_load?;
+        let mut keep = false;
+        // SAFETY: the host callback and output slot are valid during this guest call.
+        unsafe { callback(ctx.host.ctx, self.handle, &mut keep) }.then_some(keep)
+    }
+
+    /// Stages whether this root object persists when a scene is loaded.
+    pub fn set_keep_on_load(&self, ctx: &mut Context<'_>, keep: bool) -> bool {
+        let Some(callback) = ctx.host.object_set_keep_on_load else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, keep) }
+    }
+
+    /// Finds another script instance on this object: a lite script is found by its virtual path
+    /// and a heavy script by its registered name. Returns `None` if no such instance exists.
+    pub fn script(&self, ctx: &Context<'_>, key: &str) -> Option<ScriptRef> {
+        let callback = ctx.host.object_script?;
+        let mut handle = 0;
+        // SAFETY: the key and output slot live through this synchronous host call.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(key),
+                &mut handle,
+            )
+        }
+        .then_some(ScriptRef { handle })
+    }
+
+    /// Returns the world position.
+    pub fn world_position(&self, ctx: &mut Context<'_>) -> Option<[f32; 3]> {
+        vec3_query(ctx.host.object_world_position, ctx, self.handle)
+    }
+
+    /// Sets the world position, keeping the parent space in mind.
+    pub fn set_world_position(&self, ctx: &mut Context<'_>, position: [f32; 3]) -> bool {
+        let Some(callback) = ctx.host.object_set_world_position else {
+            return false;
+        };
+        // SAFETY: the host context and the vector are valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, &position) }
+    }
+
+    /// Returns the world rotation as Euler angles in degrees.
+    pub fn world_rotation(&self, ctx: &mut Context<'_>) -> Option<[f32; 3]> {
+        vec3_query(ctx.host.object_world_rotation, ctx, self.handle)
+    }
+
+    /// Sets the world rotation from Euler angles in degrees.
+    pub fn set_world_rotation(&self, ctx: &mut Context<'_>, rotation_deg: [f32; 3]) -> bool {
+        let Some(callback) = ctx.host.object_set_world_rotation else {
+            return false;
+        };
+        // SAFETY: the host context and the vector are valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, &rotation_deg) }
+    }
+
+    /// Returns the tag; an empty string means no tag.
+    pub fn tag(&self, ctx: &mut Context<'_>) -> Option<String> {
+        let callback = ctx.host.object_tag?;
+        let mut value = RveStr::from_static("");
+        // SAFETY: the host context and the output slot are valid for this callback.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return None;
+        }
+        // SAFETY: the host keeps the string valid for the duration of this callback.
+        unsafe { value.to_str() }.ok().map(str::to_owned)
+    }
+
+    /// Sets the tag `[A-Za-z0-9_-]{1,64}`, or an empty string to clear it.
+    pub fn set_tag(&self, ctx: &mut Context<'_>, tag: &str) -> bool {
+        let Some(callback) = ctx.host.object_set_tag else {
+            return false;
+        };
+        // SAFETY: the borrowed string is valid for this call.
+        unsafe { callback(ctx.host.ctx, self.handle, RveStr::from_str_ref(tag)) }
+    }
+
+    /// Returns the layer index `0..32`.
+    pub fn layer(&self, ctx: &mut Context<'_>) -> Option<u32> {
+        let callback = ctx.host.object_layer?;
+        let mut layer = 0u32;
+        // SAFETY: the host context and the output slot are valid for this callback.
+        (unsafe { callback(ctx.host.ctx, self.handle, &mut layer) }).then_some(layer)
+    }
+
+    /// Sets the layer index `0..32`.
+    pub fn set_layer(&self, ctx: &mut Context<'_>, layer: u32) -> bool {
+        let Some(callback) = ctx.host.object_set_layer else {
+            return false;
+        };
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, layer) }
+    }
+
+    /// Returns whether the object has the named component (see [`crate::abi::RVE_COMPONENT_NAMES`]),
+    /// or `script:<path>` for an attached Lua script.
+    pub fn has_component(&self, ctx: &mut Context<'_>, name: &str) -> bool {
+        let Some(callback) = ctx.host.object_has_component else {
+            return false;
+        };
+        let mut present = false;
+        // SAFETY: the borrowed name and the output slot are valid for this callback.
+        let ok = unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &mut present,
+            )
+        };
+        ok && present
+    }
+
+    /// Returns the names of the built-in components this object has.
+    pub fn components(&self, ctx: &mut Context<'_>) -> Vec<&'static str> {
+        crate::abi::RVE_COMPONENT_NAMES
+            .into_iter()
+            .filter(|name| self.has_component(ctx, name))
+            .collect()
+    }
+}
+
+fn bool_query(
+    callback: Option<abi::RveObjectBoolQueryFn>,
+    ctx: &mut Context<'_>,
+    handle: u64,
+) -> Option<bool> {
+    let callback = callback?;
+    let mut value = false;
+    // SAFETY: the host context and the output slot are valid for this callback.
+    (unsafe { callback(ctx.host.ctx, handle, &mut value) }).then_some(value)
+}
+
+fn vec3_query(
+    callback: Option<abi::RveObjectVec3QueryFn>,
+    ctx: &mut Context<'_>,
+    handle: u64,
+) -> Option<[f32; 3]> {
+    let callback = callback?;
+    let mut value = [0.0; 3];
+    // SAFETY: the host context and the output slot are valid for this callback.
+    (unsafe { callback(ctx.host.ctx, handle, &mut value) }).then_some(value)
+}
+
+impl Context<'_> {
+    /// Finds the first live object with this display name, including inactive ones.
+    pub fn find_by_name(&self, name: &str) -> Option<Object> {
+        self.find_list(self.host.find_objects_by_name, name)
+            .into_iter()
+            .next()
+    }
+
+    /// Finds every live object with this display name.
+    pub fn find_all_by_name(&self, name: &str) -> Vec<Object> {
+        self.find_list(self.host.find_objects_by_name, name)
+    }
+
+    /// Finds the first live object with this tag.
+    pub fn find_with_tag(&self, tag: &str) -> Option<Object> {
+        self.find_list(self.host.find_objects_by_tag, tag)
+            .into_iter()
+            .next()
+    }
+
+    /// Finds every live object with this tag.
+    pub fn find_all_with_tag(&self, tag: &str) -> Vec<Object> {
+        self.find_list(self.host.find_objects_by_tag, tag)
+    }
+
+    /// Sets this script instance's enabled flag. Applied after this callback commits.
+    pub fn set_enabled(&self, enabled: bool) -> bool {
+        let Some(callback) = self.host.script_set_enabled else {
+            return false;
+        };
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(self.host.ctx, enabled) }
+    }
+
+    /// Returns this script instance's enabled flag; `false` if the host lacks the callback.
+    pub fn enabled(&self) -> bool {
+        let Some(callback) = self.host.script_enabled else {
+            return false;
+        };
+        let mut enabled = false;
+        // SAFETY: the host context and the output slot are valid for this callback.
+        unsafe { callback(self.host.ctx, &mut enabled) && enabled }
+    }
+
+    fn find_list(&self, callback: Option<abi::RveFindObjectsFn>, value: &str) -> Vec<Object> {
+        let Some(callback) = callback else {
+            return Vec::new();
+        };
+        let host = self.host.ctx;
+        // SAFETY: the host context and the borrowed string are valid for each call.
+        host_handles(|out, capacity, count| unsafe {
+            callback(host, RveStr::from_str_ref(value), out, capacity, count)
+        })
+    }
+}
+
+/// Failure of a UI call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiError {
+    /// The host does not provide UI callbacks.
+    Unavailable,
+    /// The host refused the call: a stale handle, an unsupported property, or a write outside
+    /// lifecycle calls.
+    Rejected,
+    /// The value does not fit the property, for example a non-finite number or a bad index.
+    InvalidInput,
+}
+
+impl std::fmt::Display for UiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "UI callback is unavailable in this host",
+            Self::Rejected => "UI operation was rejected by the host",
+            Self::InvalidInput => "UI value does not fit the property",
+        })
+    }
+}
+
+impl std::error::Error for UiError {}
+
+fn ui_status(status: u32) -> Result<(), UiError> {
+    match status {
+        RVE_UI_OK => Ok(()),
+        RVE_UI_INVALID_INPUT => Err(UiError::InvalidInput),
+        _ => Err(UiError::Rejected),
+    }
+}
+
+/// Handle of an open canvas. A closed canvas's handle is rejected, even if its slot is reused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct Canvas {
+    raw: u64,
+}
+
+/// Handle of one element of a canvas.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct Element {
+    canvas: Canvas,
+    index: u32,
+}
+
+impl Element {
+    /// The canvas that contains this element.
+    pub fn canvas(self) -> Canvas {
+        self.canvas
+    }
+}
+
+/// Value of an element. A dropdown index counts from zero.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiValue {
+    Number(f64),
+    Bool(bool),
+    Index(usize),
+    Text(String),
+    Color([u8; 4]),
+}
+
+/// Kind of a UI event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiEventKind {
+    Click,
+    ValueChanged,
+    Submit,
+    Cancel,
+    Focus,
+    Blur,
+    HoverEnter,
+    HoverExit,
+}
+
+/// UI event delivered to [`Script::on_ui_event`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiEvent {
+    pub kind: UiEventKind,
+    pub canvas: Canvas,
+    pub element: Element,
+    /// Identifier of the element in its document.
+    pub element_id: String,
+    /// Value carried by the event, when the kind has one.
+    pub value: Option<UiValue>,
+}
+
+/// Rectangle of an element in canvas units: anchors, pivot, and offsets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiRect {
+    pub anchor_min: [f32; 2],
+    pub anchor_max: [f32; 2],
+    pub pivot: [f32; 2],
+    pub offset_min: [f32; 2],
+    pub offset_max: [f32; 2],
+}
+
+impl From<RveUiRect> for UiRect {
+    fn from(rect: RveUiRect) -> Self {
+        Self {
+            anchor_min: rect.anchor_min,
+            anchor_max: rect.anchor_max,
+            pivot: rect.pivot,
+            offset_min: rect.offset_min,
+            offset_max: rect.offset_max,
+        }
+    }
+}
+
+impl From<UiRect> for RveUiRect {
+    fn from(rect: UiRect) -> Self {
+        Self {
+            anchor_min: rect.anchor_min,
+            anchor_max: rect.anchor_max,
+            pivot: rect.pivot,
+            offset_min: rect.offset_min,
+            offset_max: rect.offset_max,
+        }
+    }
+}
+
+fn empty_ui_value() -> RveUiValue {
+    RveUiValue {
+        kind: RVE_UI_VALUE_NONE,
+        flag: false,
+        number: 0.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    }
+}
+
+/// Converts a host value; `None` means the host reported no value.
+///
+/// # Safety
+/// For a text value, `value.text` must refer to readable storage for this callback.
+unsafe fn ui_value_from_abi(value: RveUiValue) -> Result<Option<UiValue>, UiError> {
+    Ok(match value.kind {
+        RVE_UI_VALUE_NONE => None,
+        RVE_UI_VALUE_NUMBER => Some(UiValue::Number(value.number)),
+        RVE_UI_VALUE_BOOL => Some(UiValue::Bool(value.flag)),
+        RVE_UI_VALUE_INDEX => Some(UiValue::Index(
+            usize::try_from(value.integer).map_err(|_| UiError::Rejected)?,
+        )),
+        RVE_UI_VALUE_TEXT => {
+            // SAFETY: the caller guarantees the host keeps the text readable for this callback.
+            let text = unsafe { value.text.to_str() }.map_err(|_| UiError::Rejected)?;
+            Some(UiValue::Text(text.to_owned()))
+        }
+        RVE_UI_VALUE_COLOR => Some(UiValue::Color(value.color)),
+        _ => return Err(UiError::Rejected),
+    })
+}
+
+/// Borrowed host value for `value`; the caller keeps `value` alive for the call.
+fn ui_value_to_abi(value: &UiValue) -> Result<RveUiValue, UiError> {
+    let mut abi = empty_ui_value();
+    match value {
+        UiValue::Number(number) => {
+            abi.kind = RVE_UI_VALUE_NUMBER;
+            abi.number = *number;
+        }
+        UiValue::Bool(flag) => {
+            abi.kind = RVE_UI_VALUE_BOOL;
+            abi.flag = *flag;
+        }
+        UiValue::Index(index) => {
+            abi.kind = RVE_UI_VALUE_INDEX;
+            abi.integer = i64::try_from(*index).map_err(|_| UiError::InvalidInput)?;
+        }
+        UiValue::Text(text) => {
+            abi.kind = RVE_UI_VALUE_TEXT;
+            abi.text = RveStr::from_str_ref(text);
+        }
+        UiValue::Color(color) => {
+            abi.kind = RVE_UI_VALUE_COLOR;
+            abi.color = *color;
+        }
+    }
+    Ok(abi)
+}
+
+fn ui_event_kind(kind: u32) -> Option<UiEventKind> {
+    Some(match kind {
+        RVE_UI_EVENT_CLICK => UiEventKind::Click,
+        RVE_UI_EVENT_VALUE_CHANGED => UiEventKind::ValueChanged,
+        RVE_UI_EVENT_SUBMIT => UiEventKind::Submit,
+        RVE_UI_EVENT_CANCEL => UiEventKind::Cancel,
+        RVE_UI_EVENT_FOCUS => UiEventKind::Focus,
+        RVE_UI_EVENT_BLUR => UiEventKind::Blur,
+        RVE_UI_EVENT_HOVER_ENTER => UiEventKind::HoverEnter,
+        RVE_UI_EVENT_HOVER_EXIT => UiEventKind::HoverExit,
+        _ => return None,
+    })
+}
+
+/// Call-scoped UI access from [`Context::ui`]. Every method returns [`UiError::Unavailable`]
+/// when the host has no UI callbacks.
+pub struct Ui<'a> {
+    host: &'a RveHost,
+}
+
+impl Ui<'_> {
+    /// Opens a preloaded `.rveui` document as a canvas owned by this object.
+    pub fn open(&self, path: &str) -> Result<Canvas, UiError> {
+        let callback = self.host.ui_open.ok_or(UiError::Unavailable)?;
+        let mut raw = 0_u64;
+        // SAFETY: the host and the output slot are valid for this callback.
+        let status = unsafe { callback(self.host.ctx, RveStr::from_str_ref(path), &mut raw) };
+        ui_status(status)?;
+        Ok(Canvas { raw })
+    }
+
+    /// Closes a canvas at the end of this call; later calls in the same callback see it closed.
+    pub fn close(&self, canvas: Canvas) -> Result<(), UiError> {
+        let callback = self.host.ui_close.ok_or(UiError::Unavailable)?;
+        // SAFETY: the host is valid for this callback and checks the handle itself.
+        ui_status(unsafe { callback(self.host.ctx, canvas.raw) })
+    }
+
+    /// The canvas of an object's `ui_canvas` component, if it is open.
+    pub fn canvas_of(&self, object: Object) -> Option<Canvas> {
+        let callback = self.host.ui_object_canvas?;
+        let mut raw = 0_u64;
+        // SAFETY: the host and the output slot are valid for this callback.
+        unsafe { callback(self.host.ctx, object.handle, &mut raw) }.then_some(Canvas { raw })
+    }
+
+    /// The element that has focus, if any.
+    pub fn focused(&self) -> Option<Element> {
+        let callback = self.host.ui_focused?;
+        let mut canvas = 0_u64;
+        let mut index = 0_u32;
+        // SAFETY: the host and both output slots are valid for this callback.
+        unsafe { callback(self.host.ctx, &mut canvas, &mut index) }.then_some(Element {
+            canvas: Canvas { raw: canvas },
+            index,
+        })
+    }
+
+    /// Whether the pointer was over interactive UI on the last update.
+    pub fn pointer_over(&self) -> bool {
+        self.host
+            .ui_pointer_over
+            // SAFETY: the host is valid for this callback.
+            .is_some_and(|callback| unsafe { callback(self.host.ctx) })
+    }
+
+    /// The element with this identifier, or `None` when the canvas has no such element.
+    pub fn find(&self, canvas: Canvas, id: &str) -> Result<Option<Element>, UiError> {
+        let callback = self.host.ui_find.ok_or(UiError::Unavailable)?;
+        let mut index = 0_u32;
+        // SAFETY: the host and the output slot are valid for this callback.
+        let found = unsafe {
+            callback(
+                self.host.ctx,
+                canvas.raw,
+                RveStr::from_str_ref(id),
+                &mut index,
+            )
+        };
+        Ok(found.then_some(Element { canvas, index }))
+    }
+
+    fn get(&self, canvas: u64, element: u32, property: u32) -> Result<RveUiValue, UiError> {
+        let callback = self.host.ui_get.ok_or(UiError::Unavailable)?;
+        let mut out = empty_ui_value();
+        // SAFETY: the host and the output slot are valid for this callback.
+        ui_status(unsafe { callback(self.host.ctx, canvas, element, property, &mut out) })?;
+        Ok(out)
+    }
+
+    fn set(
+        &self,
+        canvas: u64,
+        element: u32,
+        property: u32,
+        value: &UiValue,
+    ) -> Result<(), UiError> {
+        let callback = self.host.ui_set.ok_or(UiError::Unavailable)?;
+        let value = ui_value_to_abi(value)?;
+        // SAFETY: the host reads the borrowed value only during this callback; `value` lives on.
+        ui_status(unsafe { callback(self.host.ctx, canvas, element, property, &value) })
+    }
+
+    fn get_bool(&self, canvas: u64, element: u32, property: u32) -> Result<bool, UiError> {
+        match self.get(canvas, element, property)? {
+            RveUiValue {
+                kind: RVE_UI_VALUE_BOOL,
+                flag,
+                ..
+            } => Ok(flag),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    /// Whether the canvas is visible.
+    pub fn canvas_visible(&self, canvas: Canvas) -> Result<bool, UiError> {
+        self.get_bool(canvas.raw, 0, RVE_UI_PROP_CANVAS_VISIBLE)
+    }
+
+    pub fn set_canvas_visible(&self, canvas: Canvas, visible: bool) -> Result<(), UiError> {
+        self.set(
+            canvas.raw,
+            0,
+            RVE_UI_PROP_CANVAS_VISIBLE,
+            &UiValue::Bool(visible),
+        )
+    }
+
+    /// Drawing layer of the canvas; higher layers draw above lower ones.
+    pub fn canvas_layer(&self, canvas: Canvas) -> Result<i32, UiError> {
+        match self.get(canvas.raw, 0, RVE_UI_PROP_CANVAS_LAYER)? {
+            RveUiValue {
+                kind: RVE_UI_VALUE_INTEGER,
+                integer,
+                ..
+            } => i32::try_from(integer).map_err(|_| UiError::Rejected),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    pub fn set_canvas_layer(&self, canvas: Canvas, layer: i32) -> Result<(), UiError> {
+        let callback = self.host.ui_set.ok_or(UiError::Unavailable)?;
+        let value = RveUiValue {
+            kind: RVE_UI_VALUE_INTEGER,
+            integer: i64::from(layer),
+            ..empty_ui_value()
+        };
+        // SAFETY: the host reads the value only during this callback.
+        ui_status(unsafe {
+            callback(
+                self.host.ctx,
+                canvas.raw,
+                0,
+                RVE_UI_PROP_CANVAS_LAYER,
+                &value,
+            )
+        })
+    }
+
+    /// Text of a `Text` or `InputField` element.
+    pub fn text(&self, element: Element) -> Result<String, UiError> {
+        match self.get_value_abi(element, RVE_UI_PROP_TEXT)? {
+            Some(UiValue::Text(text)) => Ok(text),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    pub fn set_text(&self, element: Element, text: &str) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_TEXT,
+            &UiValue::Text(text.to_owned()),
+        )
+    }
+
+    /// Value of a slider, progress bar, toggle, dropdown, or input field. `None` for a dropdown
+    /// without a selection.
+    pub fn value(&self, element: Element) -> Result<Option<UiValue>, UiError> {
+        self.get_value_abi(element, RVE_UI_PROP_VALUE)
+    }
+
+    pub fn set_value(&self, element: Element, value: UiValue) -> Result<(), UiError> {
+        self.set(element.canvas.raw, element.index, RVE_UI_PROP_VALUE, &value)
+    }
+
+    fn get_value_abi(&self, element: Element, property: u32) -> Result<Option<UiValue>, UiError> {
+        let value = self.get(element.canvas.raw, element.index, property)?;
+        // SAFETY: the host keeps the text of the value readable for this callback.
+        unsafe { ui_value_from_abi(value) }
+    }
+
+    pub fn element_visible(&self, element: Element) -> Result<bool, UiError> {
+        self.get_bool(element.canvas.raw, element.index, RVE_UI_PROP_VISIBLE)
+    }
+
+    pub fn set_element_visible(&self, element: Element, visible: bool) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_VISIBLE,
+            &UiValue::Bool(visible),
+        )
+    }
+
+    pub fn interactable(&self, element: Element) -> Result<bool, UiError> {
+        self.get_bool(element.canvas.raw, element.index, RVE_UI_PROP_INTERACTABLE)
+    }
+
+    pub fn set_interactable(&self, element: Element, interactable: bool) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_INTERACTABLE,
+            &UiValue::Bool(interactable),
+        )
+    }
+
+    /// Tint color of the element as sRGB bytes.
+    pub fn color(&self, element: Element) -> Result<[u8; 4], UiError> {
+        match self.get(element.canvas.raw, element.index, RVE_UI_PROP_COLOR)? {
+            RveUiValue {
+                kind: RVE_UI_VALUE_COLOR,
+                color,
+                ..
+            } => Ok(color),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    pub fn set_color(&self, element: Element, color: [u8; 4]) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_COLOR,
+            &UiValue::Color(color),
+        )
+    }
+
+    /// Replaces the image of an `Image` or `Button` element with a declared `.png` path.
+    pub fn set_image(&self, element: Element, path: &str) -> Result<(), UiError> {
+        let callback = self.host.ui_set_image.ok_or(UiError::Unavailable)?;
+        // SAFETY: the host copies the borrowed path during this callback.
+        ui_status(unsafe {
+            callback(
+                self.host.ctx,
+                element.canvas.raw,
+                element.index,
+                RveStr::from_str_ref(path),
+            )
+        })
+    }
+
+    pub fn rect(&self, element: Element) -> Result<UiRect, UiError> {
+        let callback = self.host.ui_get_rect.ok_or(UiError::Unavailable)?;
+        let mut out = RveUiRect {
+            anchor_min: [0.0; 2],
+            anchor_max: [0.0; 2],
+            pivot: [0.0; 2],
+            offset_min: [0.0; 2],
+            offset_max: [0.0; 2],
+        };
+        // SAFETY: the host and the output slot are valid for this callback.
+        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index, &mut out) })?;
+        Ok(out.into())
+    }
+
+    pub fn set_rect(&self, element: Element, rect: UiRect) -> Result<(), UiError> {
+        let callback = self.host.ui_set_rect.ok_or(UiError::Unavailable)?;
+        let rect = RveUiRect::from(rect);
+        // SAFETY: the host reads the rectangle only during this callback.
+        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index, &rect) })
+    }
+
+    /// Replaces the options of a dropdown; the selection is kept only while its index remains.
+    pub fn set_options(&self, element: Element, options: &[&str]) -> Result<(), UiError> {
+        let callback = self.host.ui_set_options.ok_or(UiError::Unavailable)?;
+        let borrowed: Vec<RveStr> = options
+            .iter()
+            .map(|option| RveStr::from_str_ref(option))
+            .collect();
+        // SAFETY: `borrowed` and the strings it points to outlive this callback.
+        ui_status(unsafe {
+            callback(
+                self.host.ctx,
+                element.canvas.raw,
+                element.index,
+                borrowed.as_ptr(),
+                borrowed.len(),
+            )
+        })
+    }
+
+    /// Moves focus to a focusable element.
+    pub fn focus(&self, element: Element) -> Result<(), UiError> {
+        let callback = self.host.ui_focus.ok_or(UiError::Unavailable)?;
+        // SAFETY: the host is valid for this callback and checks the handle itself.
+        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index) })
+    }
+}
+
 #[doc(hidden)]
 pub mod __private {
-    use super::{Context, Params, Script, ValueError};
+    use super::{
+        Canvas, CollisionContact, Context, Element, Object, Params, Script, UiEvent, ValueError,
+        ui_event_kind, ui_value_from_abi,
+    };
     use crate::abi::{
-        RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
-        RveMessageFn, RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUpdateFn,
-        RveValue,
+        RVE_COLLISION_ENTER, RVE_COLLISION_EXIT, RVE_NET_EVENT_MESSAGE,
+        RVE_NET_EVENT_PEER_CONNECTED, RVE_NET_EVENT_PEER_DISCONNECTED, RVE_PARAM_HAS_MAX,
+        RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RVE_TRIGGER_STAY,
+        RveCollisionEvent, RveCollisionFn, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
+        RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveSetPropertyFn,
+        RveStartFn, RveStatus, RveStr, RveTimerFn, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    struct GuestInstance(Box<dyn Script>);
+    /// Guest state of one script instance. `properties` holds its declared values: creation values,
+    /// then writes the host delivers through [`Script::set_property`].
+    struct GuestInstance {
+        script: Box<dyn Script>,
+        properties: Params,
+        declared_properties: Vec<String>,
+    }
 
     // Mirrors the fields of `RveScriptDesc`, which the macro fills in one call.
     #[allow(clippy::too_many_arguments)]
@@ -797,10 +4120,19 @@ pub mod __private {
         create: RveCreateFn,
         start: RveStartFn,
         update: RveUpdateFn,
+        fixed_update: RveUpdateFn,
+        late_update: RveUpdateFn,
+        timer: RveTimerFn,
         message: RveMessageFn,
         destroy: RveStartFn,
         drop: RveDropFn,
         command: RveCommandFn,
+        collision: RveCollisionFn,
+        net_event: RveNetEventFn,
+        ui_event: RveUiEventFn,
+        enable: RveStartFn,
+        disable: RveStartFn,
+        set_property: RveSetPropertyFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -814,6 +4146,15 @@ pub mod __private {
             params: params.as_ptr(),
             param_count: params.len(),
             command: Some(command),
+            collision: Some(collision),
+            net_event: Some(net_event),
+            ui_event: Some(ui_event),
+            on_enable: Some(enable),
+            on_disable: Some(disable),
+            on_fixed_update: Some(fixed_update),
+            on_late_update: Some(late_update),
+            on_timer: Some(timer),
+            set_property: Some(set_property),
         }
     }
 
@@ -852,13 +4193,37 @@ pub mod __private {
                 Some(label) => RveStr::from_static(label),
                 None => RveStr::empty(),
             },
+            argument: RveStr::empty(),
         }
+    }
+
+    pub const fn param_argument(
+        name: &'static str,
+        kind: u32,
+        default: RveValue,
+        argument: &'static str,
+        label: Option<&'static str>,
+    ) -> RveParamDesc {
+        let mut descriptor = param(name, kind, default, None, None, label);
+        descriptor.argument = RveStr::from_static(argument);
+        descriptor
     }
 
     pub unsafe fn create(
         host: *const RveHost,
         params: *const RveParams,
         out: *mut *mut c_void,
+        factory: fn(&Params) -> Result<Box<dyn Script>, String>,
+    ) -> RveStatus {
+        // SAFETY: the caller provides valid callback pointers as required by this function.
+        unsafe { create_with_param_descs(host, params, out, &[], factory) }
+    }
+
+    pub unsafe fn create_with_param_descs(
+        host: *const RveHost,
+        params: *const RveParams,
+        out: *mut *mut c_void,
+        param_descs: &'static [RveParamDesc],
         factory: fn(&Params) -> Result<Box<dyn Script>, String>,
     ) -> RveStatus {
         if out.is_null() {
@@ -872,11 +4237,25 @@ pub mod __private {
             }
             // SAFETY: params is valid for the callback per the ABI contract.
             let params = unsafe { (*params).into_owned() }.map_err(|error| error.to_string())?;
-            factory(&params)
+            let script = factory(&params)?;
+            let declared_properties = param_descs
+                .iter()
+                .map(|param| {
+                    // SAFETY: SDK descriptor names come from process-lifetime static strings.
+                    unsafe { param.name.to_str() }
+                        .map(str::to_owned)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((script, params, declared_properties))
         }));
         match result {
-            Ok(Ok(instance)) => {
-                let instance = Box::new(GuestInstance(instance));
+            Ok(Ok((script, properties, declared_properties))) => {
+                let instance = Box::new(GuestInstance {
+                    script,
+                    properties,
+                    declared_properties,
+                });
                 // SAFETY: out was checked above and stores the unique guest allocation.
                 unsafe { *out = Box::into_raw(instance).cast() };
                 RveStatus::Ok
@@ -892,6 +4271,83 @@ pub mod __private {
 
     pub unsafe fn update(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus {
         unsafe { with_context(instance, host, |script, ctx| script.on_update(ctx, dt)) }
+    }
+
+    pub unsafe fn fixed_update(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus {
+        unsafe {
+            with_context(instance, host, |script, ctx| {
+                script.on_fixed_update(ctx, dt)
+            })
+        }
+    }
+
+    pub unsafe fn late_update(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus {
+        unsafe { with_context(instance, host, |script, ctx| script.on_late_update(ctx, dt)) }
+    }
+
+    /// Delivers a declared property write to the instance (ABI v22). The default [`Script`] hook
+    /// stores the value in the instance's params; an override is responsible for its own backing
+    /// state and must keep `get_property` consistent with it.
+    pub unsafe fn set_property(
+        instance: *mut c_void,
+        host: *const RveHost,
+        name: RveStr,
+        value: *const crate::abi::RveValue,
+        phase: u32,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() || value.is_null() {
+            return report(host, "null property callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: pointers are valid for this ABI callback.
+            let name = unsafe { name.to_str() }.map_err(|error| error.to_string())?;
+            // SAFETY: pointers are valid for this ABI callback.
+            let value =
+                unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
+            // SAFETY: instance and host are valid for this callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut properties = instance.properties.clone();
+            properties.insert(name.to_owned(), value.clone());
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut properties,
+                &instance.declared_properties,
+            )?;
+            match phase {
+                crate::abi::RVE_PROPERTY_PHASE_VALIDATE => {
+                    instance.script.validate_property(&context, name, &value)?;
+                    context.sync_script_properties_except(instance.script.as_ref(), Some(name))?;
+                }
+                crate::abi::RVE_PROPERTY_PHASE_COMMIT => {
+                    instance.script.set_property(&mut context, name, value);
+                    instance.properties = properties;
+                }
+                _ => return Err("unknown property callback phase".to_owned()),
+            }
+            Ok(())
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn timer(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus {
+        if instance.is_null() || host.is_null() {
+            return report(host, "null timer callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: the tag is borrowed for the duration of this ABI callback.
+            let tag = unsafe { tag.to_str() }.map_err(|error| error.to_string())?;
+            // SAFETY: pointers are valid for this callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            instance.script.on_timer(&mut context, tag);
+            context.sync_script_properties(instance.script.as_ref())?;
+            context.commit()
+        }));
+        status_from_result(host, result)
     }
 
     pub unsafe fn message(
@@ -914,8 +4370,59 @@ pub mod __private {
                 unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
             // SAFETY: instance and host are valid for this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_message(&mut context, sender, name, &value);
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            instance
+                .script
+                .on_message(&mut context, sender, name, &value);
+            context.sync_script_properties(instance.script.as_ref())?;
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn collision(
+        instance: *mut c_void,
+        host: *const RveHost,
+        event: RveCollisionEvent,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() || event.other == 0 {
+            return report(
+                host,
+                "null or invalid collision callback argument",
+                RveStatus::Error,
+            );
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: instance and host are valid for this synchronous ABI callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            let other = Object {
+                handle: event.other,
+            };
+            match event.kind {
+                RVE_COLLISION_ENTER => instance.script.on_collision_enter(
+                    &mut context,
+                    other,
+                    CollisionContact {
+                        point: event.point,
+                        normal: event.normal,
+                    },
+                ),
+                RVE_COLLISION_EXIT => instance.script.on_collision_exit(&mut context, other),
+                RVE_TRIGGER_ENTER => instance.script.on_trigger_enter(&mut context, other),
+                RVE_TRIGGER_EXIT => instance.script.on_trigger_exit(&mut context, other),
+                RVE_TRIGGER_STAY => instance.script.on_trigger_stay(&mut context, other),
+                _ => return Err("unknown collision event kind".to_owned()),
+            }
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -949,8 +4456,104 @@ pub mod __private {
                 .collect::<Result<Vec<_>, _>>()?;
             // SAFETY: instance and host are valid for the duration of this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_command(&mut context, name, &args);
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            instance.script.on_command(&mut context, name, &args);
+            context.sync_script_properties(instance.script.as_ref())?;
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn net_event(
+        instance: *mut c_void,
+        host: *const RveHost,
+        event: RveNetEvent,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() {
+            return report(host, "null net event callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: instance and host are valid for this synchronous ABI callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            match event.kind {
+                RVE_NET_EVENT_MESSAGE => {
+                    if event.value.is_null() {
+                        return Err("null net message value".to_owned());
+                    }
+                    // SAFETY: the host keeps the name and value readable for this callback.
+                    let name = unsafe { event.name.to_str() }.map_err(|error| error.to_string())?;
+                    // SAFETY: the host keeps the value readable for this callback.
+                    let value = unsafe { (*event.value).into_owned() }
+                        .map_err(|error: ValueError| error.to_string())?;
+                    instance
+                        .script
+                        .on_net_message(&mut context, event.peer, name, &value);
+                }
+                RVE_NET_EVENT_PEER_CONNECTED => {
+                    instance.script.on_peer_connected(&mut context, event.peer);
+                }
+                RVE_NET_EVENT_PEER_DISCONNECTED => {
+                    // SAFETY: the host keeps the reason readable for this callback.
+                    let reason =
+                        unsafe { event.reason.to_str() }.map_err(|error| error.to_string())?;
+                    instance
+                        .script
+                        .on_peer_disconnected(&mut context, event.peer, reason);
+                }
+                _ => return Err("unknown net event kind".to_owned()),
+            }
+            context.sync_script_properties(instance.script.as_ref())?;
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn ui_event(
+        instance: *mut c_void,
+        host: *const RveHost,
+        event: RveUiEvent,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() {
+            return report(host, "null ui event callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: instance and host are valid for this synchronous ABI callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            let kind =
+                ui_event_kind(event.kind).ok_or_else(|| "unknown ui event kind".to_owned())?;
+            // SAFETY: the host keeps the identifier and value readable for this callback.
+            let element_id =
+                unsafe { event.element_id.to_str() }.map_err(|error| error.to_string())?;
+            let value =
+                unsafe { ui_value_from_abi(event.value) }.map_err(|error| error.to_string())?;
+            instance.script.on_ui_event(
+                &mut context,
+                UiEvent {
+                    kind,
+                    canvas: Canvas { raw: event.canvas },
+                    element: Element {
+                        canvas: Canvas { raw: event.canvas },
+                        index: event.element,
+                    },
+                    element_id: element_id.to_owned(),
+                    value,
+                },
+            );
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -958,6 +4561,14 @@ pub mod __private {
 
     pub unsafe fn destroy(instance: *mut c_void, host: *const RveHost) -> RveStatus {
         unsafe { with_context(instance, host, |script, ctx| script.on_destroy(ctx)) }
+    }
+
+    pub unsafe fn enable(instance: *mut c_void, host: *const RveHost) -> RveStatus {
+        unsafe { with_context(instance, host, |script, ctx| script.on_enable(ctx)) }
+    }
+
+    pub unsafe fn disable(instance: *mut c_void, host: *const RveHost) -> RveStatus {
+        unsafe { with_context(instance, host, |script, ctx| script.on_disable(ctx)) }
     }
 
     pub unsafe fn drop_instance(instance: *mut c_void) -> RveStatus {
@@ -984,8 +4595,13 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: the host supplies valid call-scoped pointers.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            callback(instance.0.as_mut(), &mut context);
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            callback(instance.script.as_mut(), &mut context);
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -1054,8 +4670,10 @@ macro_rules! script_module {
 /// }
 /// ```
 ///
-/// Supported types are `bool`, `i64`, `f32`/`f64` (float), `&str` and `[f32; 3]`. Defaults are
-/// literals; numeric types accept an inclusive `(min..=max)` range, and every parameter accepts a
+/// Supported types are `bool`, `i64`, `f32`/`f64` (float), `&str`, `[f32; 3]`, `Option<Object>`,
+/// `component(name)`, `Asset`, `enum(...)`, `Color` and `Vec<T>`. Object and component defaults are
+/// `None`; asset defaults are path literals, enum uses its first value, and `Vec<T>` defaults to
+/// empty. Numeric types accept an inclusive `(min..=max)` range, and every parameter accepts a
 /// trailing label literal for editors. A script without a block declares no schema and receives
 /// scene parameters unchecked.
 #[macro_export]
@@ -1142,6 +4760,102 @@ macro_rules! __rve_params {
             $crate::__rve_label!($($label)?),
         ),] $($($rest)*)?)
     };
+    (@munch [$($acc:expr,)*] $param:ident : Option<Object> = None
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_OBJECT,
+            $crate::abi::RveValue::object(0),
+            "",
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : component($component:ident) = None
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_COMPONENT,
+            $crate::abi::RveValue::object(0),
+            stringify!($component),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : Asset = $default:literal
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_ASSET,
+            $crate::abi::RveValue::static_asset($default),
+            "",
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : enum($first:literal $(, $other:literal)*)
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_ENUM,
+            $crate::abi::RveValue::static_string($first),
+            concat!($first, "\0" $(, $other, "\0")*),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : Color = [$r:literal, $g:literal, $b:literal]
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_COLOR,
+            {
+                static VALUES: [$crate::abi::RveValue; 3] = [
+                    $crate::abi::RveValue::float($r as f64),
+                    $crate::abi::RveValue::float($g as f64),
+                    $crate::abi::RveValue::float($b as f64),
+                ];
+                $crate::abi::RveValue::array(&VALUES)
+            },
+            "",
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : Vec<$element:ident> = []
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param_argument(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_ARRAY,
+            $crate::abi::RveValue::array(&[]),
+            $crate::__rve_element_kind!($element),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rve_element_kind {
+    (bool) => {
+        "bool"
+    };
+    (i64) => {
+        "int"
+    };
+    (f32) => {
+        "float"
+    };
+    (f64) => {
+        "float"
+    };
+    (String) => {
+        "string"
+    };
+    (&str) => {
+        "string"
+    };
+    (Object) => {
+        "object"
+    };
+    (Asset) => {
+        "asset"
+    };
 }
 
 #[doc(hidden)]
@@ -1170,13 +4884,23 @@ macro_rules! __rve_label {
 #[macro_export]
 macro_rules! __rve_script_descriptor {
     ($name:literal, $factory:path, [$($params:tt)*]) => {{
+        static __RVE_PARAMS: &[$crate::abi::RveParamDesc] =
+            $crate::__rve_params!(@munch [] $($params)*);
         unsafe extern "C" fn __rve_create(
             host: *const $crate::abi::RveHost,
             params: *const $crate::abi::RveParams,
             out: *mut *mut ::std::ffi::c_void,
         ) -> $crate::abi::RveStatus {
             // SAFETY: host ABI supplies all callback pointers for the duration of this call.
-            unsafe { $crate::__private::create(host, params, out, $factory) }
+            unsafe {
+                $crate::__private::create_with_param_descs(
+                    host,
+                    params,
+                    out,
+                    __RVE_PARAMS,
+                    $factory,
+                )
+            }
         }
         unsafe extern "C" fn __rve_start(
             instance: *mut ::std::ffi::c_void,
@@ -1192,6 +4916,30 @@ macro_rules! __rve_script_descriptor {
         ) -> $crate::abi::RveStatus {
             // SAFETY: host ABI owns the instance and call-scoped host pointer.
             unsafe { $crate::__private::update(instance, host, dt) }
+        }
+        unsafe extern "C" fn __rve_fixed_update(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            dt: f32,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::fixed_update(instance, host, dt) }
+        }
+        unsafe extern "C" fn __rve_late_update(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            dt: f32,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::late_update(instance, host, dt) }
+        }
+        unsafe extern "C" fn __rve_timer(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            tag: $crate::abi::RveStr,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped timer tag.
+            unsafe { $crate::__private::timer(instance, host, tag) }
         }
         unsafe extern "C" fn __rve_message(
             instance: *mut ::std::ffi::c_void,
@@ -1213,12 +4961,60 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped command argument pointers.
             unsafe { $crate::__private::command(instance, host, name, args, arg_count) }
         }
+        unsafe extern "C" fn __rve_collision(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            event: $crate::abi::RveCollisionEvent,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: the host owns the instance and event for this callback.
+            unsafe { $crate::__private::collision(instance, host, event) }
+        }
+        unsafe extern "C" fn __rve_net_event(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            event: $crate::abi::RveNetEvent,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: the host owns the instance and event for this callback.
+            unsafe { $crate::__private::net_event(instance, host, event) }
+        }
+        unsafe extern "C" fn __rve_ui_event(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            event: $crate::abi::RveUiEvent,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: the host owns the instance and event for this callback.
+            unsafe { $crate::__private::ui_event(instance, host, event) }
+        }
         unsafe extern "C" fn __rve_destroy(
             instance: *mut ::std::ffi::c_void,
             host: *const $crate::abi::RveHost,
         ) -> $crate::abi::RveStatus {
             // SAFETY: host ABI owns the instance and call-scoped host pointer.
             unsafe { $crate::__private::destroy(instance, host) }
+        }
+        unsafe extern "C" fn __rve_enable(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::enable(instance, host) }
+        }
+        unsafe extern "C" fn __rve_disable(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::disable(instance, host) }
+        }
+        unsafe extern "C" fn __rve_set_property(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            name: $crate::abi::RveStr,
+            value: *const $crate::abi::RveValue,
+            phase: u32,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped name and value pointers.
+            unsafe { $crate::__private::set_property(instance, host, name, value, phase) }
         }
         unsafe extern "C" fn __rve_drop_instance(
             instance: *mut ::std::ffi::c_void,
@@ -1231,11 +5027,20 @@ macro_rules! __rve_script_descriptor {
             __rve_create,
             __rve_start,
             __rve_update,
+            __rve_fixed_update,
+            __rve_late_update,
+            __rve_timer,
             __rve_message,
             __rve_destroy,
             __rve_drop_instance,
             __rve_command,
-            $crate::__rve_params!(@munch [] $($params)*),
+            __rve_collision,
+            __rve_net_event,
+            __rve_ui_event,
+            __rve_enable,
+            __rve_disable,
+            __rve_set_property,
+            __RVE_PARAMS,
         )
     }};
 }

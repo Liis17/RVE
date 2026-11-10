@@ -5,8 +5,56 @@ use std::ffi::c_void;
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 4;
+///
+/// Version 8 appends cursor callbacks after the v7 audio tail.
+/// Version 9 appends spawn, destroy, object-state and prefab callbacks after the v8 cursor tail.
+/// Version 10 appends animation callbacks after the v9 prefab tail.
+/// Version 11 appends gamepad state and rumble callbacks after the v10 animation tail.
+/// Version 12 appends post-process callbacks after the v11 gamepad tail.
+/// Version 13 appends network callbacks after the v12 post-process tail and net_event after the
+/// v6 collision callback.
+/// Version 14 appends screen shader callbacks after the v13 network tail.
+/// Version 15 adds typed parameter kinds and the argument string; historical reference and UI
+/// branches used distinct parameter and descriptor layouts at this version.
+/// Version 16 appends UI callbacks after the screen shader tail and ui_event after the v15 descriptor.
+/// Version 17 appends hierarchy and activity callbacks after the UI tail and lifecycle callbacks
+/// after ui_event in the descriptor.
+/// Version 18 appends physics callbacks after the hierarchy tail and adds trigger-stay events.
+/// Version 19 appends scene component callbacks after the physics tail.
+/// Version 20 appends clock and timer callbacks to the host and script callbacks to the descriptor.
+/// Version 21 appends transactional save callbacks after the v20 host tail.
+/// Version 22 appends script-reference and scene callbacks after the v21 host tail, and the
+/// nullable `set_property` callback after the v20 descriptor tail.
+/// Version 23 appends the nullable application-quit callback after the v22 host tail.
+/// Version 24 appends window and file dialog callbacks after the v23 quit callback.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 24;
 
+/// Validate an external property write before any `Script::set_property` hook runs.
+pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
+/// Commit a previously validated external property write.
+pub const RVE_PROPERTY_PHASE_COMMIT: u32 = 1;
+
+/// Component names accepted by RveHost::object_has_component, in the order used by
+/// components() on the guest side.
+pub const RVE_COMPONENT_NAMES: [&str; 17] = [
+    "transform",
+    "camera",
+    "mesh_renderer",
+    "lod_group",
+    "directional_light",
+    "point_light",
+    "spot_light",
+    "environment",
+    "collider",
+    "rigid_body",
+    "character_controller",
+    "audio_source",
+    "animator",
+    "particle_emitter",
+    "network_identity",
+    "network_transform",
+    "ui_canvas",
+];
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
@@ -24,12 +72,31 @@ pub const RVE_TONEMAPPER_NEUTRAL: u32 = 1;
 /// Camera tonemapper code for [`RveCameraSettings::tonemapper`].
 pub const RVE_TONEMAPPER_NONE: u32 = 2;
 
+/// File dialog kind for [`RveFileDialog::kind`]: pick one existing file.
+pub const RVE_FILE_DIALOG_OPEN_FILE: u32 = 0;
+/// File dialog kind for [`RveFileDialog::kind`]: pick several existing files.
+pub const RVE_FILE_DIALOG_OPEN_FILES: u32 = 1;
+/// File dialog kind for [`RveFileDialog::kind`]: choose a path to save a file.
+pub const RVE_FILE_DIALOG_SAVE_FILE: u32 = 2;
+/// File dialog kind for [`RveFileDialog::kind`]: pick a folder.
+pub const RVE_FILE_DIALOG_PICK_FOLDER: u32 = 3;
+
 /// Input state bit: the key or button is currently held.
 pub const RVE_INPUT_DOWN: u32 = 1;
 /// Input state bit: the key or button became held in this frame.
 pub const RVE_INPUT_PRESSED: u32 = 2;
 /// Input state bit: the key or button became released in this frame.
 pub const RVE_INPUT_RELEASED: u32 = 4;
+/// Input action kind code for button actions.
+pub const RVE_ACTION_BUTTON: u32 = 0;
+/// Input action kind code for scalar axis actions.
+pub const RVE_ACTION_AXIS: u32 = 1;
+/// Input action kind code for two-dimensional vector actions.
+pub const RVE_ACTION_VECTOR2: u32 = 2;
+/// Maximum number of physical inputs in one binding slot.
+pub const RVE_INPUT_MAX_BINDINGS: usize = 16;
+/// Number of gamepad slots, numbered 1..=4 in script names and 0 for the aggregate.
+pub const RVE_GAMEPAD_SLOTS: usize = 4;
 
 /// Stable key codes shared by the host ABI and the Rust guest API.
 #[repr(u32)]
@@ -255,6 +322,203 @@ impl MouseButton {
     }
 }
 
+/// Stable gamepad button codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GamepadButton {
+    South = 0,
+    East = 1,
+    West = 2,
+    North = 3,
+    LeftBumper = 4,
+    RightBumper = 5,
+    LeftTrigger = 6,
+    RightTrigger = 7,
+    Select = 8,
+    Start = 9,
+    Mode = 10,
+    LeftStick = 11,
+    RightStick = 12,
+    DPadUp = 13,
+    DPadDown = 14,
+    DPadLeft = 15,
+    DPadRight = 16,
+}
+
+impl GamepadButton {
+    /// Every button in ABI code order.
+    pub const ALL: [Self; 17] = [
+        Self::South,
+        Self::East,
+        Self::West,
+        Self::North,
+        Self::LeftBumper,
+        Self::RightBumper,
+        Self::LeftTrigger,
+        Self::RightTrigger,
+        Self::Select,
+        Self::Start,
+        Self::Mode,
+        Self::LeftStick,
+        Self::RightStick,
+        Self::DPadUp,
+        Self::DPadDown,
+        Self::DPadLeft,
+        Self::DPadRight,
+    ];
+
+    /// Converts an API name to a gamepad button.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|button| button.name() == name)
+    }
+
+    /// Converts a stable ABI gamepad-button code to a button when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::South),
+            1 => Some(Self::East),
+            2 => Some(Self::West),
+            3 => Some(Self::North),
+            4 => Some(Self::LeftBumper),
+            5 => Some(Self::RightBumper),
+            6 => Some(Self::LeftTrigger),
+            7 => Some(Self::RightTrigger),
+            8 => Some(Self::Select),
+            9 => Some(Self::Start),
+            10 => Some(Self::Mode),
+            11 => Some(Self::LeftStick),
+            12 => Some(Self::RightStick),
+            13 => Some(Self::DPadUp),
+            14 => Some(Self::DPadDown),
+            15 => Some(Self::DPadLeft),
+            16 => Some(Self::DPadRight),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable button name without the `Gamepad` prefix.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::South => "South",
+            Self::East => "East",
+            Self::West => "West",
+            Self::North => "North",
+            Self::LeftBumper => "LeftBumper",
+            Self::RightBumper => "RightBumper",
+            Self::LeftTrigger => "LeftTrigger",
+            Self::RightTrigger => "RightTrigger",
+            Self::Select => "Select",
+            Self::Start => "Start",
+            Self::Mode => "Mode",
+            Self::LeftStick => "LeftStick",
+            Self::RightStick => "RightStick",
+            Self::DPadUp => "DPadUp",
+            Self::DPadDown => "DPadDown",
+            Self::DPadLeft => "DPadLeft",
+            Self::DPadRight => "DPadRight",
+        }
+    }
+}
+
+/// Stable gamepad analog-axis codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GamepadAxis {
+    LeftX = 0,
+    LeftY = 1,
+    RightX = 2,
+    RightY = 3,
+    LeftTrigger = 4,
+    RightTrigger = 5,
+}
+
+impl GamepadAxis {
+    /// Converts an API name to a gamepad axis.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "LeftX" => Some(Self::LeftX),
+            "LeftY" => Some(Self::LeftY),
+            "RightX" => Some(Self::RightX),
+            "RightY" => Some(Self::RightY),
+            "LeftTrigger" => Some(Self::LeftTrigger),
+            "RightTrigger" => Some(Self::RightTrigger),
+            _ => None,
+        }
+    }
+
+    /// Converts a stable ABI gamepad-axis code to an axis when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::LeftX),
+            1 => Some(Self::LeftY),
+            2 => Some(Self::RightX),
+            3 => Some(Self::RightY),
+            4 => Some(Self::LeftTrigger),
+            5 => Some(Self::RightTrigger),
+            _ => None,
+        }
+    }
+}
+
+/// Splits `Gamepad[N].<Name>` into its optional slot (1..=4, `None` for any gamepad) and the
+/// trailing name. Returns `None` for other strings and for slots outside 1..=4.
+pub fn split_gamepad_name(name: &str) -> Option<(Option<u8>, &str)> {
+    let rest = name.strip_prefix("Gamepad")?;
+    let (pad, tail) = rest.split_once('.')?;
+    let pad = match pad {
+        "" => None,
+        digits if digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            let pad = digits.parse::<u8>().ok()?;
+            if !(1..=RVE_GAMEPAD_SLOTS as u8).contains(&pad) {
+                return None;
+            }
+            Some(pad)
+        }
+        _ => return None,
+    };
+    Some((pad, tail))
+}
+
+/// A physical keyboard key, mouse button, or gamepad button used by project input bindings.
+///
+/// `GamepadButton.pad` is `None` for any gamepad (`Gamepad.South`) or `Some(1..=4)` for one
+/// slot (`Gamepad2.South`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PhysicalInput {
+    Key(Key),
+    MouseButton(MouseButton),
+    GamepadButton {
+        pad: Option<u8>,
+        button: GamepadButton,
+    },
+}
+
+impl PhysicalInput {
+    /// Parses a stable key name, a `Mouse.<Button>` name, or a `Gamepad[N].<Button>` name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        if let Some(button) = name.strip_prefix("Mouse.") {
+            MouseButton::from_name(button).map(Self::MouseButton)
+        } else if let Some((pad, button)) = split_gamepad_name(name) {
+            GamepadButton::from_name(button).map(|button| Self::GamepadButton { pad, button })
+        } else {
+            Key::from_name(name).map(Self::Key)
+        }
+    }
+
+    /// Returns the stable name used by project input bindings.
+    pub fn name(self) -> String {
+        match self {
+            Self::Key(key) => format!("{key:?}"),
+            Self::MouseButton(button) => format!("Mouse.{button:?}"),
+            Self::GamepadButton { pad: None, button } => format!("Gamepad.{}", button.name()),
+            Self::GamepadButton {
+                pad: Some(pad),
+                button,
+            } => format!("Gamepad{pad}.{}", button.name()),
+        }
+    }
+}
+
 /// Value tag for a boolean.
 pub const RVE_VALUE_BOOL: u32 = 0;
 /// Value tag for a signed 64-bit integer.
@@ -265,6 +529,10 @@ pub const RVE_VALUE_FLOAT: u32 = 2;
 pub const RVE_VALUE_STR: u32 = 3;
 /// Value tag for a borrowed array of values.
 pub const RVE_VALUE_ARRAY: u32 = 4;
+/// Value tag for a world object handle.
+pub const RVE_VALUE_OBJECT: u32 = 5;
+/// Value tag for a borrowed asset path string.
+pub const RVE_VALUE_ASSET: u32 = 6;
 
 /// Informational log severity.
 pub const RVE_LOG_INFO: u32 = 0;
@@ -356,6 +624,8 @@ pub union RveValueData {
     pub string: RveStr,
     /// Array payload selected by [`RVE_VALUE_ARRAY`].
     pub array: RveArray,
+    /// Object handle payload selected by [`RVE_VALUE_OBJECT`].
+    pub object: u64,
 }
 
 /// A tagged value crossing the script ABI.
@@ -425,6 +695,34 @@ impl RveValue {
             },
         }
     }
+
+    /// Creates a world object handle value. Zero represents an absent optional object.
+    pub const fn object(handle: u64) -> Self {
+        Self {
+            tag: RVE_VALUE_OBJECT,
+            data: RveValueData { object: handle },
+        }
+    }
+
+    /// Creates a borrowed asset path value.
+    pub fn asset(value: &str) -> Self {
+        Self {
+            tag: RVE_VALUE_ASSET,
+            data: RveValueData {
+                string: RveStr::from_str_ref(value),
+            },
+        }
+    }
+
+    /// Creates a process-lifetime asset path value usable in constant tables.
+    pub const fn static_asset(value: &'static str) -> Self {
+        Self {
+            tag: RVE_VALUE_ASSET,
+            data: RveValueData {
+                string: RveStr::from_static(value),
+            },
+        }
+    }
 }
 
 /// One key/value pair in a borrowed parameter table.
@@ -466,6 +764,19 @@ pub struct RveTime {
     /// Elapsed scene time in seconds.
     pub elapsed: f64,
     /// Current frame number.
+    pub frame: u64,
+}
+
+/// Full scaled and unscaled clock snapshot supplied by ABI v20.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveScriptTime {
+    pub dt: f32,
+    pub unscaled_dt: f32,
+    pub elapsed: f64,
+    pub unscaled_elapsed: f64,
+    pub fixed_dt: f32,
+    pub scale: f32,
     pub frame: u64,
 }
 
@@ -530,6 +841,178 @@ impl Default for RveCameraSettings {
     }
 }
 
+/// Exposure source code for [`RvePostProcessSettings::exposure_mode`].
+pub const RVE_EXPOSURE_MODE_MANUAL: u32 = 0;
+/// Exposure source code for [`RvePostProcessSettings::exposure_mode`].
+pub const RVE_EXPOSURE_MODE_AUTO: u32 = 1;
+/// Ambient occlusion quality code for [`RvePostProcessSettings::ao_quality`].
+pub const RVE_AO_QUALITY_LOW: u32 = 0;
+/// Ambient occlusion quality code for [`RvePostProcessSettings::ao_quality`].
+pub const RVE_AO_QUALITY_MEDIUM: u32 = 1;
+/// Ambient occlusion quality code for [`RvePostProcessSettings::ao_quality`].
+pub const RVE_AO_QUALITY_HIGH: u32 = 2;
+
+/// Complete post-process settings of one camera, flattened for the C ABI.
+///
+/// Boolean fields use `0` and `1`. Enum fields use the stable `RVE_*` codes above and
+/// `RVE_TONEMAPPER_*`. Appended in ABI v12; [`RveCameraSettings`] keeps its v2 layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RvePostProcessSettings {
+    pub exposure_enabled: u32,
+    pub exposure_mode: u32,
+    pub exposure_ev: f32,
+    pub exposure_min_ev: f32,
+    pub exposure_max_ev: f32,
+    pub exposure_speed_up: f32,
+    pub exposure_speed_down: f32,
+    pub exposure_low_percent: f32,
+    pub exposure_high_percent: f32,
+    pub tonemapping_enabled: u32,
+    pub tonemapper: u32,
+    pub bloom_enabled: u32,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
+    pub bloom_knee: f32,
+    pub bloom_scatter: f32,
+    pub bloom_tint: [f32; 3],
+    pub ao_enabled: u32,
+    pub ao_radius: f32,
+    pub ao_intensity: f32,
+    pub ao_falloff: f32,
+    pub ao_quality: u32,
+    pub grading_enabled: u32,
+    pub grading_temperature: f32,
+    pub grading_tint: f32,
+    pub grading_contrast: f32,
+    pub grading_saturation: f32,
+    pub grading_lift: [f32; 3],
+    pub grading_gamma: [f32; 3],
+    pub grading_gain: [f32; 3],
+    pub vignette_enabled: u32,
+    pub vignette_intensity: f32,
+    pub vignette_smoothness: f32,
+    pub vignette_roundness: f32,
+    pub vignette_color: [f32; 3],
+    pub aberration_enabled: u32,
+    pub aberration_intensity: f32,
+    pub grain_enabled: u32,
+    pub grain_intensity: f32,
+    pub grain_response: f32,
+    pub dof_enabled: u32,
+    pub dof_focus_distance: f32,
+    pub dof_aperture: f32,
+    pub dof_focal_length_mm: f32,
+    pub dof_max_blur_px: f32,
+    pub motion_enabled: u32,
+    pub motion_shutter_angle_deg: f32,
+    pub motion_samples: u32,
+    pub motion_max_blur_px: f32,
+}
+
+impl Default for RvePostProcessSettings {
+    /// Совпадает со значениями по умолчанию движка: все эффекты выключены, EV 0, ACES.
+    fn default() -> Self {
+        Self {
+            exposure_enabled: 1,
+            exposure_mode: RVE_EXPOSURE_MODE_MANUAL,
+            exposure_ev: 0.0,
+            exposure_min_ev: -6.0,
+            exposure_max_ev: 6.0,
+            exposure_speed_up: 3.0,
+            exposure_speed_down: 1.0,
+            exposure_low_percent: 10.0,
+            exposure_high_percent: 90.0,
+            tonemapping_enabled: 1,
+            tonemapper: RVE_TONEMAPPER_ACES,
+            bloom_enabled: 0,
+            bloom_intensity: 0.5,
+            bloom_threshold: 1.0,
+            bloom_knee: 0.5,
+            bloom_scatter: 0.7,
+            bloom_tint: [1.0; 3],
+            ao_enabled: 0,
+            ao_radius: 0.5,
+            ao_intensity: 1.0,
+            ao_falloff: 0.6,
+            ao_quality: RVE_AO_QUALITY_MEDIUM,
+            grading_enabled: 0,
+            grading_temperature: 0.0,
+            grading_tint: 0.0,
+            grading_contrast: 1.0,
+            grading_saturation: 1.0,
+            grading_lift: [0.0; 3],
+            grading_gamma: [1.0; 3],
+            grading_gain: [1.0; 3],
+            vignette_enabled: 0,
+            vignette_intensity: 0.4,
+            vignette_smoothness: 0.5,
+            vignette_roundness: 1.0,
+            vignette_color: [0.0; 3],
+            aberration_enabled: 0,
+            aberration_intensity: 0.3,
+            grain_enabled: 0,
+            grain_intensity: 0.3,
+            grain_response: 0.8,
+            dof_enabled: 0,
+            dof_focus_distance: 10.0,
+            dof_aperture: 2.8,
+            dof_focal_length_mm: 50.0,
+            dof_max_blur_px: 16.0,
+            motion_enabled: 0,
+            motion_shutter_angle_deg: 180.0,
+            motion_samples: 12,
+            motion_max_blur_px: 32.0,
+        }
+    }
+}
+
+/// Copies one object's post-process settings to a guest-provided output. Appended in ABI v12.
+pub type RveGetPostProcessFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RvePostProcessSettings) -> bool;
+/// Stages one object's post-process settings. Appended in ABI v12.
+pub type RveSetPostProcessFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    settings: *const RvePostProcessSettings,
+) -> bool;
+
+/// State of one camera screen shader slot: `enabled` is 0 or 1; `params` are `rve_param(0..16)`.
+/// Path and stage are fixed by the scene; appended in ABI v14.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveScreenShaderState {
+    pub enabled: u32,
+    pub params: [f32; 16],
+}
+
+impl Default for RveScreenShaderState {
+    fn default() -> Self {
+        Self {
+            enabled: 0,
+            params: [0.0; 16],
+        }
+    }
+}
+
+/// Writes the number of screen shader slots of one camera. Appended in ABI v14.
+pub type RveScreenShaderCountFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u32) -> bool;
+/// Copies one screen shader slot (zero-based). Appended in ABI v14.
+pub type RveGetScreenShaderFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    out: *mut RveScreenShaderState,
+) -> bool;
+/// Stages enabled flag and parameters of one screen shader slot (zero-based). Appended in ABI v14.
+pub type RveSetScreenShaderFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    slot: u32,
+    state: *const RveScreenShaderState,
+) -> bool;
+
 /// Host callback that copies a guest error string for the duration of the call.
 pub type RveSetErrorFn = unsafe extern "C" fn(ctx: *mut c_void, message: RveStr);
 /// Host callback that appends a guest log event.
@@ -579,6 +1062,661 @@ pub type RveRegisterCommandFn =
     unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, description: RveStr) -> u32;
 /// Host command unregistration callback; returns `RveStatus` as a `u32`.
 pub type RveUnregisterCommandFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr) -> u32;
+/// Reads button action state flags. Appended in ABI v5.
+pub type RveActionStateFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, kind: u32) -> u32;
+/// Reads an axis or vector2 action value after checking its kind. Appended in ABI v5.
+pub type RveActionValueFn =
+    unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, kind: u32, out: *mut [f32; 2]) -> bool;
+/// Copies the active input context name. Appended in ABI v5.
+pub type RveInputContextFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveStr) -> bool;
+/// Stages an input context change. Appended in ABI v5.
+pub type RveSetInputContextFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr) -> bool;
+/// Stages replacement of one action binding slot. Appended in ABI v5.
+pub type RveRebindActionFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    context: RveStr,
+    action: RveStr,
+    slot: RveStr,
+    inputs: *const RveStr,
+    input_count: usize,
+) -> bool;
+/// Iterates one binding slot. A valid empty slot returns true with an empty string at index zero.
+/// Appended in ABI v5.
+pub type RveActionBindingFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    context: RveStr,
+    action: RveStr,
+    slot: RveStr,
+    index: usize,
+    out: *mut RveStr,
+) -> bool;
+/// Stages restoration of the project input bindings. Appended in ABI v5.
+pub type RveResetBindingsFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
+
+/// Cursor state copied to a guest-provided output slot. Appended in ABI v8.
+#[repr(C)]
+pub struct RveCursorState {
+    pub visible: bool,
+    pub locked: bool,
+}
+
+/// Copies the cursor state applied by the host. Appended in ABI v8.
+pub type RveCursorStateFn =
+    unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveCursorState) -> bool;
+/// Stages a cursor visibility or lock change. Appended in ABI v8.
+pub type RveSetCursorFn = unsafe extern "C" fn(ctx: *mut c_void, value: bool) -> bool;
+
+pub const RVE_COLLISION_ENTER: u32 = 0;
+pub const RVE_COLLISION_EXIT: u32 = 1;
+pub const RVE_TRIGGER_ENTER: u32 = 2;
+pub const RVE_TRIGGER_EXIT: u32 = 3;
+/// Событие каждого кадра обновления, пока пара триггера активна; появилось в ABI v18.
+pub const RVE_TRIGGER_STAY: u32 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveRaycastHit {
+    pub object: u64,
+    pub point: [f32; 3],
+    pub normal: [f32; 3],
+    pub distance: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveCharacterMoveResult {
+    pub translation: [f32; 3],
+    pub grounded: bool,
+    pub collided: bool,
+}
+
+/// Collider shape codes for [`RveColliderValue::shape`]. Appended in ABI v18.
+pub const RVE_COLLIDER_BOX: u32 = 0;
+/// Collider shape code; see [`RVE_COLLIDER_BOX`].
+pub const RVE_COLLIDER_SPHERE: u32 = 1;
+/// Collider shape code; see [`RVE_COLLIDER_BOX`]. Mesh shapes are read-only from scripts.
+pub const RVE_COLLIDER_CAPSULE: u32 = 2;
+/// Collider shape code for a convex mesh; read-only, see [`RVE_COLLIDER_BOX`].
+pub const RVE_COLLIDER_CONVEX_MESH: u32 = 3;
+/// Collider shape code for a triangle mesh; read-only, see [`RVE_COLLIDER_BOX`].
+pub const RVE_COLLIDER_TRIANGLE_MESH: u32 = 4;
+
+/// Body kind codes for [`RveRigidBodyValue::kind`]. Appended in ABI v18.
+pub const RVE_BODY_STATIC: u32 = 0;
+/// Body kind code; see [`RVE_BODY_STATIC`].
+pub const RVE_BODY_KINEMATIC: u32 = 1;
+/// Body kind code; see [`RVE_BODY_STATIC`].
+pub const RVE_BODY_DYNAMIC: u32 = 2;
+
+/// Collider component values. `size` is the full box extent; `radius` and `height` apply to
+/// spheres and capsules. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveColliderValue {
+    pub shape: u32,
+    pub trigger: bool,
+    pub size: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub offset: [f32; 3],
+}
+
+/// Rigid body component values. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveRigidBodyValue {
+    pub kind: u32,
+    pub mass: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub gravity_scale: f32,
+    pub lock_rotation: bool,
+}
+
+/// Character controller component values. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveControllerValue {
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+    pub max_slope_deg: f32,
+    pub snap_distance: f32,
+    pub skin: f32,
+    pub push_strength: f32,
+    pub jump_height: f32,
+    pub gravity_scale: f32,
+    pub use_gravity: bool,
+}
+
+/// Query shape codes for [`RveQueryShape::kind`]: sphere, box or capsule. Appended in ABI v18.
+pub const RVE_QUERY_SPHERE: u32 = 0;
+/// Query shape code; see [`RVE_QUERY_SPHERE`].
+pub const RVE_QUERY_BOX: u32 = 1;
+/// Query shape code; see [`RVE_QUERY_SPHERE`].
+pub const RVE_QUERY_CAPSULE: u32 = 2;
+
+/// Convex query shape for overlap and cast callbacks. `size` is the full box extent. Appended in
+/// ABI v17.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveQueryShape {
+    pub kind: u32,
+    pub size: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+}
+
+/// Overlap and cast options. `ignore` points at `ignore_count` object handles and may be null
+/// when the count is zero. Appended in ABI v18.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveQueryOptions {
+    pub layer_mask: u32,
+    pub include_triggers: bool,
+    pub ignore: *const u64,
+    pub ignore_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveCollisionEvent {
+    pub kind: u32,
+    pub other: u64,
+    pub point: [f32; 3],
+    /// Contact normal points from this script object's collider toward `other`.
+    pub normal: [f32; 3],
+}
+
+pub type RvePhysicsRaycastFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    include_triggers: bool,
+    ignore: u64,
+    out: *mut RveRaycastHit,
+) -> bool;
+pub type RvePhysicsVectorFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut [f32; 3]) -> bool;
+pub type RvePhysicsSetVectorFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const [f32; 3]) -> bool;
+pub type RvePhysicsMoveCharacterFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    displacement: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool;
+pub type RvePhysicsBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut bool) -> bool;
+pub type RvePhysicsSetBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: bool) -> bool;
+
+/// Reads a collider component; appended in ABI v18.
+pub type RvePhysicsGetColliderFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveColliderValue) -> bool;
+/// Stages a collider component; appended in ABI v18.
+pub type RvePhysicsSetColliderFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveColliderValue) -> bool;
+/// Reads a rigid body component; appended in ABI v18.
+pub type RvePhysicsGetRigidBodyFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveRigidBodyValue) -> bool;
+/// Stages a rigid body component; appended in ABI v18.
+pub type RvePhysicsSetRigidBodyFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveRigidBodyValue) -> bool;
+/// Reads a character controller component; appended in ABI v18.
+pub type RvePhysicsGetControllerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveControllerValue) -> bool;
+/// Stages a character controller component; appended in ABI v18.
+pub type RvePhysicsSetControllerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveControllerValue) -> bool;
+/// Gravity-aware horizontal move; appended in ABI v18.
+pub type RvePhysicsSimpleMoveFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    velocity: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool;
+/// Reads one `f32` physics value; appended in ABI v18.
+pub type RvePhysicsFloatFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut f32) -> bool;
+/// Lists the bodies overlapping a query shape; appended in ABI v18.
+pub type RvePhysicsOverlapFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    options: *const RveQueryOptions,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Lists every raycast hit in distance order; appended in ABI v18.
+pub type RvePhysicsRaycastAllFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Shape-casts and writes the first hit; `object` is zero when nothing is hit. Appended in ABI v18.
+pub type RvePhysicsShapeCastFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    displacement: *const [f32; 3],
+    skin: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+) -> bool;
+
+/// Audio group code for [`RveAudioParams::group`] and `audio_set_group_volume`. Appended in ABI v7.
+pub const RVE_AUDIO_GROUP_MASTER: u32 = 0;
+/// Audio group code; see [`RVE_AUDIO_GROUP_MASTER`].
+pub const RVE_AUDIO_GROUP_MUSIC: u32 = 1;
+/// Audio group code; see [`RVE_AUDIO_GROUP_MASTER`].
+pub const RVE_AUDIO_GROUP_EFFECTS: u32 = 2;
+/// Audio group code; see [`RVE_AUDIO_GROUP_MASTER`].
+pub const RVE_AUDIO_GROUP_AMBIENT: u32 = 3;
+
+/// Clip parameters for `audio_play_clip`. Appended in ABI v7.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioParams {
+    /// One of the `RVE_AUDIO_GROUP_*` codes; `master` is rejected for clips.
+    pub group: u32,
+    pub volume: f32,
+    pub looping: bool,
+    /// When false, `position` is ignored and the clip plays without a spatial emitter.
+    pub has_position: bool,
+    pub position: [f32; 3],
+}
+
+/// Audio callback on one scene object; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioObjectFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
+/// Audio callback on one scene object with a volume; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioObjectVolumeFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, volume: f32) -> u32;
+/// Starts a clip by virtual path and writes its voice id to `out_voice`; returns `RveStatus` as a `u32`.
+/// Appended in ABI v7.
+pub type RveAudioPlayClipFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioParams,
+    out_voice: *mut u64,
+) -> u32;
+/// Stops one voice by id; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioVoiceFn = unsafe extern "C" fn(ctx: *mut c_void, voice: u64) -> u32;
+/// Sets one audio group's volume; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioGroupVolumeFn =
+    unsafe extern "C" fn(ctx: *mut c_void, group: u32, volume: f32) -> u32;
+
+/// Object state code: the handle is dead, or it never named a live or pending object.
+/// Returned by `RveHost::object_state`. Appended in ABI v9.
+pub const RVE_OBJECT_DEAD: u32 = 0;
+/// Object state code: the object was spawned in this phase and is not in the world yet.
+pub const RVE_OBJECT_PENDING: u32 = 1;
+/// Object state code: the object is in the world.
+pub const RVE_OBJECT_ALIVE: u32 = 2;
+
+/// Prefab state code: the path is not in the project prefab list.
+/// Returned by `RveHost::prefab_state`. Appended in ABI v9.
+pub const RVE_PREFAB_UNKNOWN: u32 = 0;
+/// Prefab state code: a scene fast prefab, always resident.
+pub const RVE_PREFAB_RESIDENT: u32 = 1;
+/// Prefab state code: a heavy prefab that is not in memory.
+pub const RVE_PREFAB_UNLOADED: u32 = 2;
+/// Prefab state code: a heavy prefab whose load is in progress.
+pub const RVE_PREFAB_LOADING: u32 = 3;
+/// Prefab state code: a heavy prefab in memory.
+pub const RVE_PREFAB_LOADED: u32 = 4;
+/// Prefab state code: a heavy prefab whose unload is in progress.
+pub const RVE_PREFAB_UNLOADING: u32 = 5;
+/// Prefab state code: a heavy prefab whose load failed.
+pub const RVE_PREFAB_FAILED: u32 = 6;
+
+/// [`RveSpawnOptions::flags`] bit: `position` is set.
+pub const RVE_SPAWN_HAS_POSITION: u32 = 1 << 0;
+/// [`RveSpawnOptions::flags`] bit: `rotation_deg` is set.
+pub const RVE_SPAWN_HAS_ROTATION: u32 = 1 << 1;
+/// [`RveSpawnOptions::flags`] bit: `scale` is set.
+pub const RVE_SPAWN_HAS_SCALE: u32 = 1 << 2;
+/// [`RveSpawnOptions::flags`] bit: `velocity` is set; it applies only to a dynamic root.
+pub const RVE_SPAWN_HAS_VELOCITY: u32 = 1 << 3;
+/// [`RveSpawnOptions::flags`] bit: `parent` is set.
+pub const RVE_SPAWN_HAS_PARENT: u32 = 1 << 4;
+/// [`RveSpawnOptions::flags`] bit: `name` is set.
+pub const RVE_SPAWN_HAS_NAME: u32 = 1 << 5;
+/// [`RveSpawnOptions::flags`] bit: `id` is set.
+pub const RVE_SPAWN_HAS_ID: u32 = 1 << 6;
+/// Every known [`RveSpawnOptions::flags`] bit. The host refuses a spawn with any other bit set.
+pub const RVE_SPAWN_KNOWN_FLAGS: u32 = RVE_SPAWN_HAS_ID
+    | RVE_SPAWN_HAS_NAME
+    | RVE_SPAWN_HAS_PARENT
+    | RVE_SPAWN_HAS_VELOCITY
+    | RVE_SPAWN_HAS_SCALE
+    | RVE_SPAWN_HAS_ROTATION
+    | RVE_SPAWN_HAS_POSITION;
+
+/// Optional fields of one spawn request. Read only the fields whose presence bit is set in
+/// `flags`; the others may hold any value. Appended in ABI v9.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RveSpawnOptions {
+    /// `RVE_SPAWN_HAS_*` presence bits; unknown bits are refused.
+    pub flags: u32,
+    /// Local position of the new root.
+    pub position: [f32; 3],
+    /// Local Euler rotation of the new root in degrees.
+    pub rotation_deg: [f32; 3],
+    /// Local scale of the new root.
+    pub scale: [f32; 3],
+    /// Initial linear velocity of a dynamic root.
+    pub velocity: [f32; 3],
+    /// Handle of an existing live object that becomes the parent.
+    pub parent: u64,
+    /// Name of the new root.
+    pub name: RveStr,
+    /// Author id of the new root, `[A-Za-z0-9_-]{1,64}`.
+    pub id: RveStr,
+}
+
+/// Spawns a prefab by project virtual path (without a leading slash). Returns the pending handle,
+/// or zero when the host refuses. The options pointer may be null. Appended in ABI v9.
+pub type RveSpawnFn =
+    unsafe extern "C" fn(ctx: *mut c_void, prefab: RveStr, options: *const RveSpawnOptions) -> u64;
+/// Queues an object subtree for removal; a positive delay is in seconds. Returns `false` for a
+/// dead handle or a refused request. Appended in ABI v9.
+pub type RveDestroyObjectFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, delay: f32) -> bool;
+/// Returns one of the `RVE_OBJECT_*` state codes. Appended in ABI v9.
+pub type RveObjectStateFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
+/// Requests a heavy prefab load or unload by path; returns `false` when the host refuses.
+/// Appended in ABI v9.
+pub type RvePrefabRequestFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
+/// Returns one of the `RVE_PREFAB_*` state codes for a prefab path. Appended in ABI v9.
+pub type RvePrefabStateFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> u32;
+/// Playback options for `animation_play`. Appended in ABI v10.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RvePlayAnimationParams {
+    /// Crossfade duration in seconds; zero switches at once.
+    pub fade: f32,
+    /// `-1` keeps the component's default, `0` plays once, `1` loops.
+    pub looping: i32,
+    /// Motion that starts when this one finishes; an empty string means none.
+    pub then: RveStr,
+}
+
+/// Starts a motion on one animated object; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationPlayFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    params: *const RvePlayAnimationParams,
+) -> u32;
+/// Sets a motion's manual weight with a fade; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationSetWeightFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    weight: f32,
+    fade: f32,
+) -> u32;
+/// Sets one blend tree parameter; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationSetParameterFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, name: RveStr, value: f32) -> u32;
+/// Sets the animator speed; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationSetSpeedFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, speed: f32) -> u32;
+/// Stops every motion of one animated object; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationStopFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
+
+/// Gamepad snapshot copied by [`RveGamepadStateFn`]. Button bits use [`GamepadButton`] codes and
+/// axes use [`GamepadAxis`] codes. Appended in ABI v11.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveGamepadState {
+    /// Non-zero when the slot (or any slot, for the aggregate) has a connected gamepad.
+    pub connected: u32,
+    /// Button bits held now.
+    pub down: u32,
+    /// Button bits that became held since the previous script update.
+    pub pressed: u32,
+    /// Button bits that became released since the previous script update.
+    pub released: u32,
+    /// Analog axis values in [`GamepadAxis`] code order.
+    pub axes: [f32; 6],
+}
+
+/// Copies one gamepad snapshot. `pad` is 0 for the aggregate of all slots or 1..=4 for one slot.
+/// Returns `false` and zeroes `out` for any other slot. Appended in ABI v11.
+pub type RveGamepadStateFn =
+    unsafe extern "C" fn(ctx: *mut c_void, pad: u32, out: *mut RveGamepadState) -> bool;
+
+/// Queues one rumble request for `pad` (0 for every connected gamepad, 1..=4 for one slot).
+/// Appended in ABI v11.
+pub type RveGamepadRumbleFn =
+    unsafe extern "C" fn(ctx: *mut c_void, pad: u32, strong: f32, weak: f32, seconds: f32) -> bool;
+/// Network mode code returned by [`RveHost::net_mode`]: no network.
+pub const RVE_NET_MODE_OFFLINE: u32 = 0;
+/// Network mode code: listen server, which also has a local client.
+pub const RVE_NET_MODE_HOST: u32 = 1;
+/// Network mode code: dedicated server.
+pub const RVE_NET_MODE_SERVER: u32 = 2;
+/// Network mode code: client connected to a server.
+pub const RVE_NET_MODE_CLIENT: u32 = 3;
+
+/// Message target code: the server.
+pub const RVE_NET_TARGET_SERVER: u32 = 0;
+/// Message target code: every connected peer.
+pub const RVE_NET_TARGET_ALL: u32 = 1;
+/// Message target code: the peer whose number is passed next to the code.
+pub const RVE_NET_TARGET_PEER: u32 = 2;
+
+/// Network status code: the request was accepted.
+pub const RVE_NET_OK: u32 = 0;
+/// Network status code: the host refused the request in the current phase or state.
+pub const RVE_NET_REJECTED: u32 = 1;
+/// Network status code: the arguments violate the message or peer limits.
+pub const RVE_NET_INVALID_INPUT: u32 = 2;
+
+/// Net event kind: a message from a peer. Also sets `value`.
+pub const RVE_NET_EVENT_MESSAGE: u32 = 0;
+/// Net event kind: a peer connected.
+pub const RVE_NET_EVENT_PEER_CONNECTED: u32 = 1;
+/// Net event kind: a peer disconnected; `reason` is set.
+pub const RVE_NET_EVENT_PEER_DISCONNECTED: u32 = 2;
+
+/// Returns one of the `RVE_NET_MODE_*` codes.
+pub type RveNetModeFn = unsafe extern "C" fn(ctx: *mut c_void) -> u32;
+/// Returns the local peer number.
+pub type RveNetLocalPeerFn = unsafe extern "C" fn(ctx: *mut c_void) -> u32;
+/// Copies up to `capacity` remote peer numbers into `out` and writes the total count to
+/// `count`. A guest may call it with zero capacity to learn the count first.
+pub type RveNetPeersFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    out: *mut u32,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Stages a message for `target_kind` (`RVE_NET_TARGET_*`) and `peer`; returns `RVE_NET_*`.
+pub type RveNetSendFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32;
+/// Copies one object's network number into `out`; returns false when it has no identity.
+pub type RveNetObjectIdFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u32) -> bool;
+/// Writes one object's network boolean into `out`; returns false when the object is unavailable.
+pub type RveNetObjectBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut bool) -> bool;
+/// Stages the owner of one object; returns `RVE_NET_*`.
+pub type RveNetObjectSetOwnerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, peer: u32) -> u32;
+/// Stages a message for the same object on the other side; returns `RVE_NET_*`.
+pub type RveNetObjectSendFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32;
+
+/// Результат UI-вызова хоста: `RVE_UI_OK`, `RVE_UI_REJECTED` или `RVE_UI_INVALID_INPUT`.
+pub const RVE_UI_OK: u32 = 0;
+/// Хост отказал: устаревший хендл, неподдерживаемое свойство или запись запрещена в этой фазе.
+pub const RVE_UI_REJECTED: u32 = 1;
+/// Значение не подходит: не конечное число, неверный индекс, объявленная картинка не найдена.
+pub const RVE_UI_INVALID_INPUT: u32 = 2;
+
+/// Свойства канваса; передаются в `ui_get`/`ui_set` с элементом `0`.
+pub const RVE_UI_PROP_CANVAS_VISIBLE: u32 = 0;
+/// Слой канваса (`i64` в значении, хост проверяет диапазон `i32`).
+pub const RVE_UI_PROP_CANVAS_LAYER: u32 = 1;
+/// Текст `Text` или `InputField`.
+pub const RVE_UI_PROP_TEXT: u32 = 2;
+/// Значение элемента: число, флаг, индекс выпадающего списка (с нуля) или текст.
+pub const RVE_UI_PROP_VALUE: u32 = 3;
+pub const RVE_UI_PROP_VISIBLE: u32 = 4;
+pub const RVE_UI_PROP_INTERACTABLE: u32 = 5;
+/// Цвет элемента в `RveUiValue::color`.
+pub const RVE_UI_PROP_COLOR: u32 = 6;
+
+/// Вид значения в [`RveUiValue::kind`]; `NONE` означает отсутствие значения в событии.
+pub const RVE_UI_VALUE_NONE: u32 = 0;
+pub const RVE_UI_VALUE_NUMBER: u32 = 1;
+pub const RVE_UI_VALUE_BOOL: u32 = 2;
+pub const RVE_UI_VALUE_INDEX: u32 = 3;
+pub const RVE_UI_VALUE_TEXT: u32 = 4;
+pub const RVE_UI_VALUE_COLOR: u32 = 5;
+/// Integer payload for the canvas layer.
+pub const RVE_UI_VALUE_INTEGER: u32 = 6;
+
+/// Вид события UI в [`RveUiEvent::kind`].
+pub const RVE_UI_EVENT_CLICK: u32 = 0;
+pub const RVE_UI_EVENT_VALUE_CHANGED: u32 = 1;
+pub const RVE_UI_EVENT_SUBMIT: u32 = 2;
+pub const RVE_UI_EVENT_CANCEL: u32 = 3;
+pub const RVE_UI_EVENT_FOCUS: u32 = 4;
+pub const RVE_UI_EVENT_BLUR: u32 = 5;
+pub const RVE_UI_EVENT_HOVER_ENTER: u32 = 6;
+pub const RVE_UI_EVENT_HOVER_EXIT: u32 = 7;
+
+/// Значение элемента или свойства канваса. Индекс выпадающего списка считается с нуля.
+/// Строка заимствована: хост или гость владеют её памятью только на время вызова.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveUiValue {
+    /// One of the `RVE_UI_VALUE_*` kinds.
+    pub kind: u32,
+    /// Boolean payload for `RVE_UI_VALUE_BOOL`.
+    pub flag: bool,
+    /// Number payload for `RVE_UI_VALUE_NUMBER`.
+    pub number: f64,
+    /// Index payload for `RVE_UI_VALUE_INDEX`, and integer payload for `RVE_UI_VALUE_INTEGER`.
+    pub integer: i64,
+    /// Text payload for `RVE_UI_VALUE_TEXT`.
+    pub text: RveStr,
+    /// Color payload for `RVE_UI_VALUE_COLOR`, as sRGB bytes.
+    pub color: [u8; 4],
+}
+
+/// Прямоугольник элемента: якоря, pivot и смещения в единицах канваса.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveUiRect {
+    pub anchor_min: [f32; 2],
+    pub anchor_max: [f32; 2],
+    pub pivot: [f32; 2],
+    pub offset_min: [f32; 2],
+    pub offset_max: [f32; 2],
+}
+
+/// Событие UI, доставляемое `on_ui_event`. Строки и значение действительны только для callback.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveUiEvent {
+    /// One of the `RVE_UI_EVENT_*` kinds.
+    pub kind: u32,
+    /// Canvas handle as returned by `ui_open`.
+    pub canvas: u64,
+    /// Element index in the canvas document.
+    pub element: u32,
+    /// Element identifier from the document.
+    pub element_id: RveStr,
+    /// Event value; `kind` is `RVE_UI_VALUE_NONE` when the event carries none.
+    pub value: RveUiValue,
+}
+
+/// Opens a preloaded `.rveui` document owned by the calling object; `out` receives the canvas.
+pub type RveUiOpenFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr, out: *mut u64) -> u32;
+/// Closes a canvas at commit; returns `RVE_UI_*`.
+pub type RveUiCloseFn = unsafe extern "C" fn(ctx: *mut c_void, canvas: u64) -> u32;
+/// Writes the canvas of an object's `ui_canvas` component; false when there is none.
+pub type RveUiObjectCanvasFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u64) -> bool;
+/// Writes the focused element; false when nothing has focus.
+pub type RveUiFocusedFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: *mut u64, element: *mut u32) -> bool;
+/// Whether the pointer was over interactive UI on the last update.
+pub type RveUiPointerOverFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
+/// Writes the element index with this identifier; false when the canvas has no such element.
+pub type RveUiFindFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, id: RveStr, out: *mut u32) -> bool;
+/// Reads a canvas or element property into `out`.
+pub type RveUiGetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    out: *mut RveUiValue,
+) -> u32;
+/// Writes a canvas or element property from `value`.
+pub type RveUiSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    value: *const RveUiValue,
+) -> u32;
+/// Reads an element rectangle into `out`.
+pub type RveUiGetRectFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32, out: *mut RveUiRect) -> u32;
+/// Writes an element rectangle.
+pub type RveUiSetRectFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    rect: *const RveUiRect,
+) -> u32;
+/// Replaces the options of a dropdown; `options` holds `count` borrowed strings.
+pub type RveUiSetOptionsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    options: *const RveStr,
+    count: usize,
+) -> u32;
+/// Sets the image of an `Image` or `Button` element to a declared `.png` path.
+pub type RveUiSetImageFn =
+    unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32, path: RveStr) -> u32;
+/// Moves focus to a focusable element.
+pub type RveUiFocusFn = unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32) -> u32;
+/// Guest `on_ui_event` callback.
+pub type RveUiEventFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    event: RveUiEvent,
+) -> RveStatus;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
@@ -587,7 +1725,8 @@ pub struct RveHost {
     pub ctx: *mut c_void,
     /// Time snapshot for the current lifecycle phase.
     pub time: RveTime,
-    /// Current object's handle, encoded as `index + 1`.
+    /// Current object's handle, encoded as `(generation << 32) | (index + 1)`. The generation
+    /// keeps a stale handle from matching a reused slot; zero means no object.
     pub self_object: u64,
     /// Host error-reporting callback.
     pub set_error: RveSetErrorFn,
@@ -631,7 +1770,524 @@ pub struct RveHost {
     pub register_command: Option<RveRegisterCommandFn>,
     /// Unregisters a command owned by the active script; appended in ABI v4.
     pub unregister_command: Option<RveUnregisterCommandFn>,
+    /// Reads button action flags; appended in ABI v5.
+    pub action_state: Option<RveActionStateFn>,
+    /// Reads an axis or vector2 value; appended in ABI v5.
+    pub action_value: Option<RveActionValueFn>,
+    /// Copies the active input context name; appended in ABI v5.
+    pub input_context: Option<RveInputContextFn>,
+    /// Stages an input context change; appended in ABI v5.
+    pub set_input_context: Option<RveSetInputContextFn>,
+    /// Stages one action binding replacement; appended in ABI v5.
+    pub rebind_action: Option<RveRebindActionFn>,
+    /// Iterates one action binding slot; appended in ABI v5.
+    pub action_binding: Option<RveActionBindingFn>,
+    /// Stages resetting bindings; appended in ABI v5.
+    pub reset_bindings: Option<RveResetBindingsFn>,
+    /// Optional physics callbacks appended in ABI v6.
+    pub raycast: Option<RvePhysicsRaycastFn>,
+    pub get_velocity: Option<RvePhysicsVectorFn>,
+    pub set_velocity: Option<RvePhysicsSetVectorFn>,
+    pub add_impulse: Option<RvePhysicsSetVectorFn>,
+    pub add_force: Option<RvePhysicsSetVectorFn>,
+    pub move_character: Option<RvePhysicsMoveCharacterFn>,
+    pub is_grounded: Option<RvePhysicsBoolFn>,
+    pub set_collider_enabled: Option<RvePhysicsSetBoolFn>,
+    pub is_collider_enabled: Option<RvePhysicsBoolFn>,
+    /// Audio callbacks appended in ABI v7; `None` marks an unavailable callback.
+    pub audio_play_source: Option<RveAudioObjectFn>,
+    pub audio_stop_source: Option<RveAudioObjectFn>,
+    pub audio_set_source_volume: Option<RveAudioObjectVolumeFn>,
+    pub audio_play_clip: Option<RveAudioPlayClipFn>,
+    pub audio_stop_voice: Option<RveAudioVoiceFn>,
+    pub audio_set_group_volume: Option<RveAudioGroupVolumeFn>,
+    /// Copies the cursor state applied by the host; appended in ABI v8.
+    pub cursor_state: Option<RveCursorStateFn>,
+    /// Stages cursor visibility; appended in ABI v8.
+    pub set_cursor_visible: Option<RveSetCursorFn>,
+    /// Stages cursor locking; appended in ABI v8.
+    pub set_cursor_locked: Option<RveSetCursorFn>,
+    /// Spawn, destroy, object-state and prefab callbacks appended in ABI v9; `None` marks an
+    /// unavailable callback.
+    pub spawn: Option<RveSpawnFn>,
+    pub destroy: Option<RveDestroyObjectFn>,
+    pub object_state: Option<RveObjectStateFn>,
+    pub prefab_load: Option<RvePrefabRequestFn>,
+    pub prefab_unload: Option<RvePrefabRequestFn>,
+    pub prefab_state: Option<RvePrefabStateFn>,
+    /// Animation callbacks appended in ABI v10; `None` marks an unavailable callback.
+    pub animation_play: Option<RveAnimationPlayFn>,
+    pub animation_set_weight: Option<RveAnimationSetWeightFn>,
+    pub animation_set_parameter: Option<RveAnimationSetParameterFn>,
+    pub animation_set_speed: Option<RveAnimationSetSpeedFn>,
+    pub animation_stop: Option<RveAnimationStopFn>,
+    /// Gamepad state and rumble callbacks appended in ABI v11; `None` marks an unavailable callback.
+    pub gamepad_state: Option<RveGamepadStateFn>,
+    pub gamepad_rumble: Option<RveGamepadRumbleFn>,
+    /// Copies one camera's post-process settings; appended in ABI v12.
+    pub get_post_process: Option<RveGetPostProcessFn>,
+    /// Stages one camera's post-process settings; appended in ABI v12.
+    pub set_post_process: Option<RveSetPostProcessFn>,
+    /// Network callbacks appended in ABI v13; `None` marks an unavailable callback.
+    pub net_mode: Option<RveNetModeFn>,
+    pub net_local_peer: Option<RveNetLocalPeerFn>,
+    pub net_peers: Option<RveNetPeersFn>,
+    pub net_send: Option<RveNetSendFn>,
+    pub net_object_id: Option<RveNetObjectIdFn>,
+    pub net_object_owner: Option<RveNetObjectIdFn>,
+    pub net_object_is_owner: Option<RveNetObjectBoolFn>,
+    pub net_object_has_authority: Option<RveNetObjectBoolFn>,
+    pub net_object_set_owner: Option<RveNetObjectSetOwnerFn>,
+    pub net_object_send: Option<RveNetObjectSendFn>,
+    /// Screen shader callbacks appended in ABI v14; `None` marks an unavailable callback.
+    pub screen_shader_count: Option<RveScreenShaderCountFn>,
+    pub get_screen_shader: Option<RveGetScreenShaderFn>,
+    pub set_screen_shader: Option<RveSetScreenShaderFn>,
+    /// UI callbacks appended in ABI v16; None on hosts without the game UI.
+    pub ui_open: Option<RveUiOpenFn>,
+    pub ui_close: Option<RveUiCloseFn>,
+    pub ui_object_canvas: Option<RveUiObjectCanvasFn>,
+    pub ui_focused: Option<RveUiFocusedFn>,
+    pub ui_pointer_over: Option<RveUiPointerOverFn>,
+    pub ui_find: Option<RveUiFindFn>,
+    pub ui_get: Option<RveUiGetFn>,
+    pub ui_set: Option<RveUiSetFn>,
+    pub ui_get_rect: Option<RveUiGetRectFn>,
+    pub ui_set_rect: Option<RveUiSetRectFn>,
+    pub ui_set_options: Option<RveUiSetOptionsFn>,
+    pub ui_set_image: Option<RveUiSetImageFn>,
+    pub ui_focus: Option<RveUiFocusFn>,
+    /// Hierarchy, activity, tag, layer and script-enable callbacks appended after the UI tail in ABI v17.
+    /// None marks an unavailable callback.
+    pub object_set_active: Option<RveObjectSetActiveFn>,
+    pub object_is_active: Option<RveObjectBoolQueryFn>,
+    pub object_active_in_hierarchy: Option<RveObjectBoolQueryFn>,
+    pub object_parent: Option<RveObjectParentFn>,
+    pub object_set_parent: Option<RveObjectSetParentFn>,
+    pub object_children: Option<RveObjectListFn>,
+    pub object_world_position: Option<RveObjectVec3QueryFn>,
+    pub object_set_world_position: Option<RveObjectSetVec3Fn>,
+    pub object_world_rotation: Option<RveObjectVec3QueryFn>,
+    pub object_set_world_rotation: Option<RveObjectSetVec3Fn>,
+    pub object_tag: Option<RveObjectStrQueryFn>,
+    pub object_set_tag: Option<RveObjectSetStrFn>,
+    pub object_layer: Option<RveObjectLayerQueryFn>,
+    pub object_set_layer: Option<RveObjectSetLayerFn>,
+    pub object_has_component: Option<RveObjectHasComponentFn>,
+    pub find_objects_by_name: Option<RveFindObjectsFn>,
+    pub find_objects_by_tag: Option<RveFindObjectsFn>,
+    pub script_set_enabled: Option<RveScriptSetEnabledFn>,
+    pub script_enabled: Option<RveScriptEnabledFn>,
+    /// Runtime physics component, character, overlap and cast callbacks appended in ABI v18;
+    /// `None` marks an unavailable callback.
+    pub physics_get_collider: Option<RvePhysicsGetColliderFn>,
+    pub physics_set_collider: Option<RvePhysicsSetColliderFn>,
+    pub physics_get_rigid_body: Option<RvePhysicsGetRigidBodyFn>,
+    pub physics_set_rigid_body: Option<RvePhysicsSetRigidBodyFn>,
+    pub physics_get_controller: Option<RvePhysicsGetControllerFn>,
+    pub physics_set_controller: Option<RvePhysicsSetControllerFn>,
+    pub physics_simple_move: Option<RvePhysicsSimpleMoveFn>,
+    pub physics_jump: Option<RvePhysicsBoolFn>,
+    pub physics_vertical_velocity: Option<RvePhysicsFloatFn>,
+    pub physics_overlaps: Option<RveObjectListFn>,
+    pub physics_overlap: Option<RvePhysicsOverlapFn>,
+    pub physics_raycast_all: Option<RvePhysicsRaycastAllFn>,
+    pub physics_shape_cast: Option<RvePhysicsShapeCastFn>,
+    /// Light, mesh renderer, particle, environment, LOD, audio source and voice callbacks appended
+    /// in ABI v19; `None` marks an unavailable callback.
+    pub light_get: Option<RveLightGetFn>,
+    pub light_set: Option<RveLightSetFn>,
+    pub mesh_get_visible: Option<RveObjectBoolQueryFn>,
+    pub mesh_set_visible: Option<RveObjectSetBoolFn>,
+    pub mesh_set_material_params: Option<RveMeshSetMaterialParamsFn>,
+    pub particles_get_playing: Option<RveObjectBoolQueryFn>,
+    pub particles_set_playing: Option<RveObjectSetBoolFn>,
+    pub particles_command: Option<RveParticlesCommandFn>,
+    pub environment_get: Option<RveEnvironmentGetFn>,
+    pub environment_set: Option<RveEnvironmentSetFn>,
+    pub lod_get: Option<RveLodGetFn>,
+    pub lod_set: Option<RveLodSetFn>,
+    pub audio_get_source: Option<RveAudioGetSourceFn>,
+    pub audio_set_source: Option<RveAudioSetSourceFn>,
+    pub audio_play_clip_ex: Option<RveAudioPlayClipExFn>,
+    pub audio_set_voice_position: Option<RveAudioSetVoicePositionFn>,
+    /// Replaces the material of every mesh part with a `.rvemat` declared in the scene; appended
+    /// in ABI v19 after the audio callbacks.
+    pub mesh_set_material_path: Option<RveMeshSetMaterialPathFn>,
+    /// Full scaled and unscaled time snapshot appended in ABI v20.
+    pub script_time: RveScriptTime,
+    /// Stages a finite nonnegative time scale for the next frame; appended in ABI v20.
+    pub set_time_scale: Option<RveSetTimeScaleFn>,
+    /// Schedules a script-owned timer; a zero repeat interval denotes a one-shot timer.
+    pub schedule_timer: Option<RveScheduleTimerFn>,
+    /// Cancels a timer owned by the calling script.
+    pub cancel_timer: Option<RveCancelTimerFn>,
+    /// Reads a save value; returned strings and nested arrays remain valid for the guest callback.
+    pub save_get: Option<RveSaveGetFn>,
+    /// Stages a save value for the current script transaction.
+    pub save_set: Option<RveSaveSetFn>,
+    /// Stages removal of one save key.
+    pub save_delete: Option<RveSaveKeyFn>,
+    /// Checks whether a save key is present.
+    pub save_has: Option<RveSaveKeyFn>,
+    /// Copies sorted save keys into the caller's string array.
+    pub save_keys: Option<RveSaveKeysFn>,
+    /// Requests an atomic save flush at successful transaction commit.
+    pub save_flush: Option<RveSaveFlushFn>,
+    /// Reads or stages the root object's keep-on-load flag; appended in ABI v21.
+    pub object_keep_on_load: Option<RveObjectBoolQueryFn>,
+    pub object_set_keep_on_load: Option<RveObjectSetBoolFn>,
+    /// Finds a script instance on an object by key (virtual path or heavy name); appended in ABI v22.
+    pub object_script: Option<RveObjectScriptFn>,
+    /// Reads a declared property of a script instance found by [`Self::object_script`].
+    pub script_ref_get: Option<RveScriptRefGetFn>,
+    /// Validates and stages a declared property write of another script instance.
+    pub script_ref_set: Option<RveScriptRefSetFn>,
+    /// Sends a message only to the chosen script instance.
+    pub script_ref_send: Option<RveScriptRefSetFn>,
+    /// Reads the enabled flag of a script instance found by [`Self::object_script`].
+    pub script_ref_enabled: Option<RveObjectBoolQueryFn>,
+    /// Stages the enabled flag of a script instance found by [`Self::object_script`].
+    pub script_ref_set_enabled: Option<RveObjectSetBoolFn>,
+    /// Requests loading a project scene at the end of the frame; the path must be enabled in the project. Appended in ABI v22.
+    pub scene_load: Option<RveSceneLoadFn>,
+    /// Writes the current scene name as a call-scoped string value. Appended in ABI v22.
+    pub scene_current: Option<RveSceneCurrentFn>,
+    /// Requests graceful application shutdown; appended in ABI v23.
+    pub app_quit: Option<RveAppQuitFn>,
+    /// Reads whether the window is in borderless fullscreen. Appended in ABI v24.
+    pub window_fullscreen: Option<RveWindowFullscreenFn>,
+    /// Stages a borderless fullscreen change for the end of the frame. Appended in ABI v24.
+    pub window_set_fullscreen: Option<RveWindowSetFullscreenFn>,
+    /// Stages a PNG screenshot of the window; an empty path selects the default folder.
+    /// Appended in ABI v24.
+    pub window_screenshot: Option<RveWindowScreenshotFn>,
+    /// Stages a system file dialog and writes its nonzero id. Appended in ABI v24.
+    pub file_dialog_open: Option<RveFileDialogOpenFn>,
+    /// Reads a file dialog result by id. Appended in ABI v24.
+    pub file_dialog_poll: Option<RveFileDialogPollFn>,
 }
+
+/// One extension filter of [`RveFileDialog`]; extensions are given without a dot. Appended in
+/// ABI v24.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RveFileDialogFilter {
+    pub name: RveStr,
+    pub extensions: *const RveStr,
+    pub extension_count: usize,
+}
+
+/// System file dialog parameters; empty strings leave the choice to the system. Appended in
+/// ABI v24.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RveFileDialog {
+    /// One of the `RVE_FILE_DIALOG_*` kinds.
+    pub kind: u32,
+    pub title: RveStr,
+    /// Initial folder.
+    pub directory: RveStr,
+    /// Suggested file name.
+    pub file_name: RveStr,
+    pub filters: *const RveFileDialogFilter,
+    pub filter_count: usize,
+}
+
+/// Writes the window fullscreen state into `out`. Appended in ABI v24.
+pub type RveWindowFullscreenFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut bool) -> bool;
+/// Stages a borderless fullscreen change. Appended in ABI v24.
+pub type RveWindowSetFullscreenFn =
+    unsafe extern "C" fn(ctx: *mut c_void, fullscreen: bool) -> bool;
+/// Stages a window screenshot saved as PNG at `path`, or in the default folder for an empty
+/// path. Appended in ABI v24.
+pub type RveWindowScreenshotFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
+/// Stages a file dialog; on success writes its nonzero id into `out`. Appended in ABI v24.
+pub type RveFileDialogOpenFn =
+    unsafe extern "C" fn(ctx: *mut c_void, dialog: *const RveFileDialog, out: *mut u64) -> bool;
+/// Reads a file dialog result. `done` is false while the dialog is open. Once done, selected
+/// paths are copied into `paths` (up to `capacity`), `count` receives their total number (zero
+/// when cancelled) and the result is consumed when the calling script callback succeeds.
+/// Strings remain valid until the calling guest callback ends. Appended in ABI v24.
+pub type RveFileDialogPollFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    id: u64,
+    paths: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+    done: *mut bool,
+) -> bool;
+
+/// Copies one save value into the output; the value is valid until the calling script callback ends.
+pub type RveSaveGetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, key: RveStr, out: *mut RveValue) -> bool;
+/// Stages a save value after validating its tag and object references.
+pub type RveSaveSetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, key: RveStr, value: *const RveValue) -> bool;
+/// Reads or deletes a named save key. The callback is selected by the host field.
+pub type RveSaveKeyFn = unsafe extern "C" fn(ctx: *mut c_void, key: RveStr) -> bool;
+/// Copies sorted save keys into `keys`, writing the full count to `count`.
+pub type RveSaveKeysFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    keys: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Stages a flush request for the current script transaction.
+pub type RveSaveFlushFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
+
+/// Sets a boolean on an object (`mesh_set_visible`, `particles_set_playing`); appended in v19.
+pub type RveObjectSetBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: bool) -> bool;
+/// Light kind code for `RveLightGetFn` and `RveLightSetFn`. Appended in ABI v19.
+pub const RVE_LIGHT_DIRECTIONAL: u32 = 0;
+/// Light kind code; see [`RVE_LIGHT_DIRECTIONAL`].
+pub const RVE_LIGHT_POINT: u32 = 1;
+/// Light kind code; see [`RVE_LIGHT_DIRECTIONAL`].
+pub const RVE_LIGHT_SPOT: u32 = 2;
+/// Particle command code for `particles_command`: restarts the emitter cycle. Appended in v19.
+pub const RVE_PARTICLE_RESTART: u32 = 0;
+/// Particle command code: one-shot burst of `count` particles. Appended in v19.
+pub const RVE_PARTICLE_BURST: u32 = 1;
+/// Largest burst accepted by `particles_command`; the host refuses larger counts.
+pub const RVE_MAX_PARTICLE_BURST: u32 = 4096;
+/// Audio rolloff code for [`RveAudioSourceState::rolloff`]. Appended in v19.
+pub const RVE_AUDIO_ROLLOFF_INVERSE: u32 = 0;
+/// Audio rolloff code; see [`RVE_AUDIO_ROLLOFF_INVERSE`].
+pub const RVE_AUDIO_ROLLOFF_LINEAR: u32 = 1;
+
+/// Light parameters for one light kind. Fields that a kind does not use are ignored on write and
+/// zero on read. Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveLightState {
+    pub color: [f32; 3],
+    /// Directional lights only.
+    pub ambient: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    /// Spot lights only, in degrees.
+    pub inner_angle_deg: f32,
+    /// Spot lights only, in degrees.
+    pub outer_angle_deg: f32,
+    /// Directional lights only.
+    pub shadow_distance: f32,
+    /// Directional lights only: 1..=4.
+    pub shadow_cascades: u32,
+    pub shadows: bool,
+    /// Whether the object's lights contribute to the frame.
+    pub enabled: bool,
+}
+
+/// Procedural sky parameters in linear RGB. Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveProceduralSky {
+    pub zenith_color: [f32; 3],
+    pub horizon_color: [f32; 3],
+    pub ground_color: [f32; 3],
+    pub sun_size_deg: f32,
+    pub sun_intensity: f32,
+}
+
+/// Environment intensity and, for procedural environments, the sky. Appended in ABI v19.
+/// `has_sky` is false for HDR environments; `sky` is then ignored on write.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveEnvironmentState {
+    pub intensity: f32,
+    pub has_sky: bool,
+    pub sky: RveProceduralSky,
+}
+
+/// Mesh material factor overrides. A `has_*` flag set to false keeps the current value.
+/// Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveMeshMaterialParams {
+    pub has_base_color: bool,
+    pub has_emissive: bool,
+    pub has_metallic: bool,
+    pub has_roughness: bool,
+    pub base_color: [f32; 3],
+    pub emissive: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+}
+
+/// Audio source settings readable and writable by scripts. The clip is set by the scene and is
+/// not part of this state. Appended in ABI v19.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioSourceState {
+    /// One of the `RVE_AUDIO_GROUP_*` codes; `master` is rejected.
+    pub group: u32,
+    pub volume: f32,
+    pub looping: bool,
+    pub play_on_start: bool,
+    pub spatial_blend: f32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    /// One of the `RVE_AUDIO_ROLLOFF_*` codes.
+    pub rolloff: u32,
+    pub pitch: f32,
+    pub force_mono: bool,
+}
+
+/// Options for `audio_play_clip_ex`. `follow` is an object handle, zero when unused. Appended in
+/// ABI v19; `RveAudioParams` keeps its v7 layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioPlayExParams {
+    pub group: u32,
+    pub volume: f32,
+    pub looping: bool,
+    pub has_position: bool,
+    pub position: [f32; 3],
+    pub follow: u64,
+    pub spatial_blend: f32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub force_mono: bool,
+}
+
+/// Reads one light of the given kind; returns `false` when the object has no such light.
+pub type RveLightGetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, kind: u32, out: *mut RveLightState) -> bool;
+/// Writes one light of the given kind and its object-level enabled flag.
+pub type RveLightSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    kind: u32,
+    value: *const RveLightState,
+) -> bool;
+/// Writes material factor overrides of a mesh renderer.
+pub type RveMeshSetMaterialParamsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    params: *const RveMeshMaterialParams,
+) -> bool;
+/// Replaces the material of every mesh part with the `.rvemat` at `path`. The path must be declared
+/// in the scene's `[[assets]]`; otherwise the call returns `false` and changes nothing.
+pub type RveMeshSetMaterialPathFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, path: RveStr) -> bool;
+/// Restarts the emitter or queues a burst; `count` is used by bursts only.
+pub type RveParticlesCommandFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, kind: u32, count: u32) -> bool;
+/// Reads the environment of an object; returns `false` without an environment component.
+pub type RveEnvironmentGetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveEnvironmentState) -> bool;
+/// Writes the environment intensity and, when `has_sky` is set, the procedural sky.
+pub type RveEnvironmentSetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveEnvironmentState) -> bool;
+/// Copies LOD distances and the cull distance. Writes at most `capacity` distances and always
+/// stores the full level count in `count`; `has_cull` tells whether `cull` is set.
+pub type RveLodGetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    distances: *mut f32,
+    capacity: usize,
+    count: *mut usize,
+    has_cull: *mut bool,
+    cull: *mut f32,
+) -> bool;
+/// Sets LOD distances (one per level) and an optional cull distance.
+pub type RveLodSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    distances: *const f32,
+    count: usize,
+    has_cull: bool,
+    cull: f32,
+) -> bool;
+/// Reads the audio source settings of an object.
+pub type RveAudioGetSourceFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveAudioSourceState) -> bool;
+/// Writes the audio source settings of an object; the clip is kept.
+pub type RveAudioSetSourceFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveAudioSourceState) -> bool;
+/// Starts a clip with spatial options and writes its voice id; returns the same status code as
+/// `audio_play_clip`.
+pub type RveAudioPlayClipExFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioPlayExParams,
+    out_voice: *mut u64,
+) -> u32;
+/// Pins a voice's emitter at `position` and stops following its object.
+pub type RveAudioSetVoicePositionFn =
+    unsafe extern "C" fn(ctx: *mut c_void, voice: u64, position: *const [f32; 3]) -> u32;
+
+/// Sets an object's own active flag. Returns `false` for a dead object or a refused write.
+pub type RveObjectSetActiveFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, active: bool) -> bool;
+/// Reads a boolean from an object into `out`; returns `false` for an unavailable object.
+pub type RveObjectBoolQueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut bool) -> bool;
+/// Writes the parent handle into `out`; `0` means no parent.
+pub type RveObjectParentFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u64) -> bool;
+/// Sets the parent (`0` for a root). `keep_world` preserves the world pose.
+pub type RveObjectSetParentFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, parent: u64, keep_world: bool) -> bool;
+/// Writes up to `capacity` handles into `out` and the total count into `count`.
+pub type RveObjectListFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Writes a `[x, y, z]` vector into `out`.
+pub type RveObjectVec3QueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut [f32; 3]) -> bool;
+/// Sets a `[x, y, z]` vector read from `value`.
+pub type RveObjectSetVec3Fn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const [f32; 3]) -> bool;
+/// Writes the object's tag into `out`; an empty string means no tag.
+pub type RveObjectStrQueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveStr) -> bool;
+pub type RveObjectSetStrFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: RveStr) -> bool;
+pub type RveObjectLayerQueryFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u32) -> bool;
+pub type RveObjectSetLayerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, layer: u32) -> bool;
+/// Tests a component name from [`RVE_COMPONENT_NAMES`] or `script:<path>`.
+pub type RveObjectHasComponentFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, name: RveStr, out: *mut bool) -> bool;
+/// Writes live objects with the given name or tag into `out`, up to `capacity`, and the total
+/// count into `count`.
+pub type RveFindObjectsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    value: RveStr,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Sets the calling instance's enabled flag.
+pub type RveScriptSetEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, enabled: bool) -> bool;
+/// Reads the calling instance's enabled flag into `out`.
+pub type RveScriptEnabledFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut bool) -> bool;
+/// Finds a script instance on `object` by key and writes its nonzero handle into `out`. Appended in ABI v22.
+pub type RveObjectScriptFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, key: RveStr, out: *mut u64) -> bool;
+/// Copies a declared property of script instance `script` into a call-scoped value. Appended in ABI v22.
+pub type RveScriptRefGetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, script: u64, name: RveStr, out: *mut RveValue) -> bool;
+/// Validates and stages a value for script instance `script` (property write or addressed message).
+pub type RveScriptRefSetFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    script: u64,
+    name: RveStr,
+    value: *const RveValue,
+) -> bool;
+/// Requests a scene load for the end of the frame. Appended in ABI v22.
+pub type RveSceneLoadFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
+/// Copies the current scene name into `out`; valid until the calling guest callback ends.
+pub type RveSceneCurrentFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveValue) -> bool;
+/// Requests graceful application shutdown from the current script callback.
+pub type RveAppQuitFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
 
 /// Guest factory callback.
 pub type RveCreateFn = unsafe extern "C" fn(
@@ -645,6 +2301,30 @@ pub type RveStartFn =
 /// Guest `on_update` callback.
 pub type RveUpdateFn =
     unsafe extern "C" fn(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus;
+/// Guest timer callback appended to the script descriptor in ABI v20.
+pub type RveTimerFn =
+    unsafe extern "C" fn(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus;
+/// Guest property-write callback appended to the script descriptor in ABI v22.
+pub type RveSetPropertyFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    name: RveStr,
+    value: *const RveValue,
+    phase: u32,
+) -> RveStatus;
+/// Changes the transactional time scale for the current script callback.
+pub type RveSetTimeScaleFn = unsafe extern "C" fn(ctx: *mut c_void, scale: f32) -> bool;
+/// Schedules a script-owned timer. A zero repeat interval denotes a one-shot timer.
+pub type RveScheduleTimerFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    delay_seconds: f64,
+    repeat_seconds: f64,
+    tag: RveStr,
+    timer_id: *mut u64,
+) -> u32;
+/// Cancels a script-owned timer and reports whether it was active.
+pub type RveCancelTimerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, timer_id: u64, canceled: *mut bool) -> u32;
 /// Guest message callback.
 pub type RveMessageFn = unsafe extern "C" fn(
     instance: *mut c_void,
@@ -664,6 +2344,12 @@ pub type RveCommandFn = unsafe extern "C" fn(
     name: RveStr,
     args: *const RveStr,
     arg_count: usize,
+) -> RveStatus;
+/// Guest collision and trigger callback.
+pub type RveCollisionFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    event: RveCollisionEvent,
 ) -> RveStatus;
 
 /// Script descriptor layout used by ABI versions 1 and 2.
@@ -703,17 +2389,18 @@ pub struct RveScriptDescV3 {
     /// Releases one successfully created instance.
     pub drop: RveDropFn,
     /// Declared parameters in declaration order; null only when `param_count` is zero.
-    pub params: *const RveParamDesc,
+    pub params: *const RveParamDescV13,
     /// Number of parameter descriptors. Zero means the script declares no schema.
     pub param_count: usize,
 }
 
-/// One exported guest script implementation in ABI version 4.
+/// Script descriptor layout shared by ABI versions 4 and 5.
 ///
-/// The optional command callback was appended in v4. Versions 1 and 2 use
-/// [`RveScriptDescV1`], and version 3 uses [`RveScriptDescV3`]; both are normalized by the host.
+/// The optional command callback was appended in v4; ABI v5 kept this descriptor unchanged.
+/// Versions 1 and 2 use [`RveScriptDescV1`], and version 3 uses [`RveScriptDescV3`]; both are
+/// normalized by the host.
 #[repr(C)]
-pub struct RveScriptDesc {
+pub struct RveScriptDescV4 {
     /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
     pub name: RveStr,
     /// Creates one guest instance.
@@ -729,11 +2416,197 @@ pub struct RveScriptDesc {
     /// Releases one successfully created instance.
     pub drop: RveDropFn,
     /// Declared parameters in declaration order; null only when `param_count` is zero.
-    pub params: *const RveParamDesc,
+    pub params: *const RveParamDescV13,
     /// Number of parameter descriptors. Zero means the script declares no schema.
     pub param_count: usize,
     /// Optional callback for console commands registered by this script.
     pub command: Option<RveCommandFn>,
+}
+
+/// Guest network event callback. `event` is valid only for the call.
+pub type RveNetEventFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    event: RveNetEvent,
+) -> RveStatus;
+
+/// One network event delivered to a guest instance. Text fields are empty and `value` is null
+/// when the event kind does not use them.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveNetEvent {
+    /// One of the `RVE_NET_EVENT_*` kinds.
+    pub kind: u32,
+    /// Sender for messages; the connected or disconnected peer otherwise.
+    pub peer: u32,
+    /// Message name; empty for peer events.
+    pub name: RveStr,
+    /// Message value; null for peer events.
+    pub value: *const RveValue,
+    /// Disconnect reason; empty for other kinds.
+    pub reason: RveStr,
+}
+
+/// One exported guest script implementation in ABI version 6 through 12.
+#[repr(C)]
+pub struct RveScriptDescV6 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDescV13,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    /// Optional collision and trigger callback appended in ABI v6.
+    pub collision: Option<RveCollisionFn>,
+}
+
+/// ABI v13–v14 descriptor layout, kept for modules with pre-v15 parameter descriptors.
+#[repr(C)]
+pub struct RveScriptDescV13 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDescV13,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+}
+
+/// ABI v15 reference-branch descriptor layout: typed parameters and network events, before UI
+/// callbacks. The UI branch appended one nullable ui_event callback to this descriptor stride.
+#[repr(C)]
+pub struct RveScriptDescV15 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+}
+
+/// ABI v16 descriptor layout; ui_event was appended after the v15 descriptor tail.
+#[repr(C)]
+pub struct RveScriptDescV16 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+}
+
+/// ABI v17 descriptor layout; lifecycle callbacks follow the ABI v16 ui_event tail.
+#[repr(C)]
+pub struct RveScriptDescV17 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+}
+
+/// ABI v18 adds physics callbacks to the host and keeps the ABI v17 descriptor layout.
+pub type RveScriptDescV18 = RveScriptDescV17;
+
+/// ABI v19 descriptor layout, retained so old modules can be normalized without reading past it.
+#[repr(C)]
+pub struct RveScriptDescV19 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+}
+
+/// ABI v20 and v21 script descriptor, retained so modules with these layouts load without reading the v22 tail.
+#[repr(C)]
+pub struct RveScriptDescV20 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+    pub on_fixed_update: Option<RveUpdateFn>,
+    pub on_late_update: Option<RveUpdateFn>,
+    pub on_timer: Option<RveTimerFn>,
+}
+
+/// Current script descriptor (ABI v22): the v20 layout plus the nullable property-write callback.
+#[repr(C)]
+pub struct RveScriptDesc {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+    pub on_fixed_update: Option<RveUpdateFn>,
+    pub on_late_update: Option<RveUpdateFn>,
+    pub on_timer: Option<RveTimerFn>,
+    /// Applies a declared property written by another script before this instance's next
+    /// callback. Appended in ABI v22; modules that predate it never receive writes.
+    pub set_property: Option<RveSetPropertyFn>,
 }
 
 /// Parameter kind: boolean.
@@ -746,16 +2619,28 @@ pub const RVE_PARAM_FLOAT: u32 = 2;
 pub const RVE_PARAM_STRING: u32 = 3;
 /// Parameter kind: array of three floating-point numbers.
 pub const RVE_PARAM_VEC3: u32 = 4;
+/// Parameter kind: object reference.
+pub const RVE_PARAM_OBJECT: u32 = 5;
+/// Parameter kind: component-constrained object reference.
+pub const RVE_PARAM_COMPONENT: u32 = 6;
+/// Parameter kind: asset path with optional extension constraint.
+pub const RVE_PARAM_ASSET: u32 = 7;
+/// Parameter kind: string from a fixed set of values.
+pub const RVE_PARAM_ENUM: u32 = 8;
+/// Parameter kind: RGB color in `[0, 1]`.
+pub const RVE_PARAM_COLOR: u32 = 9;
+/// Parameter kind: array of values described recursively by `argument`.
+pub const RVE_PARAM_ARRAY: u32 = 10;
 
 /// [`RveParamDesc::flags`] bit: `min` is set.
 pub const RVE_PARAM_HAS_MIN: u32 = 1;
 /// [`RveParamDesc::flags`] bit: `max` is set.
 pub const RVE_PARAM_HAS_MAX: u32 = 2;
 
-/// One declared script parameter. All pointers refer to process-lifetime data.
+/// ABI v3–v14 parameter descriptor retained for loading older modules.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct RveParamDesc {
+pub struct RveParamDescV13 {
     /// Parameter name in the `[A-Za-z_][A-Za-z0-9_]*` format, at most 64 bytes.
     pub name: RveStr,
     /// One of the `RVE_PARAM_*` kinds.
@@ -770,6 +2655,21 @@ pub struct RveParamDesc {
     pub flags: u32,
     /// Optional UTF-8 label for editors; empty means none.
     pub label: RveStr,
+}
+
+/// One declared script parameter. All pointers refer to process-lifetime data.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveParamDesc {
+    pub name: RveStr,
+    pub kind: u32,
+    pub default: RveValue,
+    pub min: f64,
+    pub max: f64,
+    pub flags: u32,
+    pub label: RveStr,
+    /// Component name, asset extension, enum values, or nested array kind; empty when unused.
+    pub argument: RveStr,
 }
 
 /// Static script table returned from `rve_script_module`.
@@ -805,17 +2705,29 @@ unsafe impl Sync for RveValueData {}
 unsafe impl Sync for RveValue {}
 unsafe impl Sync for RveParamEntry {}
 unsafe impl Sync for RveParamDesc {}
+unsafe impl Sync for RveParamDescV13 {}
 unsafe impl Sync for RveScriptDescV1 {}
 unsafe impl Sync for RveScriptDescV3 {}
+unsafe impl Sync for RveScriptDescV4 {}
+unsafe impl Sync for RveScriptDescV6 {}
+unsafe impl Sync for RveScriptDescV13 {}
+unsafe impl Sync for RveScriptDescV15 {}
+unsafe impl Sync for RveScriptDescV16 {}
+unsafe impl Sync for RveScriptDescV17 {}
+unsafe impl Sync for RveScriptDescV19 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Key, MouseButton, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA,
-        RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
-        RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn, RveHost,
+        Key, MouseButton, PhysicalInput, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR,
+        RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_AO_QUALITY_HIGH,
+        RVE_EXPOSURE_MODE_AUTO, RVE_EXPOSURE_MODE_MANUAL, RVE_SCRIPT_ABI_VERSION,
+        RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_TRIGGER_STAY,
+        RveAnimationStopFn, RveCameraSettings, RveGamepadRumbleFn, RveGamepadStateFn,
+        RveGetCameraSettingsFn, RveGetPostProcessFn, RveHost, RvePhysicsShapeCastFn,
+        RvePostProcessSettings, RveScriptEnabledFn,
     };
 
     #[test]
@@ -882,6 +2794,26 @@ mod tests {
     }
 
     #[test]
+    fn physical_input_names_are_stable_and_explicit_for_mouse_buttons() {
+        assert_eq!(
+            PhysicalInput::from_name("Space"),
+            Some(PhysicalInput::Key(Key::Space))
+        );
+        assert_eq!(
+            PhysicalInput::from_name("Mouse.Left"),
+            Some(PhysicalInput::MouseButton(MouseButton::Left))
+        );
+        assert_eq!(PhysicalInput::Key(Key::ArrowUp).name(), "ArrowUp");
+        assert_eq!(
+            PhysicalInput::MouseButton(MouseButton::Forward).name(),
+            "Mouse.Forward"
+        );
+        assert_eq!(PhysicalInput::from_name("Left"), None);
+        assert_eq!(PhysicalInput::from_name("Mouse.Unknown"), None);
+        assert_eq!(PhysicalInput::from_name("Mouse.Left.Extra"), None);
+    }
+
+    #[test]
     fn camera_settings_codes_and_c_layout_are_stable_and_appended_to_host() {
         assert_eq!(RVE_ANTI_ALIASING_FXAA, 0);
         assert_eq!(RVE_ANTI_ALIASING_NONE, 1);
@@ -910,5 +2842,274 @@ mod tests {
             std::mem::size_of::<Option<RveGetCameraSettingsFn>>(),
             std::mem::size_of::<RveGetCameraSettingsFn>()
         );
+    }
+
+    #[test]
+    fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
+        assert_eq!(RVE_AO_QUALITY_HIGH, 2);
+        assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
+        assert_eq!(
+            std::mem::offset_of!(RvePostProcessSettings, exposure_enabled),
+            0
+        );
+        assert_eq!(std::mem::offset_of!(RvePostProcessSettings, exposure_ev), 8);
+        assert_eq!(std::mem::offset_of!(RvePostProcessSettings, tonemapper), 40);
+        assert_eq!(std::mem::offset_of!(RvePostProcessSettings, bloom_tint), 64);
+        assert_eq!(
+            std::mem::offset_of!(RvePostProcessSettings, motion_samples),
+            228
+        );
+        assert_eq!(std::mem::size_of::<RvePostProcessSettings>(), 236);
+        assert_eq!(
+            std::mem::offset_of!(RveHost, gamepad_state),
+            std::mem::offset_of!(RveHost, animation_stop)
+                + std::mem::size_of::<Option<RveAnimationStopFn>>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(RveHost, gamepad_rumble),
+            std::mem::offset_of!(RveHost, gamepad_state)
+                + std::mem::size_of::<Option<RveGamepadStateFn>>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(RveHost, get_post_process),
+            std::mem::offset_of!(RveHost, gamepad_rumble)
+                + std::mem::size_of::<Option<RveGamepadRumbleFn>>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(RveHost, set_post_process),
+            std::mem::offset_of!(RveHost, get_post_process)
+                + std::mem::size_of::<Option<RveGetPostProcessFn>>()
+        );
+        // Camera settings keep the v2 layout: post-process data never changes it.
+        assert_eq!(std::mem::size_of::<RveCameraSettings>(), 40);
+    }
+
+    #[test]
+    fn post_process_defaults_match_engine_defaults() {
+        let defaults = RvePostProcessSettings::default();
+        assert_eq!(defaults.exposure_enabled, 1);
+        assert_eq!(defaults.exposure_mode, RVE_EXPOSURE_MODE_MANUAL);
+        assert_eq!(defaults.tonemapper, RVE_TONEMAPPER_ACES);
+        assert_eq!(defaults.bloom_enabled, 0);
+        assert_eq!(defaults.motion_samples, 12);
+    }
+
+    #[test]
+    fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_TRIGGER_STAY, 4);
+        assert_eq!(
+            offset_of!(RveHost, physics_get_collider),
+            offset_of!(RveHost, script_enabled) + size_of::<Option<RveScriptEnabledFn>>()
+        );
+    }
+
+    #[test]
+    fn component_callbacks_append_after_the_v18_physics_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(
+            offset_of!(RveHost, light_get),
+            offset_of!(RveHost, physics_shape_cast) + size_of::<Option<RvePhysicsShapeCastFn>>()
+        );
+        assert_eq!(
+            offset_of!(RveHost, mesh_set_material_path)
+                + size_of::<Option<super::RveMeshSetMaterialPathFn>>(),
+            offset_of!(RveHost, script_time)
+        );
+    }
+
+    #[test]
+    fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
+        assert_eq!(size_of::<super::RveScriptTime>(), 40);
+        assert_eq!(align_of::<super::RveScriptTime>(), 8);
+        assert_eq!(offset_of!(super::RveScriptTime, dt), 0);
+        assert_eq!(offset_of!(super::RveScriptTime, unscaled_dt), 4);
+        assert_eq!(offset_of!(super::RveScriptTime, elapsed), 8);
+        assert_eq!(offset_of!(super::RveScriptTime, unscaled_elapsed), 16);
+        assert_eq!(offset_of!(super::RveScriptTime, fixed_dt), 24);
+        assert_eq!(offset_of!(super::RveScriptTime, scale), 28);
+        assert_eq!(offset_of!(super::RveScriptTime, frame), 32);
+
+        assert_eq!(
+            offset_of!(super::RveHost, script_time),
+            offset_of!(super::RveHost, mesh_set_material_path)
+                + size_of::<Option<super::RveMeshSetMaterialPathFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, set_time_scale),
+            offset_of!(super::RveHost, script_time) + size_of::<super::RveScriptTime>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, schedule_timer),
+            offset_of!(super::RveHost, set_time_scale)
+                + size_of::<Option<super::RveSetTimeScaleFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, cancel_timer),
+            offset_of!(super::RveHost, schedule_timer)
+                + size_of::<Option<super::RveScheduleTimerFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, save_get),
+            offset_of!(super::RveHost, cancel_timer) + size_of::<Option<super::RveCancelTimerFn>>()
+        );
+
+        assert_eq!(
+            size_of::<super::RveScriptDescV19>(),
+            offset_of!(super::RveScriptDesc, on_fixed_update)
+        );
+        assert_eq!(
+            offset_of!(super::RveScriptDesc, on_late_update),
+            offset_of!(super::RveScriptDesc, on_fixed_update)
+                + size_of::<Option<super::RveUpdateFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveScriptDesc, on_timer),
+            offset_of!(super::RveScriptDesc, on_late_update)
+                + size_of::<Option<super::RveUpdateFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveScriptDesc, set_property),
+            offset_of!(super::RveScriptDesc, on_timer) + size_of::<Option<super::RveTimerFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveScriptDesc>(),
+            offset_of!(super::RveScriptDesc, set_property)
+                + size_of::<Option<super::RveSetPropertyFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveScriptDescV20>(),
+            offset_of!(super::RveScriptDescV20, on_timer) + size_of::<Option<super::RveTimerFn>>()
+        );
+    }
+
+    #[test]
+    fn abi21_callbacks_append_after_the_abi20_host_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(
+            offset_of!(super::RveHost, save_set),
+            offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, save_delete),
+            offset_of!(super::RveHost, save_set) + size_of::<Option<super::RveSaveSetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, save_has),
+            offset_of!(super::RveHost, save_delete) + size_of::<Option<super::RveSaveKeyFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, save_flush),
+            offset_of!(super::RveHost, save_keys) + size_of::<Option<super::RveSaveKeysFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, object_keep_on_load),
+            offset_of!(super::RveHost, save_flush) + size_of::<Option<super::RveSaveFlushFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, object_set_keep_on_load),
+            offset_of!(super::RveHost, object_keep_on_load)
+                + size_of::<Option<super::RveObjectBoolQueryFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, object_script),
+            offset_of!(super::RveHost, object_set_keep_on_load)
+                + size_of::<Option<super::RveObjectSetBoolFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_get),
+            offset_of!(super::RveHost, object_script)
+                + size_of::<Option<super::RveObjectScriptFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_set),
+            offset_of!(super::RveHost, script_ref_get)
+                + size_of::<Option<super::RveScriptRefGetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_send),
+            offset_of!(super::RveHost, script_ref_set)
+                + size_of::<Option<super::RveScriptRefSetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_enabled),
+            offset_of!(super::RveHost, script_ref_send)
+                + size_of::<Option<super::RveScriptRefSetFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, script_ref_set_enabled),
+            offset_of!(super::RveHost, script_ref_enabled)
+                + size_of::<Option<super::RveObjectBoolQueryFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, scene_load),
+            offset_of!(super::RveHost, script_ref_set_enabled)
+                + size_of::<Option<super::RveObjectSetBoolFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, scene_current),
+            offset_of!(super::RveHost, scene_load) + size_of::<Option<super::RveSceneLoadFn>>()
+        );
+    }
+
+    #[test]
+    fn abi23_app_quit_callback_appends_after_the_scene_host_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
+        assert_eq!(
+            offset_of!(super::RveHost, app_quit),
+            offset_of!(super::RveHost, scene_current)
+                + size_of::<Option<super::RveSceneCurrentFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, window_fullscreen),
+            offset_of!(super::RveHost, app_quit) + size_of::<Option<super::RveAppQuitFn>>()
+        );
+    }
+
+    #[test]
+    fn abi24_window_and_dialog_callbacks_append_after_the_abi23_quit_callback() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        let pointer = size_of::<usize>();
+        assert_eq!(size_of::<Option<super::RveWindowFullscreenFn>>(), pointer);
+        assert_eq!(
+            offset_of!(super::RveHost, window_set_fullscreen),
+            offset_of!(super::RveHost, window_fullscreen) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, window_screenshot),
+            offset_of!(super::RveHost, window_set_fullscreen) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, file_dialog_open),
+            offset_of!(super::RveHost, window_screenshot) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, file_dialog_poll),
+            offset_of!(super::RveHost, file_dialog_open) + pointer
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, file_dialog_poll) + pointer
+        );
+        assert_eq!(offset_of!(super::RveFileDialog, title), pointer);
+        assert_eq!(size_of::<super::RveFileDialog>(), pointer * 9);
+        assert_eq!(size_of::<super::RveFileDialogFilter>(), pointer * 4);
+        assert_eq!(super::RVE_FILE_DIALOG_PICK_FOLDER, 3);
     }
 }

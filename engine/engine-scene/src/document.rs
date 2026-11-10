@@ -1,11 +1,21 @@
 //! TOML-документы сцен и их проверенная схема, независимая от renderer.
 
 use crate::CameraSettings;
-use crate::prefab::PrefabInstance;
+use crate::animation::{AnimatorComponent, validate_animator};
+use crate::audio::{AudioSourceComponent, validate_audio_source};
+use crate::material_slots_serde;
+use crate::network::{
+    NetworkIdentityComponent, NetworkTransformComponent, validate_network_object,
+    validate_scene_net_ids,
+};
+use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
+use crate::physics_material::PhysicsMaterialSettings;
+use crate::prefab::{PREFAB_EXTENSION, PrefabInstance};
+use crate::ui_canvas::{UiCanvasComponent, validate_ui_canvas};
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::ser::SerializeSeq;
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -161,10 +171,33 @@ impl SceneDocument {
                     format!("некорректное имя архива {archive:?}"),
                 ));
             }
+            if let Some(max_instances) = asset.max_instances {
+                let is_prefab = Path::new(asset.path.as_str())
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(PREFAB_EXTENSION));
+                if !is_prefab || max_instances == 0 {
+                    return Err(SceneError::new(
+                        source,
+                        None,
+                        format!(
+                            "max_instances ресурса /{} допустим только для .{PREFAB_EXTENSION} и должен быть больше 0",
+                            asset.path.as_str()
+                        ),
+                    ));
+                }
+            }
         }
 
         let mut object_indices = HashMap::with_capacity(self.objects.len());
         for (index, object) in self.objects.iter().enumerate() {
+            if object.keep_on_load && object.parent.is_some() {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    "keep_on_load is only valid on a root object",
+                ));
+            }
             if self.expanded {
                 if !crate::prefab::valid_expanded_id(&object.id) {
                     return Err(SceneError::new(
@@ -180,6 +213,20 @@ impl SceneDocument {
                     "id должен соответствовать [A-Za-z0-9_-]{1,64}",
                 ));
             }
+            if !object.tag.is_empty() && !valid_ascii_name(&object.tag, true) {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    "tag должен соответствовать [A-Za-z0-9_-]{1,64}",
+                ));
+            }
+            if object.layer >= LAYER_COUNT {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    format!("layer должен быть в диапазоне 0..{LAYER_COUNT}"),
+                ));
+            }
             if object_indices.insert(object.id.as_str(), index).is_some() {
                 return Err(SceneError::new(
                     source,
@@ -189,6 +236,9 @@ impl SceneDocument {
             }
         }
         crate::prefab::validate_instances(self, &asset_paths, &object_indices)?;
+        if self.kind == DocumentKind::Prefab {
+            validate_prefab_object_refs(self, &object_indices)?;
+        }
         let local_only = !self.instances.is_empty();
         if self.kind == DocumentKind::Prefab {
             let roots = self
@@ -224,7 +274,22 @@ impl SceneDocument {
                     format!("родитель {parent:?} не существует"),
                 ));
             }
+            if let Some(parent) = &object.parent
+                && object.is_static
+                && object_indices
+                    .get(parent.as_str())
+                    .is_some_and(|&index| !self.objects[index].is_static)
+            {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    format!("родитель {parent:?} статического объекта должен быть статическим"),
+                ));
+            }
             validate_transform(source, object)?;
+            validate_static_object(source, object)?;
+            validate_physics_components(source, object)?;
+            validate_network_object(source, object)?;
             if let Some(camera) = &object.camera {
                 camera_count += 1;
                 active_camera_count += usize::from(camera.active);
@@ -244,6 +309,39 @@ impl SceneDocument {
                         "настройки камеры",
                     )?;
                 }
+                if let Some(post_process) = &camera.post_process {
+                    require_asset_path(
+                        source,
+                        &object.id,
+                        &asset_paths,
+                        post_process,
+                        "постобработка камеры",
+                    )?;
+                    require_extension(
+                        source,
+                        &object.id,
+                        post_process,
+                        "postprocess",
+                        "постобработка камеры",
+                    )?;
+                }
+                validate_screen_shaders(source, &object.id, &asset_paths, &camera.screen_shaders)?;
+            }
+            if let Some(material) = object.collider.as_ref().and_then(|c| c.material.as_ref()) {
+                require_asset_path(
+                    source,
+                    &object.id,
+                    &asset_paths,
+                    material,
+                    "физический материал",
+                )?;
+                require_extension(
+                    source,
+                    &object.id,
+                    material,
+                    "rvephysmat",
+                    "физический материал",
+                )?;
             }
             if let Some(light) = &object.directional_light {
                 light_count += 1;
@@ -259,12 +357,40 @@ impl SceneDocument {
                 environment_count += 1;
                 validate_environment(source, &object.id, &asset_paths, environment)?;
             }
+            if let Some(audio) = &object.audio_source {
+                validate_audio_source(source, &object.id, &asset_paths, audio)?;
+            }
+            if let Some(animator) = &object.animator {
+                validate_animator(source, object, &asset_paths, animator)?;
+            }
+            if let Some(canvas) = &object.ui_canvas {
+                validate_ui_canvas(source, &object.id, &asset_paths, canvas)?;
+            }
+            if let Some(emitter) = &object.particle_emitter {
+                validate_particle_emitter(source, &object.id, &asset_paths, emitter)?;
+            }
             if let Some(mesh) = &object.mesh_renderer {
                 require_asset_path(source, &object.id, &asset_paths, &mesh.model, "модель")?;
                 require_extension(source, &object.id, &mesh.model, "fbx", "модель")?;
                 if let Some(texture) = &mesh.texture {
                     require_asset_path(source, &object.id, &asset_paths, texture, "текстура")?;
                     require_extension(source, &object.id, texture, "png", "текстура")?;
+                }
+                for material in mesh.materials.iter().flatten() {
+                    require_asset_path(
+                        source,
+                        &object.id,
+                        &asset_paths,
+                        material,
+                        "материал части меша",
+                    )?;
+                    require_extension(
+                        source,
+                        &object.id,
+                        material,
+                        "rvemat",
+                        "материал части меша",
+                    )?;
                 }
                 if let Some(material) = &mesh.material {
                     validate_material_override(source, &object.id, &asset_paths, material)?;
@@ -357,6 +483,9 @@ impl SceneDocument {
             }
         }
 
+        if !local_only {
+            validate_scene_net_ids(source, &self.objects)?;
+        }
         if camera_count == 0 && self.kind == DocumentKind::Scene && !local_only {
             return Err(SceneError::new(
                 source,
@@ -438,6 +567,71 @@ impl SceneDocument {
     }
 }
 
+fn validate_prefab_object_refs(
+    document: &SceneDocument,
+    object_indices: &HashMap<&str, usize>,
+) -> Result<(), SceneError> {
+    let instance_ids = document
+        .instances
+        .iter()
+        .map(|instance| instance.id.as_str())
+        .collect::<HashSet<_>>();
+    let valid_ref = |reference: &str| {
+        object_indices.contains_key(reference)
+            || reference.split_once('.').is_some_and(|(instance, local)| {
+                !local.is_empty() && instance_ids.contains(instance)
+            })
+    };
+    let validate_params = |owner: &str, params: &BTreeMap<String, ParamValue>| {
+        fn refs<'a>(value: &'a ParamValue, output: &mut Vec<&'a str>) {
+            match value {
+                ParamValue::Object(id) if !id.is_empty() => output.push(id),
+                ParamValue::Array(values) => {
+                    for value in values {
+                        refs(value, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut references = Vec::new();
+        for value in params.values() {
+            refs(value, &mut references);
+        }
+        if let Some(reference) = references
+            .into_iter()
+            .find(|reference| !valid_ref(reference))
+        {
+            Err(SceneError::new(
+                document.source_label(),
+                Some(owner),
+                format!("ссылка на объект {reference:?} выходит за пределы префаба"),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    for object in &document.objects {
+        for script in &object.lite_scripts {
+            validate_params(&object.id, &script.params)?;
+        }
+        for script in &object.heavy_scripts {
+            validate_params(&object.id, &script.params)?;
+        }
+    }
+    for instance in &document.instances {
+        for change in &instance.overrides {
+            for params in &change.lite_params {
+                validate_params(&instance.id, &params.params)?;
+            }
+            for params in &change.heavy_params {
+                validate_params(&instance.id, &params.params)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Ресурс, объявленный для включения в архив сцены.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -446,6 +640,9 @@ pub struct SceneAsset {
     pub path: VirtualPath,
     #[serde(default)]
     pub archive: Option<String>,
+    /// Лимит живых spawn-экземпляров; допустим только для `.rveprefab` и больше нуля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u32>,
 }
 
 /// Объект сцены в порядке документа.
@@ -457,6 +654,23 @@ pub struct SceneObject {
     pub name: Option<String>,
     #[serde(default)]
     pub parent: Option<String>,
+    /// `false` скрывает объект и его поддерево из кадра, физики, звука и скриптов.
+    #[serde(default = "default_active", skip_serializing_if = "is_active")]
+    pub active: bool,
+    /// Keeps this object and its descendants when a script loads another scene.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keep_on_load: bool,
+    /// Тег из `[tags]` проекта; пустая строка означает отсутствие тега.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+    /// Слой `0..32` из `[layers]` проекта.
+    #[serde(default, skip_serializing_if = "is_default_layer")]
+    pub layer: u8,
+    /// Статический объект: трансформация и родитель не меняются после загрузки. Предки тоже
+    /// статические; dynamic/kinematic rigid body, character controller, animator и
+    /// network transform запрещены. Основа для оптимизаций неподвижной геометрии.
+    #[serde(rename = "static", default, skip_serializing_if = "is_false")]
+    pub is_static: bool,
     #[serde(default)]
     pub transform: SceneTransform,
     #[serde(default)]
@@ -473,16 +687,226 @@ pub struct SceneObject {
     pub spot_light: Option<SpotLightComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collider: Option<ColliderComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rigid_body: Option<RigidBodyComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_controller: Option<CharacterControllerComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_source: Option<AudioSourceComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animator: Option<AnimatorComponent>,
+    pub particle_emitter: Option<ParticleEmitterComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_identity: Option<NetworkIdentityComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_transform: Option<NetworkTransformComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_canvas: Option<UiCanvasComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]
     pub heavy_scripts: Vec<HeavyScript>,
 }
 
+impl Default for SceneObject {
+    /// Пустой объект активен: `bool::default()` дал бы `false`, поэтому реализация ручная.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: None,
+            parent: None,
+            active: true,
+            keep_on_load: false,
+            tag: String::new(),
+            layer: 0,
+            is_static: false,
+            transform: SceneTransform::default(),
+            camera: None,
+            mesh_renderer: None,
+            lod_group: None,
+            directional_light: None,
+            point_light: None,
+            spot_light: None,
+            environment: None,
+            collider: None,
+            rigid_body: None,
+            character_controller: None,
+            audio_source: None,
+            animator: None,
+            particle_emitter: None,
+            network_identity: None,
+            network_transform: None,
+            ui_canvas: None,
+            lite_scripts: Vec::new(),
+            heavy_scripts: Vec::new(),
+        }
+    }
+}
+
+fn default_active() -> bool {
+    true
+}
+
+fn is_active(active: &bool) -> bool {
+    *active
+}
+
+fn is_default_layer(layer: &u8) -> bool {
+    *layer == 0
+}
+
+/// Число слоёв проекта; `layer` объекта меньше этого значения.
+pub const LAYER_COUNT: u8 = 32;
+
 impl SceneObject {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
     }
+}
+
+/// Shape used by a physics collider.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColliderShape {
+    #[default]
+    Box,
+    Sphere,
+    Capsule,
+    ConvexMesh,
+    TriangleMesh,
+}
+
+/// Collider geometry and contact material settings. Непустой `material` заменяет инлайн-поля
+/// `friction` и `restitution`; `resolved_material` заполняет загрузчик из `.rvephysmat`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ColliderComponent {
+    pub shape: ColliderShape,
+    pub half_extents: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub offset: [f32; 3],
+    pub trigger: bool,
+    pub friction: f32,
+    pub restitution: f32,
+    #[serde(with = "option_virtual_path_serde")]
+    pub material: Option<VirtualPath>,
+    #[serde(skip)]
+    pub resolved_material: Option<PhysicsMaterialSettings>,
+}
+
+impl Default for ColliderComponent {
+    fn default() -> Self {
+        Self {
+            shape: ColliderShape::Box,
+            half_extents: [0.5; 3],
+            radius: 0.5,
+            height: 1.0,
+            offset: [0.0; 3],
+            trigger: false,
+            friction: 0.5,
+            restitution: 0.0,
+            material: None,
+            resolved_material: None,
+        }
+    }
+}
+
+/// Motion type of a rigid body.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RigidBodyKind {
+    Static,
+    Kinematic,
+    #[default]
+    Dynamic,
+}
+
+/// Body settings attached to an object with a collider.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RigidBodyComponent {
+    pub kind: RigidBodyKind,
+    pub mass: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub gravity_scale: f32,
+    pub lock_rotation: bool,
+}
+
+impl Default for RigidBodyComponent {
+    fn default() -> Self {
+        Self {
+            kind: RigidBodyKind::Dynamic,
+            mass: 1.0,
+            linear_damping: 0.0,
+            angular_damping: 0.05,
+            gravity_scale: 1.0,
+            lock_rotation: false,
+        }
+    }
+}
+
+/// Character capsule movement settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CharacterControllerComponent {
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+    pub max_slope_deg: f32,
+    pub snap_distance: f32,
+    pub skin: f32,
+    pub push_strength: f32,
+    /// Гравитация для `simple_move`; по умолчанию выключена, как у старых контроллеров.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_gravity: bool,
+    #[serde(default = "one_f32", skip_serializing_if = "is_one")]
+    pub gravity_scale: f32,
+    #[serde(
+        default = "default_jump_height",
+        skip_serializing_if = "is_default_jump_height"
+    )]
+    pub jump_height: f32,
+}
+
+impl Default for CharacterControllerComponent {
+    fn default() -> Self {
+        Self {
+            radius: 0.35,
+            height: 1.1,
+            step_height: 0.3,
+            max_slope_deg: 45.0,
+            snap_distance: 0.2,
+            skin: 0.02,
+            push_strength: 1.0,
+            use_gravity: false,
+            gravity_scale: 1.0,
+            jump_height: default_jump_height(),
+        }
+    }
+}
+
+fn one_f32() -> f32 {
+    1.0
+}
+
+fn default_jump_height() -> f32 {
+    1.0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_one(value: &f32) -> bool {
+    *value == 1.0
+}
+
+fn is_default_jump_height(value: &f32) -> bool {
+    *value == default_jump_height()
 }
 
 /// Локальная трансформация документа; углы вращения хранятся в градусах.
@@ -507,13 +931,72 @@ impl Default for SceneTransform {
     }
 }
 
+/// Стадия экранного шейдера камеры относительно цепочки постобработки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenShaderStage {
+    /// HDR после TAA/FSR/DLSS, до motion blur, экспозиции, bloom и tonemap.
+    BeforePost,
+    /// LDR после tonemap, до FXAA, film grain и UI.
+    AfterPost,
+}
+
+/// Экранный шейдер камеры: GLSL-ассет, стадия, включение и параметры `rve_param(0..16)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenShaderRef {
+    #[serde(with = "virtual_path_serde")]
+    pub shader: VirtualPath,
+    pub stage: ScreenShaderStage,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Не больше [`MAX_SCREEN_SHADER_PARAMS`] конечных чисел; недостающие считаются нулями.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<f32>,
+}
+
+/// Максимум экранных шейдеров на одну камеру.
+pub const MAX_SCREEN_SHADERS: usize = 4;
+/// Максимум пользовательских параметров экранного шейдера.
+pub const MAX_SCREEN_SHADER_PARAMS: usize = 16;
+
+fn default_enabled() -> bool {
+    true
+}
+
 /// Ссылка на настройки камеры и выбор активной камеры сцены.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraComponent {
     #[serde(default, with = "option_virtual_path_serde")]
     pub settings: Option<VirtualPath>,
+    /// Файл `.postprocess`; без него используется постобработка по умолчанию.
+    #[serde(default, with = "option_virtual_path_serde")]
+    pub post_process: Option<VirtualPath>,
+    /// Экранные шейдеры камеры в порядке записи; не больше [`MAX_SCREEN_SHADERS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screen_shaders: Vec<ScreenShaderRef>,
     pub active: bool,
+    /// Состояние курсора при старте сцены; действует, только если камера активна.
+    #[serde(default, skip_serializing_if = "CameraCursor::is_default")]
+    pub cursor: CameraCursor,
+}
+
+/// Начальное состояние курсора, которое камера задаёт при старте сцены.
+///
+/// Флаги независимы: `hide_on_start` только скрывает курсор, `lock_on_start` только
+/// удерживает его в окне. Значения по умолчанию не записываются в сцену.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CameraCursor {
+    pub hide_on_start: bool,
+    pub lock_on_start: bool,
+}
+
+impl CameraCursor {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Экземпляр FBX, необязательная замена base-color PNG и override материала.
@@ -530,6 +1013,30 @@ pub struct MeshRenderer {
     pub texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialOverride>,
+    /// Material asset per FBX part; empty entries keep the part's FBX material.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "material_slots_serde"
+    )]
+    pub materials: Vec<Option<VirtualPath>>,
+}
+
+/// Модель, геометрия которой нужна мешевому коллайдеру: `model` меш-рендерера, если форма
+/// коллайдера — выпуклый или треугольный меш. Одинакова для сцены, префабов и редактора.
+pub fn mesh_collider_model(
+    collider: Option<ColliderComponent>,
+    mesh: Option<&MeshRenderer>,
+) -> Option<&str> {
+    let collider = collider?;
+    if matches!(
+        collider.shape,
+        ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+    ) {
+        Some(mesh?.model.as_str())
+    } else {
+        None
+    }
 }
 
 pub const MAX_LOD_LEVELS: usize = 6;
@@ -733,6 +1240,10 @@ pub enum ParamValue {
     Float(f64),
     String(String),
     Array(Vec<ParamValue>),
+    /// Scene object id, serialized as `{ object = "id" }`.
+    Object(String),
+    /// Asset virtual path, serialized as `{ asset = "path" }`.
+    Asset(VirtualPath),
 }
 
 impl Serialize for ParamValue {
@@ -745,6 +1256,16 @@ impl Serialize for ParamValue {
             Self::Int(value) => serializer.serialize_i64(*value),
             Self::Float(value) => serializer.serialize_f64(*value),
             Self::String(value) => serializer.serialize_str(value),
+            Self::Object(value) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("object", value)?;
+                map.end()
+            }
+            Self::Asset(value) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("asset", value.as_str())?;
+                map.end()
+            }
             Self::Array(values) => {
                 let mut sequence = serializer.serialize_seq(Some(values.len()))?;
                 for value in values {
@@ -767,9 +1288,8 @@ impl<'de> Deserialize<'de> for ParamValue {
             type Value = ParamValue;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(
-                    "логическое значение, целое число, вещественное число, строка или массив таких значений",
-                )
+                formatter
+                    .write_str("логическое значение, число, строка, массив или ссылка object/asset")
             }
 
             fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
@@ -812,13 +1332,28 @@ impl<'de> Deserialize<'de> for ParamValue {
                 Ok(ParamValue::Array(values))
             }
 
-            fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                Err(de::Error::custom(
-                    "вложенные таблицы параметров и даты/время TOML не поддерживаются",
-                ))
+                let Some(key) = map.next_key::<String>()? else {
+                    return Err(de::Error::custom("таблица параметра не может быть пустой"));
+                };
+                let value = map.next_value::<String>()?;
+                if map.next_key::<String>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "ссылка параметра должна содержать только один ключ",
+                    ));
+                }
+                match key.as_str() {
+                    "object" => Ok(ParamValue::Object(value)),
+                    "asset" => VirtualPath::parse(&value)
+                        .map(ParamValue::Asset)
+                        .map_err(de::Error::custom),
+                    _ => Err(de::Error::custom(
+                        "таблица параметра должна содержать только object или asset",
+                    )),
+                }
             }
         }
 
@@ -834,6 +1369,9 @@ pub struct LiteScript {
     pub path: VirtualPath,
     #[serde(default)]
     pub params: BTreeMap<String, ParamValue>,
+    /// Начальный флаг `script:set_enabled`; `false` создаёт экземпляр выключенным.
+    #[serde(default = "default_active", skip_serializing_if = "is_active")]
+    pub enabled: bool,
 }
 
 /// Фабрика скрипта, зарегистрированная игровым крейтом.
@@ -843,6 +1381,9 @@ pub struct HeavyScript {
     pub name: String,
     #[serde(default)]
     pub params: BTreeMap<String, ParamValue>,
+    /// Начальный флаг `script:set_enabled`; `false` создаёт экземпляр выключенным.
+    #[serde(default = "default_active", skip_serializing_if = "is_active")]
+    pub enabled: bool,
 }
 
 fn validate_transform(source: &str, object: &SceneObject) -> Result<(), SceneError> {
@@ -862,48 +1403,220 @@ fn validate_transform(source: &str, object: &SceneObject) -> Result<(), SceneErr
     Ok(())
 }
 
+/// Компоненты, которые двигают объект, несовместимы с `static`.
+fn validate_static_object(source: &str, object: &SceneObject) -> Result<(), SceneError> {
+    if !object.is_static {
+        return Ok(());
+    }
+    let moving = if object
+        .rigid_body
+        .is_some_and(|body| body.kind != RigidBodyKind::Static)
+    {
+        Some("dynamic или kinematic rigid_body")
+    } else if object.character_controller.is_some() {
+        Some("character_controller")
+    } else if object.animator.is_some() {
+        Some("animator")
+    } else if object.network_transform.is_some() {
+        Some("network_transform")
+    } else {
+        None
+    };
+    match moving {
+        Some(component) => Err(SceneError::new(
+            source,
+            Some(&object.id),
+            format!("статический объект не может иметь {component}"),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(), SceneError> {
+    if let Some(collider) = &object.collider {
+        if !collider
+            .half_extents
+            .into_iter()
+            .chain([collider.radius, collider.height])
+            .all(f32::is_finite)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider dimensions должны содержать конечные числа",
+            ));
+        }
+        if !collider.offset.into_iter().all(f32::is_finite) {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider.offset должен содержать конечные числа",
+            ));
+        }
+        if !collider.friction.is_finite() || collider.friction < 0.0 {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider.friction должен быть конечным и >= 0",
+            ));
+        }
+        if !collider.restitution.is_finite() || !(0.0..=1.0).contains(&collider.restitution) {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider.restitution должен быть конечным и находиться в диапазоне [0, 1]",
+            ));
+        }
+        let valid_dimensions = match collider.shape {
+            ColliderShape::Box => collider.half_extents.into_iter().all(|value| value > 0.0),
+            ColliderShape::Sphere => collider.radius > 0.0,
+            ColliderShape::Capsule => collider.radius > 0.0 && collider.height > 0.0,
+            ColliderShape::ConvexMesh | ColliderShape::TriangleMesh => true,
+        };
+        if !valid_dimensions {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider dimensions должны быть > 0 для выбранной формы",
+            ));
+        }
+        if matches!(
+            collider.shape,
+            ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+        ) && object.mesh_renderer.is_none()
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider mesh shape требует mesh_renderer",
+            ));
+        }
+    }
+
+    if let Some(body) = &object.rigid_body {
+        if object.collider.is_none() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "rigid_body требует collider",
+            ));
+        }
+        if !body.mass.is_finite()
+            || body.mass <= 0.0
+            || !body.linear_damping.is_finite()
+            || body.linear_damping < 0.0
+            || !body.angular_damping.is_finite()
+            || body.angular_damping < 0.0
+            || !body.gravity_scale.is_finite()
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "rigid_body mass должен быть > 0, damping >= 0, а все числа конечными",
+            ));
+        }
+        if body.kind == RigidBodyKind::Dynamic
+            && object
+                .collider
+                .as_ref()
+                .is_some_and(|collider| collider.shape == ColliderShape::TriangleMesh)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "dynamic rigid_body несовместим с triangle_mesh",
+            ));
+        }
+        if body.kind == RigidBodyKind::Dynamic && object.parent.is_some() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "dynamic rigid_body должен быть корневым объектом",
+            ));
+        }
+    }
+
+    if let Some(controller) = &object.character_controller {
+        if object.collider.is_some() || object.rigid_body.is_some() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller несовместим с collider и rigid_body",
+            ));
+        }
+        if ![
+            controller.radius,
+            controller.height,
+            controller.step_height,
+            controller.max_slope_deg,
+            controller.snap_distance,
+            controller.skin,
+            controller.push_strength,
+            controller.gravity_scale,
+            controller.jump_height,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller должен содержать конечные числа",
+            ));
+        }
+        if controller.radius <= 0.0
+            || controller.height <= 0.0
+            || controller.step_height < 0.0
+            || !(0.0 < controller.max_slope_deg && controller.max_slope_deg < 90.0)
+            || controller.snap_distance < 0.0
+            || controller.skin < 0.0
+            || controller.push_strength < 0.0
+            || controller.gravity_scale < 0.0
+            || controller.jump_height < 0.0
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller требует положительные radius/height, slope в (0, 90) и остальные значения >= 0",
+            ));
+        }
+        if object.parent.is_some() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller должен быть корневым объектом",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Переводит причину отказа общего правила (`world::*_problem`) в ошибку сцены с объектом.
+fn problem_error(
+    source: &str,
+    object_id: &str,
+    problem: Option<&'static str>,
+) -> Result<(), SceneError> {
+    match problem {
+        Some(problem) => Err(SceneError::new(source, Some(object_id), problem)),
+        None => Ok(()),
+    }
+}
+
+// Правила света и окружения берутся из `world::components`, чтобы сцена, скрипты и редактор
+// не расходились в проверках.
+
 fn validate_light(
     source: &str,
     object: &SceneObject,
     light: &DirectionalLightComponent,
 ) -> Result<(), SceneError> {
-    if !light
-        .color
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.color должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light
-        .ambient
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.ambient должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light.shadow_distance.is_finite() || light.shadow_distance <= 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.shadow_distance должен быть конечным и > 0",
-        ));
-    }
-    if !(1..=crate::light::MAX_SHADOW_CASCADES).contains(&light.shadow_cascades) {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "directional_light.shadow_cascades должен быть в диапазоне 1..=4",
-        ));
-    }
-    Ok(())
+    problem_error(
+        source,
+        &object.id,
+        crate::world::directional_light_problem(light),
+    )
 }
 
 fn validate_point_light(
@@ -911,32 +1624,7 @@ fn validate_point_light(
     object: &SceneObject,
     light: &PointLightComponent,
 ) -> Result<(), SceneError> {
-    if !light
-        .color
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "point_light.color должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light.intensity.is_finite() || light.intensity < 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "point_light.intensity должен быть конечным и >= 0",
-        ));
-    }
-    if !light.range.is_finite() || light.range <= 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "point_light.range должен быть конечным и > 0",
-        ));
-    }
-    Ok(())
+    problem_error(source, &object.id, crate::world::point_light_problem(light))
 }
 
 fn validate_spot_light(
@@ -944,44 +1632,7 @@ fn validate_spot_light(
     object: &SceneObject,
     light: &SpotLightComponent,
 ) -> Result<(), SceneError> {
-    if !light
-        .color
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light.color должен содержать конечные компоненты >= 0",
-        ));
-    }
-    if !light.intensity.is_finite() || light.intensity < 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light.intensity должен быть конечным и >= 0",
-        ));
-    }
-    if !light.range.is_finite() || light.range <= 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light.range должен быть конечным и > 0",
-        ));
-    }
-    if !light.inner_angle_deg.is_finite()
-        || !light.outer_angle_deg.is_finite()
-        || light.inner_angle_deg <= 0.0
-        || light.inner_angle_deg > light.outer_angle_deg
-        || light.outer_angle_deg > 90.0
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "spot_light angles должны удовлетворять 0 < inner_angle_deg <= outer_angle_deg <= 90",
-        ));
-    }
-    Ok(())
+    problem_error(source, &object.id, crate::world::spot_light_problem(light))
 }
 
 pub(crate) fn validate_environment(
@@ -997,46 +1648,21 @@ pub(crate) fn validate_environment(
             "environment должен задавать ровно один источник: hdr или procedural",
         ));
     }
-    if !environment.intensity.is_finite() || environment.intensity < 0.0 {
-        return Err(SceneError::new(
-            source,
-            Some(object_id),
-            "environment.intensity должен быть конечным и >= 0",
-        ));
-    }
+    problem_error(
+        source,
+        object_id,
+        crate::world::environment_intensity_problem(environment.intensity),
+    )?;
     if let Some(path) = &environment.hdr {
         require_asset_path(source, object_id, assets, path, "HDR environment")?;
         require_extension(source, object_id, path, "hdr", "HDR environment")?;
     }
     if let Some(sky) = environment.procedural {
-        if [sky.zenith_color, sky.horizon_color, sky.ground_color]
-            .into_iter()
-            .flatten()
-            .any(|value| !value.is_finite() || value < 0.0)
-        {
-            return Err(SceneError::new(
-                source,
-                Some(object_id),
-                "environment.procedural цвета должны содержать конечные компоненты >= 0",
-            ));
-        }
-        if !sky.sun_size_deg.is_finite()
-            || !(0.0..=180.0).contains(&sky.sun_size_deg)
-            || sky.sun_size_deg == 0.0
-        {
-            return Err(SceneError::new(
-                source,
-                Some(object_id),
-                "environment.procedural.sun_size_deg должен быть конечным и в диапазоне (0, 180]",
-            ));
-        }
-        if !sky.sun_intensity.is_finite() || sky.sun_intensity < 0.0 {
-            return Err(SceneError::new(
-                source,
-                Some(object_id),
-                "environment.procedural.sun_intensity должен быть конечным и >= 0",
-            ));
-        }
+        problem_error(
+            source,
+            object_id,
+            crate::world::procedural_sky_problem(&sky),
+        )?;
     }
     Ok(())
 }
@@ -1100,6 +1726,16 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, key, path))
             }));
+            paths.extend(
+                renderer
+                    .get("materials")
+                    .and_then(toml::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(toml::Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| (object_id, "materials", path)),
+            );
             if let Some(material) = renderer.get("material").and_then(toml::Value::as_table) {
                 paths.extend(
                     [
@@ -1118,6 +1754,14 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                 );
             }
         }
+        if let Some(collider) = object.get("collider").and_then(toml::Value::as_table) {
+            paths.extend(
+                collider
+                    .get("material")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "collider.material", path)),
+            );
+        }
         if let Some(camera) = object.get("camera").and_then(toml::Value::as_table) {
             paths.extend(
                 camera
@@ -1125,6 +1769,21 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, "camera.settings", path)),
             );
+            paths.extend(
+                camera
+                    .get("post_process")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "camera.post_process", path)),
+            );
+            if let Some(shaders) = camera.get("screen_shaders").and_then(toml::Value::as_array) {
+                paths.extend(
+                    shaders
+                        .iter()
+                        .filter_map(toml::Value::as_table)
+                        .filter_map(|table| table.get("shader").and_then(toml::Value::as_str))
+                        .map(|path| (object_id, "camera.screen_shaders.shader", path)),
+                );
+            }
         }
         if let Some(environment) = object.get("environment").and_then(toml::Value::as_table) {
             paths.extend(
@@ -1304,6 +1963,44 @@ pub(crate) fn validate_material_override(
         if let Some(path) = path {
             require_asset_path(source, object_id, assets, path, kind)?;
             require_extension(source, object_id, path, "png", kind)?;
+        }
+    }
+    Ok(())
+}
+
+/// Проверяет экранные шейдеры камеры: не больше четырёх, объявленные `.glsl` и конечные параметры
+/// не длиннее шестнадцати. Общая для сцены, префабов и их override.
+pub(crate) fn validate_screen_shaders(
+    source: &str,
+    object_id: &str,
+    assets: &HashSet<VirtualPath>,
+    shaders: &[ScreenShaderRef],
+) -> Result<(), SceneError> {
+    if shaders.len() > MAX_SCREEN_SHADERS {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            format!("у камеры больше {MAX_SCREEN_SHADERS} экранных шейдеров"),
+        ));
+    }
+    for shader in shaders {
+        require_asset_path(source, object_id, assets, &shader.shader, "экранный шейдер")?;
+        require_extension(source, object_id, &shader.shader, "glsl", "экранный шейдер")?;
+        if shader.params.len() > MAX_SCREEN_SHADER_PARAMS {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                format!(
+                    "экранный шейдер принимает не больше {MAX_SCREEN_SHADER_PARAMS} параметров"
+                ),
+            ));
+        }
+        if !shader.params.iter().all(|value| value.is_finite()) {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "параметры экранного шейдера должны быть конечными",
+            ));
         }
     }
     Ok(())
@@ -1505,7 +2202,11 @@ pub(crate) mod option_virtual_path_serde {
 
 #[cfg(test)]
 mod tests {
-    use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, ParamValue, SceneDocument};
+    use super::ScreenShaderStage;
+    use super::{
+        CharacterControllerComponent, ColliderComponent, LodGroup, LodLevel, MAX_LOD_LEVELS,
+        MaterialAlphaMode, ParamValue, RigidBodyComponent, SceneDocument,
+    };
     use engine_files::VirtualPath;
 
     const VALID: &str = r#"
@@ -1528,8 +2229,91 @@ id = "camera"
         assert!(document.validate().unwrap_err().message.contains("камер"));
     }
 
+    #[test]
+    fn keep_on_load_defaults_false_and_is_valid_only_on_scene_roots() {
+        let root =
+            parse("[[objects]]\nid = \"root\"\nkeep_on_load = true\n[objects.camera]\n").unwrap();
+        assert!(root.objects[0].keep_on_load);
+        let defaulted = parse("[[objects]]\nid = \"camera\"\n[objects.camera]\n").unwrap();
+        assert!(!defaulted.objects[0].keep_on_load);
+        assert!(!defaulted.to_toml().unwrap().contains("keep_on_load"));
+        assert!(parse(&root.to_toml().unwrap()).unwrap().objects[0].keep_on_load);
+        error(
+            "[[objects]]\nid = \"root\"\n[objects.camera]\n[[objects]]\nid = \"child\"\nparent = \"root\"\nkeep_on_load = true\n",
+            "root object",
+        );
+    }
+
     fn parse(input: &str) -> Result<SceneDocument, super::SceneError> {
         SceneDocument::parse("scenes/test.rvescene", input)
+    }
+
+    #[test]
+    fn static_flag_round_trips_and_is_omitted_when_false() {
+        let document = parse(&format!(
+            "{VALID}[[objects]]\nid = \"rock\"\nstatic = true\n[[objects]]\nid = \"crate\"\n"
+        ))
+        .unwrap();
+        assert!(document.objects[1].is_static);
+        assert!(!document.objects[2].is_static);
+
+        let saved = document.to_toml().unwrap();
+        assert_eq!(saved.matches("static = true").count(), 1, "{saved}");
+        assert!(!saved.contains("static = false"), "{saved}");
+        assert_eq!(parse(&saved).unwrap().objects, document.objects);
+    }
+
+    #[test]
+    fn static_object_requires_static_ancestors() {
+        let scene = |parent_static: &str| {
+            format!(
+                "{VALID}[[objects]]\nid = \"base\"\n{parent_static}[[objects]]\nid = \"rock\"\nparent = \"base\"\nstatic = true\n"
+            )
+        };
+        error(&scene(""), "статического объекта должен быть статическим");
+        assert!(parse(&scene("static = true\n")).is_ok());
+        let dynamic_child = format!(
+            "{VALID}[[objects]]\nid = \"base\"\nstatic = true\n[[objects]]\nid = \"lamp\"\nparent = \"base\"\n"
+        );
+        assert!(
+            parse(&dynamic_child).is_ok(),
+            "нестатический потомок допустим"
+        );
+    }
+
+    #[test]
+    fn static_object_rejects_components_that_move_it() {
+        let rock = |components: &str| {
+            format!("{VALID}[[objects]]\nid = \"rock\"\nstatic = true\n{components}")
+        };
+        let collider = "[objects.collider]\n";
+        error(
+            &rock(&format!(
+                "{collider}[objects.rigid_body]\nkind = \"dynamic\"\n"
+            )),
+            "dynamic или kinematic rigid_body",
+        );
+        error(
+            &rock(&format!(
+                "{collider}[objects.rigid_body]\nkind = \"kinematic\"\n"
+            )),
+            "dynamic или kinematic rigid_body",
+        );
+        assert!(
+            parse(&rock(&format!(
+                "{collider}[objects.rigid_body]\nkind = \"static\"\n"
+            )))
+            .is_ok()
+        );
+        assert!(parse(&rock(collider)).is_ok());
+        error(
+            &rock("[objects.character_controller]\n"),
+            "character_controller",
+        );
+        error(
+            &rock("[objects.network_identity]\n[objects.network_transform]\n"),
+            "network_transform",
+        );
     }
 
     fn error(input: &str, contains: &str) {
@@ -1835,6 +2619,49 @@ scale=[1.0,1.0,0.0]
     }
 
     #[test]
+    fn collider_material_must_be_an_asset_with_rvephysmat_extension() {
+        let missing = format!(
+            "{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nmaterial=\"/materials/ice.rvephysmat\"\n"
+        );
+        error(&missing, "отсутствует в [[assets]]");
+        let wrong_extension = format!(
+            "[[assets]]\npath=\"/materials/ice.toml\"\n{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nmaterial=\"/materials/ice.toml\"\n"
+        );
+        error(&wrong_extension, "расширение .rvephysmat");
+        let valid = format!(
+            "[[assets]]\npath=\"/materials/ice.rvephysmat\"\n{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nfriction=0.2\nrestitution=0.8\nmaterial=\"/materials/ice.rvephysmat\"\n"
+        );
+        let document = parse(&valid).unwrap();
+        let collider = document
+            .objects
+            .iter()
+            .find(|object| object.id == "ball")
+            .and_then(|object| object.collider.as_ref())
+            .unwrap();
+        assert_eq!(
+            collider.material.as_ref().map(|path| path.as_str()),
+            Some("materials/ice.rvephysmat")
+        );
+        assert!(collider.resolved_material.is_none());
+    }
+
+    #[test]
+    fn scene_documents_without_collider_material_keep_inline_friction_values() {
+        let input = format!(
+            "{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nfriction=0.2\nrestitution=0.8\n"
+        );
+        let document = parse(&input).unwrap();
+        let collider = document
+            .objects
+            .iter()
+            .find(|object| object.id == "ball")
+            .and_then(|object| object.collider.as_ref())
+            .unwrap();
+        assert!(collider.material.is_none());
+        assert_eq!((collider.friction, collider.restitution), (0.2, 0.8));
+    }
+
+    #[test]
     fn component_paths_must_be_assets_with_expected_case_insensitive_extensions() {
         let missing = format!(
             "{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n"
@@ -1873,6 +2700,129 @@ scale=[1.0,1.0,0.0]
             )
         );
         assert!(parse(&good).is_ok());
+    }
+
+    #[test]
+    fn camera_post_process_must_be_a_declared_postprocess_asset() {
+        let rejects = |input: &str, expected: &str| {
+            let message = parse(input).unwrap_err().to_string();
+            assert!(message.contains(expected), "{message}");
+        };
+        let with_post_process = |path: &str| {
+            VALID.replace(
+                "[objects.camera]",
+                &format!("[objects.camera]\npost_process=\"{path}\""),
+            )
+        };
+        rejects(
+            &with_post_process("/post/default.postprocess"),
+            "отсутствует в [[assets]]",
+        );
+        let wrong_extension = format!(
+            "[[assets]]\npath=\"/post/default.toml\"\n{}",
+            with_post_process("/post/default.toml")
+        );
+        rejects(&wrong_extension, "расширение .postprocess");
+        let good = format!(
+            "[[assets]]\npath=\"/post/Default.POSTprocess\"\n{}",
+            with_post_process("/post/Default.POSTprocess")
+        );
+        let document = parse(&good).unwrap();
+        assert!(
+            document.objects[0]
+                .camera
+                .as_ref()
+                .is_some_and(|camera| camera.post_process.is_some())
+        );
+    }
+
+    /// Камера с экранными шейдерами поверх `VALID`; `extra` вставляется строками после `[objects.camera]`.
+    fn camera_with_screen_shaders(extra: &str) -> String {
+        format!(
+            "[[assets]]\npath=\"/fx/vhs.glsl\"\n[[assets]]\npath=\"/fx/crt.glsl\"\n{}",
+            VALID.replace("[objects.camera]", &format!("[objects.camera]\n{extra}"))
+        )
+    }
+
+    #[test]
+    fn screen_shaders_parse_with_defaults_and_round_trip() {
+        let document = parse(&camera_with_screen_shaders(
+            "[[objects.camera.screen_shaders]]\nshader=\"/fx/vhs.glsl\"\nstage=\"after_post\"\nparams=[0.7, 0.3]\n[[objects.camera.screen_shaders]]\nshader=\"/fx/crt.glsl\"\nstage=\"before_post\"\nenabled=false",
+        ))
+        .unwrap();
+        let shaders = &document.objects[0].camera.as_ref().unwrap().screen_shaders;
+        assert_eq!(shaders.len(), 2);
+        assert_eq!(shaders[0].stage, ScreenShaderStage::AfterPost);
+        assert!(shaders[0].enabled, "enabled по умолчанию true");
+        assert_eq!(shaders[0].params, [0.7, 0.3]);
+        assert_eq!(shaders[1].stage, ScreenShaderStage::BeforePost);
+        assert!(!shaders[1].enabled);
+        assert!(shaders[1].params.is_empty());
+
+        let written = document.to_toml().unwrap();
+        let reparsed = parse(&written).unwrap();
+        assert_eq!(
+            reparsed.objects[0].camera.as_ref().unwrap().screen_shaders,
+            *shaders
+        );
+    }
+
+    #[test]
+    fn scene_without_screen_shaders_is_written_without_the_field() {
+        let document = parse(VALID).unwrap();
+        let written = document.to_toml().unwrap();
+        assert!(!written.contains("screen_shaders"), "{written}");
+    }
+
+    #[test]
+    fn screen_shaders_reject_invalid_declarations() {
+        let shader = |path: &str, params: &str| {
+            format!(
+                "[[objects.camera.screen_shaders]]\nshader=\"{path}\"\nstage=\"after_post\"\n{params}"
+            )
+        };
+        let rejects = |input: String, expected: &str| {
+            let message = parse(&input).unwrap_err().to_string();
+            assert!(message.contains(expected), "{message}");
+        };
+        let five = (0..5)
+            .map(|_| shader("/fx/vhs.glsl", ""))
+            .collect::<String>();
+        rejects(
+            camera_with_screen_shaders(&five),
+            "больше 4 экранных шейдеров",
+        );
+        let many_params = format!("params={:?}", vec![0.0_f32; 17]);
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/vhs.glsl", &many_params)),
+            "не больше 16 параметров",
+        );
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/vhs.glsl", "params=[nan]")),
+            "параметры экранного шейдера должны быть конечными",
+        );
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/missing.glsl", "")),
+            "отсутствует в [[assets]]",
+        );
+        rejects(
+            camera_with_screen_shaders(&shader("/fx/vhs.glsl", "bogus=1\n")),
+            "bogus",
+        );
+        rejects(
+            camera_with_screen_shaders(
+                "[[objects.camera.screen_shaders]]\nshader=\"/fx/vhs.glsl\"\nstage=\"middle\"",
+            ),
+            "middle",
+        );
+        let wrong_extension = format!(
+            "[[assets]]\npath=\"/fx/vhs.txt\"\n{}",
+            VALID.replace(
+                "[objects.camera]",
+                &format!("[objects.camera]\n{}", shader("/fx/vhs.txt", ""))
+            )
+        );
+        rejects(wrong_extension, "расширение .glsl");
     }
 
     #[test]
@@ -1989,6 +2939,58 @@ scale=[1.0,1.0,0.0]
                 .unwrap()
                 .material
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn mesh_material_slots_round_trip_empty_entries_and_validate_paths() {
+        let input = format!(
+            "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/materials/a.rvemat\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\nmaterials=[\"\", \"/materials/a.rvemat\", \"\"]\n"
+        );
+        let document = parse(&input).unwrap();
+        let slots = &document.objects[1]
+            .mesh_renderer
+            .as_ref()
+            .unwrap()
+            .materials;
+        assert_eq!(slots.len(), 3);
+        assert!(slots[0].is_none());
+        assert_eq!(slots[1].as_ref().unwrap().as_str(), "materials/a.rvemat");
+        assert!(slots[2].is_none());
+
+        let serialized = document.to_toml().unwrap();
+        let serialized_value: toml::Value = toml::from_str(&serialized).unwrap();
+        let serialized_slots = serialized_value["objects"][1]["mesh_renderer"]["materials"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            serialized_slots
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .unwrap(),
+            ["", "/materials/a.rvemat", ""]
+        );
+        assert_eq!(
+            parse(&serialized).unwrap().objects[1]
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .materials,
+            *slots
+        );
+
+        error(
+            &format!(
+                "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\nmaterials=[\"/materials/missing.rvemat\"]\n"
+            ),
+            "отсутствует в [[assets]]",
+        );
+        error(
+            &format!(
+                "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/materials/a.toml\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\nmaterials=[\"/materials/a.toml\"]\n"
+            ),
+            "расширение .rvemat",
         );
     }
 
@@ -2218,6 +3220,261 @@ scale=[1.0,1.0,0.0]
     }
 
     #[test]
+    fn physics_components_default_and_round_trip() {
+        let document = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"box\"\n[objects.collider]\n[objects.rigid_body]\n\
+             [[objects]]\nid=\"player\"\n[objects.character_controller]\n"
+        ))
+        .unwrap();
+        let box_object = &document.objects[1];
+        assert_eq!(box_object.collider, Some(ColliderComponent::default()));
+        assert_eq!(box_object.rigid_body, Some(RigidBodyComponent::default()));
+        assert_eq!(
+            box_object.character_controller, None,
+            "components stay optional per object"
+        );
+        assert_eq!(
+            document.objects[2].character_controller,
+            Some(CharacterControllerComponent::default())
+        );
+
+        let round_trip = parse(&document.to_toml().unwrap()).unwrap();
+        assert_eq!(round_trip.objects[1].collider, box_object.collider);
+        assert_eq!(round_trip.objects[1].rigid_body, box_object.rigid_body);
+        assert_eq!(
+            round_trip.objects[2].character_controller,
+            document.objects[2].character_controller
+        );
+    }
+
+    #[test]
+    fn physics_components_preserve_authored_values_in_round_trip() {
+        let document = parse(&format!(
+            r#"{VALID}
+[[objects]]
+id = "body"
+[objects.collider]
+shape = "capsule"
+radius = 0.25
+height = 0.75
+offset = [1.0, 2.0, 3.0]
+trigger = true
+friction = 0.8
+restitution = 0.5
+[objects.rigid_body]
+kind = "kinematic"
+mass = 3.0
+linear_damping = 0.1
+angular_damping = 0.2
+gravity_scale = -1.0
+lock_rotation = true
+[[objects]]
+id = "player"
+[objects.character_controller]
+radius = 0.4
+height = 1.4
+step_height = 0.5
+max_slope_deg = 60.0
+snap_distance = 0.3
+skin = 0.04
+push_strength = 2.0
+"#
+        ))
+        .unwrap();
+        let round_trip = parse(&document.to_toml().unwrap()).unwrap();
+        assert_eq!(round_trip.objects[1].collider, document.objects[1].collider);
+        assert_eq!(
+            round_trip.objects[1].rigid_body,
+            document.objects[1].rigid_body
+        );
+        assert_eq!(
+            round_trip.objects[2].character_controller,
+            document.objects[2].character_controller
+        );
+    }
+
+    #[test]
+    fn physics_components_validate_shape_dependencies_and_body_relationships() {
+        let missing_collider = format!("{VALID}\n[[objects]]\nid=\"body\"\n[objects.rigid_body]\n");
+        assert!(
+            parse(&missing_collider)
+                .unwrap_err()
+                .message
+                .contains("требует collider")
+        );
+
+        for shape in ["convex_mesh", "triangle_mesh"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.collider]\nshape=\"{shape}\"\n"
+            );
+            assert!(
+                parse(&input)
+                    .unwrap_err()
+                    .message
+                    .contains("требует mesh_renderer")
+            );
+        }
+
+        let dynamic_triangle_mesh = format!(
+            "[[assets]]\npath=\"/models/mesh.fbx\"\n{VALID}\n\
+             [[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/mesh.fbx\"\n\
+             [objects.collider]\nshape=\"triangle_mesh\"\n[objects.rigid_body]\nkind=\"dynamic\"\n"
+        );
+        assert!(
+            parse(&dynamic_triangle_mesh)
+                .unwrap_err()
+                .message
+                .contains("несовместим с triangle_mesh")
+        );
+
+        let character_with_collider = format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.collider]\n\
+             [objects.character_controller]\n"
+        );
+        assert!(
+            parse(&character_with_collider)
+                .unwrap_err()
+                .message
+                .contains("несовместим")
+        );
+
+        let character_with_body = format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.collider]\n\
+             [objects.rigid_body]\n[objects.character_controller]\n"
+        );
+        assert!(
+            parse(&character_with_body)
+                .unwrap_err()
+                .message
+                .contains("несовместим")
+        );
+    }
+
+    #[test]
+    fn physics_pose_writers_must_be_roots_but_kinematic_bodies_may_be_children() {
+        let dynamic_child = format!(
+            "{VALID}\n[[objects]]\nid=\"body\"\nparent=\"camera\"\n\
+             [objects.collider]\n[objects.rigid_body]\nkind=\"dynamic\"\n"
+        );
+        assert!(
+            parse(&dynamic_child)
+                .unwrap_err()
+                .message
+                .contains("должен быть корневым")
+        );
+
+        let character_child = format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\nparent=\"camera\"\n\
+             [objects.character_controller]\n"
+        );
+        assert!(
+            parse(&character_child)
+                .unwrap_err()
+                .message
+                .contains("должен быть корневым")
+        );
+
+        let kinematic_child = format!(
+            "{VALID}\n[[objects]]\nid=\"platform\"\nparent=\"camera\"\n\
+             [objects.collider]\n[objects.rigid_body]\nkind=\"kinematic\"\n"
+        );
+        assert!(parse(&kinematic_child).is_ok());
+    }
+
+    #[test]
+    fn physics_components_reject_non_finite_and_out_of_range_values() {
+        for collider in [
+            "shape=\"box\"\nhalf_extents=[0.5, nan, 0.5]",
+            "shape=\"box\"\nhalf_extents=[0.0, 0.5, 0.5]",
+            "shape=\"sphere\"\nradius=0.0",
+            "shape=\"capsule\"\nheight=0.0",
+            "friction=inf",
+            "friction=-0.1",
+            "restitution=1.1",
+            "offset=[0.0, 0.0, nan]",
+            "unknown=true",
+        ] {
+            let input =
+                format!("{VALID}\n[[objects]]\nid=\"shape\"\n[objects.collider]\n{collider}\n");
+            assert!(
+                parse(&input).is_err(),
+                "accepted collider fields {collider}"
+            );
+        }
+
+        for body in [
+            "mass=0.0",
+            "linear_damping=-1.0",
+            "angular_damping=nan",
+            "gravity_scale=inf",
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"body\"\n[objects.collider]\n\
+                 [objects.rigid_body]\n{body}\n"
+            );
+            assert!(parse(&input).is_err(), "accepted rigid_body.{body}");
+        }
+
+        for field in [
+            "radius=0.0",
+            "height=nan",
+            "step_height=-0.1",
+            "max_slope_deg=0.0",
+            "max_slope_deg=-0.1",
+            "max_slope_deg=90.0",
+            "snap_distance=-0.1",
+            "skin=-0.1",
+            "push_strength=inf",
+            "unknown=true",
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\n{field}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted character_controller.{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn character_controller_gravity_fields_default_for_old_scenes_and_round_trip() {
+        let old = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\nradius=0.5\n"
+        ))
+        .unwrap();
+        let controller = old.objects[1].character_controller.unwrap();
+        assert!(!controller.use_gravity);
+        assert_eq!(controller.gravity_scale, 1.0);
+        assert_eq!(controller.jump_height, 1.0);
+        let saved = old.to_toml().unwrap();
+        assert!(!saved.contains("use_gravity"), "{saved}");
+        assert!(!saved.contains("jump_height"), "{saved}");
+
+        let authored = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\n\
+             use_gravity=true\ngravity_scale=2.5\njump_height=0.0\n"
+        ))
+        .unwrap();
+        let round_trip = parse(&authored.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            round_trip.objects[1].character_controller,
+            authored.objects[1].character_controller
+        );
+        let controller = round_trip.objects[1].character_controller.unwrap();
+        assert!(controller.use_gravity);
+        assert_eq!(controller.gravity_scale, 2.5);
+        assert_eq!(controller.jump_height, 0.0);
+
+        for field in ["gravity_scale=-1.0", "jump_height=-0.5", "jump_height=nan"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\n{field}\n"
+            );
+            assert!(parse(&input).is_err(), "accepted {field}");
+        }
+    }
+
+    #[test]
     fn script_names_and_parameter_values_follow_their_schema() {
         let params = format!(
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{bool=true, int=-2, float=1.5, text=\"x\", array=[1, false, \"y\"]}}\n[[assets]]\npath=\"/s.lua\"\n[[objects.heavy_scripts]]\nname=\"Spin_2\"\nparams={{items=[1,2]}}\n"
@@ -2248,20 +3505,45 @@ scale=[1.0,1.0,0.0]
         let nested_table = format!(
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{nested={{value=1}}}}\n[[assets]]\npath=\"/s.lua\"\n"
         );
-        let nested_table_error = parse(&nested_table).unwrap_err();
-        assert!(
-            nested_table_error
-                .message
-                .contains("вложенные таблицы параметров")
-        );
+        assert!(parse(&nested_table).is_err());
         let date = format!(
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{date=1979-05-27}}\n[[assets]]\npath=\"/s.lua\"\n"
         );
         let date_error = parse(&date).unwrap_err();
         assert!(
-            date_error.message.contains("даты/время TOML"),
+            date_error.message.contains("object или asset"),
             "{date_error}"
         );
+    }
+
+    #[test]
+    fn object_and_asset_parameter_references_round_trip_and_reject_foreign_tables() {
+        let input = format!(
+            "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{target={{object=\"hero\"}}, texture={{asset=\"textures/hero.png\"}}}}\n[[assets]]\npath=\"/s.lua\"\n"
+        );
+        let document = parse(&input).unwrap();
+        let params = &document.objects[0].lite_scripts[0].params;
+        assert_eq!(params["target"], ParamValue::Object("hero".into()));
+        assert_eq!(
+            params["texture"],
+            ParamValue::Asset(VirtualPath::parse("textures/hero.png").unwrap())
+        );
+        let serialized = document.to_toml().unwrap();
+        let round_trip = parse(&serialized).unwrap();
+        assert_eq!(
+            round_trip.objects[0].lite_scripts[0].params, *params,
+            "{serialized}"
+        );
+        for foreign in [
+            "other=\"hero\"",
+            "object=\"hero\", asset=\"x.png\"",
+            "object=1",
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{target={{{foreign}}}}}\n[[assets]]\npath=\"/s.lua\"\n"
+            );
+            assert!(parse(&input).is_err(), "accepted {foreign}");
+        }
     }
 
     #[test]
@@ -2383,6 +3665,46 @@ sun_intensity=4.0
     }
 
     #[test]
+    fn camera_cursor_defaults_to_false_for_existing_scenes() {
+        let document = parse(VALID).unwrap();
+        let camera = document.objects[0].camera.as_ref().unwrap();
+        assert_eq!(camera.cursor, super::CameraCursor::default());
+        assert!(!camera.cursor.hide_on_start);
+        assert!(!camera.cursor.lock_on_start);
+    }
+
+    #[test]
+    fn camera_cursor_flags_round_trip_and_default_table_is_not_written() {
+        let scene = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[objects.camera.cursor]
+hide_on_start = true
+lock_on_start = true
+"#;
+        let document = parse(scene).unwrap();
+        let cursor = document.objects[0].camera.as_ref().unwrap().cursor;
+        assert!(cursor.hide_on_start && cursor.lock_on_start);
+        let written = document.to_toml().unwrap();
+        assert!(written.contains("[objects.camera.cursor]"), "{written}");
+        let reparsed = parse(&written).unwrap();
+        assert_eq!(reparsed.objects[0].camera.as_ref().unwrap().cursor, cursor);
+
+        let mut default_cursor = document;
+        default_cursor.objects[0].camera.as_mut().unwrap().cursor = Default::default();
+        let written = default_cursor.to_toml().unwrap();
+        assert!(!written.contains("cursor"), "{written}");
+    }
+
+    #[test]
+    fn camera_cursor_rejects_unknown_fields() {
+        let scene = format!("{VALID}\n[objects.camera.cursor]\nunknown = true\n");
+        assert!(parse(&scene).is_err());
+    }
+
+    #[test]
     fn environment_rejects_unknown_fields_and_undeclared_assets() {
         let unknown = format!(
             "{VALID}\n[[objects]]\nid=\"environment\"\n[objects.environment]\nhdr=\"/sky.hdr\"\nunknown=true\n"
@@ -2393,5 +3715,44 @@ sun_intensity=4.0
         );
         let error = SceneDocument::parse("missing-environment.rvescene", &missing).unwrap_err();
         assert!(error.message.contains("отсутствует в [[assets]]"));
+    }
+
+    #[test]
+    fn max_instances_round_trips_for_prefab_assets_and_stays_absent_otherwise() {
+        let input = format!(
+            "[[assets]]\npath = \"/prefabs/bullet.rveprefab\"\nmax_instances = 100\n[[assets]]\npath = \"/models/crate.fbx\"\n{VALID}"
+        );
+        let document = parse(&input).unwrap();
+        assert_eq!(document.assets[0].max_instances, Some(100));
+        assert_eq!(document.assets[1].max_instances, None);
+        let text = document.to_toml().unwrap();
+        assert!(text.contains("max_instances = 100"), "{text}");
+        assert_eq!(parse(&text).unwrap().assets, document.assets);
+
+        let plain = parse(&format!(
+            "[[assets]]\npath = \"/models/crate.fbx\"\n{VALID}"
+        ))
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        assert!(!plain.contains("max_instances"), "{plain}");
+        assert_eq!(parse(&plain).unwrap().to_toml().unwrap(), plain);
+    }
+
+    #[test]
+    fn max_instances_requires_a_prefab_and_a_positive_value() {
+        for asset in [
+            "path = \"/models/crate.fbx\"\nmax_instances = 3",
+            "path = \"/prefabs/bullet.rveprefab\"\nmax_instances = 0",
+        ] {
+            let error = parse(&format!("[[assets]]\n{asset}\n{VALID}")).unwrap_err();
+            assert!(error.message.contains("max_instances"), "{error}");
+        }
+        assert!(
+            parse(&format!(
+                "[[assets]]\npath = \"/prefabs/bullet.rveprefab\"\nmax_instances = -1\n{VALID}"
+            ))
+            .is_err()
+        );
     }
 }

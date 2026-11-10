@@ -1,11 +1,18 @@
 //! Панели и диалоги редактора.
 
+pub mod asset_inspector;
 pub mod console;
 mod debug_view;
 pub mod game_view;
 pub mod hierarchy;
 pub mod inspector;
+pub mod material_preview;
+pub mod preferences;
+pub mod profiler;
 pub mod project_panel;
+pub mod project_prefabs;
+pub mod project_tags;
+pub mod scene_assets;
 pub mod scene_view;
 pub mod toolbar;
 
@@ -13,19 +20,78 @@ pub mod toolbar;
 mod tests;
 
 use crate::layout::{EditorTabs, Tab};
-use crate::state::{Action, EditorState};
+use crate::state::{Action, AssetDrag, EditorState};
 use egui_dock::{DockArea, DockState, Style};
 
 /// Строит весь интерфейс кадра.
+#[cfg(test)]
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
+    show_with_mcp(
+        ui,
+        state,
+        dock,
+        &mut preferences::Preferences::default(),
+        &crate::settings::McpSettings::default(),
+        &crate::mcp::McpStatus::Off,
+    );
+}
+
+pub fn show_with_mcp(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    dock: &mut DockState<Tab>,
+    preferences: &mut preferences::Preferences,
+    mcp_settings: &crate::settings::McpSettings,
+    mcp_status: &crate::mcp::McpStatus,
+) {
+    // Видимость и наведение панелей известны только с прошлого кадра: сброс ниже их стирает.
+    // В Play numpad-команды Scene действуют, лишь если Scene показана и курсор не над Game.
+    if state.is_playing() && (!state.scene_view.visible || state.game_view.hovered) {
+        state.view_commands.clear();
+    }
     state.scene_view.visible = false;
     state.scene_view.hovered = false;
     state.scene_view.rect = None;
     state.game_view.visible = false;
     state.game_view.hovered = false;
     state.game_view.rect = None;
+    if state.ui_editor_rect.is_none() {
+        state.ui_editor_active = false;
+    }
+    if ui.input(|i| i.pointer.any_pressed()) {
+        state.ui_editor_active = state
+            .ui_editor_rect
+            .is_some_and(|r| ui.input(|i| i.pointer.interact_pos().is_some_and(|p| r.contains(p))));
+    }
+    state.material_preview.visible = false;
+    if std::mem::take(&mut state.preview_requested) {
+        if let Some(path) = dock.find_tab(&Tab::MaterialPreview) {
+            let _ = dock.set_active_tab(path);
+        } else {
+            dock.push_to_first_leaf(Tab::MaterialPreview);
+        }
+    }
     toolbar::handle_shortcuts(ui.ctx(), state);
-    toolbar::show(ui, state, dock);
+    state.ui_editor_rect = None;
+    if std::mem::take(&mut state.ui_editor_requested) {
+        if !crate::layout::is_open(dock, Tab::UiEditor) {
+            if let Some(scene) = dock
+                .find_tab(&Tab::Scene)
+                .or_else(|| dock.find_tab(&Tab::Game))
+            {
+                dock.set_focused_node_and_surface(scene.node_path());
+            }
+            dock.push_to_focused_leaf(Tab::UiEditor);
+        }
+        if let Some(path) = dock.find_tab(&Tab::UiEditor) {
+            let _ = dock.set_active_tab(path);
+        }
+    }
+    state.ui_authoring = dock.find_tab(&Tab::UiEditor).is_some_and(|path| {
+        dock.leaf(path.node_path())
+            .is_ok_and(|leaf| leaf.active == path.tab && !leaf.collapsed)
+    }) && state.ui_document.is_some();
+    toolbar::show_with_mcp(ui, state, dock, preferences, mcp_settings);
     show_status_bar(ui, state);
 
     if state.project.is_none() {
@@ -40,7 +106,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     show_apply_prompt(ui.ctx(), state);
     show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
+    crate::ui_editor::pending_dialog(ui.ctx(), state);
     show_new_project_dialog(ui.ctx(), state);
+    preferences::show(ui.ctx(), preferences, mcp_status);
     state.smart_zoom = false;
     state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
 }
@@ -206,6 +274,72 @@ fn show_apply_prompt(ctx: &egui::Context, state: &mut EditorState) {
             }
         });
     });
+}
+
+/// Текстовое поле, которое отдаёт значение только при уходе фокуса или Enter: промежуточный
+/// текст не попадает в документ. Пока фокуса нет, поле показывает текущее значение. Уход фокуса
+/// без изменения значения ничего не отдаёт, поэтому не создаёт пустую правку в undo.
+pub(crate) fn committed_text_field(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    current: &str,
+    hint: &str,
+    width: f32,
+) -> Option<String> {
+    let mut text = ui
+        .ctx()
+        .data(|data| data.get_temp::<String>(id))
+        .unwrap_or_else(|| current.to_owned());
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .hint_text(hint)
+            .desired_width(width),
+    );
+    let committed = (response.lost_focus() && text != current).then(|| text.clone());
+    if response.has_focus() {
+        ui.ctx().data_mut(|data| data.insert_temp(id, text));
+    } else {
+        ui.ctx().data_mut(|data| data.remove::<String>(id));
+    }
+    committed
+}
+
+/// Разбор лимита экземпляров: пустой текст — без лимита, иначе целое число. Ноль отклоняет
+/// валидация документа, поэтому здесь он проходит.
+pub(crate) fn parse_max_instances(text: &str) -> Result<Option<u32>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("max_instances: ожидается целое число, получено {text:?}"))
+}
+
+/// Полоса, принимающая `.rveprefab`, перетащенный из Project. Возвращает путь относительно
+/// `Assets` при отпускании; тип ресурса проверяет модель, которая получит путь.
+pub(crate) fn prefab_drop_zone(ui: &mut egui::Ui, text: &str) -> Option<String> {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let stroke = if response.dnd_hover_payload::<AssetDrag>().is_some() {
+        ui.visuals().selection.stroke
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    let color = ui.visuals().text_color();
+    let painter = ui.painter();
+    painter.rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(12.0),
+        color,
+    );
+    response
+        .dnd_release_payload::<AssetDrag>()
+        .map(|asset| asset.0.clone())
 }
 
 /// Список недавних проектов. Отсутствующие проекты помечены и недоступны;

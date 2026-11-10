@@ -1,5 +1,6 @@
 use super::*;
 use crate::World;
+use crate::network::{NetAuthority, NetworkTransformComponent};
 
 const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
 
@@ -38,6 +39,8 @@ const DOOR: &str = r#"
 [[assets]]
 path = "/models/door.fbx"
 [[assets]]
+path = "/materials/frame.rvemat"
+[[assets]]
 path = "/scripts/rotate.lua"
 [[objects]]
 id = "frame"
@@ -46,6 +49,7 @@ name = "Frame"
 position = [0.0, 0.0, 0.0]
 [objects.mesh_renderer]
 model = "/models/door.fbx"
+materials = ["", "/materials/frame.rvemat"]
 [objects.mesh_renderer.material]
 metallic = 0.2
 roughness = 0.4
@@ -64,7 +68,7 @@ params = { speed = 10.0, axis = "y" }
 
 fn door_scene(instance_body: &str) -> String {
     format!(
-        "[[assets]]\npath = \"/prefabs/door.rveprefab\"\n[[assets]]\npath = \"/textures/gold.png\"\n[[assets]]\npath = \"/models/gold.fbx\"\n{CAMERA}[[objects]]\nid = \"room\"\n[[instances]]\nid = \"door1\"\nprefab = \"/prefabs/door.rveprefab\"\n{instance_body}"
+        "[[assets]]\npath = \"/prefabs/door.rveprefab\"\n[[assets]]\npath = \"/textures/gold.png\"\n[[assets]]\npath = \"/models/gold.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n{CAMERA}[[objects]]\nid = \"room\"\n[[instances]]\nid = \"door1\"\nprefab = \"/prefabs/door.rveprefab\"\n{instance_body}"
     )
 }
 
@@ -126,6 +130,117 @@ fn one_level_instance_gets_mapped_ids_parents_and_instance_fields() {
 }
 
 #[test]
+fn prefab_object_references_are_local_and_are_mapped_for_instances_and_spawns() {
+    let prefab = r#"
+[[assets]]
+path = "/scripts/ref.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/ref.lua"
+params = { target = { object = "child" } }
+[[objects]]
+id = "child"
+parent = "root"
+"#;
+    let library = Library::new(&[("prefabs/ref.rveprefab", prefab)]);
+    let prefab_document = SceneDocument::parse_prefab("/prefabs/ref.rveprefab", prefab).unwrap();
+    let expanded = library
+        .expand(&scene(
+            &format!("{CAMERA}[[assets]]\npath=\"/prefabs/ref.rveprefab\"\n[[instances]]\nid=\"door\"\nprefab=\"/prefabs/ref.rveprefab\"\n"),
+        ))
+        .unwrap();
+    assert_eq!(
+        object(&expanded.document, "door").lite_scripts[0].params["target"],
+        ParamValue::Object("door.child".into())
+    );
+
+    let template = load_template(&library, "prefabs/ref.rveprefab").unwrap();
+    let document = scene(CAMERA);
+    let mut world = World::from_document(&document).unwrap();
+    let reserved = (0..template.objects().len())
+        .map(|_| world.reserve_object())
+        .collect();
+    world
+        .spawn(
+            reserved,
+            &template,
+            crate::SpawnOptions {
+                id: Some("spawned".into()),
+                ..crate::SpawnOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        world.object_by_id("spawned").unwrap().lite_scripts[0].params["target"],
+        ParamValue::Object("spawned.child".into())
+    );
+
+    let outside = prefab.replace("object = \"child\"", "object = \"outside\"");
+    let error = SceneDocument::parse_prefab("/prefabs/ref.rveprefab", &outside).unwrap_err();
+    assert!(
+        error.message.contains("outside the prefab") || error.message.contains("пределы префаба")
+    );
+    assert!(prefab_document.is_prefab());
+}
+
+#[test]
+fn prefab_object_reference_override_keeps_a_colliding_scene_object_id() {
+    let prefab = r#"
+[[assets]]
+path = "/scripts/ref.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/ref.lua"
+params = { target = { object = "player" } }
+[[objects]]
+id = "player"
+parent = "root"
+"#;
+    let library = Library::new(&[("prefabs/ref.rveprefab", prefab)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/prefabs/ref.rveprefab\"\n{CAMERA}[[objects]]\nid = \"player\"\n[[instances]]\nid = \"inst\"\nprefab = \"/prefabs/ref.rveprefab\"\n[[instances.overrides]]\ntarget = \"root\"\nlite_params = [{{ path = \"/scripts/ref.lua\", params = {{ target = {{ object = \"player\" }} }} }}]\n"
+    ));
+
+    let expanded = library.expand(&document).unwrap().document;
+
+    assert_eq!(
+        object(&expanded, "inst").lite_scripts[0].params["target"],
+        ParamValue::Object("player".into())
+    );
+}
+
+#[test]
+fn prefab_object_reference_override_accepts_a_full_instance_path() {
+    let prefab = r#"
+[[assets]]
+path = "/scripts/ref.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/ref.lua"
+params = { target = { object = "child" } }
+[[objects]]
+id = "child"
+parent = "root"
+"#;
+    let library = Library::new(&[("prefabs/ref.rveprefab", prefab)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/prefabs/ref.rveprefab\"\n{CAMERA}[[instances]]\nid = \"inst\"\nprefab = \"/prefabs/ref.rveprefab\"\n[[instances.overrides]]\ntarget = \"root\"\nlite_params = [{{ path = \"/scripts/ref.lua\", params = {{ target = {{ object = \"inst.child\" }} }} }}]\n"
+    ));
+
+    let expanded = library.expand(&document).unwrap().document;
+    let world = World::from_document(&expanded).unwrap();
+
+    assert!(world.handle("inst.child").is_some());
+    assert_eq!(
+        object(&expanded, "inst").lite_scripts[0].params["target"],
+        ParamValue::Object("inst.child".into())
+    );
+}
+
+#[test]
 fn nested_prefabs_produce_dotted_ids_and_outer_overrides_win() {
     let lock = "[[assets]]\npath = \"/models/door.fbx\"\n[[objects]]\nid = \"body\"\n[[objects]]\nid = \"bolt\"\nparent = \"body\"\nname = \"Bolt\"\n[objects.mesh_renderer]\nmodel = \"/models/door.fbx\"\n";
     let door = "[[assets]]\npath = \"/prefabs/lock.rveprefab\"\n[[objects]]\nid = \"frame\"\n[[instances]]\nid = \"lock\"\nparent = \"frame\"\nprefab = \"/prefabs/lock.rveprefab\"\n[[instances.overrides]]\ntarget = \"bolt\"\nname = \"Inner\"\ntransform = { position = [1.0, 2.0, 3.0] }\n";
@@ -158,7 +273,7 @@ fn overrides_change_only_the_given_fields() {
 target = "handle"
 name = "Gold handle"
 transform = { position = [0.1, 1.0, 0.0] }
-mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png" }
+mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png", materials = ["", "/materials/gold.rvemat"] }
 lite_params = [{ path = "/scripts/rotate.lua", params = { speed = 90.0 } }]
 [[instances.overrides]]
 target = "frame"
@@ -173,6 +288,12 @@ mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opaci
     let mesh = handle.mesh_renderer.as_ref().unwrap();
     assert_eq!(mesh.model.as_str(), "models/gold.fbx");
     assert_eq!(mesh.texture.as_ref().unwrap().as_str(), "textures/gold.png");
+    assert_eq!(mesh.materials.len(), 2);
+    assert!(mesh.materials[0].is_none());
+    assert_eq!(
+        mesh.materials[1].as_ref().unwrap().as_str(),
+        "materials/gold.rvemat"
+    );
     let params = &handle.lite_scripts[0].params;
     assert_eq!(params["speed"], ParamValue::Float(90.0));
     assert_eq!(params["axis"], ParamValue::String("y".into()));
@@ -191,6 +312,22 @@ mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opaci
     assert_eq!(material.alpha_cutoff, Some(0.25));
     assert_eq!(material.occlusion_strength, Some(0.7));
     assert_eq!(material.double_sided, Some(false));
+}
+
+#[test]
+fn material_slot_override_requires_a_declared_rvemat_asset() {
+    let missing = door_scene(
+        "[[instances.overrides]]\ntarget = \"handle\"\nmesh_renderer = { materials = [\"/materials/missing.rvemat\"] }\n",
+    );
+    let error = SceneDocument::parse("scene.rvescene", &missing).unwrap_err();
+    assert!(error.message.contains("отсутствует в [[assets]]"));
+
+    let wrong_extension = door_scene(
+        "[[instances.overrides]]\ntarget = \"handle\"\nmesh_renderer = { materials = [\"/materials/gold.toml\"] }\n",
+    )
+    .replace("/materials/gold.rvemat", "/materials/gold.toml");
+    let error = SceneDocument::parse("scene.rvescene", &wrong_extension).unwrap_err();
+    assert!(error.message.contains("расширение .rvemat"));
 }
 
 #[test]
@@ -299,6 +436,83 @@ fn point_and_spot_prefab_overrides_replace_whole_components() {
             inner_angle_deg: 20.0,
             outer_angle_deg: 42.0,
             shadows: false,
+        })
+    );
+}
+
+#[test]
+fn physics_prefab_overrides_replace_whole_components() {
+    let prefab = r#"
+[[objects]]
+id = "box"
+[objects.collider]
+friction = 0.2
+[objects.rigid_body]
+kind = "kinematic"
+mass = 5.0
+"#;
+    let library = Library::new(&[("prefabs/box.rveprefab", prefab)]);
+    let document = scene(
+        r#"
+[[assets]]
+path = "/prefabs/box.rveprefab"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[instances]]
+id = "crate"
+prefab = "/prefabs/box.rveprefab"
+[[instances.overrides]]
+target = "box"
+collider = { friction = 0.8 }
+rigid_body = { mass = 2.0 }
+"#,
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    let crate_object = object(&expanded, "crate");
+    assert_eq!(
+        crate_object.collider,
+        Some(crate::ColliderComponent {
+            friction: 0.8,
+            ..crate::ColliderComponent::default()
+        })
+    );
+    assert_eq!(
+        crate_object.rigid_body,
+        Some(crate::RigidBodyComponent {
+            mass: 2.0,
+            ..crate::RigidBodyComponent::default()
+        })
+    );
+
+    let prefab = r#"
+[[objects]]
+id = "player"
+[objects.character_controller]
+radius = 0.6
+"#;
+    let library = Library::new(&[("prefabs/player.rveprefab", prefab)]);
+    let document = scene(
+        r#"
+[[assets]]
+path = "/prefabs/player.rveprefab"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[instances]]
+id = "player"
+prefab = "/prefabs/player.rveprefab"
+[[instances.overrides]]
+target = "player"
+character_controller = { radius = 0.4 }
+"#,
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    assert_eq!(
+        object(&expanded, "player").character_controller,
+        Some(crate::CharacterControllerComponent {
+            radius: 0.4,
+            ..crate::CharacterControllerComponent::default()
         })
     );
 }
@@ -664,7 +878,7 @@ fn expand_without_overrides_skips_only_that_instance() {
 #[test]
 fn documents_without_instances_validate_as_before() {
     let path = format!(
-        "{}/../../examples/demo-game/Assets/scenes/second.rvescene",
+        "{}/../../examples/demo-game/Assets/scenes/physics.rvescene",
         env!("CARGO_MANIFEST_DIR")
     );
     let text = std::fs::read_to_string(&path).unwrap();
@@ -680,4 +894,435 @@ fn documents_without_instances_validate_as_before() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn ui_canvas_prefab_override_replaces_the_whole_component_and_checks_its_document() {
+    let prefab = "[[assets]]\npath = \"/ui/hud.rveui\"\n[[objects]]\nid = \"hud\"\n[objects.ui_canvas]\ndocument = \"/ui/hud.rveui\"\nlayer = 3\n";
+    let library = Library::new(&[("prefabs/hud.rveprefab", prefab)]);
+    let assets = "[[assets]]\npath = \"/prefabs/hud.rveprefab\"\n[[assets]]\npath = \"/ui/hud.rveui\"\n[[assets]]\npath = \"/ui/menu.rveui\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"ui\"\nprefab = \"/prefabs/hud.rveprefab\"\n[[instances.overrides]]\ntarget = \"hud\"\nui_canvas = {{ document = \"/ui/menu.rveui\", visible = false }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let canvas = object(&expanded, "ui").ui_canvas.clone().unwrap();
+    assert_eq!(canvas.document.as_str(), "ui/menu.rveui");
+    assert!(!canvas.visible);
+    assert_eq!(
+        canvas.layer, None,
+        "replacement must not keep inherited fields"
+    );
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"ui\"\nprefab = \"/prefabs/hud.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "ui").ui_canvas.as_ref().unwrap().layer,
+        Some(3)
+    );
+
+    let undeclared = format!(
+        "{CAMERA}[[assets]]\npath = \"/prefabs/hud.rveprefab\"\n[[instances]]\nid = \"ui\"\nprefab = \"/prefabs/hud.rveprefab\"\n[[instances.overrides]]\ntarget = \"hud\"\nui_canvas = {{ document = \"/ui/menu.rveui\" }}\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &undeclared).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\nui_canvas = {{ document = \"/ui/hud.rveui\" }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("ui_canvas"), "{error}");
+}
+
+#[test]
+fn audio_source_prefab_override_replaces_the_whole_component_and_checks_its_clip() {
+    let prefab = "[[assets]]\npath = \"/audio/hum.wav\"\n[[objects]]\nid = \"speaker\"\n[objects.audio_source]\nclip = \"/audio/hum.wav\"\nvolume = 0.4\nlooping = true\n";
+    let library = Library::new(&[("prefabs/speaker.rveprefab", prefab)]);
+    let assets = "[[assets]]\npath = \"/prefabs/speaker.rveprefab\"\n[[assets]]\npath = \"/audio/hum.wav\"\n[[assets]]\npath = \"/audio/bell.ogg\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spk\"\nprefab = \"/prefabs/speaker.rveprefab\"\n[[instances.overrides]]\ntarget = \"speaker\"\naudio_source = {{ clip = \"/audio/bell.ogg\", spatial = true }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let audio = object(&expanded, "spk").audio_source.clone().unwrap();
+    assert_eq!(audio.clip.as_str(), "audio/bell.ogg");
+    assert_eq!(audio.spatial_blend, 1.0);
+    assert!(!audio.looping, "replacement must not keep inherited fields");
+    assert_eq!(audio.volume, 1.0);
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spk\"\nprefab = \"/prefabs/speaker.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "spk").audio_source.as_ref().unwrap().volume,
+        0.4
+    );
+
+    let missing_clip_asset = format!(
+        "{CAMERA}[[assets]]\npath = \"/prefabs/speaker.rveprefab\"\n[[instances]]\nid = \"spk\"\nprefab = \"/prefabs/speaker.rveprefab\"\n[[instances.overrides]]\ntarget = \"speaker\"\naudio_source = {{ clip = \"/audio/bell.ogg\" }}\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &missing_clip_asset).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\naudio_source = {{ clip = \"/audio/bell.ogg\" }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("audio_source"), "{error}");
+}
+
+#[test]
+fn animator_prefab_override_replaces_the_whole_component_and_checks_its_clips() {
+    let prefab = "[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anims/run.fbx\"\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\nclips = [\"/anims/run.fbx\"]\nlooping = true\nspeed = 1.5\n";
+    let library = Library::new(&[("prefabs/hero.rveprefab", prefab)]);
+    let assets = "[[assets]]\npath = \"/prefabs/hero.rveprefab\"\n[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anims/run.fbx\"\n[[assets]]\npath = \"/anims/jump.fbx\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n[[instances.overrides]]\ntarget = \"hero\"\nanimator = {{ looping = false, clips = [\"/anims/jump.fbx\"] }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let animator = object(&expanded, "h").animator.clone().unwrap();
+    assert!(!animator.looping);
+    assert_eq!(
+        animator.speed, 1.0,
+        "замена не сохраняет унаследованную скорость"
+    );
+    assert_eq!(animator.clips[0].as_str(), "anims/jump.fbx");
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(object(&kept, "h").animator.as_ref().unwrap().speed, 1.5);
+
+    let undeclared = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n[[instances.overrides]]\ntarget = \"hero\"\nanimator = {{ clips = [\"/anims/missing.fbx\"] }}\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &undeclared).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\nanimator = {{ looping = false }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("animator"), "{error}");
+}
+
+fn load_template(library: &Library, path: &str) -> Result<PrefabTemplate, SceneError> {
+    let path = VirtualPath::parse(path).unwrap();
+    let mut read = |child: &VirtualPath| -> Result<String, String> {
+        library
+            .0
+            .get(child.as_str())
+            .cloned()
+            .ok_or_else(|| "не найден".to_owned())
+    };
+    PrefabTemplate::load(&path, &mut read)
+}
+
+#[test]
+fn max_instances_from_nested_prefab_assets_never_reaches_the_scene() {
+    let inner = "[[objects]]\nid = \"core\"\n";
+    let outer = "[[assets]]\npath = \"/prefabs/inner.rveprefab\"\nmax_instances = 5\n[[objects]]\nid = \"base\"\n[[instances]]\nid = \"door\"\nprefab = \"/prefabs/inner.rveprefab\"\nparent = \"base\"\n";
+    let library = Library::new(&[
+        ("prefabs/inner.rveprefab", inner),
+        ("prefabs/outer.rveprefab", outer),
+    ]);
+    let instances = "[[instances]]\nid = \"x\"\nprefab = \"/prefabs/outer.rveprefab\"\n";
+    let max_instances = |expanded: &Expansion, path: &str| {
+        expanded
+            .document
+            .assets
+            .iter()
+            .find(|asset| asset.path.as_str() == path)
+            .and_then(|asset| asset.max_instances)
+    };
+
+    // Лимит внешнего префаба задан сценой, лимит вложенного в префабе не переносится.
+    let declared = "[[assets]]\npath = \"/prefabs/outer.rveprefab\"\nmax_instances = 2\n";
+    let expanded = library
+        .expand(&scene(&format!("{declared}{CAMERA}{instances}")))
+        .unwrap();
+    assert_eq!(max_instances(&expanded, "prefabs/outer.rveprefab"), Some(2));
+    assert_eq!(max_instances(&expanded, "prefabs/inner.rveprefab"), None);
+    assert!(
+        expanded
+            .document
+            .assets
+            .iter()
+            .any(|asset| asset.path.as_str() == "prefabs/inner.rveprefab")
+    );
+
+    // Собственная запись сцены остаётся при слиянии с вложенным префабом.
+    let declared = "[[assets]]\npath = \"/prefabs/outer.rveprefab\"\nmax_instances = 2\n[[assets]]\npath = \"/prefabs/inner.rveprefab\"\nmax_instances = 7\n";
+    let expanded = library
+        .expand(&scene(&format!("{declared}{CAMERA}{instances}")))
+        .unwrap();
+    assert_eq!(max_instances(&expanded, "prefabs/inner.rveprefab"), Some(7));
+}
+
+#[test]
+fn particle_emitter_prefab_override_replaces_the_whole_component_and_checks_texture() {
+    let prefab =
+        "[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ncapacity = 512\nrate = 40.0\n";
+    let library = Library::new(&[("prefabs/fx.rveprefab", prefab)]);
+    let assets =
+        "[[assets]]\npath = \"/prefabs/fx.rveprefab\"\n[[assets]]\npath = \"/fx/smoke.png\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spark\"\nprefab = \"/prefabs/fx.rveprefab\"\n[[instances.overrides]]\ntarget = \"fx\"\nparticle_emitter = {{ blend = \"alpha\", texture = \"/fx/smoke.png\" }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let emitter = object(&expanded, "spark").particle_emitter.clone().unwrap();
+    assert_eq!(emitter.blend, crate::particles::ParticleBlendMode::Alpha);
+    assert_eq!(
+        emitter.rate, 10.0,
+        "replacement must not keep inherited fields"
+    );
+    assert_eq!(emitter.capacity, 256);
+    assert_eq!(
+        emitter.texture.as_ref().map(|path| path.as_str()),
+        Some("fx/smoke.png")
+    );
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spark\"\nprefab = \"/prefabs/fx.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "spark")
+            .particle_emitter
+            .as_ref()
+            .unwrap()
+            .capacity,
+        512
+    );
+
+    let undeclared = format!(
+        "{CAMERA}[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ntexture = \"/fx/smoke.png\"\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &undeclared).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\nparticle_emitter = {{ rate = 5.0 }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("particle_emitter"), "{error}");
+}
+
+#[test]
+fn prefab_with_environment_loads_as_a_template_and_only_spawn_is_refused() {
+    let environment = "[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    let text = format!("[[objects]]\nid = \"sky\"\n{environment}");
+    let library = Library::new(&[("prefabs/sky.rveprefab", text.as_str())]);
+    let template = load_template(&library, "prefabs/sky.rveprefab").unwrap();
+    assert_eq!(template.objects().len(), 1);
+    assert!(template.check_spawnable().is_err());
+}
+
+#[test]
+fn spawn_template_accepts_point_and_spot_lights() {
+    let library = Library::new(&[(
+        "prefabs/lamp.rveprefab",
+        "[[objects]]\nid = \"root\"\n[objects.point_light]\n[[objects]]\nid = \"bulb\"\nparent = \"root\"\n[objects.spot_light]\n",
+    )]);
+    let template = load_template(&library, "prefabs/lamp.rveprefab").unwrap();
+    assert_eq!(template.objects.len(), 2);
+}
+
+#[test]
+fn spawn_template_rejects_camera_directional_light_and_environment() {
+    let environment = "[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    for (name, component) in [
+        ("camera", "[objects.camera]\n"),
+        ("directional_light", "[objects.directional_light]\n"),
+        ("environment", environment),
+    ] {
+        let text = format!(
+            "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"lamp\"\nparent = \"root\"\n{component}"
+        );
+        let library = Library::new(&[("prefabs/bullet.rveprefab", text.as_str())]);
+        let template = load_template(&library, "prefabs/bullet.rveprefab").unwrap();
+        let error = template.check_spawnable().unwrap_err();
+        assert!(error.message.contains(name), "{error}");
+        assert_eq!(error.object_id.as_deref(), Some("lamp"));
+    }
+}
+
+#[test]
+fn spawn_template_reports_missing_prefabs_and_dynamic_children() {
+    let empty = Library::new(&[]);
+    let error = load_template(&empty, "prefabs/gone.rveprefab").unwrap_err();
+    assert!(error.message.contains("не найден"), "{error}");
+
+    let library = Library::new(&[(
+        "prefabs/crate.rveprefab",
+        "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"child\"\nparent = \"root\"\n[objects.collider]\n[objects.rigid_body]\n",
+    )]);
+    let error = load_template(&library, "prefabs/crate.rveprefab").unwrap_err();
+    assert!(error.message.contains("корневым"), "{error}");
+}
+
+#[test]
+fn spawn_template_uses_local_ids_parents_and_order_for_nested_prefabs() {
+    let library = Library::new(&[
+        (
+            "prefabs/inner.rveprefab",
+            "[[objects]]\nid = \"core\"\n[[objects]]\nid = \"arm\"\nparent = \"core\"\n",
+        ),
+        (
+            "prefabs/outer.rveprefab",
+            "[[assets]]\npath = \"/prefabs/inner.rveprefab\"\n[[objects]]\nid = \"base\"\n\
+             [[instances]]\nid = \"door\"\nprefab = \"/prefabs/inner.rveprefab\"\nparent = \"base\"\n",
+        ),
+    ]);
+    let template = load_template(&library, "prefabs/outer.rveprefab").unwrap();
+    assert_eq!(template.stem(), "outer");
+    let ids = template
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["", "door", "door.arm"]);
+    assert_eq!(template.root, 0);
+    assert_eq!(template.parents, [None, Some(0), Some(1)]);
+    assert_eq!(template.order, [0, 1, 2]);
+    assert!(
+        template
+            .assets()
+            .iter()
+            .any(|asset| asset.path.as_str() == "prefabs/inner.rveprefab")
+    );
+}
+
+#[test]
+fn spawnable_template_passes_check_and_structural_errors_still_fail_load() {
+    let library = Library::new(&[(
+        "prefabs/ball.rveprefab",
+        "[[objects]]\nid = \"root\"\n[objects.collider]\n[objects.rigid_body]\nkind = \"dynamic\"\n",
+    )]);
+    assert!(
+        load_template(&library, "prefabs/ball.rveprefab")
+            .unwrap()
+            .check_spawnable()
+            .is_ok()
+    );
+    // Не читается — ошибка загрузки, а не отказ spawn.
+    assert!(load_template(&library, "prefabs/gone.rveprefab").is_err());
+    let broken = Library::new(&[(
+        "prefabs/bad.rveprefab",
+        "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"child\"\nparent = \"missing\"\n",
+    )]);
+    assert!(load_template(&broken, "prefabs/bad.rveprefab").is_err());
+}
+
+#[test]
+fn network_prefab_override_replaces_the_whole_component() {
+    let prefab = "[[objects]]\nid = \"crate\"\n[objects.network_identity]\nauthority = \"owner\"\n[objects.network_transform]\nsend_rate_hz = 10\nsnap_distance = 2.0\n";
+    let library = Library::new(&[("prefabs/crate.rveprefab", prefab)]);
+    assert!(
+        load_template(&library, "prefabs/crate.rveprefab")
+            .unwrap()
+            .check_spawnable()
+            .is_ok(),
+        "сетевые компоненты допустимы в spawn-префабе"
+    );
+    let assets = "[[assets]]\npath = \"/prefabs/crate.rveprefab\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"box\"\nprefab = \"/prefabs/crate.rveprefab\"\n[[instances.overrides]]\ntarget = \"crate\"\nnetwork_transform = {{ sync_scale = true }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let root = object(&expanded, "box");
+    assert_eq!(
+        root.network_transform,
+        Some(NetworkTransformComponent {
+            sync_scale: true,
+            ..NetworkTransformComponent::default()
+        }),
+        "замена не сохраняет унаследованные send_rate_hz и snap_distance"
+    );
+    assert_eq!(
+        root.network_identity.map(|identity| identity.authority),
+        Some(NetAuthority::Owner),
+        "identity без override наследуется"
+    );
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"box\"\nprefab = \"/prefabs/crate.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "box").network_transform.unwrap().send_rate_hz,
+        10
+    );
+
+    let identity_override = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"box\"\nprefab = \"/prefabs/crate.rveprefab\"\n[[instances.overrides]]\ntarget = \"crate\"\nnetwork_identity = {{ authority = \"server\" }}\n"
+    );
+    let replaced = library.expand(&scene(&identity_override)).unwrap().document;
+    assert_eq!(
+        object(&replaced, "box")
+            .network_identity
+            .map(|identity| identity.authority),
+        Some(NetAuthority::Server)
+    );
+}
+
+#[test]
+fn network_prefab_overrides_need_existing_components_and_valid_fields() {
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let library = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let assets = "[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n";
+    let instance = |override_line: &str| {
+        format!(
+            "{assets}{CAMERA}[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\n{override_line}\n"
+        )
+    };
+
+    let error = library
+        .expand(&scene(&instance(
+            "network_identity = { authority = \"owner\" }",
+        )))
+        .unwrap_err();
+    assert!(error.message.contains("network_identity"), "{error}");
+
+    let error = library
+        .expand(&scene(&instance("network_transform = {}")))
+        .unwrap_err();
+    assert!(error.message.contains("network_transform"), "{error}");
+
+    let error = SceneDocument::parse(
+        "scene.rvescene",
+        &instance("network_transform = { send_rate_hz = 0 }"),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("send_rate_hz"), "{error}");
+}
+
+#[test]
+fn camera_screen_shader_overrides_are_validated_like_the_camera() {
+    let override_camera = |shaders: &str| {
+        format!(
+            "[[assets]]\npath = \"/prefabs/rig.rveprefab\"\n[[assets]]\npath = \"/fx/vhs.glsl\"\n[[instances]]\nid = \"rig\"\nprefab = \"/prefabs/rig.rveprefab\"\n[[instances.overrides]]\ntarget = \"rig\"\ncamera = {{ screen_shaders = [{shaders}] }}\n"
+        )
+    };
+    let vhs = "{ shader = \"/fx/vhs.glsl\", stage = \"after_post\" }";
+    SceneDocument::parse("scene.rvescene", &override_camera(vhs))
+        .expect("объявленный экранный шейдер принимается");
+
+    let five = [vhs; 5].join(", ");
+    let error = SceneDocument::parse("scene.rvescene", &override_camera(&five)).unwrap_err();
+    assert!(error.message.contains("экранных шейдеров"), "{error}");
+
+    let undeclared = "{ shader = \"/fx/missing.glsl\", stage = \"after_post\" }";
+    let error = SceneDocument::parse("scene.rvescene", &override_camera(undeclared)).unwrap_err();
+    assert!(error.message.contains("/fx/missing.glsl"), "{error}");
 }

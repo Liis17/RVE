@@ -3,34 +3,33 @@
 `tools/rve-build` собирает игровой релиз из каталога проекта или запускает его в
 dev-режиме. Инструмент является внешним crate workspace и зависит от
 `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`,
-`engine-files` и `engine-script`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
+`engine-files`, `engine-script` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
 Подробности runtime layout проекта и релиза находятся в
 [[Engine/EngineRuntime]], формат сцены — в [[Engine/EngineScene]], а формат архива и
 реестр — в [[Engine/EnginePak]].
 
 ## Конвейер
 
-Автоматическая публикация Windows x64 SDK описана в
-`.github/workflows/sdk-release.yml`: push в `main` проходит отбор
-`.github/scripts/select_sdk_release.py` по графу зависимостей Cargo из
-`affected_packages.py`. Выпуск нужен при изменении `rve-editor`, `rve-build`,
-`rve-player`, `rve-sdk` или их зависимостей, общих настроек сборки и файлов
-конвейера выпуска. Документация, примеры и независимые инструменты пропускаются.
-Ручной запуск из `main` принудительный; отсутствие базы сравнения также требует сборки.
-SDK собирается MSVC с bundled GNU toolchain, затем
+Автоматическая публикация Windows x64 SDK — job `release` в
+`.github/workflows/ci.yml`. Он стартует после общей проверки `CI` при push в `mommy`
+или ручном запуске из `mommy`. Отбор `.github/scripts/select_sdk_release.py` по графу
+зависимостей Cargo из `affected_packages.py` решает, нужна ли сборка: выпуск нужен при
+изменении `rve-editor`, `rve-build`, `rve-player`, `rve-sdk` или их зависимостей, общих
+настроек сборки и файлов CI и скриптов выпуска. Документация, примеры и независимые
+инструменты пропускаются. SDK собирается MSVC с bundled GNU toolchain, затем
 `package_sdk_release.py` создаёт `sdk-verified.zip` с корнем `sdk-verified/`,
 распаковывает его во временный каталог и проверяет `scripts` и `build` на шаблоне
 New Project при PATH только с системными каталогами Windows. Успешный архив
-публикуется как prerelease `sdk-<полный SHA>`, без изменения latest release;
-повторный запуск заменяет asset того же релиза. Проверка не запускает GUI или GPU.
+публикуется как обычный GitHub Release `sdk-<полный SHA>` с отметкой latest; повторный
+запуск заменяет asset того же релиза. Проверка не запускает GUI или GPU.
 
-`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]` читает
+`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]` читает
 `project.rveproject` и `bootstrap.rves`, открывает `<project>/Assets` через
 `ResourceSystem` в `SourceMode::Loose`, затем проверяет каждую включённую сцену с
 помощью `SceneDocument`. Выключенные сцены не открываются. В сборку попадают файлы
 включённых сцен, их `[[assets]]`, внешние PNG-зависимости FBX через
 `Assets::model_dependencies` и заданный `BootstrapConfig.app_icon`. Каждый объявленный
-asset `.camerasettings` проверяется как UTF-8/TOML с диапазонами настроек до сборки.
+asset `.camerasettings` проверяется как UTF-8/TOML с диапазонами настроек до сборки; asset `.postprocess` проверяется тем же парсером `PostProcessSettings`; `.rvephysmat` проверяется так же и пакуется вместе со сценой, которая на него ссылается. Asset `.glsl` проверяется `compile_screen_shader` для обеих стадий тем же кодом, что и renderer; ошибка отклоняет сборку с путём файла и номером строки ([[Engine/EngineScreenShaders]]).
 Иконка должна
 иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
 Неиспользуемые файлы каталога Assets не копируются.
@@ -47,25 +46,51 @@ HDR при назначении архива, проверка содержим�
 `shared`. Отсутствующий или невалидный префаб — ошибка проекта с кодом 2.
 Lite-, heavy-скрипты и их параметры также берутся из раскрытого документа.
 
+`.rveprefab` из `[[assets]]` сцены, которых нет среди её экземпляров, раскрываются через
+`PrefabTemplate::load` тем же `ResourceHandle`. Ресурсы шаблона, включая вложенные
+префабы, lite- и heavy-скрипты попадают в сборку сцены по тем же правилам архивов, а
+`params` lite-скриптов шаблона проверяются. Ограничения spawn-префаба (camera,
+directional_light, environment) сборщик для них не проверяет: такой префаб допустим как
+экземпляр. `max_instances` остаётся в файле сцены как есть; значение проверяет парсер
+сцены. Префабы проекта, которых нет ни в `[[assets]]` сцены, ни в списке тяжёлых префабов,
+не упаковываются.
+
+Тяжёлые префабы из `<project>/prefabs.rveprefabs` ([[Engine/EngineProject#prefabs.rveprefabs]])
+раскрываются через `PrefabTemplate::load`, их lite- и heavy-скрипты и `params` проверяются
+так же, как у сцены. В отличие от экземпляров сцены префаб обязан проходить
+`PrefabTemplate::check_spawnable`: иначе сборка завершается ошибкой проекта с кодом 2.
+Файл префаба и все его ресурсы, включая вложенные префабы и текстуры моделей, получают
+явный `archive` записи списка, если он задан; он приоритетнее правил сцены. Без него
+ресурс, который используют сцены, следует их правилам, остальные попадают в `shared`.
+Если общий ресурс получает разные архивы от разных записей списка, он уходит в `shared`.
+Явный архив записи `[[assets]]` сцены — решение автора: любой конфликт с ним, в том числе с
+записью списка для того же ассета, — ошибка проекта. Отсутствующий файл списка означает
+пустой список.
+
 Для каждого lite-скрипта включённой сцены сборщик получает схему `properties` через
 `engine_script::lite_properties` и проверяет `params` объекта через
 `ParamSchema::resolve` (см. [[Engine/EngineScript]]). Ошибка схемы или параметра —
 ошибка проекта с кодом 2: сцена, id объекта и путь скрипта указываются в сообщении.
+Object/component refs проверяются на существующую цель и требуемый компонент; asset refs
+должны присутствовать в `[[assets]]` сцены или префаба.
 Выполнение верхнего Lua chunk для чтения схемы ограничено пятью секундами. По истечении
 срока chunk прерывается и сборка завершается ошибкой проекта.
 После сборки cdylib так же проверяются `params` heavy-скриптов по
-`ScriptLibrary::schema`, вместе с проверкой имён.
+`ScriptLibrary::schema`, вместе с проверкой имён; object/component refs должны разрешаться в
+объекты с требуемым компонентом, а asset refs — в пути из `[[assets]]`.
 
-`build_project_archives` сериализует `ProjectSettings::to_toml` и
-`ArchiveSetRegistry::to_toml` во временный каталог, передаёт generated files вместе
+`build_project_archives` сериализует `ProjectSettings::to_toml`, `PrefabCatalogFile::to_toml`
+и `ArchiveSetRegistry::to_toml` во временный каталог, передаёт generated files вместе
 с проверенными исходными файлами как `BuildFileInput` в `build_archive_set`. Архивы
 собираются во временном sibling-каталоге output, затем публикуются атомарно без
 замены существующего каталога. `base.rvepak` содержит сцены, иконку,
-`/rve/project.toml` и `/rve/assets.toml`. Runtime получает bootstrap из
+`/rve/project.toml`, `/rve/assets.toml` и `/rve/prefabs.toml`. Список тяжёлых префабов
+пишется всегда, даже пустым (`prefabs = []`), поэтому runtime читает один формат. Путь
+`/rve/prefabs.toml` зарезервирован: `Assets` не может его содержать. Runtime получает bootstrap из
 `Engine/bootstrap.rves`, а наборы архивов из `Assets/` корня релиза (см.
 [[Engine/EngineRuntime]]).
 
-На Windows корень релиза — сам output: executable, `Engine/` и `Assets/` лежат рядом.
+На Windows корень релиза — сам output: executable, `Engine/` и `Assets/` лежат рядом. Выделенный сервер `rve-server` попадает в релиз только с `--with-server`: клиенты могут подключаться к одному общему серверу, поэтому раздавать его файл каждому игроку не нужно. Без флага сервер не ищется и не собирается. С флагом он кладётся рядом с `Engine/`, на macOS — рядом с `.app`, а не внутрь бандла; это сборка без окна и без dev-console (`--no-default-features`).
 На macOS output содержит `<player>.app`: executable в `Contents/MacOS`, `Engine/` и
 `Assets/` в `Contents/Resources`, `Contents/Info.plist` генерирует
 `platform::info_plist` (`CFBundleIdentifier` = `rve.game.<id>` с заменой `_` на `-`,
@@ -86,6 +111,10 @@ Dev-player использует библиотеку из проекта. При
 только если `RVE_DLSS_SDK` задан, и записывает `dlss_enabled` в `rve-sdk.toml`;
 `run`/`build` с проектом, требующим DLSS, отклоняют SDK player без этой feature.
 
+## Материалы и Surface shaders
+
+tools/rve-build/src/project.rs валидирует каждый используемый .rvemat, затем рекурсивно включает его .rveshader и текстуры из properties в ресурсный набор сцены. Эти dependencies получают archive owner по тем же правилам, что и остальные использованные файлы. .rveshader разбирается и проверяется как формат engine-scene; GLSL body не компилируется в builder, потому что rve-build не зависит от engine-render. Ошибки TOML, schema material или отсутствующие dependencies — ошибка проекта с кодом 2. Ошибка GLSL появляется в editor/runtime и использует magenta Lit fallback; формат и ограничение compile-time см. [[Engine/EngineMaterials]].
+
 ## Назначение архивов
 
 - Явный `[[assets]].archive` сохраняется и имеет приоритет для этого ресурса.
@@ -93,7 +122,10 @@ Dev-player использует библиотеку из проекта. При
   общий для нескольких сцен — `shared`.
 - Внешняя текстура FBX без явного назначения следует множеству сцен, использующих
   её модели.
-- Файлы сцен, AppIcon и generated project/registry TOML находятся в `base`.
+- Файлы сцен, AppIcon и generated project/registry/prefab-list TOML находятся в `base`.
+- Явный `archive` записи `prefabs.rveprefabs` относится к файлу тяжёлого префаба и его
+  зависимостям и приоритетнее правил сцены. Конфликт с другим явным назначением того же
+  ассета — ошибка проекта.
 - Разные явные назначения одного ресурса, имена архивов с различием только
   регистра, недопустимое имя `scene-<stem>` и назначение AppIcon вне `base` приводят
   к ошибке проекта.
@@ -114,6 +146,8 @@ Dev-player использует библиотеку из проекта. При
 Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to date` по полю `fresh`
 этого артефакта.
 
+Выделенный сервер `rve-server` собирается тем же механизмом командой `cargo build --release --locked -p rve-server --no-default-features` в `build/server`. Сборка без dev-console и DLSS; при сборке SDK он копируется как соседний executable `rve-server` (`rve-server.exe` на Windows).
+
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
 `engine_version`, `abi_version`, `target` и `dlss_enabled`. Последнее поле по
 умолчанию false для старых SDK и отражает DLSS feature prebuilt player. Маркер
@@ -133,11 +167,11 @@ SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходн
 содержать `bin/cargo` и `bin/rustc` (на Windows `.exe`) и целиком копируется в
 `toolchain/`. `--no-rust-toolchain` предназначен для CI и пакетов без autobuild.
 
-Команда пересобирает release editor, builder и оба player; distribution player без
+Команда пересобирает release editor, builder, оба player и `rve-server`; distribution player без
 console. Пути executable берутся из Cargo JSON. Кэши изолированы в `build/sdk-player`
 и `build/sdk-tools`. На Windows каждому Cargo build передаётся явный target вместе
 с `-C target-feature=+crt-static`, поэтому флаг не затрагивает host proc macros.
-SDK содержит четыре executable, marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
+SDK содержит пять executable (builder, editor, `rve-player`, `rve-player-dev` и `rve-server`), marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
 На macOS они находятся в `RVE Editor.app/Contents/MacOS`, Vulkan loader/MoltenVK
 и ICD — в `Contents/Resources/Engine`. Публикация атомарная без замены output.
 
@@ -229,11 +263,14 @@ MoltenVK (Apache-2.0).
 
 ## Пример и ограничения
 
-`examples/demo-game/` содержит две включённые сцены, общую FBX-модель с внешней
+`examples/demo-game/` содержит три включённые сцены (`physics`, `main`, `second`), общую FBX-модель с внешней
 текстурой, явный архив `props`, Lua lite script и отдельный `HeavyScripts` crate,
 который зависит от `rve-sdk`, собирается как `cdylib` и экспортирует Rust-скрипт
 `Bobber`. Draft-сцена отключена, а лишний файл проверяет исключение неиспользуемых
-ресурсов. CI собирает проект без графического запуска; фактический Vulkan runtime
+ресурсов. Сцена `physics` объявляет быстрые префабы пули и следа (`bullet.rveprefab`,
+`bullet_hole.rveprefab` с `max_instances = 100`): они попадают в архив `scene-physics`.
+`prefabs.rveprefabs` добавляет тяжёлую `tower.rveprefab`, которую не использует ни одна
+сцена, поэтому она лежит в `shared`. F6 (`SceneCycle`) переключает `physics` и `second`; корневой `scene-tour-guide` с `keep_on_load` переносит Lua и Rust ScriptRef демонстрацию между ними, а `second` раскрывает экземпляр `satellite.rveprefab`. CI собирает проект без графического запуска; фактический Vulkan runtime
 требует совместимое устройство.
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
@@ -245,3 +282,7 @@ MoltenVK (Apache-2.0).
 `RUSTC_BOOTSTRAP=1` и gated `gnu-lld`; при обновлении Rust нужна повторная smoke-проверка,
 в том числе зависимостей с proc-macro и build.rs. Сторонние native зависимости могут
 требовать дополнительных инструментов.
+
+## UI assets
+
+`.rveui`-документы и указанные ими PNG/TTF/OTF assets являются обычными объявленными ресурсами проекта: release pak собирает их из manifest-списков assets/scenes так же, как остальные ресурсы. Игровой UI формат описан в [[Engine/EngineGui]].

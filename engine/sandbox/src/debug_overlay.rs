@@ -3,7 +3,7 @@
 //! Геометрия строится в физических пикселях окна и перестраивается только при новой
 //! выборке метрик, раз в [`SAMPLE_INTERVAL`].
 
-use engine_render::OverlayVertex;
+use engine_render::{DrawStats, FrameProfile, GpuPass, OverlayVertex};
 use font8x8::legacy::BASIC_LEGACY;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -27,6 +27,8 @@ const LINE_GAP: f32 = 4.0;
 const SECTION_GAP: f32 = 10.0;
 const GRAPH_WIDTH: f32 = 240.0;
 const GRAPH_HEIGHT: f32 = 40.0;
+/// Зазор между столбцами профиля: CPU-фазы слева, GPU-проходы справа.
+const PROFILE_COLUMN_GAP: f32 = 24.0;
 
 const PANEL_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.6];
 const TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -35,6 +37,20 @@ const FPS_COLOR: [f32; 4] = [0.2, 0.9, 0.3, 0.9];
 const RAM_COLOR: [f32; 4] = [0.3, 0.6, 1.0, 0.9];
 const CPU_COLOR: [f32; 4] = [1.0, 0.6, 0.2, 0.9];
 const GPU_COLOR: [f32; 4] = [0.9, 0.3, 0.9, 0.9];
+
+/// Строки CPU-фаз renderer, в порядке `FrameProfile::cpu`.
+const CPU_PHASE_LABELS: [&str; 7] = [
+    "prepare",
+    "fence wait",
+    "uploads",
+    "acquire",
+    "record",
+    "submit",
+    "present",
+];
+/// Строки профиля: CPU-фазы, затем GPU-проходы первого вида и его total.
+const PROFILE_ROWS: usize = CPU_PHASE_LABELS.len() + GpuPass::COUNT + 1;
+const GPU_TOTAL_ROW: usize = PROFILE_ROWS - 1;
 
 /// Последние значения метрики фиксированной длины; старые вытесняются.
 struct History {
@@ -71,12 +87,41 @@ struct Sample {
     gpu_percent: Option<f32>,
 }
 
+/// Суммы и число замеров по строкам профиля за окно выборки.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProfileAverages {
+    sum: [Duration; PROFILE_ROWS],
+    count: [u32; PROFILE_ROWS],
+}
+
+impl ProfileAverages {
+    fn add(&mut self, row: usize, value: Option<Duration>) {
+        if let Some(value) = value {
+            self.sum[row] += value;
+            self.count[row] += 1;
+        }
+    }
+
+    /// Средние значения окна; строки без замеров дают `None`. Сбрасывает суммы.
+    fn take(&mut self) -> [Option<Duration>; PROFILE_ROWS] {
+        let averages = std::array::from_fn(|row| {
+            (self.count[row] > 0).then(|| self.sum[row] / self.count[row])
+        });
+        *self = Self::default();
+        averages
+    }
+}
+
 /// Накопление кадров и GPU-времени между выборками и история значений.
 struct Metrics {
     window_start: Instant,
     frames: u32,
     gpu_time: Duration,
     gpu_measured: bool,
+    profile: ProfileAverages,
+    latest_profile: [Option<Duration>; PROFILE_ROWS],
+    /// Счётчики draw'ов последнего кадра с профилем.
+    latest_draws: Option<DrawStats>,
     latest: Sample,
     fps: History,
     memory: History,
@@ -91,6 +136,9 @@ impl Metrics {
             frames: 0,
             gpu_time: Duration::ZERO,
             gpu_measured: false,
+            profile: ProfileAverages::default(),
+            latest_profile: [None; PROFILE_ROWS],
+            latest_draws: None,
             latest: Sample::default(),
             fps: History::new(SHORT_HISTORY),
             memory: History::new(LONG_HISTORY),
@@ -106,6 +154,31 @@ impl Metrics {
     fn add_gpu_time(&mut self, time: Duration) {
         self.gpu_time += time;
         self.gpu_measured = true;
+    }
+
+    /// CPU-фазы кадра и GPU-проходы первого вида; отсутствующие значения не учитываются.
+    fn add_frame_profile(&mut self, frame: &FrameProfile) {
+        let cpu = frame.cpu;
+        let phases = [
+            cpu.prepare,
+            cpu.fence_wait,
+            cpu.uploads,
+            cpu.acquire,
+            cpu.record,
+            cpu.submit,
+            cpu.present,
+        ];
+        for (row, value) in phases.into_iter().enumerate() {
+            self.profile.add(row, Some(value));
+        }
+        self.latest_draws = Some(frame.draws);
+        let Some(view) = frame.gpu.and_then(|gpu| gpu.views[0]) else {
+            return;
+        };
+        for (pass, value) in view.passes.iter().enumerate() {
+            self.profile.add(CPU_PHASE_LABELS.len() + pass, *value);
+        }
+        self.profile.add(GPU_TOTAL_ROW, Some(view.total));
     }
 
     fn sample_due(&self, now: Instant) -> bool {
@@ -130,6 +203,7 @@ impl Metrics {
             .push(memory_bytes.map_or(0.0, |bytes| bytes as f32));
         self.cpu.push(cpu_percent.unwrap_or(0.0));
         self.gpu.push(gpu_percent.unwrap_or(0.0));
+        self.latest_profile = self.profile.take();
         self.window_start = now;
         self.frames = 0;
         self.gpu_time = Duration::ZERO;
@@ -210,6 +284,11 @@ impl DebugOverlay {
         self.metrics.frame_presented();
     }
 
+    /// Учитывает профиль кадра renderer: CPU-фазы и GPU-проходы первого вида.
+    pub fn record_frame_profile(&mut self, profile: &FrameProfile) {
+        self.metrics.add_frame_profile(profile);
+    }
+
     /// Учитывает новое GPU-время кадра и при наступлении срока делает выборку.
     ///
     /// Возвращает вершины оверлея для [`engine_render::Frame::overlay`].
@@ -258,6 +337,21 @@ fn display_name(name: &str) -> String {
     }
 }
 
+/// Строка профиля: метка и значение в миллисекундах или `n/a`.
+fn profile_text(label: &str, value: Option<Duration>) -> String {
+    let value = value.map_or_else(
+        || "n/a".to_owned(),
+        |duration| format!("{:.3}", duration.as_secs_f64() * 1000.0),
+    );
+    format!("{label:<18} {value}")
+}
+
+/// Строка счётчика: метка и значение или `n/a`.
+fn count_text(label: &str, value: Option<u32>) -> String {
+    let value = value.map_or_else(|| "n/a".to_owned(), |value| value.to_string());
+    format!("{label:<18} {value}")
+}
+
 fn percent_text(label: &str, value: Option<f32>) -> String {
     value.map_or_else(
         || format!("{label} n/a"),
@@ -300,6 +394,75 @@ fn build_panel(out: &mut Vec<OverlayVertex>, metrics: &Metrics, cpu_name: &str, 
     layout.text(&percent_text("GPU", sample.gpu_percent), TEXT_SCALE);
     layout.text(gpu_name, TEXT_SCALE);
     layout.graph(&metrics.gpu, 100.0, GPU_COLOR);
+
+    // Профиль в два столбца: иначе с одним столбцом панель выше окна 1280×720.
+    let top = layout.y;
+    let mut cpu = Layout {
+        out: &mut *layout.out,
+        left,
+        y: top,
+        right: left,
+    };
+    cpu.text("CPU phases, ms", TEXT_SCALE);
+    for (row, label) in CPU_PHASE_LABELS.iter().enumerate() {
+        cpu.text(
+            &profile_text(label, metrics.latest_profile[row]),
+            TEXT_SCALE,
+        );
+    }
+    cpu.text("Draws, last frame", TEXT_SCALE);
+    let draws = metrics.latest_draws.map(|draws| draws.values());
+    for (index, label) in DrawStats::LABELS.iter().enumerate() {
+        cpu.text(
+            &count_text(label, draws.map(|values| values[index])),
+            TEXT_SCALE,
+        );
+    }
+    let gpu_left = cpu.right + PROFILE_COLUMN_GAP;
+    let mut gpu = Layout {
+        out: &mut *cpu.out,
+        left: gpu_left,
+        y: top,
+        right: gpu_left,
+    };
+    // Проходы GPU делятся на два столбца: один столбец при росте числа проходов выходит за окно.
+    let gpu_split = GpuPass::COUNT.div_ceil(2);
+    gpu.text("GPU passes, ms", TEXT_SCALE);
+    for (pass, label) in GpuPass::ALL.iter().map(|pass| pass.label()).enumerate() {
+        if pass >= gpu_split {
+            break;
+        }
+        let row = CPU_PHASE_LABELS.len() + pass;
+        gpu.text(
+            &profile_text(label, metrics.latest_profile[row]),
+            TEXT_SCALE,
+        );
+    }
+    let second_left = gpu.right + PROFILE_COLUMN_GAP;
+    let mut second = Layout {
+        out: &mut *gpu.out,
+        left: second_left,
+        y: top,
+        right: second_left,
+    };
+    for (pass, label) in GpuPass::ALL.iter().map(|pass| pass.label()).enumerate() {
+        if pass < gpu_split {
+            continue;
+        }
+        let row = CPU_PHASE_LABELS.len() + pass;
+        second.text(
+            &profile_text(label, metrics.latest_profile[row]),
+            TEXT_SCALE,
+        );
+    }
+    second.text(
+        &profile_text("total", metrics.latest_profile[GPU_TOTAL_ROW]),
+        TEXT_SCALE,
+    );
+    let profile_bottom = cpu.y.max(gpu.y).max(second.y);
+    let profile_right = second.right.max(gpu.right).max(cpu.right);
+    layout.y = profile_bottom;
+    layout.right = layout.right.max(profile_right);
 
     let width = layout.right + PADDING - MARGIN;
     let height = layout.y - SECTION_GAP + PADDING - MARGIN;
@@ -424,11 +587,16 @@ fn push_quad(
 
 #[cfg(test)]
 mod tests {
+    use super::{CPU_PHASE_LABELS, GPU_TOTAL_ROW};
     use super::{
         FPS_GRAPH_FLOOR, GRAPH_HEIGHT, GRAPH_WIDTH, History, LONG_HISTORY, MARGIN, MAX_NAME_CHARS,
-        Metrics, SAMPLE_INTERVAL, SHORT_HISTORY, TEXT_COLOR, build_panel, display_name, push_text,
+        Metrics, SAMPLE_INTERVAL, SHORT_HISTORY, TEXT_COLOR, build_panel, count_text, display_name,
+        push_text,
     };
     use engine_render::OverlayVertex;
+    use engine_render::{
+        DrawStats, FrameProfile, GpuFrameTimings, GpuPass, GpuViewTimings, ProfiledView,
+    };
     use std::time::{Duration, Instant};
 
     /// Прямоугольники `[x, y, width, height]` из вершин, записанных push_quad.
@@ -443,6 +611,78 @@ mod tests {
                 [left, top, right - left, bottom - top]
             })
             .collect()
+    }
+
+    fn frame_with(prepare_ms: u64, clusters_ms: Option<u64>) -> FrameProfile {
+        let mut passes = [None; GpuPass::COUNT];
+        passes[GpuPass::Clusters as usize] = clusters_ms.map(Duration::from_millis);
+        let mut frame = FrameProfile::default();
+        frame.cpu.prepare = Duration::from_millis(prepare_ms);
+        frame.gpu = Some(GpuFrameTimings {
+            views: [
+                Some(GpuViewTimings {
+                    key: ProfiledView::Screen,
+                    passes,
+                    total: Duration::from_millis(3),
+                }),
+                None,
+                None,
+                None,
+            ],
+            output_ui: None,
+        });
+        frame
+    }
+
+    #[test]
+    fn profile_rows_average_the_window_and_skip_missing_passes() {
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+        metrics.add_frame_profile(&frame_with(2, Some(1)));
+        metrics.add_frame_profile(&frame_with(4, None));
+
+        metrics.sample(start + SAMPLE_INTERVAL, None, None);
+
+        let clusters = CPU_PHASE_LABELS.len();
+        assert_eq!(metrics.latest_profile[0], Some(Duration::from_millis(3)));
+        assert_eq!(
+            metrics.latest_profile[clusters],
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(metrics.latest_profile[clusters + 1], None);
+        assert_eq!(
+            metrics.latest_profile[GPU_TOTAL_ROW],
+            Some(Duration::from_millis(3))
+        );
+
+        metrics.sample(start + 2 * SAMPLE_INTERVAL, None, None);
+        assert_eq!(
+            metrics.latest_profile[0], None,
+            "следующее окно начинается пустым"
+        );
+    }
+
+    #[test]
+    fn draw_counts_show_the_latest_frame_and_are_missing_before_it() {
+        let mut metrics = Metrics::new(Instant::now());
+        assert_eq!(metrics.latest_draws, None);
+        assert_eq!(count_text("scene culled", None), "scene culled       n/a");
+
+        for scene_culled in [4, 9] {
+            metrics.add_frame_profile(&FrameProfile {
+                draws: DrawStats {
+                    scene_culled,
+                    ..DrawStats::default()
+                },
+                ..FrameProfile::default()
+            });
+        }
+
+        assert_eq!(
+            metrics.latest_draws.map(|draws| draws.scene_culled),
+            Some(9)
+        );
+        assert_eq!(count_text("scene culled", Some(9)), "scene culled       9");
     }
 
     #[test]
@@ -595,6 +835,40 @@ mod tests {
         }
         // Фон полупрозрачный чёрный и рисуется первым.
         assert_eq!(vertices[0].color, [0.0, 0.0, 0.0, 0.6]);
+    }
+
+    #[test]
+    fn panel_fits_default_window_size() {
+        const DEFAULT_WINDOW: [f32; 2] = [1280.0, 720.0];
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+        for step in 1..=10 {
+            metrics.add_gpu_time(Duration::from_millis(step as u64));
+            metrics.sample(
+                start + SAMPLE_INTERVAL * step,
+                Some(u64::from(step) << 20),
+                Some(50.0),
+            );
+        }
+        let mut vertices = Vec::new();
+        build_panel(
+            &mut vertices,
+            &metrics,
+            &"C".repeat(MAX_NAME_CHARS),
+            &"G".repeat(MAX_NAME_CHARS),
+        );
+
+        let panel = quads(&vertices)[0];
+        assert!(
+            panel[1] + panel[3] <= DEFAULT_WINDOW[1] - MARGIN,
+            "нижняя граница панели {} выше окна",
+            panel[1] + panel[3]
+        );
+        assert!(
+            panel[0] + panel[2] <= DEFAULT_WINDOW[0] - MARGIN,
+            "правая граница панели {} шире окна",
+            panel[0] + panel[2]
+        );
     }
 
     #[test]

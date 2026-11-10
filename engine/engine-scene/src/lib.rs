@@ -1,33 +1,86 @@
 //! Формат сцен `.rvescene`, runtime-граф `World` и математика камеры, трансформаций и света.
 
+pub mod animation;
+pub mod asset_kind;
+pub mod audio;
 pub mod camera;
 pub mod camera_settings;
 pub mod document;
 pub mod light;
+pub mod material_asset;
+pub(crate) mod material_slots_serde;
+pub mod network;
 pub mod params;
+pub mod particles;
+pub mod physics_material;
+pub mod post_process;
 pub mod prefab;
+pub mod shader_asset;
 pub mod transform;
+pub mod ui_canvas;
 pub mod world;
 
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub use animation::{
+    AnimationRequest, AnimatorComponent, BlendTree, BlendTreePoint, MAX_BLEND_TREE_POINTS,
+};
+pub use asset_kind::AssetKind;
+pub use audio::{
+    AudioGroup, AudioRequest, AudioRolloff, AudioSourceComponent, ClipParams, MAX_AUDIO_PITCH,
+    MAX_AUDIO_VOLUME, VoiceId, activity_audio_requests,
+};
 pub use light::ShadowSettings;
+pub use material_asset::{
+    LitValues, MaterialAsset, MaterialAssetError, ResolvedAlpha, ResolvedMaterialAsset,
+};
+pub use network::{
+    MAX_INTERPOLATION_DELAY_MS, MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
+    MAX_SEND_RATE_HZ, NetAuthority, NetEvent, NetId, NetMode, NetRequest, NetTarget,
+    NetworkIdentityComponent, NetworkTransformComponent, PeerId, SERVER_PEER_ID, scene_net_id,
+};
+pub use particles::{
+    MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, ParticleBlendMode,
+    ParticleBurstComponent, ParticleCollisionComponent, ParticleColorKeyComponent,
+    ParticleEmitterComponent, ParticleFlipbookComponent, ParticleShapeComponent,
+    ParticleSizeKeyComponent,
+};
+pub use physics_material::{CombineMode, PhysicsMaterialError, PhysicsMaterialSettings};
+pub use shader_asset::{
+    MAX_NUMERIC_SHADER_PROPERTIES, MAX_TEXTURE_SHADER_PROPERTIES, ShaderAsset, ShaderAssetError,
+    ShaderColorSpace, ShaderLighting, ShaderProperty, ShaderPropertyDefault, ShaderPropertyKind,
+    ShaderPropertyLayout, ShaderSchema, TextureFallback,
+};
+pub use ui_canvas::UiCanvasComponent;
 
 pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,
     ProjectionSettings, Tonemapper,
 };
 pub use document::{
-    CameraComponent, DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript,
-    LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer,
-    ParamValue, PointLightComponent, ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError,
-    SceneObject, SceneTransform, SpotLightComponent,
+    CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
+    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LAYER_COUNT, LiteScript,
+    LodGroup, LodLevel, MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS,
+    MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue, PointLightComponent,
+    ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset, SceneDocument,
+    SceneError, SceneObject, SceneTransform, ScreenShaderRef, ScreenShaderStage,
+    SpotLightComponent,
 };
-pub use params::{ParamKind, ParamSchema, ParamSpec};
+pub use params::{ComponentKind, ParamKind, ParamSchema, ParamSpec};
+pub use post_process::{
+    AmbientOcclusionQuality, AmbientOcclusionSettings, BloomSettings, ChromaticAberrationSettings,
+    ColorGradingSettings, DepthOfFieldSettings, ExposureMode, ExposureSettings, FilmGrainSettings,
+    MotionBlurSettings, PostProcessError, PostProcessSettings, TonemappingSettings,
+    VignetteSettings, resolve_post_process,
+};
 pub use prefab::{
     Expansion, HeavyParamsOverride, LiteParamsOverride, MeshRendererOverride, ObjectOrigin,
-    PrefabInstance, PrefabOverride, TransformOverride, apply_override, expand,
+    PrefabInstance, PrefabOverride, PrefabTemplate, TransformOverride, apply_override, expand,
     expand_without_overrides,
 };
 pub use world::{
-    EnvironmentState, LightState, LocalLightState, LocalTransform, MeshInstance, ObjectHandle,
-    SceneFrame, SceneWarning, World, WorldObject,
+    EnvironmentState, LightState, LocalLightState, LocalTransform, MAX_GENERATION,
+    MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle, ParticleEmitterInstance, SceneFrame,
+    SceneReplacement, SceneWarning, SpawnOptions, World, WorldObject,
 };

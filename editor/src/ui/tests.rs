@@ -4,8 +4,8 @@ use super::*;
 use crate::layout::default_layout;
 use crate::project::OpenProject;
 use crate::scene_edit::{EditorScene, NewObject};
-use crate::state::AssetDrag;
-use crate::viewport::camera::project_point;
+use crate::state::{AssetDrag, ObjectDrag, ViewCommand};
+use crate::viewport::camera::{EditorCamera, View, project_point};
 use crate::viewport::gizmo::GizmoTool;
 use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
 use engine_assets::{Model, ModelMesh, ModelVertex};
@@ -160,8 +160,11 @@ fn cube() -> Arc<Model> {
                 7, 4, 1, 2, 6, 1, 6, 5,
             ],
             material: Default::default(),
+            skin: None,
         }],
         textures: Vec::new(),
+        skeleton: None,
+        animations: Vec::new(),
     })
 }
 
@@ -450,6 +453,122 @@ fn tool_shortcuts_are_blocked_while_the_console_is_open() {
         harness.press(key, Modifiers::NONE);
         assert_eq!(harness.state.tool, GizmoTool::Move);
     }
+}
+
+#[test]
+fn queued_numpad_frame_and_standard_view_apply_once_and_keep_the_target() {
+    let (mut harness, id) = harness_with_cube();
+    harness.scene_mut().select(Some(id.as_str()));
+    harness.state.view_commands.push(ViewCommand::Frame);
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    assert!((harness.state.camera.target - CUBE_POSITION).length() < 1e-4);
+    assert!(harness.state.view_commands.is_empty());
+
+    let distance = harness.state.camera.distance;
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Right));
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    let camera = harness.state.camera;
+    assert!((camera.target - CUBE_POSITION).length() < 1e-4);
+    assert_eq!(camera.distance, distance);
+    assert!((camera.eye() - camera.target).normalize().x > 0.999);
+}
+
+#[test]
+fn queued_numpad_commands_are_dropped_while_typing_or_a_dialog_is_open() {
+    let mut harness = Harness::new();
+    let before = harness.state.camera;
+    let text_id = egui::Id::new("numpad_text");
+    let mut text = String::new();
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Top));
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+        ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
+        toolbar::handle_shortcuts(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert_eq!(harness.state.camera, before);
+    assert!(harness.state.view_commands.is_empty());
+
+    harness.state.console_open = true;
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Top));
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    assert_eq!(harness.state.camera, before);
+}
+
+#[test]
+fn numpad_zero_aligns_the_scene_camera_to_the_game_camera_or_does_nothing_without_one() {
+    let mut harness = Harness::new();
+    let game = {
+        let world = harness.state.world_mut().unwrap();
+        world.camera_of(world.active_camera()).unwrap()
+    };
+    harness.state.view_commands.push(ViewCommand::AlignToGame);
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    let camera = harness.state.camera;
+    assert!((camera.eye() - game.position).length() < 1e-3);
+    let forward = (game.target - game.position).normalize();
+    assert!((camera.target - camera.eye()).normalize().dot(forward) > 0.999);
+
+    let before = EditorCamera { yaw: 1.0, ..camera };
+    harness.state.camera = before;
+    harness.state.scene = None;
+    harness.state.view_commands.push(ViewCommand::AlignToGame);
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    assert_eq!(harness.state.camera, before);
+}
+
+/// Полный кадр интерфейса, как в приложении: `ui::show` сам сбрасывает видимость панелей.
+fn full_frame(harness: &mut Harness, dock: &mut DockState<Tab>) {
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| show(ui, state, dock));
+    output.textures_delta.clear();
+}
+
+#[test]
+fn numpad_view_in_play_needs_the_scene_panel_shown_on_the_previous_frame() {
+    let (mut harness, _id) = harness_with_cube();
+    // Без проекта `ui::show` показывает только стартовый экран, а dock с панелями не рисуется.
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+    harness.state.project = Some(OpenProject::open(Path::new(dir)).unwrap());
+    let mut dock = default_layout();
+    let document = harness.scene().document().clone();
+    harness.state.play =
+        Some(crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap());
+    // Первые кадры раскладывают dock; панель Scene появляется в нём не сразу.
+    for _ in 0..3 {
+        full_frame(&mut harness, &mut dock);
+    }
+    assert!(harness.state.scene_view.visible);
+
+    harness.state.scene_view.visible = false;
+    let before = harness.state.camera;
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Top));
+    full_frame(&mut harness, &mut dock);
+    assert_eq!(harness.state.camera, before);
+    assert!(harness.state.view_commands.is_empty());
+
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Front));
+    full_frame(&mut harness, &mut dock);
+    assert_eq!(harness.state.camera.yaw, 0.0);
+    assert_eq!(harness.state.camera.pitch, 0.0);
 }
 
 #[test]
@@ -879,7 +998,17 @@ fn build_player_menu_item_queues_the_action() {
     };
     click(&mut harness, "File");
     click(&mut harness, "Build Player…");
-    assert_eq!(harness.state.actions, [crate::state::Action::BuildPlayer]);
+    assert_eq!(
+        harness.state.actions,
+        [crate::state::Action::BuildPlayer { with_server: false }]
+    );
+    harness.state.actions.clear();
+    click(&mut harness, "File");
+    click(&mut harness, "Build Player with Server…");
+    assert_eq!(
+        harness.state.actions,
+        [crate::state::Action::BuildPlayer { with_server: true }]
+    );
 }
 
 #[test]
@@ -997,6 +1126,167 @@ fn script_params(harness: &Harness) -> BTreeMap<String, engine_scene::ParamValue
         .clone()
 }
 
+fn reference_schema() -> engine_scene::ParamSchema {
+    engine_scene::ParamSchema::new(vec![
+        engine_scene::ParamSpec {
+            name: "target".to_owned(),
+            kind: engine_scene::ParamKind::Object,
+            default: engine_scene::ParamValue::Object(String::new()),
+            min: None,
+            max: None,
+            label: Some("Target".to_owned()),
+        },
+        engine_scene::ParamSpec {
+            name: "model".to_owned(),
+            kind: engine_scene::ParamKind::Asset(Some(engine_scene::AssetKind::Model)),
+            default: engine_scene::ParamValue::String(String::new()),
+            min: None,
+            max: None,
+            label: Some("Model".to_owned()),
+        },
+    ])
+    .unwrap()
+}
+
+fn reference_fields(texts: &[(String, Pos2)]) -> Vec<Pos2> {
+    texts
+        .iter()
+        .filter(|(text, _)| text == "◉ None" || text == "▧ None")
+        .map(|(_, at)| *at)
+        .collect()
+}
+
+fn drop_payload<T: Clone + Send + Sync + 'static>(harness: &mut Harness, at: Pos2, payload: T) {
+    inspector_frame(harness, vec![Event::PointerMoved(at)]);
+    egui::DragAndDrop::set_payload(&harness.ctx, payload);
+    inspector_frame(harness, vec![button(at, PointerButton::Primary, false)]);
+}
+
+#[test]
+fn inspector_reference_fields_accept_object_and_asset_drops_and_register_assets() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let target = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness
+        .scene_mut()
+        .edit_object(&target, None, |object| {
+            object.name = Some("Reference Target".to_owned());
+            Ok(())
+        })
+        .unwrap();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.asset_tree = vec![crate::assets_fs::AssetEntry {
+        name: "models".to_owned(),
+        path: "models".to_owned(),
+        is_dir: true,
+        children: vec![crate::assets_fs::AssetEntry {
+            name: "target.fbx".to_owned(),
+            path: "models/target.fbx".to_owned(),
+            is_dir: false,
+            children: Vec::new(),
+        }],
+    }];
+
+    let fields = reference_fields(&inspector_frame(&mut harness, Vec::new()));
+    assert_eq!(fields.len(), 2);
+    drop_payload(&mut harness, fields[0], ObjectDrag(target.clone()));
+    drop_payload(
+        &mut harness,
+        fields[1],
+        AssetDrag("models/target.fbx".to_owned()),
+    );
+
+    let params = script_params(&harness);
+    assert_eq!(params["target"], engine_scene::ParamValue::Object(target));
+    assert_eq!(
+        params["model"],
+        engine_scene::ParamValue::Asset(VirtualPath::parse("models/target.fbx").unwrap())
+    );
+    assert!(
+        harness
+            .scene()
+            .document()
+            .assets
+            .iter()
+            .any(|asset| asset.path.as_str() == "models/target.fbx")
+    );
+    assert_eq!(harness.state.current_folder, "models");
+    assert_eq!(
+        harness.state.project_selection.as_deref(),
+        Some("models/target.fbx")
+    );
+}
+
+#[test]
+fn inspector_reference_field_rejects_wrong_payload_types() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let fields = reference_fields(&inspector_frame(&mut harness, Vec::new()));
+    drop_payload(
+        &mut harness,
+        fields[0],
+        AssetDrag("models/target.fbx".to_owned()),
+    );
+    drop_payload(&mut harness, fields[1], ObjectDrag("camera".to_owned()));
+    assert!(script_params(&harness).is_empty());
+}
+
+#[test]
+fn inspector_clears_empty_reference_by_removing_its_parameter_key() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let target = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness.scene_mut().select(Some("camera"));
+    let fields = reference_fields(&inspector_frame(&mut harness, Vec::new()));
+    drop_payload(&mut harness, fields[0], ObjectDrag(target));
+    assert!(script_params(&harness).contains_key("target"));
+
+    let frame = inspector_frame(&mut harness, Vec::new());
+    inspector_click(&mut harness, position_of(&frame, "✕"));
+
+    assert!(!script_params(&harness).contains_key("target"));
+}
+
+#[test]
+fn inspector_reference_picker_selects_and_id_changes_rewrite_the_reference() {
+    let mut harness = harness_with_script(Some(reference_schema()));
+    let target = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness
+        .scene_mut()
+        .edit_object(&target, None, |object| {
+            object.name = Some("Picker Target".to_owned());
+            Ok(())
+        })
+        .unwrap();
+    harness.scene_mut().select(Some("camera"));
+    let frame = inspector_frame(&mut harness, Vec::new());
+    let fields = reference_fields(&frame);
+    let picker = position_of(&frame, "⊙");
+    inspector_click(&mut harness, picker);
+    let menu = inspector_frame(&mut harness, Vec::new());
+    inspector_click(&mut harness, position_of(&menu, "Picker Target"));
+    assert_eq!(
+        script_params(&harness)["target"],
+        engine_scene::ParamValue::Object(target.clone())
+    );
+    assert_eq!(fields.len(), 2);
+
+    harness
+        .scene_mut()
+        .change_id(&target, "renamed_target")
+        .unwrap();
+    assert_eq!(
+        script_params(&harness)["target"],
+        engine_scene::ParamValue::Object("renamed_target".to_owned())
+    );
+}
+
 fn position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
     texts
         .iter()
@@ -1008,6 +1298,15 @@ fn position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
                 texts.iter().map(|t| &t.0).collect::<Vec<_>>()
             )
         })
+}
+
+fn last_position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
+    texts
+        .iter()
+        .rev()
+        .find(|(found, _)| found == text)
+        .map(|(_, at)| *at)
+        .unwrap_or_else(|| position_of(texts, text))
 }
 
 fn inspector_click(harness: &mut Harness, at: Pos2) {
@@ -1165,6 +1464,7 @@ fn rust_script_parameters_use_the_library_schema() {
             object.heavy_scripts.push(engine_scene::HeavyScript {
                 name: "Bobber".to_owned(),
                 params: BTreeMap::new(),
+                enabled: true,
             });
             Ok(())
         })
@@ -1376,4 +1676,651 @@ fn smart_zoom_frames_only_edit_scene_under_pointer_and_resets_when_hidden() {
     let mut output = h.ctx.run_ui(input, |ui| show(ui, &mut h.state, &mut dock));
     output.textures_delta.clear();
     assert!(!h.state.smart_zoom);
+}
+
+#[test]
+fn project_tile_label_is_centered_under_its_tile() {
+    let mut harness = Harness::new();
+    harness.state.asset_tree = vec![crate::assets_fs::AssetEntry {
+        name: "notes.txt".to_owned(),
+        path: "notes.txt".to_owned(),
+        is_dir: false,
+        children: Vec::new(),
+    }];
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| project_panel::show(ui, state));
+    });
+    output.textures_delta.clear();
+    // Заглушка типа рисуется по центру плитки, как и подпись под ней.
+    let texts = texts(&output.shapes);
+    let placeholder = position_of(&texts, "FILE");
+    let label = position_of(&texts, "notes.txt");
+    assert!(
+        (placeholder.x - label.x).abs() < 0.5,
+        "{label:?} не по центру плитки {placeholder:?}"
+    );
+}
+
+#[test]
+fn clicking_elsewhere_commits_the_hierarchy_rename_once() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    harness.panel(Vec::new(), hierarchy::show);
+    harness.panel(vec![Event::Text("Z".to_owned())], hierarchy::show);
+    assert_eq!(
+        harness.state.hierarchy_rename,
+        Some(("camera".to_owned(), "CameraZ".to_owned()))
+    );
+    // Щелчок мимо строк уводит фокус из поля: переименование завершается.
+    harness.click(pos2(600.0, 600.0), hierarchy::show);
+    assert_eq!(harness.state.hierarchy_rename, None);
+    assert_eq!(
+        harness.scene().object("camera").unwrap().name.as_deref(),
+        Some("CameraZ")
+    );
+}
+
+#[test]
+fn escape_cancels_the_hierarchy_rename() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    let name = harness.scene().object("camera").unwrap().name.clone();
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    harness.panel(Vec::new(), hierarchy::show);
+    harness.panel(vec![Event::Text("Z".to_owned())], hierarchy::show);
+    harness.panel(vec![key(egui::Key::Escape)], hierarchy::show);
+    assert_eq!(harness.state.hierarchy_rename, None);
+    assert_eq!(harness.scene().object("camera").unwrap().name, name);
+}
+
+#[test]
+fn starting_play_cancels_the_hierarchy_rename_and_blocks_new_ones() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    harness.panel(Vec::new(), hierarchy::show);
+    let document = harness.scene().document().clone();
+    let session = crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap();
+    harness.state.enter_play(session);
+    assert_eq!(harness.state.hierarchy_rename, None);
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    assert_eq!(harness.state.hierarchy_rename, None);
+}
+
+#[test]
+fn double_clicking_a_hierarchy_row_selects_and_frames_it_without_renaming() {
+    let (mut harness, id) = harness_with_cube();
+    let label = harness
+        .scene()
+        .object(&id)
+        .unwrap()
+        .display_name()
+        .to_owned();
+    let texts = hierarchy_frame(&mut harness, Vec::new());
+    let at = position_of(&texts, &label);
+    hierarchy_frame(&mut harness, vec![Event::PointerMoved(at)]);
+    // Два щелчка подряд в пределах двойного клика egui.
+    for pressed in [true, false, true, false] {
+        hierarchy_frame(
+            &mut harness,
+            vec![button(at, PointerButton::Primary, pressed)],
+        );
+    }
+    hierarchy_frame(&mut harness, Vec::new());
+    assert_eq!(harness.state.hierarchy_rename, None);
+    assert_eq!(harness.scene().selection(), Some(id.as_str()));
+    assert!((harness.state.camera.target - CUBE_POSITION).length() < 1e-4);
+}
+
+#[test]
+fn context_menu_rename_starts_renaming_the_row() {
+    let mut harness = Harness::new();
+    hierarchy_frame(&mut harness, Vec::new());
+    let texts = hierarchy_frame(&mut harness, Vec::new());
+    let row = position_of(&texts, "Camera");
+    hierarchy_frame(&mut harness, vec![Event::PointerMoved(row)]);
+    hierarchy_frame(
+        &mut harness,
+        vec![button(row, PointerButton::Secondary, true)],
+    );
+    hierarchy_frame(
+        &mut harness,
+        vec![button(row, PointerButton::Secondary, false)],
+    );
+    let texts = hierarchy_frame(&mut harness, Vec::new());
+    let rename = position_of(&texts, "Rename");
+    hierarchy_frame(&mut harness, vec![Event::PointerMoved(rename)]);
+    hierarchy_frame(
+        &mut harness,
+        vec![button(rename, PointerButton::Primary, true)],
+    );
+    hierarchy_frame(
+        &mut harness,
+        vec![button(rename, PointerButton::Primary, false)],
+    );
+    hierarchy_frame(&mut harness, Vec::new());
+    assert_eq!(
+        harness.state.hierarchy_rename,
+        Some(("camera".to_owned(), "Camera".to_owned()))
+    );
+}
+
+#[test]
+fn folder_tree_labels_render_without_an_icon_cache() {
+    let mut harness = Harness::new();
+    let folder =
+        |name: &str, children: Vec<crate::assets_fs::AssetEntry>| crate::assets_fs::AssetEntry {
+            name: name.to_owned(),
+            path: name.to_owned(),
+            is_dir: true,
+            children,
+        };
+    harness.state.asset_tree = vec![
+        folder("Models", vec![folder("Textures", Vec::new())]),
+        folder("Empty", Vec::new()),
+    ];
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| project_panel::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    for label in ["Assets", "Models", "Textures", "Empty"] {
+        position_of(&texts, label);
+    }
+}
+
+/// Кадр панели Scene Assets. Без рамки, как `Harness::panel`: иначе координаты надписей не
+/// совпадут с местом, куда `Harness::click` доставляет щелчок.
+fn scene_assets_frame(harness: &mut Harness, events: Vec<Event>) -> Vec<(String, Pos2)> {
+    let input = harness.input(events);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| scene_assets::show(ui, state));
+    });
+    output.textures_delta.clear();
+    texts(&output.shapes)
+}
+
+fn scene_prefab_paths(harness: &Harness) -> Vec<String> {
+    harness
+        .scene()
+        .document()
+        .assets
+        .iter()
+        .map(|asset| asset.path.as_str().to_owned())
+        .collect()
+}
+
+#[test]
+fn scene_assets_remove_only_prefabs_without_an_instance() {
+    let mut harness = Harness::new();
+    let prefab = "[[objects]]\nid = \"frame\"\n";
+    let loader: crate::scene_edit::PrefabLoader = std::rc::Rc::new(move |path| {
+        engine_scene::SceneDocument::parse_prefab(format!("/{}", path.as_str()), prefab)
+    });
+    harness.scene_mut().set_prefab_loader(loader).unwrap();
+    harness
+        .scene_mut()
+        .create_object(
+            &NewObject::Prefab(
+                VirtualPath::parse("/prefabs/door.rveprefab").unwrap(),
+                [0.0; 3],
+            ),
+            None,
+        )
+        .unwrap();
+    harness
+        .scene_mut()
+        .add_scene_prefab(VirtualPath::parse("/prefabs/bullet.rveprefab").unwrap())
+        .unwrap();
+
+    let texts = scene_assets_frame(&mut harness, Vec::new());
+    position_of(&texts, "/prefabs/door.rveprefab");
+    position_of(&texts, "используется экземпляром");
+    position_of(&texts, "нет экземпляра в сцене");
+    // Строки идут в порядке ресурсов сцены: сначала дверь (есть экземпляр), затем пуля.
+    let removes: Vec<Pos2> = texts
+        .iter()
+        .filter(|(text, _)| text == "Remove")
+        .map(|(_, at)| *at)
+        .collect();
+    assert_eq!(removes.len(), 2);
+
+    harness.click(removes[0], scene_assets::show);
+    assert_eq!(
+        scene_prefab_paths(&harness),
+        ["prefabs/door.rveprefab", "prefabs/bullet.rveprefab"]
+    );
+    harness.click(removes[1], scene_assets::show);
+    assert_eq!(scene_prefab_paths(&harness), ["prefabs/door.rveprefab"]);
+    assert!(harness.scene().can_undo());
+}
+
+#[test]
+fn dropping_assets_on_scene_assets_adds_only_prefabs() {
+    let mut harness = Harness::new();
+    let texts = scene_assets_frame(&mut harness, Vec::new());
+    let zone = position_of(&texts, "Перетащите сюда .rveprefab из Project");
+    scene_assets_frame(&mut harness, vec![Event::PointerMoved(zone)]);
+
+    egui::DragAndDrop::set_payload(&harness.ctx, AssetDrag("models/a.fbx".to_owned()));
+    scene_assets_frame(
+        &mut harness,
+        vec![button(zone, PointerButton::Primary, false)],
+    );
+    assert!(scene_prefab_paths(&harness).is_empty());
+    assert_eq!(harness.state.log.entries().count(), 1);
+
+    egui::DragAndDrop::set_payload(
+        &harness.ctx,
+        AssetDrag("prefabs/bullet.rveprefab".to_owned()),
+    );
+    scene_assets_frame(
+        &mut harness,
+        vec![button(zone, PointerButton::Primary, false)],
+    );
+    assert_eq!(scene_prefab_paths(&harness), ["prefabs/bullet.rveprefab"]);
+}
+
+/// Фокус в поле ресурса и уход из него без правки не меняют документ: нет undo и ревизии.
+#[test]
+fn leaving_an_unchanged_scene_prefab_field_adds_no_undo_step() {
+    let mut harness = Harness::new();
+    harness
+        .scene_mut()
+        .add_scene_prefab(VirtualPath::parse("/prefabs/bullet.rveprefab").unwrap())
+        .unwrap();
+    let revision = harness.scene().revision();
+
+    for hint in ["archive", "без лимита"] {
+        let texts = scene_assets_frame(&mut harness, Vec::new());
+        let field = position_of(&texts, hint);
+        harness.click(field, scene_assets::show);
+        scene_assets_frame(&mut harness, vec![key(egui::Key::Enter)]);
+        assert_eq!(harness.scene().revision(), revision, "{hint}");
+    }
+}
+
+/// Изменённое значение фиксируется при уходе из поля одной правкой.
+#[test]
+fn changed_scene_prefab_archive_is_committed_when_the_field_loses_focus() {
+    let mut harness = Harness::new();
+    harness
+        .scene_mut()
+        .add_scene_prefab(VirtualPath::parse("/prefabs/bullet.rveprefab").unwrap())
+        .unwrap();
+    let revision = harness.scene().revision();
+
+    let texts = scene_assets_frame(&mut harness, Vec::new());
+    let field = position_of(&texts, "archive");
+    harness.click(field, scene_assets::show);
+    scene_assets_frame(&mut harness, vec![Event::Text("buildings".to_owned())]);
+    scene_assets_frame(&mut harness, vec![key(egui::Key::Enter)]);
+
+    assert_eq!(harness.scene().revision(), revision + 1);
+    assert_eq!(
+        harness.scene().document().assets[0].archive.as_deref(),
+        Some("buildings")
+    );
+}
+
+/// Временный проект с известным списком тяжёлых префабов: тест не зависит от examples/demo-game.
+struct ProjectFixture(std::path::PathBuf);
+
+impl ProjectFixture {
+    fn new(prefabs: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rve-editor-ui-project-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join("Assets")).unwrap();
+        std::fs::write(
+            dir.join("project.rveproject"),
+            "id = \"fixture\"\nname = \"Fixture\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/main.rvescene\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("prefabs.rveprefabs"), prefabs).unwrap();
+        Self(dir)
+    }
+
+    fn write_asset(&self, path: &str, source: &str) {
+        let file = self.0.join("Assets").join(path.trim_start_matches('/'));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source).unwrap();
+    }
+}
+
+impl Drop for ProjectFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn project_prefabs_panel_loads_the_project_list_on_first_show() {
+    let fixture = ProjectFixture::new(
+        "[[prefabs]]\npath = \"/prefabs/crate.rveprefab\"\n[[prefabs]]\npath = \"/prefabs/gate.rveprefab\"\nmax_instances = 2\n",
+    );
+    let mut harness = Harness::new();
+    harness.state.project = Some(OpenProject::open(&fixture.0).unwrap());
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| project_prefabs::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    position_of(&texts, "Add Prefab");
+    position_of(&texts, "Save");
+    position_of(&texts, "Reload");
+    let project_root = harness.state.project.as_ref().unwrap().root.clone();
+    assert_eq!(
+        harness.state.project_prefabs.as_ref().unwrap().root(),
+        project_root
+    );
+    // Панель показывает список из файла проекта в порядке записей.
+    let entries = harness.state.project_prefabs.as_ref().unwrap().entries();
+    let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["/prefabs/crate.rveprefab", "/prefabs/gate.rveprefab"]
+    );
+    assert_eq!(entries[1].max_instances, Some(2));
+}
+
+#[test]
+fn inspector_shows_the_active_tag_and_layer_rows_with_their_defaults() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("sun"));
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| inspector::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    position_of(&texts, "Active");
+    position_of(&texts, "Tag");
+    position_of(&texts, "Untagged");
+    position_of(&texts, "Layer");
+    position_of(&texts, "0");
+}
+
+#[test]
+fn an_inactive_parent_marks_its_whole_subtree_inactive_in_the_hierarchy() {
+    let mut harness = Harness::new();
+    let model = VirtualPath::parse("/cube.fbx").unwrap();
+    let scene = harness.scene_mut();
+    let child = scene
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
+    scene.set_parent(&child, Some("sun")).unwrap();
+    assert!(scene.inactive_in_hierarchy().is_empty());
+
+    scene
+        .edit_object("sun", None, |object| {
+            object.active = false;
+            Ok(())
+        })
+        .unwrap();
+    let inactive = scene.inactive_in_hierarchy();
+    assert!(inactive.contains("sun"));
+    assert!(inactive.contains(&child));
+    assert!(!inactive.contains("camera"));
+}
+
+#[test]
+fn project_settings_tab_shows_saved_tags_and_layers_and_starts_clean() {
+    let fixture = ProjectFixture::new("");
+    std::fs::write(
+        fixture.0.join("project.rveproject"),
+        "id = \"fixture\"\nname = \"Fixture\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/main.rvescene\"\n\n[tags]\nnames = [\"Player\"]\n\n[layers]\nnames = [\"UI\"]\n",
+    )
+    .unwrap();
+    let mut harness = Harness::new();
+    harness.state.project = Some(OpenProject::open(&fixture.0).unwrap());
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| crate::ui::project_tags::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    position_of(&texts, "Save");
+    position_of(&texts, "Add Tag");
+    position_of(&texts, "Add Layer");
+    let draft = harness.state.tags_layers.as_ref().unwrap();
+    assert!(!draft.is_dirty());
+}
+
+fn project_panel_frame(harness: &mut Harness, events: Vec<Event>) -> Vec<(String, Pos2)> {
+    let input = harness.input(events);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| project_panel::show(ui, state));
+    });
+    output.textures_delta.clear();
+    texts(&output.shapes)
+}
+
+fn open_asset_fixture(harness: &mut Harness, fixture: &ProjectFixture) {
+    let project = OpenProject::open(&fixture.0).unwrap();
+    harness.state.asset_tree = project.assets_dir.list().unwrap();
+    harness
+        .state
+        .materials
+        .refresh_all(&project, &harness.state.asset_tree);
+    harness.state.project = Some(project);
+}
+
+#[test]
+fn clicking_material_opens_asset_inspector_and_shader_combo_lists_project_shaders() {
+    let fixture = ProjectFixture::new("");
+    fixture.write_asset(
+        "materials/test.rvemat",
+        &engine_scene::MaterialAsset::default().to_toml().unwrap(),
+    );
+    fixture.write_asset(
+        "shaders/surface.rveshader",
+        &engine_scene::ShaderAsset::template("Surface"),
+    );
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+    harness.state.current_folder = "materials".to_owned();
+
+    let assets = project_panel_frame(&mut harness, Vec::new());
+    let material = position_of(&assets, "test.rvemat");
+    harness.click(material, project_panel::show);
+    assert_eq!(
+        harness.state.inspected_asset.as_deref(),
+        Some("materials/test.rvemat")
+    );
+    let inspector = inspector_frame(&mut harness, Vec::new());
+    position_of(&inspector, "Material");
+    let shader_combo = position_of(&inspector, "Lit (built-in)");
+    inspector_click(&mut harness, shader_combo);
+    let choices = inspector_frame(&mut harness, Vec::new());
+    position_of(&choices, "shaders/surface.rveshader");
+}
+
+#[test]
+fn material_property_reset_writes_the_asset_file() {
+    let fixture = ProjectFixture::new("");
+    fixture.write_asset(
+        "materials/test.rvemat",
+        &engine_scene::MaterialAsset::default().to_toml().unwrap(),
+    );
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+    harness.state.inspected_asset = Some("materials/test.rvemat".to_owned());
+
+    let labels = inspector_frame(&mut harness, Vec::new());
+    let reset = position_of(&labels, "↺");
+    inspector_click(&mut harness, reset);
+    let saved = std::fs::read_to_string(fixture.0.join("Assets/materials/test.rvemat")).unwrap();
+    assert!(saved.contains("base_color"), "{saved}");
+}
+
+#[test]
+fn create_material_context_menu_uses_the_folder_where_it_was_opened() {
+    let fixture = ProjectFixture::new("");
+    std::fs::create_dir_all(fixture.0.join("Assets/Materials")).unwrap();
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+
+    let labels = project_panel_frame(&mut harness, Vec::new());
+    let folder = position_of(&labels, "Materials");
+    project_panel_frame(&mut harness, vec![Event::PointerMoved(folder)]);
+    project_panel_frame(
+        &mut harness,
+        vec![button(folder, PointerButton::Secondary, true)],
+    );
+    project_panel_frame(
+        &mut harness,
+        vec![button(folder, PointerButton::Secondary, false)],
+    );
+    let menu = project_panel_frame(&mut harness, Vec::new());
+    let create = last_position_of(&menu, "Create");
+    harness.click(create, project_panel::show);
+    let submenu = project_panel_frame(&mut harness, Vec::new());
+    let material = position_of(&submenu, "Material");
+    harness.click(material, project_panel::show);
+    assert_eq!(
+        harness.state.project_dialog,
+        Some(project_panel::ProjectDialog::NewMaterial {
+            folder: "Materials".to_owned(),
+            name: "New Material".to_owned(),
+        })
+    );
+
+    let input = harness.input(vec![key(egui::Key::Enter)]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        project_panel::show_dialog(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert!(
+        fixture
+            .0
+            .join("Assets/Materials/New Material.rvemat")
+            .is_file()
+    );
+}
+
+/// Модель из двух частей: Mesh Renderer показывает два слота материалов.
+fn two_part_model() -> Arc<Model> {
+    let mut model = (*cube()).clone();
+    model.meshes.push(model.meshes[0].clone());
+    Arc::new(model)
+}
+
+#[test]
+fn showing_a_multi_part_mesh_leaves_the_scene_untouched() {
+    let mut harness = Harness::new();
+    let model = VirtualPath::parse("/multi.fbx").unwrap();
+    let id = harness
+        .scene_mut()
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
+    harness.scene_mut().select(Some(id.as_str()));
+    harness
+        .state
+        .models
+        .insert("multi.fbx".to_owned(), two_part_model());
+    let revision = harness.scene().revision();
+    let can_undo = harness.scene().can_undo();
+    let dirty = harness.scene().is_dirty();
+    for _ in 0..3 {
+        harness.panel(Vec::new(), inspector::show);
+    }
+    let scene = harness.scene();
+    assert_eq!(scene.revision(), revision);
+    assert_eq!(scene.can_undo(), can_undo);
+    assert_eq!(scene.is_dirty(), dirty);
+    let mesh = scene.object(&id).unwrap().mesh_renderer.as_ref().unwrap();
+    assert!(mesh.materials.is_empty(), "{:?}", mesh.materials);
+}
+
+/// Надписи кадра вместе с прямоугольниками, которые они занимают.
+fn collect_labels(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    match shape {
+        egui::Shape::Text(text) => {
+            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+            out.push((text.galley.text().to_owned(), rect));
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_labels(shape, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl Harness {
+    /// Один кадр с `panel`; возвращает надписи, нарисованные в этом кадре.
+    fn labels(&mut self, events: Vec<Event>, panel: Panel) -> Vec<(String, Rect)> {
+        let input = self.input(events);
+        let state = &mut self.state;
+        let mut output = self.ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| panel(ui, state));
+        });
+        output.textures_delta.clear();
+        let mut labels = Vec::new();
+        for clipped in &output.shapes {
+            collect_labels(&clipped.shape, &mut labels);
+        }
+        labels
+    }
+}
+
+fn material_preview_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    crate::ui::material_preview::show(ui, state);
+}
+
+#[test]
+fn material_preview_without_a_selected_asset_shows_a_hint_instead_of_an_old_image() {
+    let mut harness = Harness::new();
+    // Текстура от прежнего материала остаётся зарегистрированной, но без выбора её не показываем.
+    harness.state.material_preview_texture = Some(egui::TextureId::default());
+    let hint = "Select a material or shader";
+    let labels = harness.labels(Vec::new(), material_preview_panel);
+    assert!(labels.iter().any(|(text, _)| text == hint), "{labels:?}");
+    harness.state.material_preview_asset = Some("/materials/steel.rvemat".to_owned());
+    let labels = harness.labels(Vec::new(), material_preview_panel);
+    assert!(labels.iter().all(|(text, _)| text != hint), "{labels:?}");
+}
+
+fn create_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    crate::ui::project_panel::create_menu(ui, state, String::new());
+}
+
+#[test]
+fn create_menu_opens_material_and_shader_items_without_a_second_create_level() {
+    let mut harness = Harness::new();
+    let labels = harness.labels(Vec::new(), create_panel);
+    let button = labels
+        .iter()
+        .find(|(text, _)| text == "Create")
+        .map(|(_, rect)| rect.center())
+        .expect("кнопка Create в шапке");
+    harness.click(button, create_panel);
+    let labels = harness.labels(Vec::new(), create_panel);
+    let count = |name: &str| labels.iter().filter(|(text, _)| text == name).count();
+    assert_eq!(count("Create"), 1, "{labels:?}");
+    assert_eq!(count("Material"), 1, "{labels:?}");
+    assert_eq!(count("Shader"), 1, "{labels:?}");
 }

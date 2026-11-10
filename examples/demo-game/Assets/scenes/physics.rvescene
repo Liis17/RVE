@@ -1,0 +1,418 @@
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+[[assets]]
+path = "/cameras/default.camerasettings"
+
+[[assets]]
+path = "/scripts/player.lua"
+
+[[assets]]
+path = "/audio/jump.wav"
+
+[[assets]]
+path = "/audio/hum.wav"
+
+[[assets]]
+path = "/scripts/coin.lua"
+
+# Физические материалы: лёд под ящиком и резиновый мяч.
+[[assets]]
+path = "/materials/ice.rvephysmat"
+
+[[assets]]
+path = "/materials/rubber.rvephysmat"
+
+# Быстрые префабы для стрельбы: пули и следы spawn-ятся из скриптов. Следам ограничен лимит живых.
+[[assets]]
+path = "/prefabs/bullet.rveprefab"
+
+[[assets]]
+path = "/prefabs/bullet_hole.rveprefab"
+max_instances = 100
+
+[[assets]]
+path = "/scripts/shooter.lua"
+
+# Модель shared-cube.fbx занимает диапазон [-1, 1] по каждой оси, поэтому коллайдеры
+# box задают half_extents = [1, 1, 1], а полуразмер коробки задаёт scale.
+
+[[objects]]
+id = "sun"
+name = "Directional Light"
+[objects.transform]
+rotation = [-35.0, 30.0, 0.0]
+[objects.directional_light]
+color = [1.0, 0.95, 0.82]
+ambient = [0.18, 0.18, 0.2]
+shadows = true
+shadow_distance = 60.0
+shadow_cascades = 3
+
+[[objects]]
+id = "environment"
+name = "Environment"
+[objects.environment]
+intensity = 1.0
+skybox = true
+[objects.environment.procedural]
+zenith_color = [0.18, 0.32, 0.58]
+horizon_color = [0.68, 0.74, 0.82]
+ground_color = [0.12, 0.11, 0.10]
+sun_size_deg = 1.0
+sun_intensity = 1.0
+
+[[objects]]
+id = "arena-floor"
+name = "Arena Floor"
+[objects.transform]
+position = [0.0, -0.5, 0.0]
+scale = [30.0, 0.5, 30.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.mesh_renderer.material]
+metallic = 0.0
+roughness = 0.9
+[objects.collider]
+shape = "triangle_mesh"
+
+# Стены арены: верх на высоте 3 м.
+[[objects]]
+id = "wall-north"
+name = "Wall North"
+[objects.transform]
+position = [0.0, 1.5, -10.0]
+scale = [10.0, 1.5, 0.25]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+[[objects]]
+id = "wall-south"
+name = "Wall South"
+[objects.transform]
+position = [0.0, 1.5, 10.0]
+scale = [10.0, 1.5, 0.25]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+[[objects]]
+id = "wall-west"
+name = "Wall West"
+[objects.transform]
+position = [-10.0, 1.5, 0.0]
+scale = [0.25, 1.5, 10.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+[[objects]]
+id = "wall-east"
+name = "Wall East"
+[objects.transform]
+position = [10.0, 1.5, 0.0]
+scale = [0.25, 1.5, 10.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+# Внутренняя перегородка: блокирует проход вдоль X.
+[[objects]]
+id = "partition"
+name = "Partition"
+[objects.transform]
+position = [-3.0, 1.5, 2.0]
+scale = [0.25, 1.5, 3.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+# Ступень высотой 0.2 м (< step_height 0.3): персонаж должен на неё подняться.
+[[objects]]
+id = "low-step"
+name = "Low Step"
+[objects.transform]
+position = [-6.0, 0.1, 4.0]
+scale = [1.5, 0.1, 1.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+# Блок высотой 0.6 м (> step_height): с ходу не преодолевается.
+[[objects]]
+id = "high-block"
+name = "High Block"
+[objects.transform]
+position = [-6.0, 0.3, -4.0]
+scale = [1.5, 0.3, 1.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+# Пологая рампа 20° (< max_slope_deg 45): нижний край на полу, верх около 2 м.
+[[objects]]
+id = "gentle-ramp"
+name = "Gentle Ramp"
+[objects.transform]
+position = [0.0, 0.79, -6.0]
+rotation = [0.0, 0.0, 20.0]
+scale = [3.0, 0.25, 3.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+# Крутой склон 60° (> max_slope_deg 45): персонаж не удерживается и скатывается.
+[[objects]]
+id = "steep-ramp"
+name = "Steep Ramp"
+[objects.transform]
+position = [6.5, 0.91, -6.0]
+rotation = [0.0, 0.0, 60.0]
+scale = [1.2, 0.25, 2.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+
+# Динамические ящики: корневые объекты, каждый со своим коллайдером и телом.
+[[objects]]
+id = "crate-a"
+name = "Crate A"
+[objects.transform]
+position = [1.5, 0.5, 1.0]
+scale = [0.5, 0.5, 0.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 2.0
+
+[[objects]]
+id = "crate-b"
+name = "Crate B"
+[objects.transform]
+position = [2.6, 0.5, 1.0]
+scale = [0.5, 0.5, 0.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 2.0
+
+[[objects]]
+id = "crate-c"
+name = "Crate C"
+[objects.transform]
+position = [2.05, 1.55, 1.0]
+scale = [0.5, 0.5, 0.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+
+[[objects]]
+id = "crate-d"
+name = "Crate D"
+[objects.transform]
+position = [-0.5, 0.5, 1.5]
+scale = [0.5, 0.5, 0.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+
+# Ледяная площадка с ящиком: материал льда задаёт трение 0.05 у пары с ящиком.
+[[objects]]
+id = "ice-pad"
+name = "Ice Pad"
+[objects.transform]
+position = [6.0, 0.05, 7.0]
+scale = [1.5, 0.05, 1.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+material = "/materials/ice.rvephysmat"
+
+[[objects]]
+id = "crate-ice"
+name = "Crate On Ice"
+[objects.transform]
+position = [6.0, 0.6, 7.0]
+scale = [0.5, 0.5, 0.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+
+# Резиновый мяч: падает на арену и отскакивает по материалу резины.
+[[objects]]
+id = "rubber-ball"
+name = "Rubber Ball"
+[objects.transform]
+position = [2.0, 4.0, -2.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+material = "/materials/rubber.rvephysmat"
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+
+# Монеты: статические триггеры. Lua скрывает монету и отключает коллайдер при входе игрока.
+[[objects]]
+id = "coin-1"
+name = "Coin 1"
+[objects.transform]
+position = [-8.0, 0.6, -8.0]
+scale = [0.25, 0.25, 0.25]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+trigger = true
+[[objects.lite_scripts]]
+path = "/scripts/coin.lua"
+
+[[objects]]
+id = "coin-2"
+name = "Coin 2"
+[objects.transform]
+position = [8.0, 0.6, 4.0]
+scale = [0.25, 0.25, 0.25]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+trigger = true
+[[objects.lite_scripts]]
+path = "/scripts/coin.lua"
+
+[[objects]]
+id = "coin-3"
+name = "Coin 3"
+[objects.transform]
+position = [-6.0, 0.6, 8.0]
+scale = [0.25, 0.25, 0.25]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+trigger = true
+[[objects.lite_scripts]]
+path = "/scripts/coin.lua"
+
+[[objects]]
+id = "coin-4"
+name = "Coin 4"
+[objects.transform]
+position = [4.0, 0.6, -1.0]
+scale = [0.25, 0.25, 0.25]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+trigger = true
+[[objects.lite_scripts]]
+path = "/scripts/coin.lua"
+
+# Игрок: корень с character_controller (origin — центр капсулы, ступни на 0.9 м ниже).
+# Масштаб корня = 1, иначе капсула контроллера запечётся с масштабом. Видимое тело и камера — дети.
+[[objects]]
+id = "player"
+name = "Player"
+[objects.transform]
+position = [0.0, 1.0, 4.0]
+[objects.character_controller]
+radius = 0.35
+height = 1.1
+step_height = 0.3
+max_slope_deg = 45.0
+[[objects.lite_scripts]]
+path = "/scripts/player.lua"
+
+[[objects]]
+id = "player-body"
+name = "Player Body"
+parent = "player"
+[objects.transform]
+scale = [0.35, 0.9, 0.35]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+
+[[objects]]
+id = "player-camera"
+name = "Player Camera"
+parent = "player"
+[objects.transform]
+position = [0.0, 0.6, 3.5]
+rotation = [-8.0, 0.0, 0.0]
+[objects.camera]
+settings = "/cameras/default.camerasettings"
+# Стрельба: fire — пуля вылетает вперёд по взгляду, spawn_heavy — переключает тяжёлую башню.
+[[objects.lite_scripts]]
+path = "/scripts/shooter.lua"
+
+[[objects]]
+id = "ambient-hum"
+name = "Ambient Hum"
+[objects.transform]
+position = [0.0, 1.0, 0.0]
+[objects.audio_source]
+clip = "/audio/hum.wav"
+group = "ambient"
+volume = 0.6
+looping = true
+play_on_start = true
+spatial = true
+min_distance = 2.0
+max_distance = 25.0
+
+# Демо-HUD: канвас с документом /ui/hud.rveui.
+[[assets]]
+path = "/ui/hud.rveui"
+
+[[objects]]
+id = "hud"
+[objects.ui_canvas]
+document = "/ui/hud.rveui"
+
+[[objects.lite_scripts]]
+path = "/scripts/hud.lua"
+
+[[assets]]
+path = "/scripts/hud.lua"
+
+[[objects]]
+id = "scene-tour-guide"
+name = "Scene Tour Guide"
+keep_on_load = true
+[[objects.lite_scripts]]
+path = "/scripts/scene_probe.lua"
+[[objects.heavy_scripts]]
+name = "SceneReferenceProbe"
+
+[[assets]]
+path = "/scripts/scene_probe.lua"

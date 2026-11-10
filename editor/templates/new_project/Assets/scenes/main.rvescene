@@ -5,6 +5,9 @@ path = "/models/cube.fbx"
 path = "/cameras/default.camerasettings"
 
 [[assets]]
+path = "/cameras/default.postprocess"
+
+[[assets]]
 path = "/scripts/jump.lua"
 
 [[objects]]
@@ -14,6 +17,7 @@ name = "Camera"
 position = [0.0, 2.2, 6.0]
 [objects.camera]
 settings = "/cameras/default.camerasettings"
+post_process = "/cameras/default.postprocess"
 [[objects.heavy_scripts]]
 name = "Orbit"
 params = { radius = 6.0, height = 2.2, speed = 20.0 }

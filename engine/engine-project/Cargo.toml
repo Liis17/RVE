@@ -1,10 +1,11 @@
 [package]
 name = "engine-project"
-version.workspace = true
+version = "0.10.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 engine-files = { path = "../engine-files" }
+rve-sdk = { path = "../rve-sdk" }
 serde.workspace = true
 toml.workspace = true

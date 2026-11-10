@@ -1,0 +1,118 @@
+#version 450
+
+// Screen-space ambient occlusion по горизонтам (в духе GTAO): для каждого направления экрана
+// ищется наибольший угол горизонта относительно нормали, восстановленной из глубины.
+// Результат R8: 1 — открыто, 0 — полностью закрыто.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_image;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D ao_output;
+
+layout(push_constant) uniform PushConstants {
+    // x, y — масштабы проекции; z — near; w — far.
+    vec4 projection_near_far;
+    // x — радиус в метрах; y — интенсивность; z — доля радиуса, с которой начинается спад; w — направления.
+    vec4 radius_intensity_falloff_slices;
+    // x, y — размер цели; z — шаги на направление.
+    vec4 size_steps;
+} push_constants;
+
+float linear_depth(float depth) {
+    float near = push_constants.projection_near_far.z;
+    float far = push_constants.projection_near_far.w;
+    return near * far / (far - depth * (far - near));
+}
+
+vec2 target_size() {
+    return push_constants.size_steps.xy;
+}
+
+// Позиция в видовом пространстве по пикселю и глубине; взгляд направлен на -Z.
+vec3 view_position(ivec2 pixel, float depth) {
+    vec2 uv = (vec2(pixel) + 0.5) / target_size();
+    vec2 ndc = uv * 2.0 - 1.0;
+    float z = linear_depth(depth);
+    return vec3(ndc.x * z / push_constants.projection_near_far.x,
+                ndc.y * z / push_constants.projection_near_far.y,
+                -z);
+}
+
+float sample_depth(ivec2 pixel) {
+    ivec2 limit = ivec2(target_size()) - 1;
+    return texelFetch(depth_image, clamp(pixel, ivec2(0), limit), 0).r;
+}
+
+// Наибольший косинус угла горизонта с нормалью вдоль одной стороны слайса; 0 — горизонта нет.
+float horizon_cosine(ivec2 pixel, vec2 direction, float radius_px, vec3 center, vec3 normal,
+                     float radius, float falloff, int steps) {
+    float best = 0.0;
+    for (int step = 1; step <= steps; step++) {
+        float t = float(step) / float(steps);
+        ivec2 sample_pixel = pixel + ivec2(round(direction * radius_px * t));
+        if (sample_pixel == pixel) {
+            continue;
+        }
+        float sample_depth_value = sample_depth(sample_pixel);
+        if (sample_depth_value >= 0.99999) {
+            continue;
+        }
+        vec3 offset = view_position(sample_pixel, sample_depth_value) - center;
+        float distance_to_sample = length(offset);
+        if (distance_to_sample < 1e-5 || distance_to_sample > radius) {
+            continue;
+        }
+        float cosine = dot(offset / distance_to_sample, normal);
+        float weight = 1.0 - smoothstep(falloff, 1.0, distance_to_sample / radius);
+        best = max(best, cosine * weight);
+    }
+    return best;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(target_size().x) || pixel.y >= int(target_size().y)) {
+        return;
+    }
+    float depth = sample_depth(pixel);
+    if (depth >= 0.99999) {
+        imageStore(ao_output, pixel, vec4(1.0));
+        return;
+    }
+    vec3 center = view_position(pixel, depth);
+    vec3 right = view_position(pixel + ivec2(1, 0), sample_depth(pixel + ivec2(1, 0)));
+    vec3 left = view_position(pixel - ivec2(1, 0), sample_depth(pixel - ivec2(1, 0)));
+    vec3 down = view_position(pixel + ivec2(0, 1), sample_depth(pixel + ivec2(0, 1)));
+    vec3 up = view_position(pixel - ivec2(0, 1), sample_depth(pixel - ivec2(0, 1)));
+    // Нормаль берётся с меньшим перепадом по каждой оси: меньше ложных краёв у силуэтов.
+    vec3 dx = abs(right.z - center.z) < abs(left.z - center.z) ? right - center : center - left;
+    vec3 dy = abs(down.z - center.z) < abs(up.z - center.z) ? down - center : center - up;
+    vec3 normal = normalize(cross(dx, dy));
+    vec3 to_view = normalize(-center);
+    if (dot(normal, to_view) < 0.0) {
+        normal = -normal;
+    }
+
+    float radius = push_constants.radius_intensity_falloff_slices.x;
+    float intensity = push_constants.radius_intensity_falloff_slices.y;
+    float falloff = push_constants.radius_intensity_falloff_slices.z;
+    int slices = int(push_constants.radius_intensity_falloff_slices.w + 0.5);
+    int steps = int(push_constants.size_steps.z + 0.5);
+    // Радиус в пикселях зависит от расстояния: проекция по вертикали переводит метры в экран.
+    float radius_px = radius * push_constants.projection_near_far.y * target_size().y * 0.5 / max(-center.z, 1e-4);
+    // Интерливинг по пикселю убирает регулярные полосы при малом числе направлений.
+    float noise = fract(52.9829189 * fract(dot(vec2(pixel), vec2(0.06711056, 0.00583715))));
+
+    float visibility = 0.0;
+    for (int slice = 0; slice < slices; slice++) {
+        float angle = (float(slice) + noise) * 3.14159265 / float(slices);
+        vec2 direction = vec2(cos(angle), sin(angle));
+        // Слайс — прямая через пиксель: горизонт ищется с обеих сторон, иначе открытость смещена.
+        float best_forward = horizon_cosine(pixel, direction, radius_px, center, normal, radius, falloff, steps);
+        float best_backward = horizon_cosine(pixel, -direction, radius_px, center, normal, radius, falloff, steps);
+        visibility += 0.5 * ((1.0 - best_forward) + (1.0 - best_backward));
+    }
+    float average = visibility / float(max(slices, 1));
+    float ao = clamp(1.0 - (1.0 - average) * intensity, 0.0, 1.0);
+    imageStore(ao_output, pixel, vec4(ao, 0.0, 0.0, 1.0));
+}

@@ -3,7 +3,7 @@ use crate::error::BuildError;
 #[cfg(windows)]
 use crate::ico::png_to_ico;
 use crate::platform;
-use crate::project::{HeavyScriptUse, ProjectBuild, prepare_project};
+use crate::project::{HeavyScriptUse, ProjectBuild, prepare_project, validate_script_references};
 use crate::sdk::{self, PlayerLocation};
 use crate::temporary::TempDir;
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
@@ -20,6 +20,8 @@ use std::process::{Command, Stdio};
 pub(crate) enum PlayerFlavor {
     Distribution,
     Dev,
+    /// Выделенный сервер `rve-server`: release без функций, без DLSS.
+    Server,
 }
 
 impl PlayerFlavor {
@@ -27,16 +29,25 @@ impl PlayerFlavor {
         match self {
             Self::Distribution => "player",
             Self::Dev => "player-dev",
+            Self::Server => "server",
+        }
+    }
+
+    /// Пакет Cargo, который собирает этот вариант.
+    pub(crate) fn package(self) -> &'static str {
+        match self {
+            Self::Server => "rve-server",
+            Self::Distribution | Self::Dev => "rve-player",
         }
     }
 
     fn cargo_arguments(self, dlss: bool) -> Vec<&'static str> {
         let mut arguments = vec!["build"];
-        if self == Self::Distribution {
+        if self != Self::Dev {
             arguments.push("--release");
         }
-        arguments.extend(["--locked", "-p", "rve-player"]);
-        if self == Self::Distribution {
+        arguments.extend(["--locked", "-p", self.package()]);
+        if self != Self::Dev {
             arguments.push("--no-default-features");
         }
         if dlss {
@@ -51,6 +62,7 @@ pub(crate) fn build_distribution(
     project_dir: &Path,
     output: &Path,
     vulkan_sdk: Option<&Path>,
+    with_server: bool,
 ) -> Result<(), BuildError> {
     let output = absolute_output_path(output)?;
     ensure_output_missing(&output)?;
@@ -69,6 +81,9 @@ pub(crate) fn build_distribution(
     )?;
     #[cfg(not(windows))]
     let executable = locate_player(PlayerFlavor::Distribution, false)?;
+    let server_executable = with_server
+        .then(|| locate_player(PlayerFlavor::Server, false))
+        .transpose()?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -134,6 +149,7 @@ pub(crate) fn build_distribution(
 
     let output_binary = binary_dir.join(&executable_name);
     copy_file(&executable, &output_binary)?;
+    stage_server(server_executable.as_deref(), staging.path())?;
     #[cfg(windows)]
     if let Some(icon_path) = &project.icon {
         let source = project
@@ -158,6 +174,17 @@ pub(crate) fn build_distribution(
             "не удалось опубликовать {}: {error}",
             output.display()
         ))),
+    }
+}
+
+/// Сервер лежит рядом с Engine (Windows) или рядом с `.app` (macOS), а не внутри бандла: без окна.
+fn stage_server(server_executable: Option<&Path>, release_root: &Path) -> Result<(), BuildError> {
+    match server_executable {
+        Some(server) => copy_file(
+            server,
+            &release_root.join(sdk::player_filename(PlayerFlavor::Server)),
+        ),
+        None => Ok(()),
     }
 }
 
@@ -368,15 +395,27 @@ fn validate_heavy_scripts(
     for script in heavy_scripts {
         if !library.contains_script(&script.name) {
             return Err(BuildError::input(format!(
-                "сцена /{} ссылается на heavy-скрипт {:?}, которого нет в библиотеке",
-                script.scene, script.name
+                "{} ссылается на heavy-скрипт {:?}, которого нет в библиотеке",
+                script.owner, script.name
             )));
         }
         if let Some(schema) = library.schema(&script.name) {
-            schema.resolve(&script.params).map_err(|error| {
+            let resolved = schema.resolve(&script.params).map_err(|error| {
                 BuildError::input(format!(
-                    "сцена /{}, объект {:?}, heavy-скрипт {:?}: {error}",
-                    script.scene, script.object, script.name
+                    "{}, объект {:?}, heavy-скрипт {:?}: {error}",
+                    script.owner, script.object, script.name
+                ))
+            })?;
+            validate_script_references(
+                schema,
+                &resolved,
+                &script.references.objects,
+                &script.references.assets,
+            )
+            .map_err(|error| {
+                BuildError::input(format!(
+                    "{}, объект {:?}, heavy-скрипт {:?}: {error}",
+                    script.owner, script.object, script.name
                 ))
             })?;
         }
@@ -593,7 +632,7 @@ fn locate_player(flavor: PlayerFlavor, dlss: bool) -> Result<PathBuf, BuildError
             executable,
             manifest,
         } => {
-            println!("rve-player: prebuilt (SDK)");
+            println!("{}: prebuilt (SDK)", flavor.package());
             println!("rve-sdk engine version: {}", manifest.engine_version);
             Ok(executable)
         }
@@ -634,6 +673,7 @@ pub(crate) fn build_checkout_player(
     let root = repo_root()?;
     let target_dir = normalize_build_path(&checkout_player_target_dir(&root, flavor))?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let package = flavor.package();
     let stdout = run_cargo(
         Command::new(cargo)
             .args(flavor.cargo_arguments(dlss))
@@ -642,16 +682,19 @@ pub(crate) fn build_checkout_player(
         match flavor {
             PlayerFlavor::Distribution => "сборка distribution rve-player",
             PlayerFlavor::Dev => "сборка dev rve-player",
+            PlayerFlavor::Server => "сборка rve-server",
         },
         CargoFailure::Operational,
     )?;
-    let artifact = parse_cargo_output(&stdout, "rve-player", "bin", None)
-        .map_err(|message| BuildError::operational(format!("сборка rve-player: {message}")))?;
+    let artifact = parse_cargo_output(&stdout, package, "bin", None)
+        .map_err(|message| BuildError::operational(format!("сборка {package}: {message}")))?;
     let executable = artifact.executable.ok_or_else(|| {
-        BuildError::operational("cargo не сообщил executable для бинарника rve-player")
+        BuildError::operational(format!(
+            "cargo не сообщил executable для бинарника {package}"
+        ))
     })?;
     println!(
-        "rve-player: {}",
+        "{package}: {}",
         if artifact.fresh {
             "up to date"
         } else {
@@ -659,7 +702,7 @@ pub(crate) fn build_checkout_player(
         }
     );
     normalize_build_path(&executable)
-        .map_err(|error| BuildError::operational(format!("сборка rve-player: {error}")))
+        .map_err(|error| BuildError::operational(format!("сборка {package}: {error}")))
 }
 
 pub(crate) fn build_sdk_binary(
@@ -1059,10 +1102,11 @@ mod tests {
         validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
-    use crate::project::{HeavyScriptUse, ProjectBuild};
+    use crate::project::{HeavyScriptUse, ProjectBuild, ScriptReferenceContext};
     use crate::temporary::TempDir;
-    use engine_files::strip_windows_verbatim_prefix;
+    use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
     use engine_project::ProjectSettings;
+    use engine_scene::{ParamValue, SceneDocument};
     use engine_script::ScriptLibrary;
     use rve_sdk::{Params, Script};
     use std::collections::BTreeMap;
@@ -1081,6 +1125,11 @@ mod tests {
         let module = rve_sdk::script_module! {
             "Bobber" => test_factory { speed: f32 = 1.4 (0.0..=10.0) },
             "Spinner" => test_factory,
+            "Reference" => test_factory {
+                target: Option<Object> = None,
+                camera: component(camera) = None,
+                model: Asset = "",
+            },
         };
         // SAFETY: script_module! stores the descriptors and names in static storage.
         unsafe { ScriptLibrary::from_module(module) }.unwrap()
@@ -1272,6 +1321,37 @@ mod tests {
             checkout_player_target_dir(root, PlayerFlavor::Dev),
             root.join("build/player-dev")
         );
+        assert_eq!(
+            PlayerFlavor::Server.cargo_arguments(false),
+            [
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "rve-server",
+                "--no-default-features",
+                "--message-format=json",
+            ]
+        );
+        assert_eq!(
+            checkout_player_target_dir(root, PlayerFlavor::Server),
+            root.join("build/server")
+        );
+    }
+
+    #[test]
+    fn network_settings_survive_the_project_toml_written_for_release() {
+        // Релиз пишет project.toml через to_toml: сетевые настройки должны вернуться без изменений.
+        let settings = ProjectSettings::parse(
+            "id = \"net\"\nname = \"Net\"\nversion = \"1\"\n[[scenes]]\npath = \"scene.rvescene\"\n[network]\nenabled = true\nport = 9100\nmax_clients = 16\ntick_hz = 20\ntimeout_ms = 5000\n",
+        )
+        .unwrap();
+        let written = settings.to_toml().unwrap();
+        assert!(written.contains("[network]"), "{written}");
+        let reread = ProjectSettings::parse(&written).unwrap();
+        assert_eq!(reread.network, settings.network);
+        assert!(reread.network.enabled);
+        assert_eq!(reread.network.port, 9100);
     }
 
     fn sample_project(project_dir: &Path, heavy_scripts: Option<&str>) -> ProjectBuild {
@@ -1284,6 +1364,7 @@ mod tests {
             project_dir: project_dir.to_path_buf(),
             bootstrap_path: project_dir.join("bootstrap.rves"),
             settings,
+            prefabs: engine_project::PrefabCatalogFile::default(),
             files: BTreeMap::new(),
             assignments: BTreeMap::new(),
             archives: vec!["base".to_owned()],
@@ -1516,10 +1597,11 @@ mod tests {
         }
         let wrapper: Wrapper = toml::from_str(&format!("params = {params}")).unwrap();
         HeavyScriptUse {
-            scene: scene.to_owned(),
+            owner: format!("сцена /{scene}"),
             object: "mesh".to_owned(),
             name: name.to_owned(),
             params: wrapper.params,
+            references: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -1535,6 +1617,63 @@ mod tests {
             assert_eq!(error.exit_code(), 2, "{params}: {error}");
             assert!(error.to_string().contains("\"mesh\""), "{error}");
             assert!(error.to_string().contains("Bobber"), "{error}");
+        }
+    }
+
+    #[test]
+    fn heavy_script_references_require_targets_components_and_declared_assets() {
+        let library = test_library();
+        let document = SceneDocument::parse(
+            "references.rvescene",
+            r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+[[objects]]
+id = "plain"
+"#,
+        )
+        .unwrap();
+        let assets =
+            std::collections::BTreeSet::from([VirtualPath::parse("models/ship.fbx").unwrap()]);
+        let make_use = |target: &str, camera: &str, model: &str| {
+            let params: BTreeMap<String, ParamValue> = toml::from_str(&format!(
+                "target = {{ object = {target:?} }}\ncamera = {{ object = {camera:?} }}\nmodel = {{ asset = {model:?} }}"
+            ))
+            .unwrap();
+            HeavyScriptUse {
+                owner: "scene /references.rvescene".to_owned(),
+                object: "camera".to_owned(),
+                name: "Reference".to_owned(),
+                params,
+                references: std::sync::Arc::new(ScriptReferenceContext {
+                    objects: document.objects.clone(),
+                    assets: assets.clone(),
+                }),
+            }
+        };
+
+        assert!(
+            validate_heavy_scripts(&library, &[make_use("target", "target", "models/ship.fbx")])
+                .is_ok()
+        );
+
+        for (usage, expected) in [
+            (make_use("missing", "target", "models/ship.fbx"), "missing"),
+            (make_use("target", "plain", "models/ship.fbx"), "camera"),
+            (
+                make_use("target", "target", "models/missing.fbx"),
+                "[[assets]]",
+            ),
+        ] {
+            let error = validate_heavy_scripts(&library, &[usage]).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 
@@ -1597,13 +1736,29 @@ mod tests {
     }
 
     #[test]
+    fn release_contains_the_server_only_when_requested() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-stage-server").unwrap();
+        let server = root.path().join("server-source");
+        fs::write(&server, b"server binary").unwrap();
+        let staged = root
+            .path()
+            .join(crate::sdk::player_filename(PlayerFlavor::Server));
+
+        super::stage_server(None, root.path()).unwrap();
+        assert!(!staged.exists());
+
+        super::stage_server(Some(&server), root.path()).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"server binary");
+    }
+
+    #[test]
     fn existing_output_fails_before_touching_project_or_output_contents() {
         let root = TempDir::create(&std::env::temp_dir(), "rve-build-output-exists").unwrap();
         let output = root.path().join("existing-output");
         fs::create_dir(&output).unwrap();
         fs::write(output.join("marker"), b"keep").unwrap();
-        let error =
-            build_distribution(&root.path().join("missing-project"), &output, None).unwrap_err();
+        let error = build_distribution(&root.path().join("missing-project"), &output, None, false)
+            .unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert_eq!(fs::read(output.join("marker")).unwrap(), b"keep");
         assert!(!root.path().join("missing-project/.rve").exists());

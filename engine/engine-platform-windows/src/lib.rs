@@ -15,6 +15,9 @@ pub use instance::{
 
 pub use ash_window::{create_surface, enumerate_required_extensions};
 
+/// Platform adapter version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Дополнительные к surface расширения instance, необходимые платформе.
 pub const INSTANCE_EXTENSIONS: &[&CStr] = &[];
 /// Флаги создания Vulkan instance для платформы.
@@ -25,6 +28,45 @@ pub const DEVICE_EXTENSIONS: &[&CStr] = &[];
 /// Returns the user's local application cache directory.
 pub fn user_cache_dir() -> Option<PathBuf> {
     user_cache_dir_with(|name| std::env::var_os(name))
+}
+
+/// Returns the user's roaming application-data directory.
+pub fn user_data_dir() -> Option<PathBuf> {
+    user_data_dir_with(|name| std::env::var_os(name))
+}
+
+fn user_data_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
+    get("APPDATA")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            get("USERPROFILE")
+                .filter(|path| !path.is_empty())
+                .map(|profile| PathBuf::from(profile).join("AppData").join("Roaming"))
+        })
+}
+
+/// Atomically replaces a file using the Windows replace-existing operation.
+pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers valid for this call.
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn user_cache_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
@@ -102,5 +144,22 @@ mod tests {
             Some(PathBuf::from(r"C:\Users\rve\AppData\Local"))
         );
         assert_eq!(user_cache_dir_with(|_| None), None);
+    }
+
+    #[test]
+    fn data_directory_uses_roaming_app_data_and_profile_fallback() {
+        assert_eq!(
+            user_data_dir_with(
+                |name| (name == "APPDATA").then(|| OsString::from(r"C:\Users\rve\AppData\Roaming"))
+            ),
+            Some(PathBuf::from(r"C:\Users\rve\AppData\Roaming"))
+        );
+        assert_eq!(
+            user_data_dir_with(
+                |name| (name == "USERPROFILE").then(|| OsString::from(r"C:\Users\rve"))
+            ),
+            Some(PathBuf::from(r"C:\Users\rve\AppData\Roaming"))
+        );
+        assert_eq!(user_data_dir_with(|_| None), None);
     }
 }

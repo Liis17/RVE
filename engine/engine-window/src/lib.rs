@@ -3,17 +3,22 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalPosition;
 use winit::error::{EventLoopError, OsError};
-use winit::event::{DeviceEvent, ElementState, MouseScrollDelta};
+use winit::event::{DeviceEvent, ElementState, Ime, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Icon, WindowId};
+use winit::keyboard::{Key as LogicalKey, KeyCode, NamedKey, PhysicalKey};
+use winit::window::{CursorGrabMode, Fullscreen, Icon, WindowId};
 
 pub use winit::dpi::PhysicalSize;
 pub use winit::event::WindowEvent;
 pub use winit::window::Window;
+
+/// Версия крейта из `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Поддерживаемый набор физических клавиш.
 #[repr(u32)]
@@ -191,6 +196,74 @@ fn map_mouse_scroll(delta: MouseScrollDelta) -> (f32, f32) {
     }
 }
 
+/// Текстовый ввод для полей ввода: набранный текст и клавиши редактирования.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextInputEvent {
+    /// Печатный текст или IME-фиксация без управляющих символов.
+    Text(String),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    Enter,
+}
+
+/// Переводит нажатие клавиши в текстовое событие. Отпускание ничего не даёт.
+///
+/// Клавиши редактирования имеют приоритет над сопровождающим их текстом (например, `\r` у Enter).
+/// Управляющие символы и символы приватной области (коды функциональных клавиш macOS) отбрасываются.
+fn text_input_for_key(
+    pressed: bool,
+    named: Option<NamedKey>,
+    text: Option<&str>,
+) -> Option<TextInputEvent> {
+    if !pressed {
+        return None;
+    }
+    if let Some(edit) = named.and_then(edit_event) {
+        return Some(edit);
+    }
+    let printable: String = text?
+        .chars()
+        .filter(|&c| !c.is_control() && !matches!(c, '\u{E000}'..='\u{F8FF}'))
+        .collect();
+    (!printable.is_empty()).then_some(TextInputEvent::Text(printable))
+}
+
+fn edit_event(key: NamedKey) -> Option<TextInputEvent> {
+    Some(match key {
+        NamedKey::Backspace => TextInputEvent::Backspace,
+        NamedKey::Delete => TextInputEvent::Delete,
+        NamedKey::ArrowLeft => TextInputEvent::Left,
+        NamedKey::ArrowRight => TextInputEvent::Right,
+        NamedKey::Home => TextInputEvent::Home,
+        NamedKey::End => TextInputEvent::End,
+        NamedKey::Enter => TextInputEvent::Enter,
+        _ => return None,
+    })
+}
+
+/// Фиксация IME передаётся как текст; пустая фиксация ничего не меняет.
+fn commit_event(text: String) -> Option<TextInputEvent> {
+    (!text.is_empty()).then_some(TextInputEvent::Text(text))
+}
+
+/// `NamedKey::Process` на Windows означает, что клавишу обработал IME: набранный текст придёт
+/// через `Ime::Commit`. Пока IME разрешён, такое нажатие не должно дать текст, иначе символ
+/// дублируется (как в egui-winit 0.36.2, `try_on_ime_processed_keyboard_input`).
+fn ime_processed_key(ime_allowed: bool, key: Option<NamedKey>) -> bool {
+    ime_allowed && key == Some(NamedKey::Process)
+}
+
+fn named_key(key: &LogicalKey) -> Option<NamedKey> {
+    match key {
+        LogicalKey::Named(named) => Some(*named),
+        _ => None,
+    }
+}
+
 /// Параметры создаваемого окна.
 pub struct WindowConfig {
     pub title: String,
@@ -273,15 +346,61 @@ impl RedrawMode {
     }
 }
 
+/// Желаемое состояние курсора окна.
+///
+/// По умолчанию курсор видим и не удерживается. Удержание включается только в фокусированном
+/// окне и после нажатия мыши в клиентской области; дельта движения приходит через `mouse_motion`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorState {
+    /// Показывать системный курсор.
+    pub visible: bool,
+    /// Держать курсор неподвижно в окне.
+    pub locked: bool,
+    /// Точка удержания в физических пикселях клиентской области; `None` — центр окна.
+    pub lock_position: Option<PhysicalPosition<f64>>,
+}
+
+impl Default for CursorState {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            locked: false,
+            lock_position: None,
+        }
+    }
+}
+
 enum InternalEvent {
     RequestFocus,
     RequestExit,
+    SetCursor(CursorState),
+    SetTextInput(bool),
+    SetFullscreen(FullscreenRequest),
+    Wake,
+}
+
+/// Запрос полноэкранного режима без рамки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullscreenRequest {
+    Set(bool),
+    Toggle,
+}
+
+impl FullscreenRequest {
+    /// Целевое состояние относительно текущего.
+    fn target(self, current: bool) -> bool {
+        match self {
+            Self::Set(fullscreen) => fullscreen,
+            Self::Toggle => !current,
+        }
+    }
 }
 
 /// Потокобезопасный handle для запросов в оконный цикл событий.
 #[derive(Clone)]
 pub struct WindowProxy {
     event_loop_proxy: EventLoopProxy<InternalEvent>,
+    fullscreen: Arc<AtomicBool>,
 }
 
 impl WindowProxy {
@@ -300,6 +419,60 @@ impl WindowProxy {
     /// После завершения цикла событий запрос игнорируется.
     pub fn request_exit(&self) {
         let _ = self.event_loop_proxy.send_event(InternalEvent::RequestExit);
+    }
+
+    /// Запрашивает видимость и удержание курсора в потоке цикла событий.
+    ///
+    /// Запрос без окна сохраняется и применяется при его создании. Без фокуса курсор остаётся
+    /// видимым и свободным, а удержание включается после следующего нажатия мыши в окне.
+    pub fn set_cursor(&self, state: CursorState) {
+        let _ = self
+            .event_loop_proxy
+            .send_event(InternalEvent::SetCursor(state));
+    }
+
+    /// Включает или выключает IME окна в потоке цикла событий.
+    ///
+    /// Текст приходит через `WindowHandler::text_input`. Запрос, поступивший до создания окна,
+    /// сохраняется и применяется при его создании.
+    pub fn set_text_input(&self, enabled: bool) {
+        let _ = self
+            .event_loop_proxy
+            .send_event(InternalEvent::SetTextInput(enabled));
+    }
+
+    /// Включает или выключает полноэкранный режим без рамки на текущем мониторе.
+    ///
+    /// Запрос применяется в потоке цикла событий; запрос до создания окна применяется при его
+    /// создании. После завершения цикла событий запрос игнорируется.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        let _ = self
+            .event_loop_proxy
+            .send_event(InternalEvent::SetFullscreen(FullscreenRequest::Set(
+                fullscreen,
+            )));
+    }
+
+    /// Переключает полноэкранный режим без рамки относительно состояния в момент применения.
+    pub fn toggle_fullscreen(&self) {
+        let _ = self
+            .event_loop_proxy
+            .send_event(InternalEvent::SetFullscreen(FullscreenRequest::Toggle));
+    }
+
+    /// Последнее состояние полноэкранного режима, применённое или замеченное циклом событий.
+    ///
+    /// Обновляется после применения запроса и при изменении размера окна, поэтому учитывает и
+    /// выход из полноэкранного режима средствами ОС.
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen.load(Ordering::Acquire)
+    }
+
+    /// Будит цикл событий, чтобы он снова вызвал `WindowHandler::update`.
+    ///
+    /// Само событие не меняет состояние окна и игнорируется оконным циклом.
+    pub fn wake(&self) {
+        let _ = self.event_loop_proxy.send_event(InternalEvent::Wake);
     }
 }
 
@@ -376,6 +549,10 @@ pub trait WindowHandler {
     /// Вызывается для поддерживаемой физической клавиши; автоповтор не передаётся.
     fn key(&mut self, _key: Key, _pressed: bool) {}
 
+    /// Вызывается для текстового ввода: печатный текст, IME-фиксация и клавиши редактирования.
+    /// Автоповтор клавиш передаётся, в отличие от `key`.
+    fn text_input(&mut self, _event: TextInputEvent) {}
+
     /// Вызывается при нажатии или отпускании поддерживаемой кнопки мыши.
     fn mouse_button(&mut self, _button: MouseButton, _pressed: bool) {}
 
@@ -399,8 +576,10 @@ pub fn run(mut config: WindowConfig, handler: &mut impl WindowHandler) -> Result
         .build()
         .map_err(WindowError::EventLoop)?;
     event_loop.set_control_flow(config.redraw.control_flow());
+    let fullscreen = Arc::new(AtomicBool::new(false));
     handler.attach_proxy(WindowProxy {
         event_loop_proxy: event_loop.create_proxy(),
+        fullscreen: Arc::clone(&fullscreen),
     });
 
     let mut app = WindowApplication {
@@ -412,6 +591,9 @@ pub fn run(mut config: WindowConfig, handler: &mut impl WindowHandler) -> Result
         exited: false,
         focus_requests: FocusRequestState::default(),
         focused: false,
+        cursor: CursorController::default(),
+        text_input: false,
+        fullscreen: FullscreenState::new(fullscreen),
     };
     let run_result = event_loop.run_app(&mut app);
     app.finish();
@@ -431,13 +613,66 @@ struct WindowApplication<'a, H> {
     exited: bool,
     focus_requests: FocusRequestState,
     focused: bool,
+    cursor: CursorController,
+    /// Запрошен ли IME; применяется к окну при создании и при каждом изменении.
+    text_input: bool,
+    fullscreen: FullscreenState,
 }
 
+/// Состояние полноэкранного режима, общее с `WindowProxy::is_fullscreen`.
+///
+/// Не обращается к `Window`: применённое значение возвращается вызывающему коду.
+struct FullscreenState {
+    shared: Arc<AtomicBool>,
+    /// Целевое состояние запроса, поступившего до создания окна.
+    pending: Option<bool>,
+}
+
+impl FullscreenState {
+    fn new(shared: Arc<AtomicBool>) -> Self {
+        Self {
+            shared,
+            pending: None,
+        }
+    }
+
+    fn current(&self) -> bool {
+        self.shared.load(Ordering::Acquire)
+    }
+
+    /// Возвращает целевое состояние для окна или сохраняет запрос, если окна ещё нет.
+    fn request(&mut self, request: FullscreenRequest, window_exists: bool) -> Option<bool> {
+        let current = self.pending.unwrap_or_else(|| self.current());
+        let target = request.target(current);
+        if window_exists {
+            Some(target)
+        } else {
+            self.pending = Some(target);
+            None
+        }
+    }
+
+    fn window_created(&mut self) -> Option<bool> {
+        self.pending.take()
+    }
+
+    fn observe(&self, fullscreen: bool) {
+        self.shared.store(fullscreen, Ordering::Release);
+    }
+}
+
+fn apply_fullscreen(window: &Window, fullscreen: bool, state: &FullscreenState) {
+    window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
+    state.observe(fullscreen);
+}
 impl<H: WindowHandler> WindowApplication<'_, H> {
     fn finish(&mut self) {
         if !self.exited {
             self.handler.exiting();
             self.exited = true;
+        }
+        if let Some(window) = self.window.as_ref() {
+            apply_cursor_plan(window, self.cursor.release(window.inner_size()));
         }
         self.window.take();
     }
@@ -448,6 +683,176 @@ impl<H: WindowHandler> WindowApplication<'_, H> {
 
     fn should_exit_on_close_requested(&mut self) -> bool {
         self.handler.close_requested()
+    }
+}
+
+/// Вызов winit для удержания курсора.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CursorGrab {
+    Release,
+    /// Первое удержание: перенос курсора в точку и `Locked`.
+    Lock {
+        anchor: PhysicalPosition<f64>,
+    },
+    /// Переустановка активного удержания: сначала снимается `Locked`. Иначе на Windows
+    /// ClipCursor остаётся на прежнем месте экрана, и перенос курсора им ограничивается.
+    Relock {
+        anchor: PhysicalPosition<f64>,
+    },
+}
+
+/// Изменения курсора окна; `None` оставляет значение без вызова winit.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CursorPlan {
+    visible: Option<bool>,
+    grab: Option<CursorGrab>,
+}
+
+/// Решает, какие вызовы winit нужны для желаемого состояния курсора.
+///
+/// Хранит применённые видимость и удержание, чтобы не повторять вызовы без изменения.
+/// Не обращается к `Window`: размер окна передаётся параметром, поэтому логика тестируется
+/// без окна. Размер `None` означает, что окна ещё нет: запрос сохраняется, но не применяется.
+struct CursorController {
+    requested: CursorState,
+    focused: bool,
+    /// Удержание разрешено: окно в фокусе и нажатие мыши было уже после получения фокуса.
+    lock_ready: bool,
+    applied_visible: bool,
+    applied_locked: bool,
+}
+
+impl Default for CursorController {
+    fn default() -> Self {
+        Self {
+            requested: CursorState::default(),
+            focused: false,
+            lock_ready: false,
+            applied_visible: true,
+            applied_locked: false,
+        }
+    }
+}
+
+impl CursorController {
+    fn request(&mut self, state: CursorState, size: Option<PhysicalSize<u32>>) -> CursorPlan {
+        let relock = state.lock_position != self.requested.lock_position;
+        self.requested = state;
+        self.plan(size, relock)
+    }
+
+    /// Окно создано. Если оно уже в фокусе при старте, удержание применяется сразу.
+    fn window_created(&mut self, focused: bool, size: PhysicalSize<u32>) -> CursorPlan {
+        self.focused = focused;
+        self.lock_ready = focused;
+        self.plan(Some(size), false)
+    }
+
+    /// Фокус меняется. Удержание после получения фокуса ждёт нажатия мыши.
+    fn focus_changed(&mut self, focused: bool, size: PhysicalSize<u32>) -> CursorPlan {
+        if focused == self.focused {
+            return CursorPlan::default();
+        }
+        self.focused = focused;
+        self.lock_ready = false;
+        self.plan(Some(size), false)
+    }
+
+    fn mouse_pressed(&mut self, size: PhysicalSize<u32>) -> CursorPlan {
+        if self.focused {
+            self.lock_ready = true;
+        }
+        self.plan(Some(size), false)
+    }
+
+    /// Окно переместилось или изменило размер или масштаб: активное удержание переустанавливается.
+    fn window_geometry_changed(&mut self, size: PhysicalSize<u32>) -> CursorPlan {
+        self.plan(Some(size), true)
+    }
+
+    /// Освобождает курсор независимо от запроса; вызывается перед уничтожением окна.
+    fn release(&mut self, size: PhysicalSize<u32>) -> CursorPlan {
+        self.transition(true, false, size, false)
+    }
+
+    fn plan(&mut self, size: Option<PhysicalSize<u32>>, relock: bool) -> CursorPlan {
+        let Some(size) = size else {
+            return CursorPlan::default();
+        };
+        let (visible, locked) = if self.focused {
+            (
+                self.requested.visible,
+                self.requested.locked && self.lock_ready,
+            )
+        } else {
+            (true, false)
+        };
+        self.transition(visible, locked, size, relock)
+    }
+
+    fn transition(
+        &mut self,
+        visible: bool,
+        locked: bool,
+        size: PhysicalSize<u32>,
+        relock: bool,
+    ) -> CursorPlan {
+        let mut plan = CursorPlan::default();
+        if visible != self.applied_visible {
+            self.applied_visible = visible;
+            plan.visible = Some(visible);
+        }
+        if locked {
+            if !self.applied_locked {
+                plan.grab = Some(CursorGrab::Lock {
+                    anchor: self.anchor(size),
+                });
+            } else if relock {
+                plan.grab = Some(CursorGrab::Relock {
+                    anchor: self.anchor(size),
+                });
+            }
+        } else if self.applied_locked {
+            plan.grab = Some(CursorGrab::Release);
+        }
+        self.applied_locked = locked;
+        plan
+    }
+
+    fn anchor(&self, size: PhysicalSize<u32>) -> PhysicalPosition<f64> {
+        self.requested.lock_position.unwrap_or_else(|| {
+            PhysicalPosition::new(f64::from(size.width) / 2.0, f64::from(size.height) / 2.0)
+        })
+    }
+}
+
+fn apply_cursor_plan(window: &Window, plan: CursorPlan) {
+    if let Some(visible) = plan.visible {
+        window.set_cursor_visible(visible);
+    }
+    match plan.grab {
+        Some(CursorGrab::Lock { anchor }) => lock_cursor_at(window, anchor),
+        Some(CursorGrab::Relock { anchor }) => {
+            if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                log::warn!("не удалось освободить курсор перед удержанием: {error}");
+            }
+            lock_cursor_at(window, anchor);
+        }
+        Some(CursorGrab::Release) => {
+            if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                log::warn!("не удалось освободить курсор: {error}");
+            }
+        }
+        None => {}
+    }
+}
+
+fn lock_cursor_at(window: &Window, anchor: PhysicalPosition<f64>) {
+    if let Err(error) = window.set_cursor_position(anchor) {
+        log::warn!("не удалось переместить курсор в точку удержания: {error}");
+    }
+    if let Err(error) = window.set_cursor_grab(CursorGrabMode::Locked) {
+        log::warn!("не удалось удержать курсор в окне: {error}");
     }
 }
 
@@ -494,12 +899,23 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
         if let Some(icon) = self.icon.take() {
             window.set_window_icon(Some(icon));
         }
+        if self.text_input {
+            window.set_ime_allowed(true);
+        }
 
         self.window = Some(Arc::clone(&window));
         self.focused = window.has_focus();
         self.handler.focused(self.focused);
+        apply_cursor_plan(
+            &window,
+            self.cursor
+                .window_created(self.focused, window.inner_size()),
+        );
         if self.focus_requests.window_created() {
             request_window_focus(&window);
+        }
+        if let Some(fullscreen) = self.fullscreen.window_created() {
+            apply_fullscreen(&window, fullscreen, &self.fullscreen);
         }
         if !self.handler.init(window) {
             self.stop(event_loop);
@@ -524,6 +940,18 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
             self.handler.window_event(window, &event);
         }
 
+        // Текст приходит и при автоповторе, поэтому проверка не зависит от `key`.
+        if let WindowEvent::KeyboardInput { event, .. } = &event
+            && !ime_processed_key(self.text_input, named_key(&event.logical_key))
+            && let Some(text_event) = text_input_for_key(
+                event.state == ElementState::Pressed,
+                named_key(&event.logical_key),
+                event.text.as_deref(),
+            )
+        {
+            self.handler.text_input(text_event);
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 if self.should_exit_on_close_requested() {
@@ -533,6 +961,12 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 self.handler.focused(focused);
+                if let Some(window) = self.window.as_ref() {
+                    apply_cursor_plan(
+                        window,
+                        self.cursor.focus_changed(focused, window.inner_size()),
+                    );
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
                 if let PhysicalKey::Code(code) = event.physical_key
@@ -541,7 +975,17 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                     self.handler.key(key, event.state == ElementState::Pressed);
                 }
             }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                if let Some(text_event) = commit_event(text) {
+                    self.handler.text_input(text_event);
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed
+                    && let Some(window) = self.window.as_ref()
+                {
+                    apply_cursor_plan(window, self.cursor.mouse_pressed(window.inner_size()));
+                }
                 if let Some(button) = map_mouse_button(button) {
                     self.handler
                         .mouse_button(button, state == ElementState::Pressed);
@@ -554,7 +998,14 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                 let (dx, dy) = map_mouse_scroll(delta);
                 self.handler.mouse_wheel(dx, dy);
             }
-            WindowEvent::Resized(size) => self.handler.resized(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                if let Some(window) = self.window.as_ref() {
+                    self.fullscreen.observe(window.fullscreen().is_some());
+                }
+                self.handler.resized(size.width, size.height);
+                self.relock_cursor();
+            }
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => self.relock_cursor(),
             WindowEvent::Occluded(occluded) => self.handler.occluded(occluded),
             WindowEvent::RedrawRequested => {
                 if let Some(window) = self.window.as_ref()
@@ -590,6 +1041,28 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                 }
             }
             InternalEvent::RequestExit => self.stop(event_loop),
+            InternalEvent::SetCursor(state) => {
+                let size = self.window.as_ref().map(|window| window.inner_size());
+                let plan = self.cursor.request(state, size);
+                if let Some(window) = self.window.as_ref() {
+                    apply_cursor_plan(window, plan);
+                }
+            }
+            InternalEvent::SetTextInput(enabled) => {
+                self.text_input = enabled;
+                if let Some(window) = self.window.as_ref() {
+                    window.set_ime_allowed(enabled);
+                }
+            }
+            InternalEvent::SetFullscreen(request) => {
+                let window = self.window.as_ref();
+                if let Some(fullscreen) = self.fullscreen.request(request, window.is_some())
+                    && let Some(window) = window
+                {
+                    apply_fullscreen(window, fullscreen, &self.fullscreen);
+                }
+            }
+            InternalEvent::Wake => {}
         }
     }
 
@@ -608,6 +1081,17 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.finish();
+    }
+}
+
+impl<H: WindowHandler> WindowApplication<'_, H> {
+    fn relock_cursor(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            apply_cursor_plan(
+                window,
+                self.cursor.window_geometry_changed(window.inner_size()),
+            );
+        }
     }
 }
 
@@ -724,6 +1208,82 @@ mod tests {
         );
     }
 
+    fn text(value: &str) -> Option<TextInputEvent> {
+        Some(TextInputEvent::Text(value.to_owned()))
+    }
+
+    #[test]
+    fn released_keys_produce_no_text_input() {
+        assert_eq!(
+            text_input_for_key(false, Some(NamedKey::Backspace), None),
+            None
+        );
+        assert_eq!(text_input_for_key(false, None, Some("a")), None);
+    }
+
+    #[test]
+    fn edit_keys_map_to_edit_events_before_their_control_text() {
+        let cases = [
+            (
+                NamedKey::Backspace,
+                Some("\u{8}"),
+                TextInputEvent::Backspace,
+            ),
+            (NamedKey::Delete, Some("\u{7f}"), TextInputEvent::Delete),
+            (NamedKey::ArrowLeft, None, TextInputEvent::Left),
+            (NamedKey::ArrowRight, None, TextInputEvent::Right),
+            (NamedKey::Home, None, TextInputEvent::Home),
+            (NamedKey::End, None, TextInputEvent::End),
+            (NamedKey::Enter, Some("\r"), TextInputEvent::Enter),
+        ];
+        for (key, produced, expected) in cases {
+            assert_eq!(
+                text_input_for_key(true, Some(key), produced),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn printable_text_passes_and_control_or_private_use_characters_are_dropped() {
+        assert_eq!(text_input_for_key(true, None, Some("ж")), text("ж"));
+        assert_eq!(
+            text_input_for_key(true, Some(NamedKey::Space), Some(" ")),
+            text(" ")
+        );
+        assert_eq!(text_input_for_key(true, None, Some("a\u{7}b")), text("ab"));
+        assert_eq!(
+            text_input_for_key(true, Some(NamedKey::Tab), Some("\t")),
+            None
+        );
+        assert_eq!(
+            text_input_for_key(true, Some(NamedKey::Escape), Some("\u{1b}")),
+            None
+        );
+        assert_eq!(text_input_for_key(true, None, Some("\u{f704}")), None);
+        assert_eq!(text_input_for_key(true, None, Some("")), None);
+        assert_eq!(text_input_for_key(true, None, None), None);
+    }
+
+    #[test]
+    fn unsupported_named_keys_without_text_are_ignored() {
+        assert_eq!(text_input_for_key(true, Some(NamedKey::F1), None), None);
+    }
+
+    #[test]
+    fn ime_commit_is_text_and_empty_commit_is_ignored() {
+        assert_eq!(commit_event("é".to_owned()), text("é"));
+        assert_eq!(commit_event(String::new()), None);
+    }
+
+    #[test]
+    fn ime_processed_key_is_skipped_only_while_ime_is_allowed() {
+        assert!(ime_processed_key(true, Some(NamedKey::Process)));
+        assert!(!ime_processed_key(false, Some(NamedKey::Process)));
+        assert!(!ime_processed_key(true, Some(NamedKey::Enter)));
+        assert!(!ime_processed_key(true, None));
+    }
+
     #[test]
     fn window_icon_requires_exact_nonzero_rgba_buffer_size() {
         let icon = WindowIcon {
@@ -773,6 +1333,29 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_requests_toggle_from_the_latest_state_and_wait_for_the_window() {
+        let shared = Arc::new(AtomicBool::new(false));
+        let mut state = FullscreenState::new(Arc::clone(&shared));
+
+        assert_eq!(state.request(FullscreenRequest::Toggle, false), None);
+        assert_eq!(state.request(FullscreenRequest::Toggle, false), None);
+        assert_eq!(state.request(FullscreenRequest::Toggle, false), None);
+        assert_eq!(state.window_created(), Some(true));
+        assert_eq!(state.window_created(), None);
+
+        state.observe(true);
+        assert!(shared.load(Ordering::Acquire));
+        assert_eq!(state.request(FullscreenRequest::Toggle, true), Some(false));
+        assert_eq!(
+            state.request(FullscreenRequest::Set(true), true),
+            Some(true)
+        );
+
+        state.observe(false);
+        assert_eq!(state.request(FullscreenRequest::Toggle, true), Some(true));
+    }
+
+    #[test]
     fn close_request_uses_application_handler_decision() {
         let mut default_handler = Handler::default();
         let mut default_app = WindowApplication {
@@ -784,6 +1367,9 @@ mod tests {
             exited: false,
             focus_requests: FocusRequestState::default(),
             focused: false,
+            cursor: CursorController::default(),
+            text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
         assert!(default_app.should_exit_on_close_requested());
 
@@ -797,8 +1383,242 @@ mod tests {
             exited: false,
             focus_requests: FocusRequestState::default(),
             focused: false,
+            cursor: CursorController::default(),
+            text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
         assert!(!keep_open_app.should_exit_on_close_requested());
+    }
+
+    fn size(width: u32, height: u32) -> PhysicalSize<u32> {
+        PhysicalSize::new(width, height)
+    }
+
+    fn lock_state() -> CursorState {
+        CursorState {
+            visible: false,
+            locked: true,
+            lock_position: None,
+        }
+    }
+
+    fn lock_at_center(width: u32, height: u32) -> CursorGrab {
+        CursorGrab::Lock {
+            anchor: PhysicalPosition::new(f64::from(width) / 2.0, f64::from(height) / 2.0),
+        }
+    }
+
+    fn relock_at_center(width: u32, height: u32) -> CursorGrab {
+        CursorGrab::Relock {
+            anchor: PhysicalPosition::new(f64::from(width) / 2.0, f64::from(height) / 2.0),
+        }
+    }
+
+    #[test]
+    fn cursor_state_defaults_to_visible_and_free() {
+        let state = CursorState::default();
+        assert!(state.visible);
+        assert!(!state.locked);
+        assert_eq!(state.lock_position, None);
+    }
+
+    #[test]
+    fn request_before_window_is_applied_when_window_is_created_focused() {
+        let mut cursor = CursorController::default();
+        assert_eq!(cursor.request(lock_state(), None), CursorPlan::default());
+
+        let plan = cursor.window_created(true, size(800, 600));
+        assert_eq!(
+            plan,
+            CursorPlan {
+                visible: Some(false),
+                grab: Some(lock_at_center(800, 600)),
+            }
+        );
+    }
+
+    #[test]
+    fn lock_waits_for_mouse_press_after_focus_gained_later() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(false, size(800, 600));
+        cursor.request(lock_state(), Some(size(800, 600)));
+
+        let plan = cursor.focus_changed(true, size(800, 600));
+        assert_eq!(
+            plan,
+            CursorPlan {
+                visible: Some(false),
+                grab: None,
+            },
+            "видимость применяется сразу, удержание ждёт клика"
+        );
+
+        let plan = cursor.mouse_pressed(size(800, 600));
+        assert_eq!(
+            plan,
+            CursorPlan {
+                visible: None,
+                grab: Some(lock_at_center(800, 600)),
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_focus_event_keeps_an_active_lock() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        cursor.request(lock_state(), Some(size(800, 600)));
+
+        assert_eq!(
+            cursor.focus_changed(true, size(800, 600)),
+            CursorPlan::default(),
+            "повторное Focused(true) без смены фокуса ничего не меняет"
+        );
+        assert!(cursor.applied_locked);
+    }
+
+    #[test]
+    fn focus_loss_releases_the_cursor_and_shows_it() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        cursor.request(lock_state(), Some(size(800, 600)));
+        assert!(cursor.applied_locked);
+
+        let plan = cursor.focus_changed(false, size(800, 600));
+        assert_eq!(
+            plan,
+            CursorPlan {
+                visible: Some(true),
+                grab: Some(CursorGrab::Release),
+            }
+        );
+        assert!(!cursor.applied_locked && cursor.applied_visible);
+    }
+
+    #[test]
+    fn request_without_focus_is_deferred_until_a_click() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(false, size(800, 600));
+        assert_eq!(
+            cursor.request(lock_state(), Some(size(800, 600))),
+            CursorPlan::default()
+        );
+        cursor.focus_changed(true, size(800, 600));
+        assert_eq!(
+            cursor.mouse_pressed(size(800, 600)).grab,
+            Some(lock_at_center(800, 600))
+        );
+    }
+
+    #[test]
+    fn geometry_changes_reapply_an_active_lock_at_the_new_center() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        cursor.request(lock_state(), Some(size(800, 600)));
+
+        assert_eq!(
+            cursor.window_geometry_changed(size(1000, 700)),
+            CursorPlan {
+                visible: None,
+                grab: Some(relock_at_center(1000, 700)),
+            },
+            "переустановка при смене размера, а не первое удержание"
+        );
+    }
+
+    #[test]
+    fn changing_lock_position_relocks_an_active_lock() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        cursor.request(lock_state(), Some(size(800, 600)));
+
+        let point = PhysicalPosition::new(10.0, 20.0);
+        assert_eq!(
+            cursor
+                .request(
+                    CursorState {
+                        lock_position: Some(point),
+                        ..lock_state()
+                    },
+                    Some(size(800, 600)),
+                )
+                .grab,
+            Some(CursorGrab::Relock { anchor: point }),
+        );
+    }
+
+    #[test]
+    fn first_lock_is_not_a_relock() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        assert_eq!(
+            cursor.request(lock_state(), Some(size(800, 600))).grab,
+            Some(lock_at_center(800, 600)),
+        );
+    }
+
+    #[test]
+    fn geometry_changes_without_active_lock_apply_nothing() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        assert_eq!(
+            cursor.window_geometry_changed(size(1000, 700)),
+            CursorPlan::default()
+        );
+    }
+
+    #[test]
+    fn explicit_lock_position_is_used_as_anchor() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        let point = PhysicalPosition::new(10.0, 20.0);
+        let plan = cursor.request(
+            CursorState {
+                lock_position: Some(point),
+                ..lock_state()
+            },
+            Some(size(800, 600)),
+        );
+        assert_eq!(
+            plan.grab,
+            Some(CursorGrab::Lock { anchor: point }),
+            "точка удержания задаёт anchor вместо центра окна"
+        );
+    }
+
+    #[test]
+    fn unchanged_visibility_is_not_applied_again() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        let hidden = CursorState {
+            visible: false,
+            ..CursorState::default()
+        };
+        assert_eq!(
+            cursor.request(hidden, Some(size(800, 600))).visible,
+            Some(false)
+        );
+        assert_eq!(cursor.request(hidden, Some(size(800, 600))).visible, None);
+    }
+
+    #[test]
+    fn finish_releases_a_locked_hidden_cursor() {
+        let mut cursor = CursorController::default();
+        cursor.window_created(true, size(800, 600));
+        cursor.request(lock_state(), Some(size(800, 600)));
+
+        assert_eq!(
+            cursor.release(size(800, 600)),
+            CursorPlan {
+                visible: Some(true),
+                grab: Some(CursorGrab::Release),
+            }
+        );
+        assert_eq!(
+            cursor.release(size(800, 600)),
+            CursorPlan::default(),
+            "повторное освобождение ничего не меняет"
+        );
     }
 
     #[test]
@@ -819,6 +1639,9 @@ mod tests {
             exited: false,
             focus_requests: FocusRequestState::default(),
             focused: false,
+            cursor: CursorController::default(),
+            text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
 
         app.finish();
@@ -840,6 +1663,9 @@ mod tests {
             exited: false,
             focus_requests: FocusRequestState::default(),
             focused: false,
+            cursor: CursorController::default(),
+            text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
 
         app.finish();

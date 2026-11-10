@@ -24,6 +24,8 @@ Virtual paths используют UTF-8, чувствительный к рег
 
 Удаление request отменяет ещё не завершённую работу. `shutdown` прекращает приём запросов, завершает queued requests и joins coordinator/workers; локальный системный read нельзя прервать до ближайшей границы чтения. Сохранённые handles после остановки возвращают `Stopped`.
 
+Workers завершаются закрытием общей очереди заданий, а не отдельным stop-каналом через `flume::Selector`: в flume 0.11.1 и 0.12.0 Selector может потерять пробуждение при двух каналах и оставить worker в ожидании, тогда `shutdown` висит на join. Регрессия покрыта тестом `shutdown_stops_workers_that_were_just_woken_by_jobs`. Другие крейты с тем же паттерном Selector (`engine-audio`, `engine-physics`, `engine-runtime` pipeline) этим исправлением не затронуты и на такой сбой не проверены.
+
 ## Источники
 
 | Файл | Значимые символы | Роль |
@@ -32,7 +34,14 @@ Virtual paths используют UTF-8, чувствительный к рег
 | `engine/engine-resources/src/service.rs` | `ResourceSystem`, `ResourceHandle`, `ResourceRequest` | Координация workers, backend выбор, отмена и memory leases |
 | `engine/engine-resources/src/error.rs` | `ResourceError`, `ResourceErrorKind` | Типизированные ошибки запросов, бюджета, архивов, реестра и loose paths |
 | `engine/engine-resources/src/service/tests.rs` | unit tests, recording reader | Startup modes, ranges/codecs, concurrency, shutdown и budgets |
+| `engine/engine-resources/src/sampler.rs` | `ResourceSampler` | Дельта снимков за интервал и группа отчёта `Resources` |
+
+## Статистика
+
+`ResourceHandle::stats() -> ResourceStats` возвращает снимок счётчиков сервиса: `completed`, `failed`, `cancelled` (учитывает worker при ответе), `bytes` успешных `read_all` и `read_range`, `in_flight` — запросы, которые потребитель ещё не получил. `queue` и `read` — `TimingTotals` с числом замеров, суммой и максимумом времени от постановки до взятия worker'ом и времени выполнения. Поля читаются по отдельности, поэтому снимок во время работы может расходиться между полями.
+
+`ResourceSampler` превращает последовательные снимки в группу отчёта `Resources`: счётчики и средние времена за интервал между двумя последними снимками, а также `in flight` и максимумы с запуска. До второго снимка интервальные строки равны `n/a`. Группу публикуют runtime (источник `resources`, раз в 500 мс) и вкладка Profiler редактора.
 
 ## Зависимости и интеграция
 
-Крейт зависит от `engine-files` для virtual paths и positional reads, `engine-pak` для discovery, каталога и декодирования архивов, а также bounded async-capable channel `flume`. Он не добавляет глобальный runtime, scheduler, asset cache или format decoder. `ResourceHandle::root` возвращает закреплённый корень для совместимого `Assets::root()` API.
+Крейт зависит от `engine-core` (типы отчёта профайлера для `ResourceSampler`), `engine-files` для virtual paths и positional reads, `engine-pak` для discovery, каталога и декодирования архивов, а также bounded async-capable channel `flume`. Он не добавляет глобальный runtime, scheduler, asset cache или format decoder. `ResourceHandle::root` возвращает закреплённый корень для совместимого `Assets::root()` API.

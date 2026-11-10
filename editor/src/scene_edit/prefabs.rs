@@ -1,8 +1,8 @@
 //! Команды над экземплярами префабов: размещение, создание, Unpack и правка через overrides.
 
 use super::{
-    EditorScene, ensure_asset, expand_document_with, file_stem, rename_reference, subtree_ids,
-    unique_id,
+    EditorScene, ensure_asset, ensure_param_assets, expand_document_with, file_stem,
+    remap_document_script_refs, remap_object_script_refs, rename_reference, subtree_ids, unique_id,
 };
 use engine_files::VirtualPath;
 use engine_scene::{
@@ -107,6 +107,7 @@ impl EditorScene {
             for parent in parents {
                 *parent = parent.take().map(mapped);
             }
+            remap_document_script_refs(document, |reference| mapped(reference.to_owned()));
             ensure_asset(document, prefab);
             document.instances.push(PrefabInstance {
                 id: id.to_owned(),
@@ -201,6 +202,9 @@ impl EditorScene {
             |parent: Option<String>| parent.map(|parent| rename_reference(&renamed, parent));
         for object in &mut objects {
             object.parent = remap(object.parent.take());
+            remap_object_script_refs(object, |reference| {
+                rename_reference(&renamed, reference.to_owned())
+            });
             object.id = renamed[&object.id].clone();
         }
         for inner in &mut nested {
@@ -249,6 +253,7 @@ impl EditorScene {
             for parent in parents {
                 *parent = parent.take().map(outside);
             }
+            remap_document_script_refs(document, |reference| outside(reference.to_owned()));
             for asset in assets {
                 if !document
                     .assets
@@ -303,11 +308,23 @@ impl EditorScene {
             }
         }
         let assets = override_paths(&diff);
+        let param_assets = edited
+            .lite_scripts
+            .iter()
+            .flat_map(|script| script.params.values().cloned())
+            .chain(
+                edited
+                    .heavy_scripts
+                    .iter()
+                    .flat_map(|script| script.params.values().cloned()),
+            )
+            .collect::<Vec<_>>();
         self.edit(coalesce, |document| {
             // Ресурсы override объявляются в документе экземпляра.
             for path in &assets {
                 ensure_asset(document, path);
             }
+            ensure_param_assets(document, param_assets);
             let instance = document
                 .instances
                 .iter_mut()
@@ -391,6 +408,7 @@ fn used_paths(document: &SceneDocument) -> HashSet<VirtualPath> {
         if let Some(mesh) = &object.mesh_renderer {
             collected.push(mesh.model.clone());
             collected.extend(mesh.texture.clone());
+            collected.extend(mesh.materials.iter().flatten().cloned());
             if let Some(material) = &mesh.material {
                 collected.extend(material_paths(material));
             }
@@ -411,6 +429,7 @@ fn used_paths(document: &SceneDocument) -> HashSet<VirtualPath> {
             if let Some(mesh) = &change.mesh_renderer {
                 collected.extend(mesh.model.clone());
                 collected.extend(mesh.texture.clone());
+                collected.extend(mesh.materials.iter().flatten().flatten().cloned());
                 if let Some(material) = &mesh.material {
                     collected.extend(material_paths(material));
                 }
@@ -509,6 +528,33 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.environment.is_some() {
         base.environment = outer.environment.clone();
     }
+    if outer.collider.is_some() {
+        base.collider = outer.collider.clone();
+    }
+    if outer.rigid_body.is_some() {
+        base.rigid_body = outer.rigid_body;
+    }
+    if outer.character_controller.is_some() {
+        base.character_controller = outer.character_controller;
+    }
+    if outer.audio_source.is_some() {
+        base.audio_source = outer.audio_source.clone();
+    }
+    if outer.animator.is_some() {
+        base.animator = outer.animator.clone();
+    }
+    if outer.particle_emitter.is_some() {
+        base.particle_emitter = outer.particle_emitter.clone();
+    }
+    if outer.network_identity.is_some() {
+        base.network_identity = outer.network_identity;
+    }
+    if outer.network_transform.is_some() {
+        base.network_transform = outer.network_transform;
+    }
+    if outer.ui_canvas.is_some() {
+        base.ui_canvas = outer.ui_canvas.clone();
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -540,6 +586,15 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.point_light.is_none()
         && change.spot_light.is_none()
         && change.environment.is_none()
+        && change.collider.is_none()
+        && change.rigid_body.is_none()
+        && change.character_controller.is_none()
+        && change.audio_source.is_none()
+        && change.animator.is_none()
+        && change.particle_emitter.is_none()
+        && change.network_identity.is_none()
+        && change.network_transform.is_none()
+        && change.ui_canvas.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -591,6 +646,9 @@ pub(crate) fn object_override(
                     to.material.as_ref().unwrap_or(&MaterialOverride::default()),
                 )?);
             }
+            if to.materials != from.materials {
+                mesh.materials = Some(to.materials.clone());
+            }
             if mesh != MeshRendererOverride::default() {
                 change.mesh_renderer = Some(mesh);
             }
@@ -623,6 +681,53 @@ pub(crate) fn object_override(
     match (&base.environment, &edited.environment) {
         (None, None) => {}
         (Some(from), Some(to)) => change.environment = (to != from).then(|| to.clone()),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.collider.clone(), edited.collider.clone()) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.collider = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.rigid_body, edited.rigid_body) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.rigid_body = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.character_controller, edited.character_controller) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.character_controller = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.audio_source, &edited.audio_source) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.audio_source = (to != from).then(|| to.clone()),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.animator, &edited.animator) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.animator = (to != from).then(|| to.clone()),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.particle_emitter, &edited.particle_emitter) {
+        (None, None) => {}
+        (Some(from), Some(to)) => {
+            change.particle_emitter = (to != from).then(|| to.clone());
+        }
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.network_identity, edited.network_identity) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.network_identity = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.network_transform, edited.network_transform) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.network_transform = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.ui_canvas, &edited.ui_canvas) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.ui_canvas = (to != from).then(|| to.clone()),
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -766,6 +871,15 @@ pub enum OverrideField {
     PointLight,
     SpotLight,
     Environment,
+    Collider,
+    RigidBody,
+    CharacterController,
+    AudioSource,
+    Animator,
+    ParticleEmitter,
+    NetworkIdentity,
+    NetworkTransform,
+    UiCanvas,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -793,6 +907,15 @@ impl EditorScene {
             OverrideField::PointLight => change.point_light.is_some(),
             OverrideField::SpotLight => change.spot_light.is_some(),
             OverrideField::Environment => change.environment.is_some(),
+            OverrideField::Collider => change.collider.is_some(),
+            OverrideField::RigidBody => change.rigid_body.is_some(),
+            OverrideField::CharacterController => change.character_controller.is_some(),
+            OverrideField::AudioSource => change.audio_source.is_some(),
+            OverrideField::Animator => change.animator.is_some(),
+            OverrideField::ParticleEmitter => change.particle_emitter.is_some(),
+            OverrideField::NetworkIdentity => change.network_identity.is_some(),
+            OverrideField::NetworkTransform => change.network_transform.is_some(),
+            OverrideField::UiCanvas => change.ui_canvas.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -832,6 +955,15 @@ impl EditorScene {
                     OverrideField::PointLight => change.point_light = None,
                     OverrideField::SpotLight => change.spot_light = None,
                     OverrideField::Environment => change.environment = None,
+                    OverrideField::Collider => change.collider = None,
+                    OverrideField::RigidBody => change.rigid_body = None,
+                    OverrideField::CharacterController => change.character_controller = None,
+                    OverrideField::AudioSource => change.audio_source = None,
+                    OverrideField::Animator => change.animator = None,
+                    OverrideField::ParticleEmitter => change.particle_emitter = None,
+                    OverrideField::NetworkIdentity => change.network_identity = None,
+                    OverrideField::NetworkTransform => change.network_transform = None,
+                    OverrideField::UiCanvas => change.ui_canvas = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -901,6 +1033,7 @@ impl EditorScene {
                 prefab.assets.push(engine_scene::SceneAsset {
                     path: asset,
                     archive,
+                    max_instances: None,
                 });
             }
         }
@@ -940,6 +1073,7 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
     if let Some(mesh) = &change.mesh_renderer {
         paths.extend(mesh.model.clone());
         paths.extend(mesh.texture.clone());
+        paths.extend(mesh.materials.iter().flatten().flatten().cloned());
         if let Some(material) = &mesh.material {
             paths.extend(material_paths(material));
         }
@@ -958,20 +1092,33 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
     {
         paths.push(hdr);
     }
+    if let Some(audio) = &change.audio_source {
+        paths.push(audio.clip.clone());
+    }
+    if let Some(animator) = &change.animator {
+        paths.extend(animator.clips.iter().cloned());
+    }
+    if let Some(texture) = change
+        .particle_emitter
+        .as_ref()
+        .and_then(|emitter| emitter.texture.clone())
+    {
+        paths.push(texture);
+    }
     paths
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Component, EditorScene, NewObject, PrefabLoader};
-    use super::{OverrideField, material_diff, material_paths, merge_material};
+    use super::super::{Component, ComponentKind, EditorScene, NewObject, PrefabLoader};
+    use super::{OverrideField, material_diff, material_paths, merge_material, merge_override};
     use engine_files::VirtualPath;
     use engine_scene::{
-        MaterialAlphaMode, MaterialOverride, ParamValue, SceneDocument, SceneError, SceneTransform,
-        World,
+        ColliderComponent, MaterialAlphaMode, MaterialOverride, ParamValue, PrefabOverride,
+        RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneTransform, World,
     };
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::rc::Rc;
 
     /// Файлы префабов в памяти: тест может «записать» новый префаб.
@@ -1335,6 +1482,98 @@ mod tests {
     }
 
     #[test]
+    fn audio_source_prefab_override_replaces_the_component_registers_its_clip_and_reverts() {
+        let prefab = "[[assets]]\npath = \"/audio/hum.wav\"\n[[objects]]\nid = \"speaker\"\n[objects.audio_source]\nclip = \"/audio/hum.wav\"\nvolume = 0.4\nlooping = true\n";
+        let files = Files::with(&[("prefabs/speaker.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/speaker.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("speaker", None, |object| {
+                let audio = object.audio_source.as_mut().unwrap();
+                audio.volume = 0.9;
+                audio.clip = path("/audio/bell.ogg");
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(scene.is_overridden("speaker", &OverrideField::AudioSource));
+        let change = scene.object_override("speaker").unwrap();
+        assert_eq!(
+            change.audio_source,
+            scene.object("speaker").unwrap().audio_source
+        );
+        assert!(
+            scene
+                .view()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/audio/bell.ogg")),
+            "override clip must be declared in the instance document"
+        );
+
+        scene
+            .revert_field("speaker", &OverrideField::AudioSource)
+            .unwrap();
+        assert!(!scene.is_overridden("speaker", &OverrideField::AudioSource));
+        let audio = scene
+            .object("speaker")
+            .unwrap()
+            .audio_source
+            .clone()
+            .unwrap();
+        assert_eq!(audio.clip, path("/audio/hum.wav"));
+        assert_eq!(audio.volume, 0.4);
+    }
+
+    #[test]
+    fn animator_prefab_override_replaces_the_component_registers_its_clips_and_reverts() {
+        let prefab = "[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anim/walk.fbx\"\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\nclips = [\"/anim/walk.fbx\"]\nspeed = 1.0\n";
+        let files = Files::with(&[("prefabs/hero.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/hero.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("hero", None, |object| {
+                let animator = object.animator.as_mut().unwrap();
+                animator.speed = 2.0;
+                animator.clips.push(path("/anim/run.fbx"));
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(scene.is_overridden("hero", &OverrideField::Animator));
+        assert_eq!(
+            scene.object_override("hero").unwrap().animator,
+            scene.object("hero").unwrap().animator
+        );
+        assert!(
+            scene
+                .view()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/anim/run.fbx")),
+            "клип override объявляется в документе экземпляра"
+        );
+
+        scene
+            .revert_field("hero", &OverrideField::Animator)
+            .unwrap();
+        assert!(!scene.is_overridden("hero", &OverrideField::Animator));
+        let animator = scene.object("hero").unwrap().animator.clone().unwrap();
+        assert_eq!(animator.speed, 1.0);
+        assert_eq!(animator.clips, vec![path("/anim/walk.fbx")]);
+    }
+
+    #[test]
     fn local_light_prefab_overrides_replace_whole_components_and_revert() {
         let prefab = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\ncolor = [0.8, 0.6, 0.4]\nintensity = 1.0\nrange = 5.0\n[objects.spot_light]\ncolor = [0.4, 0.6, 0.8]\nintensity = 2.0\nrange = 7.0\ninner_angle_deg = 10.0\nouter_angle_deg = 20.0\n";
         let files = Files::with(&[("prefabs/lamp.rveprefab", prefab)]);
@@ -1394,6 +1633,115 @@ mod tests {
                 .outer_angle_deg,
             20.0
         );
+    }
+
+    #[test]
+    fn physics_prefab_overrides_replace_whole_components_and_keep_each_other() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[objects.collider]\nhalf_extents = [0.5, 0.5, 0.5]\n[objects.rigid_body]\nkind = \"dynamic\"\nmass = 2.0\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("crate", None, |object| {
+                object.collider.as_mut().unwrap().friction = 0.9;
+                object.rigid_body.as_mut().unwrap().mass = 5.0;
+                Ok(())
+            })
+            .unwrap();
+        let change = scene.object_override("crate").unwrap();
+        assert_eq!(change.collider, scene.object("crate").unwrap().collider);
+        assert_eq!(change.rigid_body, scene.object("crate").unwrap().rigid_body);
+        assert!(scene.is_overridden("crate", &OverrideField::Collider));
+        assert!(scene.is_overridden("crate", &OverrideField::RigidBody));
+        let (_, applied) = scene.prefab_with_override("crate").unwrap();
+        assert_eq!(applied.objects[0].collider, change.collider);
+        assert_eq!(applied.objects[0].rigid_body, change.rigid_body);
+
+        // Откат одного компонента не должен стереть override второго.
+        scene
+            .revert_field("crate", &OverrideField::RigidBody)
+            .unwrap();
+        assert!(!scene.is_overridden("crate", &OverrideField::RigidBody));
+        assert!(scene.is_overridden("crate", &OverrideField::Collider));
+        assert_eq!(scene.object("crate").unwrap().rigid_body.unwrap().mass, 2.0);
+        scene
+            .revert_field("crate", &OverrideField::Collider)
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("crate")
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
+            0.5
+        );
+        assert!(scene.object_override("crate").is_none());
+    }
+
+    #[test]
+    fn adding_or_removing_physics_components_of_instance_objects_is_rejected() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[objects.collider]\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        assert!(
+            scene
+                .remove_physics_component("crate", ComponentKind::Collider)
+                .is_err()
+        );
+        assert!(
+            scene
+                .set_component("crate", Component::RigidBody(RigidBodyComponent::default()))
+                .is_err()
+        );
+        assert!(scene.object("crate").unwrap().rigid_body.is_none());
+    }
+
+    #[test]
+    fn nested_merge_keeps_physics_overrides_from_both_levels() {
+        let mut base = PrefabOverride {
+            target: "crate".to_owned(),
+            collider: Some(ColliderComponent {
+                friction: 0.2,
+                ..ColliderComponent::default()
+            }),
+            ..PrefabOverride::default()
+        };
+        let outer = PrefabOverride {
+            target: "crate".to_owned(),
+            rigid_body: Some(RigidBodyComponent {
+                kind: RigidBodyKind::Kinematic,
+                ..RigidBodyComponent::default()
+            }),
+            ..PrefabOverride::default()
+        };
+        merge_override(&mut base, &outer);
+        assert_eq!(base.collider.as_ref().unwrap().friction, 0.2);
+        assert_eq!(base.rigid_body.unwrap().kind, RigidBodyKind::Kinematic);
+
+        let replacement = PrefabOverride {
+            target: "crate".to_owned(),
+            collider: Some(ColliderComponent {
+                friction: 0.8,
+                ..ColliderComponent::default()
+            }),
+            ..PrefabOverride::default()
+        };
+        merge_override(&mut base, &replacement);
+        assert_eq!(base.collider.as_ref().unwrap().friction, 0.8);
     }
 
     #[test]
@@ -1509,6 +1857,55 @@ mod tests {
     }
 
     #[test]
+    fn prefab_script_asset_refs_with_the_same_key_are_all_registered() {
+        let prefab = r#"
+[[assets]]
+path = "/scripts/a.lua"
+[[assets]]
+path = "/scripts/b.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/a.lua"
+params = { model = { asset = "/models/base-a.fbx" } }
+[[objects.lite_scripts]]
+path = "/scripts/b.lua"
+params = { model = { asset = "/models/base-b.fbx" } }
+"#;
+        let files = Files::with(&[("prefabs/models.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/models.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("models", None, |object| {
+                object.lite_scripts[0].params.insert(
+                    "model".to_owned(),
+                    ParamValue::Asset(path("/models/new-a.fbx")),
+                );
+                object.lite_scripts[1].params.insert(
+                    "model".to_owned(),
+                    ParamValue::Asset(path("/models/new-b.fbx")),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let assets = scene
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<HashSet<_>>();
+        assert!(assets.contains("models/new-a.fbx"));
+        assert!(assets.contains("models/new-b.fbx"));
+    }
+
+    #[test]
     fn revert_all_keeps_root_instance_placement_transform() {
         let (_, mut scene, _) = door_scene();
         scene
@@ -1608,7 +2005,10 @@ mod tests {
         let added = scene.edit_object("door.handle", None, |object| {
             object.camera = Some(engine_scene::CameraComponent {
                 settings: None,
+                post_process: None,
+                screen_shaders: Vec::new(),
                 active: false,
+                cursor: Default::default(),
             });
             Ok(())
         });
@@ -1854,5 +2254,145 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn particle_emitter_prefab_override_diffs_the_whole_component_and_reverts() {
+        let prefab =
+            "[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ncapacity = 128\nrate = 20.0\n";
+        let files = Files::with(&[("prefabs/fx.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/fx.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("fx", None, |object| {
+                let emitter = object.particle_emitter.as_mut().unwrap();
+                emitter.rate = 60.0;
+                emitter.texture = Some(path("/fx/smoke.png"));
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(scene.is_overridden("fx", &OverrideField::ParticleEmitter));
+        let change = scene.object_override("fx").unwrap();
+        assert_eq!(
+            change.particle_emitter,
+            scene.object("fx").unwrap().particle_emitter
+        );
+        assert!(
+            scene
+                .view()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/fx/smoke.png")),
+            "override texture must be declared in the instance document"
+        );
+
+        scene
+            .revert_field("fx", &OverrideField::ParticleEmitter)
+            .unwrap();
+        assert!(!scene.is_overridden("fx", &OverrideField::ParticleEmitter));
+        let emitter = scene
+            .object("fx")
+            .unwrap()
+            .particle_emitter
+            .clone()
+            .unwrap();
+        assert_eq!(emitter.rate, 20.0);
+        assert_eq!(emitter.capacity, 128);
+    }
+
+    #[test]
+    fn network_components_override_replaces_the_component_and_reverts() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[objects.network_identity]\nauthority = \"owner\"\n[objects.network_transform]\nsend_rate_hz = 10\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("crate", None, |object| {
+                object.network_transform.as_mut().unwrap().send_rate_hz = 30;
+                Ok(())
+            })
+            .unwrap();
+        assert!(scene.is_overridden("crate", &OverrideField::NetworkTransform));
+        assert!(!scene.is_overridden("crate", &OverrideField::NetworkIdentity));
+        let change = scene.object_override("crate").unwrap();
+        assert_eq!(
+            change.network_transform,
+            scene.object("crate").unwrap().network_transform
+        );
+
+        scene
+            .edit_object("crate", None, |object| {
+                object.network_identity.as_mut().unwrap().authority =
+                    engine_scene::NetAuthority::Server;
+                Ok(())
+            })
+            .unwrap();
+        assert!(scene.is_overridden("crate", &OverrideField::NetworkIdentity));
+
+        scene
+            .revert_field("crate", &OverrideField::NetworkTransform)
+            .unwrap();
+        assert!(!scene.is_overridden("crate", &OverrideField::NetworkTransform));
+        assert_eq!(
+            scene
+                .object("crate")
+                .unwrap()
+                .network_transform
+                .unwrap()
+                .send_rate_hz,
+            10
+        );
+        scene
+            .revert_field("crate", &OverrideField::NetworkIdentity)
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("crate")
+                .unwrap()
+                .network_identity
+                .unwrap()
+                .authority,
+            engine_scene::NetAuthority::Owner
+        );
+    }
+
+    #[test]
+    fn network_identity_cannot_be_added_to_a_prefab_part() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[[objects]]\nid = \"lid\"\nparent = \"crate\"\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        let part = scene
+            .view()
+            .objects
+            .iter()
+            .find(|object| object.parent.is_some())
+            .unwrap()
+            .id
+            .clone();
+        let error = scene
+            .set_component(
+                &part,
+                Component::NetworkIdentity(engine_scene::NetworkIdentityComponent::default()),
+            )
+            .unwrap_err();
+        assert!(error.contains("компоненты"), "{error}");
+        assert!(scene.object(&part).unwrap().network_identity.is_none());
     }
 }

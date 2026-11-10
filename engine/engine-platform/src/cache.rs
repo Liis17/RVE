@@ -14,6 +14,58 @@ pub fn pipeline_cache_path(application: &str) -> Option<PathBuf> {
     })
 }
 
+/// Returns the per-user save file path for a named application.
+pub fn save_data_path(application: &str) -> Option<PathBuf> {
+    super::user_data_dir().map(|root| {
+        root.join("RVE")
+            .join(safe_cache_app_name(application))
+            .join("save.toml")
+    })
+}
+
+/// Returns the per-user screenshot directory for a named application, next to its save file.
+pub fn screenshots_dir(application: &str) -> Option<PathBuf> {
+    super::user_data_dir().map(|root| {
+        root.join("RVE")
+            .join(safe_cache_app_name(application))
+            .join("Screenshots")
+    })
+}
+
+/// Atomically replaces a user-data file after writing and syncing a sibling temporary file.
+pub fn write_user_data_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "user data path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let (temporary_path, mut file) = loop {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary_path = parent.join(format!(".rve-save-{}-{id}.tmp", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => break (temporary_path, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        super::replace_file(&temporary_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
 /// Replaces path separators and unsafe characters in an application cache directory name.
 pub fn safe_cache_app_name(application: &str) -> String {
     let mut name = application
@@ -115,7 +167,7 @@ pub fn write_pipeline_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary_path, path)
+        super::replace_file(&temporary_path, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
@@ -163,6 +215,33 @@ mod tests {
         assert_eq!(read_pipeline_cache(&path).unwrap(), b"first cache");
         write_pipeline_cache(&path, b"replacement cache").unwrap();
         assert_eq!(read_pipeline_cache(&path).unwrap(), b"replacement cache");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn user_save_path_is_scoped_by_application_and_atomic_write_preserves_old_file_on_error() {
+        let directory = temporary_directory();
+        let path = directory
+            .join("user_data")
+            .join("RVE")
+            .join("sandbox")
+            .join("save.toml");
+        write_user_data_atomically(&path, b"first").unwrap();
+        write_user_data_atomically(&path, b"replacement").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+
+        let blocked_parent = directory.join("not-a-directory");
+        fs::write(&blocked_parent, b"keep").unwrap();
+        assert!(write_user_data_atomically(&blocked_parent.join("save.toml"), b"new").is_err());
+        assert_eq!(fs::read(&blocked_parent).unwrap(), b"keep");
+        assert_eq!(
+            save_data_path("A game/Title").unwrap().file_name().unwrap(),
+            "save.toml"
+        );
+        assert_eq!(
+            screenshots_dir("A game/Title").unwrap().parent(),
+            save_data_path("A game/Title").unwrap().parent()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

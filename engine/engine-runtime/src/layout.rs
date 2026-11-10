@@ -1,5 +1,6 @@
 #[cfg(windows)]
 use engine_files::strip_windows_verbatim_prefix;
+use engine_project::{PREFAB_CATALOG_FILE_NAME, PREFAB_CATALOG_RELEASE_PATH};
 use engine_resources::SourceMode;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,30 @@ pub(crate) fn release_root(exe_dir: &Path) -> PathBuf {
     exe_dir.to_owned()
 }
 
+/// Корень release-раскладки для `rve-server`. На macOS сервер лежит рядом с `.app`, а не внутри него,
+/// поэтому без `Engine` рядом берётся ресурсы единственного `*.app` в том же каталоге. Иначе — каталог
+/// исполняемого файла, как у игры.
+pub(crate) fn server_release_root(exe_dir: &Path) -> PathBuf {
+    if !cfg!(target_os = "macos") || exe_dir.join("Engine").is_dir() {
+        return exe_dir.to_owned();
+    }
+    let Ok(entries) = std::fs::read_dir(exe_dir) else {
+        return exe_dir.to_owned();
+    };
+    let mut bundles = entries.filter_map(Result::ok).filter_map(|entry| {
+        let path = entry.path();
+        let resources = path.join("Contents").join("Resources");
+        let is_bundle = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+        (is_bundle && resources.join("Engine").is_dir()).then_some(resources)
+    });
+    match (bundles.next(), bundles.next()) {
+        (Some(resources), None) => resources,
+        _ => exe_dir.to_owned(),
+    }
+}
+
 fn app_bundle_resources(exe_dir: &Path) -> Option<PathBuf> {
     let contents = exe_dir.parent()?;
     let bundle = contents.parent()?;
@@ -62,6 +87,13 @@ pub(crate) enum ProjectSettingsLocation {
     Resource(&'static str),
 }
 
+/// Где лежит список тяжёлых префабов: файл проекта в dev или ресурс `base` в release.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PrefabCatalogLocation {
+    File(PathBuf),
+    Resource(&'static str),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Layout {
     pub bootstrap: PathBuf,
@@ -69,6 +101,7 @@ pub(crate) struct Layout {
     pub scripts_library: Option<PathBuf>,
     pub source_mode: SourceMode,
     pub project_settings: ProjectSettingsLocation,
+    pub prefab_catalog: PrefabCatalogLocation,
 }
 
 impl Layout {
@@ -85,6 +118,7 @@ impl Layout {
             scripts_library,
             source_mode: SourceMode::Registry,
             project_settings: ProjectSettingsLocation::Resource("/rve/project.toml"),
+            prefab_catalog: PrefabCatalogLocation::Resource(PREFAB_CATALOG_RELEASE_PATH),
         }
     }
 
@@ -95,6 +129,7 @@ impl Layout {
             scripts_library: None,
             source_mode: SourceMode::Loose,
             project_settings: ProjectSettingsLocation::File(project_dir.join("project.rveproject")),
+            prefab_catalog: PrefabCatalogLocation::File(project_dir.join(PREFAB_CATALOG_FILE_NAME)),
         }
     }
 
@@ -146,9 +181,38 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, ProjectSettingsLocation, app_bundle_resources};
+    use super::{
+        Layout, PrefabCatalogLocation, ProjectSettingsLocation, app_bundle_resources,
+        server_release_root,
+    };
     use engine_resources::SourceMode;
     use std::path::Path;
+
+    #[test]
+    fn server_root_uses_engine_next_to_it_or_the_only_app_bundle() {
+        let dir = std::env::temp_dir().join(format!("rve-server-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = dir.join("Game.app/Contents/Resources");
+        std::fs::create_dir_all(bundle.join("Engine")).unwrap();
+        let expected = if cfg!(target_os = "macos") {
+            bundle.clone()
+        } else {
+            dir.clone()
+        };
+        assert_eq!(server_release_root(&dir), expected);
+
+        std::fs::create_dir_all(dir.join("Engine")).unwrap();
+        assert_eq!(server_release_root(&dir), dir);
+
+        std::fs::remove_dir_all(dir.join("Engine")).unwrap();
+        std::fs::create_dir_all(dir.join("Other.app/Contents/Resources/Engine")).unwrap();
+        assert_eq!(
+            server_release_root(&dir),
+            dir,
+            "неоднозначные bundle не выбираются"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn release_layout_is_anchored_to_executable_directory() {
@@ -174,6 +238,10 @@ mod tests {
         assert_eq!(
             layout.project_settings,
             ProjectSettingsLocation::Resource("/rve/project.toml")
+        );
+        assert_eq!(
+            layout.prefab_catalog,
+            PrefabCatalogLocation::Resource("/rve/prefabs.toml")
         );
     }
 
@@ -212,6 +280,10 @@ mod tests {
         assert_eq!(
             layout.project_settings,
             ProjectSettingsLocation::File(Path::new("/tmp/demo/project.rveproject").into())
+        );
+        assert_eq!(
+            layout.prefab_catalog,
+            PrefabCatalogLocation::File(Path::new("/tmp/demo/prefabs.rveprefabs").into())
         );
     }
 

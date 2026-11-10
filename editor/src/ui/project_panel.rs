@@ -1,7 +1,10 @@
 //! Панель Project: файловый менеджер каталога `Assets/`.
 
 use crate::assets_fs::{AssetEntry, AssetKind};
+use crate::icons::{file_icon, folder_icon};
 use crate::state::{Action, AssetDrag, EditorState};
+use engine_files::VirtualPath;
+use engine_scene::{CombineMode, PhysicsMaterialSettings};
 
 const TILE_SIZE: f32 = 88.0;
 
@@ -9,20 +12,32 @@ const TILE_SIZE: f32 = 88.0;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectDialog {
     NewFolder { name: String },
+    NewUi { name: String },
     Rename { path: String, name: String },
     Delete { path: String, is_dir: bool },
+    NewPhysicsMaterial { name: String },
+    NewMaterial { folder: String, name: String },
+    NewShader { folder: String, name: String },
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
-        if ui.button("Refresh").clicked() {
-            state.action(Action::RefreshAssets);
+        if ui.button("New UI Canvas").clicked() {
+            state.project_dialog = Some(ProjectDialog::NewUi {
+                name: "Canvas".into(),
+            });
         }
         if ui.button("New Folder").clicked() {
             state.project_dialog = Some(ProjectDialog::NewFolder {
                 name: String::new(),
             });
         }
+        if ui.button("New Physics Material").clicked() {
+            state.project_dialog = Some(ProjectDialog::NewPhysicsMaterial {
+                name: "New Physics Material".to_owned(),
+            });
+        }
+        create_menu(ui, state, state.current_folder.clone());
         if ui.button("Import…").clicked() {
             state.action(Action::ImportDialog);
         }
@@ -46,14 +61,25 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         .show(ui, |ui| {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                 let root_selected = state.current_folder.is_empty();
-                if ui.selectable_label(root_selected, "Assets").clicked() {
-                    state.current_folder.clear();
-                }
+                let root_response = ui
+                    .horizontal(|ui| {
+                        folder_icon_image(ui, state, "Assets", !state.asset_tree.is_empty());
+                        if ui.selectable_label(root_selected, "Assets").clicked() {
+                            state.current_folder.clear();
+                        }
+                    })
+                    .response;
+                root_response.context_menu(|ui| create_menu(ui, state, "".to_owned()));
                 let tree = std::mem::take(&mut state.asset_tree);
                 folder_tree(ui, state, &tree);
                 state.asset_tree = tree;
             });
         });
+    if state.physics_material_edit.is_some() {
+        egui::Panel::bottom("physics_material").show(ui, |ui| {
+            show_physics_material_fields(ui, state);
+        });
+    }
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink(false)
@@ -74,30 +100,65 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                         tile(ui, state, entry);
                     }
                 });
+                let available = egui::Rect::from_min_size(ui.cursor().min, ui.available_size());
+                let empty_response = ui.interact(
+                    available,
+                    ui.make_persistent_id("project_empty_context"),
+                    egui::Sense::click(),
+                );
+                empty_response.context_menu(|ui| {
+                    create_menu(ui, state, state.current_folder.clone());
+                });
                 state.asset_tree = tree;
             });
     });
+}
+
+/// Иконка папки перед подписью в дереве; без загруженной текстуры подпись выводится одна.
+fn folder_icon_image(ui: &mut egui::Ui, state: &EditorState, name: &str, has_children: bool) {
+    let Some(texture) = state.icons.get(folder_icon(name, has_children)) else {
+        return;
+    };
+    let size = ui.spacing().interact_size.y;
+    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+        texture,
+        egui::vec2(size, size),
+    )));
 }
 
 fn folder_tree(ui: &mut egui::Ui, state: &mut EditorState, entries: &[AssetEntry]) {
     for entry in entries.iter().filter(|entry| entry.is_dir) {
         let selected = state.current_folder == entry.path;
         let has_folders = entry.children.iter().any(|child| child.is_dir);
+        let has_children = !entry.children.is_empty();
         if has_folders {
             let id = ui.make_persistent_id(("project_folder", &entry.path));
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
                 .show_header(ui, |ui| {
-                    if ui.selectable_label(selected, &entry.name).clicked() {
+                    folder_icon_image(ui, state, &entry.name, has_children);
+                    let response = ui.selectable_label(selected, &entry.name);
+                    if response.clicked() {
                         state.current_folder = entry.path.clone();
                     }
+                    response.context_menu(|ui| {
+                        create_menu(ui, state, create_target(Some(entry), ""));
+                    });
                 })
                 .body(|ui| folder_tree(ui, state, &entry.children));
         } else {
-            ui.horizontal(|ui| {
-                ui.add_space(ui.spacing().indent);
-                if ui.selectable_label(selected, &entry.name).clicked() {
-                    state.current_folder = entry.path.clone();
-                }
+            let response = ui
+                .horizontal(|ui| {
+                    ui.add_space(ui.spacing().indent);
+                    folder_icon_image(ui, state, &entry.name, has_children);
+                    let response = ui.selectable_label(selected, &entry.name);
+                    if response.clicked() {
+                        state.current_folder = entry.path.clone();
+                    }
+                    response
+                })
+                .inner;
+            response.context_menu(|ui| {
+                create_menu(ui, state, create_target(Some(entry), ""));
             });
         }
     }
@@ -139,11 +200,18 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
     }
     match AssetKind::of(&entry.path) {
         AssetKind::Scene => "SCENE",
+        AssetKind::Ui => "UI",
         AssetKind::Prefab => "PREFAB",
         AssetKind::CameraSettings => "CAMERA",
+        AssetKind::PostProcess => "POST",
+        AssetKind::ScreenShader => "GLSL",
+        AssetKind::PhysicsMaterial => "PHYSMAT",
+        AssetKind::Material => "MATERIAL",
+        AssetKind::Shader => "SHADER",
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
         AssetKind::Hdr => "HDR",
+        AssetKind::Audio => "AUDIO",
         AssetKind::Script => "LUA",
         AssetKind::Other => "FILE",
     }
@@ -159,6 +227,14 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
         let painter = ui.painter();
         if response.hovered() {
             painter.rect_filled(rect, 4.0, visuals.bg_fill);
+        }
+        if state.project_selection.as_deref() == Some(entry.path.as_str()) {
+            painter.rect_stroke(
+                rect,
+                4.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Inside,
+            );
         }
         let image_rect = egui::Rect::from_min_size(
             rect.min + egui::vec2(16.0, 4.0),
@@ -176,7 +252,13 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
             })
         })
         .flatten();
-        match preview {
+        let icon = if entry.is_dir {
+            Some(folder_icon(&entry.name, !entry.children.is_empty()))
+        } else {
+            file_icon(AssetKind::of(&entry.path))
+        }
+        .and_then(|name| state.icons.get(name));
+        match preview.or(icon) {
             Some(texture) => {
                 painter.image(
                     texture,
@@ -200,31 +282,60 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
             egui::pos2(rect.min.x + 2.0, image_rect.max.y + 2.0),
             rect.max - egui::vec2(2.0, 0.0),
         );
-        let galley = painter.layout(
+        let mut job = egui::text::LayoutJob::simple(
             entry.name.clone(),
             egui::FontId::proportional(11.0),
             visuals.text_color(),
             name_rect.width(),
         );
-        painter
-            .with_clip_rect(name_rect)
-            .galley(name_rect.min, galley, visuals.text_color());
+        job.halign = egui::Align::Center;
+        let galley = painter.layout_job(job);
+        painter.with_clip_rect(name_rect).galley(
+            name_rect.center_top(),
+            galley,
+            visuals.text_color(),
+        );
     }
     let response = response.on_hover_text(&entry.path);
+    if response.clicked()
+        && !entry.is_dir
+        && AssetKind::of(&entry.path) == AssetKind::PhysicsMaterial
+    {
+        open_physics_material(state, &entry.path);
+    }
+    if response.clicked() && !entry.is_dir {
+        state.project_selection = Some(entry.path.clone());
+        state.inspected_asset = matches!(
+            AssetKind::of(&entry.path),
+            AssetKind::Material | AssetKind::Shader
+        )
+        .then(|| entry.path.clone());
+    }
     if response.double_clicked() {
-        if entry.is_dir {
+        if AssetKind::of(&entry.path) == AssetKind::Ui && !entry.is_dir {
+            crate::ui_editor::open(state, &entry.path);
+        } else if entry.is_dir {
             state.current_folder = entry.path.clone();
         } else if matches!(
             AssetKind::of(&entry.path),
             AssetKind::Scene | AssetKind::Prefab
         ) {
             state.action(Action::OpenScene(Some(entry.path.clone())));
+        } else if matches!(
+            AssetKind::of(&entry.path),
+            AssetKind::Material | AssetKind::Shader
+        ) && let Some(project) = state.project.as_ref()
+            && let Err(error) = state.external_editor.open(project, &entry.path)
+        {
+            state.log.error(error);
         }
     }
     if !entry.is_dir {
         response.dnd_set_drag_payload(AssetDrag(entry.path.clone()));
     }
     response.context_menu(|ui| {
+        create_menu(ui, state, create_target(Some(entry), &state.current_folder));
+        ui.separator();
         if ui.button("Rename").clicked() {
             state.project_dialog = Some(ProjectDialog::Rename {
                 path: entry.path.clone(),
@@ -240,6 +351,39 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
     });
 }
 
+/// Resolves where a Create action from Project should write its asset.
+pub fn create_target(entry: Option<&AssetEntry>, current_folder: &str) -> String {
+    match entry {
+        Some(entry) if entry.is_dir => entry.path.clone(),
+        Some(entry) => entry
+            .path
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            .to_owned(),
+        None => current_folder.to_owned(),
+    }
+}
+
+/// Подменю «Create» с пунктами создания ресурсов в `folder`; используется и в шапке, и в контекстных меню.
+pub(super) fn create_menu(ui: &mut egui::Ui, state: &mut EditorState, folder: String) {
+    ui.menu_button("Create", |ui| {
+        if ui.button("Material").clicked() {
+            state.project_dialog = Some(ProjectDialog::NewMaterial {
+                folder: folder.clone(),
+                name: "New Material".to_owned(),
+            });
+            ui.close();
+        }
+        if ui.button("Shader").clicked() {
+            state.project_dialog = Some(ProjectDialog::NewShader {
+                folder,
+                name: "New Shader".to_owned(),
+            });
+            ui.close();
+        }
+    });
+}
+
 /// Показывает модальный диалог файловой операции и выполняет её при подтверждении.
 pub fn show_dialog(ctx: &egui::Context, state: &mut EditorState) {
     let Some(mut dialog) = state.project_dialog.clone() else {
@@ -250,8 +394,24 @@ pub fn show_dialog(ctx: &egui::Context, state: &mut EditorState) {
     egui::Modal::new(egui::Id::new("project_dialog")).show(ctx, |ui| {
         ui.set_max_width(380.0);
         match &mut dialog {
+            ProjectDialog::NewUi { name } => {
+                ui.heading("New UI Canvas");
+                ui.text_edit_singleline(name);
+            }
             ProjectDialog::NewFolder { name } => {
                 ui.heading("New Folder");
+                ui.text_edit_singleline(name).request_focus();
+            }
+            ProjectDialog::NewPhysicsMaterial { name } => {
+                ui.heading("New Physics Material");
+                ui.text_edit_singleline(name).request_focus();
+            }
+            ProjectDialog::NewMaterial { name, .. } => {
+                ui.heading("New Material");
+                ui.text_edit_singleline(name).request_focus();
+            }
+            ProjectDialog::NewShader { name, .. } => {
+                ui.heading("New Shader");
                 ui.text_edit_singleline(name).request_focus();
             }
             ProjectDialog::Rename { name, .. } => {
@@ -295,6 +455,55 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
     let Some(project) = state.project.as_ref() else {
         return;
     };
+    if let ProjectDialog::NewUi { name } = dialog {
+        let name = if name.ends_with(".rveui") {
+            name.clone()
+        } else {
+            format!("{name}.rveui")
+        };
+        let text = "[canvas]\nlayer = 0\n";
+        match project
+            .assets_dir
+            .create_file(&state.current_folder, &name, text)
+        {
+            Ok(path) => {
+                state.action(Action::RefreshTree);
+                crate::ui_editor::open(state, &path);
+            }
+            Err(error) => state.log.error(error.to_string()),
+        }
+        return;
+    }
+    if let ProjectDialog::NewPhysicsMaterial { name } = dialog {
+        match project.create_physics_material(&state.current_folder, name) {
+            Ok(path) => {
+                state.log.info(format!("Создан физический материал {path}"));
+                state.action(Action::RefreshTree);
+            }
+            Err(error) => state.log.error(error),
+        }
+        return;
+    }
+    if let ProjectDialog::NewMaterial { folder, name } = dialog {
+        match project.create_material(folder, name) {
+            Ok(path) => {
+                state.log.info(format!("Создан материал {path}"));
+                state.action(Action::RefreshTree);
+            }
+            Err(error) => state.log.error(error),
+        }
+        return;
+    }
+    if let ProjectDialog::NewShader { folder, name } = dialog {
+        match project.create_shader(folder, name) {
+            Ok(path) => {
+                state.log.info(format!("Создан шейдер {path}"));
+                state.action(Action::RefreshTree);
+            }
+            Err(error) => state.log.error(error),
+        }
+        return;
+    }
     let assets = &project.assets_dir;
     let result = match dialog {
         ProjectDialog::NewFolder { name } => assets
@@ -303,6 +512,8 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
         ProjectDialog::Rename { path, name } => assets
             .rename(path, name)
             .map(|target| format!("{path} переименован в {target}")),
+        ProjectDialog::NewPhysicsMaterial { .. } | ProjectDialog::NewUi { .. } => return,
+        ProjectDialog::NewMaterial { .. } | ProjectDialog::NewShader { .. } => return,
         ProjectDialog::Delete { path, .. } => {
             assets.remove(path).map(|()| format!("Удалён {path}"))
         }
@@ -310,9 +521,118 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
     match result {
         Ok(message) => {
             state.log.info(message);
-            state.action(Action::RefreshAssets);
+            state.action(Action::RefreshTree);
         }
         Err(error) => state.log.error(error.to_string()),
+    }
+}
+
+/// `.rvephysmat`, открытый панелью полей: значения записываются в файл при каждом изменении.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhysicsMaterialEdit {
+    pub path: String,
+    pub settings: PhysicsMaterialSettings,
+}
+
+fn open_physics_material(state: &mut EditorState, path: &str) {
+    let Some(project) = state.project.as_ref() else {
+        return;
+    };
+    let settings = project.read_text(path).and_then(|source| {
+        PhysicsMaterialSettings::parse(path, &source).map_err(|error| error.to_string())
+    });
+    match settings {
+        Ok(settings) => {
+            state.physics_material_edit = Some(PhysicsMaterialEdit {
+                path: path.to_owned(),
+                settings,
+            });
+        }
+        Err(error) => state.log.error(error),
+    }
+}
+
+/// Панель полей выбранного `.rvephysmat`; изменение сразу сохраняется в файл.
+fn show_physics_material_fields(ui: &mut egui::Ui, state: &mut EditorState) {
+    let Some(mut edit) = state.physics_material_edit.take() else {
+        return;
+    };
+    let mut changed = false;
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.strong(format!("Physics Material {}", edit.path));
+        close = ui.button("Close").clicked();
+    });
+    egui::Grid::new("physics_material_fields")
+        .num_columns(2)
+        .show(ui, |ui| {
+            changed |= field_drag(
+                ui,
+                "Static Friction",
+                &mut edit.settings.static_friction,
+                0.0..=f32::MAX,
+            );
+            changed |= field_drag(
+                ui,
+                "Dynamic Friction",
+                &mut edit.settings.dynamic_friction,
+                0.0..=f32::MAX,
+            );
+            changed |= field_drag(ui, "Bounciness", &mut edit.settings.bounciness, 0.0..=1.0);
+            changed |= combine_row(ui, "Friction Combine", &mut edit.settings.friction_combine);
+            changed |= combine_row(ui, "Bounce Combine", &mut edit.settings.bounce_combine);
+        });
+    if changed
+        && let Some(project) = state.project.as_ref()
+        && let Ok(path) = VirtualPath::parse(&edit.path)
+        && let Err(error) = project.save_physics_material(&path, &edit.settings)
+    {
+        state.log.error(error);
+    }
+    if !close {
+        state.physics_material_edit = Some(edit);
+    }
+}
+
+fn field_drag(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    ui.label(label);
+    let changed = ui
+        .add(egui::DragValue::new(value).speed(0.01).range(range))
+        .changed();
+    ui.end_row();
+    changed
+}
+
+fn combine_row(ui: &mut egui::Ui, label: &str, mode: &mut CombineMode) -> bool {
+    ui.label(label);
+    let before = *mode;
+    egui::ComboBox::from_id_salt(label)
+        .selected_text(combine_label(*mode))
+        .show_ui(ui, |ui| {
+            for option in [
+                CombineMode::Average,
+                CombineMode::Minimum,
+                CombineMode::Multiply,
+                CombineMode::Maximum,
+            ] {
+                ui.selectable_value(mode, option, combine_label(option));
+            }
+        });
+    ui.end_row();
+    *mode != before
+}
+
+fn combine_label(mode: CombineMode) -> &'static str {
+    match mode {
+        CombineMode::Average => "Average",
+        CombineMode::Minimum => "Minimum",
+        CombineMode::Multiply => "Multiply",
+        CombineMode::Maximum => "Maximum",
     }
 }
 
@@ -368,5 +688,20 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths, ["Models/Cars", "Models/Cars/Car.fbx", "car.png"]);
         assert!(search_entries(&tree, "missing").is_empty());
+    }
+
+    #[test]
+    fn create_target_uses_folder_file_parent_or_current_folder() {
+        let folder = folder("Models", "Models", Vec::new());
+        let file = AssetEntry {
+            name: "ball.rvemat".to_owned(),
+            path: "Materials/ball.rvemat".to_owned(),
+            is_dir: false,
+            children: Vec::new(),
+        };
+        assert_eq!(create_target(Some(&folder), "Current"), "Models");
+        assert_eq!(create_target(Some(&file), "Current"), "Materials");
+        assert_eq!(create_target(None, "Current"), "Current");
+        assert_eq!(create_target(None, ""), "");
     }
 }

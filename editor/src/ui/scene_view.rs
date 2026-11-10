@@ -1,10 +1,14 @@
 //! Панель Scene: изображение сцены, камера редактора, выделение и гизмо.
 
-use crate::state::{AssetDrag, EditorState};
+use super::game_view;
+use crate::play_cursor::MotionSource;
+use crate::state::{AssetDrag, EditorState, ViewCommand};
 use crate::viewport::camera::{Ray, ground_point, project_point, screen_ray};
+use crate::viewport::colliders::{ColliderWire, WireSource, WireStyle, source_wires};
 use crate::viewport::gizmo::{DragTarget, GizmoDrag, GizmoTool, gizmo_axes};
 use crate::viewport::picking::{nearest_hit, ray_model};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use engine_physics::object_world_transform;
 use glam::{Mat4, Vec3};
 
 const AXIS_COLORS: [Color32; 3] = [
@@ -56,6 +60,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             &mut state.scene_view.debug_view,
             state.wireframe_supported,
         );
+        ui.checkbox(&mut state.scene_view.show_colliders, "Colliders");
     });
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -101,6 +106,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     };
     draw_markers(ui, &markers, view_projection, rect);
     draw_selection_bounds(ui, state, &markers, view_projection, rect);
+    let wires = collider_wires(state);
+    draw_colliders(ui, &wires, view_projection, rect);
     let gizmo_taken = handle_gizmo(ui, state, &response, view_projection, rect);
     if !gizmo_taken
         && response.clicked()
@@ -128,6 +135,9 @@ pub(super) fn feed_play_pointer(
             input.smooth_scroll_delta,
         )
     });
+    // Дельту egui добавляем только если источник не raw: иначе счёт двойной.
+    let egui_motion =
+        state.play_cursor.motion_source(state.pointer_over_view()) == MotionSource::Egui;
     let Some(play) = &mut state.play else {
         return;
     };
@@ -137,7 +147,9 @@ pub(super) fn feed_play_pointer(
     {
         let local = (pointer - rect.min) * pixels_per_point;
         input.set_cursor(local.x, local.y);
-        input.add_mouse_delta(delta.x * pixels_per_point, delta.y * pixels_per_point);
+        if egui_motion {
+            input.add_mouse_delta(delta.x * pixels_per_point, delta.y * pixels_per_point);
+        }
         input.add_wheel(scroll.x, scroll.y);
     }
 }
@@ -220,6 +232,7 @@ fn collect_markers(state: &mut EditorState) -> Option<Vec<Marker>> {
         world
             .objects()
             .iter()
+            .filter(|object| world.active_in_hierarchy(object.handle) == Some(true))
             .filter_map(|object| {
                 let matrix = world.world_matrix(object.handle)?;
                 let label = if object.camera.is_some() {
@@ -294,6 +307,65 @@ fn box_corners(matrix: Mat4, (min, max): ([f32; 3], [f32; 3])) -> [Vec3; 8] {
     })
 }
 
+/// Рёбра коллайдеров: при флажке «Colliders» — все объекты, иначе только выделенные.
+/// Ошибку геометрии здесь не показываем: её видно в инспекторе.
+fn collider_wires(state: &mut EditorState) -> Vec<ColliderWire> {
+    let show_all = state.scene_view.show_colliders;
+    let selected: Vec<String> = state
+        .scene
+        .as_ref()
+        .map(|scene| scene.selected_ids().to_vec())
+        .unwrap_or_default();
+    let Some(world) = state.world_mut() else {
+        return Vec::new();
+    };
+    let sources: Vec<WireSource> = world
+        .objects()
+        .iter()
+        .filter(|object| world.active_in_hierarchy(object.handle) == Some(true))
+        .filter(|object| object.collider.is_some() || object.character_controller.is_some())
+        .filter(|object| show_all || selected.contains(&object.id))
+        .filter_map(|object| {
+            Some(WireSource {
+                transform: object_world_transform(world, object.handle).ok()?,
+                collider: object.collider.clone(),
+                character: object.character_controller,
+                model: object
+                    .mesh_renderer
+                    .as_ref()
+                    .map(|mesh| mesh.model.as_str().to_owned()),
+            })
+        })
+        .collect();
+    let mut wires = Vec::new();
+    for source in &sources {
+        if let Ok(found) = source_wires(&mut state.collider_cache, &state.models, source) {
+            wires.extend(found);
+        }
+    }
+    wires
+}
+
+fn draw_colliders(ui: &egui::Ui, wires: &[ColliderWire], view_projection: Mat4, rect: Rect) {
+    let painter = ui.painter_at(rect);
+    for wire in wires {
+        let color = match wire.style {
+            WireStyle::Body => Color32::from_rgb(120, 230, 150),
+            WireStyle::Trigger => Color32::from_rgb(110, 210, 255),
+            WireStyle::Character => Color32::from_rgb(255, 170, 90),
+        };
+        let stroke = Stroke::new(1.0, color);
+        for [a, b] in &wire.segments {
+            if let (Some(a), Some(b)) = (
+                to_screen(view_projection, rect, *a),
+                to_screen(view_projection, rect, *b),
+            ) {
+                painter.line_segment([a, b], stroke);
+            }
+        }
+    }
+}
+
 /// Рамки границ моделей выделенных объектов. Рёбра с вершиной за камерой пропускаются.
 fn draw_selection_bounds(
     ui: &egui::Ui,
@@ -354,6 +426,7 @@ fn pick(
         }))
     });
     if let Some(scene) = &mut state.scene {
+        state.inspected_asset = None;
         apply_click_selection(scene, selected.as_deref(), modifiers);
     }
 }
@@ -636,6 +709,33 @@ pub fn focus_selection(state: &mut EditorState) {
         None => (matrix.w_axis.truncate(), 1.0),
     };
     state.camera.focus(center, radius);
+}
+
+/// Применяет команду numpad к камере Scene; отбор по режиму и вводу делает `ui::show`.
+pub fn apply_view_command(state: &mut EditorState, command: ViewCommand) {
+    match command {
+        ViewCommand::Frame => focus_selection(state),
+        ViewCommand::Look(view) => state.camera.set_view(view),
+        ViewCommand::Rotate { yaw, pitch } => state.camera.rotate_by(yaw, pitch),
+        ViewCommand::Opposite => state.camera.opposite(),
+        ViewCommand::AlignToGame => align_to_game_camera(state),
+    }
+}
+
+/// Ставит камеру Scene на место камеры Game; без камеры в мире ничего не делает.
+fn align_to_game_camera(state: &mut EditorState) {
+    let selected = state.game_camera.clone();
+    let Some(world) = state.world_mut() else {
+        return;
+    };
+    world.recalculate_world_matrices();
+    let handle = game_view::camera_handle(world, selected.as_deref());
+    let Some(camera) = world.camera_of(handle) else {
+        return;
+    };
+    state
+        .camera
+        .align_to(camera.position, camera.target - camera.position);
 }
 
 /// Мировая сфера вокруг границ модели, размещённой матрицей `matrix`.

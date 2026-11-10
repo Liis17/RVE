@@ -1188,6 +1188,35 @@ fn shutdown_wakes_pending_work_rejects_retained_handles_and_joins_workers() {
 }
 
 #[test]
+fn shutdown_stops_workers_that_were_just_woken_by_jobs() {
+    // Regression: a worker woken by a job that another worker took first could
+    // lose its stop signal, so `shutdown` blocked forever on that worker's join.
+    const ROUNDS: usize = 2000;
+    for round in 0..ROUNDS {
+        let root = TempDirectory::new();
+        let backend = Backend::Loose(root.path().to_path_buf());
+        let system = injected_system(root.path(), backend, 4, 8, 1024 * 1024);
+        let handle = system.handle();
+        let requests: Vec<_> = (0..round % 5 + 1)
+            .map(|index| handle.stat(format!("missing-{index}.bin")).unwrap())
+            .collect();
+        drop(handle);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut system = system;
+            let _ = done_tx.send(system.shutdown());
+        });
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                panic!("round {round}: shutdown did not finish, a worker missed its stop")
+            });
+        assert!(result.is_ok());
+        drop(requests);
+    }
+}
+
+#[test]
 fn injected_worker_thread_panic_completes_the_request_and_releases_memory() {
     let root = TempDirectory::new();
     let mut system = loose_system(root.path());
@@ -1214,4 +1243,65 @@ fn injected_worker_thread_panic_completes_the_request_and_releases_memory() {
 fn resource_handle_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ResourceHandle>();
+}
+
+#[test]
+fn stats_count_completed_reads_with_their_bytes_and_queue_timing() {
+    let root = TempDirectory::new();
+    fs::write(root.path().join("data.bin"), b"hello").unwrap();
+    let system = loose_system(root.path());
+    let handle = system.handle();
+
+    assert_eq!(
+        handle.read_all("data.bin").unwrap().wait().unwrap(),
+        b"hello"
+    );
+
+    let stats = handle.stats();
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.bytes, 5);
+    assert_eq!((stats.failed, stats.cancelled), (0, 0));
+    assert_eq!(stats.in_flight, 0);
+    assert_eq!(stats.queue.count, 1);
+    assert_eq!(stats.read.count, 1);
+}
+
+#[test]
+fn stats_count_failed_requests_separately_from_completed_ones() {
+    let root = TempDirectory::new();
+    let system = loose_system(root.path());
+    let handle = system.handle();
+
+    assert!(handle.read_all("missing.bin").unwrap().wait().is_err());
+
+    let stats = handle.stats();
+    assert_eq!(stats.failed, 1);
+    assert_eq!((stats.completed, stats.cancelled, stats.bytes), (0, 0, 0));
+}
+
+#[test]
+fn stats_count_request_cancelled_while_its_read_is_in_progress() {
+    let root = TempDirectory::new();
+    let gate = Arc::new(ReadGate::default());
+    let (catalog, _reader) = catalog_with_reader(
+        archive_bytes(Codec::None, 4, &[("first.bin", b"abcdefgh")]),
+        Arc::clone(&gate),
+    );
+    let system = injected_system(root.path(), Backend::Packed(catalog), 1, 2, 1024);
+    gate.enable();
+    let handle = system.handle();
+
+    let active = handle.read_all("first.bin").unwrap();
+    assert!(gate.wait_for_arrivals(1, Duration::from_secs(2)));
+    assert_eq!(handle.stats().in_flight, 1);
+    drop(active);
+    gate.release();
+    // Единственный worker берёт запросы по очереди: после stat первое чтение уже учтено.
+    assert_eq!(handle.stat("first.bin").unwrap().wait().unwrap().size, 8);
+
+    let stats = handle.stats();
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.completed, 1, "завершился только stat");
+    assert_eq!(stats.bytes, 0);
+    assert_eq!(stats.in_flight, 0);
 }

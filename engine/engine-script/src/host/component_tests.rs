@@ -1,0 +1,513 @@
+use super::ScriptHost;
+use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabSpec};
+use crate::{ScriptEventLevel, ScriptLoadOptions, ScriptTime};
+use engine_files::VirtualPath;
+use engine_scene::world::ParticleCommand;
+use engine_scene::{AudioRequest, AudioRolloff, PrefabTemplate, SceneDocument, World};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+const SCENE: &str = r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/audio/hum.wav"
+[[assets]]
+path = "/models/crate.fbx"
+[[assets]]
+path = "/materials/gold.rvemat"
+
+[[objects]]
+id = "camera"
+[objects.camera]
+
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+
+[[objects]]
+id = "lamp"
+[objects.point_light]
+intensity = 1.0
+
+[[objects]]
+id = "crate"
+[objects.mesh_renderer]
+model = "/models/crate.fbx"
+
+[[objects]]
+id = "fire"
+[objects.particle_emitter]
+
+[[objects]]
+id = "sky"
+[objects.environment.procedural]
+zenith_color = [0.1, 0.2, 0.8]
+horizon_color = [0.6, 0.6, 0.6]
+ground_color = [0.1, 0.1, 0.1]
+sun_size_deg = 1.0
+sun_intensity = 3.0
+
+[[objects]]
+id = "tower"
+[objects.mesh_renderer]
+model = "/models/crate.fbx"
+[objects.lod_group]
+cull_distance = 50.0
+[[objects.lod_group.levels]]
+model = "/models/crate.fbx"
+distance = 10.0
+
+[[objects]]
+id = "speaker"
+[objects.audio_source]
+clip = "/audio/hum.wav"
+"#;
+
+fn load(source: &str) -> (World, ScriptHost) {
+    let world =
+        World::from_document(&SceneDocument::parse("test.rvescene", SCENE).unwrap()).unwrap();
+    let sources = BTreeMap::from([("driver.lua".to_owned(), source.to_owned())]);
+    let host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+    (world, host)
+}
+
+fn run_once(world: &mut World, host: &mut ScriptHost) {
+    host.update(world, 1.0 / 60.0, ScriptTime::default());
+}
+
+fn errors(host: &mut ScriptHost) -> Vec<String> {
+    host.drain_events()
+        .into_iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message)
+        .collect()
+}
+
+#[test]
+fn component_writes_reach_the_world_after_a_successful_call() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  rve.find("lamp"):set_light({ intensity = 3.0, color = {x = 0.0, y = 1.0, z = 0.0}, enabled = false })
+  rve.find("crate"):set_visible(false)
+  rve.find("crate"):set_material_params({ metallic = 0.5, base_color = {x = 0.2, y = 0.4, z = 0.6} })
+  rve.find("fire"):particles_stop()
+  rve.find("fire"):particles_emit(12)
+  rve.find("sky"):set_environment({ intensity = 2.0, sky = { sun_size_deg = 2.0 } })
+  rve.find("tower"):set_lod_distances({ 20.0 }, 80.0)
+  rve.find("speaker"):set_audio_source({ volume = 0.5, spatial_blend = 0.25, rolloff = "linear", pitch = 2.0 })
+  rve.audio.play("/audio/hum.wav", { follow = rve.find("speaker"), spatial_blend = 1.0, force_mono = true })
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    let errs = errors(&mut host);
+    assert!(errs.is_empty(), "{errs:?}");
+
+    let lamp = world.handle("lamp").unwrap();
+    let light = world.object(lamp).unwrap().point_light.unwrap();
+    assert_eq!((light.intensity, light.color), (3.0, [0.0, 1.0, 0.0]));
+    assert!(!world.object(lamp).unwrap().light_enabled);
+
+    let crate_handle = world.handle("crate").unwrap();
+    assert!(!world.object(crate_handle).unwrap().mesh_visible);
+    let material = world
+        .object(crate_handle)
+        .unwrap()
+        .mesh_renderer
+        .as_ref()
+        .unwrap()
+        .material
+        .clone()
+        .unwrap();
+    assert_eq!(
+        (material.metallic, material.base_color),
+        (Some(0.5), Some([0.2, 0.4, 0.6]))
+    );
+
+    let fire = world.handle("fire").unwrap();
+    assert!(!world.object(fire).unwrap().particles_playing);
+    assert_eq!(
+        host.drain_particle_commands(),
+        vec![ParticleCommand::Burst {
+            object: fire,
+            count: 12
+        }]
+    );
+
+    let sky = world.handle("sky").unwrap();
+    let environment = world.object(sky).unwrap().environment.clone().unwrap();
+    assert_eq!(environment.intensity, 2.0);
+    assert_eq!(environment.procedural.unwrap().sun_size_deg, 2.0);
+    assert_eq!(
+        environment.procedural.unwrap().sun_intensity,
+        3.0,
+        "неуказанные поля сохраняются"
+    );
+
+    let tower = world.object(world.handle("tower").unwrap()).unwrap();
+    let group = tower.lod_group.clone().unwrap();
+    assert_eq!(
+        (group.levels[0].distance, group.cull_distance),
+        (20.0, Some(80.0))
+    );
+
+    let speaker = world.object(world.handle("speaker").unwrap()).unwrap();
+    let audio = speaker.audio_source.clone().unwrap();
+    assert_eq!(audio.volume, 0.5);
+    assert_eq!(audio.spatial_blend, 0.25);
+    assert_eq!(audio.rolloff, AudioRolloff::Linear);
+    assert_eq!(audio.pitch, 2.0);
+    assert_eq!(
+        audio.clip.as_str(),
+        "audio/hum.wav",
+        "клип сцены не меняется"
+    );
+
+    let play = host
+        .drain_audio_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            AudioRequest::PlayClip { params, .. } => Some(params),
+            _ => None,
+        })
+        .expect("play request");
+    assert_eq!(play.follow, Some(world.handle("speaker").unwrap()));
+    assert_eq!((play.spatial_blend, play.force_mono), (1.0, true));
+}
+
+#[test]
+fn an_invalid_value_refuses_the_whole_call_and_keeps_earlier_writes_out() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  rve.find("crate"):set_visible(false)
+  rve.find("lamp"):set_light({ intensity = -1.0 })
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    assert!(
+        !errors(&mut host).is_empty(),
+        "неверная интенсивность отклоняется ошибкой вызова"
+    );
+    let crate_handle = world.handle("crate").unwrap();
+    assert!(
+        world.object(crate_handle).unwrap().mesh_visible,
+        "запись, сделанная до ошибки, не применяется"
+    );
+    let lamp = world.handle("lamp").unwrap();
+    assert_eq!(
+        world.object(lamp).unwrap().point_light.unwrap().intensity,
+        1.0
+    );
+}
+
+#[test]
+fn missing_components_and_bad_ranges_are_refused_at_the_call() {
+    for body in [
+        r#"rve.find("crate"):set_light({ intensity = 1.0 })"#,
+        r#"rve.find("lamp"):particles_stop()"#,
+        r#"rve.find("crate"):set_material_params({ metallic = 1.5 })"#,
+        r#"rve.find("fire"):particles_emit(0)"#,
+        r#"rve.find("tower"):set_lod_distances({ 30.0, 20.0 }, nil)"#,
+        r#"rve.find("sky"):set_environment({ intensity = -1.0 })"#,
+        r#"rve.find("speaker"):set_audio_source({ pitch = 0.0 })"#,
+        r#"rve.audio.play("/audio/hum.wav", { spatial_blend = 2.0, position = {x=0, y=0, z=0} })"#,
+    ] {
+        let (mut world, mut host) = load(&format!(
+            "local Script = {{}}\nfunction Script:on_update()\n  {body}\nend\nreturn Script\n"
+        ));
+        run_once(&mut world, &mut host);
+        assert!(
+            !errors(&mut host).is_empty(),
+            "ожидалась ошибка вызова: {body}"
+        );
+        assert!(host.drain_particle_commands().is_empty(), "{body}");
+        assert!(host.drain_audio_requests().is_empty(), "{body}");
+    }
+}
+
+#[test]
+fn a_clip_cannot_follow_an_object_that_is_inactive() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  rve.find("tower"):set_active(false)
+  rve.audio.play("/audio/hum.wav", { follow = rve.find("tower") })
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    assert!(
+        !errors(&mut host).is_empty(),
+        "follow на неактивный объект отклоняется"
+    );
+    assert!(host.drain_audio_requests().is_empty());
+}
+
+#[test]
+fn a_caught_environment_error_leaves_the_intensity_unchanged() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  local ok = pcall(function()
+    rve.find("sky"):set_environment({ intensity = 2.0, sky = { sun_size_deg = 0.0 } })
+  end)
+  if not ok then
+    rve.find("crate"):set_visible(false)
+  end
+end
+return Script
+"#,
+    );
+    let sky = world.handle("sky").unwrap();
+    let before = world.object(sky).unwrap().environment.clone();
+    run_once(&mut world, &mut host);
+    assert!(
+        !world
+            .object(world.handle("crate").unwrap())
+            .unwrap()
+            .mesh_visible,
+        "вызов должен отказать, а скрипт продолжить"
+    );
+    let after = world.object(sky).unwrap().environment.clone();
+    assert_eq!(format!("{after:?}"), format!("{before:?}"));
+}
+
+#[test]
+fn rejected_procedural_update_preserves_hdr_intensity() {
+    let scene = r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/sky.hdr"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "sky"
+[objects.environment]
+hdr = "/sky.hdr"
+intensity = 1.0
+[[objects.lite_scripts]]
+path = "/driver.lua"
+"#;
+    let mut world =
+        World::from_document(&SceneDocument::parse("hdr.rvescene", scene).unwrap()).unwrap();
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local sky = rve.find("sky")
+  local ok = pcall(function()
+    sky:set_environment({ intensity = 2.0, sky = { sun_size_deg = 2.0 } })
+  end)
+  assert(not ok)
+  assert(sky:get_environment().intensity == 1.0)
+end
+return Script
+"#;
+    let sources = BTreeMap::from([("driver.lua".to_owned(), source.to_owned())]);
+    let mut host = ScriptHost::load(&world, "hdr", &sources, None).unwrap();
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    assert_eq!(
+        world
+            .object(world.handle("sky").unwrap())
+            .unwrap()
+            .environment
+            .as_ref()
+            .unwrap()
+            .intensity,
+        1.0
+    );
+}
+
+#[test]
+fn a_caught_light_error_leaves_the_light_unchanged() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  local ok = pcall(function()
+    rve.find("lamp"):set_light({ intensity = 3.0, enabled = "no" })
+  end)
+  if not ok then
+    rve.find("crate"):set_visible(false)
+  end
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    assert!(
+        !world
+            .object(world.handle("crate").unwrap())
+            .unwrap()
+            .mesh_visible,
+        "вызов должен отказать, а скрипт продолжить"
+    );
+    let lamp = world.object(world.handle("lamp").unwrap()).unwrap();
+    assert_eq!(lamp.point_light.unwrap().intensity, 1.0);
+    assert!(lamp.light_enabled);
+}
+
+#[test]
+fn particle_commands_are_refused_for_an_inactive_emitter() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  if self.hidden then
+    rve.find("fire"):particles_restart()
+    rve.find("fire"):particles_emit(4)
+  else
+    self.hidden = true
+    rve.find("fire"):set_active(false)
+  end
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    run_once(&mut world, &mut host);
+    assert!(
+        !errors(&mut host).is_empty(),
+        "команда неактивному эмиттеру отклоняется вызовом"
+    );
+    assert!(host.drain_particle_commands().is_empty());
+}
+
+#[test]
+fn set_material_applies_a_declared_rvemat_once_the_call_commits() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  rve.find("crate"):set_material("/materials/gold.rvemat")
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    let raised = errors(&mut host);
+    assert!(raised.is_empty(), "{raised:?}");
+    let crate_handle = world.handle("crate").unwrap();
+    assert_eq!(
+        world
+            .mesh_material_path(crate_handle)
+            .map(|path| path.as_str()),
+        Some("materials/gold.rvemat")
+    );
+    assert_eq!(world.take_mesh_material_changes(), vec![crate_handle]);
+}
+
+#[test]
+fn spawned_prefab_accepts_its_material_and_params_and_scene_materials() {
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 1 then
+    rve.spawn("prefabs/material.rveprefab", { id = "spawned" })
+  elseif self.frames == 2 then
+    local object = rve.find("spawned")
+    object:set_material("/materials/prefab.rvemat")
+    object:set_material_params({ roughness = 0.25 })
+  elseif self.frames == 3 then
+    rve.find("spawned"):set_material("/materials/gold.rvemat")
+  end
+end
+return Script
+"#;
+    let document = SceneDocument::parse("test.rvescene", SCENE).unwrap();
+    let mut world = World::from_document(&document).unwrap();
+    let path = "prefabs/material.rveprefab";
+    let mut prefabs = PrefabCatalog::default();
+    prefabs.insert(
+        path,
+        PrefabSpec {
+            kind: PrefabKind::Fast,
+            max_instances: None,
+        },
+    );
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &BTreeMap::from([("driver.lua".to_owned(), source.to_owned())]),
+        None,
+        ScriptLoadOptions {
+            prefabs,
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    let prefab_path = VirtualPath::parse(path).unwrap();
+    let template = Arc::new(
+        PrefabTemplate::load(&prefab_path, &mut |_| {
+            Ok("[[assets]]\npath = \"/models/crate.fbx\"\n[[assets]]\npath = \"/materials/prefab.rvemat\"\n[[objects]]\nid = \"root\"\n[objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n".to_owned())
+        })
+        .unwrap(),
+    );
+    host.register_prefab(&world, path, template, &BTreeMap::new())
+        .unwrap();
+
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    let spawned = world.handle("spawned").unwrap();
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    assert_eq!(
+        world.mesh_material_path(spawned).map(VirtualPath::as_str),
+        Some("materials/prefab.rvemat")
+    );
+    assert_eq!(
+        world
+            .object(spawned)
+            .unwrap()
+            .mesh_renderer
+            .as_ref()
+            .unwrap()
+            .material
+            .as_ref()
+            .unwrap()
+            .roughness,
+        Some(0.25)
+    );
+    assert_eq!(world.take_mesh_material_changes(), [spawned]);
+
+    run_once(&mut world, &mut host);
+    assert!(errors(&mut host).is_empty());
+    assert_eq!(
+        world.mesh_material_path(spawned).map(VirtualPath::as_str),
+        Some("materials/gold.rvemat")
+    );
+}
+
+#[test]
+fn set_material_refuses_undeclared_wrong_extension_and_objects_without_a_mesh() {
+    for body in [
+        r#"rve.find("crate"):set_material("/materials/silver.rvemat")"#,
+        r#"rve.find("crate"):set_material("/materials/gold.toml")"#,
+        r#"rve.find("lamp"):set_material("/materials/gold.rvemat")"#,
+    ] {
+        let (mut world, mut host) = load(&format!(
+            "local Script = {{}}\nfunction Script:on_update()\n  {body}\nend\nreturn Script\n"
+        ));
+        run_once(&mut world, &mut host);
+        assert!(!errors(&mut host).is_empty(), "ожидалась ошибка: {body}");
+        let crate_handle = world.handle("crate").unwrap();
+        assert!(world.mesh_material_path(crate_handle).is_none(), "{body}");
+        assert!(world.take_mesh_material_changes().is_empty(), "{body}");
+    }
+}

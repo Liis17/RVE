@@ -1,6 +1,7 @@
 //! Файловые операции над каталогом ресурсов проекта. Все пути остаются внутри `Assets/`.
 
 use engine_files::VirtualPath;
+pub use engine_scene::AssetKind;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,39 +15,6 @@ pub struct AssetEntry {
     pub is_dir: bool,
     /// Содержимое папки; папки идут первыми, внутри групп — по имени.
     pub children: Vec<AssetEntry>,
-}
-
-/// Вид ресурса, определяемый по расширению файла.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AssetKind {
-    Scene,
-    Prefab,
-    CameraSettings,
-    Model,
-    Texture,
-    Hdr,
-    Script,
-    Other,
-}
-
-impl AssetKind {
-    pub fn of(path: &str) -> Self {
-        let extension = path
-            .rsplit('/')
-            .next()
-            .and_then(|name| name.rsplit_once('.'))
-            .map(|(_, extension)| extension.to_ascii_lowercase());
-        match extension.as_deref() {
-            Some("rvescene") => Self::Scene,
-            Some("rveprefab") => Self::Prefab,
-            Some("camerasettings") => Self::CameraSettings,
-            Some("fbx") => Self::Model,
-            Some("png") => Self::Texture,
-            Some("hdr") => Self::Hdr,
-            Some("lua") => Self::Script,
-            _ => Self::Other,
-        }
-    }
 }
 
 /// Каталог ресурсов проекта.
@@ -120,6 +88,18 @@ impl AssetsDir {
         }
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
         Ok(entries)
+    }
+
+    /// Создаёт новый файл с содержимым `contents`; существующий файл не перезаписывается.
+    pub fn create_file(&self, parent: &str, name: &str, contents: &str) -> io::Result<String> {
+        validate_name(name)?;
+        let path = join(parent, name);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.resolve(&path)?)?;
+        io::Write::write_all(&mut file, contents.as_bytes())?;
+        Ok(path)
     }
 
     pub fn create_folder(&self, parent: &str, name: &str) -> io::Result<String> {
@@ -303,7 +283,28 @@ mod tests {
             AssetKind::of("camera.CAMERASETTINGS"),
             AssetKind::CameraSettings
         );
+        assert_eq!(AssetKind::of("look.PostProcess"), AssetKind::PostProcess);
         assert_eq!(AssetKind::of("s.lua"), AssetKind::Script);
+    }
+
+    #[test]
+    fn physics_material_files_are_classified_and_created_without_overwrite() {
+        assert_eq!(
+            AssetKind::of("materials/ICE.RVEPHYSMAT"),
+            AssetKind::PhysicsMaterial
+        );
+        let temp = TempAssets::new();
+        assert_eq!(
+            temp.assets
+                .create_file("", "ice.rvephysmat", "static_friction = 0.1\n")
+                .unwrap(),
+            "ice.rvephysmat"
+        );
+        assert!(temp.assets.create_file("", "ice.rvephysmat", "").is_err());
+        assert_eq!(
+            fs::read_to_string(temp.assets.root().join("ice.rvephysmat")).unwrap(),
+            "static_friction = 0.1\n"
+        );
     }
 
     #[test]

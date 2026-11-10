@@ -5,6 +5,18 @@ path = "/models/shared-cube.fbx"
 path = "/cameras/default.camerasettings"
 
 [[assets]]
+path = "/cameras/default.postprocess"
+
+[[assets]]
+path = "/fx/color_isolate.glsl"
+
+[[assets]]
+path = "/fx/vhs.glsl"
+
+[[assets]]
+path = "/fx/crt.glsl"
+
+[[assets]]
 path = "/scripts/rotate.lua"
 
 [[assets]]
@@ -17,6 +29,25 @@ name = "Camera"
 position = [0.0, 1.15, 6.0]
 [objects.camera]
 settings = "/cameras/default.camerasettings"
+post_process = "/cameras/default.postprocess"
+# Экранные шейдеры выключены: демо выглядит как прежде; включите enabled = true, чтобы увидеть эффект.
+[[objects.camera.screen_shaders]]
+shader = "/fx/color_isolate.glsl"
+stage = "after_post"
+enabled = false
+params = [0.33, 0.08, 1.0]
+
+[[objects.camera.screen_shaders]]
+shader = "/fx/vhs.glsl"
+stage = "after_post"
+enabled = false
+params = [0.6, 0.4]
+
+[[objects.camera.screen_shaders]]
+shader = "/fx/crt.glsl"
+stage = "after_post"
+enabled = false
+params = [0.5, 0.5]
 
 [[objects]]
 id = "sun"
@@ -117,3 +148,35 @@ position = [0.0, 1.15, 0.0]
 target = "moon"
 name = "Moon"
 lite_params = [{ path = "/scripts/rotate.lua", params = { speed = -120.0 } }]
+
+[[assets]]
+path = "/audio/hum.wav"
+
+[[objects]]
+id = "ambient-hum"
+name = "Ambient Hum"
+[objects.transform]
+position = [0.0, 1.0, 0.0]
+[objects.audio_source]
+clip = "/audio/hum.wav"
+group = "ambient"
+volume = 0.6
+looping = true
+play_on_start = true
+spatial = true
+min_distance = 2.0
+max_distance = 25.0
+
+[[assets]]
+path = "/ui/hud.rveui"
+
+[[assets]]
+path = "/scripts/hud.lua"
+
+[[objects]]
+id = "game-hud"
+name = "Game HUD"
+[objects.ui_canvas]
+document = "/ui/hud.rveui"
+[[objects.lite_scripts]]
+path = "/scripts/hud.lua"

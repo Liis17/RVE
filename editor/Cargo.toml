@@ -1,6 +1,6 @@
 [package]
 name = "rve-editor"
-version.workspace = true
+version = "0.29.0"
 edition.workspace = true
 license.workspace = true
 
@@ -10,12 +10,20 @@ path = "src/main.rs"
 
 [dependencies]
 egui.workspace = true
+toml.workspace = true
+engine-gui = { path = "../engine/engine-gui" }
 egui-winit.workspace = true
 egui_dock = { workspace = true, features = ["serde"] }
 winit.workspace = true
 engine-console = { path = "../engine/engine-console" }
+engine-animation = { path = "../engine/engine-animation" }
+engine-core = { path = "../engine/engine-core" }
 engine-assets = { path = "../engine/engine-assets" }
+engine-audio = { path = "../engine/engine-audio" }
+engine-physics = { path = "../engine/engine-physics" }
 engine-files = { path = "../engine/engine-files" }
+engine-network = { path = "../engine/engine-network" }
+engine-input = { path = "../engine/engine-input" }
 engine-platform = { path = "../engine/engine-platform" }
 engine-ui = { path = "../engine/engine-ui" }
 engine-project = { path = "../engine/engine-project" }
@@ -24,13 +32,22 @@ engine-resources = { path = "../engine/engine-resources" }
 engine-scene = { path = "../engine/engine-scene" }
 engine-script = { path = "../engine/engine-script" }
 engine-window = { path = "../engine/engine-window" }
+engine-mcp = { path = "../engine/engine-mcp" }
+notify.workspace = true
 glam.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+png.workspace = true
+flume.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 rve-sdk = { path = "../engine/rve-sdk" }
+
+[build-dependencies]
+# Растеризация иконок из IconsPack на этапе сборки; в рантайм-бинарь не попадает.
+resvg = { version = "=0.49.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

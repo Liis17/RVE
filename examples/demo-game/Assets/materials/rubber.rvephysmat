@@ -1,0 +1,6 @@
+# Резина: высокий отскок; максимум из пары даёт мячу отскок даже от пола без отскока.
+static_friction = 0.9
+dynamic_friction = 0.8
+bounciness = 0.9
+friction_combine = "maximum"
+bounce_combine = "maximum"

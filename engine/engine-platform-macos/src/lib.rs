@@ -17,6 +17,9 @@ pub use instance::{
 
 pub use ash_window::{create_surface, enumerate_required_extensions};
 
+/// Platform adapter version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Дополнительные к surface расширения instance, необходимые платформе.
 pub const INSTANCE_EXTENSIONS: &[&CStr] = &[ash::khr::portability_enumeration::NAME];
 /// Флаги создания Vulkan instance для платформы.
@@ -28,6 +31,24 @@ pub const DEVICE_EXTENSIONS: &[&CStr] = &[ash::khr::portability_subset::NAME];
 /// Returns the user's cache directory.
 pub fn user_cache_dir() -> Option<PathBuf> {
     user_cache_dir_with(|name| std::env::var_os(name))
+}
+
+/// Returns the user's application-support directory.
+pub fn user_data_dir() -> Option<PathBuf> {
+    user_data_dir_with(|name| std::env::var_os(name))
+}
+
+fn user_data_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
+    get("HOME").filter(|path| !path.is_empty()).map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+    })
+}
+
+/// Atomically replaces a file with POSIX rename semantics.
+pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
 }
 
 fn user_cache_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
@@ -180,6 +201,15 @@ mod tests {
             Some(PathBuf::from("/Users/rve/Library/Caches"))
         );
         assert_eq!(user_cache_dir_with(|_| None), None);
+    }
+
+    #[test]
+    fn data_directory_uses_application_support() {
+        assert_eq!(
+            user_data_dir_with(|name| (name == "HOME").then(|| OsString::from("/Users/rve"))),
+            Some(PathBuf::from("/Users/rve/Library/Application Support"))
+        );
+        assert_eq!(user_data_dir_with(|_| None), None);
     }
 
     #[test]

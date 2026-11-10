@@ -3,12 +3,15 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
-    MeshRenderer, ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride,
-    ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
+    AnimatorComponent, AudioSourceComponent, CameraComponent, CameraCursor,
+    CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
+    EnvironmentComponent, Expansion, LodGroup, MeshRenderer, NetworkIdentityComponent,
+    NetworkTransformComponent, ObjectOrigin, ParamValue, ParticleEmitterComponent,
+    PointLightComponent, PrefabInstance, PrefabOverride, ProceduralSkyComponent,
+    RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
     SpotLightComponent,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 mod prefabs;
@@ -80,6 +83,15 @@ pub enum ComponentKind {
     PointLight,
     SpotLight,
     Environment,
+    Collider,
+    RigidBody,
+    CharacterController,
+    AudioSource,
+    Animator,
+    ParticleEmitter,
+    NetworkIdentity,
+    NetworkTransform,
+    UiCanvas,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -93,6 +105,15 @@ pub enum Component {
     PointLight(PointLightComponent),
     SpotLight(SpotLightComponent),
     Environment(EnvironmentComponent),
+    Collider(ColliderComponent),
+    RigidBody(RigidBodyComponent),
+    CharacterController(CharacterControllerComponent),
+    AudioSource(AudioSourceComponent),
+    Animator(AnimatorComponent),
+    ParticleEmitter(ParticleEmitterComponent),
+    NetworkIdentity(NetworkIdentityComponent),
+    NetworkTransform(NetworkTransformComponent),
+    UiCanvas(engine_scene::UiCanvasComponent),
 }
 
 impl Component {
@@ -106,6 +127,15 @@ impl Component {
             Self::PointLight(_) => ComponentKind::PointLight,
             Self::SpotLight(_) => ComponentKind::SpotLight,
             Self::Environment(_) => ComponentKind::Environment,
+            Self::Collider(_) => ComponentKind::Collider,
+            Self::RigidBody(_) => ComponentKind::RigidBody,
+            Self::CharacterController(_) => ComponentKind::CharacterController,
+            Self::AudioSource(_) => ComponentKind::AudioSource,
+            Self::Animator(_) => ComponentKind::Animator,
+            Self::ParticleEmitter(_) => ComponentKind::ParticleEmitter,
+            Self::NetworkIdentity(_) => ComponentKind::NetworkIdentity,
+            Self::NetworkTransform(_) => ComponentKind::NetworkTransform,
+            Self::UiCanvas(_) => ComponentKind::UiCanvas,
         }
     }
 
@@ -120,6 +150,19 @@ impl Component {
             ComponentKind::PointLight => Self::PointLight(object.point_light?),
             ComponentKind::SpotLight => Self::SpotLight(object.spot_light?),
             ComponentKind::Environment => Self::Environment(object.environment.clone()?),
+            ComponentKind::Collider => Self::Collider(object.collider.clone()?),
+            ComponentKind::RigidBody => Self::RigidBody(object.rigid_body?),
+            ComponentKind::CharacterController => {
+                Self::CharacterController(object.character_controller?)
+            }
+            ComponentKind::AudioSource => Self::AudioSource(object.audio_source.clone()?),
+            ComponentKind::Animator => Self::Animator(object.animator.clone()?),
+            ComponentKind::ParticleEmitter => {
+                Self::ParticleEmitter(object.particle_emitter.clone()?)
+            }
+            ComponentKind::NetworkIdentity => Self::NetworkIdentity(object.network_identity?),
+            ComponentKind::NetworkTransform => Self::NetworkTransform(object.network_transform?),
+            ComponentKind::UiCanvas => Self::UiCanvas(object.ui_canvas.clone()?),
         })
     }
 
@@ -133,12 +176,42 @@ impl Component {
                 model: object.mesh_renderer.as_ref()?.model.clone(),
                 texture: None,
                 material: None,
+                materials: Vec::new(),
             }),
             ComponentKind::LodGroup => return None,
             ComponentKind::DirectionalLight => Self::DirectionalLight(default_light()),
             ComponentKind::PointLight => Self::PointLight(PointLightComponent::default()),
             ComponentKind::SpotLight => Self::SpotLight(SpotLightComponent::default()),
             ComponentKind::Environment => Self::Environment(default_environment()),
+            ComponentKind::Collider => Self::Collider(ColliderComponent::default()),
+            ComponentKind::RigidBody => Self::RigidBody(RigidBodyComponent::default()),
+            ComponentKind::CharacterController => {
+                Self::CharacterController(CharacterControllerComponent::default())
+            }
+            // Как и модель Mesh Renderer, клип сохраняется: без него источник не задан.
+            ComponentKind::AudioSource => Self::AudioSource(AudioSourceComponent::with_clip(
+                object.audio_source.as_ref()?.clip.clone(),
+            )),
+            // Клипы сохраняются, как у источника звука: без них аниматор пустой.
+            ComponentKind::Animator => {
+                let clips = object.animator.as_ref()?.clips.clone();
+                Self::Animator(AnimatorComponent {
+                    clips,
+                    ..AnimatorComponent::new()
+                })
+            }
+            // Текстура сохраняется по той же причине, что и клип звука.
+            ComponentKind::ParticleEmitter => Self::ParticleEmitter(ParticleEmitterComponent {
+                texture: object.particle_emitter.as_ref()?.texture.clone(),
+                ..ParticleEmitterComponent::default()
+            }),
+            ComponentKind::NetworkIdentity => {
+                Self::NetworkIdentity(NetworkIdentityComponent::default())
+            }
+            ComponentKind::NetworkTransform => {
+                Self::NetworkTransform(NetworkTransformComponent::default())
+            }
+            ComponentKind::UiCanvas => Self::UiCanvas(object.ui_canvas.clone()?),
         })
     }
 
@@ -156,6 +229,15 @@ impl Component {
             Self::PointLight(value) => object.point_light = Some(value),
             Self::SpotLight(value) => object.spot_light = Some(value),
             Self::Environment(value) => object.environment = Some(value),
+            Self::Collider(value) => object.collider = Some(value),
+            Self::RigidBody(value) => object.rigid_body = Some(value),
+            Self::CharacterController(value) => object.character_controller = Some(value),
+            Self::AudioSource(value) => object.audio_source = Some(value),
+            Self::Animator(value) => object.animator = Some(value),
+            Self::ParticleEmitter(value) => object.particle_emitter = Some(value),
+            Self::NetworkIdentity(value) => object.network_identity = Some(value),
+            Self::NetworkTransform(value) => object.network_transform = Some(value),
+            Self::UiCanvas(value) => object.ui_canvas = Some(value),
         }
     }
 }
@@ -246,9 +328,45 @@ impl EditorScene {
         &self.expansion.document
     }
 
+    /// Ids объектов, действующая активность которых выключена: сам объект или один из предков
+    /// неактивен. Считается за один проход по раскрытому документу.
+    pub fn inactive_in_hierarchy(&self) -> std::collections::HashSet<String> {
+        let objects = &self.view().objects;
+        let index: std::collections::HashMap<&str, &SceneObject> = objects
+            .iter()
+            .map(|object| (object.id.as_str(), object))
+            .collect();
+        let mut inactive = std::collections::HashSet::new();
+        for object in objects {
+            let mut current = Some(object);
+            let mut hidden = false;
+            // Документ проверен на отсутствие циклов; ограничение по числу шагов страхует от зацикливания.
+            for _ in 0..=objects.len() {
+                let Some(item) = current else { break };
+                if !item.active {
+                    hidden = true;
+                    break;
+                }
+                current = item
+                    .parent
+                    .as_deref()
+                    .and_then(|parent| index.get(parent).copied());
+            }
+            if hidden {
+                inactive.insert(object.id.clone());
+            }
+        }
+        inactive
+    }
+
     /// Происхождение объекта экземпляра; `None` — собственный объект документа.
     pub fn origin(&self, id: &str) -> Option<&ObjectOrigin> {
         self.expansion.origins.get(id)
+    }
+
+    /// Файлы префабов, раскрытые экземплярами этого документа, включая вложенные.
+    pub fn instanced_prefabs(&self) -> &[VirtualPath] {
+        &self.expansion.prefabs
     }
 
     /// Авторский экземпляр префаба по id.
@@ -480,6 +598,68 @@ impl EditorScene {
         Err(format!("объект {id:?} не найден"))
     }
 
+    /// Updates Lua parameters and registers any asset references in the same scene edit.
+    pub fn set_lite_script_params(
+        &mut self,
+        id: &str,
+        index: usize,
+        params: BTreeMap<String, ParamValue>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        if self.document.objects.iter().any(|object| object.id == id) {
+            let assets = params.values().cloned().collect::<Vec<_>>();
+            self.edit(coalesce, |document| {
+                let script = find_object_mut(document, id)?
+                    .lite_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Lua-скрипт {index} не найден"))?;
+                script.params = params;
+                ensure_param_assets(document, assets);
+                Ok(())
+            })
+        } else {
+            self.edit_object(id, coalesce, |object| {
+                object
+                    .lite_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Lua-скрипт {index} не найден"))?
+                    .params = params;
+                Ok(())
+            })
+        }
+    }
+
+    /// Updates Rust parameters and registers any asset references in the same scene edit.
+    pub fn set_heavy_script_params(
+        &mut self,
+        id: &str,
+        index: usize,
+        params: BTreeMap<String, ParamValue>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        if self.document.objects.iter().any(|object| object.id == id) {
+            let assets = params.values().cloned().collect::<Vec<_>>();
+            self.edit(coalesce, |document| {
+                let script = find_object_mut(document, id)?
+                    .heavy_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Rust-скрипт {index} не найден"))?;
+                script.params = params;
+                ensure_param_assets(document, assets);
+                Ok(())
+            })
+        } else {
+            self.edit_object(id, coalesce, |object| {
+                object
+                    .heavy_scripts
+                    .get_mut(index)
+                    .ok_or_else(|| format!("объект {id:?}: Rust-скрипт {index} не найден"))?
+                    .params = params;
+                Ok(())
+            })
+        }
+    }
+
     pub fn create_object(
         &mut self,
         kind: &NewObject,
@@ -505,16 +685,7 @@ impl EditorScene {
             id: id.clone(),
             name: Some(name),
             parent: parent.map(str::to_owned),
-            transform: SceneTransform::default(),
-            camera: None,
-            mesh_renderer: None,
-            lod_group: None,
-            directional_light: None,
-            point_light: None,
-            spot_light: None,
-            environment: None,
-            lite_scripts: Vec::new(),
-            heavy_scripts: Vec::new(),
+            ..SceneObject::default()
         };
         self.edit(None, |document| {
             match kind {
@@ -547,6 +718,7 @@ impl EditorScene {
                         model: path.clone(),
                         texture: None,
                         material: None,
+                        materials: Vec::new(),
                     });
                 }
             }
@@ -679,6 +851,9 @@ impl EditorScene {
                 .cloned()
                 .map(|mut object| {
                     object.parent = remap(object.parent);
+                    remap_object_script_refs(&mut object, |reference| {
+                        rename_reference(&renamed, reference.to_owned())
+                    });
                     object.id = renamed[&object.id].clone();
                     if let Some(camera) = &mut object.camera {
                         camera.active = false;
@@ -693,6 +868,9 @@ impl EditorScene {
                 .cloned()
                 .map(|mut instance| {
                     instance.parent = remap(instance.parent);
+                    remap_instance_script_refs(&mut instance, |reference| {
+                        rename_reference(&renamed, reference.to_owned())
+                    });
                     instance.id = renamed[&instance.id].clone();
                     instance
                 })
@@ -807,6 +985,9 @@ impl EditorScene {
                     _ => None,
                 };
                 object.id = renamed[&object.id].clone();
+                remap_object_script_refs(&mut object, |reference| {
+                    rename_reference(&renamed, reference.to_owned())
+                });
                 if let Some(camera) = &mut object.camera {
                     camera.active = false;
                 }
@@ -980,6 +1161,9 @@ impl EditorScene {
                     .take()
                     .map(|parent| rename_reference(&renamed, parent));
             }
+            remap_document_script_refs(document, |reference| {
+                rename_reference(&renamed, reference.to_owned())
+            });
             Ok(())
         })?;
         for selected in &mut self.selection {
@@ -1009,6 +1193,36 @@ impl EditorScene {
                 .find(|instance| instance.id == id)
             {
                 instance.parent = parent;
+            }
+            Ok(())
+        })
+    }
+
+    /// Меняет флаг `static` одной правкой. Включение затрагивает объект, а с `with_children` —
+    /// и собственных потомков сцены. Выключение всегда снимает флаг и с потомков: у статического
+    /// объекта предки обязаны быть статическими.
+    pub fn set_static(
+        &mut self,
+        id: &str,
+        is_static: bool,
+        with_children: bool,
+    ) -> Result<(), String> {
+        self.require_own(id)?;
+        if !self.document.objects.iter().any(|object| object.id == id) {
+            return Err(format!(
+                "объект {id:?}: флаг static задаётся в самом префабе, а не у экземпляра"
+            ));
+        }
+        let targets = if with_children || !is_static {
+            subtree_ids(&self.document, id)?
+        } else {
+            HashSet::from([id.to_owned()])
+        };
+        self.edit(None, |document| {
+            for object in &mut document.objects {
+                if targets.contains(&object.id) {
+                    object.is_static = is_static;
+                }
             }
             Ok(())
         })
@@ -1060,15 +1274,84 @@ impl EditorScene {
                 ensure_asset(document, texture);
             }
             let object = find_object_mut(document, id)?;
-            let material = object
-                .mesh_renderer
-                .as_ref()
-                .and_then(|mesh| mesh.material.clone());
+            let previous = object.mesh_renderer.as_ref();
+            let material = previous.and_then(|mesh| mesh.material.clone());
+            let materials = previous.map_or_else(Vec::new, |mesh| mesh.materials.clone());
             object.mesh_renderer = Some(MeshRenderer {
                 model,
                 texture,
                 material,
+                materials,
             });
+            Ok(())
+        })
+    }
+
+    /// Assigns FBX-part material slots. Empty entries keep the imported FBX material.
+    pub fn set_mesh_materials(
+        &mut self,
+        id: &str,
+        materials: Vec<Option<VirtualPath>>,
+    ) -> Result<(), String> {
+        for path in materials.iter().flatten() {
+            if !path.as_str().to_ascii_lowercase().ends_with(".rvemat") {
+                return Err(format!("{path}: ожидается ресурс .rvemat"));
+            }
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let mesh = object
+                    .mesh_renderer
+                    .as_mut()
+                    .ok_or("Mesh Renderer объекта префаба добавляется только в самом префабе")?;
+                mesh.materials = materials;
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            for path in materials.iter().flatten() {
+                ensure_asset(document, path);
+            }
+            find_object_mut(document, id)?
+                .mesh_renderer
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?}: нет Mesh Renderer"))?
+                .materials = materials;
+            Ok(())
+        })
+    }
+
+    /// Назначает коллайдеру `.rvephysmat` и добавляет его в ресурсы сцены; `None` возвращает
+    /// инлайн-поля трения и отскока.
+    pub fn set_collider_material(
+        &mut self,
+        id: &str,
+        material: Option<VirtualPath>,
+    ) -> Result<(), String> {
+        if let Some(path) = &material
+            && !path.as_str().to_ascii_lowercase().ends_with(".rvephysmat")
+        {
+            return Err(format!("{}: ожидается ресурс .rvephysmat", path));
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let collider = object
+                    .collider
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет коллайдера"))?;
+                collider.material = material;
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            if let Some(path) = &material {
+                ensure_asset(document, path);
+            }
+            let collider = find_object_mut(document, id)?
+                .collider
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет коллайдера"))?;
+            collider.material = material;
             Ok(())
         })
     }
@@ -1106,6 +1389,176 @@ impl EditorScene {
                 .as_mut()
                 .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
             camera.settings = settings;
+            Ok(())
+        })
+    }
+
+    /// Заменяет экранные шейдеры камеры; пути объявляются в `[[assets]]`, как у `.postprocess`.
+    /// `coalesce` объединяет подряд идущие правки одного параметра в одну запись истории.
+    pub fn set_camera_screen_shaders(
+        &mut self,
+        id: &str,
+        shaders: Vec<engine_scene::ScreenShaderRef>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        if shaders.len() > engine_scene::MAX_SCREEN_SHADERS {
+            return Err(format!(
+                "у камеры не больше {} экранных шейдеров",
+                engine_scene::MAX_SCREEN_SHADERS
+            ));
+        }
+        for shader in &shaders {
+            if !shader
+                .shader
+                .as_str()
+                .to_ascii_lowercase()
+                .ends_with(".glsl")
+            {
+                return Err(format!("{}: ожидается ресурс .glsl", shader.shader));
+            }
+            if shader.params.len() > engine_scene::MAX_SCREEN_SHADER_PARAMS
+                || !shader.params.iter().all(|value| value.is_finite())
+            {
+                return Err(format!(
+                    "параметры экранного шейдера должны быть конечными и не длиннее {}",
+                    engine_scene::MAX_SCREEN_SHADER_PARAMS
+                ));
+            }
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, coalesce, |object| {
+                let camera = object
+                    .camera
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+                camera.screen_shaders = shaders;
+                Ok(())
+            });
+        }
+        self.edit(coalesce, |document| {
+            for shader in &shaders {
+                ensure_asset(document, &shader.shader);
+            }
+            let camera = find_object_mut(document, id)?
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.screen_shaders = shaders;
+            Ok(())
+        })
+    }
+
+    /// Назначает файл постобработки камеры и добавляет его путь в список ресурсов сцены.
+    /// Изменение входит в общий undo/redo, как и назначение `.camerasettings`.
+    pub fn set_camera_post_process(
+        &mut self,
+        id: &str,
+        post_process: Option<VirtualPath>,
+    ) -> Result<(), String> {
+        if let Some(path) = &post_process
+            && !path.as_str().to_ascii_lowercase().ends_with(".postprocess")
+        {
+            return Err(format!("{}: ожидается ресурс .postprocess", path));
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let camera = object
+                    .camera
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+                camera.post_process = post_process;
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            if let Some(path) = &post_process {
+                ensure_asset(document, path);
+            }
+            let camera = find_object_mut(document, id)?
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.post_process = post_process;
+            Ok(())
+        })
+    }
+
+    /// Задаёт флаги курсора камеры для старта сцены; действуют, только если камера активна.
+    pub fn set_camera_cursor(&mut self, id: &str, cursor: CameraCursor) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            let camera = object
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.cursor = cursor;
+            Ok(())
+        })
+    }
+
+    /// Добавляет `.rveprefab` в ресурсы сцены: только такие префабы спавнятся быстро.
+    pub fn add_scene_prefab(&mut self, path: VirtualPath) -> Result<(), String> {
+        require_prefab_path(&path)?;
+        self.edit(None, |document| {
+            if document.assets.iter().any(|asset| asset.path == path) {
+                return Err(format!("/{} уже есть в ресурсах сцены", path.as_str()));
+            }
+            document.assets.push(SceneAsset {
+                path,
+                archive: None,
+                max_instances: None,
+            });
+            Ok(())
+        })
+    }
+
+    /// Удаляет `.rveprefab` из ресурсов сцены. Префаб, на который есть экземпляр, не удаляется.
+    pub fn remove_scene_prefab(&mut self, path: &VirtualPath) -> Result<(), String> {
+        require_prefab_path(path)?;
+        if self
+            .document
+            .instances
+            .iter()
+            .any(|instance| &instance.prefab == path)
+        {
+            return Err(format!(
+                "/{} используется экземпляром: сначала удалите экземпляр",
+                path.as_str()
+            ));
+        }
+        self.edit(None, |document| {
+            let index = scene_asset_index(document, path)?;
+            document.assets.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Задаёт архив ресурса `.rveprefab`; имя проверяет [`SceneDocument::validate`].
+    pub fn set_scene_prefab_archive(
+        &mut self,
+        path: &VirtualPath,
+        archive: Option<String>,
+    ) -> Result<(), String> {
+        self.edit_scene_prefab(path, |asset| asset.archive = archive)
+    }
+
+    /// Задаёт лимит экземпляров ресурса `.rveprefab`; ноль отклоняет валидация документа.
+    pub fn set_scene_prefab_max_instances(
+        &mut self,
+        path: &VirtualPath,
+        max_instances: Option<u32>,
+    ) -> Result<(), String> {
+        self.edit_scene_prefab(path, |asset| asset.max_instances = max_instances)
+    }
+
+    fn edit_scene_prefab(
+        &mut self,
+        path: &VirtualPath,
+        change: impl FnOnce(&mut SceneAsset),
+    ) -> Result<(), String> {
+        require_prefab_path(path)?;
+        self.edit(None, |document| {
+            let index = scene_asset_index(document, path)?;
+            change(&mut document.assets[index]);
             Ok(())
         })
     }
@@ -1160,7 +1613,41 @@ impl EditorScene {
         })
     }
 
-    /// Задаёт значение компонента целиком; его ресурсы добавляются в список сцены.
+    /// Задаёт mesh renderer и добавляет его ресурсы в список сцены.
+    pub fn set_mesh_renderer(&mut self, id: &str, mesh: MeshRenderer) -> Result<(), String> {
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                object.mesh_renderer = Some(mesh);
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            let object = find_object_mut(document, id)?;
+            object.mesh_renderer = Some(mesh);
+            let object = object.clone();
+            register_object_assets(document, &object)
+        })
+    }
+
+    /// Sets camera settings while leaving active-state changes to `set_camera_active`.
+    pub fn set_camera_component(
+        &mut self,
+        id: &str,
+        mut camera: CameraComponent,
+    ) -> Result<(), String> {
+        if let Some(active) = self
+            .view()
+            .objects
+            .iter()
+            .find(|object| object.id == id)
+            .and_then(|object| object.camera.as_ref())
+            .map(|current| current.active)
+        {
+            camera.active = active;
+        }
+        self.set_component(id, Component::Camera(camera))
+    }
+
     pub fn set_component(&mut self, id: &str, component: Component) -> Result<(), String> {
         if self.origin(id).is_some() {
             return self.edit_object(id, None, |object| {
@@ -1176,11 +1663,73 @@ impl EditorScene {
         })
     }
 
+    /// Удаляет звуковой источник объекта.
+    pub fn remove_audio_source(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.audio_source = None;
+            Ok(())
+        })
+    }
+
+    /// Удаляет аниматор объекта; клипы в `[[assets]]` остаются объявленными.
+    pub fn remove_animator(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.animator = None;
+            Ok(())
+        })
+    }
+    /// Удаляет эмиттер частиц объекта.
+    pub fn remove_particle_emitter(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.particle_emitter = None;
+            Ok(())
+        })
+    }
+
+    /// Удаляет сетевой идентификатор вместе с `network_transform`: без идентификатора трансформация
+    /// невалидна, поэтому оба компонента уходят в одной правке (как Mesh Renderer с LOD Group).
+    pub fn remove_network_identity(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.network_identity = None;
+            object.network_transform = None;
+            Ok(())
+        })
+    }
+
+    /// Удаляет сетевую трансформацию; идентификатор остаётся.
+    pub fn remove_network_transform(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.network_transform = None;
+            Ok(())
+        })
+    }
+
     /// Удаляет mesh renderer и его обязательную LOD Group в одной правке.
     pub fn remove_mesh_renderer(&mut self, id: &str) -> Result<(), String> {
         self.edit_object(id, None, |object| {
             object.mesh_renderer = None;
             object.lod_group = None;
+            Ok(())
+        })
+    }
+
+    /// Удаляет физический компонент одной правкой. Rigid Body без коллайдера документ не
+    /// принимает, поэтому коллайдер удаляется вместе с телом.
+    pub fn remove_physics_component(
+        &mut self,
+        id: &str,
+        kind: ComponentKind,
+    ) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            match kind {
+                ComponentKind::Collider => {
+                    object.collider = None;
+                    object.rigid_body = None;
+                }
+                ComponentKind::RigidBody => object.rigid_body = None,
+                ComponentKind::CharacterController => object.character_controller = None,
+                other => return Err(format!("{other:?} не является физическим компонентом")),
+            }
             Ok(())
         })
     }
@@ -1194,6 +1743,7 @@ impl EditorScene {
                 .push(engine_scene::LiteScript {
                     path,
                     params: Default::default(),
+                    enabled: true,
                 });
             Ok(())
         })
@@ -1289,6 +1839,79 @@ fn rename_reference(renamed: &std::collections::HashMap<String, String>, id: Str
     id
 }
 
+pub(super) fn remap_object_script_refs(
+    object: &mut SceneObject,
+    mut remap: impl FnMut(&str) -> String,
+) {
+    fn remap_params(
+        params: &mut BTreeMap<String, ParamValue>,
+        remap: &mut impl FnMut(&str) -> String,
+    ) {
+        fn visit(value: &mut ParamValue, remap: &mut impl FnMut(&str) -> String) {
+            match value {
+                ParamValue::Object(id) if !id.is_empty() => *id = remap(id),
+                ParamValue::Array(values) => {
+                    for value in values {
+                        visit(value, remap);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for value in params.values_mut() {
+            visit(value, remap);
+        }
+    }
+    for script in &mut object.lite_scripts {
+        remap_params(&mut script.params, &mut remap);
+    }
+    for script in &mut object.heavy_scripts {
+        remap_params(&mut script.params, &mut remap);
+    }
+}
+
+pub(super) fn remap_document_script_refs(
+    document: &mut SceneDocument,
+    mut remap: impl FnMut(&str) -> String,
+) {
+    for object in &mut document.objects {
+        remap_object_script_refs(object, &mut remap);
+    }
+    for instance in &mut document.instances {
+        remap_instance_script_refs(instance, &mut remap);
+    }
+}
+
+fn remap_instance_script_refs(
+    instance: &mut PrefabInstance,
+    mut remap: impl FnMut(&str) -> String,
+) {
+    for change in &mut instance.overrides {
+        for params in &mut change.lite_params {
+            for value in params.params.values_mut() {
+                remap_param_value(value, &mut remap);
+            }
+        }
+        for params in &mut change.heavy_params {
+            for value in params.params.values_mut() {
+                remap_param_value(value, &mut remap);
+            }
+        }
+    }
+}
+
+fn remap_param_value(value: &mut ParamValue, remap: &mut impl FnMut(&str) -> String) {
+    match value {
+        ParamValue::Object(id) if !id.is_empty() => *id = remap(id),
+        ParamValue::Array(values) => {
+            for value in values {
+                remap_param_value(value, remap);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Светлая настройка по умолчанию для нового directional light.
 pub fn default_light() -> DirectionalLightComponent {
     DirectionalLightComponent {
@@ -1347,6 +1970,9 @@ fn register_object_assets(
 ) -> Result<(), String> {
     if let Some(mesh) = &object.mesh_renderer {
         ensure_asset(document, &mesh.model);
+        for path in mesh.materials.iter().flatten() {
+            ensure_asset(document, path);
+        }
         let material = mesh.material.as_ref();
         for path in [
             mesh.texture.as_ref(),
@@ -1371,6 +1997,21 @@ fn register_object_assets(
             }
         }
     }
+    if let Some(audio) = &object.audio_source {
+        ensure_asset(document, &audio.clip);
+    }
+    if let Some(animator) = &object.animator {
+        for clip in &animator.clips {
+            ensure_asset(document, clip);
+        }
+    }
+    if let Some(texture) = object
+        .particle_emitter
+        .as_ref()
+        .and_then(|emitter| emitter.texture.as_ref())
+    {
+        ensure_asset(document, texture);
+    }
     for script in &object.lite_scripts {
         ensure_asset(document, &script.path);
     }
@@ -1387,6 +2028,9 @@ fn register_object_assets(
         .and_then(|environment| environment.hdr.as_ref())
     {
         ensure_asset(document, hdr);
+    }
+    if let Some(canvas) = &object.ui_canvas {
+        ensure_asset(document, &canvas.document);
     }
     Ok(())
 }
@@ -1441,13 +2085,51 @@ fn find_object<'a>(document: &'a SceneDocument, id: &str) -> Result<&'a SceneObj
         .ok_or_else(|| format!("объект {id:?} не найден"))
 }
 
+fn ensure_param_assets(document: &mut SceneDocument, params: impl IntoIterator<Item = ParamValue>) {
+    fn collect(value: &ParamValue, paths: &mut Vec<VirtualPath>) {
+        match value {
+            ParamValue::Asset(path) => paths.push(path.clone()),
+            ParamValue::Array(values) => {
+                for value in values {
+                    collect(value, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    for value in params {
+        collect(&value, &mut paths);
+    }
+    for path in paths {
+        ensure_asset(document, &path);
+    }
+}
+
 fn ensure_asset(document: &mut SceneDocument, path: &VirtualPath) {
     if !document.assets.iter().any(|asset| &asset.path == path) {
         document.assets.push(SceneAsset {
             path: path.clone(),
             archive: None,
+            max_instances: None,
         });
     }
+}
+
+fn require_prefab_path(path: &VirtualPath) -> Result<(), String> {
+    if is_prefab_path(path) {
+        Ok(())
+    } else {
+        Err(format!("/{}: ожидается ресурс .rveprefab", path.as_str()))
+    }
+}
+
+fn scene_asset_index(document: &SceneDocument, path: &VirtualPath) -> Result<usize, String> {
+    document
+        .assets
+        .iter()
+        .position(|asset| &asset.path == path)
+        .ok_or_else(|| format!("/{} нет в ресурсах сцены", path.as_str()))
 }
 
 fn parse_lod_path(id: &str, value: &str, field: &str) -> Result<VirtualPath, String> {
@@ -1522,6 +2204,65 @@ mod tests {
 
     fn scene() -> EditorScene {
         EditorScene::new_untitled().unwrap()
+    }
+
+    #[test]
+    fn static_flag_follows_the_ancestor_rule_in_one_undoable_edit() {
+        let mut scene = scene();
+        let base = scene.create_object(&NewObject::Empty, None).unwrap();
+        let child = scene.create_object(&NewObject::Empty, None).unwrap();
+        let leaf = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.set_parent(&child, Some(&base)).unwrap();
+        scene.set_parent(&leaf, Some(&child)).unwrap();
+        let is_static = |scene: &EditorScene, id: &str| scene.object(id).unwrap().is_static;
+
+        let error = scene.set_static(&child, true, false).unwrap_err();
+        assert!(error.contains("должен быть статическим"), "{error}");
+        assert!(!is_static(&scene, &child));
+
+        scene.set_static(&base, true, false).unwrap();
+        assert!(is_static(&scene, &base) && !is_static(&scene, &child));
+        scene.set_static(&base, true, true).unwrap();
+        assert!(is_static(&scene, &child) && is_static(&scene, &leaf));
+
+        scene.set_static(&base, false, false).unwrap();
+        assert!(
+            [&base, &child, &leaf]
+                .iter()
+                .all(|id| !is_static(&scene, id))
+        );
+        assert!(scene.undo());
+        assert!(
+            [&base, &child, &leaf]
+                .iter()
+                .all(|id| is_static(&scene, id))
+        );
+    }
+
+    #[test]
+    fn ui_canvas_component_is_undoable_and_registers_its_document() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let canvas = engine_scene::UiCanvasComponent {
+            document: path("ui/hud.rveui"),
+            visible: false,
+            layer: Some(4),
+        };
+        scene
+            .set_component(&id, Component::UiCanvas(canvas.clone()))
+            .unwrap();
+        assert_eq!(scene.object(&id).unwrap().ui_canvas, Some(canvas.clone()));
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == canvas.document)
+        );
+        assert!(scene.undo());
+        assert!(scene.object(&id).unwrap().ui_canvas.is_none());
+        assert!(scene.redo());
+        assert_eq!(scene.object(&id).unwrap().ui_canvas, Some(canvas));
     }
 
     fn path(value: &str) -> VirtualPath {
@@ -1834,6 +2575,83 @@ mod tests {
     }
 
     #[test]
+    fn material_slots_register_assets_and_undo_as_one_edit() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.set_mesh(&id, path("/mesh.fbx"), None).unwrap();
+        let slots = vec![Some(path("/materials/metal.rvemat")), None];
+        scene.set_mesh_materials(&id, slots.clone()).unwrap();
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .materials,
+            slots
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/materials/metal.rvemat"))
+        );
+        assert!(
+            scene
+                .set_mesh_materials(&id, vec![Some(path("/bad.png"))])
+                .is_err()
+        );
+        assert!(scene.undo());
+        assert!(
+            scene
+                .object(&id)
+                .unwrap()
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .materials
+                .is_empty()
+        );
+        assert!(
+            !scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/materials/metal.rvemat"))
+        );
+    }
+
+    #[test]
+    fn camera_cursor_flags_are_written_to_the_document_and_undoable() {
+        let mut scene = scene();
+        let cursor = CameraCursor {
+            hide_on_start: true,
+            lock_on_start: true,
+        };
+        scene.set_camera_cursor("camera", cursor).unwrap();
+        let stored = |scene: &EditorScene| {
+            scene
+                .document()
+                .objects
+                .iter()
+                .find(|object| object.id == "camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .cursor
+        };
+        assert_eq!(stored(&scene), cursor);
+        assert!(scene.undo());
+        assert_eq!(stored(&scene), CameraCursor::default());
+        assert!(scene.redo());
+        assert_eq!(stored(&scene), cursor);
+        assert!(scene.set_camera_cursor("missing", cursor).is_err());
+    }
+
+    #[test]
     fn assigning_camera_settings_registers_a_valid_asset_path() {
         let mut scene = scene();
         let settings = path("/cameras/main.camerasettings");
@@ -1861,6 +2679,197 @@ mod tests {
             scene
                 .set_camera_settings("camera", Some(path("/cameras/main.toml")))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn screen_shaders_are_validated_registered_and_undoable() {
+        let mut scene = scene();
+        let shader = |name: &str| engine_scene::ScreenShaderRef {
+            shader: path(name),
+            stage: engine_scene::ScreenShaderStage::AfterPost,
+            enabled: true,
+            params: vec![0.5],
+        };
+        let camera_shaders = |scene: &EditorScene| {
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .screen_shaders
+                .clone()
+        };
+        assert!(
+            scene
+                .set_camera_screen_shaders("camera", vec![shader("/fx/vhs.glsl"); 5], None)
+                .is_err(),
+            "больше четырёх шейдеров отклоняется"
+        );
+        assert!(
+            scene
+                .set_camera_screen_shaders("camera", vec![shader("/fx/look.postprocess")], None)
+                .is_err(),
+            "ожидается .glsl"
+        );
+        scene
+            .set_camera_screen_shaders("camera", vec![shader("/fx/vhs.glsl")], None)
+            .unwrap();
+        assert_eq!(camera_shaders(&scene), vec![shader("/fx/vhs.glsl")]);
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/fx/vhs.glsl"))
+        );
+        assert!(scene.undo());
+        assert!(camera_shaders(&scene).is_empty());
+    }
+
+    #[test]
+    fn screen_shader_param_edits_with_one_key_are_one_undo_step() {
+        let mut scene = scene();
+        let key = "screen-shader-camera-0-p1";
+        let with_param = |value: f32| {
+            vec![engine_scene::ScreenShaderRef {
+                shader: path("/fx/vhs.glsl"),
+                stage: engine_scene::ScreenShaderStage::AfterPost,
+                enabled: true,
+                params: vec![0.0, value],
+            }]
+        };
+        let second_param = |scene: &EditorScene| {
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .screen_shaders
+                .first()
+                .map(|shader| shader.params[1])
+        };
+        scene
+            .set_camera_screen_shaders("camera", with_param(0.1), None)
+            .unwrap();
+        for value in [0.2, 0.3, 0.4] {
+            scene
+                .set_camera_screen_shaders("camera", with_param(value), Some(key))
+                .unwrap();
+        }
+        assert_eq!(second_param(&scene), Some(0.4));
+        assert!(scene.undo());
+        assert_eq!(
+            second_param(&scene),
+            Some(0.1),
+            "все шаги перетаскивания откатываются одним undo"
+        );
+        assert!(scene.undo());
+        assert_eq!(
+            second_param(&scene),
+            None,
+            "добавление шейдера — отдельный шаг"
+        );
+    }
+
+    #[test]
+    fn assigning_post_process_registers_asset_and_supports_undo() {
+        let mut scene = scene();
+        let post = path("/cameras/look.postprocess");
+        scene
+            .set_camera_post_process("camera", Some(post.clone()))
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .post_process,
+            Some(post.clone())
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == post)
+        );
+        assert!(
+            scene
+                .set_camera_post_process("camera", Some(path("/cameras/look.toml")))
+                .is_err()
+        );
+        assert!(scene.undo());
+        assert_eq!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .post_process,
+            None
+        );
+        assert!(scene.redo());
+        assert!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .post_process
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn assigning_collider_material_registers_asset_and_inline_clears_it() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene
+            .set_component(&id, Component::Collider(ColliderComponent::default()))
+            .unwrap();
+        let material = path("/materials/ice.rvephysmat");
+        scene
+            .set_collider_material(&id, Some(material.clone()))
+            .unwrap();
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .material,
+            Some(material.clone())
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == material)
+        );
+        assert!(
+            scene
+                .set_collider_material(&id, Some(path("/materials/ice.toml")))
+                .is_err()
+        );
+        scene.set_collider_material(&id, None).unwrap();
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .material,
+            None
         );
     }
 
@@ -2227,6 +3236,304 @@ mod tests {
     }
 
     #[test]
+    fn physics_components_add_edit_and_remove_as_undoable_steps() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene
+            .set_component(&id, Component::Collider(ColliderComponent::default()))
+            .unwrap();
+        scene
+            .set_component(&id, Component::RigidBody(RigidBodyComponent::default()))
+            .unwrap();
+        scene
+            .edit_object(&id, Some("collider-friction"), |object| {
+                object.collider.as_mut().unwrap().friction = 0.9;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
+            0.9
+        );
+        assert!(scene.undo());
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
+            0.5
+        );
+
+        // Коллайдер нельзя убрать, оставив тело: удаление идёт одной правкой, один undo вернёт оба.
+        scene
+            .remove_physics_component(&id, ComponentKind::Collider)
+            .unwrap();
+        let object = scene.object(&id).unwrap();
+        assert!(object.collider.is_none() && object.rigid_body.is_none());
+        assert!(scene.undo());
+        let object = scene.object(&id).unwrap();
+        assert!(object.collider.is_some() && object.rigid_body.is_some());
+        assert!(scene.redo());
+        assert!(scene.object(&id).unwrap().collider.is_none());
+    }
+
+    #[test]
+    fn controller_and_body_components_follow_document_rules_and_roll_back() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let body = Component::RigidBody(RigidBodyComponent::default());
+        let error = scene.set_component(&id, body).unwrap_err();
+        assert!(error.contains("требует collider"), "{error}");
+        assert!(scene.object(&id).unwrap().rigid_body.is_none());
+
+        let mesh = Component::Collider(ColliderComponent {
+            shape: engine_scene::ColliderShape::TriangleMesh,
+            ..ColliderComponent::default()
+        });
+        let error = scene.set_component(&id, mesh).unwrap_err();
+        assert!(error.contains("mesh_renderer"), "{error}");
+
+        scene
+            .set_component(
+                &id,
+                Component::CharacterController(CharacterControllerComponent::default()),
+            )
+            .unwrap();
+        let error = scene
+            .set_component(&id, Component::Collider(ColliderComponent::default()))
+            .unwrap_err();
+        assert!(error.contains("несовместим"), "{error}");
+        assert!(scene.object(&id).unwrap().collider.is_none());
+
+        scene
+            .remove_physics_component(&id, ComponentKind::CharacterController)
+            .unwrap();
+        assert!(scene.object(&id).unwrap().character_controller.is_none());
+        assert!(
+            scene
+                .remove_physics_component(&id, ComponentKind::PointLight)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audio_source_registers_its_clip_resets_keeping_it_and_rolls_back_invalid_values() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let clip = VirtualPath::parse("audio/hum.wav").unwrap();
+        let loud = AudioSourceComponent {
+            volume: 0.5,
+            looping: true,
+            ..AudioSourceComponent::with_clip(clip.clone())
+        };
+        scene
+            .set_component(&id, Component::AudioSource(loud))
+            .unwrap();
+        assert!(scene.view().assets.iter().any(|asset| asset.path == clip));
+
+        let copied =
+            Component::read(scene.object(&id).unwrap(), ComponentKind::AudioSource).unwrap();
+        assert!(matches!(
+            copied,
+            Component::AudioSource(ref audio) if audio.volume == 0.5 && audio.looping
+        ));
+
+        let reset =
+            Component::reset(scene.object(&id).unwrap(), ComponentKind::AudioSource).unwrap();
+        scene.set_component(&id, reset).unwrap();
+        let audio = scene.object(&id).unwrap().audio_source.clone().unwrap();
+        assert_eq!(audio, AudioSourceComponent::with_clip(clip.clone()));
+
+        let invalid = AudioSourceComponent {
+            volume: -1.0,
+            ..AudioSourceComponent::with_clip(clip)
+        };
+        let error = scene
+            .set_component(&id, Component::AudioSource(invalid))
+            .unwrap_err();
+        assert!(error.contains("volume"), "{error}");
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .audio_source
+                .as_ref()
+                .unwrap()
+                .volume,
+            1.0
+        );
+
+        scene.remove_audio_source(&id).unwrap();
+        assert!(scene.object(&id).unwrap().audio_source.is_none());
+        assert!(Component::reset(scene.object(&id).unwrap(), ComponentKind::AudioSource).is_none());
+    }
+
+    #[test]
+    fn animator_registers_its_clips_resets_keeping_them_and_rolls_back_invalid_values() {
+        let mut scene = scene();
+        let model = VirtualPath::parse("models/hero.fbx").unwrap();
+        let id = scene
+            .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+            .unwrap();
+        let clip = VirtualPath::parse("anims/walk.fbx").unwrap();
+        let animator = AnimatorComponent {
+            clips: vec![clip.clone()],
+            speed: 2.0,
+            ..AnimatorComponent::new()
+        };
+        scene
+            .set_component(&id, Component::Animator(animator))
+            .unwrap();
+        assert!(scene.view().assets.iter().any(|asset| asset.path == clip));
+
+        let copied = Component::read(scene.object(&id).unwrap(), ComponentKind::Animator).unwrap();
+        assert!(matches!(
+            copied,
+            Component::Animator(ref value) if value.speed == 2.0
+        ));
+
+        // Reset сохраняет клипы: без них аниматор пуст, как и источник звука без клипа.
+        let reset = Component::reset(scene.object(&id).unwrap(), ComponentKind::Animator).unwrap();
+        scene.set_component(&id, reset).unwrap();
+        assert_eq!(
+            scene.object(&id).unwrap().animator.clone().unwrap(),
+            AnimatorComponent {
+                clips: vec![clip],
+                ..AnimatorComponent::new()
+            }
+        );
+
+        let invalid = AnimatorComponent {
+            speed: -1.0,
+            ..AnimatorComponent::new()
+        };
+        let error = scene
+            .set_component(&id, Component::Animator(invalid))
+            .unwrap_err();
+        assert!(error.contains("speed"), "{error}");
+        assert_eq!(
+            scene.object(&id).unwrap().animator.as_ref().unwrap().speed,
+            1.0
+        );
+
+        scene.remove_animator(&id).unwrap();
+        assert!(scene.object(&id).unwrap().animator.is_none());
+        assert!(Component::reset(scene.object(&id).unwrap(), ComponentKind::Animator).is_none());
+    }
+
+    #[test]
+    fn animator_edits_and_removal_are_undoable_as_whole_components() {
+        let mut scene = scene();
+        let model = VirtualPath::parse("models/hero.fbx").unwrap();
+        let id = scene
+            .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+            .unwrap();
+        let speed = |scene: &EditorScene| {
+            scene
+                .object(&id)
+                .unwrap()
+                .animator
+                .as_ref()
+                .map(|a| a.speed)
+        };
+        scene
+            .set_component(
+                &id,
+                Component::Animator(AnimatorComponent {
+                    speed: 2.0,
+                    ..AnimatorComponent::new()
+                }),
+            )
+            .unwrap();
+        scene
+            .set_component(
+                &id,
+                Component::Animator(AnimatorComponent {
+                    speed: 3.0,
+                    ..AnimatorComponent::new()
+                }),
+            )
+            .unwrap();
+        assert_eq!(speed(&scene), Some(3.0));
+
+        assert!(scene.undo());
+        assert_eq!(speed(&scene), Some(2.0));
+        assert!(scene.redo());
+        assert_eq!(speed(&scene), Some(3.0));
+
+        scene.remove_animator(&id).unwrap();
+        assert_eq!(speed(&scene), None);
+        assert!(scene.undo());
+        assert_eq!(
+            speed(&scene),
+            Some(3.0),
+            "удаление откатывается целым компонентом"
+        );
+    }
+
+    #[test]
+    fn particle_emitter_adds_registers_texture_and_undoes_removal() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let texture = VirtualPath::parse("fx/smoke.png").unwrap();
+        let emitter = engine_scene::ParticleEmitterComponent {
+            texture: Some(texture.clone()),
+            ..engine_scene::ParticleEmitterComponent::default()
+        };
+        scene
+            .set_component(&id, Component::ParticleEmitter(emitter.clone()))
+            .unwrap();
+        assert_eq!(
+            scene.object(&id).unwrap().particle_emitter.as_ref(),
+            Some(&emitter)
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == texture),
+            "texture must be declared in [[assets]]"
+        );
+
+        let reset =
+            Component::reset(scene.object(&id).unwrap(), ComponentKind::ParticleEmitter).unwrap();
+        scene.set_component(&id, reset).unwrap();
+        let kept = scene.object(&id).unwrap().particle_emitter.clone().unwrap();
+        assert_eq!(
+            kept.texture,
+            Some(texture.clone()),
+            "reset keeps the texture"
+        );
+        assert_eq!(
+            kept.capacity,
+            engine_scene::ParticleEmitterComponent::default().capacity
+        );
+
+        scene.remove_particle_emitter(&id).unwrap();
+        assert!(scene.object(&id).unwrap().particle_emitter.is_none());
+        assert!(scene.undo());
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .particle_emitter
+                .as_ref()
+                .map(|value| value.capacity),
+            Some(kept.capacity)
+        );
+    }
+
+    #[test]
     fn pasting_an_invalid_component_is_rolled_back() {
         let mut scene = scene();
         let id = scene.create_object(&NewObject::Empty, None).unwrap();
@@ -2514,6 +3821,114 @@ mod tests {
         );
     }
 
+    fn prefab_loader(prefab: &'static str) -> PrefabLoader {
+        Rc::new(move |path| SceneDocument::parse_prefab(format!("/{}", path.as_str()), prefab))
+    }
+
+    #[test]
+    fn scene_prefab_assets_add_and_remove_as_undoable_steps() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        assert_eq!(scene.document().assets.len(), 1);
+        assert!(scene.add_scene_prefab(bullet.clone()).is_err());
+        assert!(scene.add_scene_prefab(path("/models/a.fbx")).is_err());
+        assert_eq!(scene.document().assets.len(), 1);
+
+        scene.remove_scene_prefab(&bullet).unwrap();
+        assert!(scene.document().assets.is_empty());
+        assert!(scene.remove_scene_prefab(&bullet).is_err());
+        assert!(scene.remove_scene_prefab(&path("/models/a.fbx")).is_err());
+
+        assert!(scene.undo());
+        assert_eq!(scene.document().assets[0].path, bullet);
+        assert!(scene.redo());
+        assert!(scene.document().assets.is_empty());
+    }
+
+    #[test]
+    fn scene_prefab_used_by_an_instance_cannot_be_removed() {
+        let mut scene = scene();
+        scene
+            .set_prefab_loader(prefab_loader("[[objects]]\nid = \"frame\"\n"))
+            .unwrap();
+        let door = path("/prefabs/door.rveprefab");
+        scene
+            .create_object(&NewObject::Prefab(door.clone(), [0.0; 3]), None)
+            .unwrap();
+        let revision = scene.revision();
+
+        assert!(scene.remove_scene_prefab(&door).is_err());
+        assert_eq!(scene.revision(), revision);
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == door)
+        );
+    }
+
+    #[test]
+    fn scene_prefab_archive_and_max_instances_are_validated_and_undoable() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        let asset = |scene: &EditorScene| scene.document().assets[0].clone();
+
+        scene
+            .set_scene_prefab_archive(&bullet, Some("weapons".to_owned()))
+            .unwrap();
+        scene
+            .set_scene_prefab_max_instances(&bullet, Some(100))
+            .unwrap();
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert_eq!(asset(&scene).max_instances, Some(100));
+
+        for archive in ["shared", "base", "bad name"] {
+            let archive = Some(archive.to_owned());
+            assert!(scene.set_scene_prefab_archive(&bullet, archive).is_err());
+        }
+        assert!(
+            scene
+                .set_scene_prefab_max_instances(&bullet, Some(0))
+                .is_err()
+        );
+        assert!(
+            scene
+                .set_scene_prefab_max_instances(&path("/models/a.fbx"), Some(1))
+                .is_err()
+        );
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert_eq!(asset(&scene).max_instances, Some(100));
+
+        assert!(scene.undo());
+        assert_eq!(asset(&scene).max_instances, None);
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert!(scene.undo());
+        assert_eq!(asset(&scene).archive, None);
+        assert!(scene.redo());
+        assert!(scene.redo());
+        assert_eq!(asset(&scene).max_instances, Some(100));
+    }
+
+    #[test]
+    fn scene_prefab_assets_serialize_without_extra_fields() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        let text = scene.document().to_toml().unwrap();
+        assert!(!text.contains("archive"), "{text}");
+        assert!(!text.contains("max_instances"), "{text}");
+
+        scene
+            .set_scene_prefab_max_instances(&bullet, Some(7))
+            .unwrap();
+        let text = scene.document().to_toml().unwrap();
+        assert!(text.contains("max_instances = 7"), "{text}");
+        assert!(!text.contains("archive"), "{text}");
+    }
+
     struct TempDir(std::path::PathBuf);
 
     impl TempDir {
@@ -2600,5 +4015,94 @@ mod tests {
         assert_eq!(cube.lite_scripts.len(), 1);
         assert_eq!(cube.heavy_scripts[0].name, "Bobber");
         assert_eq!(cube.heavy_scripts[0].params.len(), 2);
+    }
+
+    #[test]
+    fn network_transform_needs_identity_and_removing_identity_takes_both() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let transform = engine_scene::NetworkTransformComponent {
+            send_rate_hz: 10,
+            ..Default::default()
+        };
+        assert!(
+            scene
+                .set_component(&id, Component::NetworkTransform(transform))
+                .is_err(),
+            "network_transform без network_identity невалиден"
+        );
+        assert!(scene.object(&id).unwrap().network_transform.is_none());
+
+        let identity = engine_scene::NetworkIdentityComponent {
+            authority: engine_scene::NetAuthority::Owner,
+        };
+        scene
+            .set_component(&id, Component::NetworkIdentity(identity))
+            .unwrap();
+        scene
+            .set_component(&id, Component::NetworkTransform(transform))
+            .unwrap();
+        assert_eq!(scene.object(&id).unwrap().network_identity, Some(identity));
+        assert_eq!(
+            scene.object(&id).unwrap().network_transform,
+            Some(transform)
+        );
+
+        scene.remove_network_identity(&id).unwrap();
+        let object = scene.object(&id).unwrap();
+        assert!(object.network_identity.is_none());
+        assert!(object.network_transform.is_none());
+        assert!(scene.undo());
+        let object = scene.object(&id).unwrap();
+        assert_eq!(object.network_identity, Some(identity));
+        assert_eq!(
+            object.network_transform,
+            Some(transform),
+            "откат возвращает пару целиком"
+        );
+
+        scene.remove_network_transform(&id).unwrap();
+        let object = scene.object(&id).unwrap();
+        assert!(object.network_transform.is_none());
+        assert_eq!(
+            object.network_identity,
+            Some(identity),
+            "удаление трансформации оставляет идентификатор"
+        );
+    }
+
+    #[test]
+    fn network_transform_out_of_range_values_are_rolled_back() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene
+            .set_component(
+                &id,
+                Component::NetworkIdentity(engine_scene::NetworkIdentityComponent::default()),
+            )
+            .unwrap();
+        let limit = engine_scene::MAX_SEND_RATE_HZ;
+        for invalid in [
+            engine_scene::NetworkTransformComponent {
+                send_rate_hz: 0,
+                ..Default::default()
+            },
+            engine_scene::NetworkTransformComponent {
+                send_rate_hz: limit + 1,
+                ..Default::default()
+            },
+            engine_scene::NetworkTransformComponent {
+                snap_distance: f32::NAN,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                scene
+                    .set_component(&id, Component::NetworkTransform(invalid))
+                    .is_err(),
+                "{invalid:?}"
+            );
+            assert!(scene.object(&id).unwrap().network_transform.is_none());
+        }
     }
 }

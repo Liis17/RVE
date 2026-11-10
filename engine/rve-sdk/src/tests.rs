@@ -1,11 +1,16 @@
+use super::empty_ui_value;
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
-    RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveHeader, RveHost, RveModule, RveParamEntry, RveParams, RveScriptDesc,
-    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_LOG_WARN, RVE_QUERY_BOX, RVE_QUERY_CAPSULE, RVE_QUERY_SPHERE, RVE_SCRIPT_ABI_VERSION,
+    RVE_TRIGGER_STAY, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams, RveCameraSettings,
+    RveCharacterMoveResult, RveCursorState, RveGamepadState, RveHeader, RveHost, RveModule,
+    RveParamEntry, RveParams, RvePlayAnimationParams, RveQueryOptions, RveQueryShape,
+    RveRaycastHit, RveScriptDesc, RveScriptTime, RveStatus, RveStr, RveTime, RveTransform,
+    RveUiRect, RveUiValue, RveValue, RveValueData,
 };
 use crate::{
-    AntiAliasing, CameraSettings, ConsoleLevel, Context, Key, MouseButton, Params, Script,
+    AntiAliasing, CameraSettings, ConsoleLevel, Context, GamepadAxis, GamepadButton, GamepadState,
+    GamepadStick, Key, MouseButton, Object, Params, PhysicalInput, QueryOptions, Script,
     Tonemapper, Value,
 };
 use std::ffi::c_void;
@@ -17,6 +22,19 @@ struct Probe {
     panic_destroy: bool,
     panic_drop: bool,
     last_message: String,
+}
+
+struct QuitProbe;
+
+impl Script for QuitProbe {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        let accepted = ctx.quit();
+        ctx.log_info(if accepted {
+            "quit accepted"
+        } else {
+            "quit rejected"
+        });
+    }
 }
 
 impl Script for Probe {
@@ -111,6 +129,10 @@ fn probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     }))
 }
 
+fn quit_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(QuitProbe))
+}
+
 fn error_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Err("factory error".to_owned())
 }
@@ -132,6 +154,12 @@ fn scripts() -> &'static RveModule {
         "Probe" => probe_factory,
         "Error" => error_factory,
         "Panic" => panic_factory,
+    }
+}
+
+fn quit_scripts() -> &'static RveModule {
+    crate::script_module! {
+        "QuitProbe" => quit_probe_factory,
     }
 }
 
@@ -183,6 +211,12 @@ mod exported {
 #[derive(Default)]
 struct HostState {
     error: Option<String>,
+    /// UI calls in guest order, with their arguments spelled out.
+    ui_calls: Vec<String>,
+    /// Status returned by every UI callback; zero is `RVE_UI_OK`.
+    ui_status: u32,
+    /// Text returned by the text property of every element.
+    ui_text: String,
     transform: RveTransform,
     logs: Vec<String>,
     log_levels: Vec<u32>,
@@ -198,6 +232,48 @@ struct HostState {
     wheel: [f32; 2],
     camera_settings: RveCameraSettings,
     active_camera: u64,
+    physics_velocity: [f32; 3],
+    physics_enabled: bool,
+    physics_vectors: Vec<(u64, [f32; 3])>,
+    physics_query_calls: Vec<String>,
+    cursor_visible: bool,
+    cursor_locked: bool,
+    audio_calls: Vec<String>,
+    animation_calls: Vec<String>,
+    /// Status returned by every audio callback; zero is `RveStatus::Ok`.
+    audio_status: u32,
+    next_voice: u64,
+    /// Spawn, destroy, object-state and prefab calls in guest order.
+    lifecycle_calls: Vec<String>,
+    /// Handle returned by every spawn callback; zero is a refusal.
+    spawn_handle: u64,
+    /// Result of every destroy and prefab request callback.
+    lifecycle_accepts: bool,
+    /// Code returned by the object-state callback.
+    object_state_code: u32,
+    /// Code returned by the prefab-state callback.
+    prefab_state_code: u32,
+    /// Mode code returned by the network mode callback.
+    net_mode: u32,
+    net_local_peer: u32,
+    net_peers: Vec<u32>,
+    /// Status returned by the network send and owner callbacks.
+    net_status: u32,
+    /// Network calls in guest order, formatted for comparison.
+    net_calls: Vec<String>,
+    /// Gamepad snapshots indexed by pad: 0 is the aggregate, 1..=4 are slots.
+    gamepads: [RveGamepadState; 5],
+    /// Rumble requests in guest order: pad, strong, weak, seconds.
+    rumble_calls: Vec<(u32, f32, f32, f32)>,
+    /// Result of every rumble callback.
+    rumble_accepts: bool,
+    time_scale: Option<f32>,
+    scheduled_timers: Vec<(f64, f64, String)>,
+    canceled_timers: Vec<u64>,
+    save_values: std::collections::BTreeMap<String, i64>,
+    save_flushed: bool,
+    quit_accepts: bool,
+    quit_calls: usize,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -205,6 +281,13 @@ unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
     let state = unsafe { &mut *ctx.cast::<HostState>() };
     // SAFETY: message references a live guest string for this callback.
     state.error = Some(unsafe { message.to_str() }.unwrap().to_owned());
+}
+
+unsafe extern "C" fn app_quit(ctx: *mut c_void) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.quit_calls += 1;
+    state.quit_accepts
 }
 
 unsafe extern "C" fn log(ctx: *mut c_void, level: u32, message: RveStr) {
@@ -232,6 +315,45 @@ unsafe extern "C" fn unregister_command(ctx: *mut c_void, name: RveStr) -> u32 {
     state
         .unregistered_commands
         .push(unsafe { name.to_str() }.unwrap().to_owned());
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn set_time_scale(ctx: *mut c_void, scale: f32) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    unsafe { (&mut *ctx.cast::<HostState>()).time_scale = Some(scale) };
+    true
+}
+
+unsafe extern "C" fn schedule_timer(
+    ctx: *mut c_void,
+    delay: f64,
+    repeat: f64,
+    tag: RveStr,
+    timer_id: *mut u64,
+) -> u32 {
+    if timer_id.is_null() {
+        return RveStatus::Error as u32;
+    }
+    // SAFETY: the test context, tag, and output slot are live for this call.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state
+        .scheduled_timers
+        .push((delay, repeat, unsafe { tag.to_str() }.unwrap().to_owned()));
+    // SAFETY: timer_id was checked and belongs to the caller's live stack frame.
+    unsafe { *timer_id = 41 };
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn cancel_timer(ctx: *mut c_void, timer_id: u64, canceled: *mut bool) -> u32 {
+    if canceled.is_null() {
+        return RveStatus::Error as u32;
+    }
+    // SAFETY: the test context and output slot are live for this call.
+    unsafe { &mut *ctx.cast::<HostState>() }
+        .canceled_timers
+        .push(timer_id);
+    // SAFETY: canceled was checked and belongs to the caller's live stack frame.
+    unsafe { *canceled = true };
     RveStatus::Ok as u32
 }
 
@@ -367,6 +489,34 @@ unsafe extern "C" fn wheel_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
     unsafe { input_vector(ctx, out, |state| state.wheel) }
 }
 
+unsafe extern "C" fn cursor_state(ctx: *mut c_void, out: *mut RveCursorState) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: test host points to a live HostState during the guest call.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    // SAFETY: output was checked and points to the guest's writable stack slot.
+    unsafe {
+        *out = RveCursorState {
+            visible: state.cursor_visible,
+            locked: state.cursor_locked,
+        };
+    }
+    true
+}
+
+unsafe extern "C" fn set_cursor_visible(ctx: *mut c_void, value: bool) -> bool {
+    // SAFETY: test host points to a live HostState during the guest call.
+    unsafe { (&mut *ctx.cast::<HostState>()).cursor_visible = value };
+    true
+}
+
+unsafe extern "C" fn set_cursor_locked(ctx: *mut c_void, value: bool) -> bool {
+    // SAFETY: test host points to a live HostState during the guest call.
+    unsafe { (&mut *ctx.cast::<HostState>()).cursor_locked = value };
+    true
+}
+
 unsafe extern "C" fn get_camera_settings(
     ctx: *mut c_void,
     object: u64,
@@ -407,6 +557,99 @@ unsafe extern "C" fn set_active_camera(ctx: *mut c_void, object: u64) -> bool {
     true
 }
 
+unsafe extern "C" fn save_get(ctx: *mut c_void, key: RveStr, out: *mut RveValue) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: this test host owns its context and output during the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    let Some(value) = state.save_values.get(key).copied() else {
+        return false;
+    };
+    // SAFETY: out is checked above and belongs to the current guest call.
+    unsafe { *out = RveValue::integer(value) };
+    true
+}
+
+unsafe extern "C" fn save_set(ctx: *mut c_void, key: RveStr, value: *const RveValue) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: the test host and borrowed inputs live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    // SAFETY: value is checked above and valid for the callback.
+    let value = unsafe { *value };
+    if value.tag != crate::abi::RVE_VALUE_INT {
+        return false;
+    }
+    // SAFETY: the tag selects the integer payload.
+    state
+        .save_values
+        .insert(key.to_owned(), unsafe { value.data.integer });
+    true
+}
+
+unsafe extern "C" fn save_delete(ctx: *mut c_void, key: RveStr) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    state.save_values.remove(key).is_some()
+}
+
+unsafe extern "C" fn save_has(ctx: *mut c_void, key: RveStr) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    // SAFETY: SDK passes a borrowed key that remains live during the callback.
+    let Ok(key) = (unsafe { key.to_str() }) else {
+        return false;
+    };
+    state.save_values.contains_key(key)
+}
+
+unsafe extern "C" fn save_keys(
+    ctx: *mut c_void,
+    keys: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    if count.is_null() || (capacity > 0 && keys.is_null()) {
+        return false;
+    }
+    // SAFETY: test host and output buffers are valid during this callback.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    // SAFETY: count is checked above.
+    unsafe { *count = state.save_values.len() };
+    if capacity == 0 {
+        return true;
+    }
+    if capacity < state.save_values.len() {
+        return false;
+    }
+    // SAFETY: keys points to at least capacity initialized output slots.
+    let output = unsafe { std::slice::from_raw_parts_mut(keys, capacity) };
+    for (slot, key) in output.iter_mut().zip(state.save_values.keys()) {
+        *slot = RveStr::from_str_ref(key);
+    }
+    true
+}
+
+unsafe extern "C" fn save_flush(ctx: *mut c_void) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    unsafe { (&mut *ctx.cast::<HostState>()).save_flushed = true };
+    true
+}
+
 fn host(state: &mut HostState) -> RveHost {
     state.matrix = [2.0; 16];
     RveHost {
@@ -437,7 +680,347 @@ fn host(state: &mut HostState) -> RveHost {
         set_active_camera: Some(set_active_camera),
         register_command: Some(register_command),
         unregister_command: Some(unregister_command),
+        action_state: None,
+        action_value: None,
+        input_context: None,
+        set_input_context: None,
+        rebind_action: None,
+        action_binding: None,
+        reset_bindings: None,
+        raycast: None,
+        get_velocity: None,
+        set_velocity: None,
+        add_impulse: None,
+        add_force: None,
+        move_character: None,
+        is_grounded: None,
+        set_collider_enabled: None,
+        is_collider_enabled: None,
+        audio_play_source: None,
+        audio_stop_source: None,
+        audio_set_source_volume: None,
+        audio_play_clip: None,
+        audio_stop_voice: None,
+        audio_set_group_volume: None,
+        cursor_state: Some(cursor_state),
+        set_cursor_visible: Some(set_cursor_visible),
+        set_cursor_locked: Some(set_cursor_locked),
+        spawn: None,
+        destroy: None,
+        object_state: None,
+        prefab_load: None,
+        prefab_unload: None,
+        prefab_state: None,
+        animation_play: None,
+        animation_set_weight: None,
+        animation_set_parameter: None,
+        animation_set_speed: None,
+        animation_stop: None,
+        gamepad_state: None,
+        gamepad_rumble: None,
+        get_post_process: None,
+        set_post_process: None,
+        net_mode: None,
+        net_local_peer: None,
+        net_peers: None,
+        net_send: None,
+        net_object_id: None,
+        net_object_owner: None,
+        net_object_is_owner: None,
+        net_object_has_authority: None,
+        net_object_set_owner: None,
+        net_object_send: None,
+        ui_open: None,
+        ui_close: None,
+        ui_object_canvas: None,
+        ui_focused: None,
+        ui_pointer_over: None,
+        ui_find: None,
+        ui_get: None,
+        ui_set: None,
+        ui_get_rect: None,
+        ui_set_rect: None,
+        ui_set_options: None,
+        ui_set_image: None,
+        ui_focus: None,
+        screen_shader_count: None,
+        get_screen_shader: None,
+        set_screen_shader: None,
+        object_set_active: None,
+        object_is_active: None,
+        object_active_in_hierarchy: None,
+        object_parent: None,
+        object_set_parent: None,
+        object_children: None,
+        object_world_position: None,
+        object_set_world_position: None,
+        object_world_rotation: None,
+        object_set_world_rotation: None,
+        object_tag: None,
+        object_set_tag: None,
+        object_layer: None,
+        object_set_layer: None,
+        object_has_component: None,
+        find_objects_by_name: None,
+        find_objects_by_tag: None,
+        script_set_enabled: None,
+        script_enabled: None,
+        physics_get_collider: None,
+        physics_set_collider: None,
+        physics_get_rigid_body: None,
+        physics_set_rigid_body: None,
+        physics_get_controller: None,
+        physics_set_controller: None,
+        physics_simple_move: None,
+        physics_jump: None,
+        physics_vertical_velocity: None,
+        physics_overlaps: None,
+        physics_overlap: None,
+        physics_raycast_all: None,
+        physics_shape_cast: None,
+        light_get: None,
+        light_set: None,
+        mesh_get_visible: None,
+        mesh_set_visible: None,
+        mesh_set_material_params: None,
+        particles_get_playing: None,
+        particles_set_playing: None,
+        particles_command: None,
+        environment_get: None,
+        environment_set: None,
+        lod_get: None,
+        lod_set: None,
+        audio_get_source: None,
+        audio_set_source: None,
+        audio_play_clip_ex: None,
+        audio_set_voice_position: None,
+        mesh_set_material_path: None,
+        script_time: RveScriptTime {
+            dt: 0.25,
+            unscaled_dt: 0.5,
+            elapsed: 12.5,
+            unscaled_elapsed: 25.0,
+            fixed_dt: 0.02,
+            scale: 0.5,
+            frame: 8,
+        },
+        set_time_scale: Some(set_time_scale),
+        schedule_timer: Some(schedule_timer),
+        cancel_timer: Some(cancel_timer),
+        save_get: Some(save_get),
+        save_set: Some(save_set),
+        save_delete: Some(save_delete),
+        save_has: Some(save_has),
+        save_keys: Some(save_keys),
+        save_flush: Some(save_flush),
+        object_keep_on_load: None,
+        object_set_keep_on_load: None,
+        object_script: None,
+        script_ref_get: None,
+        script_ref_set: None,
+        script_ref_send: None,
+        script_ref_enabled: None,
+        script_ref_set_enabled: None,
+        scene_load: None,
+        scene_current: None,
+        window_fullscreen: None,
+        window_set_fullscreen: None,
+        window_screenshot: None,
+        file_dialog_open: None,
+        file_dialog_poll: None,
+        app_quit: None,
     }
+}
+
+unsafe extern "C" fn physics_raycast(
+    _: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    _: bool,
+    _: u64,
+    out: *mut RveRaycastHit,
+) -> bool {
+    if origin.is_null() || direction.is_null() || out.is_null() || max_distance <= 0.0 {
+        return false;
+    }
+    // SAFETY: test inputs and output are valid for the callback.
+    unsafe {
+        *out = RveRaycastHit {
+            object: 2,
+            point: [1.0, 2.0, 3.0],
+            normal: [0.0, 1.0, 0.0],
+            distance: 4.5,
+        }
+    };
+    true
+}
+
+unsafe extern "C" fn physics_get_velocity(ctx: *mut c_void, _: u64, out: *mut [f32; 3]) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: the context and output slot are valid for the callback.
+    unsafe { *out = (&*ctx.cast::<HostState>()).physics_velocity };
+    true
+}
+
+unsafe extern "C" fn physics_set_velocity(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: the context and vector pointer are valid for the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.physics_velocity = unsafe { *value };
+    state.physics_vectors.push((object, state.physics_velocity));
+    true
+}
+
+unsafe extern "C" fn physics_stage_vector(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: the context and vector pointer are valid for the callback.
+    unsafe { &mut *ctx.cast::<HostState>() }
+        .physics_vectors
+        .push((object, unsafe { *value }));
+    true
+}
+
+unsafe extern "C" fn physics_move_character(
+    _: *mut c_void,
+    _: u64,
+    displacement: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool {
+    if displacement.is_null() || out.is_null() {
+        return false;
+    }
+    // SAFETY: the callback receives valid input and output storage.
+    unsafe {
+        *out = RveCharacterMoveResult {
+            translation: *displacement,
+            grounded: true,
+            collided: false,
+        }
+    };
+    true
+}
+
+unsafe extern "C" fn physics_get_grounded(_: *mut c_void, _: u64, out: *mut bool) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: out is writable for this callback.
+    unsafe { *out = true };
+    true
+}
+
+unsafe extern "C" fn physics_set_enabled(ctx: *mut c_void, _: u64, enabled: bool) -> bool {
+    // SAFETY: the context is live for this callback.
+    unsafe { (&mut *ctx.cast::<HostState>()).physics_enabled = enabled };
+    true
+}
+
+unsafe extern "C" fn physics_get_enabled(ctx: *mut c_void, _: u64, out: *mut bool) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: the context and output pointer are valid for the callback.
+    unsafe { *out = (&*ctx.cast::<HostState>()).physics_enabled };
+    true
+}
+
+unsafe extern "C" fn physics_overlap_query(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    options: *const RveQueryOptions,
+    _: *mut u64,
+    _: usize,
+    count: *mut usize,
+) -> bool {
+    if shape.is_null() || center.is_null() || options.is_null() || count.is_null() {
+        return false;
+    }
+    // SAFETY: pointers are valid for this host callback and optional ignore storage is borrowed.
+    let (shape, center, options) = unsafe { (*shape, *center, *options) };
+    let ignored = if options.ignore_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(options.ignore, options.ignore_count) }.to_vec()
+    };
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.physics_query_calls.push(format!(
+        "overlap:{}:{:?}:{:?}:{}:{}:{}:{ignored:?}",
+        shape.kind, shape.size, center, shape.radius, options.layer_mask, options.include_triggers
+    ));
+    unsafe { *count = 0 };
+    true
+}
+
+unsafe extern "C" fn physics_shape_cast_query(
+    ctx: *mut c_void,
+    shape: *const RveQueryShape,
+    center: *const [f32; 3],
+    displacement: *const [f32; 3],
+    skin: f32,
+    options: *const RveQueryOptions,
+    out: *mut RveRaycastHit,
+) -> bool {
+    if shape.is_null()
+        || center.is_null()
+        || displacement.is_null()
+        || options.is_null()
+        || out.is_null()
+    {
+        return false;
+    }
+    // SAFETY: pointers are valid for this host callback and optional ignore storage is borrowed.
+    let (shape, center, displacement, options) =
+        unsafe { (*shape, *center, *displacement, *options) };
+    let ignored = if options.ignore_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(options.ignore, options.ignore_count) }.to_vec()
+    };
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.physics_query_calls.push(format!(
+        "cast:{}:{:?}:{:?}:{:?}:{}:{}:{}:{ignored:?}",
+        shape.kind,
+        shape.size,
+        center,
+        displacement,
+        skin,
+        options.layer_mask,
+        options.include_triggers
+    ));
+    unsafe { *out = RveRaycastHit::default() };
+    true
+}
+
+fn physics_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.raycast = Some(physics_raycast);
+    host.get_velocity = Some(physics_get_velocity);
+    host.set_velocity = Some(physics_set_velocity);
+    host.add_impulse = Some(physics_stage_vector);
+    host.add_force = Some(physics_stage_vector);
+    host.move_character = Some(physics_move_character);
+    host.is_grounded = Some(physics_get_grounded);
+    host.set_collider_enabled = Some(physics_set_enabled);
+    host.is_collider_enabled = Some(physics_get_enabled);
+    host.physics_overlap = Some(physics_overlap_query);
+    host.physics_shape_cast = Some(physics_shape_cast_query);
+    host
 }
 
 fn descriptor(module: &RveModule, name: &str) -> &'static RveScriptDesc {
@@ -462,6 +1045,9 @@ fn script_module_macro_builds_abi_table_and_guest_callbacks() {
     assert_eq!(module.script_count, 3);
 
     let script = descriptor(module, "Probe");
+    assert!(script.on_fixed_update.is_some());
+    assert!(script.on_late_update.is_some());
+    assert!(script.on_timer.is_some());
     let mut state = HostState {
         transform: RveTransform::default(),
         ..HostState::default()
@@ -482,8 +1068,85 @@ fn script_module_macro_builds_abi_table_and_guest_callbacks() {
     assert_eq!(unsafe { (script.start)(instance, &host) }, RveStatus::Ok);
     assert_eq!(state.transform.position, [7.0, 0.0, 0.0]);
     assert_eq!(state.logs, ["guest log"]);
+    // SAFETY: event and callback pointers are valid during this guest call.
+    assert_eq!(
+        unsafe {
+            (script.collision.unwrap())(
+                instance,
+                &host,
+                crate::abi::RveCollisionEvent {
+                    kind: crate::abi::RVE_COLLISION_ENTER,
+                    other: 1,
+                    point: [1.0, 0.0, 0.0],
+                    normal: [1.0, 0.0, 0.0],
+                },
+            )
+        },
+        RveStatus::Ok
+    );
     // SAFETY: drop is called exactly once for this successful create.
     assert_eq!(unsafe { (script.drop)(instance) }, RveStatus::Ok);
+}
+
+#[test]
+fn context_quit_returns_the_host_decision_and_handles_a_missing_callback() {
+    let mut state = HostState {
+        quit_accepts: true,
+        ..HostState::default()
+    };
+    let mut abi_host = host(&mut state);
+    abi_host.app_quit = Some(app_quit);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let script = descriptor(quit_scripts(), "QuitProbe");
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor and host remain live through each synchronous guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&abi_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+        assert_eq!((script.update)(instance, &abi_host, 0.1), RveStatus::Ok);
+        assert_eq!((script.drop)(instance), RveStatus::Ok);
+    }
+    assert_eq!(state.quit_calls, 1);
+    assert_eq!(state.logs, ["quit accepted"]);
+
+    let mut rejected_state = HostState::default();
+    let mut rejected_host = host(&mut rejected_state);
+    rejected_host.app_quit = Some(app_quit);
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor and host remain live through each synchronous guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&rejected_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+        assert_eq!(
+            (script.update)(instance, &rejected_host, 0.1),
+            RveStatus::Ok
+        );
+        assert_eq!((script.drop)(instance), RveStatus::Ok);
+    }
+    assert_eq!(rejected_state.quit_calls, 1);
+    assert_eq!(rejected_state.logs, ["quit rejected"]);
+
+    let mut missing_state = HostState::default();
+    let missing_host = host(&mut missing_state);
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor and host remain live through each synchronous guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&missing_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+        assert_eq!((script.update)(instance, &missing_host, 0.1), RveStatus::Ok);
+        assert_eq!((script.drop)(instance), RveStatus::Ok);
+    }
+    assert_eq!(missing_state.quit_calls, 0);
+    assert_eq!(missing_state.logs, ["quit rejected"]);
 }
 
 #[test]
@@ -564,9 +1227,724 @@ fn console_command_registration_reports_unavailable_optional_host_callbacks() {
     let mut host = host(&mut state);
     host.register_command = None;
     host.unregister_command = None;
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     assert!(context.console.register("sdk.cmd", None).is_err());
     assert!(context.console.unregister("sdk.cmd").is_err());
+}
+
+#[test]
+fn sdk_save_api_round_trips_values_and_reports_optional_callbacks() {
+    let mut state = HostState::default();
+    let host_table = host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host_table, &mut properties).unwrap();
+    let save = context.save();
+
+    save.set("score", &Value::Int(12)).unwrap();
+    assert_eq!(save.get("score").unwrap(), Some(Value::Int(12)));
+    assert!(save.has("score").unwrap());
+    assert_eq!(save.keys().unwrap(), vec!["score"]);
+    assert!(save.delete("score").unwrap());
+    assert!(!save.has("score").unwrap());
+    assert!(save.keys().unwrap().is_empty());
+    save.flush().unwrap();
+    assert!(state.save_flushed);
+
+    let mut unavailable = host(&mut state);
+    unavailable.save_set = None;
+    let mut properties = Params::new();
+    let context = Context::new(&unavailable, &mut properties).unwrap();
+    assert_eq!(
+        context.save().set("score", &Value::Int(1)),
+        Err(crate::SaveError::Unavailable)
+    );
+}
+
+#[test]
+fn sdk_physics_api_wraps_queries_commands_and_character_state() {
+    let mut state = HostState {
+        physics_velocity: [1.0, 2.0, 3.0],
+        physics_enabled: true,
+        ..HostState::default()
+    };
+    let host = physics_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+
+    let hit = context
+        .physics()
+        .raycast_with_options([0.0; 3], [1.0, 0.0, 0.0], 10.0, true, Some(object))
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.object.id(&mut context).as_deref(), Some("camera"));
+    assert_eq!(hit.point, [1.0, 2.0, 3.0]);
+    assert_eq!(hit.normal, [0.0, 1.0, 0.0]);
+    assert_eq!(hit.distance, 4.5);
+    assert_eq!(object.get_velocity(&context).unwrap(), [1.0, 2.0, 3.0]);
+    object.set_velocity(&mut context, [4.0, 5.0, 6.0]).unwrap();
+    object.add_impulse(&mut context, [0.0, 1.0, 0.0]).unwrap();
+    object.add_force(&mut context, [0.0, 0.0, 2.0]).unwrap();
+    let movement = object
+        .move_character(&mut context, [0.5, 0.0, 0.0])
+        .unwrap();
+    assert_eq!(movement.translation, [0.5, 0.0, 0.0]);
+    assert!(movement.grounded);
+    assert!(!movement.collided);
+    assert!(object.is_grounded(&context).unwrap());
+    object.set_collider_enabled(&mut context, false).unwrap();
+    assert!(!object.is_collider_enabled(&context).unwrap());
+    context.commit().unwrap();
+    assert_eq!(state.physics_velocity, [4.0, 5.0, 6.0]);
+    assert_eq!(state.physics_vectors.len(), 3);
+}
+
+#[test]
+fn sdk_physics_api_reports_absent_optional_callbacks() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        context.physics().raycast([0.0; 3], [1.0, 0.0, 0.0], 1.0),
+        Err(crate::PhysicsError::Unavailable)
+    );
+    assert_eq!(
+        object.set_velocity(&mut context, [0.0; 3]),
+        Err(crate::PhysicsError::Unavailable)
+    );
+}
+
+#[test]
+fn sdk_named_shape_queries_forward_the_requested_shapes_and_filters() {
+    let mut state = HostState::default();
+    let host = physics_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let ignored = [context.find("camera").unwrap()];
+    let options = QueryOptions {
+        layer_mask: 1 << 3,
+        include_triggers: true,
+        ignore: &ignored,
+    };
+    let physics = context.physics();
+
+    assert!(
+        physics
+            .overlap_sphere([1.0, 2.0, 3.0], 0.5, options)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        physics
+            .overlap_box([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], options)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        physics
+            .overlap_capsule([1.0, 2.0, 3.0], 0.5, 2.0, options)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        physics
+            .sphere_cast([1.0, 2.0, 3.0], 0.5, [7.0, 8.0, 9.0], 0.03, options)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        physics
+            .box_cast(
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [7.0, 8.0, 9.0],
+                0.03,
+                options
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        physics
+            .capsule_cast([1.0, 2.0, 3.0], 0.5, 2.0, [7.0, 8.0, 9.0], 0.03, options)
+            .unwrap()
+            .is_none()
+    );
+
+    let sphere_overlap = format!(
+        "overlap:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:0.5:8:true:[1]",
+        RVE_QUERY_SPHERE
+    );
+    let box_overlap = format!(
+        "overlap:{}:[4.0, 5.0, 6.0]:[1.0, 2.0, 3.0]:0:8:true:[1]",
+        RVE_QUERY_BOX
+    );
+    let capsule_overlap = format!(
+        "overlap:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:0.5:8:true:[1]",
+        RVE_QUERY_CAPSULE
+    );
+    assert_eq!(
+        state.physics_query_calls,
+        [
+            sphere_overlap.clone(),
+            sphere_overlap,
+            box_overlap.clone(),
+            box_overlap,
+            capsule_overlap.clone(),
+            capsule_overlap,
+            format!(
+                "cast:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:[7.0, 8.0, 9.0]:0.03:8:true:[1]",
+                RVE_QUERY_SPHERE
+            ),
+            format!(
+                "cast:{}:[4.0, 5.0, 6.0]:[1.0, 2.0, 3.0]:[7.0, 8.0, 9.0]:0.03:8:true:[1]",
+                RVE_QUERY_BOX
+            ),
+            format!(
+                "cast:{}:[0.0, 0.0, 0.0]:[1.0, 2.0, 3.0]:[7.0, 8.0, 9.0]:0.03:8:true:[1]",
+                RVE_QUERY_CAPSULE
+            ),
+        ]
+    );
+}
+
+unsafe extern "C" fn audio_object(ctx: *mut c_void, _: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push("object".to_owned());
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_object_volume(ctx: *mut c_void, _: u64, volume: f32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push(format!("volume:{volume}"));
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_play_clip(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioParams,
+    out_voice: *mut u64,
+) -> u32 {
+    // SAFETY: the context, guest path and params are live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let path = unsafe { path.to_str() }.unwrap();
+    let params = unsafe { *params };
+    state.audio_calls.push(format!(
+        "clip:{path}:group={}:volume={}:looping={}:position={:?}",
+        params.group,
+        params.volume,
+        params.looping,
+        params.has_position.then_some(params.position)
+    ));
+    if state.audio_status == 0 {
+        // SAFETY: out_voice is writable for this callback.
+        unsafe { *out_voice = state.next_voice };
+    }
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_stop_voice(ctx: *mut c_void, voice: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push(format!("stop:{voice}"));
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_group_volume(ctx: *mut c_void, group: u32, volume: f32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push(format!("group:{group}:{volume}"));
+    state.audio_status
+}
+
+fn audio_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.audio_play_source = Some(audio_object);
+    host.audio_stop_source = Some(audio_object);
+    host.audio_set_source_volume = Some(audio_object_volume);
+    host.audio_play_clip = Some(audio_play_clip);
+    host.audio_stop_voice = Some(audio_stop_voice);
+    host.audio_set_group_volume = Some(audio_group_volume);
+    host
+}
+
+#[test]
+fn sdk_audio_api_forwards_options_and_returns_the_voice_id() {
+    let mut state = HostState {
+        next_voice: 42,
+        ..HostState::default()
+    };
+    let host = audio_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    object.play_sound(&mut context).unwrap();
+    object.set_sound_volume(&mut context, 0.5).unwrap();
+    let voice = context
+        .play_clip(
+            "/audio/hum.wav",
+            crate::ClipOptions {
+                group: crate::AudioGroup::Music,
+                volume: 0.25,
+                looping: true,
+                position: Some([1.0, 2.0, 3.0]),
+            },
+        )
+        .unwrap();
+    assert_eq!(voice, 42);
+    context.stop_voice(voice).unwrap();
+    context
+        .set_group_volume(crate::AudioGroup::Master, 0.75)
+        .unwrap();
+    assert_eq!(
+        state.audio_calls,
+        [
+            "object",
+            "volume:0.5",
+            "clip:/audio/hum.wav:group=1:volume=0.25:looping=true:position=Some([1.0, 2.0, 3.0])",
+            "stop:42",
+            "group:0:0.75",
+        ]
+    );
+}
+
+#[test]
+fn sdk_audio_api_reports_rejections_missing_callbacks_and_invalid_input() {
+    let mut state = HostState {
+        audio_status: 1,
+        ..HostState::default()
+    };
+    let host = audio_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.play_sound(&mut context),
+        Err(crate::AudioError::Rejected)
+    );
+    assert_eq!(
+        context.play_clip("/audio/hum.wav", crate::ClipOptions::default()),
+        Err(crate::AudioError::Rejected)
+    );
+    assert_eq!(
+        object.set_sound_volume(&mut context, -1.0),
+        Err(crate::AudioError::InvalidInput)
+    );
+    assert_eq!(
+        object.set_sound_volume(&mut context, crate::MAX_AUDIO_VOLUME + 0.5),
+        Err(crate::AudioError::InvalidInput)
+    );
+    assert_eq!(
+        context.set_group_volume(crate::AudioGroup::Music, 10.0),
+        Err(crate::AudioError::InvalidInput)
+    );
+    let nan_position = crate::ClipOptions {
+        position: Some([f32::NAN, 0.0, 0.0]),
+        ..crate::ClipOptions::default()
+    };
+    assert_eq!(
+        context.play_clip("/audio/hum.wav", nan_position),
+        Err(crate::AudioError::InvalidInput)
+    );
+    assert_eq!(
+        state.audio_calls.len(),
+        2,
+        "invalid input never reaches the host"
+    );
+
+    let mut plain = HostState::default();
+    let plain_host = self::host(&mut plain);
+    let mut properties = Params::new();
+    let mut context = Context::new(&plain_host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.stop_sound(&mut context),
+        Err(crate::AudioError::Unavailable)
+    );
+    assert_eq!(
+        context.set_group_volume(crate::AudioGroup::Music, 1.0),
+        Err(crate::AudioError::Unavailable)
+    );
+}
+
+#[test]
+fn audio_callbacks_and_params_keep_the_v7_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<crate::abi::RveAudioParams>(), 24);
+    assert_eq!(offset_of!(crate::abi::RveAudioParams, position), 12);
+    assert_eq!(
+        offset_of!(RveHost, audio_play_source),
+        offset_of!(RveHost, is_collider_enabled)
+            + size_of::<Option<crate::abi::RvePhysicsBoolFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, audio_set_group_volume),
+        offset_of!(RveHost, audio_stop_voice) + size_of::<Option<crate::abi::RveAudioVoiceFn>>()
+    );
+}
+
+fn present<T>(flags: u32, bit: u32, value: T) -> Option<T> {
+    (flags & bit != 0).then_some(value)
+}
+
+/// Renders the spawn options as the guest-visible fields, so tests can compare the whole request.
+fn describe_spawn(prefab: &str, options: Option<crate::abi::RveSpawnOptions>) -> String {
+    let Some(options) = options else {
+        return format!("spawn:{prefab}:null");
+    };
+    let flags = options.flags;
+    // SAFETY: the test host receives strings that the guest keeps alive for this call.
+    let name = present(flags, crate::abi::RVE_SPAWN_HAS_NAME, options.name)
+        .map(|value| unsafe { value.to_str() }.unwrap().to_owned());
+    let id = present(flags, crate::abi::RVE_SPAWN_HAS_ID, options.id)
+        .map(|value| unsafe { value.to_str() }.unwrap().to_owned());
+    format!(
+        "spawn:{prefab}:flags={flags:#x}:position={:?}:rotation={:?}:scale={:?}:velocity={:?}:parent={:?}:name={name:?}:id={id:?}",
+        present(flags, crate::abi::RVE_SPAWN_HAS_POSITION, options.position),
+        present(
+            flags,
+            crate::abi::RVE_SPAWN_HAS_ROTATION,
+            options.rotation_deg
+        ),
+        present(flags, crate::abi::RVE_SPAWN_HAS_SCALE, options.scale),
+        present(flags, crate::abi::RVE_SPAWN_HAS_VELOCITY, options.velocity),
+        present(flags, crate::abi::RVE_SPAWN_HAS_PARENT, options.parent),
+    )
+}
+
+unsafe extern "C" fn spawn_object(
+    ctx: *mut c_void,
+    prefab: RveStr,
+    options: *const crate::abi::RveSpawnOptions,
+) -> u64 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid prefab string for this callback.
+    let prefab = unsafe { prefab.to_str() }.unwrap();
+    // SAFETY: the guest passes either null or a readable options struct.
+    let options = unsafe { options.as_ref() }.copied();
+    state.lifecycle_calls.push(describe_spawn(prefab, options));
+    state.spawn_handle
+}
+
+unsafe extern "C" fn destroy_object(ctx: *mut c_void, object: u64, delay: f32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state
+        .lifecycle_calls
+        .push(format!("destroy:{object}:{delay}"));
+    state.lifecycle_accepts
+}
+
+unsafe extern "C" fn object_state(ctx: *mut c_void, object: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.lifecycle_calls.push(format!("state:{object}"));
+    state.object_state_code
+}
+
+unsafe extern "C" fn prefab_load(ctx: *mut c_void, path: RveStr) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid path string for this callback.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.lifecycle_calls.push(format!("load:{path}"));
+    state.lifecycle_accepts
+}
+
+unsafe extern "C" fn prefab_unload(ctx: *mut c_void, path: RveStr) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid path string for this callback.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.lifecycle_calls.push(format!("unload:{path}"));
+    state.lifecycle_accepts
+}
+
+unsafe extern "C" fn prefab_state(ctx: *mut c_void, path: RveStr) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid path string for this callback.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.lifecycle_calls.push(format!("prefab_state:{path}"));
+    state.prefab_state_code
+}
+
+fn lifecycle_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.spawn = Some(spawn_object);
+    host.destroy = Some(destroy_object);
+    host.object_state = Some(object_state);
+    host.prefab_load = Some(prefab_load);
+    host.prefab_unload = Some(prefab_unload);
+    host.prefab_state = Some(prefab_state);
+    host
+}
+
+#[test]
+fn sdk_spawn_api_forwards_present_fields_and_returns_the_pending_object() {
+    let mut state = HostState {
+        spawn_handle: 42,
+        ..HostState::default()
+    };
+    let host = lifecycle_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let camera = context.find("camera").unwrap();
+    let options = crate::SpawnOptions::new()
+        .position([1.0, 2.0, 3.0])
+        .rotation_deg([0.0, 90.0, 0.0])
+        .scale([2.0; 3])
+        .velocity([0.0, 5.0, 0.0])
+        .parent(camera)
+        .name("Bolt")
+        .id("bolt_1");
+    let bolt = context
+        .spawn("prefabs/bolt.rveprefab", &options)
+        .expect("host returned a pending handle");
+    assert_eq!(bolt.handle, 42);
+    assert_eq!(
+        state.lifecycle_calls.last().unwrap(),
+        &format!(
+            "spawn:prefabs/bolt.rveprefab:flags=0x7f:position=Some([1.0, 2.0, 3.0]):rotation=Some([0.0, 90.0, 0.0]):scale=Some([2.0, 2.0, 2.0]):velocity=Some([0.0, 5.0, 0.0]):parent=Some({}):name=Some(\"Bolt\"):id=Some(\"bolt_1\")",
+            camera.handle
+        )
+    );
+
+    // Unset fields are not presented to the host; the request is a no-op for the prefab's values.
+    context.spawn("prefabs/bolt.rveprefab", &crate::SpawnOptions::new());
+    assert_eq!(
+        state.lifecycle_calls.last().unwrap(),
+        "spawn:prefabs/bolt.rveprefab:flags=0x0:position=None:rotation=None:scale=None:velocity=None:parent=None:name=None:id=None"
+    );
+}
+
+#[test]
+fn sdk_spawn_api_returns_none_for_refusals_and_non_finite_options() {
+    let mut state = HostState::default();
+    let host = lifecycle_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert!(
+        context
+            .spawn("prefabs/bolt.rveprefab", &crate::SpawnOptions::new())
+            .is_none(),
+        "a zero handle is a refusal"
+    );
+    let calls = state.lifecycle_calls.len();
+    let non_finite = crate::SpawnOptions::new().position([f32::NAN, 0.0, 0.0]);
+    assert!(
+        context
+            .spawn("prefabs/bolt.rveprefab", &non_finite)
+            .is_none()
+    );
+    let infinite = crate::SpawnOptions::new().velocity([0.0, f32::INFINITY, 0.0]);
+    assert!(context.spawn("prefabs/bolt.rveprefab", &infinite).is_none());
+    assert_eq!(
+        state.lifecycle_calls.len(),
+        calls,
+        "non-finite options never reach the host"
+    );
+}
+
+#[test]
+fn sdk_object_lifecycle_api_forwards_destroy_and_state_codes() {
+    let mut state = HostState {
+        lifecycle_accepts: true,
+        object_state_code: crate::abi::RVE_OBJECT_ALIVE,
+        ..HostState::default()
+    };
+    let host = lifecycle_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    assert!(object.destroy(&mut context, 1.5));
+    assert!(object.is_alive(&context));
+    assert!(!object.is_pending(&context));
+    for delay in [f32::NAN, f32::INFINITY, -0.5] {
+        assert!(!object.destroy(&mut context, delay), "delay {delay}");
+    }
+    assert_eq!(
+        state.lifecycle_calls,
+        [
+            format!("destroy:{}:1.5", object.handle),
+            format!("state:{}", object.handle),
+            format!("state:{}", object.handle),
+        ],
+        "invalid delays never reach the host"
+    );
+
+    state.object_state_code = crate::abi::RVE_OBJECT_PENDING;
+    assert!(object.is_pending(&context));
+    assert!(!object.is_alive(&context));
+    state.object_state_code = crate::abi::RVE_OBJECT_DEAD;
+    assert!(!object.is_pending(&context));
+    assert!(!object.is_alive(&context));
+
+    state.lifecycle_accepts = false;
+    assert!(!object.destroy(&mut context, 0.0), "the host refused it");
+}
+
+#[test]
+fn sdk_prefab_api_forwards_requests_and_maps_every_state_code() {
+    let mut state = HostState {
+        lifecycle_accepts: true,
+        ..HostState::default()
+    };
+    let host = lifecycle_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let prefabs = context.prefabs();
+    assert!(prefabs.load("prefabs/heavy.rveprefab"));
+    assert!(prefabs.unload("prefabs/heavy.rveprefab"));
+
+    let expected = [
+        (crate::abi::RVE_PREFAB_UNKNOWN, crate::PrefabState::Unknown),
+        (
+            crate::abi::RVE_PREFAB_RESIDENT,
+            crate::PrefabState::Resident,
+        ),
+        (
+            crate::abi::RVE_PREFAB_UNLOADED,
+            crate::PrefabState::Unloaded,
+        ),
+        (crate::abi::RVE_PREFAB_LOADING, crate::PrefabState::Loading),
+        (crate::abi::RVE_PREFAB_LOADED, crate::PrefabState::Loaded),
+        (
+            crate::abi::RVE_PREFAB_UNLOADING,
+            crate::PrefabState::Unloading,
+        ),
+        (crate::abi::RVE_PREFAB_FAILED, crate::PrefabState::Failed),
+        (99, crate::PrefabState::Unknown),
+    ];
+    for (code, state_value) in expected {
+        // The host state lives behind a raw pointer; updating it between calls is the test's job.
+        let host_state = unsafe { &mut *host.ctx.cast::<HostState>() };
+        host_state.prefab_state_code = code;
+        assert_eq!(
+            prefabs.state("prefabs/heavy.rveprefab"),
+            state_value,
+            "code {code}"
+        );
+    }
+    assert_eq!(
+        state.lifecycle_calls.last().unwrap(),
+        "prefab_state:prefabs/heavy.rveprefab"
+    );
+    assert_eq!(state.lifecycle_calls[0], "load:prefabs/heavy.rveprefab");
+    assert_eq!(state.lifecycle_calls[1], "unload:prefabs/heavy.rveprefab");
+
+    state.lifecycle_accepts = false;
+    assert!(!prefabs.load("prefabs/heavy.rveprefab"));
+}
+
+#[test]
+fn sdk_lifecycle_api_reports_missing_callbacks_without_calling_the_host() {
+    let mut state = HostState::default();
+    let host = self::host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    assert!(
+        context
+            .spawn("prefabs/bolt.rveprefab", &crate::SpawnOptions::new())
+            .is_none()
+    );
+    assert!(!object.destroy(&mut context, 0.0));
+    assert!(!object.is_alive(&context));
+    assert!(!object.is_pending(&context));
+    let prefabs = context.prefabs();
+    assert!(!prefabs.load("prefabs/heavy.rveprefab"));
+    assert!(!prefabs.unload("prefabs/heavy.rveprefab"));
+    assert_eq!(
+        prefabs.state("prefabs/heavy.rveprefab"),
+        crate::PrefabState::Unavailable
+    );
+    assert!(state.lifecycle_calls.is_empty());
+}
+
+#[test]
+fn lifecycle_callbacks_and_spawn_options_keep_the_v9_layout() {
+    use crate::abi::RveSpawnOptions;
+    use std::mem::{align_of, offset_of, size_of};
+    assert_eq!(size_of::<RveSpawnOptions>(), 96);
+    assert_eq!(align_of::<RveSpawnOptions>(), 8);
+    assert_eq!(offset_of!(RveSpawnOptions, flags), 0);
+    assert_eq!(offset_of!(RveSpawnOptions, position), 4);
+    assert_eq!(offset_of!(RveSpawnOptions, rotation_deg), 16);
+    assert_eq!(offset_of!(RveSpawnOptions, scale), 28);
+    assert_eq!(offset_of!(RveSpawnOptions, velocity), 40);
+    assert_eq!(offset_of!(RveSpawnOptions, parent), 56);
+    assert_eq!(offset_of!(RveSpawnOptions, name), 64);
+    assert_eq!(offset_of!(RveSpawnOptions, id), 80);
+
+    assert_eq!(
+        offset_of!(RveHost, spawn),
+        offset_of!(RveHost, set_cursor_locked) + size_of::<Option<crate::abi::RveSetCursorFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, destroy),
+        offset_of!(RveHost, spawn) + size_of::<Option<crate::abi::RveSpawnFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, object_state),
+        offset_of!(RveHost, destroy) + size_of::<Option<crate::abi::RveDestroyObjectFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, prefab_load),
+        offset_of!(RveHost, object_state) + size_of::<Option<crate::abi::RveObjectStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, prefab_unload),
+        offset_of!(RveHost, prefab_load) + size_of::<Option<crate::abi::RvePrefabRequestFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, prefab_state),
+        offset_of!(RveHost, prefab_unload) + size_of::<Option<crate::abi::RvePrefabRequestFn>>()
+    );
+
+    use crate::abi::{
+        RVE_OBJECT_ALIVE, RVE_OBJECT_DEAD, RVE_OBJECT_PENDING, RVE_PREFAB_FAILED,
+        RVE_PREFAB_LOADED, RVE_PREFAB_LOADING, RVE_PREFAB_RESIDENT, RVE_PREFAB_UNKNOWN,
+        RVE_PREFAB_UNLOADED, RVE_PREFAB_UNLOADING, RVE_SPAWN_HAS_ID, RVE_SPAWN_HAS_NAME,
+        RVE_SPAWN_HAS_PARENT, RVE_SPAWN_HAS_POSITION, RVE_SPAWN_HAS_ROTATION, RVE_SPAWN_HAS_SCALE,
+        RVE_SPAWN_HAS_VELOCITY, RVE_SPAWN_KNOWN_FLAGS,
+    };
+    assert_eq!(
+        [RVE_OBJECT_DEAD, RVE_OBJECT_PENDING, RVE_OBJECT_ALIVE],
+        [0, 1, 2]
+    );
+    assert_eq!(
+        [
+            RVE_PREFAB_UNKNOWN,
+            RVE_PREFAB_RESIDENT,
+            RVE_PREFAB_UNLOADED,
+            RVE_PREFAB_LOADING,
+            RVE_PREFAB_LOADED,
+            RVE_PREFAB_UNLOADING,
+            RVE_PREFAB_FAILED,
+        ],
+        [0, 1, 2, 3, 4, 5, 6]
+    );
+    let flags = [
+        RVE_SPAWN_HAS_POSITION,
+        RVE_SPAWN_HAS_ROTATION,
+        RVE_SPAWN_HAS_SCALE,
+        RVE_SPAWN_HAS_VELOCITY,
+        RVE_SPAWN_HAS_PARENT,
+        RVE_SPAWN_HAS_NAME,
+        RVE_SPAWN_HAS_ID,
+    ];
+    for (index, flag) in flags.into_iter().enumerate() {
+        assert_eq!(flag, 1 << index);
+    }
+    assert_eq!(RVE_SPAWN_KNOWN_FLAGS, 0x7f);
 }
 
 #[test]
@@ -604,7 +1982,8 @@ fn guest_input_wrapper_reads_states_and_pointer_vectors() {
         ..HostState::default()
     };
     let host = host(&mut state);
-    let context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
     let input = context.input();
 
     assert!(input.key_down(Key::W));
@@ -619,13 +1998,39 @@ fn guest_input_wrapper_reads_states_and_pointer_vectors() {
 }
 
 #[test]
+fn guest_clock_and_timer_context_api_uses_the_appended_host_tail() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+
+    let time = context.script_time();
+    assert_eq!(time.dt, 0.25);
+    assert_eq!(time.unscaled_dt, 0.5);
+    assert_eq!(time.elapsed, 12.5);
+    assert_eq!(time.unscaled_elapsed, 25.0);
+    assert_eq!(time.fixed_dt, 0.02);
+    assert_eq!(time.scale, 0.5);
+    assert_eq!(time.frame, 8);
+
+    context.set_time_scale(0.0).unwrap();
+    let timer = context.schedule(0.75, Some(0.25), "pulse").unwrap();
+    assert!(context.cancel_timer(timer).unwrap());
+    assert_eq!(timer.0, 41);
+    assert_eq!(state.time_scale, Some(0.0));
+    assert_eq!(state.scheduled_timers, [(0.75, 0.25, "pulse".to_owned())]);
+    assert_eq!(state.canceled_timers, [41]);
+}
+
+#[test]
 fn guest_camera_wrappers_read_write_and_switch_cameras() {
     let mut state = HostState {
         active_camera: 1,
         ..HostState::default()
     };
     let host = host(&mut state);
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let camera = context.find("camera").unwrap();
     assert_eq!(context.active_camera(), Some(camera));
     assert_eq!(
@@ -662,7 +2067,8 @@ fn guest_camera_wrappers_report_when_callbacks_are_unavailable() {
     host.set_camera_settings = None;
     host.active_camera = None;
     host.set_active_camera = None;
-    let mut context = Context::new(&host).unwrap();
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
     let camera = context.find("camera").unwrap();
 
     assert_eq!(context.active_camera(), None);
@@ -895,6 +2301,14 @@ fn borrowed_abi_values_and_params_become_owned_values() {
             key: RveStr::from_static("nested"),
             value: RveValue::array(&nested),
         },
+        RveParamEntry {
+            key: RveStr::from_static("object"),
+            value: RveValue::object(9),
+        },
+        RveParamEntry {
+            key: RveStr::from_static("asset"),
+            value: RveValue::asset("models/tree.fbx"),
+        },
     ];
     let params = RveParams {
         entries: entries.as_ptr(),
@@ -911,6 +2325,17 @@ fn borrowed_abi_values_and_params_become_owned_values() {
             Value::String("value".to_owned())
         ])])
     );
+    assert_eq!(owned["object"], Value::Object(Object { handle: 9 }));
+    assert_eq!(owned["asset"], Value::Asset("models/tree.fbx".to_owned()));
+}
+
+#[test]
+fn context_object_returns_its_own_handle() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(context.object(), Object { handle: 1 });
 }
 
 #[test]
@@ -1000,8 +2425,55 @@ mod with_params {
                 axis: [f32; 3] = [0.0, 1, -0.5],
             },
             "Plain" => factory,
+            "Refs" => factory {
+                target: Option<Object> = None,
+                body: component(rigid_body) = None,
+                source: Asset = "",
+                mode: enum("idle", "run"),
+                tint: Color = [0.1, 0.2, 0.3],
+                weights: Vec<f32> = [],
+            },
         }
     }
+}
+
+#[test]
+fn script_module_macro_exports_reference_and_collection_parameter_kinds() {
+    use crate::abi::{
+        RVE_PARAM_ARRAY, RVE_PARAM_ASSET, RVE_PARAM_COLOR, RVE_PARAM_COMPONENT, RVE_PARAM_ENUM,
+        RVE_PARAM_OBJECT, RveParamDesc,
+    };
+    let module = with_params::module();
+    let descriptor = descriptor(module, "Refs");
+    let params: &[RveParamDesc] =
+        unsafe { std::slice::from_raw_parts(descriptor.params, descriptor.param_count) };
+    let strings = params
+        .iter()
+        .map(|param| unsafe { param.argument.to_str() }.unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        params.iter().map(|param| param.kind).collect::<Vec<_>>(),
+        [
+            RVE_PARAM_OBJECT,
+            RVE_PARAM_COMPONENT,
+            RVE_PARAM_ASSET,
+            RVE_PARAM_ENUM,
+            RVE_PARAM_COLOR,
+            RVE_PARAM_ARRAY,
+        ]
+    );
+    assert_eq!(strings, ["", "rigid_body", "", "idle\0run\0", "", "float"]);
+    assert_eq!(unsafe { params[0].default.data.object }, 0);
+    assert_eq!(unsafe { params[1].default.data.object }, 0);
+    assert_eq!(
+        unsafe { params[2].default.data.string.to_str() }.unwrap(),
+        ""
+    );
+    assert_eq!(
+        unsafe { params[3].default.data.string.to_str() }.unwrap(),
+        "idle"
+    );
+    assert_eq!(unsafe { params[5].default.data.array.len }, 0);
 }
 
 #[test]
@@ -1070,11 +2542,17 @@ fn script_module_macro_exports_typed_parameter_tables() {
 
 #[test]
 fn param_descriptor_layout_is_c_compatible() {
-    use crate::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveParamDesc, RveScriptDescV3};
+    use crate::abi::{
+        RVE_SCRIPT_ABI_MIN_VERSION, RveParamDesc, RveParamDescV13, RveScriptDescV3, RveScriptDescV4,
+    };
     use std::mem::{align_of, offset_of, size_of};
     let pointer = size_of::<usize>();
     assert_eq!(offset_of!(RveParamDesc, name), 0);
     assert_eq!(offset_of!(RveParamDesc, kind), 2 * pointer);
+    assert_eq!(
+        offset_of!(RveParamDesc, argument),
+        size_of::<RveParamDescV13>()
+    );
     assert_eq!(
         offset_of!(RveParamDesc, default) % align_of::<RveValue>(),
         0
@@ -1092,11 +2570,1701 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, command),
         size_of::<RveScriptDescV3>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 4);
+    assert_eq!(
+        offset_of!(RveScriptDescV4, command),
+        size_of::<RveScriptDescV3>()
+    );
+    assert_eq!(
+        offset_of!(RveScriptDesc, collision),
+        size_of::<RveScriptDescV4>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
+    assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
         offset_of!(RveHost, register_command),
         offset_of!(RveHost, set_active_camera)
             + size_of::<Option<crate::abi::RveSetActiveCameraFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, action_state),
+        offset_of!(RveHost, unregister_command)
+            + size_of::<Option<crate::abi::RveUnregisterCommandFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, action_value),
+        offset_of!(RveHost, action_state) + size_of::<Option<crate::abi::RveActionStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, input_context),
+        offset_of!(RveHost, action_value) + size_of::<Option<crate::abi::RveActionValueFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_input_context),
+        offset_of!(RveHost, input_context) + size_of::<Option<crate::abi::RveInputContextFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, rebind_action),
+        offset_of!(RveHost, set_input_context)
+            + size_of::<Option<crate::abi::RveSetInputContextFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, action_binding),
+        offset_of!(RveHost, rebind_action) + size_of::<Option<crate::abi::RveRebindActionFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, reset_bindings),
+        offset_of!(RveHost, action_binding) + size_of::<Option<crate::abi::RveActionBindingFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, raycast),
+        offset_of!(RveHost, reset_bindings) + size_of::<Option<crate::abi::RveResetBindingsFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, cursor_state),
+        offset_of!(RveHost, audio_set_group_volume)
+            + size_of::<Option<crate::abi::RveAudioGroupVolumeFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_cursor_visible),
+        offset_of!(RveHost, cursor_state) + size_of::<Option<crate::abi::RveCursorStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_cursor_locked),
+        offset_of!(RveHost, set_cursor_visible) + size_of::<Option<crate::abi::RveSetCursorFn>>()
+    );
+}
+
+#[test]
+fn sdk_cursor_api_reads_applied_state_and_stages_changes() {
+    let mut state = HostState {
+        cursor_visible: false,
+        cursor_locked: true,
+        ..HostState::default()
+    };
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(context.input().cursor_visible(), Some(false));
+    assert_eq!(context.input().cursor_locked(), Some(true));
+    assert!(context.set_cursor_visible(true));
+    assert!(context.set_cursor_locked(false));
+    assert!(state.cursor_visible);
+    assert!(!state.cursor_locked);
+}
+
+#[test]
+fn sdk_cursor_api_reports_unavailable_callbacks_before_abi_v8() {
+    let mut state = HostState::default();
+    let mut host = host(&mut state);
+    host.cursor_state = None;
+    host.set_cursor_visible = None;
+    host.set_cursor_locked = None;
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(context.input().cursor_visible(), None);
+    assert_eq!(context.input().cursor_locked(), None);
+    assert!(!context.set_cursor_visible(false));
+    assert!(!context.set_cursor_locked(true));
+}
+
+unsafe fn animation_text(value: RveStr) -> String {
+    // SAFETY: the guest passes a valid string for the synchronous callback.
+    let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len) };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+unsafe extern "C" fn animation_play(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    params: *const RvePlayAnimationParams,
+) -> u32 {
+    // SAFETY: the context and params are live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let params = unsafe { *params };
+    let then = unsafe { animation_text(params.then) };
+    let motion = unsafe { animation_text(motion) };
+    state.animation_calls.push(format!(
+        "play {object} {motion} fade={} loop={} then={then}",
+        params.fade, params.looping
+    ));
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn animation_set_weight(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    weight: f32,
+    fade: f32,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let motion = unsafe { animation_text(motion) };
+    state
+        .animation_calls
+        .push(format!("weight {object} {motion} {weight} {fade}"));
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn animation_set_parameter(
+    ctx: *mut c_void,
+    object: u64,
+    name: RveStr,
+    value: f32,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let name = unsafe { animation_text(name) };
+    state
+        .animation_calls
+        .push(format!("parameter {object} {name} {value}"));
+    RveStatus::Error as u32
+}
+
+unsafe extern "C" fn animation_set_speed(ctx: *mut c_void, object: u64, speed: f32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state
+        .animation_calls
+        .push(format!("speed {object} {speed}"));
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn animation_stop(ctx: *mut c_void, object: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.animation_calls.push(format!("stop {object}"));
+    RveStatus::Ok as u32
+}
+
+fn animation_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.animation_play = Some(animation_play);
+    host.animation_set_weight = Some(animation_set_weight);
+    host.animation_set_parameter = Some(animation_set_parameter);
+    host.animation_set_speed = Some(animation_set_speed);
+    host.animation_stop = Some(animation_stop);
+    host
+}
+
+#[test]
+fn sdk_animation_api_forwards_options_and_reports_host_refusals() {
+    let mut state = HostState::default();
+    let host = animation_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    object
+        .play_animation(
+            &mut context,
+            "walk",
+            crate::PlayAnimationOptions {
+                fade: 0.25,
+                looping: Some(false),
+                then: Some("idle"),
+            },
+        )
+        .unwrap();
+    object
+        .play_animation(&mut context, "idle", crate::PlayAnimationOptions::default())
+        .unwrap();
+    object
+        .set_animation_weight(&mut context, "walk", 0.5, 0.0)
+        .unwrap();
+    object.set_animation_speed(&mut context, 2.0).unwrap();
+    object.stop_animation(&mut context).unwrap();
+    assert_eq!(
+        state.animation_calls,
+        [
+            "play 1 walk fade=0.25 loop=0 then=idle",
+            "play 1 idle fade=0 loop=-1 then=",
+            "weight 1 walk 0.5 0",
+            "speed 1 2",
+            "stop 1",
+        ]
+    );
+}
+
+#[test]
+fn sdk_animation_api_checks_inputs_before_calling_the_host() {
+    let mut state = HostState::default();
+    let host = animation_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.play_animation(
+            &mut context,
+            "walk",
+            crate::PlayAnimationOptions {
+                fade: -1.0,
+                ..Default::default()
+            },
+        ),
+        Err(crate::AnimationError::InvalidInput)
+    );
+    assert_eq!(
+        object.set_animation_weight(&mut context, "walk", f32::NAN, 0.0),
+        Err(crate::AnimationError::InvalidInput)
+    );
+    assert_eq!(
+        object.set_animation_speed(&mut context, -0.5),
+        Err(crate::AnimationError::InvalidInput)
+    );
+    assert!(state.animation_calls.is_empty());
+    // Хост отклонил параметр: SDK возвращает Rejected, а не молчит.
+    assert_eq!(
+        object.set_animation_parameter(&mut context, "speed", 1.0),
+        Err(crate::AnimationError::Rejected)
+    );
+}
+
+#[test]
+fn sdk_animation_api_is_unavailable_for_hosts_without_v9_callbacks() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.stop_animation(&mut context),
+        Err(crate::AnimationError::Unavailable)
+    );
+    assert_eq!(
+        object.play_animation(&mut context, "walk", crate::PlayAnimationOptions::default()),
+        Err(crate::AnimationError::Unavailable)
+    );
+}
+
+#[test]
+fn animation_callbacks_and_params_keep_the_v9_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<RvePlayAnimationParams>(), 24);
+    assert_eq!(offset_of!(RvePlayAnimationParams, looping), 4);
+    assert_eq!(offset_of!(RvePlayAnimationParams, then), 8);
+    assert_eq!(
+        offset_of!(RveHost, animation_play),
+        offset_of!(RveHost, prefab_state) + size_of::<Option<crate::abi::RvePrefabStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, animation_stop),
+        offset_of!(RveHost, animation_set_speed)
+            + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+}
+
+#[test]
+fn screen_shader_callbacks_are_appended_in_v14() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, screen_shader_count),
+        offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, get_screen_shader),
+        offset_of!(RveHost, screen_shader_count)
+            + size_of::<Option<crate::abi::RveScreenShaderCountFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_screen_shader),
+        offset_of!(RveHost, get_screen_shader)
+            + size_of::<Option<crate::abi::RveGetScreenShaderFn>>()
+    );
+    assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
+    assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+}
+
+#[test]
+fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, net_mode),
+        offset_of!(RveHost, set_post_process)
+            + size_of::<Option<crate::abi::RveSetPostProcessFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, net_object_send),
+        offset_of!(RveHost, net_object_set_owner)
+            + size_of::<Option<crate::abi::RveNetObjectSetOwnerFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV13>(),
+        size_of::<crate::abi::RveScriptDescV6>() + size_of::<Option<crate::abi::RveNetEventFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV15>(),
+        size_of::<crate::abi::RveScriptDescV13>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+}
+
+#[test]
+fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, ui_open),
+        offset_of!(RveHost, set_screen_shader)
+            + size_of::<Option<crate::abi::RveSetScreenShaderFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, ui_focus),
+        offset_of!(RveHost, ui_set_image) + size_of::<Option<crate::abi::RveUiSetImageFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV16>(),
+        size_of::<crate::abi::RveScriptDescV15>() + size_of::<Option<crate::abi::RveUiEventFn>>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV16, ui_event),
+        size_of::<crate::abi::RveScriptDescV15>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDesc, ui_event),
+        size_of::<crate::abi::RveScriptDescV15>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDesc, on_enable),
+        size_of::<crate::abi::RveScriptDescV16>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDesc, on_disable),
+        offset_of!(crate::abi::RveScriptDesc, on_enable)
+            + size_of::<Option<crate::abi::RveStartFn>>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+}
+
+#[test]
+fn lifecycle_descriptor_fields_follow_the_ui_event_in_abi_v17() {
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV17, ui_event),
+        size_of::<crate::abi::RveScriptDescV15>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV17, on_enable),
+        size_of::<crate::abi::RveScriptDescV16>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV17>(),
+        size_of::<crate::abi::RveScriptDescV16>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV18>(),
+        size_of::<crate::abi::RveScriptDescV17>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDescV19>(),
+        size_of::<crate::abi::RveScriptDescV18>()
+    );
+}
+#[test]
+fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(crate::abi::RVE_COMPONENT_NAMES.last(), Some(&"ui_canvas"));
+    assert_eq!(
+        offset_of!(RveHost, object_set_active),
+        offset_of!(RveHost, ui_focus) + size_of::<Option<crate::abi::RveUiFocusFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>(),
+        offset_of!(RveHost, physics_get_collider)
+    );
+}
+
+#[test]
+fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_TRIGGER_STAY, 4);
+    assert_eq!(
+        offset_of!(RveHost, physics_get_collider),
+        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, physics_shape_cast)
+            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>(),
+        offset_of!(RveHost, light_get)
+    );
+}
+
+#[test]
+fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(
+        offset_of!(RveHost, light_get),
+        offset_of!(RveHost, physics_shape_cast)
+            + size_of::<Option<crate::abi::RvePhysicsShapeCastFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, mesh_set_visible),
+        offset_of!(RveHost, mesh_get_visible)
+            + size_of::<Option<crate::abi::RveObjectBoolQueryFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, mesh_set_material_path)
+            + size_of::<Option<crate::abi::RveMeshSetMaterialPathFn>>(),
+        offset_of!(RveHost, script_time)
+    );
+}
+#[test]
+fn v15_parameter_argument_is_an_appended_tail_after_the_legacy_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(crate::abi::RveParamDesc, argument),
+        size_of::<crate::abi::RveParamDescV13>()
+    );
+    assert_eq!(
+        offset_of!(crate::abi::RveScriptDescV15, params),
+        offset_of!(crate::abi::RveScriptDescV13, params)
+    );
+}
+
+#[test]
+fn runtime_physics_value_types_are_c_layout_in_v18() {
+    use crate::abi::{
+        RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
+    };
+    use std::mem::{offset_of, size_of};
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(size_of::<RveColliderValue>(), 40);
+    assert_eq!(offset_of!(RveColliderValue, size), 8);
+    assert_eq!(offset_of!(RveColliderValue, offset), 28);
+    assert_eq!(size_of::<RveRigidBodyValue>(), 24);
+    assert_eq!(size_of::<RveControllerValue>(), 40);
+    assert_eq!(size_of::<RveQueryShape>(), 24);
+    assert_eq!(offset_of!(RveQueryOptions, ignore), 8);
+    assert_eq!(size_of::<RveQueryOptions>(), 24);
+}
+unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {
+    // SAFETY: the context is live for this callback.
+    unsafe { (*ctx.cast::<HostState>()).net_mode }
+}
+
+unsafe extern "C" fn net_local_peer(ctx: *mut c_void) -> u32 {
+    // SAFETY: the context is live for this callback.
+    unsafe { (*ctx.cast::<HostState>()).net_local_peer }
+}
+
+unsafe extern "C" fn net_peers(
+    ctx: *mut c_void,
+    out: *mut u32,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a writable count slot.
+    unsafe { *count = state.net_peers.len() };
+    for (index, peer) in state.net_peers.iter().take(capacity).enumerate() {
+        // SAFETY: the guest allocated `capacity` entries, and `index` is below it.
+        unsafe { out.add(index).write(*peer) };
+    }
+    true
+}
+
+unsafe extern "C" fn net_send(
+    ctx: *mut c_void,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest keeps the name and value readable for this call.
+    let name = unsafe { name.to_str() }.unwrap().to_owned();
+    let value = unsafe { (*value).into_owned() }.unwrap();
+    state.net_calls.push(format!(
+        "send {target_kind} {peer} {name} {reliable} {value:?}"
+    ));
+    state.net_status
+}
+
+unsafe extern "C" fn net_object_id(ctx: *mut c_void, object: u64, out: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("id {object}"));
+    if object == 7 {
+        // SAFETY: the guest owns the output slot.
+        unsafe { *out = 77 };
+        true
+    } else {
+        false
+    }
+}
+
+unsafe extern "C" fn net_object_owner(ctx: *mut c_void, object: u64, out: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("owner {object}"));
+    // SAFETY: the guest owns the output slot.
+    unsafe { *out = 3 };
+    true
+}
+
+unsafe extern "C" fn net_object_is_owner(ctx: *mut c_void, object: u64, out: *mut bool) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("is_owner {object}"));
+    // SAFETY: the guest owns the output slot.
+    unsafe { *out = false };
+    true
+}
+
+unsafe extern "C" fn net_object_has_authority(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut bool,
+) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("authority {object}"));
+    // SAFETY: the guest owns the output slot.
+    unsafe { *out = true };
+    true
+}
+
+unsafe extern "C" fn net_object_set_owner(ctx: *mut c_void, object: u64, peer: u32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("set_owner {object} {peer}"));
+    state.net_status
+}
+
+unsafe extern "C" fn net_object_send(
+    ctx: *mut c_void,
+    object: u64,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest keeps the name and value readable for this call.
+    let name = unsafe { name.to_str() }.unwrap().to_owned();
+    let value = unsafe { (*value).into_owned() }.unwrap();
+    state.net_calls.push(format!(
+        "object_send {object} {target_kind} {peer} {name} {reliable} {value:?}"
+    ));
+    state.net_status
+}
+
+fn net_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.net_mode = Some(net_mode);
+    host.net_local_peer = Some(net_local_peer);
+    host.net_peers = Some(net_peers);
+    host.net_send = Some(net_send);
+    host.net_object_id = Some(net_object_id);
+    host.net_object_owner = Some(net_object_owner);
+    host.net_object_is_owner = Some(net_object_is_owner);
+    host.net_object_has_authority = Some(net_object_has_authority);
+    host.net_object_set_owner = Some(net_object_set_owner);
+    host.net_object_send = Some(net_object_send);
+    host
+}
+
+#[test]
+fn gamepad_callbacks_and_state_keep_the_v11_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<RveGamepadState>(), 40);
+    assert_eq!(offset_of!(RveGamepadState, axes), 16);
+    assert_eq!(
+        offset_of!(RveHost, gamepad_state),
+        offset_of!(RveHost, animation_stop) + size_of::<Option<crate::abi::RveAnimationStopFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, gamepad_rumble),
+        offset_of!(RveHost, gamepad_state) + size_of::<Option<crate::abi::RveGamepadStateFn>>()
+    );
+    assert_eq!(
+        size_of::<Option<crate::abi::RveGamepadRumbleFn>>(),
+        size_of::<crate::abi::RveGamepadRumbleFn>()
+    );
+}
+
+#[test]
+fn gamepad_physical_input_names_round_trip_and_reject_invalid_slots() {
+    for name in ["Gamepad.South", "Gamepad3.LeftBumper", "Gamepad4.DPadRight"] {
+        let input = PhysicalInput::from_name(name).unwrap();
+        assert_eq!(input.name(), name);
+    }
+    assert_eq!(
+        PhysicalInput::from_name("Gamepad2.Start"),
+        Some(PhysicalInput::GamepadButton {
+            pad: Some(2),
+            button: GamepadButton::Start,
+        })
+    );
+    for name in [
+        "Gamepad0.South",
+        "Gamepad5.South",
+        "Gamepad+1.South",
+        "GamepadX.South",
+        "Gamepad.Unknown",
+        "Gamepad.South.Extra",
+        "Gamepad1",
+        "Gamepad",
+    ] {
+        assert_eq!(PhysicalInput::from_name(name), None, "{name}");
+    }
+    assert_eq!(GamepadButton::ALL.len(), 17);
+    for (code, button) in GamepadButton::ALL.into_iter().enumerate() {
+        assert_eq!(button as u32, code as u32);
+        assert_eq!(GamepadButton::from_code(code as u32), Some(button));
+    }
+    assert_eq!(GamepadButton::from_code(17), None);
+    assert_eq!(
+        crate::abi::split_gamepad_name("Gamepad2.LeftStick"),
+        Some((Some(2), "LeftStick"))
+    );
+    assert_eq!(
+        crate::abi::split_gamepad_name("Gamepad.RightTrigger"),
+        Some((None, "RightTrigger"))
+    );
+    assert_eq!(crate::abi::split_gamepad_name("Gamepad5.South"), None);
+    assert_eq!(crate::abi::split_gamepad_name("Mouse.Left"), None);
+    assert_eq!(
+        GamepadAxis::from_name("RightTrigger"),
+        Some(GamepadAxis::RightTrigger)
+    );
+    assert_eq!(GamepadAxis::from_name("Trigger"), None);
+}
+
+unsafe extern "C" fn gamepad_state(ctx: *mut c_void, pad: u32, out: *mut RveGamepadState) -> bool {
+    // SAFETY: test host points to a live HostState and the output slot is valid during the call.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    let Some(snapshot) = state.gamepads.get(pad as usize) else {
+        // SAFETY: the guest passes a valid output slot for this call.
+        unsafe { *out = RveGamepadState::default() };
+        return false;
+    };
+    // SAFETY: the guest passes a valid output slot for this call.
+    unsafe { *out = *snapshot };
+    true
+}
+
+unsafe extern "C" fn gamepad_rumble(
+    ctx: *mut c_void,
+    pad: u32,
+    strong: f32,
+    weak: f32,
+    seconds: f32,
+) -> bool {
+    // SAFETY: test host points to a live HostState for the guest call.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.rumble_calls.push((pad, strong, weak, seconds));
+    state.rumble_accepts
+}
+
+fn gamepad_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.gamepad_state = Some(gamepad_state);
+    host.gamepad_rumble = Some(gamepad_rumble);
+    host
+}
+
+#[test]
+fn sdk_net_api_reports_mode_peers_and_copies_the_full_peer_list() {
+    let mut state = HostState {
+        net_mode: crate::abi::RVE_NET_MODE_CLIENT,
+        net_local_peer: 5,
+        net_peers: vec![1, 2, 9],
+        ..HostState::default()
+    };
+    let host = net_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let net = context.net();
+    assert_eq!(net.mode(), Ok(crate::NetMode::Client));
+    assert_eq!(net.is_server(), Ok(false));
+    assert_eq!(net.is_client(), Ok(true));
+    assert_eq!(net.local_peer(), Ok(5));
+    assert_eq!(net.peers(), Ok(vec![1, 2, 9]));
+
+    state.net_mode = crate::abi::RVE_NET_MODE_HOST;
+    state.net_peers = vec![4; 70];
+    let host = net_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let net = context.net();
+    assert_eq!(net.mode(), Ok(crate::NetMode::Host));
+    assert_eq!(net.is_server(), Ok(true));
+    assert_eq!(net.is_client(), Ok(true));
+    assert_eq!(net.peers().unwrap().len(), 70);
+}
+
+#[test]
+fn sdk_net_send_encodes_targets_and_maps_host_statuses() {
+    let mut state = HostState {
+        net_status: crate::abi::RVE_NET_OK,
+        ..HostState::default()
+    };
+    let host = net_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let net = context.net();
+    assert_eq!(
+        net.send(crate::NetTarget::Server, "a", &Value::Int(1), true),
+        Ok(())
+    );
+    assert_eq!(
+        net.send(crate::NetTarget::All, "b", &Value::Bool(true), false),
+        Ok(())
+    );
+    assert_eq!(
+        net.send(crate::NetTarget::Peer(4), "c", &Value::Float(0.5), true),
+        Ok(())
+    );
+    assert_eq!(
+        state.net_calls,
+        vec![
+            "send 0 0 a true Int(1)".to_owned(),
+            "send 1 0 b false Bool(true)".to_owned(),
+            "send 2 4 c true Float(0.5)".to_owned(),
+        ]
+    );
+
+    state.net_status = crate::abi::RVE_NET_INVALID_INPUT;
+    let host = net_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(
+        context
+            .net()
+            .send(crate::NetTarget::All, "d", &Value::Int(0), true),
+        Err(crate::NetError::InvalidInput)
+    );
+    state.net_status = crate::abi::RVE_NET_REJECTED;
+    let host = net_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(
+        context
+            .net()
+            .send(crate::NetTarget::All, "d", &Value::Int(0), true),
+        Err(crate::NetError::Rejected)
+    );
+}
+
+#[test]
+fn sdk_net_object_api_forwards_handles_and_reports_unavailable_hosts() {
+    let mut state = HostState {
+        net_status: crate::abi::RVE_NET_OK,
+        ..HostState::default()
+    };
+    let host = net_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    let object = crate::Object { handle: 7 };
+    assert_eq!(object.net_id(&context), Ok(Some(77)));
+    assert_eq!(object.net_owner(&context), Ok(Some(3)));
+    assert_eq!(object.is_owner(&context), Ok(false));
+    assert_eq!(object.has_authority(&context), Ok(true));
+    assert_eq!(object.set_net_owner(&mut context, 4), Ok(()));
+    assert_eq!(
+        object.net_send(
+            &mut context,
+            "hit",
+            &Value::String("x".to_owned()),
+            crate::NetTarget::Peer(6),
+            false,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        state.net_calls,
+        vec![
+            "id 7".to_owned(),
+            "owner 7".to_owned(),
+            "is_owner 7".to_owned(),
+            "authority 7".to_owned(),
+            "set_owner 7 4".to_owned(),
+            "object_send 7 2 6 hit false String(\"x\")".to_owned(),
+        ]
+    );
+
+    state.net_status = crate::abi::RVE_NET_REJECTED;
+    let host = net_host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(
+        object.set_net_owner(&mut context, 4),
+        Err(crate::NetError::Rejected)
+    );
+
+    let mut bare = HostState::default();
+    let bare_host = self::host(&mut bare);
+    let mut properties = Params::new();
+    let mut context = Context::new(&bare_host, &mut properties).unwrap();
+    let net = context.net();
+    assert_eq!(net.mode(), Err(crate::NetError::Unavailable));
+    assert_eq!(net.peers(), Err(crate::NetError::Unavailable));
+    assert_eq!(
+        net.send(crate::NetTarget::Server, "a", &Value::Int(1), true),
+        Err(crate::NetError::Unavailable)
+    );
+    assert_eq!(object.net_id(&context), Err(crate::NetError::Unavailable));
+    assert_eq!(
+        object.set_net_owner(&mut context, 1),
+        Err(crate::NetError::Unavailable)
+    );
+}
+
+struct NetProbe;
+
+impl Script for NetProbe {
+    fn on_net_message(&mut self, ctx: &mut Context<'_>, peer: u32, name: &str, value: &Value) {
+        ctx.log_info(format!("message {peer} {name} {value:?}"));
+    }
+
+    fn on_peer_connected(&mut self, ctx: &mut Context<'_>, peer: u32) {
+        ctx.log_info(format!("connected {peer}"));
+    }
+
+    fn on_peer_disconnected(&mut self, ctx: &mut Context<'_>, peer: u32, reason: &str) {
+        ctx.log_info(format!("disconnected {peer} {reason}"));
+    }
+}
+
+fn net_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(NetProbe))
+}
+
+#[test]
+fn net_events_reach_the_guest_callbacks_and_failures_stay_in_the_guest() {
+    use crate::abi::{RVE_NET_EVENT_MESSAGE, RVE_NET_EVENT_PEER_CONNECTED, RveNetEvent};
+    let mut state = HostState::default();
+    let host = net_host(&mut state);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: the host and parameters remain valid for this synchronous creation call.
+    let status =
+        unsafe { crate::__private::create(&host, &params, &mut instance, net_probe_factory) };
+    assert_eq!(status, RveStatus::Ok);
+
+    let value = RveValue::integer(9);
+    // SAFETY: the instance was created by this module and the value outlives the call.
+    let status = unsafe {
+        crate::__private::net_event(
+            instance,
+            &host,
+            RveNetEvent {
+                kind: RVE_NET_EVENT_MESSAGE,
+                peer: 3,
+                name: RveStr::from_static("hit"),
+                value: &value,
+                reason: RveStr::empty(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    // SAFETY: as above.
+    let status = unsafe {
+        crate::__private::net_event(
+            instance,
+            &host,
+            RveNetEvent {
+                kind: RVE_NET_EVENT_PEER_CONNECTED,
+                peer: 8,
+                name: RveStr::empty(),
+                value: std::ptr::null(),
+                reason: RveStr::empty(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    // SAFETY: as above; an unknown kind is rejected by the guest without a panic.
+    let status = unsafe {
+        crate::__private::net_event(
+            instance,
+            &host,
+            RveNetEvent {
+                kind: 99,
+                peer: 0,
+                name: RveStr::empty(),
+                value: std::ptr::null(),
+                reason: RveStr::empty(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Error);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unknown net event kind")
+    );
+    // SAFETY: the instance is dropped exactly once.
+    assert_eq!(
+        unsafe { crate::__private::drop_instance(instance) },
+        RveStatus::Ok
+    );
+}
+
+#[test]
+fn guest_gamepad_wrapper_reads_slot_and_aggregate_snapshots() {
+    let mut state = HostState::default();
+    state.gamepads[2] = RveGamepadState {
+        connected: 1,
+        down: 1 << GamepadButton::South as u32,
+        pressed: 1 << GamepadButton::East as u32,
+        released: 0,
+        axes: [0.5, -0.25, 0.0, 0.0, 0.75, 0.0],
+    };
+    let host = gamepad_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let input = context.input();
+
+    let pad = input.gamepad(2);
+    assert!(pad.connected());
+    assert!(pad.down(GamepadButton::South));
+    assert!(pad.pressed(GamepadButton::East));
+    assert!(!pad.released(GamepadButton::East));
+    assert_eq!(pad.axis(GamepadAxis::LeftX), 0.5);
+    assert_eq!(pad.axis(GamepadAxis::LeftTrigger), 0.75);
+    assert_eq!(pad.stick(GamepadStick::Left), [0.5, -0.25]);
+    assert!(!input.gamepad(1).connected());
+    assert!(!input.gamepad(5).connected());
+    assert_eq!(input.gamepad(5), GamepadState::default());
+}
+
+#[test]
+fn guest_gamepad_rumble_forwards_requests_and_reports_host_refusal() {
+    let mut state = HostState {
+        rumble_accepts: true,
+        ..HostState::default()
+    };
+    let host = gamepad_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert!(context.input().rumble(0, 0.5, 1.0, 0.25));
+    assert_eq!(state.rumble_calls, vec![(0, 0.5, 1.0, 0.25)]);
+
+    state.rumble_accepts = false;
+    let host = gamepad_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert!(!context.input().rumble(3, 1.0, 1.0, 1.0));
+    assert_eq!(state.rumble_calls.last(), Some(&(3, 1.0, 1.0, 1.0)));
+}
+
+#[test]
+fn guest_gamepad_api_is_unavailable_for_hosts_without_v11_callbacks() {
+    let mut state = HostState {
+        rumble_accepts: true,
+        ..HostState::default()
+    };
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(context.input().gamepad(1), GamepadState::default());
+    assert!(!context.input().rumble(1, 1.0, 1.0, 1.0));
+    assert!(context.input().pressed_inputs().is_empty());
+}
+
+#[test]
+fn pressed_inputs_list_gamepad_slots_in_order_with_concrete_names() {
+    let mut state = HostState::default();
+    state.gamepads[1].connected = 1;
+    state.gamepads[1].pressed = 1 << GamepadButton::South as u32;
+    state.gamepads[3].connected = 1;
+    state.gamepads[3].pressed = 1 << GamepadButton::DPadUp as u32;
+    let host = gamepad_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(
+        context.input().pressed_inputs(),
+        vec!["Gamepad1.South".to_owned(), "Gamepad3.DPadUp".to_owned()]
+    );
+}
+
+const UI_CANVAS: u64 = 7;
+const UI_LABEL: u32 = 3;
+
+unsafe fn ui_state<'a>(ctx: *mut c_void) -> &'a mut HostState {
+    // SAFETY: the test host passes its live state as the call context.
+    unsafe { &mut *ctx.cast::<HostState>() }
+}
+
+unsafe extern "C" fn ui_open(ctx: *mut c_void, path: RveStr, out: *mut u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the test passes valid UTF-8 paths.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.ui_calls.push(format!("open {path}"));
+    if state.ui_status == 0 {
+        // SAFETY: the guest passes a writable output slot.
+        unsafe { *out = UI_CANVAS };
+    }
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_close(ctx: *mut c_void, canvas: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push(format!("close {canvas}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_object_canvas(ctx: *mut c_void, object: u64, out: *mut u64) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push(format!("object_canvas {object}"));
+    // SAFETY: the guest passes a writable output slot.
+    unsafe { *out = UI_CANVAS };
+    true
+}
+
+unsafe extern "C" fn ui_focused(ctx: *mut c_void, canvas: *mut u64, element: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push("focused".to_owned());
+    // SAFETY: the guest passes writable output slots.
+    unsafe {
+        *canvas = UI_CANVAS;
+        *element = UI_LABEL;
+    }
+    true
+}
+
+unsafe extern "C" fn ui_pointer_over(ctx: *mut c_void) -> bool {
+    // SAFETY: the context is live for this callback.
+    unsafe { ui_state(ctx) }
+        .ui_calls
+        .push("pointer_over".to_owned());
+    true
+}
+
+unsafe extern "C" fn ui_find(ctx: *mut c_void, canvas: u64, id: RveStr, out: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the test passes valid UTF-8 identifiers.
+    let id = unsafe { id.to_str() }.unwrap();
+    state.ui_calls.push(format!("find {canvas} {id}"));
+    if id == "label" {
+        // SAFETY: the guest passes a writable output slot.
+        unsafe { *out = UI_LABEL };
+        true
+    } else {
+        false
+    }
+}
+
+unsafe extern "C" fn ui_get(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    out: *mut RveUiValue,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state
+        .ui_calls
+        .push(format!("get {canvas} {element} {property}"));
+    if state.ui_status != 0 {
+        return state.ui_status;
+    }
+    let mut value = RveUiValue {
+        kind: crate::abi::RVE_UI_VALUE_NONE,
+        flag: false,
+        number: 0.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    };
+    match property {
+        crate::abi::RVE_UI_PROP_CANVAS_VISIBLE | crate::abi::RVE_UI_PROP_VISIBLE => {
+            value.kind = crate::abi::RVE_UI_VALUE_BOOL;
+            value.flag = true;
+        }
+        crate::abi::RVE_UI_PROP_CANVAS_LAYER => {
+            value.kind = crate::abi::RVE_UI_VALUE_INTEGER;
+            value.integer = 5;
+        }
+        crate::abi::RVE_UI_PROP_TEXT => {
+            value.kind = crate::abi::RVE_UI_VALUE_TEXT;
+            value.text = RveStr::from_str_ref(&state.ui_text);
+        }
+        crate::abi::RVE_UI_PROP_VALUE => {
+            value.kind = crate::abi::RVE_UI_VALUE_NUMBER;
+            value.number = 2.5;
+        }
+        crate::abi::RVE_UI_PROP_COLOR => {
+            value.kind = crate::abi::RVE_UI_VALUE_COLOR;
+            value.color = [1, 2, 3, 4];
+        }
+        _ => return crate::abi::RVE_UI_REJECTED,
+    }
+    // SAFETY: the guest passes a writable output slot; the text outlives this call.
+    unsafe { *out = value };
+    crate::abi::RVE_UI_OK
+}
+
+fn describe_ui_value(value: &RveUiValue) -> String {
+    match value.kind {
+        crate::abi::RVE_UI_VALUE_NUMBER => format!("number {}", value.number),
+        crate::abi::RVE_UI_VALUE_BOOL => format!("bool {}", value.flag),
+        crate::abi::RVE_UI_VALUE_INDEX => format!("index {}", value.integer),
+        crate::abi::RVE_UI_VALUE_TEXT => {
+            // SAFETY: the guest-side wrapper passes borrowed UTF-8 text for this call.
+            format!("text {}", unsafe { value.text.to_str() }.unwrap())
+        }
+        crate::abi::RVE_UI_VALUE_COLOR => format!("color {:?}", value.color),
+        _ => "none".to_owned(),
+    }
+}
+
+unsafe extern "C" fn ui_set(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    property: u32,
+    value: *const RveUiValue,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the guest passes a readable value for this call.
+    let description = describe_ui_value(unsafe { &*value });
+    state
+        .ui_calls
+        .push(format!("set {canvas} {element} {property} {description}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_get_rect(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    out: *mut RveUiRect,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    unsafe { ui_state(ctx) }
+        .ui_calls
+        .push(format!("get_rect {canvas} {element}"));
+    // SAFETY: the guest passes a writable output slot.
+    unsafe {
+        *out = RveUiRect {
+            anchor_min: [0.5, 0.5],
+            anchor_max: [0.5, 0.5],
+            pivot: [0.5, 0.5],
+            offset_min: [-10.0, -4.0],
+            offset_max: [10.0, 4.0],
+        };
+    }
+    crate::abi::RVE_UI_OK
+}
+
+unsafe extern "C" fn ui_set_rect(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    rect: *const RveUiRect,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the guest passes a readable rectangle for this call.
+    let rect = unsafe { *rect };
+    state.ui_calls.push(format!(
+        "set_rect {canvas} {element} {:?} {:?}",
+        rect.offset_min, rect.offset_max
+    ));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_set_options(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    options: *const RveStr,
+    count: usize,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the guest passes `count` readable strings for this call.
+    let options: Vec<&str> = unsafe { std::slice::from_raw_parts(options, count) }
+        .iter()
+        // SAFETY: the test passes valid UTF-8 options.
+        .map(|option| unsafe { option.to_str() }.unwrap())
+        .collect();
+    state
+        .ui_calls
+        .push(format!("set_options {canvas} {element} {options:?}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_set_image(
+    ctx: *mut c_void,
+    canvas: u64,
+    element: u32,
+    path: RveStr,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the test passes valid UTF-8 paths.
+    let path = unsafe { path.to_str() }.unwrap();
+    state
+        .ui_calls
+        .push(format!("set_image {canvas} {element} {path}"));
+    state.ui_status
+}
+
+unsafe extern "C" fn ui_focus(ctx: *mut c_void, canvas: u64, element: u32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push(format!("focus {canvas} {element}"));
+    state.ui_status
+}
+
+fn ui_host(state: &mut HostState) -> RveHost {
+    let mut host = self::host(state);
+    host.ui_open = Some(ui_open);
+    host.ui_close = Some(ui_close);
+    host.ui_object_canvas = Some(ui_object_canvas);
+    host.ui_focused = Some(ui_focused);
+    host.ui_pointer_over = Some(ui_pointer_over);
+    host.ui_find = Some(ui_find);
+    host.ui_get = Some(ui_get);
+    host.ui_set = Some(ui_set);
+    host.ui_get_rect = Some(ui_get_rect);
+    host.ui_set_rect = Some(ui_set_rect);
+    host.ui_set_options = Some(ui_set_options);
+    host.ui_set_image = Some(ui_set_image);
+    host.ui_focus = Some(ui_focus);
+    host
+}
+
+#[test]
+fn sdk_ui_api_reads_writes_and_decodes_host_values() {
+    let mut state = HostState {
+        ui_text: "hi".to_owned(),
+        ..HostState::default()
+    };
+    let host = ui_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    let ui = context.ui();
+    let canvas = ui.open("ui/menu.rveui").unwrap();
+    let label = ui.find(canvas, "label").unwrap().unwrap();
+    assert_eq!(ui.find(canvas, "missing"), Ok(None));
+    assert_eq!(ui.text(label), Ok("hi".to_owned()));
+    ui.set_text(label, "bye").unwrap();
+    assert_eq!(ui.value(label), Ok(Some(crate::UiValue::Number(2.5))));
+    ui.set_value(label, crate::UiValue::Index(1)).unwrap();
+    assert_eq!(ui.canvas_layer(canvas), Ok(5));
+    ui.set_canvas_visible(canvas, false).unwrap();
+    assert_eq!(ui.color(label), Ok([1, 2, 3, 4]));
+    ui.set_color(label, [9, 8, 7, 6]).unwrap();
+    ui.set_options(label, &["a", "b"]).unwrap();
+    ui.set_image(label, "/ui/icon.png").unwrap();
+    let rect = ui.rect(label).unwrap();
+    assert_eq!(rect.offset_max, [10.0, 4.0]);
+    ui.set_rect(label, rect).unwrap();
+    ui.focus(label).unwrap();
+    assert_eq!(ui.focused(), Some(label));
+    assert!(ui.pointer_over());
+    assert_eq!(
+        ui.canvas_of(object).map(|canvas| canvas.raw),
+        Some(UI_CANVAS)
+    );
+    ui.close(canvas).unwrap();
+    assert_eq!(
+        state.ui_calls,
+        [
+            "open ui/menu.rveui",
+            "find 7 label",
+            "find 7 missing",
+            "get 7 3 2",
+            "set 7 3 2 text bye",
+            "get 7 3 3",
+            "set 7 3 3 index 1",
+            "get 7 0 1",
+            "set 7 0 0 bool false",
+            "get 7 3 6",
+            "set 7 3 6 color [9, 8, 7, 6]",
+            "set_options 7 3 [\"a\", \"b\"]",
+            "set_image 7 3 /ui/icon.png",
+            "get_rect 7 3",
+            "set_rect 7 3 [-10.0, -4.0] [10.0, 4.0]",
+            "focus 7 3",
+            "focused",
+            "pointer_over",
+            "object_canvas 1",
+            "close 7",
+        ]
+    );
+}
+
+#[test]
+fn sdk_ui_api_reports_missing_callbacks_and_host_refusals() {
+    let mut bare = HostState::default();
+    let bare_host = self::host(&mut bare);
+    let mut properties = Params::new();
+    let context = Context::new(&bare_host, &mut properties).unwrap();
+    let object = context.find("camera").unwrap();
+    let ui = context.ui();
+    let canvas = crate::Canvas { raw: UI_CANVAS };
+    assert_eq!(ui.open("ui/menu.rveui"), Err(crate::UiError::Unavailable));
+    assert_eq!(ui.close(canvas), Err(crate::UiError::Unavailable));
+    assert_eq!(ui.canvas_of(object), None);
+    assert_eq!(ui.focused(), None);
+    assert!(!ui.pointer_over());
+    assert_eq!(ui.find(canvas, "label"), Err(crate::UiError::Unavailable));
+
+    let mut state = HostState {
+        ui_status: crate::abi::RVE_UI_REJECTED,
+        ..HostState::default()
+    };
+    let host = ui_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let ui = context.ui();
+    assert_eq!(ui.open("ui/menu.rveui"), Err(crate::UiError::Rejected));
+    let label = crate::Element {
+        canvas,
+        index: UI_LABEL,
+    };
+    assert_eq!(ui.set_text(label, "x"), Err(crate::UiError::Rejected));
+
+    state.ui_status = crate::abi::RVE_UI_INVALID_INPUT;
+    let host = ui_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    let ui = context.ui();
+    assert_eq!(
+        ui.set_value(label, crate::UiValue::Number(f64::NAN)),
+        Err(crate::UiError::InvalidInput)
+    );
+    assert_eq!(
+        ui.set_value(label, crate::UiValue::Index(usize::MAX)),
+        Err(crate::UiError::InvalidInput)
+    );
+}
+
+struct UiProbe;
+
+impl Script for UiProbe {
+    fn on_ui_event(&mut self, ctx: &mut Context<'_>, event: crate::UiEvent) {
+        ctx.log_info(format!(
+            "{:?} {} {} {:?}",
+            event.kind, event.element_id, event.element.index, event.value
+        ));
+    }
+}
+
+fn ui_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(UiProbe))
+}
+
+#[test]
+fn ui_events_reach_on_ui_event_with_decoded_values_and_reject_unknown_kinds() {
+    use crate::abi::{RVE_UI_EVENT_BLUR, RVE_UI_EVENT_VALUE_CHANGED, RveUiEvent, RveUiValue};
+    let mut state = HostState::default();
+    let host = ui_host(&mut state);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: the host and parameters remain valid for this synchronous creation call.
+    let status =
+        unsafe { crate::__private::create(&host, &params, &mut instance, ui_probe_factory) };
+    assert_eq!(status, RveStatus::Ok);
+
+    let number = RveUiValue {
+        kind: crate::abi::RVE_UI_VALUE_NUMBER,
+        flag: false,
+        number: 4.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    };
+    // SAFETY: the instance was created by this module and the event outlives the call.
+    let status = unsafe {
+        crate::__private::ui_event(
+            instance,
+            &host,
+            RveUiEvent {
+                kind: RVE_UI_EVENT_VALUE_CHANGED,
+                canvas: UI_CANVAS,
+                element: UI_LABEL,
+                element_id: RveStr::from_static("volume"),
+                value: number,
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    assert!(
+        state
+            .logs
+            .iter()
+            .any(|line| line == "ValueChanged volume 3 Some(Number(4.0))"),
+        "{:?}",
+        state.logs
+    );
+
+    // SAFETY: as above; a blur without a value has no payload.
+    let status = unsafe {
+        crate::__private::ui_event(
+            instance,
+            &host,
+            RveUiEvent {
+                kind: RVE_UI_EVENT_BLUR,
+                canvas: UI_CANVAS,
+                element: UI_LABEL,
+                element_id: RveStr::from_static("volume"),
+                value: empty_ui_value(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    assert!(state.logs.iter().any(|line| line == "Blur volume 3 None"));
+
+    // SAFETY: as above; an unknown kind is rejected by the guest without a panic.
+    let status = unsafe {
+        crate::__private::ui_event(
+            instance,
+            &host,
+            RveUiEvent {
+                kind: 99,
+                canvas: UI_CANVAS,
+                element: UI_LABEL,
+                element_id: RveStr::empty(),
+                value: empty_ui_value(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Error);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unknown ui event kind")
+    );
+    // SAFETY: the instance is dropped exactly once.
+    assert_eq!(
+        unsafe { crate::__private::drop_instance(instance) },
+        RveStatus::Ok
+    );
+}
+
+#[test]
+fn v19_component_structs_keep_their_documented_c_layout() {
+    use crate::abi::{
+        RveAudioPlayExParams, RveAudioSourceState, RveEnvironmentState, RveLightState,
+        RveMeshMaterialParams, RveProceduralSky,
+    };
+    use std::mem::{offset_of, size_of};
+
+    assert_eq!(size_of::<RveLightState>(), 52);
+    assert_eq!(offset_of!(RveLightState, ambient), 12);
+    assert_eq!(offset_of!(RveLightState, shadow_cascades), 44);
+    assert_eq!(offset_of!(RveLightState, shadows), 48);
+    assert_eq!(offset_of!(RveLightState, enabled), 49);
+
+    assert_eq!(size_of::<RveProceduralSky>(), 44);
+    assert_eq!(offset_of!(RveProceduralSky, horizon_color), 12);
+    assert_eq!(offset_of!(RveProceduralSky, sun_size_deg), 36);
+    assert_eq!(offset_of!(RveProceduralSky, sun_intensity), 40);
+
+    assert_eq!(size_of::<RveEnvironmentState>(), 52);
+    assert_eq!(offset_of!(RveEnvironmentState, has_sky), 4);
+    assert_eq!(offset_of!(RveEnvironmentState, sky), 8);
+
+    assert_eq!(size_of::<RveMeshMaterialParams>(), 36);
+    assert_eq!(offset_of!(RveMeshMaterialParams, base_color), 4);
+    assert_eq!(offset_of!(RveMeshMaterialParams, metallic), 28);
+    assert_eq!(offset_of!(RveMeshMaterialParams, roughness), 32);
+
+    assert_eq!(size_of::<RveAudioSourceState>(), 36);
+    assert_eq!(offset_of!(RveAudioSourceState, rolloff), 24);
+    assert_eq!(offset_of!(RveAudioSourceState, pitch), 28);
+    assert_eq!(offset_of!(RveAudioSourceState, force_mono), 32);
+
+    assert_eq!(size_of::<RveAudioPlayExParams>(), 48);
+    assert_eq!(offset_of!(RveAudioPlayExParams, position), 12);
+    assert_eq!(offset_of!(RveAudioPlayExParams, follow), 24);
+    assert_eq!(offset_of!(RveAudioPlayExParams, spatial_blend), 32);
+    assert_eq!(offset_of!(RveAudioPlayExParams, force_mono), 44);
+}
+
+/// Kind, title and `(name, extensions)` filters of the last opened dialog.
+type ProbeDialog = (u32, String, Vec<(String, Vec<String>)>);
+
+#[derive(Default)]
+struct PlatformProbe {
+    fullscreen: bool,
+    screenshot: Option<String>,
+    dialog: Option<ProbeDialog>,
+    done: bool,
+    paths: Vec<String>,
+}
+
+unsafe extern "C" fn probe_fullscreen(ctx: *mut c_void, out: *mut bool) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe and out at a local bool.
+    unsafe { *out = (*ctx.cast::<PlatformProbe>()).fullscreen };
+    true
+}
+
+unsafe extern "C" fn probe_set_fullscreen(ctx: *mut c_void, fullscreen: bool) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe.
+    unsafe { (*ctx.cast::<PlatformProbe>()).fullscreen = fullscreen };
+    true
+}
+
+unsafe extern "C" fn probe_screenshot(ctx: *mut c_void, path: RveStr) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe; the SDK keeps path alive.
+    unsafe { (*ctx.cast::<PlatformProbe>()).screenshot = Some(path.to_str().unwrap().to_owned()) };
+    true
+}
+
+unsafe extern "C" fn probe_dialog_open(
+    ctx: *mut c_void,
+    dialog: *const crate::abi::RveFileDialog,
+    out: *mut u64,
+) -> bool {
+    // SAFETY: the SDK passes a dialog whose borrowed arrays live during this call.
+    let dialog = unsafe { &*dialog };
+    let filters = (0..dialog.filter_count)
+        .map(|index| {
+            // SAFETY: index is below filter_count.
+            let filter = unsafe { &*dialog.filters.add(index) };
+            let extensions = (0..filter.extension_count)
+                // SAFETY: index is below extension_count and strings are live.
+                .map(|index| {
+                    unsafe { (*filter.extensions.add(index)).to_str() }
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            // SAFETY: the filter name is live during this call.
+            (
+                unsafe { filter.name.to_str() }.unwrap().to_owned(),
+                extensions,
+            )
+        })
+        .collect();
+    // SAFETY: the test points ctx at a live PlatformProbe; title is live during this call.
+    unsafe {
+        (*ctx.cast::<PlatformProbe>()).dialog = Some((
+            dialog.kind,
+            dialog.title.to_str().unwrap().to_owned(),
+            filters,
+        ));
+        *out = 7;
+    }
+    true
+}
+
+unsafe extern "C" fn probe_dialog_poll(
+    ctx: *mut c_void,
+    id: u64,
+    paths: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+    done: *mut bool,
+) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe.
+    let probe = unsafe { &*ctx.cast::<PlatformProbe>() };
+    if id != 7 {
+        return false;
+    }
+    // SAFETY: the SDK passes valid output pointers.
+    unsafe {
+        *done = probe.done;
+        *count = if probe.done { probe.paths.len() } else { 0 };
+    }
+    for (index, path) in probe.paths.iter().enumerate().take(capacity) {
+        // SAFETY: the SDK provides capacity output slots.
+        unsafe { *paths.add(index) = RveStr::from_str_ref(path) };
+    }
+    true
+}
+
+#[test]
+fn sdk_window_and_file_dialog_api_round_trips_through_the_host() {
+    use crate::{FileDialog, FileDialogKind, FileDialogPoll};
+    let mut state = HostState::default();
+    let mut probe = PlatformProbe::default();
+    let mut host = host(&mut state);
+    host.ctx = (&mut probe as *mut PlatformProbe).cast();
+    host.window_fullscreen = Some(probe_fullscreen);
+    host.window_set_fullscreen = Some(probe_set_fullscreen);
+    host.window_screenshot = Some(probe_screenshot);
+    host.file_dialog_open = Some(probe_dialog_open);
+    host.file_dialog_poll = Some(probe_dialog_poll);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+
+    assert!(!context.is_fullscreen());
+    assert!(context.set_fullscreen(true));
+    assert!(context.is_fullscreen());
+    assert!(context.take_screenshot(None));
+    let id = context
+        .open_file_dialog(
+            &FileDialog::new(FileDialogKind::OpenFiles)
+                .title("Open map")
+                .filter("Maps", &["map", "json"]),
+        )
+        .unwrap();
+    assert_eq!(id.get(), 7);
+    assert_eq!(context.poll_file_dialog(id), Some(FileDialogPoll::Pending));
+    drop(context);
+
+    assert_eq!(probe.screenshot.as_deref(), Some(""));
+    assert_eq!(
+        probe.dialog,
+        Some((
+            crate::abi::RVE_FILE_DIALOG_OPEN_FILES,
+            "Open map".to_owned(),
+            vec![("Maps".to_owned(), vec!["map".to_owned(), "json".to_owned()])]
+        ))
+    );
+    probe.done = true;
+    probe.paths = vec!["/maps/a.map".to_owned(), "/maps/b.map".to_owned()];
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(
+        context.poll_file_dialog(id),
+        Some(FileDialogPoll::Done(vec![
+            "/maps/a.map".into(),
+            "/maps/b.map".into()
+        ]))
+    );
+}
+
+#[test]
+fn sdk_window_api_reports_hosts_without_platform_callbacks() {
+    use crate::{FileDialog, FileDialogKind};
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert!(!context.is_fullscreen());
+    assert!(!context.set_fullscreen(true));
+    assert!(!context.take_screenshot(Some("shot.png")));
+    assert!(
+        context
+            .open_file_dialog(&FileDialog::new(FileDialogKind::PickFolder))
+            .is_none()
     );
 }
