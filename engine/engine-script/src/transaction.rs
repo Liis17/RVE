@@ -7,6 +7,10 @@ use crate::lifecycle::{
 use crate::lite::EventQueue;
 use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::{BindingUpdate, PhysicsScriptState};
+use crate::platform::{
+    DialogPoll, FileDialogRequest, MAX_OPEN_DIALOGS, MAX_PLATFORM_REQUESTS, PlatformRequest,
+    SharedPlatformState,
+};
 use crate::scene_state::{SharedSceneState, check_scene_request};
 use crate::script_refs::{ScriptRefError, ScriptRefs, coerce_property, find_entry, find_serial};
 use crate::timeline::{CoroutineWait, ScriptCoroutine, ScriptTimeline, TimelineOp, TimerCallback};
@@ -42,6 +46,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
@@ -306,6 +311,12 @@ pub(crate) struct ScriptTransaction {
     scene_state: SharedSceneState,
     /// Запрос `rve.scene.load` этого вызова; переносится в состояние хоста при коммите.
     pending_scene_request: Option<String>,
+    /// Состояние окна и диалогов хоста; меняется только при коммите.
+    platform: SharedPlatformState,
+    /// Запросы окна и диалогов этого вызова.
+    pending_platform: Vec<PlatformRequest>,
+    /// Диалоги, чей готовый результат прочитан этим вызовом; удаляются при коммите.
+    pending_dialog_reads: Vec<u64>,
     /// Записи свойств чужих и своих экземпляров; применяются при коммите и синхронизируют Lua.
     pending_properties: Vec<PropertyWrite>,
     /// Заявки `enabled` для экземпляров по серийному номеру; применяются на границе фазы.
@@ -737,6 +748,9 @@ impl Default for ScriptTransaction {
             script_refs: ScriptRefs::default(),
             scene_state: SharedSceneState::default(),
             pending_scene_request: None,
+            platform: SharedPlatformState::default(),
+            pending_platform: Vec::new(),
+            pending_dialog_reads: Vec::new(),
             pending_properties: Vec::new(),
             pending_remote_enabled: Vec::new(),
             instance_enabled: true,
@@ -965,6 +979,8 @@ impl ScriptTransaction {
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
         self.pending_rumble.clear();
+        self.pending_platform.clear();
+        self.pending_dialog_reads.clear();
         self.pending_animation.clear();
         self.net = init.net;
         self.queued_net = init.queued_net;
@@ -2820,6 +2836,86 @@ impl ScriptTransaction {
         Ok(())
     }
 
+    pub(crate) fn attach_platform_state(&mut self, state: SharedPlatformState) {
+        self.platform = state;
+    }
+
+    /// Полноэкранный режим с учётом запроса этого вызова.
+    pub(crate) fn window_fullscreen(&self) -> bool {
+        self.pending_platform
+            .iter()
+            .rev()
+            .find_map(|request| match request {
+                PlatformRequest::SetFullscreen(fullscreen) => Some(*fullscreen),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.platform.borrow().fullscreen)
+    }
+
+    fn stage_platform(&mut self, request: PlatformRequest) -> Result<(), String> {
+        if !self.writable {
+            return Err(
+                "window and dialog requests are unavailable during script creation".to_owned(),
+            );
+        }
+        let queued = self.platform.borrow().queued_requests();
+        if queued + self.pending_platform.len() >= MAX_PLATFORM_REQUESTS {
+            return Err(format!(
+                "window and dialog requests limit ({MAX_PLATFORM_REQUESTS}) reached"
+            ));
+        }
+        self.pending_platform.push(request);
+        Ok(())
+    }
+
+    pub(crate) fn request_fullscreen(&mut self, fullscreen: bool) -> Result<(), String> {
+        self.stage_platform(PlatformRequest::SetFullscreen(fullscreen))
+    }
+
+    pub(crate) fn request_screenshot(&mut self, path: Option<PathBuf>) -> Result<(), String> {
+        self.stage_platform(PlatformRequest::Screenshot(path))
+    }
+
+    /// Ставит системный диалог и возвращает его идентификатор для `poll_file_dialog`.
+    pub(crate) fn open_file_dialog(&mut self, request: FileDialogRequest) -> Result<u64, String> {
+        let request = request.normalized()?;
+        let staged = self
+            .pending_platform
+            .iter()
+            .filter(|request| matches!(request, PlatformRequest::FileDialog { .. }))
+            .count();
+        if self.platform.borrow().open_dialogs() + staged >= MAX_OPEN_DIALOGS {
+            return Err(format!(
+                "open file dialogs limit ({MAX_OPEN_DIALOGS}) reached; poll finished dialogs first"
+            ));
+        }
+        // Идентификатор выделяется сразу: после отказа вызова он просто не используется.
+        let id = self.platform.borrow_mut().allocate_dialog();
+        self.stage_platform(PlatformRequest::FileDialog { id, request })?;
+        Ok(id)
+    }
+
+    /// Результат диалога: `None`, пока он открыт. Готовый результат удаляется при коммите.
+    pub(crate) fn poll_file_dialog(&mut self, id: u64) -> Result<Option<Vec<PathBuf>>, String> {
+        if !self.writable {
+            return Err("file dialogs are unavailable during script creation".to_owned());
+        }
+        if self.pending_platform.iter().any(
+            |request| matches!(request, PlatformRequest::FileDialog { id: staged, .. } if *staged == id),
+        ) {
+            return Ok(None);
+        }
+        match self.platform.borrow().poll(id)? {
+            DialogPoll::Pending => Ok(None),
+            DialogPoll::Done(paths) => {
+                if !self.pending_dialog_reads.contains(&id) {
+                    self.pending_dialog_reads.push(id);
+                }
+                Ok(Some(paths))
+            }
+        }
+    }
+
     /// Имя текущей сцены.
     pub(crate) fn current_scene(&self) -> String {
         self.scene_state.borrow().current.clone()
@@ -3443,6 +3539,10 @@ impl ScriptTransaction {
         if let Some(path) = self.pending_scene_request.take() {
             self.scene_state.borrow_mut().request = Some(path);
         }
+        self.platform.borrow_mut().commit(
+            std::mem::take(&mut self.pending_platform),
+            &std::mem::take(&mut self.pending_dialog_reads),
+        );
         let writes = std::mem::take(&mut self.pending_properties);
         {
             let mut refs = self.script_refs.borrow_mut();
@@ -3519,6 +3619,8 @@ impl ScriptTransaction {
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
         self.pending_rumble.clear();
+        self.pending_platform.clear();
+        self.pending_dialog_reads.clear();
         self.pending_animation.clear();
         self.pending_net.clear();
         self.world = std::ptr::null();

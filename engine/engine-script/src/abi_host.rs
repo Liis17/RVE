@@ -1,7 +1,12 @@
 mod components;
+mod platform;
 mod scenes;
 mod script_refs;
 
+use platform::{
+    host_file_dialog_open, host_file_dialog_poll, host_window_fullscreen, host_window_screenshot,
+    host_window_set_fullscreen,
+};
 use scenes::{host_scene_current, host_scene_load};
 use script_refs::{
     host_object_script, host_script_ref_enabled, host_script_ref_get, host_script_ref_send,
@@ -100,6 +105,8 @@ pub(crate) struct AbiCallContext<'a> {
     poisoned: bool,
     save_values: Vec<OwnedAbiValue>,
     save_keys: Vec<String>,
+    /// Пути последнего `file_dialog_poll`; живут до конца callback.
+    dialog_paths: Vec<String>,
 }
 
 pub(crate) struct AbiScriptCall<'a> {
@@ -143,6 +150,7 @@ impl<'a> AbiCallContext<'a> {
             poisoned: false,
             save_values: Vec::new(),
             save_keys: Vec::new(),
+            dialog_paths: Vec::new(),
         }
     }
 
@@ -169,6 +177,7 @@ impl<'a> AbiCallContext<'a> {
             poisoned: false,
             save_values: Vec::new(),
             save_keys: Vec::new(),
+            dialog_paths: Vec::new(),
         }
     }
 
@@ -411,6 +420,11 @@ impl<'a> AbiCallContext<'a> {
             script_ref_set_enabled: Some(host_script_ref_set_enabled),
             scene_load: Some(host_scene_load),
             scene_current: Some(host_scene_current),
+            window_fullscreen: Some(host_window_fullscreen),
+            window_set_fullscreen: Some(host_window_set_fullscreen),
+            window_screenshot: Some(host_window_screenshot),
+            file_dialog_open: Some(host_file_dialog_open),
+            file_dialog_poll: Some(host_file_dialog_poll),
         }
     }
 

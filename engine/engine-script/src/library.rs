@@ -846,7 +846,7 @@ mod abi22_compat_tests {
 
     #[test]
     fn abi21_and_abi20_two_descriptor_tables_use_the_historical_stride() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         let current = rve_sdk::script_module! {
             "Probe" => probe,
             "SecondProbe" => second_probe,

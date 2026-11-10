@@ -967,6 +967,7 @@ fn sdk_module() -> &'static RveModule {
         "InvalidScriptRefProbe" => invalid_script_ref_factory,
         "StaleScriptRefProbe" => stale_script_ref_factory,
         "ScriptRefProbe" => script_ref_probe_factory,
+        "PlatformProbe" => platform_probe_factory,
         "PropertyProbe" => property_probe_factory {
             speed: f32 = 1.5 (0.0..=10.0),
         },
@@ -6470,4 +6471,95 @@ fn legacy_library(abi_version: u32) -> crate::ScriptLibrary {
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
     assert_eq!(library.abi_version(), abi_version);
     library
+}
+
+/// Heavy probe for window requests and file dialogs.
+struct PlatformProbe {
+    frame: u32,
+    dialog: Option<rve_sdk::FileDialogId>,
+}
+
+fn platform_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PlatformProbe {
+        frame: 0,
+        dialog: None,
+    }))
+}
+
+impl Script for PlatformProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        self.frame += 1;
+        if self.frame == 1 {
+            assert!(!ctx.is_fullscreen());
+            assert!(ctx.set_fullscreen(true));
+            assert!(ctx.is_fullscreen());
+            assert!(ctx.take_screenshot(None));
+            self.dialog = ctx.open_file_dialog(
+                &rve_sdk::FileDialog::new(rve_sdk::FileDialogKind::OpenFiles)
+                    .title("Open")
+                    .filter("Maps", &["map"]),
+            );
+            let id = self.dialog.expect("dialog id");
+            assert_eq!(
+                ctx.poll_file_dialog(id),
+                Some(rve_sdk::FileDialogPoll::Pending)
+            );
+        } else if let Some(id) = self.dialog.take() {
+            match ctx.poll_file_dialog(id) {
+                Some(rve_sdk::FileDialogPoll::Done(paths)) => {
+                    ctx.log_info(format!("picked {}", paths.len()));
+                }
+                other => ctx.log_info(format!("unexpected {other:?}")),
+            }
+        } else {
+            ctx.log_info(format!("fullscreen {}", ctx.is_fullscreen()));
+        }
+    }
+}
+
+#[test]
+fn abi_window_and_dialog_requests_round_trip_through_the_host() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "PlatformProbe"
+"#,
+    );
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let first = host.drain_events();
+    assert!(
+        first
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{first:?}"
+    );
+    let requests = host.take_platform_requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert_eq!(requests[0], crate::PlatformRequest::SetFullscreen(true));
+    assert_eq!(requests[1], crate::PlatformRequest::Screenshot(None));
+    let crate::PlatformRequest::FileDialog { id, request } = &requests[2] else {
+        panic!("expected a file dialog: {requests:?}");
+    };
+    assert_eq!(request.kind, crate::FileDialogKind::OpenFiles);
+    assert_eq!(request.filters[0].extensions, ["map"]);
+
+    host.complete_file_dialog(
+        *id,
+        vec![
+            std::path::PathBuf::from("a.map"),
+            std::path::PathBuf::from("b.map"),
+        ],
+    );
+    host.set_window_fullscreen(true);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"picked 2".to_owned()));
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(message_list(&mut host).contains(&"fullscreen true".to_owned()));
 }

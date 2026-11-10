@@ -25,7 +25,8 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 21 appends transactional save callbacks after the v20 host tail.
 /// Version 22 appends script-reference and scene callbacks after the v21 host tail, and the
 /// nullable `set_property` callback after the v20 descriptor tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 22;
+/// Version 23 appends window and file dialog callbacks after the v22 host tail.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 23;
 
 /// Validate an external property write before any `Script::set_property` hook runs.
 pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
@@ -69,6 +70,15 @@ pub const RVE_TONEMAPPER_ACES: u32 = 0;
 pub const RVE_TONEMAPPER_NEUTRAL: u32 = 1;
 /// Camera tonemapper code for [`RveCameraSettings::tonemapper`].
 pub const RVE_TONEMAPPER_NONE: u32 = 2;
+
+/// File dialog kind for [`RveFileDialog::kind`]: pick one existing file.
+pub const RVE_FILE_DIALOG_OPEN_FILE: u32 = 0;
+/// File dialog kind for [`RveFileDialog::kind`]: pick several existing files.
+pub const RVE_FILE_DIALOG_OPEN_FILES: u32 = 1;
+/// File dialog kind for [`RveFileDialog::kind`]: choose a path to save a file.
+pub const RVE_FILE_DIALOG_SAVE_FILE: u32 = 2;
+/// File dialog kind for [`RveFileDialog::kind`]: pick a folder.
+pub const RVE_FILE_DIALOG_PICK_FOLDER: u32 = 3;
 
 /// Input state bit: the key or button is currently held.
 pub const RVE_INPUT_DOWN: u32 = 1;
@@ -1942,7 +1952,68 @@ pub struct RveHost {
     pub scene_load: Option<RveSceneLoadFn>,
     /// Writes the current scene name as a call-scoped string value. Appended in ABI v22.
     pub scene_current: Option<RveSceneCurrentFn>,
+    /// Reads whether the window is in borderless fullscreen. Appended in ABI v23.
+    pub window_fullscreen: Option<RveWindowFullscreenFn>,
+    /// Stages a borderless fullscreen change for the end of the frame. Appended in ABI v23.
+    pub window_set_fullscreen: Option<RveWindowSetFullscreenFn>,
+    /// Stages a PNG screenshot of the window; an empty path selects the default folder.
+    /// Appended in ABI v23.
+    pub window_screenshot: Option<RveWindowScreenshotFn>,
+    /// Stages a system file dialog and writes its nonzero id. Appended in ABI v23.
+    pub file_dialog_open: Option<RveFileDialogOpenFn>,
+    /// Reads a file dialog result by id. Appended in ABI v23.
+    pub file_dialog_poll: Option<RveFileDialogPollFn>,
 }
+
+/// One extension filter of [`RveFileDialog`]; extensions are given without a dot. Appended in
+/// ABI v23.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RveFileDialogFilter {
+    pub name: RveStr,
+    pub extensions: *const RveStr,
+    pub extension_count: usize,
+}
+
+/// System file dialog parameters; empty strings leave the choice to the system. Appended in
+/// ABI v23.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RveFileDialog {
+    /// One of the `RVE_FILE_DIALOG_*` kinds.
+    pub kind: u32,
+    pub title: RveStr,
+    /// Initial folder.
+    pub directory: RveStr,
+    /// Suggested file name.
+    pub file_name: RveStr,
+    pub filters: *const RveFileDialogFilter,
+    pub filter_count: usize,
+}
+
+/// Writes the window fullscreen state into `out`. Appended in ABI v23.
+pub type RveWindowFullscreenFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut bool) -> bool;
+/// Stages a borderless fullscreen change. Appended in ABI v23.
+pub type RveWindowSetFullscreenFn =
+    unsafe extern "C" fn(ctx: *mut c_void, fullscreen: bool) -> bool;
+/// Stages a window screenshot saved as PNG at `path`, or in the default folder for an empty
+/// path. Appended in ABI v23.
+pub type RveWindowScreenshotFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
+/// Stages a file dialog; on success writes its nonzero id into `out`. Appended in ABI v23.
+pub type RveFileDialogOpenFn =
+    unsafe extern "C" fn(ctx: *mut c_void, dialog: *const RveFileDialog, out: *mut u64) -> bool;
+/// Reads a file dialog result. `done` is false while the dialog is open. Once done, selected
+/// paths are copied into `paths` (up to `capacity`), `count` receives their total number (zero
+/// when cancelled) and the result is consumed when the calling script callback succeeds.
+/// Strings remain valid until the calling guest callback ends. Appended in ABI v23.
+pub type RveFileDialogPollFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    id: u64,
+    paths: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+    done: *mut bool,
+) -> bool;
 
 /// Copies one save value into the output; the value is valid until the calling script callback ends.
 pub type RveSaveGetFn =
@@ -2770,7 +2841,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2824,7 +2895,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -2851,7 +2922,7 @@ mod tests {
     fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
         use std::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(size_of::<super::RveScriptTime>(), 40);
         assert_eq!(align_of::<super::RveScriptTime>(), 8);
@@ -2920,7 +2991,7 @@ mod tests {
     fn abi21_callbacks_append_after_the_abi20_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(
             offset_of!(super::RveHost, save_set),
             offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()
@@ -2986,9 +3057,42 @@ mod tests {
             offset_of!(super::RveHost, scene_load) + size_of::<Option<super::RveSceneLoadFn>>()
         );
         assert_eq!(
-            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, window_fullscreen),
             offset_of!(super::RveHost, scene_current)
                 + size_of::<Option<super::RveSceneCurrentFn>>()
         );
+    }
+
+    #[test]
+    fn abi23_window_and_dialog_callbacks_append_after_the_abi22_host_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+        let pointer = size_of::<usize>();
+        assert_eq!(size_of::<Option<super::RveWindowFullscreenFn>>(), pointer);
+        assert_eq!(
+            offset_of!(super::RveHost, window_set_fullscreen),
+            offset_of!(super::RveHost, window_fullscreen) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, window_screenshot),
+            offset_of!(super::RveHost, window_set_fullscreen) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, file_dialog_open),
+            offset_of!(super::RveHost, window_screenshot) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, file_dialog_poll),
+            offset_of!(super::RveHost, file_dialog_open) + pointer
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, file_dialog_poll) + pointer
+        );
+        assert_eq!(offset_of!(super::RveFileDialog, title), pointer);
+        assert_eq!(size_of::<super::RveFileDialog>(), pointer * 9);
+        assert_eq!(size_of::<super::RveFileDialogFilter>(), pointer * 4);
+        assert_eq!(super::RVE_FILE_DIALOG_PICK_FOLDER, 3);
     }
 }
