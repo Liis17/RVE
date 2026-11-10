@@ -13,6 +13,9 @@ pub const MAX_SHAPE_CAST_ITERATIONS: usize = 32;
 /// Допуск сходимости conservative advancement: расстояние в пределах `skin` с округлением
 /// float не должно растягивать каждую итерацию на доли 1e-9 до исчерпания лимита.
 const CAST_DISTANCE_TOLERANCE: f32 = 1.0e-5;
+/// Минимальный косинус между смещением и нормалью, при котором касание в пределах skin считается
+/// попаданием. Меньший угол — скольжение вдоль поверхности.
+const GRAZING_APPROACH: f32 = 1.0e-3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryFilter {
@@ -345,6 +348,36 @@ impl QuerySnapshot {
         Ok(bodies)
     }
 
+    /// Самое глубокое проникновение выпуклой формы в static или kinematic коллайдер:
+    /// нормаль от формы к препятствию и глубина. Dynamic-тела разводит solver, а не запрос.
+    pub(crate) fn deepest_static_penetration(
+        &self,
+        shape: &Shape,
+        pose: Pose,
+        filter: QueryFilter,
+        overrides: QueryOverrides<'_>,
+    ) -> Result<Option<(Vec3, f32)>, QueryError> {
+        let bounds = shape.aabb(pose)?;
+        let mut deepest: Option<(Vec3, f32)> = None;
+        for index in self.candidates(bounds, filter, overrides)? {
+            let collider = &self.colliders[index];
+            if collider.body_kind == BodyKind::Dynamic {
+                continue;
+            }
+            let Some(manifold) = collide(shape, pose, &collider.shape, collider.pose)? else {
+                continue;
+            };
+            let depth = manifold
+                .contacts
+                .iter()
+                .fold(0.0_f32, |depth, contact| depth.max(contact.penetration));
+            if deepest.is_none_or(|(_, old)| depth > old) {
+                deepest = Some((manifold.normal, depth));
+            }
+        }
+        Ok(deepest)
+    }
+
     pub fn shape_cast(
         &self,
         shape: &Shape,
@@ -577,9 +610,14 @@ fn conservative_advance(
             return Err(QueryError::InvalidCast);
         }
         if distance.distance <= skin + tolerance {
-            return Ok(
-                (displacement.dot(distance.normal) > 0.0).then_some((fraction as f32, distance))
-            );
+            // Касательное движение вдоль поверхности в пределах skin не попадание: шум нормали
+            // (~1e-7) иначе даёт попадание на fraction 0, которое перекрывает настоящее препятствие.
+            // Заход остатка смещения за разделяющую плоскость ограничен половиной зазора, поэтому
+            // длинный почти касательный бросок не входит в выпуклое препятствие.
+            let approach = displacement.dot(distance.normal);
+            let grazing = approach <= GRAZING_APPROACH * displacement.length()
+                && approach * (1.0 - fraction as f32) <= 0.5 * distance.distance;
+            return Ok((!grazing && approach > 0.0).then_some((fraction as f32, distance)));
         }
         let closing_speed = displacement.dot(distance.normal) as f64;
         if closing_speed <= 0.0 {
@@ -786,6 +824,44 @@ mod tests {
         .expect("cast must converge at skin contact");
         let (fraction, _) = contact.expect("approaching contact must be reported");
         assert_eq!(fraction, 0.0);
+    }
+
+    #[test]
+    fn grazing_motion_along_a_touching_surface_is_not_a_hit() {
+        // Капсула стоит на полу в пределах skin и идёт вдоль него; шум нормали пола даёт
+        // крошечную положительную проекцию. Это скольжение, а не попадание на fraction 0.
+        let skin = 0.02;
+        let noisy_floor = DistanceResult {
+            distance: skin,
+            normal: Vec3::new(3.0e-7, -1.0, 0.0).normalize(),
+            point_a: Vec3::ZERO,
+            point_b: Vec3::ZERO,
+        };
+        let along = super::conservative_advance(
+            Vec3::X * 0.066,
+            skin,
+            super::CAST_DISTANCE_TOLERANCE,
+            |_| Ok(noisy_floor),
+        )
+        .unwrap();
+        assert!(along.is_none(), "{along:?}");
+        let into = super::conservative_advance(
+            Vec3::new(0.066, -0.003, 0.0),
+            skin,
+            super::CAST_DISTANCE_TOLERANCE,
+            |_| Ok(noisy_floor),
+        )
+        .unwrap();
+        assert_eq!(into.map(|(fraction, _)| fraction), Some(0.0));
+        // Длинный бросок под тем же малым углом зашёл бы в пол глубже зазора: это попадание.
+        let long = super::conservative_advance(
+            Vec3::new(50.0, -0.04, 0.0),
+            skin,
+            super::CAST_DISTANCE_TOLERANCE,
+            |_| Ok(noisy_floor),
+        )
+        .unwrap();
+        assert_eq!(long.map(|(fraction, _)| fraction), Some(0.0));
     }
 
     #[test]
