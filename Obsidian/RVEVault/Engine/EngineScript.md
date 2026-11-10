@@ -175,6 +175,14 @@ Lua `rve.physics.raycast(origin, direction, max_distance, options?)` возвр�
 - `ref:enabled()` и `ref:set_enabled(bool)` читают и меняют флаг `user_enabled` выбранного экземпляра; изменение применяется на границе фазы, как у `self.script:set_enabled`.
 - Lua и ABI используют один справочник (`script_refs.rs`) и одну транзакцию. Ошибки get/set/enabled ABI ScriptRef сохраняют текст причины для случая, когда callback сам завершается ошибкой; документированные `None`/`false` продолжают возвращаться без принудительного отказа callback. Недекодируемое значение в ABI-вызове остаётся фатальной ошибкой вызова.
 
+## Окно, файлы и системные диалоги
+
+`src/platform.rs` хранит общее с транзакциями `PlatformState` (как `scene_state.rs`), `src/platform_lua.rs` — Lua API, `src/abi_host/platform.rs` — ABI v24 ([[Engine/RveSdk]]).
+
+- `rve.fs.read/write/append/exists/is_dir/list/create_dir` работают с диском сразу и без ограничений путей (относительные — от рабочего каталога процесса); данные — байтовые Lua-строки. Ошибки ввода-вывода возвращаются как `nil, message`, неверные аргументы поднимают ошибку. Запись файла не откатывается при отказе вызова.
+- `rve.window.fullscreen()`, `set_fullscreen(bool)`, `screenshot([path])` и `rve.dialog.open_file/open_files/save_file/pick_folder([options])` транзакционны: запросы применяются при коммите и выдаются вызывающему коду `ScriptHost::take_platform_requests` (`PlatformRequest`). Недоступны во время `create`. `fullscreen()` сначала видит запрос текущего вызова, затем значение `set_window_fullscreen` хоста.
+- Диалог сразу получает id; `rve.dialog.poll(id)` возвращает `nil`, пока результат не передан `complete_file_dialog`, затем таблицу путей (пустую при отмене). Прочитанный результат удаляется при коммите вызова, поэтому отказавший вызов его не теряет, а повторное чтение после успешного — ошибка неизвестного id. Ограничения: не больше 16 ожидающих запросов и 8 непрочитанных диалогов.
+
 ## Lua sandbox и ошибки
 
 Зависимость `mlua` закреплена как `=0.12.2` с features `lua54` и `vendored`; системный Lua не нужен. Lua base library открыта библиотекой mlua; дополнительно загружаются table, string, math, utf8 и coroutine. `coroutine` открыта; `io`, `os`, `package`, `debug`, `dofile`, `loadfile` и `require` недоступны. `load` принимает только текстовые чанки с режимом `t`; без явного окружения загруженный chunk использует `_ENV` своего файла. Бинарный bytecode отклоняется.

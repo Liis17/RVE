@@ -577,6 +577,15 @@ pub(crate) fn create_lua(
     rve.set("audio", audio_table(&lua, active_call.clone())?)?;
     rve.set("net", net_table(&lua, active_call.clone())?)?;
     rve.set("ui", ui_lua::ui_table(&lua, active_call.clone())?)?;
+    rve.set("fs", crate::platform_lua::fs_table(&lua)?)?;
+    rve.set(
+        "window",
+        crate::platform_lua::window_table(&lua, active_call.clone())?,
+    )?;
+    rve.set(
+        "dialog",
+        crate::platform_lua::dialog_table(&lua, active_call.clone())?,
+    )?;
     rve.set("input", input_table(&lua, active_call)?)?;
     globals.set("rve", rve)?;
     lua.load(

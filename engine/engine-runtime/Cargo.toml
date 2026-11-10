@@ -1,6 +1,6 @@
 [package]
 name = "engine-runtime"
-version = "0.28.0"
+version = "0.29.0"
 edition.workspace = true
 license.workspace = true
 
@@ -37,6 +37,8 @@ epaint = "=0.36.2"
 flume.workspace = true
 glam.workspace = true
 log.workspace = true
+png.workspace = true
+rfd.workspace = true
 sysinfo.workspace = true
 winit = { workspace = true, optional = true }
 

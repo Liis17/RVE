@@ -97,6 +97,14 @@ Parent: [[Index]]
 - `cancel_capture` переводит тикет в `Cancelled` до отправки. Для отправленного тикета помечается только результат, без раннего освобождения staging-буфера.
 - `free_viewport` переводит ожидающие тикеты этого viewport в ошибку: очередь получает `InvalidTexture`, отправленные — `InvalidState`. Потеря синхронизации слотов или сбой записи кадра переводят тикеты в `InvalidState`.
 
+## Захват окна
+
+`Renderer::request_window_capture()` ставит тикет на изображение swapchain, которое покажет следующий успешно записанный кадр; обслуживают оба пути — `render_frame*` и `render_frame_with_ui*`. Результат — непрозрачный RGBA8 (альфа принудительно 255) размера swapchain, включая UI кадра; выдаётся тем же `take_captures`, жизненный цикл тикета как у захвата viewport (`CaptureRecord::viewport = None`).
+
+- Swapchain создаётся с `TRANSFER_SRC`, только если surface его поддерживает (флаг `SwapchainBundle::transfer_src`); иначе тикет сразу получает `Unsupported`. Поддерживаются только 8-битные `B8G8R8A8`/`R8G8B8A8` (sRGB и UNORM); другой формат — `Unsupported`.
+- При запросе последний проход вывода (`record_output_pass` или `record_ui`) вместо барьера в `PRESENT_SRC_KHR` выполняет `record_present_copies`: `COLOR_ATTACHMENT_OPTIMAL → TRANSFER_SRC_OPTIMAL`, копии в host-буферы, host-read барьер, `→ PRESENT_SRC_KHR`. Без запросов кадр записывается как прежде.
+- Ошибка выделения буфера завершает только захват; кадр рисуется. Сбой записи кадра переводит подготовленные захваты в `InvalidState`. Использует runtime для F12 и `rve.window.screenshot` ([[Engine/EngineRuntime]]).
+
 ## Skinning
 
 - Compute-проход `skin.comp` выполняется до теней и основной сцены: один dispatch на уникальный `SkinId` за вызов `render_frame*`, даже если им пользуются несколько scenes (Scene и Game в редакторе). Разные палитры для одного `SkinId` в одном вызове дают `InvalidConfig`.

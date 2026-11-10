@@ -23,6 +23,15 @@ pub fn save_data_path(application: &str) -> Option<PathBuf> {
     })
 }
 
+/// Returns the per-user screenshot directory for a named application, next to its save file.
+pub fn screenshots_dir(application: &str) -> Option<PathBuf> {
+    super::user_data_dir().map(|root| {
+        root.join("RVE")
+            .join(safe_cache_app_name(application))
+            .join("Screenshots")
+    })
+}
+
 /// Atomically replaces a user-data file after writing and syncing a sibling temporary file.
 pub fn write_user_data_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
@@ -228,6 +237,10 @@ mod tests {
         assert_eq!(
             save_data_path("A game/Title").unwrap().file_name().unwrap(),
             "save.toml"
+        );
+        assert_eq!(
+            screenshots_dir("A game/Title").unwrap().parent(),
+            save_data_path("A game/Title").unwrap().parent()
         );
         fs::remove_dir_all(directory).unwrap();
     }

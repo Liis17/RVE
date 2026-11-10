@@ -15,6 +15,7 @@ use crate::net::{
     networked_template, validate_message,
 };
 use crate::physics::PhysicsScriptState;
+use crate::platform::{PlatformRequest, SharedPlatformState};
 use crate::save_writer::SaveWriter;
 use crate::scene_state::{SceneState, SharedSceneState, canonical_scene_path};
 use crate::script_refs::{ScriptRefCapabilities, ScriptRefEntry, ScriptRefs};
@@ -48,7 +49,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -216,6 +217,7 @@ pub struct ScriptHost {
     script_refs: ScriptRefs,
     /// Объявленные сцены проекта, текущая сцена и запрос `rve.scene.load`; общие с транзакциями.
     scene_state: SharedSceneState,
+    platform_state: SharedPlatformState,
     save_values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
     save_flush_requested: Rc<Cell<bool>>,
     save_generation: Rc<Cell<u64>>,
@@ -467,6 +469,8 @@ impl ScriptHost {
             ..SceneState::default()
         }));
         transaction.attach_scene_state(scene_state.clone());
+        let platform_state = SharedPlatformState::default();
+        transaction.attach_platform_state(platform_state.clone());
         transaction.attach_time_state(timeline.clone(), time_scale.clone());
         transaction.attach_save_state(
             save_values.clone(),
@@ -496,6 +500,7 @@ impl ScriptHost {
             transaction,
             script_refs,
             scene_state,
+            platform_state,
             save_values,
             save_flush_requested,
             save_generation,
@@ -1179,6 +1184,24 @@ impl ScriptHost {
     /// выполнить вызывающий код после кадра: загрузить сцену и передать её в [`Self::replace_scene`].
     pub fn take_scene_request(&mut self) -> Option<String> {
         self.scene_state.borrow_mut().request.take()
+    }
+
+    /// Сообщает скриптам состояние окна: `rve.window.fullscreen()` и `ctx.is_fullscreen()`.
+    pub fn set_window_fullscreen(&mut self, fullscreen: bool) {
+        self.platform_state.borrow_mut().fullscreen = fullscreen;
+    }
+
+    /// Запросы окна и системных диалогов, принятые успешными вызовами с прошлого чтения, в порядке
+    /// коммита. Вызывающий код выполняет их после кадра; для каждого `FileDialog` он позже
+    /// передаёт результат в [`Self::complete_file_dialog`].
+    pub fn take_platform_requests(&mut self) -> Vec<PlatformRequest> {
+        self.platform_state.borrow_mut().take_requests()
+    }
+
+    /// Передаёт скриптам результат диалога: выбранные пути или пустой список при отмене.
+    /// Неизвестный или уже завершённый `id` игнорируется.
+    pub fn complete_file_dialog(&mut self, id: u64, paths: Vec<PathBuf>) {
+        self.platform_state.borrow_mut().complete(id, paths);
     }
 
     /// Returns whether a successful script callback requested graceful application shutdown.
@@ -4516,6 +4539,9 @@ mod keep_on_load_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod net_tests;
+#[cfg(test)]
+#[path = "host/platform_tests.rs"]
+mod platform_tests;
 #[cfg(test)]
 #[path = "host/save_tests.rs"]
 mod save_tests;

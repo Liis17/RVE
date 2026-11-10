@@ -482,6 +482,8 @@ pub(crate) struct ScriptThreadConfig {
     pub frame_limit: Option<u64>,
     #[cfg(feature = "dev-console")]
     pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
+    /// Окно, скриншоты и системные диалоги для скриптов.
+    pub platform: crate::platform::ScriptPlatform,
 }
 
 pub(crate) struct ScriptThreadHandle {
@@ -554,6 +556,10 @@ pub(crate) struct VulkanBackend {
     prefab_material_assets: HashMap<PrefabToken, Arc<PreparedMaterialAssets>>,
     /// Текстуры, шейдеры и запасной материал сцены, которые переиспользуют замены материалов.
     material_caches: MaterialUploadCaches,
+    /// Пути запрошенных скриншотов окна; `None` — скриншоты отключены.
+    screenshots: Option<Receiver<PathBuf>>,
+    /// Захваты окна, ждущие readback, и пути их PNG.
+    pending_screenshots: Vec<(engine_render::CaptureTicket, PathBuf)>,
 }
 
 #[cfg(feature = "dev-console")]
@@ -588,6 +594,45 @@ impl VulkanBackend {
             material_assets: None,
             prefab_material_assets: HashMap::new(),
             material_caches: MaterialUploadCaches::default(),
+            screenshots: None,
+            pending_screenshots: Vec::new(),
+        }
+    }
+
+    /// Подключает очередь скриншотов окна: каждый путь получает захват следующего кадра.
+    pub fn with_screenshots(mut self, screenshots: Receiver<PathBuf>) -> Self {
+        self.screenshots = Some(screenshots);
+        self
+    }
+
+    fn queue_screenshots(&mut self) {
+        let Some(screenshots) = &self.screenshots else {
+            return;
+        };
+        for path in screenshots.try_iter() {
+            let ticket = self.renderer.request_window_capture();
+            self.pending_screenshots.push((ticket, path));
+        }
+    }
+
+    /// Отдаёт готовые захваты на запись PNG; не ждёт GPU.
+    fn finish_screenshots(&mut self) {
+        if self.pending_screenshots.is_empty() {
+            return;
+        }
+        for (ticket, result) in self.renderer.take_captures() {
+            let Some(index) = self
+                .pending_screenshots
+                .iter()
+                .position(|(pending, _)| *pending == ticket)
+            else {
+                continue;
+            };
+            let (_, path) = self.pending_screenshots.swap_remove(index);
+            match result {
+                Ok(image) => crate::platform::save_screenshot(path, image),
+                Err(error) => log::error!("Скриншот {} не снят: {error}", path.display()),
+            }
         }
     }
 
@@ -981,6 +1026,7 @@ impl RenderBackend for VulkanBackend {
         width: u32,
         height: u32,
     ) -> Result<FrameOutcome, String> {
+        self.queue_screenshots();
         self.renderer.set_latency_frame(snapshot.sequence);
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let particle_step = particle_step(snapshot.sim_time, self.last_submitted_sim_time);
@@ -1042,6 +1088,7 @@ impl RenderBackend for VulkanBackend {
             .renderer
             .render_frame_with_outcome(&frame)
             .map_err(|error| error.to_string())?;
+        self.finish_screenshots();
         // Состояние частиц считается продвинутым только для отправленного кадра.
         if outcome.submitted {
             self.last_submitted_sim_time = Some(snapshot.sim_time);
@@ -1092,6 +1139,7 @@ impl RenderBackend for VulkanBackend {
         height: u32,
         ui: &mut ConsoleUiFrame,
     ) -> Result<FrameOutcome, String> {
+        self.queue_screenshots();
         if !ui.textures_delta.set.is_empty() {
             if let Err(error) = self
                 .ui_bridge
@@ -1204,6 +1252,7 @@ impl RenderBackend for VulkanBackend {
             .renderer
             .render_frame_with_ui_outcome(&[(viewport, &scene)], &primitives, [0.0, 0.0, 0.0, 1.0])
             .map_err(|error| error.to_string())?;
+        self.finish_screenshots();
         if outcome.status == FrameStatus::Presented && !ui.textures_delta.free.is_empty() {
             self.ui_bridge
                 .managed
@@ -1313,6 +1362,7 @@ fn scripts_thread(
         ui_text_focus,
         scene_loader,
         gpu_render,
+        platform,
         ..
     } = config;
     let library = match load_script_library(
@@ -1772,8 +1822,10 @@ fn scripts_thread(
         );
         timings.record(script_phase::LOOP, script_phase::UI, ui_started.elapsed());
         scripts.set_input(input_frame);
+        platform.before_update(&mut scripts);
         let update_started = Instant::now();
         scripts.update_frame(&mut world, frame_time);
+        platform.after_update(&mut scripts);
         if scripts.take_quit_request() {
             break;
         }
@@ -4183,6 +4235,7 @@ return Input
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -5186,6 +5239,7 @@ return Script
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -6428,6 +6482,7 @@ return Script
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -6562,6 +6617,7 @@ return Clock
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -6677,6 +6733,7 @@ return Script
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -6803,6 +6860,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -6986,6 +7044,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -7074,6 +7133,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -7397,6 +7457,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -7464,6 +7525,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -7527,6 +7589,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -7600,6 +7663,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -7678,6 +7742,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_loader: None,
+                platform: Default::default(),
                 gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
@@ -7907,6 +7972,7 @@ return Move
             ScriptThreadConfig {
                 gpu_render: wiring.render_resources.is_some(),
                 scene_loader: wiring.loader,
+                platform: Default::default(),
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "spawn.rvescene".to_owned(),

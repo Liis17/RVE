@@ -10,6 +10,7 @@ use crate::pipeline::{
     ExitRequester, FrameSnapshot, RENDER_THREAD, RenderControl, RenderThreadConfig, RuntimeStatus,
     SCRIPTS_THREAD, ScriptControl, VulkanBackend, start_render,
 };
+use crate::platform::PlayerPlatform;
 use crate::prefabs::{PREFAB_LOADER_THREAD, RenderResourceRequest};
 use crate::profiling::StartupProfile;
 #[cfg(feature = "dev-console")]
@@ -83,6 +84,8 @@ pub(crate) struct PlayerConfig {
     pub input: Arc<Mutex<InputAccumulator>>,
     /// Фокус InputField из scripts thread: по нему включается IME окна.
     pub text_focus: Arc<AtomicBool>,
+    /// Горячие клавиши окна, скриншоты и системные диалоги.
+    pub platform: PlayerPlatform,
     #[cfg(feature = "dev-console")]
     pub console_buffer: Arc<Mutex<ConsoleBuffer>>,
     #[cfg(feature = "dev-console")]
@@ -121,6 +124,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         startup,
         input,
         text_focus,
+        platform,
         #[cfg(feature = "dev-console")]
         console_buffer,
         #[cfg(feature = "dev-console")]
@@ -168,6 +172,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         text_focus,
         text_proxy: None,
         text_ime: false,
+        platform,
         #[cfg(feature = "dev-console")]
         console_buffer,
         #[cfg(feature = "dev-console")]
@@ -241,6 +246,7 @@ struct PlayerWindow<'a> {
     text_proxy: Option<WindowProxy>,
     /// Последнее состояние IME, отправленное окну.
     text_ime: bool,
+    platform: PlayerPlatform,
     debug_view: DebugView,
     #[cfg(feature = "dev-console")]
     wireframe_supported: bool,
@@ -765,6 +771,7 @@ impl WindowHandler for PlayerWindow<'_> {
     fn attach_proxy(&mut self, proxy: WindowProxy) {
         self.activation.attach(proxy.clone());
         self.cursor.attach(proxy.clone());
+        self.platform.attach(&proxy);
         self.text_proxy = Some(proxy.clone());
         self.window_exit = Some(Arc::new(WindowExit(proxy)));
     }
@@ -897,6 +904,10 @@ impl WindowHandler for PlayerWindow<'_> {
                 .with_ui_images(std::mem::take(&mut gpu_scene.ui_images))
                 .with_scene_screen_shaders(gpu_scene.screen_shader_ids())
                 .with_material_uploads(Arc::clone(&self.render_assets), material_caches);
+        let backend = match self.platform.take_screenshot_queue() {
+            Some(screenshots) => backend.with_screenshots(screenshots),
+            None => backend,
+        };
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(
@@ -949,7 +960,7 @@ impl WindowHandler for PlayerWindow<'_> {
         true
     }
 
-    fn update(&mut self, _window: &Window) -> bool {
+    fn update(&mut self, window: &Window) -> bool {
         if close_timed_out(
             Instant::now(),
             self.close_deadline,
@@ -960,8 +971,9 @@ impl WindowHandler for PlayerWindow<'_> {
             false
         } else {
             self.sync_text_input();
+            self.platform.update(window, self.text_proxy.as_ref());
             #[cfg(feature = "dev-console")]
-            self.update_console(_window);
+            self.update_console(window);
             true
         }
     }
@@ -997,6 +1009,7 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn key(&mut self, key: Key, pressed: bool) {
+        self.platform.key(key, pressed);
         #[cfg(feature = "dev-console")]
         if key == Key::F8 {
             if pressed && !self.f8_down {

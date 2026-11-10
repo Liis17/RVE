@@ -823,6 +823,11 @@ fn host(state: &mut HostState) -> RveHost {
         script_ref_set_enabled: None,
         scene_load: None,
         scene_current: None,
+        window_fullscreen: None,
+        window_set_fullscreen: None,
+        window_screenshot: None,
+        file_dialog_open: None,
+        file_dialog_poll: None,
         app_quit: None,
     }
 }
@@ -2573,7 +2578,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2848,7 +2853,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
 }
 
 #[test]
@@ -2870,7 +2875,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
 }
 
 #[test]
@@ -2894,7 +2899,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
 }
 
 #[test]
@@ -2930,7 +2935,7 @@ fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
         offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
 }
 
 #[test]
@@ -2976,7 +2981,7 @@ fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
 fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
     assert_eq!(RVE_TRIGGER_STAY, 4);
     assert_eq!(
         offset_of!(RveHost, physics_get_collider),
@@ -2993,7 +2998,7 @@ fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
 fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
     assert_eq!(
         offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
@@ -3029,7 +3034,7 @@ fn runtime_physics_value_types_are_c_layout_in_v18() {
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);
@@ -4101,4 +4106,165 @@ fn v19_component_structs_keep_their_documented_c_layout() {
     assert_eq!(offset_of!(RveAudioPlayExParams, follow), 24);
     assert_eq!(offset_of!(RveAudioPlayExParams, spatial_blend), 32);
     assert_eq!(offset_of!(RveAudioPlayExParams, force_mono), 44);
+}
+
+/// Kind, title and `(name, extensions)` filters of the last opened dialog.
+type ProbeDialog = (u32, String, Vec<(String, Vec<String>)>);
+
+#[derive(Default)]
+struct PlatformProbe {
+    fullscreen: bool,
+    screenshot: Option<String>,
+    dialog: Option<ProbeDialog>,
+    done: bool,
+    paths: Vec<String>,
+}
+
+unsafe extern "C" fn probe_fullscreen(ctx: *mut c_void, out: *mut bool) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe and out at a local bool.
+    unsafe { *out = (*ctx.cast::<PlatformProbe>()).fullscreen };
+    true
+}
+
+unsafe extern "C" fn probe_set_fullscreen(ctx: *mut c_void, fullscreen: bool) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe.
+    unsafe { (*ctx.cast::<PlatformProbe>()).fullscreen = fullscreen };
+    true
+}
+
+unsafe extern "C" fn probe_screenshot(ctx: *mut c_void, path: RveStr) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe; the SDK keeps path alive.
+    unsafe { (*ctx.cast::<PlatformProbe>()).screenshot = Some(path.to_str().unwrap().to_owned()) };
+    true
+}
+
+unsafe extern "C" fn probe_dialog_open(
+    ctx: *mut c_void,
+    dialog: *const crate::abi::RveFileDialog,
+    out: *mut u64,
+) -> bool {
+    // SAFETY: the SDK passes a dialog whose borrowed arrays live during this call.
+    let dialog = unsafe { &*dialog };
+    let filters = (0..dialog.filter_count)
+        .map(|index| {
+            // SAFETY: index is below filter_count.
+            let filter = unsafe { &*dialog.filters.add(index) };
+            let extensions = (0..filter.extension_count)
+                // SAFETY: index is below extension_count and strings are live.
+                .map(|index| {
+                    unsafe { (*filter.extensions.add(index)).to_str() }
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            // SAFETY: the filter name is live during this call.
+            (
+                unsafe { filter.name.to_str() }.unwrap().to_owned(),
+                extensions,
+            )
+        })
+        .collect();
+    // SAFETY: the test points ctx at a live PlatformProbe; title is live during this call.
+    unsafe {
+        (*ctx.cast::<PlatformProbe>()).dialog = Some((
+            dialog.kind,
+            dialog.title.to_str().unwrap().to_owned(),
+            filters,
+        ));
+        *out = 7;
+    }
+    true
+}
+
+unsafe extern "C" fn probe_dialog_poll(
+    ctx: *mut c_void,
+    id: u64,
+    paths: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+    done: *mut bool,
+) -> bool {
+    // SAFETY: the test points ctx at a live PlatformProbe.
+    let probe = unsafe { &*ctx.cast::<PlatformProbe>() };
+    if id != 7 {
+        return false;
+    }
+    // SAFETY: the SDK passes valid output pointers.
+    unsafe {
+        *done = probe.done;
+        *count = if probe.done { probe.paths.len() } else { 0 };
+    }
+    for (index, path) in probe.paths.iter().enumerate().take(capacity) {
+        // SAFETY: the SDK provides capacity output slots.
+        unsafe { *paths.add(index) = RveStr::from_str_ref(path) };
+    }
+    true
+}
+
+#[test]
+fn sdk_window_and_file_dialog_api_round_trips_through_the_host() {
+    use crate::{FileDialog, FileDialogKind, FileDialogPoll};
+    let mut state = HostState::default();
+    let mut probe = PlatformProbe::default();
+    let mut host = host(&mut state);
+    host.ctx = (&mut probe as *mut PlatformProbe).cast();
+    host.window_fullscreen = Some(probe_fullscreen);
+    host.window_set_fullscreen = Some(probe_set_fullscreen);
+    host.window_screenshot = Some(probe_screenshot);
+    host.file_dialog_open = Some(probe_dialog_open);
+    host.file_dialog_poll = Some(probe_dialog_poll);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+
+    assert!(!context.is_fullscreen());
+    assert!(context.set_fullscreen(true));
+    assert!(context.is_fullscreen());
+    assert!(context.take_screenshot(None));
+    let id = context
+        .open_file_dialog(
+            &FileDialog::new(FileDialogKind::OpenFiles)
+                .title("Open map")
+                .filter("Maps", &["map", "json"]),
+        )
+        .unwrap();
+    assert_eq!(id.get(), 7);
+    assert_eq!(context.poll_file_dialog(id), Some(FileDialogPoll::Pending));
+    drop(context);
+
+    assert_eq!(probe.screenshot.as_deref(), Some(""));
+    assert_eq!(
+        probe.dialog,
+        Some((
+            crate::abi::RVE_FILE_DIALOG_OPEN_FILES,
+            "Open map".to_owned(),
+            vec![("Maps".to_owned(), vec!["map".to_owned(), "json".to_owned()])]
+        ))
+    );
+    probe.done = true;
+    probe.paths = vec!["/maps/a.map".to_owned(), "/maps/b.map".to_owned()];
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(
+        context.poll_file_dialog(id),
+        Some(FileDialogPoll::Done(vec![
+            "/maps/a.map".into(),
+            "/maps/b.map".into()
+        ]))
+    );
+}
+
+#[test]
+fn sdk_window_api_reports_hosts_without_platform_callbacks() {
+    use crate::{FileDialog, FileDialogKind};
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut properties = Params::new();
+    let mut context = Context::new(&host, &mut properties).unwrap();
+    assert!(!context.is_fullscreen());
+    assert!(!context.set_fullscreen(true));
+    assert!(!context.take_screenshot(Some("shot.png")));
+    assert!(
+        context
+            .open_file_dialog(&FileDialog::new(FileDialogKind::PickFolder))
+            .is_none()
+    );
 }

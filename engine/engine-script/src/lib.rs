@@ -14,6 +14,8 @@ mod lite;
 mod math_lua;
 mod net;
 mod physics;
+mod platform;
+mod platform_lua;
 mod save_file;
 mod save_writer;
 mod scene_state;
@@ -37,6 +39,7 @@ pub use library::{ScriptLibrary, ScriptLibraryError};
 pub use lifecycle::{
     PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, PrefabStatus, SpawnedObject, WorldChanges,
 };
+pub use platform::{FileDialogFilter, FileDialogKind, FileDialogRequest, PlatformRequest};
 pub use rve_sdk::{Key, MouseButton};
 pub use save_file::{decode_save_data, encode_save_data};
 pub use types::{

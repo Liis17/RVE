@@ -845,8 +845,8 @@ mod abi_compat_tests {
     }
 
     #[test]
-    fn abi20_and_abi21_descriptor_tables_use_the_historical_stride_on_v23_host() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    fn abi20_and_abi21_descriptor_tables_use_the_historical_stride_on_the_current_host() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
         let current = rve_sdk::script_module! {
             "Probe" => probe,
             "SecondProbe" => second_probe,
@@ -900,8 +900,8 @@ mod abi_compat_tests {
     }
 
     #[test]
-    fn abi22_guest_descriptor_layout_loads_on_v23_host() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+    fn abi22_guest_descriptor_layout_loads_on_the_current_host() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
         let current = rve_sdk::script_module! {
             "Probe" => probe,
             "SecondProbe" => second_probe,
@@ -911,7 +911,7 @@ mod abi_compat_tests {
                 abi_version: 22,
                 header_size: std::mem::size_of::<RveHeader>() as u32,
             },
-            // ABI v23 appends only a host callback, so the v22 descriptor layout is unchanged.
+            // ABI v23 and v24 append only host callbacks, so the v22 descriptor layout is unchanged.
             scripts: current.scripts,
             script_count: current.script_count,
         }));

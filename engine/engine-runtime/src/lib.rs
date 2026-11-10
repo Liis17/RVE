@@ -18,6 +18,7 @@ mod layout;
 mod module_host;
 mod net;
 mod pipeline;
+mod platform;
 mod player;
 mod prefabs;
 mod profiling;
@@ -440,6 +441,16 @@ fn run_from_args(
         let _ = script_tx.send(ScriptControl::Background(true));
         let _ = script_tx.send(ScriptControl::Go(Box::default()));
     }
+    // Сервер без окна получает платформу без окна: диалоги отменяются, окно и скриншоты недоступны.
+    let (player_platform, script_platform) = if headless {
+        (None, platform::ScriptPlatform::default())
+    } else {
+        let (player, script) = platform::PlayerPlatform::new(
+            project.window.clone(),
+            engine_platform::screenshots_dir(&project.name),
+        );
+        (Some(player), script)
+    };
     let script_thread = match start_scripts(
         &mut modules,
         world,
@@ -491,6 +502,7 @@ fn run_from_args(
             frame_limit: if headless { args.frames } else { None },
             #[cfg(feature = "dev-console")]
             command_catalog: Arc::clone(&command_catalog),
+            platform: script_platform,
         },
     ) {
         Ok(ready) => ready,
@@ -576,6 +588,7 @@ fn run_from_args(
                 startup,
                 input,
                 text_focus: ui_text_focus,
+                platform: player_platform.expect("окно игрока создаёт платформу окна"),
                 #[cfg(feature = "dev-console")]
                 console_buffer,
                 #[cfg(feature = "dev-console")]

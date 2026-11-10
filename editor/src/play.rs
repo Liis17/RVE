@@ -1341,6 +1341,16 @@ impl PlaySession {
         self.host.take_scene_request()
     }
 
+    /// Запросы окна и системных диалогов, принятые скриптами Play с прошлого чтения.
+    pub fn take_platform_requests(&mut self) -> Vec<engine_script::PlatformRequest> {
+        self.host.take_platform_requests()
+    }
+
+    /// Передаёт скриптам результат диалога; пустой список — диалог отменён.
+    pub fn complete_file_dialog(&mut self, id: u64, paths: Vec<std::path::PathBuf>) {
+        self.host.complete_file_dialog(id, paths);
+    }
+
     /// Returns whether a successful script callback requested stopping editor Play mode.
     pub fn take_quit_request(&mut self) -> bool {
         self.host.take_quit_request()

@@ -6,6 +6,7 @@
 pub mod abi;
 mod components;
 mod math;
+mod platform;
 
 /// Version of this SDK crate, as declared in its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,6 +37,7 @@ use abi::{
 };
 pub use components::{ComponentError, LightKind, MAX_LOD_READ};
 pub use math::{Quat, Vec3};
+pub use platform::{FileDialog, FileDialogFilter, FileDialogId, FileDialogKind, FileDialogPoll};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
