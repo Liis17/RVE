@@ -378,6 +378,7 @@ fn runtime_object_value(world: &engine_scene::World, object: &engine_scene::Worl
         "id": object.id,
         "name": object.name,
         "parent": object.parent.and_then(|handle| world.object(handle)).map(|parent| parent.id.as_str()),
+        "static": object.is_static,
         "transform": {
             "position": object.transform.position.to_array(),
             "rotation": object.transform.rotation_deg.to_array(),

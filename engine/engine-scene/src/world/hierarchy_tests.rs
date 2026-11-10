@@ -390,3 +390,72 @@ fn initial_active_camera_is_not_taken_from_a_hidden_subtree() {
     );
     assert_eq!(scene.active_camera(), handle(&scene, "main"));
 }
+
+/// `rock` и его родитель `base` статические, `lamp` под `base` и `free` — нет.
+const STATIC_SCENE: &str = "[[objects]]\nid = \"base\"\nstatic = true\n\
+[[objects]]\nid = \"rock\"\nparent = \"base\"\nstatic = true\n[objects.collider]\n[objects.rigid_body]\nkind = \"static\"\n\
+[[objects]]\nid = \"lamp\"\nparent = \"base\"\n\
+[[objects]]\nid = \"free\"\n\
+[[objects]]\nid = \"camera\"\n[objects.camera]\n";
+
+#[test]
+fn static_object_pose_and_parent_cannot_change() {
+    let mut world = world(STATIC_SCENE);
+    let rock = handle(&world, "rock");
+    let free = handle(&world, "free");
+    let before = world.world_matrix(rock).unwrap();
+    assert_eq!(world.is_static(rock), Some(true));
+    assert_eq!(world.is_static(free), Some(false));
+
+    let mut transform = *world.local_transform(rock).unwrap();
+    transform.position = Vec3::ONE;
+    let errors = [
+        world.set_local_transform(rock, transform).unwrap_err(),
+        world
+            .set_root_pose(handle(&world, "base"), Vec3::ONE, glam::Quat::IDENTITY)
+            .unwrap_err(),
+        world.check_world_position(rock, Vec3::ONE).unwrap_err(),
+        world.check_world_rotation(rock, Vec3::ONE).unwrap_err(),
+        world
+            .apply_edit(&ObjectEdit::SetWorldPosition {
+                object: rock,
+                position: Vec3::ONE,
+            })
+            .unwrap_err(),
+        world
+            .apply_edit(&ObjectEdit::SetWorldRotation {
+                object: rock,
+                rotation_deg: Vec3::ONE,
+            })
+            .unwrap_err(),
+        world.set_parent(rock, Some(free), true).unwrap_err(),
+        world.set_parent(rock, None, false).unwrap_err(),
+    ];
+    for error in errors {
+        assert!(error.message.contains("статического объекта"), "{error}");
+    }
+    let mut body = *world.object(rock).unwrap().rigid_body.as_ref().unwrap();
+    body.kind = crate::RigidBodyKind::Kinematic;
+    assert!(world.set_rigid_body(rock, body).is_err());
+    assert_eq!(world.world_matrix(rock).unwrap(), before);
+}
+
+#[test]
+fn static_object_can_be_deactivated_and_its_dynamic_children_move() {
+    let mut world = world(STATIC_SCENE);
+    let rock = handle(&world, "rock");
+    let lamp = handle(&world, "lamp");
+    let free = handle(&world, "free");
+
+    world.set_active(rock, false).unwrap();
+    world
+        .set_world_position(lamp, Vec3::new(1.0, 2.0, 3.0))
+        .unwrap();
+    world.set_parent(lamp, Some(free), true).unwrap();
+    world.set_parent(free, Some(rock), true).unwrap();
+
+    assert_vec_close(
+        world.world_position(lamp).unwrap(),
+        Vec3::new(1.0, 2.0, 3.0),
+    );
+}

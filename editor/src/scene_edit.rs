@@ -1198,6 +1198,36 @@ impl EditorScene {
         })
     }
 
+    /// Меняет флаг `static` одной правкой. Включение затрагивает объект, а с `with_children` —
+    /// и собственных потомков сцены. Выключение всегда снимает флаг и с потомков: у статического
+    /// объекта предки обязаны быть статическими.
+    pub fn set_static(
+        &mut self,
+        id: &str,
+        is_static: bool,
+        with_children: bool,
+    ) -> Result<(), String> {
+        self.require_own(id)?;
+        if !self.document.objects.iter().any(|object| object.id == id) {
+            return Err(format!(
+                "объект {id:?}: флаг static задаётся в самом префабе, а не у экземпляра"
+            ));
+        }
+        let targets = if with_children || !is_static {
+            subtree_ids(&self.document, id)?
+        } else {
+            HashSet::from([id.to_owned()])
+        };
+        self.edit(None, |document| {
+            for object in &mut document.objects {
+                if targets.contains(&object.id) {
+                    object.is_static = is_static;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Объект — собственный объект документа или корень экземпляра.
     fn require_own(&self, id: &str) -> Result<(), String> {
         if self.is_prefab_part(id) {
@@ -2174,6 +2204,39 @@ mod tests {
 
     fn scene() -> EditorScene {
         EditorScene::new_untitled().unwrap()
+    }
+
+    #[test]
+    fn static_flag_follows_the_ancestor_rule_in_one_undoable_edit() {
+        let mut scene = scene();
+        let base = scene.create_object(&NewObject::Empty, None).unwrap();
+        let child = scene.create_object(&NewObject::Empty, None).unwrap();
+        let leaf = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.set_parent(&child, Some(&base)).unwrap();
+        scene.set_parent(&leaf, Some(&child)).unwrap();
+        let is_static = |scene: &EditorScene, id: &str| scene.object(id).unwrap().is_static;
+
+        let error = scene.set_static(&child, true, false).unwrap_err();
+        assert!(error.contains("должен быть статическим"), "{error}");
+        assert!(!is_static(&scene, &child));
+
+        scene.set_static(&base, true, false).unwrap();
+        assert!(is_static(&scene, &base) && !is_static(&scene, &child));
+        scene.set_static(&base, true, true).unwrap();
+        assert!(is_static(&scene, &child) && is_static(&scene, &leaf));
+
+        scene.set_static(&base, false, false).unwrap();
+        assert!(
+            [&base, &child, &leaf]
+                .iter()
+                .all(|id| !is_static(&scene, id))
+        );
+        assert!(scene.undo());
+        assert!(
+            [&base, &child, &leaf]
+                .iter()
+                .all(|id| is_static(&scene, id))
+        );
     }
 
     #[test]
