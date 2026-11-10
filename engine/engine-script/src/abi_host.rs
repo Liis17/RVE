@@ -47,7 +47,7 @@ use rve_sdk::abi::{
     RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult, RveColliderValue,
     RveCollisionEvent, RveControllerValue, RveCursorState, RveGamepadState, RveHost, RveNetEvent,
     RveParamEntry, RveParams, RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue,
-    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RveScriptDesc, RveScriptTime, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use rve_sdk::abi::{
     RVE_AO_QUALITY_HIGH, RVE_AO_QUALITY_LOW, RVE_AO_QUALITY_MEDIUM, RVE_AUDIO_GROUP_AMBIENT,
@@ -156,6 +156,7 @@ impl<'a> AbiCallContext<'a> {
     }
 
     pub(crate) fn host(&mut self, time: ScriptTime) -> RveHost {
+        let frame_time = self.transaction.frame_time();
         RveHost {
             ctx: (self as *mut Self).cast(),
             time: RveTime {
@@ -365,6 +366,18 @@ impl<'a> AbiCallContext<'a> {
                 .transaction
                 .physics_attached()
                 .then_some(host_physics_shape_cast),
+            script_time: RveScriptTime {
+                dt: frame_time.dt,
+                unscaled_dt: frame_time.unscaled_dt,
+                elapsed: frame_time.elapsed,
+                unscaled_elapsed: frame_time.unscaled_elapsed,
+                fixed_dt: frame_time.fixed_dt,
+                scale: frame_time.scale,
+                frame: frame_time.frame,
+            },
+            set_time_scale: Some(host_set_time_scale),
+            schedule_timer: Some(host_schedule_timer),
+            cancel_timer: Some(host_cancel_timer),
         }
     }
 
@@ -502,6 +515,14 @@ impl AbiScriptInstance {
                         None => RveStatus::Ok,
                     },
                     AbiPhase::Update(dt) => (self.descriptor.update)(self.instance, &host, dt),
+                    AbiPhase::FixedUpdate(dt) => match self.descriptor.on_fixed_update {
+                        Some(callback) => callback(self.instance, &host, dt),
+                        None => RveStatus::Ok,
+                    },
+                    AbiPhase::LateUpdate(dt) => match self.descriptor.on_late_update {
+                        Some(callback) => callback(self.instance, &host, dt),
+                        None => RveStatus::Ok,
+                    },
                     AbiPhase::Destroy => (self.descriptor.destroy)(self.instance, &host),
                 }
             }
@@ -661,6 +682,36 @@ impl AbiScriptInstance {
         context.callback_result(status)
     }
 
+    pub(crate) fn invoke_timer(
+        &mut self,
+        time: ScriptTime,
+        tag: &str,
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let Some(callback) = self.descriptor.on_timer else {
+            return Ok(());
+        };
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let status = {
+            let host = context.host(time);
+            // SAFETY: the tag, instance, and host remain live throughout the callback.
+            unsafe { callback(self.instance, &host, RveStr::from_str_ref(tag)) }
+        };
+        context.callback_result(status)
+    }
+
     pub(crate) fn invoke_physics_event(
         &mut self,
         time: ScriptTime,
@@ -769,6 +820,8 @@ pub(crate) enum AbiPhase {
     Enable,
     Disable,
     Update(f32),
+    FixedUpdate(f32),
+    LateUpdate(f32),
     Destroy,
 }
 
@@ -1134,6 +1187,61 @@ unsafe extern "C" fn host_active_camera(ctx: *mut c_void) -> u64 {
 unsafe extern "C" fn host_set_active_camera(ctx: *mut c_void, object: u64) -> bool {
     guarded(ctx, false, |context| {
         context.transaction.set_active_camera_from_abi(object)
+    })
+}
+
+const ABI_HOST_OK: u32 = 0;
+const ABI_HOST_ERROR: u32 = 1;
+
+unsafe extern "C" fn host_set_time_scale(ctx: *mut c_void, scale: f32) -> bool {
+    guarded(ctx, false, |context| {
+        context.transaction.stage_time_scale(scale).is_ok()
+    })
+}
+
+unsafe extern "C" fn host_schedule_timer(
+    ctx: *mut c_void,
+    delay_seconds: f64,
+    repeat_seconds: f64,
+    tag: RveStr,
+    timer_id: *mut u64,
+) -> u32 {
+    guarded(ctx, ABI_HOST_ERROR, |context| {
+        if timer_id.is_null() {
+            return ABI_HOST_ERROR;
+        }
+        // SAFETY: the guest tag is valid for this synchronous callback.
+        let Ok(tag) = (unsafe { read_abi_str(tag) }) else {
+            return ABI_HOST_ERROR;
+        };
+        let repeat = (repeat_seconds != 0.0).then_some(repeat_seconds);
+        let Ok(id) = context
+            .transaction
+            .schedule_abi_timer(delay_seconds, repeat, tag.to_owned())
+        else {
+            return ABI_HOST_ERROR;
+        };
+        // SAFETY: output pointer was checked and belongs to the guest callback.
+        unsafe { *timer_id = id };
+        ABI_HOST_OK
+    })
+}
+
+unsafe extern "C" fn host_cancel_timer(
+    ctx: *mut c_void,
+    timer_id: u64,
+    canceled: *mut bool,
+) -> u32 {
+    guarded(ctx, ABI_HOST_ERROR, |context| {
+        if canceled.is_null() {
+            return ABI_HOST_ERROR;
+        }
+        let Ok(was_canceled) = context.transaction.cancel_timer(timer_id) else {
+            return ABI_HOST_ERROR;
+        };
+        // SAFETY: output pointer was checked and belongs to the guest callback.
+        unsafe { *canceled = was_canceled };
+        ABI_HOST_OK
     })
 }
 

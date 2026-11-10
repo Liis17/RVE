@@ -17,6 +17,68 @@ pub struct ScriptTime {
     pub frame: u64,
 }
 
+/// Full clock snapshot exposed to callbacks while keeping the original `ScriptTime` layout stable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScriptFrameTime {
+    pub dt: f32,
+    pub unscaled_dt: f32,
+    pub elapsed: f64,
+    pub unscaled_elapsed: f64,
+    pub fixed_dt: f32,
+    pub scale: f32,
+    pub frame: u64,
+}
+
+impl Default for ScriptFrameTime {
+    fn default() -> Self {
+        Self {
+            dt: 0.0,
+            unscaled_dt: 0.0,
+            elapsed: 0.0,
+            unscaled_elapsed: 0.0,
+            fixed_dt: 1.0 / 60.0,
+            scale: 1.0,
+            frame: 0,
+        }
+    }
+}
+
+impl ScriptFrameTime {
+    /// Maximum unscaled delta accepted from runtime clocks.
+    pub const MAX_UNSCALED_DELTA: f32 = 0.25;
+
+    /// Advances accumulated scaled and unscaled time from one unscaled frame delta.
+    pub fn advance(
+        unscaled_dt: f32,
+        scale: f32,
+        elapsed: f64,
+        unscaled_elapsed: f64,
+        fixed_dt: f32,
+        frame: u64,
+    ) -> Self {
+        let unscaled_dt = if unscaled_dt.is_finite() {
+            unscaled_dt.clamp(0.0, Self::MAX_UNSCALED_DELTA)
+        } else {
+            0.0
+        };
+        let scale = if scale.is_finite() && scale >= 0.0 {
+            scale
+        } else {
+            0.0
+        };
+        let dt = unscaled_dt * scale;
+        Self {
+            dt,
+            unscaled_dt,
+            elapsed: elapsed + f64::from(dt),
+            unscaled_elapsed: unscaled_elapsed + f64::from(unscaled_dt),
+            fixed_dt,
+            scale,
+            frame,
+        }
+    }
+}
+
 /// Состояние курсора окна, которое скрипты задают через `rve.input` или Rust SDK.
 ///
 /// По умолчанию курсор видим и не удерживается. Значения применяет хост: engine-script

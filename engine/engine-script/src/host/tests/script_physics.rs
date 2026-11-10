@@ -3,8 +3,8 @@
 //! снимок и события. Окно и GPU не нужны; время шага фиксировано.
 
 use super::{event_messages, sources, world};
-use crate::ScriptTime;
 use crate::host::ScriptHost;
+use crate::{ScriptFrameTime, ScriptTime};
 use engine_physics::{
     ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync, Pose, QueryFilter,
     QueryOverrides, Shape, ShapeCache, StepDriver,
@@ -93,6 +93,104 @@ impl Loop {
             .unwrap()
             .is_empty()
     }
+}
+
+fn force_velocity(script: &str, frame_deltas: &[f32]) -> f32 {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/force.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.0, 5.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+gravity_scale = 0.0
+[[objects.lite_scripts]]
+path = "/force.lua"
+"#,
+    );
+    let desc = PhysicsSceneDesc::from_world(&world, &[], Vec3::ZERO, 10, 8).unwrap();
+    let (mut driver, bindings) = desc.build().unwrap();
+    let mut sync = PhysicsSceneSync::new(&world, bindings).unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("force.lua", script)]), None).unwrap();
+    host.set_fixed_step_config(10, 8).unwrap();
+    host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+
+    let mut elapsed = 0.0;
+    let mut unscaled_elapsed = 0.0;
+    for (index, dt) in frame_deltas.iter().copied().enumerate() {
+        let frame_time = ScriptFrameTime::advance(
+            dt,
+            host.time_scale(),
+            elapsed,
+            unscaled_elapsed,
+            0.1,
+            index as u64 + 1,
+        );
+        elapsed = frame_time.elapsed;
+        unscaled_elapsed = frame_time.unscaled_elapsed;
+        host.update_frame(&mut world, frame_time);
+        let events = host.drain_events();
+        assert!(
+            events
+                .iter()
+                .all(|event| event.level != crate::ScriptEventLevel::Error),
+            "{events:?}"
+        );
+        let mut commands = host.drain_physics_commands();
+        commands.extend(sync.sync_world_commands(&mut world).unwrap());
+        let result = driver.advance_step(dt, commands).unwrap();
+        sync.apply_physics_poses(&mut world, &result.poses).unwrap();
+        host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), sync.bindings());
+    }
+
+    let ball = world.handle("ball").unwrap();
+    let body = sync
+        .bindings()
+        .iter()
+        .find(|binding| binding.object == ball)
+        .unwrap()
+        .body;
+    driver.world().body_velocity(body).unwrap().x
+}
+
+#[test]
+fn fixed_callback_forces_use_each_callback_dt_while_update_forces_keep_frame_dt() {
+    const FIXED_FORCE: &str = r#"
+local Script = {}
+function Script:on_fixed_update()
+  assert(rve.find("ball"):add_force({x=10, y=0, z=0}))
+end
+return Script
+"#;
+    const UPDATE_FORCE: &str = r#"
+local Script = {}
+function Script:on_update()
+  assert(rve.find("ball"):add_force({x=10, y=0, z=0}))
+end
+return Script
+"#;
+
+    let one_large_frame = force_velocity(FIXED_FORCE, &[0.2]);
+    let two_small_frames = force_velocity(FIXED_FORCE, &[0.1, 0.1]);
+    let update_force = force_velocity(UPDATE_FORCE, &[0.2]);
+
+    assert!((one_large_frame - 2.0).abs() < 1.0e-4, "{one_large_frame}");
+    assert!(
+        (two_small_frames - 2.0).abs() < 1.0e-4,
+        "{two_small_frames}"
+    );
+    assert!((update_force - 2.0).abs() < 1.0e-4, "{update_force}");
 }
 
 const ZONE_SCENE: &str = r#"

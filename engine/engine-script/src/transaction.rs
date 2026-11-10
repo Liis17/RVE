@@ -7,6 +7,7 @@ use crate::lifecycle::{
 use crate::lite::EventQueue;
 use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::{BindingUpdate, PhysicsScriptState};
+use crate::timeline::{CoroutineWait, ScriptCoroutine, ScriptTimeline, TimelineOp, TimerCallback};
 use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
 };
@@ -27,6 +28,7 @@ use engine_scene::{
     SpotLightComponent, World,
 };
 use glam::{EulerRot, Quat, Vec3};
+use mlua::{Function, Thread};
 
 /// Состояние одного слота экранного шейдера камеры в очереди транзакции.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,7 +36,7 @@ pub(crate) struct ScreenShaderState {
     pub(crate) enabled: bool,
     pub(crate) params: [f32; MAX_SCREEN_SHADER_PARAMS],
 }
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -228,6 +230,7 @@ pub(crate) struct ScriptTransaction {
     action_frame: Option<Arc<ActionFrame>>,
     physics: Rc<RefCell<PhysicsScriptState>>,
     physics_phase_dt: Option<f32>,
+    physics_fixed_dt: Option<f32>,
     pending_physics_commands: Vec<PhysicsCommand>,
     pending_grounded: HashMap<ObjectHandle, bool>,
     pending_collider_enabled: HashMap<BodyHandle, bool>,
@@ -275,6 +278,11 @@ pub(crate) struct ScriptTransaction {
     /// Новое значение `set_enabled` экземпляра; применяется в `commit_lifecycle`.
     pending_script_enabled: Option<bool>,
     instance_enabled: bool,
+    timeline: Rc<RefCell<ScriptTimeline>>,
+    time_scale: Rc<Cell<f32>>,
+    pending_timeline: Vec<TimelineOp>,
+    pending_time_scale: Option<f32>,
+    frame_time: crate::types::ScriptFrameTime,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -287,6 +295,163 @@ struct PendingPush {
 }
 
 impl ScriptTransaction {
+    pub(crate) fn attach_time_state(
+        &mut self,
+        timeline: Rc<RefCell<ScriptTimeline>>,
+        time_scale: Rc<Cell<f32>>,
+    ) {
+        self.timeline = timeline;
+        self.time_scale = time_scale;
+    }
+
+    pub(crate) fn set_frame_time(&mut self, frame_time: crate::types::ScriptFrameTime) {
+        self.frame_time = frame_time;
+    }
+
+    pub(crate) fn set_fixed_update_dt(&mut self, dt: Option<f32>) {
+        self.physics_fixed_dt = dt;
+    }
+
+    pub(crate) fn time_scale(&self) -> f32 {
+        self.pending_time_scale
+            .unwrap_or_else(|| self.time_scale.get())
+    }
+
+    pub(crate) fn frame_time(&self) -> crate::types::ScriptFrameTime {
+        self.frame_time
+    }
+
+    pub(crate) fn stage_time_scale(&mut self, scale: f32) -> Result<(), String> {
+        self.require_writable("time scale changes")?;
+        if !scale.is_finite() || scale < 0.0 {
+            return Err("time scale must be finite and nonnegative".to_owned());
+        }
+        self.pending_time_scale = Some(scale);
+        Ok(())
+    }
+
+    pub(crate) fn schedule_lua_timer(
+        &mut self,
+        delay: f64,
+        repeat: Option<f64>,
+        callback: Function,
+    ) -> Result<u64, String> {
+        self.require_timer_write()?;
+        validate_timer(delay, repeat)?;
+        if !self.timeline.borrow().can_add_timer(&self.pending_timeline) {
+            return Err("script timer limit reached".to_owned());
+        }
+        let due = self.frame_time.elapsed + delay;
+        if !due.is_finite() {
+            return Err("timer deadline is out of range".to_owned());
+        }
+        let id = self
+            .timeline
+            .borrow_mut()
+            .allocate_id()
+            .map_err(str::to_owned)?;
+        ScriptTimeline::stage_timer(
+            &mut self.pending_timeline,
+            id,
+            self.instance_serial,
+            due,
+            repeat,
+            TimerCallback::Lua(callback),
+        );
+        Ok(id)
+    }
+
+    pub(crate) fn schedule_abi_timer(
+        &mut self,
+        delay: f64,
+        repeat: Option<f64>,
+        tag: String,
+    ) -> Result<u64, String> {
+        self.require_timer_write()?;
+        validate_timer(delay, repeat)?;
+        if !self.timeline.borrow().can_add_timer(&self.pending_timeline) {
+            return Err("script timer limit reached".to_owned());
+        }
+        let due = self.frame_time.elapsed + delay;
+        if !due.is_finite() {
+            return Err("timer deadline is out of range".to_owned());
+        }
+        let id = self
+            .timeline
+            .borrow_mut()
+            .allocate_id()
+            .map_err(str::to_owned)?;
+        ScriptTimeline::stage_timer(
+            &mut self.pending_timeline,
+            id,
+            self.instance_serial,
+            due,
+            repeat,
+            TimerCallback::Abi(tag),
+        );
+        Ok(id)
+    }
+
+    pub(crate) fn cancel_timer(&mut self, id: u64) -> Result<bool, String> {
+        self.require_timer_write()?;
+        if id == 0
+            || (!self
+                .timeline
+                .borrow()
+                .timer_exists(id, self.instance_serial)
+                && !ScriptTimeline::timer_pending(&self.pending_timeline, id, self.instance_serial))
+        {
+            return Ok(false);
+        }
+        ScriptTimeline::stage_cancel_timer(&mut self.pending_timeline, id, self.instance_serial);
+        Ok(true)
+    }
+
+    pub(crate) fn start_coroutine(&mut self, thread: Thread) -> Result<u64, String> {
+        self.require_timer_write()?;
+        if !self
+            .timeline
+            .borrow()
+            .can_add_coroutine(&self.pending_timeline)
+        {
+            return Err("script coroutine limit reached".to_owned());
+        }
+        let id = self
+            .timeline
+            .borrow_mut()
+            .allocate_id()
+            .map_err(str::to_owned)?;
+        let resume_frame = self.frame_time.frame.saturating_add(1);
+        ScriptTimeline::stage_coroutine(
+            &mut self.pending_timeline,
+            ScriptCoroutine::new(id, self.instance_serial, thread, resume_frame),
+        );
+        Ok(id)
+    }
+
+    pub(crate) fn reschedule_coroutine(&mut self, id: u64, thread: Thread, wait: CoroutineWait) {
+        ScriptTimeline::stage_coroutine(
+            &mut self.pending_timeline,
+            ScriptCoroutine::waiting(id, self.instance_serial, thread, wait),
+        );
+    }
+
+    pub(crate) fn remove_coroutine(&mut self, id: u64) {
+        ScriptTimeline::stage_coroutine_remove(
+            &mut self.pending_timeline,
+            id,
+            self.instance_serial,
+        );
+    }
+
+    fn require_timer_write(&self) -> Result<(), String> {
+        self.require_writable("timers and coroutines")?;
+        if !self.lifecycle_writes || self.instance_serial == 0 {
+            return Err("timers and coroutines are unavailable in this callback".to_owned());
+        }
+        Ok(())
+    }
+
     /// Пустая транзакция с общим состоянием UI хоста.
     pub(crate) fn with_ui(ui: Rc<RefCell<UiScriptState>>) -> Self {
         Self {
@@ -294,6 +459,16 @@ impl ScriptTransaction {
             ..Self::default()
         }
     }
+}
+
+fn validate_timer(delay: f64, repeat: Option<f64>) -> Result<(), String> {
+    if !delay.is_finite() || delay < 0.0 {
+        return Err("timer delay must be finite and nonnegative".to_owned());
+    }
+    if repeat.is_some_and(|repeat| !repeat.is_finite() || repeat <= 0.0) {
+        return Err("timer repeat interval must be finite and greater than zero".to_owned());
+    }
+    Ok(())
 }
 
 impl Default for ScriptTransaction {
@@ -320,6 +495,7 @@ impl Default for ScriptTransaction {
             action_frame: None,
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
             physics_phase_dt: None,
+            physics_fixed_dt: None,
             pending_physics_commands: Vec::new(),
             pending_grounded: HashMap::new(),
             pending_collider_enabled: HashMap::new(),
@@ -354,9 +530,56 @@ impl Default for ScriptTransaction {
             component_writes: ComponentWrites::default(),
             pending_script_enabled: None,
             instance_enabled: true,
+            timeline: Rc::new(RefCell::new(ScriptTimeline::default())),
+            time_scale: Rc::new(Cell::new(1.0)),
+            pending_timeline: Vec::with_capacity(4),
+            pending_time_scale: None,
+            frame_time: crate::types::ScriptFrameTime::default(),
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod timeline_transaction_tests {
+    use super::*;
+    use crate::timeline::{ScriptTimeline, TimerCallback};
+
+    #[test]
+    fn discarded_callback_rolls_back_timer_registration_cancellation_and_time_scale() {
+        let timeline = Rc::new(RefCell::new(ScriptTimeline::default()));
+        let time_scale = Rc::new(Cell::new(1.0));
+        let existing_id = timeline.borrow_mut().allocate_id().unwrap();
+        let mut existing = Vec::new();
+        ScriptTimeline::stage_timer(
+            &mut existing,
+            existing_id,
+            7,
+            1.0,
+            None,
+            TimerCallback::Abi("existing".to_owned()),
+        );
+        timeline.borrow_mut().apply(&mut existing);
+
+        let mut transaction = ScriptTransaction::default();
+        transaction.attach_time_state(timeline.clone(), time_scale.clone());
+        transaction.writable = true;
+        transaction.lifecycle_writes = true;
+        transaction.instance_serial = 7;
+        transaction.frame_time.frame = 3;
+        transaction.frame_time.elapsed = 0.5;
+
+        let pending_id = transaction
+            .schedule_abi_timer(0.25, None, "pending".to_owned())
+            .unwrap();
+        assert!(transaction.cancel_timer(existing_id).unwrap());
+        transaction.stage_time_scale(0.0).unwrap();
+        transaction.discard();
+
+        assert!(!timeline.borrow().timer_exists(pending_id, 7));
+        assert!(timeline.borrow().timer_exists(existing_id, 7));
+        assert_eq!(time_scale.get(), 1.0);
     }
 }
 
@@ -375,6 +598,7 @@ impl ScriptTransaction {
         self.action_frame = Some(init.actions);
         self.physics = init.physics;
         self.physics_phase_dt = init.physics_phase_dt;
+        self.physics_fixed_dt = None;
         self.source.clear();
         self.source.push_str(init.source);
         self.pending_transforms.clear();
@@ -413,6 +637,8 @@ impl ScriptTransaction {
         self.instance_enabled = init.instance_enabled;
         self.pending_edits.clear();
         self.pending_script_enabled = None;
+        self.pending_timeline.clear();
+        self.pending_time_scale = None;
         self.pending_spawns.clear();
         self.pending_destroys.clear();
         self.pending_prefab_requests.clear();
@@ -806,11 +1032,20 @@ impl ScriptTransaction {
         object: ObjectHandle,
         force: Vec3,
     ) -> Result<(), String> {
-        self.push_body_command(object, force, |body| PhysicsCommand::AddForce {
-            body,
-            force,
-            point: None,
-        })
+        if let Some(dt) = self.physics_fixed_dt {
+            let impulse = force * dt;
+            self.push_body_command(object, force, |body| PhysicsCommand::AddImpulse {
+                body,
+                impulse,
+                point: None,
+            })
+        } else {
+            self.push_body_command(object, force, |body| PhysicsCommand::AddForce {
+                body,
+                force,
+                point: None,
+            })
+        }
     }
 
     fn push_body_command(
@@ -1250,7 +1485,9 @@ impl ScriptTransaction {
         let dt = self
             .physics_phase_dt
             .filter(|dt| dt.is_finite() && *dt > 0.0)
-            .ok_or_else(|| "simple_move is only available during update".to_owned())?;
+            .ok_or_else(|| {
+                "simple_move is only available during fixed update or update".to_owned()
+            })?;
         let settings = self.controller_component(object)?;
         let mut vertical = self.vertical_velocity(object)?;
         if settings.use_gravity {
@@ -2444,6 +2681,15 @@ impl ScriptTransaction {
             self.discard();
             return Err(message);
         }
+        if !self.timeline.borrow().can_add_timer(&self.pending_timeline)
+            || !self
+                .timeline
+                .borrow()
+                .coroutines_fit(&self.pending_timeline)
+        {
+            self.discard();
+            return Err("script timer or coroutine limit reached".to_owned());
+        }
 
         let mut physics_commands = std::mem::take(&mut self.pending_physics_commands);
         if let Some(dt) = self
@@ -2538,6 +2784,10 @@ impl ScriptTransaction {
         }
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
+        if let Some(scale) = self.pending_time_scale.take() {
+            self.time_scale.set(scale);
+        }
+        self.timeline.borrow_mut().apply(&mut self.pending_timeline);
         for request in &self.pending_audio {
             match request {
                 AudioRequest::PlayClip { voice, params, .. } => {
@@ -2615,6 +2865,8 @@ impl ScriptTransaction {
         self.pending_dead_warnings.clear();
         self.pending_edits.clear();
         self.pending_script_enabled = None;
+        self.pending_timeline.clear();
+        self.pending_time_scale = None;
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
         self.pending_post_process.clear();

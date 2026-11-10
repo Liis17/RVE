@@ -131,7 +131,8 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.build_demo == 'true' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # Release packaging and SDK-isolation checks each build the player.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash

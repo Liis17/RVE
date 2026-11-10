@@ -1447,6 +1447,7 @@ impl SceneRenderer {
         world: &World,
         frame: &SceneFrame,
         particle_commands: &[ParticleCommand],
+        particle_dt: Option<f32>,
         scene_eye: Vec3,
         game_eye: Vec3,
         grid_camera_distance: Option<f32>,
@@ -1474,7 +1475,7 @@ impl SceneRenderer {
         self.scene_draws.clear();
         self.game_draws.clear();
         self.capture_draws.clear();
-        self.sync_particles(renderer, world, frame, particle_commands)?;
+        self.sync_particles(renderer, world, frame, particle_commands, particle_dt)?;
         let palette_index = palette_indices(&self.skins, play_bridge.or(self.animation.bridge()));
         let used_object_materials = {
             let mut resources = DrawResources {
@@ -1971,13 +1972,18 @@ impl SceneRenderer {
         world: &World,
         frame: &SceneFrame,
         commands: &[ParticleCommand],
+        particle_dt: Option<f32>,
     ) -> Result<(), RenderError> {
         // Старые ссылки на эмиттеры могут уйти на замену; при ошибке кадр не должен их использовать.
         self.particle_frames.clear();
         let now = Instant::now();
-        self.particle_step = self
-            .particle_clock
-            .map_or(0.0, |previous| (now - previous).as_secs_f32());
+        self.particle_step = particle_dt.map_or_else(
+            || {
+                self.particle_clock
+                    .map_or(0.0, |previous| (now - previous).as_secs_f32())
+            },
+            |dt| if dt.is_finite() { dt.max(0.0) } else { 0.0 },
+        );
         self.particle_clock = Some(now);
         if self.particles_playing != Some(self.playing) {
             for entry in self.particle_emitters.values() {

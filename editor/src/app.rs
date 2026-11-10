@@ -2245,10 +2245,14 @@ fn render_scene_frame(
         .as_mut()
         .map(PlaySession::take_particle_commands)
         .unwrap_or_default();
+    let particle_dt = state.play.as_mut().map(PlaySession::take_particle_dt);
     let Some(parts) = state.frame_parts() else {
         // Retain particle commands when this frame has no world to consume them.
         if let Some(play) = state.play.as_mut() {
             play.restore_particle_commands(particle_commands);
+            if let Some(particle_dt) = particle_dt {
+                play.restore_particle_dt(particle_dt);
+            }
         }
         return render_ui_only(renderer, ui, &[]);
     };
@@ -2280,6 +2284,7 @@ fn render_scene_frame(
         parts.world,
         &scene_frame,
         &particle_commands,
+        particle_dt,
         scene_camera.position,
         game_camera.position,
         grid_camera_distance,

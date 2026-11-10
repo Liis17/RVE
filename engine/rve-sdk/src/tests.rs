@@ -5,8 +5,8 @@ use crate::abi::{
     RVE_TRIGGER_STAY, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams, RveCameraSettings,
     RveCharacterMoveResult, RveCursorState, RveGamepadState, RveHeader, RveHost, RveModule,
     RveParamEntry, RveParams, RvePlayAnimationParams, RveQueryOptions, RveQueryShape,
-    RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveUiRect, RveUiValue,
-    RveValue, RveValueData,
+    RveRaycastHit, RveScriptDesc, RveScriptTime, RveStatus, RveStr, RveTime, RveTransform,
+    RveUiRect, RveUiValue, RveValue, RveValueData,
 };
 use crate::{
     AntiAliasing, CameraSettings, ConsoleLevel, Context, GamepadAxis, GamepadButton, GamepadState,
@@ -244,6 +244,9 @@ struct HostState {
     rumble_calls: Vec<(u32, f32, f32, f32)>,
     /// Result of every rumble callback.
     rumble_accepts: bool,
+    time_scale: Option<f32>,
+    scheduled_timers: Vec<(f64, f64, String)>,
+    canceled_timers: Vec<u64>,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -278,6 +281,45 @@ unsafe extern "C" fn unregister_command(ctx: *mut c_void, name: RveStr) -> u32 {
     state
         .unregistered_commands
         .push(unsafe { name.to_str() }.unwrap().to_owned());
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn set_time_scale(ctx: *mut c_void, scale: f32) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    unsafe { (&mut *ctx.cast::<HostState>()).time_scale = Some(scale) };
+    true
+}
+
+unsafe extern "C" fn schedule_timer(
+    ctx: *mut c_void,
+    delay: f64,
+    repeat: f64,
+    tag: RveStr,
+    timer_id: *mut u64,
+) -> u32 {
+    if timer_id.is_null() {
+        return RveStatus::Error as u32;
+    }
+    // SAFETY: the test context, tag, and output slot are live for this call.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state
+        .scheduled_timers
+        .push((delay, repeat, unsafe { tag.to_str() }.unwrap().to_owned()));
+    // SAFETY: timer_id was checked and belongs to the caller's live stack frame.
+    unsafe { *timer_id = 41 };
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn cancel_timer(ctx: *mut c_void, timer_id: u64, canceled: *mut bool) -> u32 {
+    if canceled.is_null() {
+        return RveStatus::Error as u32;
+    }
+    // SAFETY: the test context and output slot are live for this call.
+    unsafe { &mut *ctx.cast::<HostState>() }
+        .canceled_timers
+        .push(timer_id);
+    // SAFETY: canceled was checked and belongs to the caller's live stack frame.
+    unsafe { *canceled = true };
     RveStatus::Ok as u32
 }
 
@@ -626,6 +668,18 @@ fn host(state: &mut HostState) -> RveHost {
         audio_play_clip_ex: None,
         audio_set_voice_position: None,
         mesh_set_material_path: None,
+        script_time: RveScriptTime {
+            dt: 0.25,
+            unscaled_dt: 0.5,
+            elapsed: 12.5,
+            unscaled_elapsed: 25.0,
+            fixed_dt: 0.02,
+            scale: 0.5,
+            frame: 8,
+        },
+        set_time_scale: Some(set_time_scale),
+        schedule_timer: Some(schedule_timer),
+        cancel_timer: Some(cancel_timer),
     }
 }
 
@@ -842,6 +896,9 @@ fn script_module_macro_builds_abi_table_and_guest_callbacks() {
     assert_eq!(module.script_count, 3);
 
     let script = descriptor(module, "Probe");
+    assert!(script.on_fixed_update.is_some());
+    assert!(script.on_late_update.is_some());
+    assert!(script.on_timer.is_some());
     let mut state = HostState {
         transform: RveTransform::default(),
         ..HostState::default()
@@ -1690,6 +1747,30 @@ fn guest_input_wrapper_reads_states_and_pointer_vectors() {
 }
 
 #[test]
+fn guest_clock_and_timer_context_api_uses_the_appended_host_tail() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let context = Context::new(&host).unwrap();
+
+    let time = context.script_time();
+    assert_eq!(time.dt, 0.25);
+    assert_eq!(time.unscaled_dt, 0.5);
+    assert_eq!(time.elapsed, 12.5);
+    assert_eq!(time.unscaled_elapsed, 25.0);
+    assert_eq!(time.fixed_dt, 0.02);
+    assert_eq!(time.scale, 0.5);
+    assert_eq!(time.frame, 8);
+
+    context.set_time_scale(0.0).unwrap();
+    let timer = context.schedule(0.75, Some(0.25), "pulse").unwrap();
+    assert!(context.cancel_timer(timer).unwrap());
+    assert_eq!(timer.0, 41);
+    assert_eq!(state.time_scale, Some(0.0));
+    assert_eq!(state.scheduled_timers, [(0.75, 0.25, "pulse".to_owned())]);
+    assert_eq!(state.canceled_timers, [41]);
+}
+
+#[test]
 fn guest_camera_wrappers_read_write_and_switch_cameras() {
     let mut state = HostState {
         active_camera: 1,
@@ -2242,7 +2323,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2512,7 +2593,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
 }
 
 #[test]
@@ -2534,7 +2615,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
 }
 
 #[test]
@@ -2558,7 +2639,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
 }
 
 #[test]
@@ -2594,11 +2675,7 @@ fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
         offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(
-        size_of::<crate::abi::RveScriptDesc>(),
-        size_of::<crate::abi::RveScriptDescV16>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
-    );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
 }
 
 #[test]
@@ -2622,7 +2699,7 @@ fn lifecycle_descriptor_fields_follow_the_ui_event_in_abi_v17() {
         size_of::<crate::abi::RveScriptDescV17>()
     );
     assert_eq!(
-        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV19>(),
         size_of::<crate::abi::RveScriptDescV18>()
     );
 }
@@ -2644,7 +2721,7 @@ fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
 fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
     assert_eq!(RVE_TRIGGER_STAY, 4);
     assert_eq!(
         offset_of!(RveHost, physics_get_collider),
@@ -2661,7 +2738,7 @@ fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
 fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
     assert_eq!(
         offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
@@ -2675,7 +2752,7 @@ fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     assert_eq!(
         offset_of!(RveHost, mesh_set_material_path)
             + size_of::<Option<crate::abi::RveMeshSetMaterialPathFn>>(),
-        size_of::<RveHost>()
+        offset_of!(RveHost, script_time)
     );
 }
 #[test]
@@ -2697,7 +2774,7 @@ fn runtime_physics_value_types_are_c_layout_in_v18() {
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 19);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 20);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);

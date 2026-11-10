@@ -13,6 +13,7 @@ mod lifecycle;
 mod lite;
 mod net;
 mod physics;
+mod timeline;
 mod transaction;
 mod types;
 mod ui;
@@ -33,8 +34,8 @@ pub use lifecycle::{
 };
 pub use rve_sdk::{Key, MouseButton};
 pub use types::{
-    MAX_RUMBLE_SECONDS, RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput,
-    ScriptParams, ScriptTime, ScriptTransform,
+    MAX_RUMBLE_SECONDS, RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel,
+    ScriptFrameTime, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
 pub use ui_assets::{PreparedUi, UiAssetSource, UiRegistry, is_ui_document, load_ui};
 pub use ui_input::{UiInputBridge, UiTick};

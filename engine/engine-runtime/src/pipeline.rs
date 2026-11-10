@@ -58,8 +58,9 @@ use engine_scene::{
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
 use engine_script::{
-    PrefabRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle,
-    ScriptLibrary, ScriptLoadOptions, ScriptTime, SpawnedObject, WorldChanges,
+    PrefabRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptFrameTime, ScriptHost,
+    ScriptInterruptHandle, ScriptLibrary, ScriptLoadOptions, ScriptTime, SpawnedObject,
+    WorldChanges,
 };
 #[cfg(feature = "dev-console")]
 use engine_ui::render::UiBridge;
@@ -1258,6 +1259,17 @@ fn scripts_thread(
         geometry: physics_geometry,
         ..SpawnPhysics::default()
     };
+    let (fixed_hz, max_substeps) = physics_initialization
+        .as_ref()
+        .map_or((60, 8), |initialization| {
+            (initialization.fixed_hz, initialization.max_substeps)
+        });
+    if let Err(error) = scripts.set_fixed_step_config(fixed_hz, max_substeps) {
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(ScriptStartupError::Physics(error)));
+        }
+        return;
+    }
     let mut physics_client = physics_client;
     let mut physics_sync = None;
     match (physics_client.as_mut(), physics_initialization) {
@@ -1347,8 +1359,9 @@ fn scripts_thread(
     let mut frame_number = 0_u64;
     let mut last_tick = clock.now();
     let mut sim_time = 0.0_f64;
+    let mut unscaled_sim_time = 0.0_f64;
     let start_time = ScriptTime {
-        elapsed: last_tick.as_secs_f64(),
+        elapsed: 0.0,
         frame: frame_number,
     };
     if let Some(handle) = audio.as_ref() {
@@ -1527,13 +1540,23 @@ fn scripts_thread(
             latency.marker(next_frame, LatencyMarker::SimulationStart);
         }
         let now = clock.now();
-        let dt = now.saturating_sub(last_tick).as_secs_f32();
+        let unscaled_dt = now.saturating_sub(last_tick).as_secs_f32();
         last_tick = now;
-        sim_time += f64::from(dt);
         frame_number = frame_number.saturating_add(1);
+        let frame_time = ScriptFrameTime::advance(
+            unscaled_dt,
+            scripts.time_scale(),
+            sim_time,
+            unscaled_sim_time,
+            scripts.fixed_dt(),
+            frame_number,
+        );
+        sim_time = frame_time.elapsed;
+        unscaled_sim_time = frame_time.unscaled_elapsed;
+        let dt = frame_time.dt;
         let time = ScriptTime {
-            elapsed: now.as_secs_f64(),
-            frame: frame_number,
+            elapsed: frame_time.elapsed,
+            frame: frame_time.frame,
         };
         let console_started = Instant::now();
         #[cfg(feature = "dev-console")]
@@ -1617,7 +1640,7 @@ fn scripts_thread(
         timings.record(script_phase::LOOP, script_phase::UI, ui_started.elapsed());
         scripts.set_input(input_frame);
         let update_started = Instant::now();
-        scripts.update(&mut world, dt, time);
+        scripts.update_frame(&mut world, frame_time);
         let rumble = scripts.take_rumble_requests();
         if accepting_input {
             gamepads.rumble_frame(
@@ -6105,6 +6128,8 @@ return Script
                 snapshot,
             },
             bindings: Vec::new(),
+            fixed_hz: 60,
+            max_substeps: 8,
         };
         let (physics_request_tx, physics_request_rx) = flume::unbounded();
         let (_physics_reply_tx, physics_reply_rx) = flume::unbounded::<PhysicsReply>();
@@ -6173,10 +6198,25 @@ return Script
     }
 
     #[test]
-    fn physics_steps_use_the_same_injected_delta_in_foreground_and_background() {
+    fn physics_steps_use_the_scaled_clamped_runtime_clock_in_foreground_and_background() {
+        let script = r#"
+local Clock = {}
+function Clock:on_update(dt)
+  if rve.time.frame == 1 then
+    assert(math.abs(dt - 0.25) < 0.00001)
+    assert(math.abs(rve.time.elapsed - 0.25) < 0.00001)
+    rve.time.scale = 0.5
+  elseif rve.time.frame == 2 then
+    assert(math.abs(dt - 0.125) < 0.00001)
+    assert(math.abs(rve.time.elapsed - 0.375) < 0.00001)
+  end
+  self.transform.position = { x = rve.time.elapsed, y = 0, z = 0 }
+end
+return Clock
+"#;
         let document = SceneDocument::parse(
             "startup.rvescene",
-            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects.heavy_scripts]]\nname = \"TickProbe\"\n",
+            "[[assets]]\npath = 'clock.lua'\n[[objects]]\nid = 'camera'\n[objects.camera]\n[[objects.lite_scripts]]\npath = 'clock.lua'\n",
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();
@@ -6200,6 +6240,8 @@ return Script
                 snapshot: Arc::clone(&snapshot),
             },
             bindings: Vec::new(),
+            fixed_hz: 60,
+            max_substeps: 8,
         };
         let (physics_request_tx, physics_request_rx) = flume::unbounded();
         let (physics_reply_tx, physics_reply_rx) = flume::unbounded();
@@ -6237,7 +6279,7 @@ return Script
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
                 cursor: CursorControl::default(),
-                sources: BTreeMap::new(),
+                sources: BTreeMap::from([("clock.lua".to_owned(), script.to_owned())]),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
@@ -6246,7 +6288,7 @@ return Script
                 render_resources: flume::unbounded().0,
                 network: None,
                 frame_limit: None,
-                script_module: Some(script_module()),
+                script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
                 background_tick_hz: 1,
@@ -6287,16 +6329,16 @@ return Script
         clock.advance(Duration::from_millis(500));
         script_tx.send(ScriptControl::Background(true)).unwrap();
         let background_dt = physics_dt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(background_dt, 1.0);
+        assert_eq!(background_dt, 0.25);
         waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(frame_rx.try_recv().is_err());
         clock.advance(Duration::from_millis(250));
         script_tx.send(ScriptControl::Background(false)).unwrap();
 
         let foreground_dt = physics_dt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(foreground_dt, 0.25);
+        assert_eq!(foreground_dt, 0.125);
         let snapshot = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!((snapshot.camera.position.x - background_dt - foreground_dt).abs() < 1.0e-6);
+        assert!((snapshot.camera.position.x - 0.375).abs() < 1.0e-6);
         script_tx.send(ScriptControl::Shutdown).unwrap();
         script_thread
             .stopped
@@ -6624,6 +6666,8 @@ return Move
                 snapshot,
             },
             bindings: Vec::new(),
+            fixed_hz: 60,
+            max_substeps: 8,
         };
         let (physics_request_tx, physics_request_rx) = flume::unbounded();
         let (physics_reply_tx, physics_reply_rx) = flume::unbounded();

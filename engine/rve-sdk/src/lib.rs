@@ -9,6 +9,7 @@ mod components;
 /// Version of this SDK crate, as declared in its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub use abi::RveScriptTime;
 pub use abi::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
 use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
@@ -374,6 +375,12 @@ pub trait Script: 'static {
     fn on_start(&mut self, _ctx: &mut Context<'_>) {}
     /// Called for each update with the frame delta in seconds.
     fn on_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
+    /// Called zero or more times before `on_update`, with the fixed simulation delta.
+    fn on_fixed_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
+    /// Called after updates, messages, timers, and coroutines for this frame.
+    fn on_late_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
+    /// Called when a timer scheduled by this instance expires.
+    fn on_timer(&mut self, _ctx: &mut Context<'_>, _tag: &str) {}
     /// Called when a message is delivered to this script.
     fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
     /// Called when this object begins touching another collider.
@@ -1379,6 +1386,80 @@ impl<'a> Context<'a> {
         self.host.time
     }
 
+    /// Returns the full scaled and unscaled time snapshot for this callback.
+    pub fn script_time(&self) -> RveScriptTime {
+        self.host.script_time
+    }
+
+    /// Stages a finite nonnegative time scale for the next frame.
+    pub fn set_time_scale(&self, scale: f32) -> Result<(), String> {
+        if !scale.is_finite() || scale < 0.0 {
+            return Err("time scale must be finite and nonnegative".to_owned());
+        }
+        let callback = self
+            .host
+            .set_time_scale
+            .ok_or_else(|| "time scale is unavailable on this host".to_owned())?;
+        // SAFETY: the callback and host context are valid during this guest call.
+        if unsafe { callback(self.host.ctx, scale) } {
+            Ok(())
+        } else {
+            Err("could not stage time scale".to_owned())
+        }
+    }
+
+    /// Schedules a timer owned by this script. Repeating timers require a positive interval.
+    pub fn schedule(
+        &self,
+        delay: f64,
+        repeat: Option<f64>,
+        tag: impl AsRef<str>,
+    ) -> Result<TimerId, String> {
+        if !delay.is_finite() || delay < 0.0 {
+            return Err("timer delay must be finite and nonnegative".to_owned());
+        }
+        if repeat.is_some_and(|interval| !interval.is_finite() || interval <= 0.0) {
+            return Err("timer repeat interval must be finite and positive".to_owned());
+        }
+        let callback = self
+            .host
+            .schedule_timer
+            .ok_or_else(|| "timers are unavailable on this host".to_owned())?;
+        let mut id = 0;
+        let repeat = repeat.unwrap_or(0.0);
+        // SAFETY: the tag and output slot remain valid for this synchronous callback.
+        let status = unsafe {
+            callback(
+                self.host.ctx,
+                delay,
+                repeat,
+                RveStr::from_str_ref(tag.as_ref()),
+                &mut id,
+            )
+        };
+        if status == 0 && id != 0 {
+            Ok(TimerId(id))
+        } else {
+            Err("could not schedule script timer".to_owned())
+        }
+    }
+
+    /// Cancels a timer previously scheduled by this script instance.
+    pub fn cancel_timer(&self, id: TimerId) -> Result<bool, String> {
+        let callback = self
+            .host
+            .cancel_timer
+            .ok_or_else(|| "timers are unavailable on this host".to_owned())?;
+        let mut canceled = false;
+        // SAFETY: the output slot and host context remain valid during this callback.
+        let status = unsafe { callback(self.host.ctx, id.0, &mut canceled) };
+        if status == 0 {
+            Ok(canceled)
+        } else {
+            Err("could not cancel script timer".to_owned())
+        }
+    }
+
     /// Returns the input snapshot available during this callback.
     pub fn input(&self) -> Input<'_> {
         Input { host: self.host }
@@ -1552,6 +1633,10 @@ impl<'a> Context<'a> {
         unsafe { value.to_str().ok().map(str::to_owned) }
     }
 }
+
+/// Opaque identifier returned by [`Context::schedule`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TimerId(u64);
 
 impl Console<'_> {
     pub fn write(&self, message: impl AsRef<str>, level: ConsoleLevel) {
@@ -3643,7 +3728,7 @@ pub mod __private {
         RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RVE_TRIGGER_STAY,
         RveCollisionEvent, RveCollisionFn, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
         RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveStartFn, RveStatus,
-        RveStr, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
+        RveStr, RveTimerFn, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -3658,6 +3743,9 @@ pub mod __private {
         create: RveCreateFn,
         start: RveStartFn,
         update: RveUpdateFn,
+        fixed_update: RveUpdateFn,
+        late_update: RveUpdateFn,
+        timer: RveTimerFn,
         message: RveMessageFn,
         destroy: RveStartFn,
         drop: RveDropFn,
@@ -3685,6 +3773,9 @@ pub mod __private {
             ui_event: Some(ui_event),
             on_enable: Some(enable),
             on_disable: Some(disable),
+            on_fixed_update: Some(fixed_update),
+            on_late_update: Some(late_update),
+            on_timer: Some(timer),
         }
     }
 
@@ -3776,6 +3867,34 @@ pub mod __private {
 
     pub unsafe fn update(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus {
         unsafe { with_context(instance, host, |script, ctx| script.on_update(ctx, dt)) }
+    }
+
+    pub unsafe fn fixed_update(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus {
+        unsafe {
+            with_context(instance, host, |script, ctx| {
+                script.on_fixed_update(ctx, dt)
+            })
+        }
+    }
+
+    pub unsafe fn late_update(instance: *mut c_void, host: *const RveHost, dt: f32) -> RveStatus {
+        unsafe { with_context(instance, host, |script, ctx| script.on_late_update(ctx, dt)) }
+    }
+
+    pub unsafe fn timer(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus {
+        if instance.is_null() || host.is_null() {
+            return report(host, "null timer callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: the tag is borrowed for the duration of this ABI callback.
+            let tag = unsafe { tag.to_str() }.map_err(|error| error.to_string())?;
+            // SAFETY: pointers are valid for this callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new(unsafe { &*host })?;
+            instance.0.on_timer(&mut context, tag);
+            context.commit()
+        }));
+        status_from_result(host, result)
     }
 
     pub unsafe fn message(
@@ -4303,6 +4422,30 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped host pointer.
             unsafe { $crate::__private::update(instance, host, dt) }
         }
+        unsafe extern "C" fn __rve_fixed_update(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            dt: f32,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::fixed_update(instance, host, dt) }
+        }
+        unsafe extern "C" fn __rve_late_update(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            dt: f32,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::late_update(instance, host, dt) }
+        }
+        unsafe extern "C" fn __rve_timer(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            tag: $crate::abi::RveStr,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped timer tag.
+            unsafe { $crate::__private::timer(instance, host, tag) }
+        }
         unsafe extern "C" fn __rve_message(
             instance: *mut ::std::ffi::c_void,
             host: *const $crate::abi::RveHost,
@@ -4379,6 +4522,9 @@ macro_rules! __rve_script_descriptor {
             __rve_create,
             __rve_start,
             __rve_update,
+            __rve_fixed_update,
+            __rve_late_update,
+            __rve_timer,
             __rve_message,
             __rve_destroy,
             __rve_drop_instance,
