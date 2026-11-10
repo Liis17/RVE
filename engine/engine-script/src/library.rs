@@ -827,7 +827,7 @@ fn abi_param_kind(kind: u32, argument: &str) -> Option<ParamKind> {
 }
 
 #[cfg(test)]
-mod abi22_compat_tests {
+mod abi_compat_tests {
     use super::ScriptLibrary;
     use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveHeader, RveModule, RveScriptDescV20};
     use rve_sdk::{Params, Script};
@@ -845,8 +845,8 @@ mod abi22_compat_tests {
     }
 
     #[test]
-    fn abi21_and_abi20_two_descriptor_tables_use_the_historical_stride() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    fn abi20_and_abi21_descriptor_tables_use_the_historical_stride_on_v23_host() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         let current = rve_sdk::script_module! {
             "Probe" => probe,
             "SecondProbe" => second_probe,
@@ -897,6 +897,29 @@ mod abi22_compat_tests {
             assert!(library.script("SecondProbe").is_some());
             assert!(library.schema("Probe").is_none());
         }
+    }
+
+    #[test]
+    fn abi22_guest_descriptor_layout_loads_on_v23_host() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+        let current = rve_sdk::script_module! {
+            "Probe" => probe,
+            "SecondProbe" => second_probe,
+        };
+        let previous = Box::leak(Box::new(RveModule {
+            header: RveHeader {
+                abi_version: 22,
+                header_size: std::mem::size_of::<RveHeader>() as u32,
+            },
+            // ABI v23 appends only a host callback, so the v22 descriptor layout is unchanged.
+            scripts: current.scripts,
+            script_count: current.script_count,
+        }));
+        // SAFETY: the module and descriptor table are immutable process-lifetime values.
+        let library = unsafe { ScriptLibrary::from_module(std::ptr::from_ref(previous)) }.unwrap();
+        assert_eq!(library.abi_version(), 22);
+        assert!(library.script("Probe").is_some());
+        assert!(library.script("SecondProbe").is_some());
     }
 }
 

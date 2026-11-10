@@ -25,7 +25,8 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 21 appends transactional save callbacks after the v20 host tail.
 /// Version 22 appends script-reference and scene callbacks after the v21 host tail, and the
 /// nullable `set_property` callback after the v20 descriptor tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 22;
+/// Version 23 appends the nullable application-quit callback after the v22 host tail.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 23;
 
 /// Validate an external property write before any `Script::set_property` hook runs.
 pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
@@ -1942,6 +1943,8 @@ pub struct RveHost {
     pub scene_load: Option<RveSceneLoadFn>,
     /// Writes the current scene name as a call-scoped string value. Appended in ABI v22.
     pub scene_current: Option<RveSceneCurrentFn>,
+    /// Requests graceful application shutdown; appended in ABI v23.
+    pub app_quit: Option<RveAppQuitFn>,
 }
 
 /// Copies one save value into the output; the value is valid until the calling script callback ends.
@@ -2212,6 +2215,8 @@ pub type RveScriptRefSetFn = unsafe extern "C" fn(
 pub type RveSceneLoadFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
 /// Copies the current scene name into `out`; valid until the calling guest callback ends.
 pub type RveSceneCurrentFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveValue) -> bool;
+/// Requests graceful application shutdown from the current script callback.
+pub type RveAppQuitFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
 
 /// Guest factory callback.
 pub type RveCreateFn = unsafe extern "C" fn(
@@ -2770,7 +2775,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2824,7 +2829,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -2851,7 +2856,7 @@ mod tests {
     fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
         use std::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(size_of::<super::RveScriptTime>(), 40);
         assert_eq!(align_of::<super::RveScriptTime>(), 8);
@@ -2920,7 +2925,7 @@ mod tests {
     fn abi21_callbacks_append_after_the_abi20_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
         assert_eq!(
             offset_of!(super::RveHost, save_set),
             offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()
@@ -2985,10 +2990,22 @@ mod tests {
             offset_of!(super::RveHost, scene_current),
             offset_of!(super::RveHost, scene_load) + size_of::<Option<super::RveSceneLoadFn>>()
         );
+    }
+
+    #[test]
+    fn abi23_app_quit_callback_appends_after_the_scene_host_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
+        assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(
-            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, app_quit),
             offset_of!(super::RveHost, scene_current)
                 + size_of::<Option<super::RveSceneCurrentFn>>()
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, app_quit) + size_of::<Option<super::RveAppQuitFn>>()
         );
     }
 }

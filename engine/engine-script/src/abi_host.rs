@@ -2,7 +2,7 @@ mod components;
 mod scenes;
 mod script_refs;
 
-use scenes::{host_scene_current, host_scene_load};
+use scenes::{host_app_quit, host_scene_current, host_scene_load};
 use script_refs::{
     host_object_script, host_script_ref_enabled, host_script_ref_get, host_script_ref_send,
     host_script_ref_set, host_script_ref_set_enabled,
@@ -411,6 +411,7 @@ impl<'a> AbiCallContext<'a> {
             script_ref_set_enabled: Some(host_script_ref_set_enabled),
             scene_load: Some(host_scene_load),
             scene_current: Some(host_scene_current),
+            app_quit: Some(host_app_quit),
         }
     }
 

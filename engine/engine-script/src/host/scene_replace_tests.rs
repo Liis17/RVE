@@ -425,6 +425,62 @@ fn lua_scene_load_is_validated_and_applied_after_the_frame() {
 }
 
 #[test]
+fn lua_app_quit_is_committed_only_after_a_successful_callback() {
+    let mut world = driver_world();
+    let mut script_sources = sources();
+    script_sources.insert(
+        "driver.lua".to_owned(),
+        r#"
+local Script = {}
+function Script:on_update()
+  rve.app.quit()
+  error("fail after quit")
+end
+return Script
+"#
+        .to_owned(),
+    );
+    let mut host = ScriptHost::load(&world, "old.rvescene", &script_sources, None).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, at_frame(1));
+
+    assert!(!host.take_quit_request());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message.contains("fail after quit"))
+    );
+
+    let mut successful_world = driver_world();
+    script_sources.insert(
+        "driver.lua".to_owned(),
+        "return { on_update = function() rve.app.quit() end }".to_owned(),
+    );
+    let mut successful_host =
+        ScriptHost::load(&successful_world, "old.rvescene", &script_sources, None).unwrap();
+    successful_host.update(&mut successful_world, 1.0 / 60.0, at_frame(1));
+    assert!(successful_host.take_quit_request());
+    assert!(!successful_host.take_quit_request());
+}
+
+#[test]
+fn lua_app_quit_is_rejected_from_the_top_level_chunk() {
+    let world = driver_world();
+    let mut script_sources = sources();
+    script_sources.insert(
+        "driver.lua".to_owned(),
+        "rve.app.quit(); return {}".to_owned(),
+    );
+
+    let error = match ScriptHost::load(&world, "old.rvescene", &script_sources, None) {
+        Ok(_) => panic!("top-level quit request should be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("quit can only be requested"));
+}
+
+#[test]
 fn applied_scene_request_updates_current_and_failed_one_keeps_it() {
     let mut world = driver_world();
     let mut sources = sources();

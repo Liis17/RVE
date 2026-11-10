@@ -24,6 +24,19 @@ struct Probe {
     last_message: String,
 }
 
+struct QuitProbe;
+
+impl Script for QuitProbe {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        let accepted = ctx.quit();
+        ctx.log_info(if accepted {
+            "quit accepted"
+        } else {
+            "quit rejected"
+        });
+    }
+}
+
 impl Script for Probe {
     fn on_start(&mut self, ctx: &mut Context<'_>) {
         assert_eq!(ctx.time().elapsed, 12.5);
@@ -116,6 +129,10 @@ fn probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     }))
 }
 
+fn quit_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(QuitProbe))
+}
+
 fn error_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Err("factory error".to_owned())
 }
@@ -137,6 +154,12 @@ fn scripts() -> &'static RveModule {
         "Probe" => probe_factory,
         "Error" => error_factory,
         "Panic" => panic_factory,
+    }
+}
+
+fn quit_scripts() -> &'static RveModule {
+    crate::script_module! {
+        "QuitProbe" => quit_probe_factory,
     }
 }
 
@@ -249,6 +272,8 @@ struct HostState {
     canceled_timers: Vec<u64>,
     save_values: std::collections::BTreeMap<String, i64>,
     save_flushed: bool,
+    quit_accepts: bool,
+    quit_calls: usize,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -256,6 +281,13 @@ unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
     let state = unsafe { &mut *ctx.cast::<HostState>() };
     // SAFETY: message references a live guest string for this callback.
     state.error = Some(unsafe { message.to_str() }.unwrap().to_owned());
+}
+
+unsafe extern "C" fn app_quit(ctx: *mut c_void) -> bool {
+    // SAFETY: test host points to a live HostState during the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.quit_calls += 1;
+    state.quit_accepts
 }
 
 unsafe extern "C" fn log(ctx: *mut c_void, level: u32, message: RveStr) {
@@ -791,6 +823,7 @@ fn host(state: &mut HostState) -> RveHost {
         script_ref_set_enabled: None,
         scene_load: None,
         scene_current: None,
+        app_quit: None,
     }
 }
 
@@ -1048,6 +1081,67 @@ fn script_module_macro_builds_abi_table_and_guest_callbacks() {
     );
     // SAFETY: drop is called exactly once for this successful create.
     assert_eq!(unsafe { (script.drop)(instance) }, RveStatus::Ok);
+}
+
+#[test]
+fn context_quit_returns_the_host_decision_and_handles_a_missing_callback() {
+    let mut state = HostState {
+        quit_accepts: true,
+        ..HostState::default()
+    };
+    let mut abi_host = host(&mut state);
+    abi_host.app_quit = Some(app_quit);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let script = descriptor(quit_scripts(), "QuitProbe");
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor and host remain live through each synchronous guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&abi_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+        assert_eq!((script.update)(instance, &abi_host, 0.1), RveStatus::Ok);
+        assert_eq!((script.drop)(instance), RveStatus::Ok);
+    }
+    assert_eq!(state.quit_calls, 1);
+    assert_eq!(state.logs, ["quit accepted"]);
+
+    let mut rejected_state = HostState::default();
+    let mut rejected_host = host(&mut rejected_state);
+    rejected_host.app_quit = Some(app_quit);
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor and host remain live through each synchronous guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&rejected_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+        assert_eq!(
+            (script.update)(instance, &rejected_host, 0.1),
+            RveStatus::Ok
+        );
+        assert_eq!((script.drop)(instance), RveStatus::Ok);
+    }
+    assert_eq!(rejected_state.quit_calls, 1);
+    assert_eq!(rejected_state.logs, ["quit rejected"]);
+
+    let mut missing_state = HostState::default();
+    let missing_host = host(&mut missing_state);
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor and host remain live through each synchronous guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&missing_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+        assert_eq!((script.update)(instance, &missing_host, 0.1), RveStatus::Ok);
+        assert_eq!((script.drop)(instance), RveStatus::Ok);
+    }
+    assert_eq!(missing_state.quit_calls, 0);
+    assert_eq!(missing_state.logs, ["quit rejected"]);
 }
 
 #[test]
@@ -2479,7 +2573,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2754,7 +2848,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
 }
 
 #[test]
@@ -2776,7 +2870,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
 }
 
 #[test]
@@ -2800,7 +2894,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
 }
 
 #[test]
@@ -2836,7 +2930,7 @@ fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
         offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
 }
 
 #[test]
@@ -2882,7 +2976,7 @@ fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
 fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
     assert_eq!(RVE_TRIGGER_STAY, 4);
     assert_eq!(
         offset_of!(RveHost, physics_get_collider),
@@ -2899,7 +2993,7 @@ fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
 fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
     assert_eq!(
         offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
@@ -2935,7 +3029,7 @@ fn runtime_physics_value_types_are_c_layout_in_v18() {
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 23);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);

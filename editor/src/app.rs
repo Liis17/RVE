@@ -1597,15 +1597,32 @@ impl EditorApp {
     }
 
     fn stop_play(&mut self) {
-        self.state.pending_play = false;
-        if let Some(session) = self.state.play.take() {
-            if let Some(gpu) = &mut self.gpu {
+        Self::stop_play_session(&mut self.state, self.gpu.as_mut());
+    }
+
+    fn stop_play_if_requested(state: &mut EditorState, gpu: Option<&mut GpuState>) -> bool {
+        let requested = state
+            .play
+            .as_mut()
+            .is_some_and(PlaySession::take_quit_request);
+        if !requested {
+            return false;
+        }
+        state.log.info("Play stopped by script request");
+        Self::stop_play_session(state, gpu);
+        true
+    }
+
+    fn stop_play_session(state: &mut EditorState, gpu: Option<&mut GpuState>) {
+        state.pending_play = false;
+        if let Some(session) = state.play.take() {
+            if let Some(gpu) = gpu {
                 gpu.game_ui.release_all(&mut gpu.renderer);
             }
-            self.state.end_play_gamepads();
+            state.end_play_gamepads();
             let events = session.stop();
-            self.state.log.push_script_events(events);
-            self.state.log.info("Stop");
+            state.log.push_script_events(events);
+            state.log.info("Stop");
         }
     }
 
@@ -1898,6 +1915,9 @@ impl EditorApp {
             play.update_ui_input(ui_tick);
             play.tick().err()
         });
+        if play_error.is_none() {
+            Self::stop_play_if_requested(&mut self.state, Some(gpu));
+        }
         let game_ime = self
             .state
             .play
@@ -3237,6 +3257,59 @@ return S
                 .log
                 .entries()
                 .any(|entry| { entry.level == LogLevel::Warn && entry.message.ends_with("hello") })
+        );
+    }
+
+    #[test]
+    fn script_quit_stops_play_and_returns_to_the_editor() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/quit.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/quit.lua"
+"#,
+        )
+        .unwrap();
+        let script = r#"
+local S = {}
+function S:on_start() end
+function S:on_update()
+  rve.app.quit()
+end
+function S:on_destroy()
+  rve.log_info("quit destroy")
+end
+return S
+"#;
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.play =
+            Some(PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap());
+        app.state.play.as_mut().unwrap().tick().unwrap();
+
+        assert!(EditorApp::stop_play_if_requested(&mut app.state, None));
+
+        assert!(app.state.play.is_none());
+        assert!(!app.exit);
+        assert!(app.state.log.entries().any(|entry| {
+            entry.level == LogLevel::Info && entry.message == "Play stopped by script request"
+        }));
+        assert!(
+            app.state
+                .log
+                .entries()
+                .any(|entry| entry.message.contains("quit destroy")),
+            "{:?}",
+            app.state
+                .log
+                .entries()
+                .map(|entry| &entry.message)
+                .collect::<Vec<_>>()
         );
     }
 

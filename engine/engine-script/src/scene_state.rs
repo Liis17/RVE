@@ -16,6 +16,8 @@ pub(crate) struct SceneState {
     pub(crate) current: String,
     /// Последний принятый запрос на загрузку; ждёт конца кадра.
     pub(crate) request: Option<String>,
+    /// Запрос штатного завершения приложения, принятый успешным callback.
+    pub(crate) quit_requested: bool,
 }
 
 pub(crate) type SharedSceneState = Rc<RefCell<SceneState>>;

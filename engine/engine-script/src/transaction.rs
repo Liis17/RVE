@@ -306,6 +306,8 @@ pub(crate) struct ScriptTransaction {
     scene_state: SharedSceneState,
     /// Запрос `rve.scene.load` этого вызова; переносится в состояние хоста при коммите.
     pending_scene_request: Option<String>,
+    /// Запрос `rve.app.quit` этого вызова; переносится в состояние хоста при коммите.
+    pending_quit_request: bool,
     /// Записи свойств чужих и своих экземпляров; применяются при коммите и синхронизируют Lua.
     pending_properties: Vec<PropertyWrite>,
     /// Заявки `enabled` для экземпляров по серийному номеру; применяются на границе фазы.
@@ -737,6 +739,7 @@ impl Default for ScriptTransaction {
             script_refs: ScriptRefs::default(),
             scene_state: SharedSceneState::default(),
             pending_scene_request: None,
+            pending_quit_request: false,
             pending_properties: Vec::new(),
             pending_remote_enabled: Vec::new(),
             instance_enabled: true,
@@ -2820,6 +2823,17 @@ impl ScriptTransaction {
         Ok(())
     }
 
+    /// Запрашивает штатное завершение приложения из изменяющего lifecycle callback.
+    pub(crate) fn request_quit(&mut self) -> Result<(), String> {
+        if !self.writable || !self.lifecycle_writes {
+            return Err(
+                "application quit can only be requested from lifecycle callbacks".to_owned(),
+            );
+        }
+        self.pending_quit_request = true;
+        Ok(())
+    }
+
     /// Имя текущей сцены.
     pub(crate) fn current_scene(&self) -> String {
         self.scene_state.borrow().current.clone()
@@ -3440,8 +3454,12 @@ impl ScriptTransaction {
 
     /// Применяет записи свойств и заявки `enabled` чужих экземпляров. Цели проверены до коммита.
     fn commit_script_refs(&mut self) {
-        if let Some(path) = self.pending_scene_request.take() {
-            self.scene_state.borrow_mut().request = Some(path);
+        if self.pending_scene_request.is_some() || self.pending_quit_request {
+            let mut scene_state = self.scene_state.borrow_mut();
+            if let Some(path) = self.pending_scene_request.take() {
+                scene_state.request = Some(path);
+            }
+            scene_state.quit_requested |= std::mem::take(&mut self.pending_quit_request);
         }
         let writes = std::mem::take(&mut self.pending_properties);
         {
@@ -3478,6 +3496,7 @@ impl ScriptTransaction {
         self.pending_properties.clear();
         self.pending_remote_enabled.clear();
         self.pending_scene_request = None;
+        self.pending_quit_request = false;
         if !self.world.is_null() {
             // SAFETY: `world` is the live reference from `begin`, cleared only below; releasing a
             // reservation needs just a shared borrow and touches no other state of the world.
