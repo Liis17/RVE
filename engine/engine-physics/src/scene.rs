@@ -6,7 +6,7 @@ use engine_scene::{
     CombineMode as SceneCombineMode, ObjectHandle, PhysicsMaterialSettings, RigidBodyComponent,
     RigidBodyKind, World, WorldObject,
 };
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Quat, Vec3};
 
 use crate::character::{CharacterController, CharacterError};
 use crate::hull::Hull;
@@ -455,7 +455,11 @@ impl PhysicsSceneSync {
                 },
                 BodyKind::Kinematic => PhysicsCommand::KinematicTarget {
                     body: binding.body,
-                    pose: current,
+                    pose: if always_target {
+                        upright_character_pose(current)
+                    } else {
+                        current
+                    },
                 },
             };
             commands.push(command);
@@ -541,6 +545,16 @@ fn world_pose(world: &World, object: ObjectHandle) -> Result<Pose, PhysicsSceneS
         .ok_or(PhysicsSceneSyncError::MissingObject(object))?;
     Pose::new(matrix.w_axis.truncate(), rotation)
         .map_err(|_| PhysicsSceneSyncError::InvalidPose(object))
+}
+
+/// Капсула персонажа в solver вертикальна, как в `CharacterController::move_capsule`: наклон взгляда
+/// объекта иначе заваливал бы коллайдер, с которым сталкиваются dynamic-тела и другие персонажи.
+/// Капсула симметрична вокруг Y, поэтому поворот отбрасывается целиком.
+fn upright_character_pose(pose: Pose) -> Pose {
+    Pose {
+        rotation: Quat::IDENTITY,
+        ..pose
+    }
 }
 
 fn pose_changed(previous: Pose, current: Pose) -> bool {
@@ -705,7 +719,7 @@ fn scene_body(
         let shape = controller.capsule()?;
         let mut desc = BodyDesc::new(
             BodyKind::Kinematic,
-            transform.pose,
+            upright_character_pose(transform.pose),
             ColliderDesc::new(shape),
         );
         desc.character_controller = true;
@@ -1760,6 +1774,42 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn pitched_character_object_keeps_an_upright_solver_capsule() {
+        // Контроллер двигает вертикальную капсулу; solver-коллайдер, с которым сталкиваются
+        // dynamic-тела и другие персонажи, не должен наклоняться вместе со взглядом объекта.
+        let scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='player'\n[objects.transform]\nposition=[0,1,0]\n\
+             rotation=[-60,30,0]\n[objects.character_controller]\nradius=0.3\nheight=1.0\n"
+        ));
+        let built = desc(&scene, &[]);
+        assert_eq!(built.bodies[0].desc.pose.rotation, Quat::IDENTITY);
+
+        let (_, bindings) = built.build().unwrap();
+        let mut sync = PhysicsSceneSync::new(&scene, bindings).unwrap();
+        let mut scene = scene;
+        let player = scene.handle("player").unwrap();
+        scene
+            .set_local_transform(
+                player,
+                LocalTransform {
+                    position: Vec3::new(2.0, 1.0, 0.0),
+                    rotation_deg: Vec3::new(45.0, -90.0, 10.0),
+                    ..*scene.local_transform(player).unwrap()
+                },
+            )
+            .unwrap();
+        let commands = sync.sync_world_commands(&mut scene).unwrap();
+        let [PhysicsCommand::KinematicTarget { pose, .. }] = commands.as_slice() else {
+            panic!("{commands:?}");
+        };
+        assert_eq!(pose.rotation, Quat::IDENTITY);
+        assert!(
+            pose.position.distance(Vec3::new(2.0, 1.0, 0.0)) < 1.0e-5,
+            "{pose:?}"
+        );
     }
 
     #[test]
