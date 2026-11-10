@@ -43,5 +43,7 @@ pub use types::{
     MAX_RUMBLE_SECONDS, RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel,
     ScriptFrameTime, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
-pub use ui_assets::{PreparedUi, UiAssetSource, UiRegistry, is_ui_document, load_ui};
+pub use ui_assets::{
+    PreparedUi, UiAssetSource, UiRegistration, UiRegistry, is_ui_document, load_ui,
+};
 pub use ui_input::{UiInputBridge, UiTick};

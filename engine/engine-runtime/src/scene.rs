@@ -745,7 +745,6 @@ pub(crate) struct MaterialUploadCaches {
     pub(crate) shaders: HashMap<String, Result<ShaderId, String>>,
     pub(crate) error_material: Option<MaterialId>,
     ownership: MaterialResourceOwnership<MaterialId, TextureId, ShaderId>,
-    pinned_shader_paths: HashSet<String>,
 }
 
 pub(crate) struct GpuTextureCache<T> {
@@ -771,21 +770,21 @@ pub(crate) type MaterialDependencyMap =
     HashMap<MaterialId, MaterialResourceDependencies<TextureId, ShaderId>>;
 
 struct MaterialResourceOwnership<M, T, S> {
-    pinned_textures: HashSet<T>,
-    pinned_shaders: HashSet<S>,
     materials: HashMap<M, MaterialResourceDependencies<T, S>>,
     texture_refs: HashMap<T, usize>,
     shader_refs: HashMap<S, usize>,
+    scene_textures: HashMap<u64, HashSet<T>>,
+    scene_texture_refs: HashMap<T, usize>,
 }
 
 impl<M, T, S> Default for MaterialResourceOwnership<M, T, S> {
     fn default() -> Self {
         Self {
-            pinned_textures: HashSet::new(),
-            pinned_shaders: HashSet::new(),
             materials: HashMap::new(),
             texture_refs: HashMap::new(),
             shader_refs: HashMap::new(),
+            scene_textures: HashMap::new(),
+            scene_texture_refs: HashMap::new(),
         }
     }
 }
@@ -802,14 +801,6 @@ where
     T: Copy + Eq + Hash,
     S: Copy + Eq + Hash,
 {
-    fn pin_texture(&mut self, texture: T) {
-        self.pinned_textures.insert(texture);
-    }
-
-    fn pin_shader(&mut self, shader: S) {
-        self.pinned_shaders.insert(shader);
-    }
-
     fn retain_material(&mut self, material: M, dependencies: MaterialResourceDependencies<T, S>) {
         if self.materials.contains_key(&material) {
             return;
@@ -841,7 +832,7 @@ where
                 };
                 if exhausted {
                     self.texture_refs.remove(&texture);
-                    if !self.pinned_textures.contains(&texture) {
+                    if !self.scene_texture_refs.contains_key(&texture) {
                         released.textures.insert(texture);
                     }
                 }
@@ -855,8 +846,43 @@ where
                 };
                 if exhausted {
                     self.shader_refs.remove(&shader);
-                    if !self.pinned_shaders.contains(&shader) {
-                        released.shaders.insert(shader);
+                    released.shaders.insert(shader);
+                }
+            }
+        }
+        released
+    }
+
+    fn retain_scene_textures(&mut self, owner: u64, textures: HashSet<T>) {
+        if textures.is_empty() || self.scene_textures.contains_key(&owner) {
+            return;
+        }
+        for texture in &textures {
+            *self.scene_texture_refs.entry(*texture).or_default() += 1;
+        }
+        self.scene_textures.insert(owner, textures);
+    }
+
+    fn release_scene_textures(
+        &mut self,
+        owners: impl IntoIterator<Item = u64>,
+    ) -> MaterialResourceReleases<T, S> {
+        let mut released = MaterialResourceReleases::default();
+        for owner in owners {
+            let Some(textures) = self.scene_textures.remove(&owner) else {
+                continue;
+            };
+            for texture in textures {
+                let exhausted = if let Some(refs) = self.scene_texture_refs.get_mut(&texture) {
+                    *refs = refs.saturating_sub(1);
+                    *refs == 0
+                } else {
+                    false
+                };
+                if exhausted {
+                    self.scene_texture_refs.remove(&texture);
+                    if !self.texture_refs.contains_key(&texture) {
+                        released.textures.insert(texture);
                     }
                 }
             }
@@ -865,11 +891,11 @@ where
     }
 
     fn keeps_texture(&self, texture: T) -> bool {
-        self.pinned_textures.contains(&texture) || self.texture_refs.contains_key(&texture)
+        self.texture_refs.contains_key(&texture) || self.scene_texture_refs.contains_key(&texture)
     }
 
     fn keeps_shader(&self, shader: S) -> bool {
-        self.pinned_shaders.contains(&shader) || self.shader_refs.contains_key(&shader)
+        self.shader_refs.contains_key(&shader)
     }
 }
 
@@ -901,20 +927,6 @@ impl<T: Eq + Hash, S: Eq + Hash> Default for MaterialResourceReleases<T, S> {
 }
 
 impl MaterialUploadCaches {
-    pub(crate) fn pin_scene_resources(&mut self) {
-        for texture in self.textures.ids() {
-            self.ownership.pin_texture(texture);
-        }
-        for shader in self
-            .shaders
-            .values()
-            .filter_map(|result| result.as_ref().ok())
-        {
-            self.ownership.pin_shader(*shader);
-        }
-        self.pinned_shader_paths = self.shaders.keys().cloned().collect();
-    }
-
     pub(crate) fn retain_materials(
         &mut self,
         dependencies: HashMap<MaterialId, MaterialResourceDependencies<TextureId, ShaderId>>,
@@ -924,8 +936,33 @@ impl MaterialUploadCaches {
         }
     }
 
-    pub(crate) fn release_materials(&mut self, renderer: &mut Renderer, materials: &[MaterialId]) {
-        let released = self.ownership.release_materials(materials.iter().copied());
+    pub(crate) fn retain_scene_textures(&mut self, owner: u64, textures: HashSet<TextureId>) {
+        self.ownership.retain_scene_textures(owner, textures);
+    }
+
+    pub(crate) fn release_materials(
+        &mut self,
+        renderer: &mut Renderer,
+        materials: impl IntoIterator<Item = MaterialId>,
+    ) {
+        let released = self.ownership.release_materials(materials);
+        self.destroy_released_resources(renderer, released);
+    }
+
+    pub(crate) fn release_scene_textures(
+        &mut self,
+        renderer: &mut Renderer,
+        owners: impl IntoIterator<Item = u64>,
+    ) {
+        let released = self.ownership.release_scene_textures(owners);
+        self.destroy_released_resources(renderer, released);
+    }
+
+    fn destroy_released_resources(
+        &mut self,
+        renderer: &mut Renderer,
+        released: MaterialResourceReleases<TextureId, ShaderId>,
+    ) {
         for texture in released.textures {
             match renderer.destroy_texture(texture) {
                 Ok(()) => self.textures.remove_id(texture),
@@ -968,12 +1005,7 @@ impl MaterialUploadCaches {
             .shaders
             .iter()
             .filter_map(|(path, result)| match result {
-                Ok(shader)
-                    if self.pinned_shader_paths.contains(path)
-                        || self.ownership.keeps_shader(*shader) =>
-                {
-                    None
-                }
+                Ok(shader) if self.ownership.keeps_shader(*shader) => None,
                 Ok(_) | Err(_) => Some(path.clone()),
             })
             .collect::<Vec<_>>();
@@ -1691,6 +1723,7 @@ pub(crate) fn upload_scene(
     assets: &PreparedRenderAssets,
     caches: &mut MaterialUploadCaches,
     particles: SceneParticles,
+    cache_owner: u64,
 ) -> Result<GpuSceneTable, RenderError> {
     let original_textures = caches.textures.ids();
     let original_shader_paths = caches.shaders.keys().cloned().collect::<HashSet<_>>();
@@ -1701,6 +1734,8 @@ pub(crate) fn upload_scene(
     let mut material_cache = HashMap::<String, MaterialId>::new();
     let mut error_material = caches.error_material.take();
     let mut created = SceneUploadResources::<Renderer>::default();
+    let mut material_dependencies = MaterialDependencyMap::new();
+    let mut particle_texture_dependencies = HashSet::new();
     let material_assets = MaterialAssetView::from_scene(assets);
     // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
     let animated = animated_model_paths(assets);
@@ -1744,7 +1779,7 @@ pub(crate) fn upload_scene(
                     &mut texture_cache,
                     &mut material_cache,
                     None,
-                    None,
+                    Some(&mut material_dependencies),
                 )?;
                 gpu_meshes.push((mesh_id, material_id));
             }
@@ -1799,7 +1834,7 @@ pub(crate) fn upload_scene(
                 &mut shader_cache,
                 &mut material_cache,
                 &mut error_material,
-                None,
+                Some(&mut material_dependencies),
                 object,
             )?;
             if object.animated
@@ -1835,7 +1870,7 @@ pub(crate) fn upload_scene(
                         &mut shader_cache,
                         &mut material_cache,
                         &mut error_material,
-                        None,
+                        Some(&mut material_dependencies),
                         object,
                     )?,
                     None => Vec::new(),
@@ -1845,6 +1880,10 @@ pub(crate) fn upload_scene(
         }
         for (handle, source) in &assets.particles {
             let desc = particle_desc(renderer, assets, &mut texture_cache, source)?;
+            if let Some(texture) = desc.texture {
+                particle_texture_dependencies.insert(texture);
+                table.particle_texture_owners.insert(*handle, cache_owner);
+            }
             match particles {
                 SceneParticles::Emitters => {
                     let emitter = renderer.create_particle_emitter(desc)?;
@@ -1859,12 +1898,19 @@ pub(crate) fn upload_scene(
         for (path, sources) in &assets.prefab_particles {
             let mut descs = Vec::with_capacity(sources.len());
             for source in sources {
-                descs.push(match source {
+                let desc = match source {
                     Some(source) => {
                         Some(particle_desc(renderer, assets, &mut texture_cache, source)?)
                     }
                     None => None,
-                });
+                };
+                if let Some(texture) = desc.as_ref().and_then(|desc| desc.texture) {
+                    particle_texture_dependencies.insert(texture);
+                    table
+                        .particle_template_owners
+                        .insert(path.clone(), cache_owner);
+                }
+                descs.push(desc);
             }
             table.particle_templates.insert(path.clone(), descs);
         }
@@ -1872,9 +1918,18 @@ pub(crate) fn upload_scene(
     })();
     match result {
         Ok(table) => {
+            let table_materials = table
+                .by_object
+                .values()
+                .chain(table.prefabs.values().flatten())
+                .flat_map(|levels| levels.iter().flatten().map(|(_, material)| *material))
+                .collect::<HashSet<_>>();
+            material_dependencies.retain(|material, _| table_materials.contains(material));
             caches.textures = texture_cache;
             caches.shaders = shader_cache;
             caches.error_material = error_material;
+            caches.retain_materials(material_dependencies);
+            caches.retain_scene_textures(cache_owner, particle_texture_dependencies);
             Ok(table)
         }
         Err(error) => {
@@ -3988,18 +4043,15 @@ mod material_resource_ownership_tests {
     #[test]
     fn dynamic_material_dependencies_are_shared_and_retired_with_the_last_material() {
         let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
-        ownership.pin_texture(1);
-        ownership.pin_shader(11);
         ownership.retain_material(100, dependencies([1, 2], Some(11)));
         ownership.retain_material(200, dependencies([2], Some(12)));
 
-        assert_eq!(
-            ownership.release_materials([100]),
-            MaterialResourceReleases::default()
-        );
-        assert!(ownership.keeps_texture(1));
+        let first = ownership.release_materials([100]);
+        assert_eq!(first.textures, HashSet::from([1]));
+        assert_eq!(first.shaders, HashSet::from([11]));
+        assert!(!ownership.keeps_texture(1));
         assert!(ownership.keeps_texture(2));
-        assert!(ownership.keeps_shader(11));
+        assert!(!ownership.keeps_shader(11));
         assert!(ownership.keeps_shader(12));
 
         let released = ownership.release_materials([200]);
@@ -4012,12 +4064,98 @@ mod material_resource_ownership_tests {
     }
 
     #[test]
-    fn stale_material_replies_release_resources_and_failed_uploads_do_not_pin_them() {
+    fn scene_cache_owners_release_unique_resources_once_and_share_live_dependencies() {
+        fn apply(
+            resources: MaterialResourceReleases<u32, u32>,
+            live: &mut HashSet<u32>,
+            destroyed: &mut HashSet<(&'static str, u32)>,
+        ) {
+            for id in resources.textures {
+                assert!(
+                    live.remove(&id),
+                    "texture {id} released twice or was not live"
+                );
+                assert!(destroyed.insert(("texture", id)));
+            }
+            for id in resources.shaders {
+                assert!(
+                    live.remove(&id),
+                    "shader {id} released twice or was not live"
+                );
+                assert!(destroyed.insert(("shader", id)));
+            }
+        }
+
+        let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
+        ownership.retain_scene_textures(1, HashSet::from([1, 2]));
+        ownership.retain_scene_textures(2, HashSet::from([2, 3]));
+        ownership.retain_material(100, dependencies([2, 4], Some(10)));
+
+        let mut live = HashSet::from([1, 2, 3, 4, 10]);
+        let mut destroyed = HashSet::new();
+        apply(
+            ownership.release_scene_textures([2]),
+            &mut live,
+            &mut destroyed,
+        );
+        assert_eq!(live, HashSet::from([1, 2, 4, 10]));
+        apply(
+            ownership.release_scene_textures([1]),
+            &mut live,
+            &mut destroyed,
+        );
+        assert_eq!(live, HashSet::from([2, 4, 10]));
+        apply(
+            ownership.release_materials([100]),
+            &mut live,
+            &mut destroyed,
+        );
+        assert!(live.is_empty());
+        apply(
+            ownership.release_scene_textures([1, 2]),
+            &mut live,
+            &mut destroyed,
+        );
+        apply(
+            ownership.release_materials([100]),
+            &mut live,
+            &mut destroyed,
+        );
+        assert_eq!(destroyed.len(), 5);
+    }
+
+    #[test]
+    fn repeated_scene_replacements_keep_cache_ownership_bounded() {
+        let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
+        for generation in 1..=64 {
+            ownership
+                .retain_scene_textures(generation, HashSet::from([generation as u32 + 100, 42]));
+            if generation > 1 {
+                let released = ownership.release_scene_textures([generation - 1]);
+                assert_eq!(released.textures, HashSet::from([generation as u32 + 99]));
+            }
+            assert!(ownership.scene_texture_refs.len() <= 2);
+            assert!(ownership.keeps_texture(42));
+        }
+        assert_eq!(
+            ownership.release_scene_textures([64]).textures,
+            HashSet::from([164, 42])
+        );
+    }
+
+    #[test]
+    fn stale_success_releases_unique_material_dependencies_once_and_failed_uploads_do_not_pin_them()
+    {
         let mut ownership = MaterialResourceOwnership::<u32, u32, u32>::default();
         ownership.retain_material(300, dependencies([3], Some(13)));
         let stale = ownership.release_materials([300]);
         assert_eq!(stale.textures, HashSet::from([3]));
         assert_eq!(stale.shaders, HashSet::from([13]));
+        assert_eq!(
+            ownership.release_materials([300]),
+            MaterialResourceReleases::default(),
+            "a stale successful upload's unique dependencies are released only once"
+        );
 
         // A failed upload can cache dependencies before material creation, but no material owns them.
         assert!(!ownership.keeps_texture(4));

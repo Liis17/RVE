@@ -870,6 +870,7 @@ impl WindowHandler for PlayerWindow<'_> {
             &self.render_assets,
             &mut material_caches,
             SceneParticles::Emitters,
+            0,
         ) {
             Ok(scene) => scene,
             Err(error) => {

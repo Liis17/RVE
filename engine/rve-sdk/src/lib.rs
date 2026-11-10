@@ -388,9 +388,23 @@ pub trait Script: 'static {
     fn get_property(&self, ctx: &Context<'_>, name: &str) -> Option<Value> {
         ctx.properties.get(name).cloned()
     }
-    /// Applies a property write made by another script, or by the editor, before this instance's
-    /// next callback. The default stores the value in the instance's params. Overrides that keep
-    /// their own state can return it from `get_property`; the host syncs that value after callbacks.
+    /// Validates a property write made by another script or the editor before any property setter
+    /// is called. This hook must be pure: it must not mutate script state, context state, or other
+    /// externally visible state. Return an error to reject the pending property batch; no setter
+    /// has run at this point.
+    fn validate_property(
+        &self,
+        _ctx: &Context<'_>,
+        _name: &str,
+        _value: &Value,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// Commits a property write after every pending write has passed validation. The default
+    /// stores the value in the instance's params. Overrides that keep their own state can return it
+    /// from `get_property`. This is an infallible commit hook: it must not reject, panic, or change
+    /// unrelated state, and should only update the backing value for this property. The host catches
+    /// panics, but cannot roll back arbitrary script state changed by a panicking or stateful setter.
     fn set_property(&mut self, ctx: &mut Context<'_>, name: &str, value: Value) {
         ctx.properties.insert(name.to_owned(), value);
     }
@@ -1590,8 +1604,19 @@ impl<'a> Context<'a> {
     }
 
     fn sync_script_properties(&mut self, script: &dyn Script) -> Result<(), String> {
+        self.sync_script_properties_except(script, None)
+    }
+
+    fn sync_script_properties_except(
+        &mut self,
+        script: &dyn Script,
+        excluded: Option<&str>,
+    ) -> Result<(), String> {
         for index in 0..self.declared_properties.len() {
             let name = &self.declared_properties[index];
+            if excluded == Some(name.as_str()) {
+                continue;
+            }
             let Some(value) = script.get_property(self, name) else {
                 continue;
             };
@@ -4249,12 +4274,14 @@ pub mod __private {
     }
 
     /// Delivers a declared property write to the instance (ABI v22). The default [`Script`] hook
-    /// stores the value in the instance's params before any override runs.
+    /// stores the value in the instance's params; an override is responsible for its own backing
+    /// state and must keep `get_property` consistent with it.
     pub unsafe fn set_property(
         instance: *mut c_void,
         host: *const RveHost,
         name: RveStr,
         value: *const crate::abi::RveValue,
+        phase: u32,
     ) -> RveStatus {
         if instance.is_null() || host.is_null() || value.is_null() {
             return report(host, "null property callback argument", RveStatus::Error);
@@ -4267,33 +4294,24 @@ pub mod __private {
                 unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
             // SAFETY: instance and host are valid for this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let previous = instance.properties.get(name).cloned();
             let mut properties = instance.properties.clone();
             properties.insert(name.to_owned(), value.clone());
-            let result = (|| {
-                let mut context = Context::new_with_declared_properties(
-                    unsafe { &*host },
-                    &mut properties,
-                    &instance.declared_properties,
-                )?;
-                instance.script.set_property(&mut context, name, value);
-                context.sync_script_properties(instance.script.as_ref())?;
-                context.commit()
-            })();
-            if let Err(error) = result {
-                if let Some(previous) = previous {
-                    let mut rollback_properties = instance.properties.clone();
-                    if let Ok(mut context) = Context::new_with_declared_properties(
-                        unsafe { &*host },
-                        &mut rollback_properties,
-                        &instance.declared_properties,
-                    ) {
-                        instance.script.set_property(&mut context, name, previous);
-                    }
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut properties,
+                &instance.declared_properties,
+            )?;
+            match phase {
+                crate::abi::RVE_PROPERTY_PHASE_VALIDATE => {
+                    instance.script.validate_property(&context, name, &value)?;
+                    context.sync_script_properties_except(instance.script.as_ref(), Some(name))?;
                 }
-                return Err(error);
+                crate::abi::RVE_PROPERTY_PHASE_COMMIT => {
+                    instance.script.set_property(&mut context, name, value);
+                    instance.properties = properties;
+                }
+                _ => return Err("unknown property callback phase".to_owned()),
             }
-            instance.properties = properties;
             Ok(())
         }));
         status_from_result(host, result)
@@ -4981,9 +4999,10 @@ macro_rules! __rve_script_descriptor {
             host: *const $crate::abi::RveHost,
             name: $crate::abi::RveStr,
             value: *const $crate::abi::RveValue,
+            phase: u32,
         ) -> $crate::abi::RveStatus {
             // SAFETY: host ABI owns the instance and call-scoped name and value pointers.
-            unsafe { $crate::__private::set_property(instance, host, name, value) }
+            unsafe { $crate::__private::set_property(instance, host, name, value, phase) }
         }
         unsafe extern "C" fn __rve_drop_instance(
             instance: *mut ::std::ffi::c_void,

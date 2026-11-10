@@ -90,6 +90,8 @@ pub(crate) struct SceneGpuIds {
     pub skins: HashSet<SkinId>,
     pub screen_shaders: HashSet<ScreenShaderId>,
     pub ui_scene_owners: HashSet<u64>,
+    /// Scene generations that own cached particle textures.
+    pub cache_owners: HashSet<u64>,
 }
 
 impl SceneGpuIds {
@@ -116,6 +118,10 @@ impl SceneGpuIds {
             .extend(table.screen_shaders.values().copied());
         ids.ui_scene_owners
             .extend(table.ui_scene_owners.iter().copied());
+        ids.cache_owners
+            .extend(table.particle_texture_owners.values().copied());
+        ids.cache_owners
+            .extend(table.particle_template_owners.values().copied());
         ids
     }
 
@@ -125,6 +131,7 @@ impl SceneGpuIds {
             && self.skins.is_empty()
             && self.screen_shaders.is_empty()
             && self.ui_scene_owners.is_empty()
+            && self.cache_owners.is_empty()
     }
 
     fn extend(&mut self, other: &Self) {
@@ -135,6 +142,7 @@ impl SceneGpuIds {
             .extend(other.screen_shaders.iter().copied());
         self.ui_scene_owners
             .extend(other.ui_scene_owners.iter().copied());
+        self.cache_owners.extend(other.cache_owners.iter().copied());
     }
 
     /// Ресурсы этого набора, которых нет в `live`.
@@ -145,6 +153,7 @@ impl SceneGpuIds {
             skins: difference(&self.skins, &live.skins),
             screen_shaders: difference(&self.screen_shaders, &live.screen_shaders),
             ui_scene_owners: difference(&self.ui_scene_owners, &live.ui_scene_owners),
+            cache_owners: difference(&self.cache_owners, &live.cache_owners),
         }
     }
 
@@ -155,6 +164,7 @@ impl SceneGpuIds {
             skins: overlap(&self.skins, &live.skins),
             screen_shaders: overlap(&self.screen_shaders, &live.screen_shaders),
             ui_scene_owners: overlap(&self.ui_scene_owners, &live.ui_scene_owners),
+            cache_owners: overlap(&self.cache_owners, &live.cache_owners),
         }
     }
 }
@@ -290,16 +300,19 @@ impl SceneSwitch {
             };
             let ids = SceneGpuIds::of_table(&table);
             if !current {
-                ctx.release(ids, 0);
+                let live = SceneGpuIds::of_table(ctx.gpu_scene);
+                ctx.release(ids.minus(&live), 0);
                 continue;
             }
             let Some((_, pending)) = self.awaiting.take() else {
-                ctx.release(ids, 0);
+                let live = SceneGpuIds::of_table(ctx.gpu_scene);
+                ctx.release(ids.minus(&live), 0);
                 continue;
             };
             let path = pending.path.clone();
             if let Err(error) = self.commit(&mut ctx, pending, *table) {
-                ctx.release(ids, 0);
+                let live = SceneGpuIds::of_table(ctx.gpu_scene);
+                ctx.release(ids.minus(&live), 0);
                 failures.push((path, error));
             }
         }
@@ -315,8 +328,7 @@ impl SceneSwitch {
         mut table: GpuSceneTable,
     ) -> Result<(), String> {
         let new_ids = SceneGpuIds::of_table(&table);
-        // Префабы сцены проверяются до любых изменений и применяются только после замены мира,
-        // которая может отказать. Регистрация UI аддитивна и мира не меняет.
+        // Префабы и UI проверяются до замены. UI-реестр не меняется, пока host не принял сцену.
         let scene_prefabs = ctx
             .scripts
             .check_scene_prefabs(
@@ -330,7 +342,7 @@ impl SceneSwitch {
         ctx.world
             .check_scene_replacement(&pending.world)
             .map_err(|error| error.to_string())?;
-        ctx.ui_registry.register(ctx.scripts, &pending.ui)?;
+        let ui_registration = ctx.ui_registry.prepare(&pending.ui)?;
 
         let scene_objects: Vec<ObjectHandle> = pending
             .world
@@ -345,6 +357,7 @@ impl SceneSwitch {
             &pending.path,
             ctx.time,
         )?;
+        ctx.ui_registry.commit(ctx.scripts, ui_registration);
         ctx.scripts.apply_scene_prefabs(scene_prefabs);
 
         // Изменения ниже не имеют отказов: мир уже заменён. Удалённые объекты, физика и звук
@@ -377,6 +390,8 @@ impl SceneSwitch {
             .extend(rekey(&mut table.material_sources, &handles));
         gpu.skin_instances
             .extend(rekey(&mut table.skin_instances, &handles));
+        gpu.particle_texture_owners
+            .extend(rekey(&mut table.particle_texture_owners, &handles));
         gpu.joint_counts
             .extend(rekey(&mut table.joint_counts, &handles));
         for (scene_object, desc) in table.particle_descs.drain() {
@@ -393,6 +408,10 @@ impl SceneSwitch {
         // входят в `live` и освобождаются ниже.
         retain_resident(&mut gpu.prefabs, &mut table.prefabs);
         retain_resident(&mut gpu.particle_templates, &mut table.particle_templates);
+        retain_resident(
+            &mut gpu.particle_template_owners,
+            &mut table.particle_template_owners,
+        );
         retain_resident(&mut gpu.material_templates, &mut table.material_templates);
         gpu.environments.extend(table.environments);
         gpu.animation_models.extend(table.animation_models);
@@ -533,6 +552,23 @@ end
 return Script
 "#;
 
+    const UI_PROBE: &str = r#"
+local Script = {}
+function Script:on_update()
+  self.step = (self.step or 0) + 1
+  if self.step == 1 then
+    local ok = pcall(rve.ui.open, "ui/existing.rveui")
+    rve.log_info("existing ui " .. tostring(ok))
+  elseif self.step == 2 then
+    local ok = pcall(rve.ui.open, "ui/new.rveui")
+    rve.log_info("new ui " .. tostring(ok))
+    local existing = pcall(rve.ui.open, "ui/existing.rveui")
+    rve.log_info("existing ui after " .. tostring(existing))
+  end
+end
+return Script
+"#;
+
     const START_SCENE: &str = "[[assets]]\npath = \"scripts/player.lua\"\n[[assets]]\npath = \"scripts/enemy.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"player\"\nkeep_on_load = true\n[[objects.lite_scripts]]\npath = \"scripts/player.lua\"\n[[objects]]\nid = \"enemy\"\n[[objects.lite_scripts]]\npath = \"scripts/enemy.lua\"\n";
 
     const BOSS_SCENE: &str = "[[assets]]\npath = \"scripts/boss.lua\"\n[[objects]]\nid = \"camera_b\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"boss\"\n[[objects.lite_scripts]]\npath = \"scripts/boss.lua\"\n";
@@ -553,6 +589,16 @@ path = \"scripts/enemy.lua\"
 ";
 
     const CLASH_SCENE: &str = "[[objects]]\nid = \"camera_x\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"player\"\n";
+
+    const UI_ATOMICITY_SCENE: &str = "[[assets]]\npath = \"scripts/ui_probe.lua\"\n[[assets]]\npath = \"ui/existing.rveui\"\n[[objects]]\nid = \"camera_ui\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"ui_probe\"\n[[objects.lite_scripts]]\npath = \"scripts/ui_probe.lua\"\n";
+    const UI_REPLACEMENT_FAILURE_SCENE: &str = "[[assets]]\npath = \"ui/new.rveui\"\n[[objects]]\nid = \"camera_new_ui\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"bad_ui_script\"\n[[objects.heavy_scripts]]\nname = \"MissingUiScript\"\n";
+    const UI_EXISTING: &str = "[[assets]]\npath = \"ui/existing.png\"\n[canvas]\n";
+    const UI_NEW: &str = "[[assets]]\npath = \"ui/new.png\"\n[canvas]\n";
+    const TEST_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 255, 255, 255,
+        127, 0, 9, 251, 3, 253, 42, 134, 227, 138, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
 
     /// Сохраняемый `hub` спавнит быстрые префабы сцены `pb` после перехода в неё.
     const HUB: &str = r#"
@@ -626,6 +672,12 @@ return Script
             fs::write(path, text).unwrap();
         }
 
+        fn write_bytes(&self, path: &str, bytes: &[u8]) {
+            let path = self.0.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
         fn root(&self) -> &Path {
             &self.0
         }
@@ -668,6 +720,11 @@ return Script
             dir.write("levels/b.rvescene", BOSS_SCENE);
             dir.write("levels/c.rvescene", CRATE_SCENE);
             dir.write("levels/clash.rvescene", CLASH_SCENE);
+            dir.write("levels/ui_atomicity.rvescene", UI_ATOMICITY_SCENE);
+            dir.write(
+                "levels/ui_replacement_failure.rvescene",
+                UI_REPLACEMENT_FAILURE_SCENE,
+            );
             dir.write("levels/e.rvescene", ENEMY_SCENE);
             dir.write("levels/pa.rvescene", PREFAB_SCENE_A);
             dir.write("levels/pb.rvescene", PREFAB_SCENE_B);
@@ -680,9 +737,14 @@ return Script
             dir.write("levels/fx_hub.rvescene", FX_HUB_SCENE);
             dir.write("levels/bad_ui.rvescene", BAD_UI_SCENE);
             dir.write("ui/bad.rveui", "[canvas\n");
+            dir.write("ui/existing.rveui", UI_EXISTING);
+            dir.write("ui/new.rveui", UI_NEW);
+            dir.write_bytes("ui/existing.png", TEST_PNG);
+            dir.write_bytes("ui/new.png", TEST_PNG);
             dir.write("scripts/player.lua", PLAYER);
             dir.write("scripts/enemy.lua", ENEMY);
             dir.write("scripts/boss.lua", BOSS);
+            dir.write("scripts/ui_probe.lua", UI_PROBE);
             dir.write("scripts/hub.lua", HUB);
             dir.write("scripts/broken.lua", "return {");
             dir.write("prefabs/x.rveprefab", PREFAB_X);
@@ -705,6 +767,7 @@ return Script
                 mut world,
                 sources,
                 prefabs,
+                ui,
                 ..
             } = prepared;
             let mut host = ScriptHost::load_with_options(
@@ -722,6 +785,8 @@ return Script
                 host.register_prefab(&world, path, Arc::clone(template), &sources)
                     .unwrap();
             }
+            let mut ui_registry = UiRegistry::default();
+            ui_registry.register(&mut host, &ui).unwrap();
             host.start(&mut world, ScriptTime::default());
             let (loader_tx, _loader_rx) = flume::unbounded();
             let (render_tx, render_rx) = flume::unbounded();
@@ -737,7 +802,7 @@ return Script
                 prefabs: PrefabLoads::new(loader_tx, render_tx),
                 render_rx,
                 animation: AnimationBridge::default(),
-                ui_registry: UiRegistry::default(),
+                ui_registry,
                 switch: SceneSwitch::default(),
                 frame: 0,
             }
@@ -918,6 +983,90 @@ return Script
         assert!(rig.commit().is_empty());
         assert_eq!(rig.names(), sorted(&["camera", "enemy", "player"]));
         assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
+    }
+
+    #[test]
+    fn stale_success_releases_unique_resources_but_keeps_live_shared_materials() {
+        let mut rig = Rig::new();
+        let mut active = GpuSceneTable::default();
+        active.by_object.insert(
+            rig.world.handle("camera").unwrap(),
+            vec![vec![(fake_mesh(1), fake_material(7))]],
+        );
+        rig.adopt_gpu(active);
+
+        let stale = rig
+            .switch
+            .request(Some(&rig.loader), "levels/b.rvescene")
+            .unwrap();
+        rig.switch
+            .request(Some(&rig.loader), "levels/c.rvescene")
+            .unwrap();
+        let mut uploaded = GpuSceneTable::default();
+        uploaded.prefabs.insert(
+            "prefabs/stale.rveprefab".to_owned(),
+            vec![
+                vec![vec![(fake_mesh(2), fake_material(7))]],
+                vec![vec![(fake_mesh(3), fake_material(8))]],
+            ],
+        );
+        uploaded
+            .particle_template_owners
+            .insert("prefabs/stale.rveprefab".to_owned(), 99);
+        rig.switch.accept(SceneUploadReply {
+            generation: stale.generation,
+            result: Ok(Box::new(uploaded)),
+        });
+
+        assert!(rig.commit().is_empty());
+        let releases = rig.released();
+        assert_eq!(
+            releases.len(),
+            1,
+            "stale upload releases once: {releases:?}"
+        );
+        assert_eq!(
+            releases[0].meshes,
+            HashSet::from([fake_mesh(2), fake_mesh(3)])
+        );
+        assert_eq!(releases[0].materials, HashSet::from([fake_material(8)]));
+        assert_eq!(releases[0].cache_owners, HashSet::from([99]));
+    }
+
+    #[test]
+    fn failed_scene_replacement_does_not_register_new_ui_or_damage_existing_ui() {
+        let mut rig = Rig::start("levels/ui_atomicity.rvescene");
+        rig.frame_update();
+        assert!(
+            rig.messages()
+                .iter()
+                .any(|message| message == "existing ui true"),
+            "the current scene opens its registered UI document"
+        );
+
+        rig.load("levels/ui_replacement_failure.rvescene").unwrap();
+        let failures = rig.commit();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the bad script factory rejects replacement"
+        );
+        assert!(failures[0].1.contains("MissingUiScript"), "{failures:?}");
+        assert_eq!(rig.names(), sorted(&["camera_ui", "ui_probe"]));
+        assert_eq!(rig.host.current_scene(), "levels/ui_atomicity.rvescene");
+
+        rig.frame_update();
+        let messages = rig.messages();
+        assert!(
+            messages.iter().any(|message| message == "new ui false"),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "existing ui after true"),
+            "the failed candidate document is absent and the existing document still opens: {messages:?}"
+        );
     }
 
     #[test]

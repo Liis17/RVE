@@ -1365,17 +1365,17 @@ impl PlaySession {
         PhysicsSceneDesc::from_world(&world, &model_geometry, glam::Vec3::ZERO, 60, 8)
             .and_then(|desc| desc.build())
             .map_err(|error| error.to_string())?;
-        // Префабы сцены проверяются до любых изменений и применяются после замены мира, которая
-        // может отказать. Регистрация UI аддитивна и мира не меняет.
+        // Префабы и UI проверяются до любых изменений и применяются только после замены мира.
         let scene_prefabs = self
             .host
             .check_scene_prefabs(&world, &prefabs.catalog, &prefabs.templates, &sources)
             .map_err(|error| error.to_string())?;
-        self.ui_registry.register(&mut self.host, &prefabs.ui)?;
+        let ui_registration = self.ui_registry.prepare(&prefabs.ui)?;
         let time = self.script_time();
         let replacement = self
             .host
             .replace_scene(&mut self.world, world, &sources, &path, time)?;
+        self.ui_registry.commit(&mut self.host, ui_registration);
         self.host.apply_scene_prefabs(scene_prefabs);
         self.animation.replace_objects(
             &self.world,
@@ -3277,6 +3277,7 @@ return Spawner
 #[cfg(test)]
 mod scene_switch_tests {
     use super::*;
+    use engine_gui::document::UiDocument;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::SceneDocument;
     use engine_script::PrefabStatus;
@@ -3424,6 +3425,115 @@ path = \"boss.lua\"
                 .iter()
                 .any(|message| message == "enemy destroy")
         );
+    }
+
+    #[test]
+    fn failed_play_replacement_does_not_register_candidate_ui() {
+        const UI_PROBE: &str = r#"
+local Script = {}
+function Script:on_update()
+  self.step = (self.step or 0) + 1
+  if self.step == 1 then
+    local ok = pcall(rve.ui.open, "ui/existing.rveui")
+    rve.log_info("editor existing ui " .. tostring(ok))
+  elseif self.step == 2 then
+    local ok = pcall(rve.ui.open, "ui/new.rveui")
+    rve.log_info("editor new ui " .. tostring(ok))
+    local existing = pcall(rve.ui.open, "ui/existing.rveui")
+    rve.log_info("editor existing ui after " .. tostring(existing))
+  end
+end
+return Script
+"#;
+        const EXISTING_UI: &str = "[[assets]]\npath = \"ui/existing.png\"\n[canvas]\n";
+        const NEW_UI: &str = "[[assets]]\npath = \"ui/new.png\"\n[canvas]\n";
+        const UI_BYTES: &[u8] = &[255, 255, 255, 255];
+
+        let files = EmptyAssets::new();
+        let assets = files.assets();
+        let start_document = SceneDocument::parse(
+            "levels/ui_start.rvescene",
+            "[[assets]]\npath = \"scripts/ui_probe.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"ui_probe\"\n[[objects.lite_scripts]]\npath = \"scripts/ui_probe.lua\"\n",
+        )
+        .unwrap();
+        let start_world = World::from_document(&start_document).unwrap();
+        let mut start_prefabs = PlayPrefabs::default();
+        start_prefabs.ui.documents.insert(
+            "ui/existing.rveui".to_owned(),
+            Arc::new(UiDocument::parse("ui/existing.rveui", EXISTING_UI).unwrap()),
+        );
+        start_prefabs.ui.images.insert(
+            "ui/existing.png".to_owned(),
+            Arc::new(UiImageData {
+                size: [1, 1],
+                rgba: UI_BYTES.to_vec(),
+            }),
+        );
+        let mut session = PlaySession::start_with_world_and_physics(
+            &start_document,
+            start_world,
+            None,
+            &InputSettings::default(),
+            |_| Ok(UI_PROBE.to_owned()),
+            start_prefabs,
+            Vec::new(),
+            &PhysicsSettings::default(),
+            AudioConfig::default(),
+            AnimationBridge::default(),
+        )
+        .unwrap();
+        session.tick().unwrap();
+        assert!(
+            messages(&mut session)
+                .iter()
+                .any(|message| message == "editor existing ui true")
+        );
+
+        let candidate_text = "[[assets]]\npath = \"ui/new.rveui\"\n[[objects]]\nid = \"camera_new\"\n[objects.camera]\n[[objects]]\nid = \"bad_script\"\n[[objects.heavy_scripts]]\nname = \"MissingUiScript\"\n";
+        let candidate_world = World::from_document(
+            &SceneDocument::parse("levels/ui_candidate.rvescene", candidate_text).unwrap(),
+        )
+        .unwrap();
+        let mut candidate_prefabs = PlayPrefabs::default();
+        candidate_prefabs.ui.documents.insert(
+            "ui/new.rveui".to_owned(),
+            Arc::new(UiDocument::parse("ui/new.rveui", NEW_UI).unwrap()),
+        );
+        candidate_prefabs.ui.images.insert(
+            "ui/new.png".to_owned(),
+            Arc::new(UiImageData {
+                size: [1, 1],
+                rgba: UI_BYTES.to_vec(),
+            }),
+        );
+        let candidate = PlayScene::prepare(
+            "levels/ui_candidate.rvescene",
+            candidate_world,
+            candidate_prefabs,
+            |_| Err("no lite source is needed".to_owned()),
+            &assets,
+        )
+        .unwrap();
+        let error = session.replace_scene(candidate).unwrap_err();
+        assert!(error.contains("MissingUiScript"), "{error}");
+        assert_eq!(object_names(&session), ["camera", "ui_probe"]);
+        assert_eq!(session.host.current_scene(), "levels/ui_start.rvescene");
+
+        session.tick().unwrap();
+        let messages = messages(&mut session);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "editor new ui false"),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "editor existing ui after true"),
+            "the candidate document is absent and the existing UI still opens: {messages:?}"
+        );
+        session.stop();
     }
 
     #[test]

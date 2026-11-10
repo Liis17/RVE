@@ -43,7 +43,7 @@ use engine_scene::{
     RigidBodyKind, SceneReplacement, SpawnOptions, World,
 };
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
-use rve_sdk::abi::RveScriptDesc;
+use rve_sdk::abi::{RVE_PROPERTY_PHASE_COMMIT, RVE_PROPERTY_PHASE_VALIDATE, RveScriptDesc};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
@@ -3192,7 +3192,7 @@ impl ScriptHost {
                         })
                         .unwrap_or_default()
                 };
-                for (write_index, (name, value)) in writes.iter().enumerate() {
+                for (name, value) in &writes {
                     let call = AbiScriptCall {
                         self_object,
                         // SAFETY: the transaction is owned by this call until it commits or discards.
@@ -3204,8 +3204,14 @@ impl ScriptHost {
                         command_owner: index,
                         commands_allowed: true,
                     };
-                    if let Err(message) = script.invoke_set_property(time, name, value, call) {
-                        for (pending_name, _) in writes.iter().skip(write_index) {
+                    if let Err(message) = script.invoke_set_property(
+                        time,
+                        name,
+                        value,
+                        RVE_PROPERTY_PHASE_VALIDATE,
+                        call,
+                    ) {
+                        for (pending_name, _) in &writes {
                             settle_script_ref_write(
                                 script_refs,
                                 instance.serial,
@@ -3217,6 +3223,60 @@ impl ScriptHost {
                         unsafe { (*transaction_ptr).discard() };
                         return CallOutcome::Failed(message);
                     }
+                }
+                // Validate every host-side write before invoking any user setter. These writes are
+                // staged now so schema errors also happen before the infallible commit phase.
+                for (name, value) in &writes {
+                    // SAFETY: this callback exclusively owns the transaction until it returns.
+                    if let Err(error) =
+                        unsafe { (*transaction_ptr).script_set_current(name, value) }
+                    {
+                        for (pending_name, _) in &writes {
+                            settle_script_ref_write(
+                                script_refs,
+                                instance.serial,
+                                pending_name,
+                                false,
+                            );
+                        }
+                        // SAFETY: no callback-scoped transaction borrow remains.
+                        unsafe { (*transaction_ptr).discard() };
+                        return CallOutcome::Failed(error.message());
+                    }
+                }
+                for (name, value) in &writes {
+                    let call = AbiScriptCall {
+                        self_object,
+                        // SAFETY: the transaction is owned by this call until it commits or discards.
+                        transaction: unsafe { &mut *transaction_ptr },
+                        events,
+                        source: &instance.source,
+                        commands,
+                        commands_generation,
+                        command_owner: index,
+                        commands_allowed: true,
+                    };
+                    if let Err(message) = script.invoke_set_property(
+                        time,
+                        name,
+                        value,
+                        RVE_PROPERTY_PHASE_COMMIT,
+                        call,
+                    ) {
+                        for (pending_name, _) in &writes {
+                            settle_script_ref_write(
+                                script_refs,
+                                instance.serial,
+                                pending_name,
+                                false,
+                            );
+                        }
+                        // SAFETY: the synchronous delivery returned, so no call-scoped borrow remains.
+                        unsafe { (*transaction_ptr).discard() };
+                        return CallOutcome::Failed(message);
+                    }
+                }
+                for (name, _) in &writes {
                     settle_script_ref_write(script_refs, instance.serial, name, true);
                 }
                 let call = AbiScriptCall {

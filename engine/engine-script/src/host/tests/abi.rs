@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static PROBE_DROPS: AtomicUsize = AtomicUsize::new(0);
 static REJECTED_PROPERTY_SPEED_BITS: AtomicU64 = AtomicU64::new(0);
+static PROPERTY_SETTER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CREATE_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static ERROR_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static BULK_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
@@ -977,6 +978,10 @@ fn sdk_module() -> &'static RveModule {
         },
         "AdvancingRejectingPropertyProbe" => advancing_rejecting_property_probe_factory {
             speed: f64 = 1.5 (0.0..=10.0),
+        },
+        "LaterPropertyValidationProbe" => later_property_validation_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+            later: f64 = 2.5,
         },
     }
 }
@@ -5537,6 +5542,10 @@ struct AdvancingRejectingPropertyProbe {
     speed: f64,
 }
 
+struct LaterPropertyValidationProbe {
+    speed: f64,
+}
+
 impl Drop for RejectingPropertyProbe {
     fn drop(&mut self) {
         REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
@@ -5556,14 +5565,24 @@ impl Script for RejectingPropertyProbe {
         (name == "speed").then_some(Value::Float(self.speed))
     }
 
-    fn set_property(&mut self, ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+    fn validate_property(
+        &self,
+        _ctx: &rve_sdk::Context<'_>,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        if name == "speed" && matches!(value, Value::Float(speed) if *speed > 3.0) {
+            return Err("speed above 3 is rejected".to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
         if name == "speed"
             && let Value::Float(speed) = value
         {
             self.speed = speed;
-            if speed > 3.0 {
-                ctx.transform.position[0] = f32::NAN;
-            }
         }
     }
 }
@@ -5582,24 +5601,67 @@ fn advancing_rejecting_property_probe_factory(params: &Params) -> Result<Box<dyn
     Ok(Box::new(AdvancingRejectingPropertyProbe { speed }))
 }
 
+fn later_property_validation_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(LaterPropertyValidationProbe { speed }))
+}
+
 impl Script for AdvancingRejectingPropertyProbe {
     fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
         (name == "speed").then_some(Value::Float(self.speed))
     }
 
-    fn set_property(&mut self, ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+    fn validate_property(
+        &self,
+        _ctx: &rve_sdk::Context<'_>,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        if name == "speed" && matches!(value, Value::Float(speed) if *speed > 7.0) {
+            return Err("speed above 7 is rejected".to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
         if name == "speed"
             && let Value::Float(speed) = value
         {
             self.speed = speed;
-            if speed > 7.0 {
-                ctx.transform.position[0] = f32::NAN;
-            }
         }
     }
 
     fn on_update(&mut self, _ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
         self.speed += 1.0;
+    }
+}
+
+impl Script for LaterPropertyValidationProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        match name {
+            "speed" => Some(Value::Float(self.speed)),
+            "later" => Some(Value::String("invalid".to_owned())),
+            _ => None,
+        }
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+}
+
+impl Drop for LaterPropertyValidationProbe {
+    fn drop(&mut self) {
+        REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
     }
 }
 
@@ -5827,7 +5889,6 @@ path = "/reader.lua"
 
     host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
     host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
-
     let events = host.drain_events();
     assert!(
         events
@@ -5844,9 +5905,10 @@ path = "/reader.lua"
 }
 
 #[test]
-fn failed_heavy_property_setter_restores_owner_state_and_the_property_mirror() {
+fn rejected_heavy_property_write_runs_no_setter_and_preserves_owner_and_mirror() {
     let _guard = test_lock();
     REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
     let mut world = world(
         r#"
 [[assets]]
@@ -5887,9 +5949,7 @@ path = "/reader.lua"
     assert!(
         events.iter().any(|event| {
             event.level == ScriptEventLevel::Error
-                && event
-                    .message
-                    .contains("script produced a non-finite transform")
+                && event.message.contains("speed above 3 is rejected")
         }),
         "{events:?}"
     );
@@ -5901,10 +5961,11 @@ path = "/reader.lua"
     );
 
     drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 0);
     assert_eq!(
         REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
         1.5_f64.to_bits(),
-        "the failed setter leaves the Rust owner's state at the committed value"
+        "rejected validation leaves the Rust owner's state unchanged"
     );
 }
 
@@ -5912,6 +5973,7 @@ path = "/reader.lua"
 fn failed_heavy_property_setter_restores_the_last_committed_owner_value() {
     let _guard = test_lock();
     REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
     let mut world = world(
         r#"
 [[assets]]
@@ -5954,9 +6016,7 @@ path = "/reader.lua"
     assert!(
         events.iter().any(|event| {
             event.level == ScriptEventLevel::Error
-                && event
-                    .message
-                    .contains("script produced a non-finite transform")
+                && event.message.contains("speed above 7 is rejected")
         }),
         "{events:?}"
     );
@@ -5968,10 +6028,88 @@ path = "/reader.lua"
     );
 
     drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(
         REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
         5.0_f64.to_bits(),
-        "rollback restores the getter value from the last successful owner callback"
+        "the rejected second write leaves the last accepted value"
+    );
+}
+
+#[test]
+fn later_property_schema_failure_happens_before_any_custom_setter() {
+    let _guard = test_lock();
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
+    REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "LaterPropertyValidationProbe"
+params = { speed = 1.5, later = 2.5 }
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_start()
+  rve.find("target"):script("LaterPropertyValidationProbe"):set("speed", 4)
+end
+return Script"#
+                .to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("LaterPropertyValidationProbe")
+  rve.log_info("preflight properties " .. tostring(target:get("speed")) .. " " .. tostring(target:get("later")))
+end
+return Script"#
+                .to_owned(),
+        ),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    for _ in 0..3 {
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    }
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message.contains("later")
+                && event.message.contains("тип float")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "preflight properties 1.5 2.5"),
+        "{events:?}"
+    );
+    drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
+        1.5_f64.to_bits()
     );
 }
 

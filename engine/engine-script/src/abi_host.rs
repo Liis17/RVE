@@ -575,6 +575,7 @@ impl AbiScriptInstance {
         time: ScriptTime,
         name: &str,
         value: &ParamValue,
+        phase: u32,
         call: AbiScriptCall<'_>,
     ) -> Result<(), String> {
         let Some(set_property) = self.descriptor.set_property else {
@@ -599,7 +600,7 @@ impl AbiScriptInstance {
         let status = {
             let host = context.host(time);
             // SAFETY: the value, name, instance, and host remain live throughout the callback.
-            unsafe { set_property(self.instance, &host, name, &value.value) }
+            unsafe { set_property(self.instance, &host, name, &value.value, phase) }
         };
         context.callback_result(status)
     }

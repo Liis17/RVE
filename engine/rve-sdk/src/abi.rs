@@ -27,6 +27,11 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// nullable `set_property` callback after the v20 descriptor tail.
 pub const RVE_SCRIPT_ABI_VERSION: u32 = 22;
 
+/// Validate an external property write before any `Script::set_property` hook runs.
+pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
+/// Commit a previously validated external property write.
+pub const RVE_PROPERTY_PHASE_COMMIT: u32 = 1;
+
 /// Component names accepted by RveHost::object_has_component, in the order used by
 /// components() on the guest side.
 pub const RVE_COMPONENT_NAMES: [&str; 17] = [
@@ -2229,6 +2234,7 @@ pub type RveSetPropertyFn = unsafe extern "C" fn(
     host: *const RveHost,
     name: RveStr,
     value: *const RveValue,
+    phase: u32,
 ) -> RveStatus;
 /// Changes the transactional time scale for the current script callback.
 pub type RveSetTimeScaleFn = unsafe extern "C" fn(ctx: *mut c_void, scale: f32) -> bool;

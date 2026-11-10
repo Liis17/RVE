@@ -175,6 +175,10 @@ pub(crate) struct GpuSceneTable {
     pub particles: HashMap<ObjectHandle, ParticleEmitterId>,
     /// Описания эмиттеров быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub particle_templates: HashMap<String, Vec<Option<ParticleEmitterDesc>>>,
+    /// Scene cache owners for particle textures retained by active scene objects.
+    pub particle_texture_owners: HashMap<ObjectHandle, u64>,
+    /// Scene cache owners for particle textures retained by resident fast-prefab templates.
+    pub particle_template_owners: HashMap<String, u64>,
     /// Описания эмиттеров объектов загруженной при замене сцены: эмиттер создаёт render thread
     /// по заявке `ParticleRequest::Create` с финальным хендлом объекта.
     pub particle_descs: HashMap<ObjectHandle, ParticleEmitterDesc>,
@@ -592,9 +596,8 @@ impl VulkanBackend {
     pub fn with_material_uploads(
         mut self,
         assets: Arc<PreparedRenderAssets>,
-        mut caches: MaterialUploadCaches,
+        caches: MaterialUploadCaches,
     ) -> Self {
-        caches.pin_scene_resources();
         self.material_assets = Some(assets);
         self.material_caches = caches;
         self
@@ -661,6 +664,9 @@ impl VulkanBackend {
 
     fn destroy_materials(&mut self, materials: &[MaterialId]) {
         for &material in materials {
+            if Some(material) == self.material_caches.error_material {
+                continue;
+            }
             if let Err(error) = self.renderer.destroy_material(material) {
                 log::error!("материал не уничтожен: {error}");
             }
@@ -866,9 +872,9 @@ impl RenderBackend for VulkanBackend {
             &assets,
             &mut self.material_caches,
             SceneParticles::Descriptions,
+            generation,
         ) {
             Ok(mut table) => {
-                self.material_caches.pin_scene_resources();
                 self.scene_skin_instances.extend(table.skin_instance_ids());
                 self.scene_screen_shaders.extend(table.screen_shader_ids());
                 self.game_ui.adopt_scene_images_for_owner(
@@ -909,6 +915,11 @@ impl RenderBackend for VulkanBackend {
                 log::error!("материал сцены не уничтожен: {error}");
             }
         }
+        self.material_caches
+            .release_materials(&mut self.renderer, ids.materials.iter().copied());
+        self.material_caches
+            .release_scene_textures(&mut self.renderer, ids.cache_owners.iter().copied());
+        self.material_caches.prune_unowned(&mut self.renderer);
         for owner in &ids.ui_scene_owners {
             self.game_ui
                 .release_scene_images(&mut self.renderer, *owner);
@@ -926,7 +937,7 @@ impl RenderBackend for VulkanBackend {
     fn release_materials(&mut self, materials: &[MaterialId]) {
         self.destroy_materials(materials);
         self.material_caches
-            .release_materials(&mut self.renderer, materials);
+            .release_materials(&mut self.renderer, materials.iter().copied());
     }
 
     fn apply_particle_commands(&mut self, commands: &[engine_scene::world::ParticleCommand]) {
@@ -2584,12 +2595,15 @@ fn drain_prefab_replies(
                     material_models,
                     ui,
                 } = cpu;
-                if let Err(error) = ui_registry.register(scripts, &ui) {
-                    prefabs.forget(&token.path);
-                    scripts.prefab_failed(world, &token.path, &error);
-                    prefabs.release(token);
-                    continue;
-                }
+                let ui_registration = match ui_registry.prepare(&ui) {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        prefabs.forget(&token.path);
+                        scripts.prefab_failed(world, &token.path, &error);
+                        prefabs.release(token);
+                        continue;
+                    }
+                };
                 if let Err(error) = scripts.register_prefab(world, &token.path, template, &sources)
                 {
                     prefabs.forget(&token.path);
@@ -2597,6 +2611,7 @@ fn drain_prefab_replies(
                     prefabs.release(token);
                     continue;
                 }
+                ui_registry.commit(scripts, ui_registration);
                 let geometry_paths = geometry.iter().map(|model| model.path.clone()).collect();
                 spawn_physics.add_heavy_geometry(geometry);
                 gpu_scene.prefabs.insert(token.path.clone(), gpu);
@@ -2660,6 +2675,9 @@ fn detach_material_sources(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandl
 pub(crate) fn detach_object_render_data(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
     detach_objects(&mut gpu_scene.by_object, handles);
     detach_material_sources(gpu_scene, handles);
+    for handle in handles {
+        gpu_scene.particle_texture_owners.remove(handle);
+    }
 }
 
 fn detach_objects<T>(by_object: &mut HashMap<ObjectHandle, Vec<Vec<T>>>, handles: &[ObjectHandle]) {
