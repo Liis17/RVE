@@ -111,6 +111,57 @@ fn prepare_play_scene(
     Ok((scene, warnings))
 }
 
+/// Выполняет запросы окна и диалогов скриптов Play. Диалог открывается синхронно, как другие
+/// диалоги редактора; окно редактора скрипты не переключают и не снимают.
+fn apply_play_platform_requests(
+    state: &mut EditorState,
+    mut open_dialog: impl FnMut(&engine_script::FileDialogRequest) -> Vec<std::path::PathBuf>,
+) {
+    let Some(play) = state.play.as_mut() else {
+        return;
+    };
+    for request in play.take_platform_requests() {
+        match request {
+            engine_script::PlatformRequest::FileDialog { id, request } => {
+                let paths = open_dialog(&request);
+                play.complete_file_dialog(id, paths);
+            }
+            engine_script::PlatformRequest::SetFullscreen(_) => state.log.push(
+                LogLevel::Warn,
+                "полноэкранный режим скриптов недоступен в Play редактора".to_owned(),
+            ),
+            engine_script::PlatformRequest::Screenshot(_) => state.log.push(
+                LogLevel::Warn,
+                "скриншот окна скриптов недоступен в Play редактора".to_owned(),
+            ),
+        }
+    }
+}
+
+/// Системный диалог файлов для скриптов Play.
+fn run_play_file_dialog(request: &engine_script::FileDialogRequest) -> Vec<std::path::PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(title) = &request.title {
+        dialog = dialog.set_title(title);
+    }
+    if let Some(directory) = &request.directory {
+        dialog = dialog.set_directory(directory);
+    }
+    if let Some(file_name) = &request.file_name {
+        dialog = dialog.set_file_name(file_name);
+    }
+    for filter in &request.filters {
+        dialog = dialog.add_filter(&filter.name, &filter.extensions);
+    }
+    let single = |path: Option<std::path::PathBuf>| path.into_iter().collect();
+    match request.kind {
+        engine_script::FileDialogKind::OpenFile => single(dialog.pick_file()),
+        engine_script::FileDialogKind::OpenFiles => dialog.pick_files().unwrap_or_default(),
+        engine_script::FileDialogKind::SaveFile => single(dialog.save_file()),
+        engine_script::FileDialogKind::PickFolder => single(dialog.pick_folder()),
+    }
+}
+
 /// Выполняет запрос `rve.scene.load`, принятый в Play. Ошибка подготовки или замены не меняет
 /// сессию; текущая сцена продолжает работать.
 fn apply_play_scene_request(state: &mut EditorState) {
@@ -1891,6 +1942,7 @@ impl EditorApp {
         };
         let pads_accepted = ui_accepting;
         apply_play_scene_request(&mut self.state);
+        apply_play_platform_requests(&mut self.state, run_play_file_dialog);
         let play_error = self.state.play.as_mut().and_then(|play| {
             if let Some(gamepads) = self.state.gamepads.as_mut() {
                 play.poll_gamepads(gamepads, pads_accepted);
@@ -3237,6 +3289,61 @@ return S
                 .log
                 .entries()
                 .any(|entry| { entry.level == LogLevel::Warn && entry.message.ends_with("hello") })
+        );
+    }
+
+    #[test]
+    fn play_file_dialogs_reach_scripts_and_window_requests_are_reported() {
+        let mut state = EditorState::new(None);
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/picker.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/picker.lua"
+"#,
+        )
+        .unwrap();
+        let script = r#"
+local S = {}
+function S:on_update()
+  if not self.dialog then
+    self.dialog = rve.dialog.open_file({ title = "Pick" })
+    rve.window.set_fullscreen(true)
+  else
+    local paths = rve.dialog.poll(self.dialog)
+    if paths then rve.log("picked " .. paths[1]) end
+  end
+end
+return S
+"#;
+        state.play = Some(PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap());
+        state.play.as_mut().unwrap().tick().unwrap();
+        let mut titles = Vec::new();
+        apply_play_platform_requests(&mut state, |request| {
+            titles.push(request.title.clone());
+            vec![std::path::PathBuf::from("map.json")]
+        });
+        assert_eq!(titles, [Some("Pick".to_owned())]);
+        assert!(
+            state
+                .log
+                .entries()
+                .any(|entry| entry.level == LogLevel::Warn
+                    && entry.message.contains("полноэкранный"))
+        );
+        state.play.as_mut().unwrap().tick().unwrap();
+        let events = state.play.as_mut().unwrap().drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message == "picked map.json"),
+            "{events:?}"
         );
     }
 

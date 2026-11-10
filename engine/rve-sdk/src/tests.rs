@@ -4014,11 +4014,14 @@ fn v19_component_structs_keep_their_documented_c_layout() {
     assert_eq!(offset_of!(RveAudioPlayExParams, force_mono), 44);
 }
 
+/// Kind, title and `(name, extensions)` filters of the last opened dialog.
+type ProbeDialog = (u32, String, Vec<(String, Vec<String>)>);
+
 #[derive(Default)]
 struct PlatformProbe {
     fullscreen: bool,
     screenshot: Option<String>,
-    dialog: Option<(u32, String, Vec<(String, Vec<String>)>)>,
+    dialog: Option<ProbeDialog>,
     done: bool,
     paths: Vec<String>,
 }

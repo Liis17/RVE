@@ -1100,7 +1100,7 @@ fn allocate_window_captures(
 }
 
 fn make_opaque(rgba8: &mut [u8]) {
-    for pixel in rgba8.chunks_exact_mut(4) {
+    for pixel in rgba8.as_chunks_mut::<4>().0 {
         pixel[3] = u8::MAX;
     }
 }

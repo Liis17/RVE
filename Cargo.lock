@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1140,6 +1140,8 @@ dependencies = [
  "flume",
  "glam",
  "log",
+ "png",
+ "rfd",
  "rve-sdk",
  "sysinfo",
  "winit",
@@ -3159,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "egui",
  "egui-winit",
