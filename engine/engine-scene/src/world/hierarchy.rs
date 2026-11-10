@@ -130,6 +130,7 @@ impl World {
         if self.objects[index].parent == parent {
             return Ok(());
         }
+        self.reject_static(index)?;
         if let Some(parent_index) = parent_index {
             let mut cursor = Some(parent_index);
             while let Some(current) = cursor {
@@ -220,6 +221,7 @@ impl World {
     }
 
     fn local_position_for_world(&self, index: usize, position: Vec3) -> Result<Vec3, SceneError> {
+        self.reject_static(index)?;
         if !position.is_finite() {
             return Err(self.object_error(index, "мировая позиция должна быть конечной"));
         }
@@ -271,6 +273,7 @@ impl World {
         index: usize,
         rotation_deg: Vec3,
     ) -> Result<Vec3, SceneError> {
+        self.reject_static(index)?;
         if !rotation_deg.is_finite() {
             return Err(self.object_error(index, "мировой поворот должен быть конечным"));
         }

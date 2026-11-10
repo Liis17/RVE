@@ -3,7 +3,7 @@
 //! Геометрия строится в физических пикселях окна и перестраивается только при новой
 //! выборке метрик, раз в [`SAMPLE_INTERVAL`].
 
-use engine_render::{FrameProfile, GpuPass, OverlayVertex};
+use engine_render::{DrawStats, FrameProfile, GpuPass, OverlayVertex};
 use font8x8::legacy::BASIC_LEGACY;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -120,6 +120,8 @@ struct Metrics {
     gpu_measured: bool,
     profile: ProfileAverages,
     latest_profile: [Option<Duration>; PROFILE_ROWS],
+    /// Счётчики draw'ов последнего кадра с профилем.
+    latest_draws: Option<DrawStats>,
     latest: Sample,
     fps: History,
     memory: History,
@@ -136,6 +138,7 @@ impl Metrics {
             gpu_measured: false,
             profile: ProfileAverages::default(),
             latest_profile: [None; PROFILE_ROWS],
+            latest_draws: None,
             latest: Sample::default(),
             fps: History::new(SHORT_HISTORY),
             memory: History::new(LONG_HISTORY),
@@ -168,6 +171,7 @@ impl Metrics {
         for (row, value) in phases.into_iter().enumerate() {
             self.profile.add(row, Some(value));
         }
+        self.latest_draws = Some(frame.draws);
         let Some(view) = frame.gpu.and_then(|gpu| gpu.views[0]) else {
             return;
         };
@@ -342,6 +346,12 @@ fn profile_text(label: &str, value: Option<Duration>) -> String {
     format!("{label:<18} {value}")
 }
 
+/// Строка счётчика: метка и значение или `n/a`.
+fn count_text(label: &str, value: Option<u32>) -> String {
+    let value = value.map_or_else(|| "n/a".to_owned(), |value| value.to_string());
+    format!("{label:<18} {value}")
+}
+
 fn percent_text(label: &str, value: Option<f32>) -> String {
     value.map_or_else(
         || format!("{label} n/a"),
@@ -397,6 +407,14 @@ fn build_panel(out: &mut Vec<OverlayVertex>, metrics: &Metrics, cpu_name: &str, 
     for (row, label) in CPU_PHASE_LABELS.iter().enumerate() {
         cpu.text(
             &profile_text(label, metrics.latest_profile[row]),
+            TEXT_SCALE,
+        );
+    }
+    cpu.text("Draws, last frame", TEXT_SCALE);
+    let draws = metrics.latest_draws.map(|draws| draws.values());
+    for (index, label) in DrawStats::LABELS.iter().enumerate() {
+        cpu.text(
+            &count_text(label, draws.map(|values| values[index])),
             TEXT_SCALE,
         );
     }
@@ -572,10 +590,13 @@ mod tests {
     use super::{CPU_PHASE_LABELS, GPU_TOTAL_ROW};
     use super::{
         FPS_GRAPH_FLOOR, GRAPH_HEIGHT, GRAPH_WIDTH, History, LONG_HISTORY, MARGIN, MAX_NAME_CHARS,
-        Metrics, SAMPLE_INTERVAL, SHORT_HISTORY, TEXT_COLOR, build_panel, display_name, push_text,
+        Metrics, SAMPLE_INTERVAL, SHORT_HISTORY, TEXT_COLOR, build_panel, count_text, display_name,
+        push_text,
     };
     use engine_render::OverlayVertex;
-    use engine_render::{FrameProfile, GpuFrameTimings, GpuPass, GpuViewTimings, ProfiledView};
+    use engine_render::{
+        DrawStats, FrameProfile, GpuFrameTimings, GpuPass, GpuViewTimings, ProfiledView,
+    };
     use std::time::{Duration, Instant};
 
     /// Прямоугольники `[x, y, width, height]` из вершин, записанных push_quad.
@@ -639,6 +660,29 @@ mod tests {
             metrics.latest_profile[0], None,
             "следующее окно начинается пустым"
         );
+    }
+
+    #[test]
+    fn draw_counts_show_the_latest_frame_and_are_missing_before_it() {
+        let mut metrics = Metrics::new(Instant::now());
+        assert_eq!(metrics.latest_draws, None);
+        assert_eq!(count_text("scene culled", None), "scene culled       n/a");
+
+        for scene_culled in [4, 9] {
+            metrics.add_frame_profile(&FrameProfile {
+                draws: DrawStats {
+                    scene_culled,
+                    ..DrawStats::default()
+                },
+                ..FrameProfile::default()
+            });
+        }
+
+        assert_eq!(
+            metrics.latest_draws.map(|draws| draws.scene_culled),
+            Some(9)
+        );
+        assert_eq!(count_text("scene culled", Some(9)), "scene culled       9");
     }
 
     #[test]

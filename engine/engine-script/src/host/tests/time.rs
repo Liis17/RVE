@@ -118,6 +118,79 @@ return Script
 }
 
 #[test]
+fn static_pose_rejection_keeps_fixed_late_timer_and_coroutine_work_alive() {
+    let source = r#"
+local Script = {}
+function Script:on_start()
+  rve.start_coroutine(function()
+    rve.wait_frames(1)
+    local moved = rve.find("rock"):set_world_position({x = 4, y = 0, z = 0})
+    rve.log_info("coroutine pose:" .. tostring(moved))
+    rve.wait_frames(1)
+    rve.log_info("coroutine resumed")
+  end)
+end
+function Script:on_fixed_update()
+  local moved = rve.find("rock"):set_world_position({x = 2, y = 0, z = 0})
+  rve.log_info("fixed pose:" .. tostring(moved))
+  rve.timer.after(0, function() rve.log_info("fixed timer fired") end)
+end
+function Script:on_late_update()
+  local moved = rve.find("rock"):set_parent(nil, true)
+  rve.log_info("late parent:" .. tostring(moved))
+end
+return Script
+"#;
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/stage5.lua"
+[[objects]]
+id = "runner"
+[[objects.lite_scripts]]
+path = "/stage5.lua"
+[[objects]]
+id = "rock"
+static = true
+"#,
+    );
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("stage5.lua", source)]), None).unwrap();
+    host.set_fixed_step_config(10, 1).unwrap();
+
+    let mut time = ScriptFrameTime::advance(0.0, 1.0, 0.0, 0.0, 0.1, 0);
+    for frame_number in 1..=4 {
+        time = frame(0.1, 1.0, time, frame_number);
+        host.update_frame(&mut world, time);
+    }
+
+    let events = host.drain_events();
+    let messages: Vec<_> = events.iter().map(|event| event.message.as_str()).collect();
+    for expected in [
+        "fixed pose:false",
+        "late parent:false",
+        "coroutine pose:false",
+        "fixed timer fired",
+        "coroutine resumed",
+    ] {
+        assert!(
+            messages.contains(&expected),
+            "missing {expected:?}: {events:?}"
+        );
+    }
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != crate::ScriptEventLevel::Error),
+        "{events:?}"
+    );
+    assert_eq!(
+        world.world_position(world.handle("rock").unwrap()),
+        Some(glam::Vec3::ZERO)
+    );
+}
+
+#[test]
 fn shared_clock_clamps_accumulates_scaled_and_unscaled_time() {
     let first = ScriptFrameTime::advance(3.0, 2.0, 0.0, 0.0, 1.0 / 60.0, 1);
     assert_eq!(first.unscaled_dt, 0.25);

@@ -346,9 +346,8 @@ pub(crate) fn dispatch(
         | "get_console_log" => read::call(tool, arguments, app.mcp_state_mut(), permissions),
         "select_objects" | "create_object" | "delete_objects" | "duplicate_objects"
         | "set_parent" | "rename_object" | "change_id" | "set_transform" | "set_component"
-        | "remove_component" | "set_script_param" | "set_camera_active" | "undo" | "redo" => {
-            edit::call(tool, arguments, app.mcp_state_mut())
-        }
+        | "remove_component" | "set_script_param" | "set_camera_active" | "set_static" | "undo"
+        | "redo" => edit::call(tool, arguments, app.mcp_state_mut()),
         "open_project" => assets::open_project(app, arguments, permissions),
         "save_scene"
         | "open_scene"
@@ -537,13 +536,14 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 47);
+        assert_eq!(names.len(), 48);
         assert!(names.contains(&"editor_status"));
         assert!(names.contains(&"get_console_log"));
         assert!(names.contains(&"capture_view"));
         for (name, permission) in [
             ("capture_view", Permission::Read),
             ("set_component", Permission::EditScene),
+            ("set_static", Permission::EditScene),
             ("undo", Permission::EditScene),
             ("write_text_file", Permission::Assets),
             ("open_project", Permission::Assets),

@@ -1845,6 +1845,12 @@ impl ScriptTransaction {
             | ObjectEdit::SetWorldPosition { object, .. }
             | ObjectEdit::SetWorldRotation { object, .. } => *object,
         };
+        let moves = matches!(
+            &edit,
+            ObjectEdit::SetParent { .. }
+                | ObjectEdit::SetWorldPosition { .. }
+                | ObjectEdit::SetWorldRotation { .. }
+        );
         let value_valid = match &edit {
             ObjectEdit::SetTag { tag, .. } => {
                 tag.is_empty()
@@ -1856,12 +1862,11 @@ impl ScriptTransaction {
             ObjectEdit::SetLayer { layer, .. } => *layer < LAYER_COUNT,
             _ => true,
         };
+        let is_static = self.world().and_then(|world| world.is_static(target));
         if !self.writable
             || !value_valid
-            || self
-                .world()
-                .and_then(|world| world.object(target))
-                .is_none()
+            || is_static.is_none()
+            || (moves && is_static == Some(true))
         {
             return false;
         }
@@ -2288,12 +2293,8 @@ impl ScriptTransaction {
         handle: ObjectHandle,
         transform: ScriptTransform,
     ) -> bool {
-        if !self.writable
-            || self
-                .world()
-                .and_then(|world| world.object(handle))
-                .is_none()
-        {
+        // Статический объект не двигается: отказ здесь не срывает остальные заявки вызова.
+        if !self.writable || self.world().and_then(|world| world.is_static(handle)) != Some(false) {
             return false;
         }
         self.pending_transforms
