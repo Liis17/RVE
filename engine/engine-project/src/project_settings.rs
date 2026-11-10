@@ -25,6 +25,9 @@ pub struct ProjectSettings {
     /// Звуковой вывод проекта: `[audio]`. Значения по умолчанию не сериализуются.
     #[serde(default, skip_serializing_if = "AudioSettings::is_default")]
     pub audio: AudioSettings,
+    /// Горячие клавиши окна игры: `[window]`. Значения по умолчанию не сериализуются.
+    #[serde(default, skip_serializing_if = "WindowSettings::is_default")]
+    pub window: WindowSettings,
     /// Значения по умолчанию не сериализуются, поэтому проекты без `[network]` не меняются.
     #[serde(default, skip_serializing_if = "NetworkSettings::is_default")]
     pub network: NetworkSettings,
@@ -169,6 +172,31 @@ pub struct AudioSettings {
 }
 
 impl AudioSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Встроенные горячие клавиши окна игры. Обе включены по умолчанию.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowSettings {
+    /// F11 переключает полноэкранный режим без рамки и обратно.
+    pub fullscreen_hotkey: bool,
+    /// F12 сохраняет PNG-скриншот окна в пользовательскую папку данных проекта.
+    pub screenshot_hotkey: bool,
+}
+
+impl Default for WindowSettings {
+    fn default() -> Self {
+        Self {
+            fullscreen_hotkey: true,
+            screenshot_hotkey: true,
+        }
+    }
+}
+
+impl WindowSettings {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -826,6 +854,31 @@ mod tests {
         let non_string = project("[[scenes]]\npath = \"scene.rvescene\"\n")
             .replace("version = \"1.2.3\"", "version = 123");
         assert!(ProjectSettings::parse(&non_string).is_err());
+    }
+
+    #[test]
+    fn window_hotkeys_default_on_and_can_be_disabled() {
+        const SCENE: &str = "[[scenes]]\npath = \"scene.rvescene\"\n";
+        let defaults = ProjectSettings::parse(&project(SCENE)).unwrap();
+        assert!(defaults.window.fullscreen_hotkey);
+        assert!(defaults.window.screenshot_hotkey);
+        assert!(!defaults.to_toml().unwrap().contains("[window]"));
+
+        let custom = ProjectSettings::parse(&format!(
+            "{}\n[window]\nfullscreen_hotkey = false\n",
+            project(SCENE)
+        ))
+        .unwrap();
+        assert!(!custom.window.fullscreen_hotkey);
+        assert!(custom.window.screenshot_hotkey);
+        assert_eq!(
+            ProjectSettings::parse(&custom.to_toml().unwrap()).unwrap(),
+            custom
+        );
+
+        let unknown =
+            ProjectSettings::parse(&format!("{}\n[window]\nvsync = true\n", project(SCENE)));
+        assert!(unknown.unwrap_err().contains("vsync"));
     }
 
     #[test]

@@ -794,7 +794,8 @@ enum SubmitAndPresentError {
 
 struct CaptureRecord {
     ticket: CaptureTicket,
-    viewport: ViewportId,
+    /// `None` — захват окна (swapchain), иначе захват viewport.
+    viewport: Option<ViewportId>,
     state: CaptureState,
 }
 
@@ -812,6 +813,9 @@ struct CaptureSubmission {
     layout: CaptureBufferLayout,
     width: u32,
     height: u32,
+    order: CapturePixelOrder,
+    /// Альфа swapchain не несёт смысла для изображения: захват окна делается непрозрачным.
+    opaque: bool,
     completion: CaptureCompletion,
 }
 
@@ -835,6 +839,22 @@ enum CaptureLifecycle {
 enum CapturePixelOrder {
     Rgba,
     Bgra,
+}
+
+/// Порядок байт 8-битного формата swapchain для захвата окна; другие форматы не поддерживаются.
+fn window_capture_order(format: vk::Format) -> Option<CapturePixelOrder> {
+    match format {
+        vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM => Some(CapturePixelOrder::Bgra),
+        vk::Format::R8G8B8A8_SRGB | vk::Format::R8G8B8A8_UNORM => Some(CapturePixelOrder::Rgba),
+        _ => None,
+    }
+}
+
+/// Копия swapchain-изображения в host-буфер перед present.
+#[derive(Clone, Copy)]
+struct SwapchainCopy {
+    buffer: vk::Buffer,
+    row_length: u32,
 }
 
 fn capture_pixel_order(format: vk::Format) -> CapturePixelOrder {
@@ -976,6 +996,113 @@ fn capture_rgba8(
         }
     }
     Ok(rgba)
+}
+
+/// Swapchain и кадровый слот, для которых готовятся захваты окна.
+struct WindowCaptureTarget<'a> {
+    instance: &'a ash::Instance,
+    device: &'a ash::Device,
+    physical_device: vk::PhysicalDevice,
+    row_alignment: u64,
+    transfer_src: bool,
+    format: vk::Format,
+    frame_slot: usize,
+    extent: vk::Extent2D,
+}
+
+/// Выделяет host-буферы для захватов окна, ждущих кадра; неподдерживаемые запросы завершает.
+///
+/// Ошибка выделения завершает только захваты окна: кадр продолжает рисоваться.
+fn prepare_window_captures(
+    captures: &mut [CaptureRecord],
+    target: WindowCaptureTarget<'_>,
+) -> (Vec<SwapchainCopy>, Vec<CaptureSubmission>) {
+    let tickets = queued_window_tickets(captures);
+    if tickets.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let prepared = window_capture_support(target.transfer_src, target.format).and_then(|order| {
+        allocate_window_captures(&target, &tickets, order).map_err(|error| {
+            log::warn!("не удалось подготовить захват окна: {error}");
+            "не удалось выделить буфер захвата окна"
+        })
+    });
+    prepared.unwrap_or_else(|message| {
+        fail_captures(captures, &tickets, message);
+        (Vec::new(), Vec::new())
+    })
+}
+
+fn queued_window_tickets(captures: &[CaptureRecord]) -> Vec<CaptureTicket> {
+    captures
+        .iter()
+        .filter(|capture| {
+            capture.viewport.is_none()
+                && capture_lifecycle(&capture.state) == CaptureLifecycle::Queued
+        })
+        .map(|capture| capture.ticket)
+        .collect()
+}
+
+/// Порядок байт захвата окна или причина, по которой swapchain нельзя прочитать.
+fn window_capture_support(
+    transfer_src: bool,
+    format: vk::Format,
+) -> Result<CapturePixelOrder, &'static str> {
+    if !transfer_src {
+        return Err("surface не поддерживает TRANSFER_SRC для захвата окна");
+    }
+    window_capture_order(format).ok_or("формат swapchain не поддерживает захват окна")
+}
+
+fn fail_captures(captures: &mut [CaptureRecord], tickets: &[CaptureTicket], message: &str) {
+    for capture in captures {
+        if tickets.contains(&capture.ticket) {
+            capture.state = CaptureState::Ready(Err(RenderError::Unsupported(message.to_owned())));
+        }
+    }
+}
+
+fn allocate_window_captures(
+    target: &WindowCaptureTarget<'_>,
+    tickets: &[CaptureTicket],
+    order: CapturePixelOrder,
+) -> Result<(Vec<SwapchainCopy>, Vec<CaptureSubmission>), RenderError> {
+    let extent = target.extent;
+    let layout = capture_buffer_layout(extent.width, extent.height, target.row_alignment)?;
+    let mut copies = Vec::with_capacity(tickets.len());
+    let mut submissions = Vec::with_capacity(tickets.len());
+    for &ticket in tickets {
+        let buffer = HostBuffer::new_empty(
+            target.instance,
+            target.device,
+            target.physical_device,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            layout.size,
+        )?;
+        copies.push(SwapchainCopy {
+            buffer: buffer.buffer,
+            row_length: layout.row_length,
+        });
+        submissions.push(CaptureSubmission {
+            ticket,
+            frame_slot: target.frame_slot,
+            buffer,
+            layout,
+            width: extent.width,
+            height: extent.height,
+            order,
+            opaque: true,
+            completion: CaptureCompletion::Image,
+        });
+    }
+    Ok((copies, submissions))
+}
+
+fn make_opaque(rgba8: &mut [u8]) {
+    for pixel in rgba8.chunks_exact_mut(4) {
+        pixel[3] = u8::MAX;
+    }
 }
 
 struct AcquiredFrameSubmission<'a> {
@@ -2255,7 +2382,7 @@ impl Renderer {
             .and_then(Option::take)
             .ok_or_else(unknown_viewport)?;
         for capture in &mut self.captures {
-            if capture.viewport != viewport {
+            if capture.viewport != Some(viewport) {
                 continue;
             }
             match &mut capture.state {
@@ -2283,8 +2410,23 @@ impl Renderer {
         };
         self.captures.push(CaptureRecord {
             ticket,
-            viewport,
+            viewport: Some(viewport),
             state,
+        });
+        ticket
+    }
+
+    /// Queues a readback of the window image presented by the next successfully recorded frame.
+    ///
+    /// Both [`Self::render_frame`] and [`Self::render_frame_with_ui`] paths serve the request.
+    /// The result fails when the surface lacks `TRANSFER_SRC` usage or uses a non-8-bit format.
+    /// The image is opaque RGBA8 at the swapchain size and includes UI drawn into that frame.
+    pub fn request_window_capture(&mut self) -> CaptureTicket {
+        let ticket = next_capture_ticket(&mut self.next_capture_ticket);
+        self.captures.push(CaptureRecord {
+            ticket,
+            viewport: None,
+            state: CaptureState::Queued,
         });
         ticket
     }
@@ -2947,6 +3089,19 @@ impl Renderer {
         let swapchain_view = swapchain.views[image_index];
         let swapchain_extent = swapchain.extent;
         let render_finished = swapchain.render_finished[image_index];
+        let (present_copies, window_captures) = prepare_window_captures(
+            &mut self.captures,
+            WindowCaptureTarget {
+                instance: &instance,
+                device: &device,
+                physical_device: self.physical_device,
+                row_alignment: self.capture_row_alignment,
+                transfer_src: swapchain.transfer_src,
+                format: self.surface_format.format,
+                frame_slot,
+                extent: swapchain_extent,
+            },
+        );
         let output_is_srgb = is_srgb_format(self.surface_format.format);
         let view_projection = multiply_4x4(frame.camera.projection, frame.camera.view);
         let particle_works = self.particles.plan_view(
@@ -3128,6 +3283,7 @@ impl Renderer {
                 skin_record,
                 screen_context,
                 output_marks,
+                &present_copies,
             )?;
             Ok((temporal_outcome, shadow_layout, local_shadow_layout))
         })();
@@ -3135,6 +3291,10 @@ impl Renderer {
         let (temporal_outcome, shadow_layout, local_shadow_layout) = match recorded {
             Ok(recorded) => recorded,
             Err(error) => {
+                self.fail_capture_submissions(
+                    &window_captures,
+                    "frame recording failed before window capture",
+                );
                 self.screen_temporal.state.missed();
                 self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
                 return Err(error);
@@ -3207,7 +3367,7 @@ impl Renderer {
             timestamps_written: timestamps.is_some(),
             timings: &mut cpu,
             temporal_submissions: &temporal_submissions,
-            capture_submissions: Vec::new(),
+            capture_submissions: window_captures,
             shadow_layout,
             local_shadow_layout,
             skin: skin_plan.as_ref(),
@@ -3912,6 +4072,19 @@ impl Renderer {
         let swapchain_view = swapchain.views[image_index];
         let swapchain_extent = swapchain.extent;
         let render_finished = swapchain.render_finished[image_index];
+        let (present_copies, window_captures) = prepare_window_captures(
+            &mut self.captures,
+            WindowCaptureTarget {
+                instance: &instance,
+                device: &device,
+                physical_device: self.physical_device,
+                row_alignment: self.capture_row_alignment,
+                transfer_src: swapchain.transfer_src,
+                format: self.surface_format.format,
+                frame_slot,
+                extent: swapchain_extent,
+            },
+        );
 
         let particle_pipelines = self.particle_pipelines();
         let mut particle_works = Vec::with_capacity(rendered.len());
@@ -4083,7 +4256,7 @@ impl Renderer {
             })
             .collect();
 
-        let mut capture_submissions = Vec::new();
+        let mut capture_submissions = window_captures;
         let mut capture_attempted_viewports = Vec::new();
         let record_started = Instant::now();
         let recorded = (|| {
@@ -4311,6 +4484,7 @@ impl Renderer {
                     None,
                     view_ui,
                     true,
+                    &[],
                 );
                 for ticket in capture_tickets.iter().copied() {
                     let layout = capture_buffer_layout(
@@ -4340,6 +4514,8 @@ impl Renderer {
                         layout,
                         width: target.extent.width,
                         height: target.extent.height,
+                        order: capture_pixel_order(LDR_FORMAT),
+                        opaque: false,
                         completion: CaptureCompletion::Image,
                     });
                 }
@@ -4412,6 +4588,7 @@ impl Renderer {
                 swapchain_image,
                 swapchain_extent,
                 &ui_pass,
+                &present_copies,
             );
             if let Some(marks) = output_marks {
                 marks.write(&device, command_buffer, 1);
@@ -4551,7 +4728,7 @@ impl Renderer {
         self.captures
             .iter()
             .filter(|capture| {
-                capture.viewport == viewport
+                capture.viewport == Some(viewport)
                     && capture_lifecycle(&capture.state) == CaptureLifecycle::Queued
             })
             .map(|capture| capture.ticket)
@@ -4590,7 +4767,9 @@ impl Renderer {
 
     fn fail_queued_captures(&mut self, viewports: &[ViewportId], message: &'static str) {
         for capture in &mut self.captures {
-            if viewports.contains(&capture.viewport)
+            if capture
+                .viewport
+                .is_some_and(|viewport| viewports.contains(&viewport))
                 && capture_lifecycle(&capture.state) == CaptureLifecycle::Queued
             {
                 capture.state = CaptureState::Ready(Err(RenderError::InvalidState(message)));
@@ -4663,8 +4842,14 @@ impl Renderer {
                                 submission.width,
                                 submission.height,
                                 submission.layout.row_pitch,
-                                capture_pixel_order(LDR_FORMAT),
+                                submission.order,
                             )
+                            .map(|mut rgba8| {
+                                if submission.opaque {
+                                    make_opaque(&mut rgba8);
+                                }
+                                rgba8
+                            })
                             .map(|rgba8| CapturedImage {
                                 width: submission.width,
                                 height: submission.height,
@@ -8766,6 +8951,8 @@ struct SwapchainBundle {
     render_finished: Vec<vk::Semaphore>,
     extent: vk::Extent2D,
     present_mode: PresentMode,
+    /// Изображения созданы с `TRANSFER_SRC`: доступен захват окна.
+    transfer_src: bool,
 }
 
 impl SwapchainBundle {
@@ -8804,6 +8991,15 @@ impl SwapchainBundle {
             surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
         }?;
         let selected_present_mode = select_present_mode(requested_present_mode, &present_modes);
+        // TRANSFER_SRC нужен только захвату окна, поэтому он необязателен.
+        let transfer_src = capabilities
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        let image_usage = if transfer_src {
+            SWAPCHAIN_USAGE | vk::ImageUsageFlags::TRANSFER_SRC
+        } else {
+            SWAPCHAIN_USAGE
+        };
         let mut create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -8811,7 +9007,7 @@ impl SwapchainBundle {
             .image_color_space(surface_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(SWAPCHAIN_USAGE)
+            .image_usage(image_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
@@ -8834,6 +9030,7 @@ impl SwapchainBundle {
             render_finished: Vec::new(),
             extent,
             present_mode: PresentMode::from_vk(selected_present_mode),
+            transfer_src,
         };
         // SAFETY: the swapchain was just created by this loader and is still alive.
         bundle.images = unsafe { loader.get_swapchain_images(bundle.handle) }?;
@@ -11233,6 +11430,7 @@ fn record_frame(
     skin: Option<skin::SkinRecord<'_>>,
     screen: ScreenContext<'_>,
     output_marks: Option<GpuMarks>,
+    present_copies: &[SwapchainCopy],
 ) -> Result<Option<TemporalResolveOutcome>, RenderError> {
     begin_command_buffer(device, command_buffer, output_marks.map(|marks| marks.pool))?;
     if let Some(record) = skin {
@@ -11365,6 +11563,7 @@ fn record_frame(
         overlay,
         ui,
         false,
+        present_copies,
     );
     if let Some(marks) = output_marks {
         marks.write(device, command_buffer, 1);
@@ -13087,6 +13286,7 @@ fn record_output_pass(
     overlay: Option<&OverlayPass>,
     ui: Option<&UiDrawPass<'_>>,
     sample_output: bool,
+    present_copies: &[SwapchainCopy],
 ) {
     let to_attachment = if sample_output {
         let (source_stage, source_access) = offscreen_previous_use(previous_output_layout);
@@ -13169,6 +13369,16 @@ fn record_output_pass(
     // SAFETY: this matches the output pass's dynamic rendering begin.
     unsafe { device.cmd_end_rendering(command_buffer) };
 
+    if !sample_output && !present_copies.is_empty() {
+        record_present_copies(
+            device,
+            command_buffer,
+            output_image,
+            output_extent,
+            present_copies,
+        );
+        return;
+    }
     let sampled_output = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -13208,6 +13418,81 @@ fn output_attachment_barrier(output_image: vk::Image) -> vk::ImageMemoryBarrier2
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(output_image)
         .subresource_range(color_subresource_range())
+}
+
+/// Переводит swapchain-изображение после вывода в `PRESENT_SRC_KHR` через копии в host-буферы.
+fn record_present_copies(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    extent: vk::Extent2D,
+    copies: &[SwapchainCopy],
+) {
+    let to_transfer = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, to_transfer);
+    for copy in copies {
+        let regions = [vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(copy.row_length)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_offset(vk::Offset3D::default())
+            .image_extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })];
+        // SAFETY: the swapchain image is in TRANSFER_SRC_OPTIMAL and was created with TRANSFER_SRC;
+        // the staging buffer fits the aligned extent.
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                copy.buffer,
+                &regions,
+            );
+        }
+    }
+    let host_read = vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+        .dst_access_mask(vk::AccessFlags2::HOST_READ);
+    let to_present = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE)
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(color_subresource_range());
+    let memory_barriers = [host_read];
+    let image_barriers = [to_present];
+    let dependency = vk::DependencyInfo::default()
+        .memory_barriers(&memory_barriers)
+        .image_memory_barriers(&image_barriers);
+    // SAFETY: the copies above write host-visible buffers read only after the frame fence signals.
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
 fn record_viewport_capture(
@@ -13337,6 +13622,7 @@ fn record_ui(
     output_image: vk::Image,
     output_extent: vk::Extent2D,
     ui: &UiPass<'_>,
+    present_copies: &[SwapchainCopy],
 ) {
     // Стадия совпадает с ожиданием acquire semaphore в submit этого command buffer.
     let to_attachment = vk::ImageMemoryBarrier2::default()
@@ -13377,6 +13663,16 @@ fn record_ui(
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
 
+    if !present_copies.is_empty() {
+        record_present_copies(
+            device,
+            command_buffer,
+            output_image,
+            output_extent,
+            present_copies,
+        );
+        return;
+    }
     let present_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -19721,8 +20017,10 @@ mod tests {
 #[cfg(test)]
 mod capture_tests {
     use super::{
-        CaptureLifecycle, CapturePixelOrder, CaptureTicket, cancel_capture_lifecycle,
-        capture_buffer_layout, capture_pixel_order, capture_rgba8, next_capture_ticket,
+        CaptureLifecycle, CapturePixelOrder, CaptureRecord, CaptureState, CaptureTicket,
+        ViewportId, cancel_capture_lifecycle, capture_buffer_layout, capture_lifecycle,
+        capture_pixel_order, capture_rgba8, fail_captures, make_opaque, next_capture_ticket,
+        queued_window_tickets, window_capture_support,
     };
     use ash::vk;
 
@@ -19738,6 +20036,63 @@ mod capture_tests {
             capture_pixel_order(vk::Format::B8G8R8A8_SRGB),
             CapturePixelOrder::Bgra
         );
+    }
+
+    #[test]
+    fn window_capture_needs_transfer_source_and_an_eight_bit_swapchain() {
+        assert_eq!(
+            window_capture_support(true, vk::Format::B8G8R8A8_UNORM),
+            Ok(CapturePixelOrder::Bgra)
+        );
+        assert_eq!(
+            window_capture_support(true, vk::Format::R8G8B8A8_SRGB),
+            Ok(CapturePixelOrder::Rgba)
+        );
+        assert!(window_capture_support(false, vk::Format::B8G8R8A8_SRGB).is_err());
+        assert!(window_capture_support(true, vk::Format::A2B10G10R10_UNORM_PACK32).is_err());
+    }
+
+    #[test]
+    fn unsupported_window_captures_fail_without_touching_viewport_captures() {
+        let mut captures = vec![
+            CaptureRecord {
+                ticket: CaptureTicket(1),
+                viewport: Some(ViewportId(0)),
+                state: CaptureState::Queued,
+            },
+            CaptureRecord {
+                ticket: CaptureTicket(2),
+                viewport: None,
+                state: CaptureState::Queued,
+            },
+            CaptureRecord {
+                ticket: CaptureTicket(3),
+                viewport: None,
+                state: CaptureState::Cancelled,
+            },
+        ];
+        let tickets = queued_window_tickets(&captures);
+        assert_eq!(tickets, [CaptureTicket(2)]);
+        fail_captures(&mut captures, &tickets, "unsupported");
+        assert_eq!(
+            capture_lifecycle(&captures[0].state),
+            CaptureLifecycle::Queued
+        );
+        assert_eq!(
+            capture_lifecycle(&captures[1].state),
+            CaptureLifecycle::Failed
+        );
+        assert_eq!(
+            capture_lifecycle(&captures[2].state),
+            CaptureLifecycle::Cancelled
+        );
+    }
+
+    #[test]
+    fn window_capture_alpha_is_made_opaque() {
+        let mut rgba = [1, 2, 3, 0, 4, 5, 6, 128];
+        make_opaque(&mut rgba);
+        assert_eq!(rgba, [1, 2, 3, 255, 4, 5, 6, 255]);
     }
 
     #[test]

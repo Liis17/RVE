@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
@@ -10,7 +11,7 @@ use winit::error::{EventLoopError, OsError};
 use winit::event::{DeviceEvent, ElementState, Ime, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as LogicalKey, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{CursorGrabMode, Icon, WindowId};
+use winit::window::{CursorGrabMode, Fullscreen, Icon, WindowId};
 
 pub use winit::dpi::PhysicalSize;
 pub use winit::event::WindowEvent;
@@ -374,13 +375,32 @@ enum InternalEvent {
     RequestExit,
     SetCursor(CursorState),
     SetTextInput(bool),
+    SetFullscreen(FullscreenRequest),
     Wake,
+}
+
+/// Запрос полноэкранного режима без рамки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullscreenRequest {
+    Set(bool),
+    Toggle,
+}
+
+impl FullscreenRequest {
+    /// Целевое состояние относительно текущего.
+    fn target(self, current: bool) -> bool {
+        match self {
+            Self::Set(fullscreen) => fullscreen,
+            Self::Toggle => !current,
+        }
+    }
 }
 
 /// Потокобезопасный handle для запросов в оконный цикл событий.
 #[derive(Clone)]
 pub struct WindowProxy {
     event_loop_proxy: EventLoopProxy<InternalEvent>,
+    fullscreen: Arc<AtomicBool>,
 }
 
 impl WindowProxy {
@@ -419,6 +439,33 @@ impl WindowProxy {
         let _ = self
             .event_loop_proxy
             .send_event(InternalEvent::SetTextInput(enabled));
+    }
+
+    /// Включает или выключает полноэкранный режим без рамки на текущем мониторе.
+    ///
+    /// Запрос применяется в потоке цикла событий; запрос до создания окна применяется при его
+    /// создании. После завершения цикла событий запрос игнорируется.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        let _ = self
+            .event_loop_proxy
+            .send_event(InternalEvent::SetFullscreen(FullscreenRequest::Set(
+                fullscreen,
+            )));
+    }
+
+    /// Переключает полноэкранный режим без рамки относительно состояния в момент применения.
+    pub fn toggle_fullscreen(&self) {
+        let _ = self
+            .event_loop_proxy
+            .send_event(InternalEvent::SetFullscreen(FullscreenRequest::Toggle));
+    }
+
+    /// Последнее состояние полноэкранного режима, применённое или замеченное циклом событий.
+    ///
+    /// Обновляется после применения запроса и при изменении размера окна, поэтому учитывает и
+    /// выход из полноэкранного режима средствами ОС.
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen.load(Ordering::Acquire)
     }
 
     /// Будит цикл событий, чтобы он снова вызвал `WindowHandler::update`.
@@ -529,8 +576,10 @@ pub fn run(mut config: WindowConfig, handler: &mut impl WindowHandler) -> Result
         .build()
         .map_err(WindowError::EventLoop)?;
     event_loop.set_control_flow(config.redraw.control_flow());
+    let fullscreen = Arc::new(AtomicBool::new(false));
     handler.attach_proxy(WindowProxy {
         event_loop_proxy: event_loop.create_proxy(),
+        fullscreen: Arc::clone(&fullscreen),
     });
 
     let mut app = WindowApplication {
@@ -544,6 +593,7 @@ pub fn run(mut config: WindowConfig, handler: &mut impl WindowHandler) -> Result
         focused: false,
         cursor: CursorController::default(),
         text_input: false,
+        fullscreen: FullscreenState::new(fullscreen),
     };
     let run_result = event_loop.run_app(&mut app);
     app.finish();
@@ -566,8 +616,55 @@ struct WindowApplication<'a, H> {
     cursor: CursorController,
     /// Запрошен ли IME; применяется к окну при создании и при каждом изменении.
     text_input: bool,
+    fullscreen: FullscreenState,
 }
 
+/// Состояние полноэкранного режима, общее с `WindowProxy::is_fullscreen`.
+///
+/// Не обращается к `Window`: применённое значение возвращается вызывающему коду.
+struct FullscreenState {
+    shared: Arc<AtomicBool>,
+    /// Целевое состояние запроса, поступившего до создания окна.
+    pending: Option<bool>,
+}
+
+impl FullscreenState {
+    fn new(shared: Arc<AtomicBool>) -> Self {
+        Self {
+            shared,
+            pending: None,
+        }
+    }
+
+    fn current(&self) -> bool {
+        self.shared.load(Ordering::Acquire)
+    }
+
+    /// Возвращает целевое состояние для окна или сохраняет запрос, если окна ещё нет.
+    fn request(&mut self, request: FullscreenRequest, window_exists: bool) -> Option<bool> {
+        let current = self.pending.unwrap_or_else(|| self.current());
+        let target = request.target(current);
+        if window_exists {
+            Some(target)
+        } else {
+            self.pending = Some(target);
+            None
+        }
+    }
+
+    fn window_created(&mut self) -> Option<bool> {
+        self.pending.take()
+    }
+
+    fn observe(&self, fullscreen: bool) {
+        self.shared.store(fullscreen, Ordering::Release);
+    }
+}
+
+fn apply_fullscreen(window: &Window, fullscreen: bool, state: &FullscreenState) {
+    window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
+    state.observe(fullscreen);
+}
 impl<H: WindowHandler> WindowApplication<'_, H> {
     fn finish(&mut self) {
         if !self.exited {
@@ -817,6 +914,9 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
         if self.focus_requests.window_created() {
             request_window_focus(&window);
         }
+        if let Some(fullscreen) = self.fullscreen.window_created() {
+            apply_fullscreen(&window, fullscreen, &self.fullscreen);
+        }
         if !self.handler.init(window) {
             self.stop(event_loop);
         }
@@ -899,6 +999,9 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                 self.handler.mouse_wheel(dx, dy);
             }
             WindowEvent::Resized(size) => {
+                if let Some(window) = self.window.as_ref() {
+                    self.fullscreen.observe(window.fullscreen().is_some());
+                }
                 self.handler.resized(size.width, size.height);
                 self.relock_cursor();
             }
@@ -949,6 +1052,14 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                 self.text_input = enabled;
                 if let Some(window) = self.window.as_ref() {
                     window.set_ime_allowed(enabled);
+                }
+            }
+            InternalEvent::SetFullscreen(request) => {
+                let window = self.window.as_ref();
+                if let Some(fullscreen) = self.fullscreen.request(request, window.is_some())
+                    && let Some(window) = window
+                {
+                    apply_fullscreen(window, fullscreen, &self.fullscreen);
                 }
             }
             InternalEvent::Wake => {}
@@ -1222,6 +1333,29 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_requests_toggle_from_the_latest_state_and_wait_for_the_window() {
+        let shared = Arc::new(AtomicBool::new(false));
+        let mut state = FullscreenState::new(Arc::clone(&shared));
+
+        assert_eq!(state.request(FullscreenRequest::Toggle, false), None);
+        assert_eq!(state.request(FullscreenRequest::Toggle, false), None);
+        assert_eq!(state.request(FullscreenRequest::Toggle, false), None);
+        assert_eq!(state.window_created(), Some(true));
+        assert_eq!(state.window_created(), None);
+
+        state.observe(true);
+        assert!(shared.load(Ordering::Acquire));
+        assert_eq!(state.request(FullscreenRequest::Toggle, true), Some(false));
+        assert_eq!(
+            state.request(FullscreenRequest::Set(true), true),
+            Some(true)
+        );
+
+        state.observe(false);
+        assert_eq!(state.request(FullscreenRequest::Toggle, true), Some(true));
+    }
+
+    #[test]
     fn close_request_uses_application_handler_decision() {
         let mut default_handler = Handler::default();
         let mut default_app = WindowApplication {
@@ -1235,6 +1369,7 @@ mod tests {
             focused: false,
             cursor: CursorController::default(),
             text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
         assert!(default_app.should_exit_on_close_requested());
 
@@ -1250,6 +1385,7 @@ mod tests {
             focused: false,
             cursor: CursorController::default(),
             text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
         assert!(!keep_open_app.should_exit_on_close_requested());
     }
@@ -1505,6 +1641,7 @@ mod tests {
             focused: false,
             cursor: CursorController::default(),
             text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
 
         app.finish();
@@ -1528,6 +1665,7 @@ mod tests {
             focused: false,
             cursor: CursorController::default(),
             text_input: false,
+            fullscreen: FullscreenState::new(Arc::default()),
         };
 
         app.finish();

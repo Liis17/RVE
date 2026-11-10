@@ -13,6 +13,7 @@ pub use prefab_catalog::{
 pub use project_settings::{
     AudioSettings, LayerSettings, MAX_LAYERS, NetworkSettings, PhysicsSettings,
     ProjectRequirements, ProjectScene, ProjectSettings, RuntimeSettings, TagSettings,
+    WindowSettings,
 };
 
 /// Версия крейта `engine-project`.
