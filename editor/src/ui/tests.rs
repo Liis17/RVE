@@ -998,7 +998,17 @@ fn build_player_menu_item_queues_the_action() {
     };
     click(&mut harness, "File");
     click(&mut harness, "Build Player…");
-    assert_eq!(harness.state.actions, [crate::state::Action::BuildPlayer]);
+    assert_eq!(
+        harness.state.actions,
+        [crate::state::Action::BuildPlayer { with_server: false }]
+    );
+    harness.state.actions.clear();
+    click(&mut harness, "File");
+    click(&mut harness, "Build Player with Server…");
+    assert_eq!(
+        harness.state.actions,
+        [crate::state::Action::BuildPlayer { with_server: true }]
+    );
 }
 
 #[test]

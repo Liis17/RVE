@@ -57,9 +57,12 @@ pub fn locate_build_tool(
 impl BuildTool {
     /// Команда `build <project> --output <output>`; пути должны быть абсолютными,
     /// потому что cargo запускается из корня workspace.
-    pub fn command(&self, project: &Path, output: &Path) -> Command {
+    pub fn command(&self, project: &Path, output: &Path, with_server: bool) -> Command {
         let mut command = self.command_for("build", project);
         command.arg("--output").arg(output);
+        if with_server {
+            command.arg("--with-server");
+        }
         command
     }
 
@@ -701,7 +704,7 @@ mod tests {
             cargo: "cargo".into(),
             workspace: PathBuf::from("ws"),
         };
-        let command = tool.command(Path::new("/game"), Path::new("/out"));
+        let command = tool.command(Path::new("/game"), Path::new("/out"), false);
         assert_eq!(command.get_current_dir(), Some(Path::new("ws")));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(
@@ -718,6 +721,18 @@ mod tests {
                 "/out"
             ]
         );
+    }
+
+    #[test]
+    fn build_command_passes_the_server_flag_only_when_requested() {
+        let tool = BuildTool::Binary(PathBuf::from("rve-build"));
+        let has_flag = |with_server| {
+            tool.command(Path::new("/game"), Path::new("/out"), with_server)
+                .get_args()
+                .any(|arg| arg == "--with-server")
+        };
+        assert!(!has_flag(false));
+        assert!(has_flag(true));
     }
 
     #[test]

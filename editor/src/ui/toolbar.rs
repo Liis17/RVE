@@ -257,7 +257,16 @@ fn show_menus(
             )
             .clicked()
         {
-            state.action(Action::BuildPlayer);
+            state.action(Action::BuildPlayer { with_server: false });
+        }
+        if ui
+            .add_enabled(
+                editing && state.build.is_none(),
+                egui::Button::new("Build Player with Server…"),
+            )
+            .clicked()
+        {
+            state.action(Action::BuildPlayer { with_server: true });
         }
         ui.separator();
         if ui.button("Exit").clicked() {

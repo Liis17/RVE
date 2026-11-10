@@ -23,7 +23,7 @@ New Project при PATH только с системными каталогам�
 публикуется как обычный GitHub Release `sdk-<полный SHA>` с отметкой latest; повторный
 запуск заменяет asset того же релиза. Проверка не запускает GUI или GPU.
 
-`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]` читает
+`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]` читает
 `project.rveproject` и `bootstrap.rves`, открывает `<project>/Assets` через
 `ResourceSystem` в `SourceMode::Loose`, затем проверяет каждую включённую сцену с
 помощью `SceneDocument`. Выключенные сцены не открываются. В сборку попадают файлы
@@ -90,7 +90,7 @@ Object/component refs проверяются на существующую це�
 `Engine/bootstrap.rves`, а наборы архивов из `Assets/` корня релиза (см.
 [[Engine/EngineRuntime]]).
 
-На Windows корень релиза — сам output: executable, `Engine/` и `Assets/` лежат рядом. Выделенный сервер `rve-server` кладётся рядом с `Engine/`, на macOS — рядом с `.app`, а не внутрь бандла; это сборка без окна и без dev-console (`--no-default-features`).
+На Windows корень релиза — сам output: executable, `Engine/` и `Assets/` лежат рядом. Выделенный сервер `rve-server` попадает в релиз только с `--with-server`: клиенты могут подключаться к одному общему серверу, поэтому раздавать его файл каждому игроку не нужно. Без флага сервер не ищется и не собирается. С флагом он кладётся рядом с `Engine/`, на macOS — рядом с `.app`, а не внутрь бандла; это сборка без окна и без dev-console (`--no-default-features`).
 На macOS output содержит `<player>.app`: executable в `Contents/MacOS`, `Engine/` и
 `Assets/` в `Contents/Resources`, `Contents/Info.plist` генерирует
 `platform::info_plist` (`CFBundleIdentifier` = `rve.game.<id>` с заменой `_` на `-`,

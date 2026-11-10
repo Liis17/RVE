@@ -62,6 +62,7 @@ pub(crate) fn build_distribution(
     project_dir: &Path,
     output: &Path,
     vulkan_sdk: Option<&Path>,
+    with_server: bool,
 ) -> Result<(), BuildError> {
     let output = absolute_output_path(output)?;
     ensure_output_missing(&output)?;
@@ -80,7 +81,9 @@ pub(crate) fn build_distribution(
     )?;
     #[cfg(not(windows))]
     let executable = locate_player(PlayerFlavor::Distribution, false)?;
-    let server_executable = locate_player(PlayerFlavor::Server, false)?;
+    let server_executable = with_server
+        .then(|| locate_player(PlayerFlavor::Server, false))
+        .transpose()?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -146,13 +149,7 @@ pub(crate) fn build_distribution(
 
     let output_binary = binary_dir.join(&executable_name);
     copy_file(&executable, &output_binary)?;
-    // Сервер лежит рядом с Engine (Windows) или рядом с `.app` (macOS), а не внутри бандла: без окна.
-    copy_file(
-        &server_executable,
-        &staging
-            .path()
-            .join(sdk::player_filename(PlayerFlavor::Server)),
-    )?;
+    stage_server(server_executable.as_deref(), staging.path())?;
     #[cfg(windows)]
     if let Some(icon_path) = &project.icon {
         let source = project
@@ -177,6 +174,17 @@ pub(crate) fn build_distribution(
             "не удалось опубликовать {}: {error}",
             output.display()
         ))),
+    }
+}
+
+/// Сервер лежит рядом с Engine (Windows) или рядом с `.app` (macOS), а не внутри бандла: без окна.
+fn stage_server(server_executable: Option<&Path>, release_root: &Path) -> Result<(), BuildError> {
+    match server_executable {
+        Some(server) => copy_file(
+            server,
+            &release_root.join(sdk::player_filename(PlayerFlavor::Server)),
+        ),
+        None => Ok(()),
     }
 }
 
@@ -1728,13 +1736,29 @@ id = "plain"
     }
 
     #[test]
+    fn release_contains_the_server_only_when_requested() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-stage-server").unwrap();
+        let server = root.path().join("server-source");
+        fs::write(&server, b"server binary").unwrap();
+        let staged = root
+            .path()
+            .join(crate::sdk::player_filename(PlayerFlavor::Server));
+
+        super::stage_server(None, root.path()).unwrap();
+        assert!(!staged.exists());
+
+        super::stage_server(Some(&server), root.path()).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"server binary");
+    }
+
+    #[test]
     fn existing_output_fails_before_touching_project_or_output_contents() {
         let root = TempDir::create(&std::env::temp_dir(), "rve-build-output-exists").unwrap();
         let output = root.path().join("existing-output");
         fs::create_dir(&output).unwrap();
         fs::write(output.join("marker"), b"keep").unwrap();
-        let error =
-            build_distribution(&root.path().join("missing-project"), &output, None).unwrap_err();
+        let error = build_distribution(&root.path().join("missing-project"), &output, None, false)
+            .unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert_eq!(fs::read(output.join("marker")).unwrap(), b"keep");
         assert!(!root.path().join("missing-project/.rve").exists());
