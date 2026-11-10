@@ -6,7 +6,8 @@ use rve_sdk::abi::{
     RVE_PARAM_ENUM, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
     RVE_PARAM_OBJECT, RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule,
     RveParamDesc, RveParamDescV13, RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
-    RveScriptDescV15, RveScriptDescV16, RveScriptDescV17, RveScriptDescV19, RveStr, RveUiEventFn,
+    RveScriptDescV15, RveScriptDescV16, RveScriptDescV17, RveScriptDescV19, RveScriptDescV20,
+    RveStr, RveUiEventFn,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -202,7 +203,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            20.. => std::mem::size_of::<RveScriptDesc>(),
+            22.. => std::mem::size_of::<RveScriptDesc>(),
+            20..=21 => std::mem::size_of::<RveScriptDescV20>(),
             19 => std::mem::size_of::<RveScriptDescV19>(),
             17..=18 => std::mem::size_of::<RveScriptDescV17>(),
             16 => std::mem::size_of::<RveScriptDescV16>(),
@@ -237,8 +239,11 @@ impl ScriptLibrary {
         };
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v20 = (header.abi_version >= 20)
+        let descriptors_v22 = (header.abi_version >= 22)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
+        let descriptors_v20 = ((20..=21).contains(&header.abi_version)).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV20>(), count)
+        });
         let descriptors_v19 = (header.abi_version == 19).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV19>(), count)
         });
@@ -270,8 +275,31 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v20 {
+            let descriptor = if let Some(descriptors) = descriptors_v22 {
                 &descriptors[index]
+            } else if let Some(descriptors) = descriptors_v20 {
+                let descriptor = &descriptors[index];
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    ui_event: descriptor.ui_event,
+                    on_enable: descriptor.on_enable,
+                    on_disable: descriptor.on_disable,
+                    on_fixed_update: descriptor.on_fixed_update,
+                    on_late_update: descriptor.on_late_update,
+                    on_timer: descriptor.on_timer,
+                    set_property: None,
+                }))
             } else if let Some(descriptors) = descriptors_v19 {
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
@@ -293,6 +321,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v17 {
                 let descriptor = &descriptors[index];
@@ -315,6 +344,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v16 {
                 let descriptor = &descriptors[index];
@@ -337,6 +367,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(stride) = descriptors_v15 {
                 // SAFETY: the selected stride matches the module's ABI v15 branch; the module
@@ -366,6 +397,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v13 {
                 let descriptor = &descriptors[index];
@@ -388,6 +420,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v6 {
                 // ABI v6 through v12 have no network callback; normalize it to `None`.
@@ -411,6 +444,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v4 {
                 // ABI v4 and v5 have no collision pointer; normalize it to `None`.
@@ -434,6 +468,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else if let Some(descriptors) = descriptors_v3 {
                 let descriptor = &descriptors[index];
@@ -457,6 +492,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             } else {
                 let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
@@ -481,6 +517,7 @@ impl ScriptLibrary {
                     on_fixed_update: None,
                     on_late_update: None,
                     on_timer: None,
+                    set_property: None,
                 }))
             };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.
@@ -787,6 +824,80 @@ fn abi_param_kind(kind: u32, argument: &str) -> Option<ParamKind> {
         RVE_PARAM_ARRAY => ParamKind::Array(Box::new(ParamKind::parse(argument)?)),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod abi22_compat_tests {
+    use super::ScriptLibrary;
+    use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveHeader, RveModule, RveScriptDescV20};
+    use rve_sdk::{Params, Script};
+
+    struct Probe;
+
+    impl Script for Probe {}
+
+    fn probe(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(Probe))
+    }
+
+    fn second_probe(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(Probe))
+    }
+
+    #[test]
+    fn abi21_and_abi20_two_descriptor_tables_use_the_historical_stride() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
+        let current = rve_sdk::script_module! {
+            "Probe" => probe,
+            "SecondProbe" => second_probe,
+        };
+        // SAFETY: the SDK macro owns an immutable process-lifetime descriptor table.
+        let descriptors =
+            unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+        let legacy: &'static [RveScriptDescV20] = Box::leak(
+            descriptors
+                .iter()
+                .map(|descriptor| RveScriptDescV20 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    ui_event: descriptor.ui_event,
+                    on_enable: descriptor.on_enable,
+                    on_disable: descriptor.on_disable,
+                    on_fixed_update: descriptor.on_fixed_update,
+                    on_late_update: descriptor.on_late_update,
+                    on_timer: descriptor.on_timer,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        for abi_version in [20, 21] {
+            let legacy = Box::leak(Box::new(RveModule {
+                header: RveHeader {
+                    abi_version,
+                    header_size: std::mem::size_of::<RveHeader>() as u32,
+                },
+                scripts: legacy.as_ptr().cast(),
+                script_count: legacy.len(),
+            }));
+            // SAFETY: the module and exact-sized historical descriptor table are process-lifetime values.
+            let library =
+                unsafe { ScriptLibrary::from_module(std::ptr::from_ref(legacy)) }.unwrap();
+            assert_eq!(library.abi_version(), abi_version);
+            assert!(library.script("Probe").is_some());
+            assert!(library.script("SecondProbe").is_some());
+            assert!(library.schema("Probe").is_none());
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

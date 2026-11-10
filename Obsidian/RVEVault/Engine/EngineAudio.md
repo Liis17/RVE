@@ -85,3 +85,7 @@
 - Кривая по умолчанию `Inverse` и ключ `spatial = true|false` сохранены: сцены с прежним форматом читаются и пишутся без изменений. Причина: пользовательские сцены не должны меняться от обновления; дробная доля пишется отдельным ключом `spatial_blend`.
 
 Источник: `engine/engine-audio/src/{lib.rs,bridge.rs,mixer.rs,decode.rs,output.rs}`, `engine/engine-scene/src/audio.rs`, `engine/engine-runtime/src/{lib.rs,pipeline.rs}`, `editor/src/play.rs`.
+
+## Замена сцены
+
+`AudioBridge::scene_replaced(world)` дополняет объявленные ассеты и предзагружает клипы мира после замены сцены. Источники сохраняемых объектов продолжают играть; запуск `play_on_start` добавленных объектов делает вызывающий код через `apply`, остановка удалённых идёт по `StopSource` ([[Engine/EngineRuntime]]).

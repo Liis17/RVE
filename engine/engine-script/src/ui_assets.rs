@@ -95,34 +95,78 @@ pub struct UiRegistry {
     images: HashSet<String>,
 }
 
+/// UI entries checked against a temporary system and ready to adopt after a scene replacement.
+pub struct UiRegistration {
+    documents: Vec<(VirtualPath, Arc<UiDocument>)>,
+    fonts: Vec<(String, Vec<u8>)>,
+    images: Vec<(String, [u32; 2])>,
+}
+
 impl UiRegistry {
-    /// Регистрирует документы для `open` и канвасов компонентов, шрифты и размеры картинок.
-    pub fn register(&mut self, scripts: &mut ScriptHost, ui: &PreparedUi) -> Result<(), String> {
+    /// Validates new UI entries without changing the host or registry.
+    pub fn prepare(&self, ui: &PreparedUi) -> Result<UiRegistration, String> {
+        let mut registration = UiRegistration {
+            documents: Vec::new(),
+            fonts: Vec::new(),
+            images: Vec::new(),
+        };
+        let mut probe = UiSystem::default();
         for (path, document) in &ui.documents {
             if !self.documents.contains(path) {
                 let parsed = VirtualPath::parse(path)
                     .map_err(|error| format!("UI-документ {path}: {error}"))?;
-                scripts.register_ui_document(parsed, Arc::clone(document));
-                self.documents.insert(path.clone());
+                registration.documents.push((parsed, Arc::clone(document)));
             }
         }
-        let mut system = scripts.ui_mut();
         for (path, bytes) in &ui.fonts {
             if !self.fonts.contains(path) {
-                system
+                probe
                     .register_font(path, bytes.to_vec())
                     .map_err(|error| error.to_string())?;
-                self.fonts.insert(path.clone());
+                registration.fonts.push((path.clone(), bytes.to_vec()));
             }
         }
         for (path, image) in &ui.images {
             if !self.images.contains(path) {
-                system
+                probe
                     .register_image(path, image.size)
                     .map_err(|error| error.to_string())?;
-                self.images.insert(path.clone());
+                registration.images.push((path.clone(), image.size));
             }
         }
+        Ok(registration)
+    }
+
+    /// Adopts a prepared registration. `prepare` has already checked every fallible operation.
+    pub fn commit(&mut self, scripts: &mut ScriptHost, registration: UiRegistration) {
+        let UiRegistration {
+            documents,
+            fonts,
+            images,
+        } = registration;
+        for (path, document) in documents {
+            self.documents.insert(path.as_str().to_owned());
+            scripts.register_ui_document(path, document);
+        }
+        let mut system = scripts.ui_mut();
+        for (path, bytes) in fonts {
+            system
+                .register_font(&path, bytes)
+                .expect("font registration was validated during UI preparation");
+            self.fonts.insert(path);
+        }
+        for (path, size) in images {
+            system
+                .register_image(&path, size)
+                .expect("image registration was validated during UI preparation");
+            self.images.insert(path);
+        }
+    }
+
+    /// Регистрирует документы для `open` и канвасов компонентов, шрифты и размеры картинок.
+    pub fn register(&mut self, scripts: &mut ScriptHost, ui: &PreparedUi) -> Result<(), String> {
+        let registration = self.prepare(ui)?;
+        self.commit(scripts, registration);
         Ok(())
     }
 }

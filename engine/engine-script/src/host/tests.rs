@@ -2753,7 +2753,11 @@ fn non_finite_heavy_transform_disables_instance_and_rolls_back() {
     let events = host.drain_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].level, ScriptEventLevel::Error);
-    assert!(events[0].message.contains("non-finite transform"));
+    assert!(
+        events[0]
+            .message
+            .contains("script produced a non-finite transform")
+    );
 }
 
 #[test]

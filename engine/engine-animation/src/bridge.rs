@@ -65,6 +65,44 @@ impl AnimationBridge {
     /// статически. Модели и файлы клипов кэшируются на время вызова.
     pub fn build(
         world: &World,
+        load_model: impl FnMut(&VirtualPath) -> Result<Arc<Model>, String>,
+        load_clips: impl FnMut(&VirtualPath) -> Result<Arc<Vec<ModelAnimation>>, String>,
+    ) -> Self {
+        Self::build_filtered(world, |_| true, load_model, load_clips)
+    }
+
+    /// Заменяет аниматоры после замены сцены: аниматоры `removed` снимаются, аниматоры
+    /// `added` собираются заново. Состояние остальных объектов (клипы, время, палитры)
+    /// не меняется.
+    pub fn replace_objects(
+        &mut self,
+        world: &World,
+        removed: &[ObjectHandle],
+        added: &[ObjectHandle],
+        load_model: impl FnMut(&VirtualPath) -> Result<Arc<Model>, String>,
+        load_clips: impl FnMut(&VirtualPath) -> Result<Arc<Vec<ModelAnimation>>, String>,
+    ) {
+        let doomed: HashSet<ObjectHandle> = removed.iter().copied().collect();
+        self.order.retain(|object| !doomed.contains(object));
+        self.objects.retain(|object, _| !doomed.contains(object));
+        self.unbuilt.retain(|object, _| !doomed.contains(object));
+        let incoming: HashSet<ObjectHandle> = added.iter().copied().collect();
+        let fresh = Self::build_filtered(
+            world,
+            |object| incoming.contains(&object),
+            load_model,
+            load_clips,
+        );
+        self.order.extend(fresh.order);
+        self.objects.extend(fresh.objects);
+        self.unbuilt.extend(fresh.unbuilt);
+        self.warnings.extend(fresh.warnings);
+    }
+
+    /// Собирает аниматоры объектов мира, для которых `include` вернул true.
+    fn build_filtered(
+        world: &World,
+        include: impl Fn(ObjectHandle) -> bool,
         mut load_model: impl FnMut(&VirtualPath) -> Result<Arc<Model>, String>,
         mut load_clips: impl FnMut(&VirtualPath) -> Result<Arc<Vec<ModelAnimation>>, String>,
     ) -> Self {
@@ -73,6 +111,9 @@ impl AnimationBridge {
         let mut clip_files: HashMap<String, Result<Arc<Vec<ModelAnimation>>, String>> =
             HashMap::new();
         for object in world.objects() {
+            if !include(object.handle) {
+                continue;
+            }
             let (Some(animator), Some(renderer)) = (&object.animator, &object.mesh_renderer) else {
                 continue;
             };
@@ -414,6 +455,71 @@ mod tests {
     fn build(world: &World) -> AnimationBridge {
         let model = Arc::new(walk_model());
         AnimationBridge::build(world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())))
+    }
+
+    /// Мир с `hero` и, если `npc`, вторым аниматором. Порядок объектов совпадает в обоих вариантах.
+    fn scene_with_npc(npc: bool) -> World {
+        let extra = if npc {
+            "[[objects]]
+id = \"npc\"
+[objects.mesh_renderer]
+model = \"/models/hero.fbx\"
+[objects.animator]
+"
+        } else {
+            ""
+        };
+        let text = format!(
+            "{SCENE}[objects.animator]
+
+{extra}"
+        );
+        World::from_document(&SceneDocument::parse("scene.rvescene", &text).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn replace_objects_keeps_persistent_state_and_adds_or_removes_only_the_given_objects() {
+        let model = Arc::new(walk_model());
+        let before = scene_with_npc(false);
+        let mut bridge = build(&before);
+        bridge.advance(0.5);
+        let hero = before.handle("hero").unwrap();
+        assert!((palette_x(&bridge, hero) - 1.0).abs() < 1e-4);
+
+        let after = scene_with_npc(true);
+        let npc = after.handle("npc").unwrap();
+        assert_eq!(
+            after.handle("hero"),
+            Some(hero),
+            "персистентный хендл не меняется"
+        );
+        bridge.replace_objects(
+            &after,
+            &[],
+            &[npc],
+            |_| Ok(model.clone()),
+            |_| Ok(Arc::new(Vec::new())),
+        );
+        assert!(bridge.has_animator(npc));
+        assert!(
+            (palette_x(&bridge, hero) - 1.0).abs() < 1e-4,
+            "состояние персистентного аниматора не сбрасывается"
+        );
+        assert!(
+            palette_x(&bridge, npc).abs() < 1e-5,
+            "новый аниматор начинает с первого кадра"
+        );
+
+        bridge.replace_objects(
+            &after,
+            &[npc],
+            &[],
+            |_| Ok(model.clone()),
+            |_| Ok(Arc::new(Vec::new())),
+        );
+        assert!(!bridge.has_animator(npc));
+        assert!(bridge.has_animator(hero));
+        assert!((palette_x(&bridge, hero) - 1.0).abs() < 1e-4);
     }
 
     /// X-компонента переноса единственной палитры.

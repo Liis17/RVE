@@ -111,6 +111,38 @@ fn start_preloads_clips_and_plays_on_start_sources() {
 }
 
 #[test]
+fn scene_replaced_preloads_new_clips_and_keeps_persistent_sources_playing() {
+    let mut rig = Rig::new();
+    let before = world(SCENE);
+    rig.bridge.start(&before);
+    rig.take();
+    let speaker = before.handle("speaker").unwrap();
+
+    let next = world(&format!(
+        "{SCENE}
+[[assets]]
+path = \"/audio/boom.wav\"
+[[objects]]
+id = \"boom\"
+[objects.audio_source]
+clip = \"/audio/boom.wav\"
+"
+    ));
+    assert_eq!(next.handle("speaker"), Some(speaker));
+    rig.bridge.scene_replaced(&next);
+    let sent = rig.take();
+    assert!(
+        matches!(&sent[..], [Command::Preload(paths)]
+            if paths.contains(&"audio/boom.wav".to_owned())),
+        "только предзагрузка, без повторного запуска постоянного источника: {sent:?}"
+    );
+    assert!(
+        rig.bridge.sources.contains_key(&speaker),
+        "постоянный источник не потерян"
+    );
+}
+
+#[test]
 fn looping_source_is_not_started_twice() {
     let mut rig = Rig::new();
     let world = world(SCENE);

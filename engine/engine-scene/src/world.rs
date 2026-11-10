@@ -8,7 +8,7 @@ use crate::document::ColliderShape;
 use crate::document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup,
-    MAX_SCREEN_SHADER_PARAMS, PointLightComponent, RigidBodyComponent, RigidBodyKind,
+    MAX_SCREEN_SHADER_PARAMS, ParamValue, PointLightComponent, RigidBodyComponent, RigidBodyKind,
     SceneDocument, SceneError, SceneObject, ScreenShaderRef, SpotLightComponent,
     camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
@@ -39,6 +39,20 @@ pub use hierarchy::ObjectEdit;
 pub const MAX_GENERATION: u32 = i32::MAX as u32;
 /// Наибольшее число живых объектов в одном мире.
 pub const MAX_LIVE_OBJECTS: usize = 65_535;
+
+/// Хендл, которого нет ни у одного объекта: держит место активной камеры во время замены сцены.
+const NO_OBJECT: ObjectHandle = ObjectHandle {
+    index: u32::MAX,
+    generation: u32::MAX,
+};
+
+/// Итог [`World::replace_nonpersistent`]: удалённые несохраняемые объекты и вставленные объекты
+/// новой сцены. Удалённые перечислены с потомками, потомки раньше родителей.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SceneReplacement {
+    pub removed: Vec<ObjectHandle>,
+    pub added: Vec<ObjectHandle>,
+}
 
 /// Хендл объекта мира: индекс слота и поколение. Освобождение слота увеличивает поколение,
 /// поэтому старый хендл перестаёт быть живым даже после переиспользования слота.
@@ -229,6 +243,8 @@ pub struct WorldObject {
     pub parent: Option<ObjectHandle>,
     /// Собственный флаг активности; действующая активность учитывает родителей.
     pub active: bool,
+    /// Whether this object is marked as a persistent root for scene loads.
+    pub keep_on_load: bool,
     /// Тег объекта; пустая строка означает отсутствие тега.
     pub tag: String,
     /// Слой объекта `0..32`.
@@ -564,6 +580,297 @@ impl World {
 
     pub fn object_by_id(&self, id: &str) -> Option<&WorldObject> {
         self.handle(id).and_then(|handle| self.object(handle))
+    }
+
+    /// Returns whether an object is marked as a persistent root for scene loads.
+    pub fn keep_on_load(&self, handle: ObjectHandle) -> Option<bool> {
+        self.object(handle).map(|object| object.keep_on_load)
+    }
+
+    /// Sets whether an object is marked as a persistent root for scene loads.
+    pub fn set_keep_on_load(&mut self, handle: ObjectHandle, keep: bool) -> bool {
+        let Some(index) = self.dense(handle) else {
+            return false;
+        };
+        if keep && self.objects[index].parent.is_some() {
+            return false;
+        }
+        self.objects[index].keep_on_load = keep;
+        true
+    }
+
+    /// Appends persistent roots from a previous scene while retaining their object handles.
+    ///
+    /// The operation validates id, reference, and slot collisions before mutating `self`. A
+    /// persistent script may only refer to objects inside its retained subtree; this avoids
+    /// silently rebinding an old object reference to an unrelated object in the new scene.
+    pub fn append_persistent_from(
+        &mut self,
+        previous: &World,
+    ) -> Result<Vec<ObjectHandle>, SceneError> {
+        let roots = previous
+            .objects
+            .iter()
+            .filter(|object| object.keep_on_load && object.parent.is_none())
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let handles = previous.subtree(&roots);
+        if self.objects.len().saturating_add(handles.len()) > MAX_LIVE_OBJECTS {
+            return Err(SceneError::new(
+                &self.source_label,
+                None,
+                "persistent objects exceed the world object limit",
+            ));
+        }
+
+        let kept = handles
+            .iter()
+            .filter_map(|handle| previous.object(*handle))
+            .collect::<Vec<_>>();
+        let kept_ids = kept
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        for object in &kept {
+            if self.indices_by_id.contains_key(&object.id) {
+                return Err(SceneError::new(
+                    &self.source_label,
+                    Some(&object.id),
+                    "persistent object id collides with the new scene",
+                ));
+            }
+            if object.keep_on_load && object.parent.is_some() {
+                return Err(SceneError::new(
+                    &self.source_label,
+                    Some(&object.id),
+                    "keep_on_load is only valid on a persistent root",
+                ));
+            }
+            for script in object
+                .lite_scripts
+                .iter()
+                .map(|script| &script.params)
+                .chain(object.heavy_scripts.iter().map(|script| &script.params))
+            {
+                for (name, value) in script {
+                    if let Some(reference) = external_object_reference(value, &kept_ids) {
+                        return Err(SceneError::new(
+                            &self.source_label,
+                            Some(&object.id),
+                            format!(
+                                "persistent script parameter {name:?} references nonpersistent object {reference:?}"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        {
+            let slots = self.slots.borrow();
+            for object in &kept {
+                if let Some(slot) = slots.slots.get(object.handle.index())
+                    && (slot.state != SlotState::Vacant
+                        || slot.generation != object.handle.generation)
+                {
+                    return Err(SceneError::new(
+                        &self.source_label,
+                        Some(&object.id),
+                        "persistent object handle collides with the new scene",
+                    ));
+                }
+            }
+        }
+
+        let mut appended = Vec::with_capacity(kept.len());
+        for object in kept {
+            let source_index = previous
+                .dense(object.handle)
+                .expect("persistent source handle was alive during validation");
+            let dense_index = self.objects.len();
+            let slot_index = object.handle.index();
+            {
+                let slots = self.slots.get_mut();
+                while slots.slots.len() <= slot_index {
+                    let index = slots.slots.len() as u32;
+                    slots.slots.push(Slot {
+                        generation: 0,
+                        state: SlotState::Vacant,
+                    });
+                    slots.free.push(index);
+                }
+                slots.free.retain(|&index| index != object.handle.index);
+                let slot = &mut slots.slots[slot_index];
+                slot.generation = object.handle.generation;
+                slot.state = SlotState::Live(dense_index);
+            }
+            self.indices_by_id.insert(object.id.clone(), object.handle);
+            self.invalid_basis_reported.remove(&object.handle);
+            self.last_valid_local_lights
+                .push(previous.last_valid_local_lights[source_index]);
+            self.world_matrices.push(Mat4::IDENTITY);
+            self.world_rotations.push(Quat::IDENTITY);
+            if let Some(paths) = previous.spawned_material_paths.get(&object.handle) {
+                self.spawned_material_paths
+                    .insert(object.handle, Arc::clone(paths));
+            }
+            self.objects.push(object.clone());
+            appended.push(object.handle);
+        }
+        let base = self.objects.len() - appended.len();
+        self.topological_order.extend(base..self.objects.len());
+        let added_paths = previous
+            .asset_paths
+            .iter()
+            .filter(|path| !self.asset_paths.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.asset_paths.extend(added_paths);
+        self.recalculate_world_matrices();
+        let _ = self.build_frame();
+        Ok(appended)
+    }
+
+    /// Хендлы сохраняемой части: корни с `keep_on_load` и все их потомки.
+    pub fn persistent_handles(&self) -> Vec<ObjectHandle> {
+        let roots = self
+            .objects
+            .iter()
+            .filter(|object| object.keep_on_load && object.parent.is_none())
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        self.subtree(&roots)
+    }
+
+    /// Проверяет, может ли `scene` заменить несохраняемую часть мира. Мир не меняется.
+    ///
+    /// Отказ, если id объекта сцены совпадает с сохраняемым объектом, параметр сохраняемого
+    /// скрипта ссылается на объект вне сохраняемой части (он будет удалён), или сумма объектов
+    /// превышает лимит мира.
+    pub fn check_scene_replacement(&self, scene: &World) -> Result<(), SceneError> {
+        let persistent = self.persistent_handles();
+        if persistent.len().saturating_add(scene.objects.len()) > MAX_LIVE_OBJECTS {
+            return Err(SceneError::new(
+                &scene.source_label,
+                None,
+                "объекты сохраняемой части и сцены превышают лимит мира",
+            ));
+        }
+        let persistent_ids = persistent
+            .iter()
+            .filter_map(|handle| self.object(*handle))
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        for object in &scene.objects {
+            if persistent_ids.contains(object.id.as_str()) {
+                return Err(SceneError::new(
+                    &scene.source_label,
+                    Some(&object.id),
+                    "id объекта сцены совпадает с сохраняемым объектом",
+                ));
+            }
+        }
+        for handle in &persistent {
+            let Some(object) = self.object(*handle) else {
+                continue;
+            };
+            for params in object
+                .lite_scripts
+                .iter()
+                .map(|script| &script.params)
+                .chain(object.heavy_scripts.iter().map(|script| &script.params))
+            {
+                for (name, value) in params {
+                    if let Some(reference) = external_object_reference(value, &persistent_ids) {
+                        return Err(SceneError::new(
+                            &self.source_label,
+                            Some(&object.id),
+                            format!(
+                                "сохраняемый параметр скрипта {name:?} ссылается на несохраняемый объект {reference:?}"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Заменяет несохраняемые объекты объектами `scene`. Хендлы сохраняемых объектов не меняются;
+    /// новые объекты получают свободные слоты с новым поколением, поэтому старые хендлы не
+    /// совпадают с ними. Активная камера сохраняется, если она сохраняемая; иначе назначается
+    /// камера сцены. Ошибки проверяются до изменения мира; при их отсутствии замена завершается.
+    pub fn replace_nonpersistent(&mut self, scene: World) -> Result<SceneReplacement, SceneError> {
+        self.check_scene_replacement(&scene)?;
+        let scene_camera = scene.dense(scene.active_camera).ok_or_else(|| {
+            SceneError::new(&scene.source_label, None, "у сцены нет активной камеры")
+        })?;
+        let roots = self
+            .objects
+            .iter()
+            .filter(|object| !object.keep_on_load && object.parent.is_none())
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let doomed = self.subtree(&roots);
+        let camera_removed = doomed.contains(&self.active_camera);
+        let previous_camera = self.active_camera;
+        if camera_removed {
+            // Временно вне мира: удаление не проверяет камеру, а новая назначается после вставки.
+            self.active_camera = NO_OBJECT;
+        }
+        let removed = match self.remove_subtrees(&roots, false) {
+            Ok(removed) => removed,
+            Err(error) => {
+                self.active_camera = previous_camera;
+                return Err(error);
+            }
+        };
+        let added = self.adopt_objects(&scene);
+        if camera_removed {
+            self.active_camera = added[scene_camera];
+        }
+        self.source_label = scene.source_label.clone();
+        Ok(SceneReplacement { removed, added })
+    }
+
+    /// Вставляет объекты `scene` в мир на свободные слоты и возвращает их хендлы в порядке
+    /// объектов сцены. Топологический порядок и мировые матрицы берутся из уже вычисленной сцены.
+    fn adopt_objects(&mut self, scene: &World) -> Vec<ObjectHandle> {
+        let base = self.objects.len();
+        let handles = scene
+            .objects
+            .iter()
+            .map(|_| self.reserve_object())
+            .collect::<Vec<_>>();
+        {
+            let mut slots = self.slots.borrow_mut();
+            for (index, handle) in handles.iter().enumerate() {
+                slots.set_live(*handle, base + index);
+            }
+        }
+        for (index, object) in scene.objects.iter().enumerate() {
+            let mut adopted = object.clone();
+            adopted.handle = handles[index];
+            adopted.parent = object
+                .parent
+                .and_then(|parent| scene.dense(parent))
+                .map(|parent| handles[parent]);
+            self.indices_by_id
+                .insert(adopted.id.clone(), adopted.handle);
+            self.objects.push(adopted);
+            self.world_matrices.push(scene.world_matrices[index]);
+            self.world_rotations.push(scene.world_rotations[index]);
+            self.last_valid_local_lights
+                .push(LastValidLocalLights::default());
+        }
+        self.topological_order
+            .extend(scene.topological_order.iter().map(|&index| base + index));
+        for path in &scene.asset_paths {
+            if !self.asset_paths.contains(path) {
+                self.asset_paths.push(path.clone());
+            }
+        }
+        handles
     }
 
     pub fn local_transform(&self, handle: ObjectHandle) -> Option<&LocalTransform> {
@@ -1297,6 +1604,13 @@ impl World {
     ) -> Result<Vec<String>, SceneError> {
         template.check_spawnable()?;
         let source = &self.source_label;
+        if options.parent.is_some() && template.objects[template.root].keep_on_load {
+            return Err(SceneError::new(
+                source,
+                Some(root_id),
+                "keep_on_load is only valid on a root object",
+            ));
+        }
         if let Some(id) = &options.id
             && !valid_ascii_name(id, true)
         {
@@ -1505,6 +1819,16 @@ impl World {
         &mut self,
         handles: &[ObjectHandle],
     ) -> Result<Vec<ObjectHandle>, SceneError> {
+        self.remove_subtrees(handles, true)
+    }
+
+    /// Удаляет поддеревья; `guard_camera` отказывает, если в них активная камера. Замена сцены
+    /// снимает проверку, потому что сама назначает новую активную камеру после вставки.
+    fn remove_subtrees(
+        &mut self,
+        handles: &[ObjectHandle],
+        guard_camera: bool,
+    ) -> Result<Vec<ObjectHandle>, SceneError> {
         let mut removed = vec![false; self.objects.len()];
         for &handle in handles {
             removed[self.live_index_or_error(handle)?] = true;
@@ -1517,7 +1841,7 @@ impl World {
             }
         }
         for (object, &gone) in self.objects.iter().zip(&removed) {
-            if gone && object.handle == self.active_camera {
+            if guard_camera && gone && object.handle == self.active_camera {
                 return Err(SceneError::new(
                     &self.source_label,
                     Some(&object.id),
@@ -1575,6 +1899,19 @@ impl World {
             .collect();
         self.topological_order = order;
         Ok(removed_handles)
+    }
+}
+
+fn external_object_reference<'a>(
+    value: &'a ParamValue,
+    retained_ids: &HashSet<&str>,
+) -> Option<&'a str> {
+    match value {
+        ParamValue::Object(id) if !id.is_empty() && !retained_ids.contains(id.as_str()) => Some(id),
+        ParamValue::Array(values) => values
+            .iter()
+            .find_map(|value| external_object_reference(value, retained_ids)),
+        _ => None,
     }
 }
 
@@ -1646,6 +1983,7 @@ fn world_object(
         name: object.display_name().to_owned(),
         parent,
         active: object.active,
+        keep_on_load: object.keep_on_load,
         tag: object.tag.clone(),
         layer: object.layer,
         is_static: object.is_static,
@@ -1786,6 +2124,8 @@ mod spawn_tests;
 mod component_tests;
 #[cfg(test)]
 mod hierarchy_tests;
+#[cfg(test)]
+mod scene_replace_tests;
 
 #[cfg(test)]
 mod tests {

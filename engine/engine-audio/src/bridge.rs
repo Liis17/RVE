@@ -61,17 +61,7 @@ impl AudioBridge {
             .iter()
             .map(|path| path.as_str().to_owned())
             .collect();
-        let mut clips: Vec<String> = world
-            .objects()
-            .iter()
-            .filter_map(|object| object.audio_source.as_ref())
-            .map(|audio| audio.clip.as_str().to_owned())
-            .collect();
-        clips.sort();
-        clips.dedup();
-        if let Err(error) = self.handle.preload(clips) {
-            log::warn!("предзагрузка звука: {error}");
-        }
+        self.preload_clips(world);
         let starts: Vec<AudioRequest> = world
             .objects()
             .iter()
@@ -88,6 +78,33 @@ impl AudioBridge {
             })
             .collect();
         self.apply(starts, world);
+    }
+
+    /// Дополняет объявленные ассеты и предзагрузку клипами мира после замены сцены. Источники
+    /// сохраняемых объектов продолжают играть; запуск `play_on_start` добавленных объектов
+    /// делает вызывающий код через [`Self::apply`].
+    pub fn scene_replaced(&mut self, world: &World) {
+        self.declared.extend(
+            world
+                .asset_paths()
+                .iter()
+                .map(|path| path.as_str().to_owned()),
+        );
+        self.preload_clips(world);
+    }
+
+    fn preload_clips(&self, world: &World) {
+        let mut clips: Vec<String> = world
+            .objects()
+            .iter()
+            .filter_map(|object| object.audio_source.as_ref())
+            .map(|audio| audio.clip.as_str().to_owned())
+            .collect();
+        clips.sort();
+        clips.dedup();
+        if let Err(error) = self.handle.preload(clips) {
+            log::warn!("предзагрузка звука: {error}");
+        }
     }
 
     /// Применяет запросы скриптов за кадр.

@@ -349,6 +349,88 @@ fn apply_edit_runs_each_edit_and_rejects_bad_targets() {
 }
 
 #[test]
+fn keep_on_load_can_only_be_set_on_a_root() {
+    let mut world = world(HIERARCHY);
+    let free = handle(&world, "free");
+    let child = handle(&world, "child");
+    world
+        .apply_edit(&ObjectEdit::SetKeepOnLoad {
+            object: free,
+            keep: true,
+        })
+        .unwrap();
+    assert_eq!(world.keep_on_load(free), Some(true));
+    assert!(
+        world
+            .apply_edit(&ObjectEdit::SetKeepOnLoad {
+                object: child,
+                keep: true,
+            })
+            .is_err()
+    );
+    assert_eq!(world.keep_on_load(child), Some(false));
+    assert!(!world.set_keep_on_load(child, true));
+    assert_eq!(world.keep_on_load(child), Some(false));
+}
+
+#[test]
+fn append_persistent_scene_subtree_keeps_handles_parenting_and_physics_components() {
+    let previous = world(
+        "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+         [[objects]]\nid = \"persistent\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"body\"\nparent = \"persistent\"\n[objects.collider]\n[objects.rigid_body]\nkind = \"kinematic\"\n",
+    );
+    let mut next = world(CAMERA);
+    let root = handle(&previous, "persistent");
+    let body = handle(&previous, "body");
+
+    assert_eq!(
+        next.append_persistent_from(&previous).unwrap(),
+        vec![root, body]
+    );
+    assert_eq!(next.object(root).unwrap().id, "persistent");
+    assert_eq!(next.object(body).unwrap().parent, Some(root));
+    assert!(next.object(body).unwrap().rigid_body.is_some());
+    assert!(next.object(body).unwrap().collider.is_some());
+}
+
+#[test]
+fn persistent_scene_collision_fails_before_the_new_world_changes() {
+    let previous = world(
+        "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+         [[objects]]\nid = \"persistent\"\nkeep_on_load = true\n",
+    );
+    let mut next = world(
+        "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+         [[objects]]\nid = \"other\"\n",
+    );
+
+    let error = next.append_persistent_from(&previous).unwrap_err();
+    assert!(error.to_string().contains("handle collides"), "{error}");
+    assert_eq!(next.objects().len(), 2);
+    assert!(next.object_by_id("persistent").is_none());
+}
+
+#[test]
+fn persistent_scene_rejects_references_outside_the_kept_subtree() {
+    let previous = world(
+        "[[assets]]\npath = \"/keep.lua\"\n\
+         [[objects]]\nid = \"camera\"\n[objects.camera]\n\
+         [[objects]]\nid = \"persistent\"\nkeep_on_load = true\n\
+         [[objects.lite_scripts]]\npath = \"/keep.lua\"\nparams = { target = { object = \"temporary\" } }\n\
+         [[objects]]\nid = \"temporary\"\n",
+    );
+    let mut next = world(CAMERA);
+
+    let error = next.append_persistent_from(&previous).unwrap_err();
+    assert!(
+        error.to_string().contains("nonpersistent object"),
+        "{error}"
+    );
+    assert_eq!(next.objects().len(), 1);
+}
+
+#[test]
 fn serde_round_trips_new_fields_and_old_files_load_with_defaults() {
     let scene = "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
 [[objects]]\nid = \"door\"\nactive = false\ntag = \"interactive\"\nlayer = 3\n";
@@ -391,6 +473,53 @@ fn initial_active_camera_is_not_taken_from_a_hidden_subtree() {
     assert_eq!(scene.active_camera(), handle(&scene, "main"));
 }
 
+#[test]
+fn set_parent_refuses_to_put_a_keep_on_load_root_under_any_parent() {
+    let scene = "[[objects]]\nid = \"persistent_parent\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"scene_parent\"\n\
+         [[objects]]\nid = \"persistent\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"nonpersistent\"\n\
+         [[objects]]\nid = \"persistent_child\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"camera\"\n[objects.camera]\n";
+    for parent_id in ["persistent_parent", "scene_parent"] {
+        let mut world = world(scene);
+        let persistent = handle(&world, "persistent");
+        let parent = handle(&world, parent_id);
+
+        let error = world
+            .set_parent(persistent, Some(parent), true)
+            .expect_err("keep_on_load is only valid on a root");
+
+        assert!(error.to_string().contains("keep_on_load"), "{error}");
+        assert_eq!(
+            world.object(persistent).unwrap().parent,
+            None,
+            "{parent_id}"
+        );
+        assert_eq!(world.keep_on_load(persistent), Some(true), "{parent_id}");
+        assert_eq!(world.children(parent), Some(Vec::new()), "{parent_id}");
+    }
+}
+
+#[test]
+fn set_parent_still_reparents_a_nonpersistent_object_under_a_persistent_root() {
+    let mut world = world(
+        "[[objects]]\nid = \"persistent\"\nkeep_on_load = true\n\
+         [[objects]]\nid = \"nonpersistent\"\n\
+         [[objects]]\nid = \"camera\"\n[objects.camera]\n",
+    );
+    let persistent = handle(&world, "persistent");
+    let nonpersistent = handle(&world, "nonpersistent");
+
+    world
+        .set_parent(nonpersistent, Some(persistent), false)
+        .unwrap();
+
+    assert_eq!(
+        world.object(nonpersistent).unwrap().parent,
+        Some(persistent)
+    );
+}
 /// `rock` и его родитель `base` статические, `lamp` под `base` и `free` — нет.
 const STATIC_SCENE: &str = "[[objects]]\nid = \"base\"\nstatic = true\n\
 [[objects]]\nid = \"rock\"\nparent = \"base\"\nstatic = true\n[objects.collider]\n[objects.rigid_body]\nkind = \"static\"\n\

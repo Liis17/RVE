@@ -5,6 +5,7 @@
 
 pub mod abi;
 mod components;
+mod math;
 
 /// Version of this SDK crate, as declared in its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -34,6 +35,7 @@ use abi::{
     RVE_UI_VALUE_TEXT, RveUiRect, RveUiValue,
 };
 pub use components::{ComponentError, LightKind, MAX_LOD_READ};
+pub use math::{Quat, Vec3};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -381,6 +383,31 @@ pub trait Script: 'static {
     fn on_late_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
     /// Called when a timer scheduled by this instance expires.
     fn on_timer(&mut self, _ctx: &mut Context<'_>, _tag: &str) {}
+    /// Reads a declared property of this instance. The default returns the value held in the
+    /// instance's params: the creation value, or the latest write the host delivered.
+    fn get_property(&self, ctx: &Context<'_>, name: &str) -> Option<Value> {
+        ctx.properties.get(name).cloned()
+    }
+    /// Validates a property write made by another script or the editor before any property setter
+    /// is called. This hook must be pure: it must not mutate script state, context state, or other
+    /// externally visible state. Return an error to reject the pending property batch; no setter
+    /// has run at this point.
+    fn validate_property(
+        &self,
+        _ctx: &Context<'_>,
+        _name: &str,
+        _value: &Value,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// Commits a property write after every pending write has passed validation. The default
+    /// stores the value in the instance's params. Overrides that keep their own state can return it
+    /// from `get_property`. This is an infallible commit hook: it must not reject, panic, or change
+    /// unrelated state, and should only update the backing value for this property. The host catches
+    /// panics, but cannot roll back arbitrary script state changed by a panicking or stateful setter.
+    fn set_property(&mut self, ctx: &mut Context<'_>, name: &str, value: Value) {
+        ctx.properties.insert(name.to_owned(), value);
+    }
     /// Called when a message is delivered to this script.
     fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
     /// Called when this object begins touching another collider.
@@ -430,7 +457,116 @@ pub struct Context<'a> {
     pub transform: Transform,
     /// Console logging and command registration for this script instance.
     pub console: Console<'a>,
+    /// Declared property values of this instance; see [`Script::get_property`].
+    properties: &'a mut Params,
+    declared_properties: &'a [String],
+    pending_properties: Vec<(String, Value)>,
     _not_send_or_sync: PhantomData<*const ()>,
+}
+
+/// Failure of a save operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SaveError {
+    /// The host does not provide save callbacks.
+    Unavailable,
+    /// The host rejected the key, value, or current callback phase.
+    Rejected,
+    /// The host returned a malformed value.
+    InvalidValue(ValueError),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "save callbacks are unavailable in this host",
+            Self::Rejected => "the host rejected the save operation",
+            Self::InvalidValue(error) => return write!(formatter, "invalid save value: {error}"),
+        })
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+/// Call-scoped save-data access from [`Context::save`].
+pub struct Save<'a> {
+    host: &'a RveHost,
+}
+
+impl Save<'_> {
+    /// Reads a value, returning `None` when the key does not exist.
+    pub fn get(&self, key: &str) -> Result<Option<Value>, SaveError> {
+        let callback = self.host.save_get.ok_or(SaveError::Unavailable)?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the callback only borrows `key` and writes a value backed by its call context.
+        if !unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &mut value) } {
+            return Ok(None);
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        unsafe { value.into_owned() }
+            .map(Some)
+            .map_err(SaveError::InvalidValue)
+    }
+
+    /// Stages a value write for this script callback's transaction.
+    pub fn set(&self, key: &str, value: &Value) -> Result<(), SaveError> {
+        let callback = self.host.save_set.ok_or(SaveError::Unavailable)?;
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the key and recursive value buffers live through the synchronous callback.
+        if unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &value.value) } {
+            Ok(())
+        } else {
+            Err(SaveError::Rejected)
+        }
+    }
+
+    /// Removes a key. Returns `false` when it was not present.
+    pub fn delete(&self, key: &str) -> Result<bool, SaveError> {
+        let callback = self.host.save_delete.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the key bytes live through this synchronous callback.
+        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+    }
+
+    /// Checks whether a key is present.
+    pub fn has(&self, key: &str) -> Result<bool, SaveError> {
+        let callback = self.host.save_has.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the key bytes live through this synchronous callback.
+        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+    }
+
+    /// Returns save keys in sorted order.
+    pub fn keys(&self) -> Result<Vec<String>, SaveError> {
+        let callback = self.host.save_keys.ok_or(SaveError::Unavailable)?;
+        let mut count = 0;
+        // SAFETY: the zero-capacity query only writes `count`.
+        if !unsafe { callback(self.host.ctx, std::ptr::null_mut(), 0, &mut count) } {
+            return Err(SaveError::Rejected);
+        }
+        let mut keys = vec![RveStr::empty(); count];
+        // SAFETY: the host writes at most `count` borrowed strings into this buffer.
+        if !unsafe { callback(self.host.ctx, keys.as_mut_ptr(), keys.len(), &mut count) } {
+            return Err(SaveError::Rejected);
+        }
+        keys.into_iter()
+            .take(count)
+            .map(|key| {
+                // SAFETY: each key remains in the host call context until this callback returns.
+                unsafe { key.to_str() }
+                    .map(str::to_owned)
+                    .map_err(|error| SaveError::InvalidValue(ValueError(error.to_string())))
+            })
+            .collect()
+    }
+
+    /// Requests an atomic flush after this callback commits.
+    pub fn flush(&self) -> Result<(), SaveError> {
+        let callback = self.host.save_flush.ok_or(SaveError::Unavailable)?;
+        // SAFETY: the host callback stages a write request in the active transaction.
+        if unsafe { callback(self.host.ctx) } {
+            Ok(())
+        } else {
+            Err(SaveError::Rejected)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1306,6 +1442,89 @@ pub struct Object {
     handle: u64,
 }
 
+/// Handle to another script instance, from [`Object::script`]. It becomes stale when that instance
+/// is removed (its object was destroyed or its scene was replaced). Stale handles never reach a
+/// different instance. Refused calls (stale handle, undeclared name, out-of-range value, or a call
+/// outside update callbacks) return `None` or `false` and do not fail the calling callback; a
+/// malformed value does fail it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptRef {
+    handle: u64,
+}
+
+impl ScriptRef {
+    /// Reads a declared property. Returns `None` for a stale handle or an undeclared name.
+    pub fn get(&self, ctx: &Context<'_>, name: &str) -> Option<Value> {
+        let callback = ctx.host.script_ref_get?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the host keeps the value's nested buffers alive until this guest callback ends.
+        if !unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &mut value,
+            )
+        } {
+            return None;
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        unsafe { value.into_owned() }.ok()
+    }
+
+    /// Stages a declared property write. The value is validated and coerced by the host when the
+    /// call is made; the write commits with the calling callback.
+    pub fn set(&self, ctx: &mut Context<'_>, name: &str, value: &Value) -> bool {
+        let Some(callback) = ctx.host.script_ref_set else {
+            return false;
+        };
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the name and recursive value buffers live through the synchronous callback.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
+    }
+
+    /// Sends a message to this instance only, not to other scripts on its object.
+    pub fn send(&self, ctx: &mut Context<'_>, name: &str, value: &Value) -> bool {
+        let Some(callback) = ctx.host.script_ref_send else {
+            return false;
+        };
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the name and recursive value buffers live through the synchronous callback.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
+    }
+
+    /// Reads the enabled flag. Returns `None` for a stale handle.
+    pub fn enabled(&self, ctx: &Context<'_>) -> Option<bool> {
+        let callback = ctx.host.script_ref_enabled?;
+        let mut enabled = false;
+        // SAFETY: the output slot lives through this synchronous host call.
+        unsafe { callback(ctx.host.ctx, self.handle, &mut enabled) }.then_some(enabled)
+    }
+
+    /// Stages the enabled flag; it takes effect at the end of the current phase.
+    pub fn set_enabled(&self, ctx: &mut Context<'_>, enabled: bool) -> bool {
+        let Some(callback) = ctx.host.script_ref_set_enabled else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, enabled) }
+    }
+}
+
 impl Object {
     /// Queues this object's subtree for removal, including a pending object from [`Context::spawn`].
     ///
@@ -1350,7 +1569,21 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn new(host: &'a RveHost) -> Result<Self, String> {
+    /// Returns call-scoped access to project save data.
+    pub fn save(&self) -> Save<'_> {
+        Save { host: self.host }
+    }
+
+    #[cfg(test)]
+    fn new(host: &'a RveHost, properties: &'a mut Params) -> Result<Self, String> {
+        Self::new_with_declared_properties(host, properties, &[])
+    }
+
+    fn new_with_declared_properties(
+        host: &'a RveHost,
+        properties: &'a mut Params,
+        declared_properties: &'a [String],
+    ) -> Result<Self, String> {
         let mut transform = RveTransform::default();
         // SAFETY: the host object is valid for this callback and owns this output slot.
         let ok = unsafe { (host.get_local)(host.ctx, host.self_object, &mut transform) };
@@ -1363,22 +1596,87 @@ impl<'a> Context<'a> {
             initial_transform,
             transform: initial_transform,
             console: Console { host },
+            properties,
+            declared_properties,
+            pending_properties: Vec::new(),
             _not_send_or_sync: PhantomData,
         })
     }
 
+    fn sync_script_properties(&mut self, script: &dyn Script) -> Result<(), String> {
+        self.sync_script_properties_except(script, None)
+    }
+
+    fn sync_script_properties_except(
+        &mut self,
+        script: &dyn Script,
+        excluded: Option<&str>,
+    ) -> Result<(), String> {
+        for index in 0..self.declared_properties.len() {
+            let name = &self.declared_properties[index];
+            if excluded == Some(name.as_str()) {
+                continue;
+            }
+            let Some(value) = script.get_property(self, name) else {
+                continue;
+            };
+            let mut canonical = value.clone();
+            if let Some(callback) = self.host.script_ref_set {
+                let borrowed = BorrowedAbiValue::new(&value);
+                // Handle zero is reserved for the calling instance's own property mirror.
+                // SAFETY: the name and recursive value buffers live through the synchronous callback.
+                if !unsafe {
+                    callback(
+                        self.host.ctx,
+                        0,
+                        RveStr::from_str_ref(name),
+                        &borrowed.value,
+                    )
+                } {
+                    return Err(format!("script property {name:?} was rejected by the host"));
+                }
+                if let Some(callback) = self.host.script_ref_get {
+                    let mut output = RveValue::integer(0);
+                    // SAFETY: the host returns a value owned by the active ABI call context.
+                    if !unsafe {
+                        callback(self.host.ctx, 0, RveStr::from_str_ref(name), &mut output)
+                    } {
+                        return Err(format!("script property {name:?} could not be read back"));
+                    }
+                    // SAFETY: the host keeps nested buffers alive through this synchronous call.
+                    canonical = unsafe { output.into_owned() }
+                        .map_err(|error| format!("script property {name:?}: {error}"))?;
+                }
+            }
+            self.pending_properties.push((name.clone(), canonical));
+        }
+        Ok(())
+    }
+
     fn commit(self) -> Result<(), String> {
-        if self.transform == self.initial_transform {
-            return Ok(());
+        if self.transform != self.initial_transform {
+            if !self
+                .transform
+                .position
+                .into_iter()
+                .chain(self.transform.rotation_deg)
+                .chain(self.transform.scale)
+                .all(f32::is_finite)
+            {
+                return Err("script produced a non-finite transform".to_owned());
+            }
+            let transform: RveTransform = self.transform.into();
+            // SAFETY: the host pointer and transform are valid for the duration of this callback.
+            let ok =
+                unsafe { (self.host.set_local)(self.host.ctx, self.host.self_object, &transform) };
+            if !ok {
+                return Err("could not write the script object's local transform".to_owned());
+            }
         }
-        let transform: RveTransform = self.transform.into();
-        // SAFETY: the host pointer and transform are valid for the duration of this callback.
-        let ok = unsafe { (self.host.set_local)(self.host.ctx, self.host.self_object, &transform) };
-        if ok {
-            Ok(())
-        } else {
-            Err("could not write the script object's local transform".to_owned())
+        for (name, value) in self.pending_properties {
+            self.properties.insert(name, value);
         }
+        Ok(())
     }
 
     /// Returns the host's time snapshot for this lifecycle call.
@@ -1518,6 +1816,33 @@ impl<'a> Context<'a> {
                 RveStr::from_str_ref(name),
                 &value.value,
             )
+        }
+    }
+
+    /// Requests loading a project scene. The request is checked against the project's enabled
+    /// scenes now and runs after this frame; the current scene changes only if that load succeeds.
+    /// Returns `false` for an undeclared path or a call outside update callbacks, without failing
+    /// the calling callback.
+    pub fn load_scene(&mut self, path: &str) -> bool {
+        let Some(callback) = self.host.scene_load else {
+            return false;
+        };
+        // SAFETY: the path bytes live through this synchronous host call.
+        unsafe { callback(self.host.ctx, RveStr::from_str_ref(path)) }
+    }
+
+    /// Returns the name of the current scene, or `None` if the host does not report one.
+    pub fn current_scene(&self) -> Option<String> {
+        let callback = self.host.scene_current?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the host keeps the string alive until this guest callback ends.
+        if !unsafe { callback(self.host.ctx, &mut value) } {
+            return None;
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        match unsafe { value.into_owned() } {
+            Ok(Value::String(name)) => Some(name),
+            _ => None,
         }
     }
 
@@ -3061,6 +3386,40 @@ impl Object {
         unsafe { callback(ctx.host.ctx, self.handle, active) }
     }
 
+    /// Returns whether this root object persists when a scene is loaded.
+    pub fn keep_on_load(&self, ctx: &Context<'_>) -> Option<bool> {
+        let callback = ctx.host.object_keep_on_load?;
+        let mut keep = false;
+        // SAFETY: the host callback and output slot are valid during this guest call.
+        unsafe { callback(ctx.host.ctx, self.handle, &mut keep) }.then_some(keep)
+    }
+
+    /// Stages whether this root object persists when a scene is loaded.
+    pub fn set_keep_on_load(&self, ctx: &mut Context<'_>, keep: bool) -> bool {
+        let Some(callback) = ctx.host.object_set_keep_on_load else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, keep) }
+    }
+
+    /// Finds another script instance on this object: a lite script is found by its virtual path
+    /// and a heavy script by its registered name. Returns `None` if no such instance exists.
+    pub fn script(&self, ctx: &Context<'_>, key: &str) -> Option<ScriptRef> {
+        let callback = ctx.host.object_script?;
+        let mut handle = 0;
+        // SAFETY: the key and output slot live through this synchronous host call.
+        unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(key),
+                &mut handle,
+            )
+        }
+        .then_some(ScriptRef { handle })
+    }
+
     /// Returns the world position.
     pub fn world_position(&self, ctx: &mut Context<'_>) -> Option<[f32; 3]> {
         vec3_query(ctx.host.object_world_position, ctx, self.handle)
@@ -3727,14 +4086,20 @@ pub mod __private {
         RVE_NET_EVENT_PEER_CONNECTED, RVE_NET_EVENT_PEER_DISCONNECTED, RVE_PARAM_HAS_MAX,
         RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RVE_TRIGGER_STAY,
         RveCollisionEvent, RveCollisionFn, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
-        RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveStartFn, RveStatus,
-        RveStr, RveTimerFn, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
+        RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveSetPropertyFn,
+        RveStartFn, RveStatus, RveStr, RveTimerFn, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    struct GuestInstance(Box<dyn Script>);
+    /// Guest state of one script instance. `properties` holds its declared values: creation values,
+    /// then writes the host delivers through [`Script::set_property`].
+    struct GuestInstance {
+        script: Box<dyn Script>,
+        properties: Params,
+        declared_properties: Vec<String>,
+    }
 
     // Mirrors the fields of `RveScriptDesc`, which the macro fills in one call.
     #[allow(clippy::too_many_arguments)]
@@ -3755,6 +4120,7 @@ pub mod __private {
         ui_event: RveUiEventFn,
         enable: RveStartFn,
         disable: RveStartFn,
+        set_property: RveSetPropertyFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -3776,6 +4142,7 @@ pub mod __private {
             on_fixed_update: Some(fixed_update),
             on_late_update: Some(late_update),
             on_timer: Some(timer),
+            set_property: Some(set_property),
         }
     }
 
@@ -3836,6 +4203,17 @@ pub mod __private {
         out: *mut *mut c_void,
         factory: fn(&Params) -> Result<Box<dyn Script>, String>,
     ) -> RveStatus {
+        // SAFETY: the caller provides valid callback pointers as required by this function.
+        unsafe { create_with_param_descs(host, params, out, &[], factory) }
+    }
+
+    pub unsafe fn create_with_param_descs(
+        host: *const RveHost,
+        params: *const RveParams,
+        out: *mut *mut c_void,
+        param_descs: &'static [RveParamDesc],
+        factory: fn(&Params) -> Result<Box<dyn Script>, String>,
+    ) -> RveStatus {
         if out.is_null() {
             return report(host, "null create output pointer", RveStatus::Error);
         }
@@ -3847,11 +4225,25 @@ pub mod __private {
             }
             // SAFETY: params is valid for the callback per the ABI contract.
             let params = unsafe { (*params).into_owned() }.map_err(|error| error.to_string())?;
-            factory(&params)
+            let script = factory(&params)?;
+            let declared_properties = param_descs
+                .iter()
+                .map(|param| {
+                    // SAFETY: SDK descriptor names come from process-lifetime static strings.
+                    unsafe { param.name.to_str() }
+                        .map(str::to_owned)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((script, params, declared_properties))
         }));
         match result {
-            Ok(Ok(instance)) => {
-                let instance = Box::new(GuestInstance(instance));
+            Ok(Ok((script, properties, declared_properties))) => {
+                let instance = Box::new(GuestInstance {
+                    script,
+                    properties,
+                    declared_properties,
+                });
                 // SAFETY: out was checked above and stores the unique guest allocation.
                 unsafe { *out = Box::into_raw(instance).cast() };
                 RveStatus::Ok
@@ -3881,6 +4273,50 @@ pub mod __private {
         unsafe { with_context(instance, host, |script, ctx| script.on_late_update(ctx, dt)) }
     }
 
+    /// Delivers a declared property write to the instance (ABI v22). The default [`Script`] hook
+    /// stores the value in the instance's params; an override is responsible for its own backing
+    /// state and must keep `get_property` consistent with it.
+    pub unsafe fn set_property(
+        instance: *mut c_void,
+        host: *const RveHost,
+        name: RveStr,
+        value: *const crate::abi::RveValue,
+        phase: u32,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() || value.is_null() {
+            return report(host, "null property callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: pointers are valid for this ABI callback.
+            let name = unsafe { name.to_str() }.map_err(|error| error.to_string())?;
+            // SAFETY: pointers are valid for this ABI callback.
+            let value =
+                unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
+            // SAFETY: instance and host are valid for this callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut properties = instance.properties.clone();
+            properties.insert(name.to_owned(), value.clone());
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut properties,
+                &instance.declared_properties,
+            )?;
+            match phase {
+                crate::abi::RVE_PROPERTY_PHASE_VALIDATE => {
+                    instance.script.validate_property(&context, name, &value)?;
+                    context.sync_script_properties_except(instance.script.as_ref(), Some(name))?;
+                }
+                crate::abi::RVE_PROPERTY_PHASE_COMMIT => {
+                    instance.script.set_property(&mut context, name, value);
+                    instance.properties = properties;
+                }
+                _ => return Err("unknown property callback phase".to_owned()),
+            }
+            Ok(())
+        }));
+        status_from_result(host, result)
+    }
+
     pub unsafe fn timer(instance: *mut c_void, host: *const RveHost, tag: RveStr) -> RveStatus {
         if instance.is_null() || host.is_null() {
             return report(host, "null timer callback argument", RveStatus::Error);
@@ -3890,8 +4326,13 @@ pub mod __private {
             let tag = unsafe { tag.to_str() }.map_err(|error| error.to_string())?;
             // SAFETY: pointers are valid for this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_timer(&mut context, tag);
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            instance.script.on_timer(&mut context, tag);
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -3917,8 +4358,15 @@ pub mod __private {
                 unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
             // SAFETY: instance and host are valid for this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_message(&mut context, sender, name, &value);
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            instance
+                .script
+                .on_message(&mut context, sender, name, &value);
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -3939,12 +4387,16 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: instance and host are valid for this synchronous ABI callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
             let other = Object {
                 handle: event.other,
             };
             match event.kind {
-                RVE_COLLISION_ENTER => instance.0.on_collision_enter(
+                RVE_COLLISION_ENTER => instance.script.on_collision_enter(
                     &mut context,
                     other,
                     CollisionContact {
@@ -3952,12 +4404,13 @@ pub mod __private {
                         normal: event.normal,
                     },
                 ),
-                RVE_COLLISION_EXIT => instance.0.on_collision_exit(&mut context, other),
-                RVE_TRIGGER_ENTER => instance.0.on_trigger_enter(&mut context, other),
-                RVE_TRIGGER_EXIT => instance.0.on_trigger_exit(&mut context, other),
-                RVE_TRIGGER_STAY => instance.0.on_trigger_stay(&mut context, other),
+                RVE_COLLISION_EXIT => instance.script.on_collision_exit(&mut context, other),
+                RVE_TRIGGER_ENTER => instance.script.on_trigger_enter(&mut context, other),
+                RVE_TRIGGER_EXIT => instance.script.on_trigger_exit(&mut context, other),
+                RVE_TRIGGER_STAY => instance.script.on_trigger_stay(&mut context, other),
                 _ => return Err("unknown collision event kind".to_owned()),
             }
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -3991,8 +4444,13 @@ pub mod __private {
                 .collect::<Result<Vec<_>, _>>()?;
             // SAFETY: instance and host are valid for the duration of this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            instance.0.on_command(&mut context, name, &args);
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            instance.script.on_command(&mut context, name, &args);
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -4009,7 +4467,11 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: instance and host are valid for this synchronous ABI callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
             match event.kind {
                 RVE_NET_EVENT_MESSAGE => {
                     if event.value.is_null() {
@@ -4021,22 +4483,23 @@ pub mod __private {
                     let value = unsafe { (*event.value).into_owned() }
                         .map_err(|error: ValueError| error.to_string())?;
                     instance
-                        .0
+                        .script
                         .on_net_message(&mut context, event.peer, name, &value);
                 }
                 RVE_NET_EVENT_PEER_CONNECTED => {
-                    instance.0.on_peer_connected(&mut context, event.peer);
+                    instance.script.on_peer_connected(&mut context, event.peer);
                 }
                 RVE_NET_EVENT_PEER_DISCONNECTED => {
                     // SAFETY: the host keeps the reason readable for this callback.
                     let reason =
                         unsafe { event.reason.to_str() }.map_err(|error| error.to_string())?;
                     instance
-                        .0
+                        .script
                         .on_peer_disconnected(&mut context, event.peer, reason);
                 }
                 _ => return Err("unknown net event kind".to_owned()),
             }
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -4053,7 +4516,11 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: instance and host are valid for this synchronous ABI callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
             let kind =
                 ui_event_kind(event.kind).ok_or_else(|| "unknown ui event kind".to_owned())?;
             // SAFETY: the host keeps the identifier and value readable for this callback.
@@ -4061,7 +4528,7 @@ pub mod __private {
                 unsafe { event.element_id.to_str() }.map_err(|error| error.to_string())?;
             let value =
                 unsafe { ui_value_from_abi(event.value) }.map_err(|error| error.to_string())?;
-            instance.0.on_ui_event(
+            instance.script.on_ui_event(
                 &mut context,
                 UiEvent {
                     kind,
@@ -4074,6 +4541,7 @@ pub mod __private {
                     value,
                 },
             );
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -4115,8 +4583,13 @@ pub mod __private {
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: the host supplies valid call-scoped pointers.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let mut context = Context::new(unsafe { &*host })?;
-            callback(instance.0.as_mut(), &mut context);
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            callback(instance.script.as_mut(), &mut context);
+            context.sync_script_properties(instance.script.as_ref())?;
             context.commit()
         }));
         status_from_result(host, result)
@@ -4399,13 +4872,23 @@ macro_rules! __rve_label {
 #[macro_export]
 macro_rules! __rve_script_descriptor {
     ($name:literal, $factory:path, [$($params:tt)*]) => {{
+        static __RVE_PARAMS: &[$crate::abi::RveParamDesc] =
+            $crate::__rve_params!(@munch [] $($params)*);
         unsafe extern "C" fn __rve_create(
             host: *const $crate::abi::RveHost,
             params: *const $crate::abi::RveParams,
             out: *mut *mut ::std::ffi::c_void,
         ) -> $crate::abi::RveStatus {
             // SAFETY: host ABI supplies all callback pointers for the duration of this call.
-            unsafe { $crate::__private::create(host, params, out, $factory) }
+            unsafe {
+                $crate::__private::create_with_param_descs(
+                    host,
+                    params,
+                    out,
+                    __RVE_PARAMS,
+                    $factory,
+                )
+            }
         }
         unsafe extern "C" fn __rve_start(
             instance: *mut ::std::ffi::c_void,
@@ -4511,6 +4994,16 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped host pointer.
             unsafe { $crate::__private::disable(instance, host) }
         }
+        unsafe extern "C" fn __rve_set_property(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            name: $crate::abi::RveStr,
+            value: *const $crate::abi::RveValue,
+            phase: u32,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped name and value pointers.
+            unsafe { $crate::__private::set_property(instance, host, name, value, phase) }
+        }
         unsafe extern "C" fn __rve_drop_instance(
             instance: *mut ::std::ffi::c_void,
         ) -> $crate::abi::RveStatus {
@@ -4534,7 +5027,8 @@ macro_rules! __rve_script_descriptor {
             __rve_ui_event,
             __rve_enable,
             __rve_disable,
-            $crate::__rve_params!(@munch [] $($params)*),
+            __rve_set_property,
+            __RVE_PARAMS,
         )
     }};
 }

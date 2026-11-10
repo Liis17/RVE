@@ -3,6 +3,7 @@ mod physics_api;
 
 use crate::actions::{ActionMutation, ActionValue};
 use crate::lifecycle::{ObjectState, PrefabRequest, SpawnArgs};
+use crate::script_refs::normalize_script_key;
 use crate::transaction::ScreenShaderState;
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
@@ -444,6 +445,9 @@ pub(crate) fn create_lua(
     time_values.set_metatable(Some(time_metatable))?;
     let rve = lua.create_table()?;
     rve.set("time", time_values.clone())?;
+    crate::math_lua::install(&lua, &rve)?;
+    rve.set("asset", asset_function(&lua)?)?;
+    rve.set("save", save_table(&lua, active_call.clone())?)?;
     let timer = lua.create_table()?;
     timer.set("after", timer_after_function(&lua, active_call.clone())?)?;
     timer.set("every", timer_every_function(&lua, active_call.clone())?)?;
@@ -565,6 +569,7 @@ pub(crate) fn create_lua(
     )?;
     rve.set("spawn", spawn_function(&lua, active_call.clone())?)?;
     rve.set("destroy", destroy_function(&lua, active_call.clone())?)?;
+    rve.set("scene", scene_table(&lua, active_call.clone())?)?;
     rve.set("prefabs", prefabs_table(&lua, active_call.clone())?)?;
     rve.set("send", send_function(&lua, active_call.clone())?)?;
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
@@ -926,12 +931,16 @@ pub(crate) struct LuaInstance {
     instance: Table,
     transform: mlua::AnyUserData,
     active_call: ActiveCall,
+    property_names: Vec<String>,
+    property_values: ScriptParams,
+    object_refs: std::collections::HashMap<String, ScriptObjectRef>,
 }
 
 pub(crate) struct LuaInstanceInit<'a> {
     pub(crate) object_id: &'a str,
     pub(crate) object_name: &'a str,
     pub(crate) params: &'a ScriptParams,
+    pub(crate) property_names: Vec<String>,
     pub(crate) transform: ScriptTransform,
     pub(crate) object_refs: &'a std::collections::HashMap<String, ScriptObjectRef>,
     pub(crate) object_handle: ObjectHandle,
@@ -978,6 +987,17 @@ impl LuaInstance {
             instance,
             transform,
             active_call,
+            property_values: init
+                .property_names
+                .iter()
+                .filter_map(|name| {
+                    init.params
+                        .get(name)
+                        .map(|value| (name.clone(), value.clone()))
+                })
+                .collect(),
+            property_names: init.property_names,
+            object_refs: init.object_refs.clone(),
         })
     }
 
@@ -1004,6 +1024,36 @@ impl LuaInstance {
 
     pub(crate) fn invoke_late_update(&self, dt: f32) -> mlua::Result<()> {
         self.invoke("on_late_update", (self.instance.clone(), dt))
+    }
+
+    pub(crate) fn declared_properties(&self, lua: &Lua) -> mlua::Result<ScriptParams> {
+        let params: Table = self.instance.get("params")?;
+        self.property_names
+            .iter()
+            .map(|name| {
+                let value: Value = params.get(name.as_str())?;
+                let value = match value {
+                    Value::Nil => ParamValue::Object(String::new()),
+                    value => lua_message_param_value_with_size(lua, &self.active_call, value)?.0,
+                };
+                Ok((name.clone(), value))
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_params(&self, lua: &Lua) -> mlua::Result<()> {
+        let params: Table = self.instance.get("params")?;
+        for (name, value) in &self.property_values {
+            params.set(
+                name.as_str(),
+                param_value(lua, value, &self.active_call, Some(&self.object_refs))?,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_properties(&mut self, properties: ScriptParams) {
+        self.property_values = properties;
     }
 
     pub(crate) fn invoke_timer(&self, callback: &Function, id: u64) -> mlua::Result<()> {
@@ -1780,6 +1830,7 @@ fn object_table(
         })?,
     )?;
     add_hierarchy_object_api(lua, &object, handle, active_call.clone())?;
+    add_script_ref_api(lua, &object, handle, active_call.clone())?;
     add_audio_object_api(lua, &object, handle, active_call.clone())?;
     component_api::add_component_methods(lua, &object, handle, active_call.clone())?;
     add_animation_object_api(lua, &object, handle, active_call.clone())?;
@@ -2947,6 +2998,31 @@ fn add_hierarchy_object_api(
         lua.create_function(move |_, _arguments: MultiValue| {
             with_active_call(&hierarchy_call, |transaction| {
                 Ok(transaction.active_in_hierarchy(handle).unwrap_or(false))
+            })
+        })?,
+    )?;
+
+    let keep_on_load_call = active_call.clone();
+    object.set(
+        "keep_on_load",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&keep_on_load_call, |transaction| {
+                Ok(transaction.keep_on_load(handle).unwrap_or(false))
+            })
+        })?,
+    )?;
+
+    let set_keep_on_load_call = active_call.clone();
+    object.set(
+        "set_keep_on_load",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let keep = lua_boolean(
+                values.into_iter().next().unwrap_or(Value::Nil),
+                "object.set_keep_on_load",
+            )?;
+            with_active_call(&set_keep_on_load_call, |transaction| {
+                Ok(transaction.set_keep_on_load(handle, keep))
             })
         })?,
     )?;
@@ -4293,6 +4369,118 @@ pub(crate) fn lua_boolean(value: Value, function: &str) -> mlua::Result<bool> {
     }
 }
 
+struct AssetUserData(VirtualPath);
+
+impl UserData for AssetUserData {}
+
+fn asset_function(lua: &Lua) -> mlua::Result<Function> {
+    lua.create_function(|lua, path: LuaString| {
+        let path = path
+            .to_str()
+            .map_err(|_| LuaError::runtime("asset paths must be valid UTF-8"))?;
+        let path = VirtualPath::parse(path.as_ref())
+            .map_err(|error| LuaError::runtime(error.to_string()))?;
+        lua.create_userdata(AssetUserData(path))
+    })
+}
+
+fn save_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let save = lua.create_table()?;
+    save.set(
+        "set",
+        lua.create_function({
+            let active_call = active_call.clone();
+            move |lua, (key, value): (LuaString, Value)| {
+                let key = key
+                    .to_str()
+                    .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                    .to_owned();
+                with_active_call(&active_call, |transaction| {
+                    let mut budget = MessageValueBudget::new();
+                    let value = lua_param_value_inner(
+                        value,
+                        0,
+                        &mut budget,
+                        Some(lua),
+                        Some(&active_call),
+                    )?;
+                    transaction.save_set(&key, value).map_err(LuaError::runtime)
+                })
+            }
+        })?,
+    )?;
+    save.set(
+        "get",
+        lua.create_function({
+            let active_call = active_call.clone();
+            move |lua, key: LuaString| {
+                let key = key
+                    .to_str()
+                    .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                    .to_owned();
+                let value =
+                    with_active_call(&active_call, |transaction| Ok(transaction.save_get(&key)))?;
+                match value {
+                    Some(ParamValue::Asset(path)) => {
+                        Ok(Value::UserData(lua.create_userdata(AssetUserData(path))?))
+                    }
+                    Some(value) => param_value(lua, &value, &active_call, None),
+                    None => Ok(Value::Nil),
+                }
+            }
+        })?,
+    )?;
+    let delete_active = active_call.clone();
+    save.set(
+        "delete",
+        lua.create_function(move |_, key: LuaString| {
+            let key = key
+                .to_str()
+                .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                .to_owned();
+            with_active_call(&delete_active, |transaction| {
+                transaction.save_delete(&key).map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    let has_active = active_call.clone();
+    save.set(
+        "has",
+        lua.create_function(move |_, key: LuaString| {
+            let key = key
+                .to_str()
+                .map_err(|_| LuaError::runtime("save keys must be valid UTF-8"))?
+                .to_owned();
+            with_active_call(&has_active, |transaction| {
+                transaction.save_has(&key).map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    let keys_active = active_call.clone();
+    save.set(
+        "keys",
+        lua.create_function(move |lua, ()| {
+            let keys = with_active_call(&keys_active, |transaction| Ok(transaction.save_keys()))?;
+            let table = lua.create_table_with_capacity(keys.len(), 0)?;
+            for (index, key) in keys.into_iter().enumerate() {
+                table.raw_set(index + 1, key)?;
+            }
+            Ok(table)
+        })?,
+    )?;
+    let flush_active = active_call;
+    save.set(
+        "flush",
+        lua.create_function(move |_, ()| {
+            with_active_call(&flush_active, |transaction| {
+                transaction.save_flush().map_err(LuaError::runtime)
+            })?;
+            Ok(true)
+        })?,
+    )?;
+    Ok(save)
+}
+
 fn action_button_function(
     lua: &Lua,
     active_call: ActiveCall,
@@ -4612,6 +4800,15 @@ fn lua_param_value_inner(
                 .map(|value| ParamValue::String(value.to_owned()))
                 .map_err(|_| LuaError::runtime("message strings must contain valid UTF-8"))
         }
+        Value::UserData(value) => {
+            let asset = value
+                .borrow::<AssetUserData>()
+                .map_err(|_| LuaError::runtime("save userdata values must be assets"))?;
+            budget
+                .add_string(asset.0.as_str().len())
+                .map_err(LuaError::runtime)?;
+            Ok(ParamValue::Asset(asset.0.clone()))
+        }
         Value::Table(table) => {
             if let (Some(lua), Some(active_call)) = (lua, active_call)
                 && let Some(handle) = object_handle_of(lua, &table)?
@@ -4852,6 +5049,200 @@ fn read_vector(table: &Table, property: &str) -> mlua::Result<[f32; 3]> {
     Ok(result)
 }
 
+/// Ссылка на экземпляр скрипта, полученная через `obj:script(key)`. Серийный номер не повторяется,
+/// поэтому после удаления объекта или смены сцены ссылка даёт ошибку, а не чужой экземпляр.
+struct ScriptRefUserData {
+    serial: u64,
+    active_call: ActiveCall,
+}
+
+impl mlua::UserData for ScriptRefUserData {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, name: LuaString| {
+            let name = lua_text_key(Value::String(name), "script.get")?;
+            let value = with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_get(this.serial, &name)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })?;
+            param_value(lua, &value, &this.active_call, None)
+        });
+        methods.add_method("set", |lua, this, (name, value): (LuaString, Value)| {
+            let name = lua_text_key(Value::String(name), "script.set")?;
+            let (value, _) = lua_message_param_value_with_size(lua, &this.active_call, value)?;
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_set(this.serial, &name, &value)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })
+        });
+        methods.add_method("send", |lua, this, (name, value): (LuaString, Value)| {
+            let name = lua_message_name(name)?;
+            let (value, value_size) =
+                lua_message_param_value_with_size(lua, &this.active_call, value)?;
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_send(this.serial, &name, value, value_size)
+                    .map_err(|error| LuaError::runtime(format!("script.send: {error:?}")))
+            })
+        });
+        methods.add_method("enabled", |_, this, ()| {
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .script_enabled_of(this.serial)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })
+        });
+        methods.add_method("set_enabled", |_, this, value: Value| {
+            let enabled = lua_boolean(value, "script.set_enabled")?;
+            with_active_call(&this.active_call, |transaction| {
+                transaction
+                    .set_script_enabled_of(this.serial, enabled)
+                    .map_err(|error| LuaError::runtime(error.message()))
+            })
+        });
+    }
+}
+
+/// `obj:script(key)`: ссылка на экземпляр объекта по виртуальному пути lite-скрипта или имени
+/// heavy-скрипта; `nil`, если такого экземпляра нет.
+fn add_script_ref_api(
+    lua: &Lua,
+    object: &Table,
+    handle: ObjectHandle,
+    active_call: ActiveCall,
+) -> mlua::Result<()> {
+    object.set(
+        "script",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let values = method_arguments(lua, arguments, handle)?;
+            let key = lua_text_key(
+                values.into_iter().next().unwrap_or(Value::Nil),
+                "object.script",
+            )?;
+            let key = normalize_script_key(&key);
+            let serial = with_active_call(&active_call, |transaction| {
+                Ok(transaction.script_ref(handle, &key))
+            })?;
+            match serial {
+                Some(serial) => Ok(Value::UserData(lua.create_userdata(ScriptRefUserData {
+                    serial,
+                    active_call: active_call.clone(),
+                })?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )
+}
+
+impl LuaInstance {
+    /// Записывает объявленные свойства в Lua-таблицу `params`. Вызывается перед вызовом экземпляра,
+    /// если другой скрипт изменил его свойства.
+    pub(crate) fn write_params(
+        &mut self,
+        lua: &Lua,
+        properties: &std::collections::BTreeMap<String, ParamValue>,
+    ) -> mlua::Result<()> {
+        self.stage_params(lua, properties)?;
+        for (name, value) in properties {
+            self.property_values.insert(name.clone(), value.clone());
+        }
+        Ok(())
+    }
+
+    /// Writes canonical callback values into `self.params` without committing their rollback base.
+    pub(crate) fn stage_params(
+        &mut self,
+        lua: &Lua,
+        properties: &std::collections::BTreeMap<String, ParamValue>,
+    ) -> mlua::Result<()> {
+        let params: Table = self.instance.get("params")?;
+        self.cache_object_refs(properties);
+        for (name, value) in properties {
+            params.set(
+                name.as_str(),
+                param_value(lua, value, &self.active_call, Some(&self.object_refs))?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn cache_object_refs(&mut self, properties: &ScriptParams) {
+        fn collect<'a>(value: &'a ParamValue, ids: &mut Vec<&'a str>) {
+            match value {
+                ParamValue::Object(id) if !id.is_empty() => ids.push(id),
+                ParamValue::Array(values) => {
+                    for value in values {
+                        collect(value, ids);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut ids = Vec::new();
+        for value in properties.values() {
+            collect(value, &mut ids);
+        }
+        for id in ids {
+            if self.object_refs.contains_key(id) {
+                continue;
+            }
+            let resolved = with_active_call(&self.active_call, |transaction| {
+                Ok(transaction.handle_by_id(id).and_then(|handle| {
+                    transaction
+                        .object_identity(handle)
+                        .map(|(_, name)| (handle, name.to_owned()))
+                }))
+            });
+            if let Ok(Some((handle, name))) = resolved {
+                self.object_refs
+                    .insert(id.to_owned(), ScriptObjectRef { handle, name });
+            }
+        }
+    }
+}
+
+/// Текст ключа свойства или скрипта: любая UTF-8 строка, без ограничения длины имени сообщения.
+fn lua_text_key(value: Value, function: &str) -> mlua::Result<String> {
+    match value {
+        Value::String(text) => text
+            .to_str()
+            .map(|text| text.to_owned())
+            .map_err(|_| LuaError::runtime(format!("{function} expects valid UTF-8 text"))),
+        other => Err(LuaError::runtime(format!(
+            "{function} expects a string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `rve.scene`: `load(path)` ставит запрос загрузки сцены проекта, `current()` возвращает имя
+/// текущей сцены. Запрос выполняется после конца кадра, если сцена объявлена и включена.
+fn scene_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let scene = lua.create_table()?;
+    let load_call = active_call.clone();
+    scene.set(
+        "load",
+        lua.create_function(move |_, path: LuaString| {
+            let path = lua_text_key(Value::String(path), "rve.scene.load")?;
+            with_active_call(&load_call, |transaction| {
+                transaction
+                    .request_scene_load(&path)
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    scene.set(
+        "current",
+        lua.create_function(move |lua, ()| {
+            let current =
+                with_active_call(&active_call, |transaction| Ok(transaction.current_scene()))?;
+            Ok(Value::String(lua.create_string(&current)?))
+        })?,
+    )?;
+    Ok(scene)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

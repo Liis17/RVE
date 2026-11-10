@@ -1,4 +1,12 @@
 mod components;
+mod scenes;
+mod script_refs;
+
+use scenes::{host_scene_current, host_scene_load};
+use script_refs::{
+    host_object_script, host_script_ref_enabled, host_script_ref_get, host_script_ref_send,
+    host_script_ref_set, host_script_ref_set_enabled,
+};
 
 use crate::abi_string::read_abi_str;
 use crate::actions::ActionMutation;
@@ -85,10 +93,13 @@ pub(crate) struct AbiCallContext<'a> {
     command_owner: usize,
     commands_allowed: bool,
     error: Option<String>,
+    preserve_error: bool,
     action_binding: String,
     /// Текст последнего UI-значения, возвращённого гостю; живёт до конца callback.
     ui_text: String,
     poisoned: bool,
+    save_values: Vec<OwnedAbiValue>,
+    save_keys: Vec<String>,
 }
 
 pub(crate) struct AbiScriptCall<'a> {
@@ -126,9 +137,12 @@ impl<'a> AbiCallContext<'a> {
             command_owner: 0,
             commands_allowed: false,
             error: None,
+            preserve_error: false,
             action_binding: String::new(),
             ui_text: String::new(),
             poisoned: false,
+            save_values: Vec::new(),
+            save_keys: Vec::new(),
         }
     }
 
@@ -149,9 +163,12 @@ impl<'a> AbiCallContext<'a> {
             command_owner: command_access.owner,
             commands_allowed: command_access.allowed,
             error: None,
+            preserve_error: false,
             action_binding: String::new(),
             ui_text: String::new(),
             poisoned: false,
+            save_values: Vec::new(),
+            save_keys: Vec::new(),
         }
     }
 
@@ -378,6 +395,22 @@ impl<'a> AbiCallContext<'a> {
             set_time_scale: Some(host_set_time_scale),
             schedule_timer: Some(host_schedule_timer),
             cancel_timer: Some(host_cancel_timer),
+            save_get: Some(host_save_get),
+            save_set: Some(host_save_set),
+            save_delete: Some(host_save_delete),
+            save_has: Some(host_save_has),
+            save_keys: Some(host_save_keys),
+            save_flush: Some(host_save_flush),
+            object_keep_on_load: Some(host_object_keep_on_load),
+            object_set_keep_on_load: Some(host_object_set_keep_on_load),
+            object_script: Some(host_object_script),
+            script_ref_get: Some(host_script_ref_get),
+            script_ref_set: Some(host_script_ref_set),
+            script_ref_send: Some(host_script_ref_send),
+            script_ref_enabled: Some(host_script_ref_enabled),
+            script_ref_set_enabled: Some(host_script_ref_set_enabled),
+            scene_load: Some(host_scene_load),
+            scene_current: Some(host_scene_current),
         }
     }
 
@@ -393,6 +426,11 @@ impl<'a> AbiCallContext<'a> {
             }));
         }
         Ok(())
+    }
+
+    pub(crate) fn script_ref_error(&mut self, message: String) {
+        self.error = Some(message);
+        self.preserve_error = true;
     }
 
     fn command_result(&mut self, status: RveStatus) -> Result<(), (String, bool)> {
@@ -526,6 +564,43 @@ impl AbiScriptInstance {
                     AbiPhase::Destroy => (self.descriptor.destroy)(self.instance, &host),
                 }
             }
+        };
+        context.callback_result(status)
+    }
+
+    /// Доставляет запись объявленного свойства (ABI v22). Модули без этого callback сохраняют
+    /// свои параметры без изменений: их Params не получают записи, которые сделал другой скрипт.
+    pub(crate) fn invoke_set_property(
+        &mut self,
+        time: ScriptTime,
+        name: &str,
+        value: &ParamValue,
+        phase: u32,
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let Some(set_property) = self.descriptor.set_property else {
+            return Err("target script does not support external property writes".to_owned());
+        };
+        let object_refs = message_object_refs(value, call.transaction);
+        let value = OwnedAbiValue::new(value, &object_refs);
+        let name = RveStr::from_str_ref(name);
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let status = {
+            let host = context.host(time);
+            // SAFETY: the value, name, instance, and host remain live throughout the callback.
+            unsafe { set_property(self.instance, &host, name, &value.value, phase) }
         };
         context.callback_result(status)
     }
@@ -849,12 +924,153 @@ fn guarded<T: Copy>(
 
 unsafe extern "C" fn host_set_error(ctx: *mut c_void, message: RveStr) {
     guarded(ctx, (), |context| {
-        context.error = Some(
-            unsafe { read_abi_str(message) }
-                .map(str::to_owned)
-                .unwrap_or_else(|_| "guest supplied an invalid error message".to_owned()),
-        );
+        if !context.preserve_error {
+            context.error = Some(
+                unsafe { read_abi_str(message) }
+                    .map(str::to_owned)
+                    .unwrap_or_else(|_| "guest supplied an invalid error message".to_owned()),
+            );
+        }
     });
+}
+
+unsafe extern "C" fn host_save_get(ctx: *mut c_void, key: RveStr, out: *mut RveValue) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            context.error = Some("save_get received a null output pointer".to_owned());
+            return false;
+        }
+        let key = match unsafe { read_abi_str(key) } {
+            Ok(key) => key,
+            Err(error) => {
+                context.error = Some(format!("save key is invalid: {error:?}"));
+                return false;
+            }
+        };
+        let Some(value) = context.transaction.save_get(key) else {
+            return false;
+        };
+        let references = message_object_refs(&value, context.transaction);
+        context
+            .save_values
+            .push(OwnedAbiValue::new(&value, &references));
+        let value = context
+            .save_values
+            .last()
+            .expect("save value was just added");
+        // SAFETY: `save_values` owns all nested buffers until this ABI call context is dropped.
+        unsafe { *out = value.value };
+        true
+    })
+}
+
+unsafe extern "C" fn host_save_set(ctx: *mut c_void, key: RveStr, value: *const RveValue) -> bool {
+    guarded(ctx, false, |context| {
+        let key = match unsafe { read_abi_str(key) } {
+            Ok(key) => key.to_owned(),
+            Err(error) => {
+                context.error = Some(format!("save key is invalid: {error:?}"));
+                return false;
+            }
+        };
+        let decoded = unsafe {
+            read_message_value_with_objects(value, |handle| {
+                match context.transaction.abi_object(handle) {
+                    AbiObject::Alive(object) => {
+                        context.transaction.object_id(object).map(str::to_owned)
+                    }
+                    AbiObject::Malformed | AbiObject::Unavailable => None,
+                }
+            })
+        };
+        let (value, _) = match decoded {
+            Ok(value) => value,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        match context.transaction.save_set(&key, value) {
+            Ok(()) => true,
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_save_delete(ctx: *mut c_void, key: RveStr) -> bool {
+    guarded(ctx, false, |context| {
+        let key = match unsafe { read_abi_str(key) } {
+            Ok(key) => key.to_owned(),
+            Err(error) => {
+                context.error = Some(format!("save key is invalid: {error:?}"));
+                return false;
+            }
+        };
+        match context.transaction.save_delete(&key) {
+            Ok(existed) => existed,
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_save_has(ctx: *mut c_void, key: RveStr) -> bool {
+    guarded(ctx, false, |context| {
+        let key = match unsafe { read_abi_str(key) } {
+            Ok(key) => key.to_owned(),
+            Err(error) => {
+                context.error = Some(format!("save key is invalid: {error:?}"));
+                return false;
+            }
+        };
+        match context.transaction.save_has(&key) {
+            Ok(exists) => exists,
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_save_keys(
+    ctx: *mut c_void,
+    keys: *mut RveStr,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if count.is_null() || capacity > 0 && keys.is_null() {
+            context.error = Some("save_keys received a null buffer".to_owned());
+            return false;
+        }
+        context.save_keys = context.transaction.save_keys();
+        let total = context.save_keys.len();
+        // SAFETY: `count` was checked and is writable for this synchronous callback.
+        unsafe { *count = total };
+        for (index, key) in context.save_keys.iter().take(capacity).enumerate() {
+            // SAFETY: capacity and the non-null array were validated above.
+            unsafe { *keys.add(index) = RveStr::from_str_ref(key) };
+        }
+        true
+    })
+}
+
+unsafe extern "C" fn host_save_flush(ctx: *mut c_void) -> bool {
+    guarded(ctx, false, |context| {
+        match context.transaction.save_flush() {
+            Ok(()) => true,
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
 }
 
 unsafe extern "C" fn host_log(ctx: *mut c_void, level: u32, message: RveStr) {
@@ -2015,6 +2231,19 @@ unsafe extern "C" fn host_object_set_active(ctx: *mut c_void, object: u64, activ
     })
 }
 
+unsafe extern "C" fn host_object_set_keep_on_load(
+    ctx: *mut c_void,
+    object: u64,
+    keep: bool,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        context.transaction.set_keep_on_load(handle, keep)
+    })
+}
+
 /// Записывает флаг в `out`, если объект жив; общий путь для `is_active` и иерархической активности.
 fn object_bool(
     ctx: *mut c_void,
@@ -2048,6 +2277,14 @@ unsafe extern "C" fn host_object_active_in_hierarchy(
     out: *mut bool,
 ) -> bool {
     object_bool(ctx, object, out, ScriptTransaction::active_in_hierarchy)
+}
+
+unsafe extern "C" fn host_object_keep_on_load(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut bool,
+) -> bool {
+    object_bool(ctx, object, out, ScriptTransaction::keep_on_load)
 }
 
 unsafe extern "C" fn host_object_parent(ctx: *mut c_void, object: u64, out: *mut u64) -> bool {

@@ -19,20 +19,22 @@ use rve_sdk::abi::{
     RVE_SPAWN_HAS_PARENT, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCreateFn, RveHeader, RveHost,
     RveModule, RveParamDescV13, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3,
     RveScriptDescV4, RveScriptDescV6, RveScriptDescV13, RveScriptDescV15, RveScriptDescV16,
-    RveScriptDescV17, RveScriptDescV19, RveSpawnOptions, RveStatus, RveStr, RveTransform,
-    RveUpdateFn, RveValue,
+    RveScriptDescV17, RveScriptDescV19, RveScriptDescV20, RveSpawnOptions, RveStatus, RveStr,
+    RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
-    NetTarget, Object, Params, PhysicalInput, Script, Tonemapper, UiEvent, Value,
+    NetTarget, Object, Params, PhysicalInput, Script, ScriptRef, Tonemapper, UiEvent, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static PROBE_DROPS: AtomicUsize = AtomicUsize::new(0);
+static REJECTED_PROPERTY_SPEED_BITS: AtomicU64 = AtomicU64::new(0);
+static PROPERTY_SETTER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CREATE_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static ERROR_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static BULK_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
@@ -61,6 +63,12 @@ struct ReferenceProbe {
     camera: Object,
 }
 struct ReferenceReceiver;
+struct InvalidScriptRefProbe;
+struct StaleScriptRefProbe {
+    target: Option<Object>,
+    script: Option<ScriptRef>,
+    destroyed: bool,
+}
 
 struct CameraControl {
     panic_update: bool,
@@ -95,6 +103,18 @@ fn reference_receiver_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(ReferenceReceiver))
 }
 
+fn invalid_script_ref_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(InvalidScriptRefProbe))
+}
+
+fn stale_script_ref_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(StaleScriptRefProbe {
+        target: None,
+        script: None,
+        destroyed: false,
+    }))
+}
+
 impl Script for ReferenceProbe {
     fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
         assert_eq!(self.target.id(ctx).as_deref(), Some("target"));
@@ -122,6 +142,34 @@ impl Script for ReferenceReceiver {
             assert_eq!(object.id(ctx).as_deref(), Some("camera"));
             ctx.log_info("ABI object message received");
         }
+    }
+}
+
+impl Script for InvalidScriptRefProbe {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        let target = ctx.find("target").expect("target exists");
+        let script = target.script(ctx, "PropertyProbe").expect("script exists");
+        assert!(script.get(ctx, "missing").is_none());
+        panic!("invalid property should retain host error details");
+    }
+}
+
+impl Script for StaleScriptRefProbe {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let target = ctx.find("target").expect("target exists");
+        self.script = target.script(ctx, "PropertyProbe");
+        self.target = Some(target);
+    }
+
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        if !self.destroyed {
+            assert!(self.target.expect("target was captured").destroy(ctx, 0.0));
+            self.destroyed = true;
+            return;
+        }
+        let script = self.script.expect("script was captured");
+        assert!(script.get(ctx, "speed").is_none());
+        panic!("stale script reference should retain host error details");
     }
 }
 
@@ -916,6 +964,25 @@ fn sdk_module() -> &'static RveModule {
             camera: component(camera) = None,
         },
         "ReferenceReceiver" => reference_receiver_factory,
+        "InvalidScriptRefProbe" => invalid_script_ref_factory,
+        "StaleScriptRefProbe" => stale_script_ref_factory,
+        "ScriptRefProbe" => script_ref_probe_factory,
+        "PropertyProbe" => property_probe_factory {
+            speed: f32 = 1.5 (0.0..=10.0),
+        },
+        "StatefulPropertyProbe" => stateful_property_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+        },
+        "RejectingPropertyProbe" => rejecting_property_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+        },
+        "AdvancingRejectingPropertyProbe" => advancing_rejecting_property_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+        },
+        "LaterPropertyValidationProbe" => later_property_validation_probe_factory {
+            speed: f64 = 1.5 (0.0..=10.0),
+            later: f64 = 2.5,
+        },
     }
 }
 
@@ -2702,6 +2769,7 @@ fn null_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2730,6 +2798,7 @@ fn null_name_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2759,6 +2828,7 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3020,7 +3090,7 @@ params = { role = "target" }
     assert!(
         message_list(&mut host)
             .iter()
-            .any(|message| message.contains("non-finite transform"))
+            .any(|message| message.contains("script produced a non-finite transform"))
     );
     host.update(&mut world, 0.5, time);
     assert!(
@@ -3168,6 +3238,7 @@ fn error_message_module() -> &'static RveModule {
             on_fixed_update: None,
             on_late_update: None,
             on_timer: None,
+            set_property: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -3188,6 +3259,7 @@ fn error_message_module() -> &'static RveModule {
             on_fixed_update: None,
             on_late_update: None,
             on_timer: None,
+            set_property: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -3224,6 +3296,7 @@ fn set_local_during_create_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3249,6 +3322,7 @@ fn poisoned_create_module() -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3903,6 +3977,7 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }]));
     RveModule::new(scripts)
 }
@@ -3988,6 +4063,7 @@ fn malformed_parameter_tables_are_rejected() {
             on_fixed_update: None,
             on_late_update: None,
             on_timer: None,
+            set_property: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -4230,6 +4306,7 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         on_fixed_update: None,
         on_late_update: None,
         on_timer: None,
+        set_property: None,
     }]));
     Box::leak(Box::new(RveModule::new(scripts)))
 }
@@ -5313,4 +5390,1084 @@ path = \"/jump.lua\"
     };
     assert!(lua.iter().any(|message| message == "jump"), "{lua:?}");
     assert_eq!(trace(&lua), trace(&abi));
+}
+
+const SCRIPT_REF_TARGET: &str = r#"
+local Script = {}
+Script.properties = {
+  speed = { type = "float", default = 1.5, min = 0, max = 10 },
+}
+function Script:on_update(dt)
+  rve.log("target update " .. string.format("%g", self.params.speed))
+end
+function Script:on_message(sender, name, value)
+  rve.log("target got " .. name .. " " .. tostring(value))
+end
+return Script
+"#;
+
+/// Heavy probe: reads, writes, messages, and toggles a lite instance found by object and path.
+struct ScriptRefProbe;
+
+fn script_ref_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ScriptRefProbe))
+}
+
+impl Script for ScriptRefProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let target = ctx.find("target").expect("target object");
+        let reference = target
+            .script(ctx, "/target.lua")
+            .expect("lite script reference");
+        assert!(target.script(ctx, "/missing.lua").is_none());
+        assert_eq!(reference.get(ctx, "speed"), Some(Value::Float(1.5)));
+        assert!(reference.set(ctx, "speed", &Value::Int(4)));
+        assert_eq!(reference.get(ctx, "speed"), Some(Value::Float(4.0)));
+        assert!(reference.send(ctx, "ping", &Value::Int(7)));
+        assert_eq!(reference.enabled(ctx), Some(true));
+        assert!(reference.set_enabled(ctx, true));
+        assert_eq!(reference.enabled(ctx), Some(true));
+        assert_eq!(ctx.current_scene().as_deref(), Some("scene"));
+        assert!(ctx.load_scene("levels/next.rvescene"));
+        ctx.log_info("script ref ok");
+    }
+}
+
+#[test]
+fn abi_script_reference_reads_writes_sends_and_toggles_a_lite_instance() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/target.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ScriptRefProbe"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/target.lua"
+"#,
+    );
+    let sources = BTreeMap::from([("target.lua".to_owned(), SCRIPT_REF_TARGET.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+    host.set_enabled_scenes(&["levels/next.rvescene".to_owned()])
+        .unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let first = host.drain_events();
+    assert!(
+        first
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{first:?}"
+    );
+    assert!(first.iter().any(|event| event.message == "script ref ok"));
+    assert_eq!(
+        host.take_scene_request().as_deref(),
+        Some("levels/next.rvescene")
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    // The start-phase message is delivered in the first update, after the probe logged its result.
+    let mut messages: Vec<String> = first.iter().map(|event| event.message.clone()).collect();
+    messages.extend(message_list(&mut host));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "target got ping 7"),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| message == "target update 4"),
+        "{messages:?}"
+    );
+}
+
+/// Heavy probe with one declared property; logs the value its callbacks observe.
+struct PropertyProbe;
+
+fn property_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PropertyProbe))
+}
+
+impl Script for PropertyProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        let speed = match self.get_property(ctx, "speed") {
+            Some(Value::Float(speed)) => speed,
+            other => panic!("speed is not a float: {other:?}"),
+        };
+        ctx.log_info(format!("probe speed {speed}"));
+    }
+}
+
+struct StatefulPropertyProbe {
+    speed: f64,
+}
+
+fn stateful_property_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(StatefulPropertyProbe { speed }))
+}
+
+impl Script for StatefulPropertyProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        (name == "speed").then_some(Value::Float(self.speed))
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+
+    fn on_update(&mut self, _ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        self.speed += 1.0;
+    }
+}
+
+struct RejectingPropertyProbe {
+    speed: f64,
+}
+
+struct AdvancingRejectingPropertyProbe {
+    speed: f64,
+}
+
+struct LaterPropertyValidationProbe {
+    speed: f64,
+}
+
+impl Drop for RejectingPropertyProbe {
+    fn drop(&mut self) {
+        REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
+    }
+}
+
+fn rejecting_property_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(RejectingPropertyProbe { speed }))
+}
+
+impl Script for RejectingPropertyProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        (name == "speed").then_some(Value::Float(self.speed))
+    }
+
+    fn validate_property(
+        &self,
+        _ctx: &rve_sdk::Context<'_>,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        if name == "speed" && matches!(value, Value::Float(speed) if *speed > 3.0) {
+            return Err("speed above 3 is rejected".to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+}
+
+impl Drop for AdvancingRejectingPropertyProbe {
+    fn drop(&mut self) {
+        REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
+    }
+}
+
+fn advancing_rejecting_property_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(AdvancingRejectingPropertyProbe { speed }))
+}
+
+fn later_property_validation_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let speed = match params.get("speed") {
+        Some(Value::Float(speed)) => *speed,
+        _ => 1.5,
+    };
+    Ok(Box::new(LaterPropertyValidationProbe { speed }))
+}
+
+impl Script for AdvancingRejectingPropertyProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        (name == "speed").then_some(Value::Float(self.speed))
+    }
+
+    fn validate_property(
+        &self,
+        _ctx: &rve_sdk::Context<'_>,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        if name == "speed" && matches!(value, Value::Float(speed) if *speed > 7.0) {
+            return Err("speed above 7 is rejected".to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+
+    fn on_update(&mut self, _ctx: &mut rve_sdk::Context<'_>, _dt: f32) {
+        self.speed += 1.0;
+    }
+}
+
+impl Script for LaterPropertyValidationProbe {
+    fn get_property(&self, _ctx: &rve_sdk::Context<'_>, name: &str) -> Option<Value> {
+        match name {
+            "speed" => Some(Value::Float(self.speed)),
+            "later" => Some(Value::String("invalid".to_owned())),
+            _ => None,
+        }
+    }
+
+    fn set_property(&mut self, _ctx: &mut rve_sdk::Context<'_>, name: &str, value: Value) {
+        PROPERTY_SETTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        if name == "speed"
+            && let Value::Float(speed) = value
+        {
+            self.speed = speed;
+        }
+    }
+}
+
+impl Drop for LaterPropertyValidationProbe {
+    fn drop(&mut self) {
+        REJECTED_PROPERTY_SPEED_BITS.store(self.speed.to_bits(), Ordering::SeqCst);
+    }
+}
+
+const PROPERTY_DRIVER: &str = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("camera"):script("PropertyProbe"):set("speed", 4)
+end
+return Script
+"#;
+
+const PROPERTY_OWNER_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("StatefulPropertyProbe")
+  rve.log_info("owner property " .. tostring(target:get("speed")))
+end
+return Script
+"#;
+
+const STATEFUL_PROPERTY_DRIVER: &str = r#"
+local Script = {}
+local did_set = false
+function Script:on_update()
+  if not did_set then
+    local target = rve.find("target"):script("StatefulPropertyProbe")
+    target:set("speed", 4)
+    did_set = true
+  end
+end
+return Script
+"#;
+
+const REJECTING_PROPERTY_DRIVER: &str = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("target"):script("RejectingPropertyProbe"):set("speed", 4)
+end
+return Script
+"#;
+
+const REJECTING_PROPERTY_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("RejectingPropertyProbe")
+  rve.log_info("rejected owner property " .. tostring(target:get("speed")))
+end
+return Script
+"#;
+
+const ADVANCING_REJECTING_PROPERTY_DRIVER: &str = r#"
+local Script = {}
+local frame = 0
+function Script:on_update()
+  frame = frame + 1
+  if frame == 1 then
+    rve.find("target"):script("AdvancingRejectingPropertyProbe"):set("speed", 4)
+  elseif frame == 2 then
+    rve.find("target"):script("AdvancingRejectingPropertyProbe"):set("speed", 8)
+  end
+end
+return Script
+"#;
+
+const ADVANCING_REJECTING_PROPERTY_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("AdvancingRejectingPropertyProbe")
+  rve.log_info("rollback owner property " .. tostring(target:get("speed")))
+end
+return Script
+"#;
+
+const LUA_PROPERTY_OWNER: &str = r#"
+local Script = {
+  properties = { speed = { type = "float", default = 1.5, min = 0, max = 10 } },
+}
+function Script:on_update()
+  self.params.speed = self.params.speed + 1
+  self.params.internal = "private"
+end
+return Script
+"#;
+
+const LUA_PROPERTY_OWNER_INTEGER: &str = r#"
+local Script = {
+  properties = { speed = { type = "float", default = 1.5, min = 0, max = 10 } },
+}
+local initialized = false
+function Script:on_update()
+  if initialized then
+    rve.log_info("lua stored property " .. tostring(self.params.speed))
+  else
+    self.params.speed = 2
+    initialized = true
+  end
+end
+return Script
+"#;
+
+const LUA_PROPERTY_OWNER_FAILS: &str = r#"
+local Script = {
+  properties = { speed = { type = "float", default = 1.5, min = 0, max = 10 } },
+}
+local did_fail = false
+function Script:on_update()
+  if not did_fail then
+    self.params.speed = 4
+    did_fail = true
+    error("reject after staging property")
+  end
+end
+return Script
+"#;
+
+const LUA_PROPERTY_READER: &str = r#"
+local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("/owner.lua")
+  rve.log_info("lua owner property " .. tostring(target:get("speed")))
+  local ok, message = pcall(function() return target:get("internal") end)
+  rve.log_info("lua undeclared " .. tostring(ok) .. " " .. tostring(message))
+end
+return Script
+"#;
+
+#[test]
+fn abi_property_write_reaches_the_heavy_instance_before_its_next_callback() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+"#,
+    );
+    let sources = BTreeMap::from([("driver.lua".to_owned(), PROPERTY_DRIVER.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let messages = message_list(&mut host);
+    assert!(
+        messages.iter().any(|message| message == "probe speed 4"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn script_ref_get_observes_rust_owner_changes_after_the_callback_commits() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "StatefulPropertyProbe"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([("reader.lua".to_owned(), PROPERTY_OWNER_READER.to_owned())]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "owner property 2.5"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn external_property_write_and_rust_owner_getter_share_one_value() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "StatefulPropertyProbe"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        ("driver.lua".to_owned(), STATEFUL_PROPERTY_DRIVER.to_owned()),
+        ("reader.lua".to_owned(), PROPERTY_OWNER_READER.to_owned()),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "owner property 5.0"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn rejected_heavy_property_write_runs_no_setter_and_preserves_owner_and_mirror() {
+    let _guard = test_lock();
+    REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "RejectingPropertyProbe"
+params = { speed = 1.5 }
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            REJECTING_PROPERTY_DRIVER.to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            REJECTING_PROPERTY_READER.to_owned(),
+        ),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message.contains("speed above 3 is rejected")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rejected owner property 1.5"),
+        "{events:?}"
+    );
+
+    drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
+        1.5_f64.to_bits(),
+        "rejected validation leaves the Rust owner's state unchanged"
+    );
+}
+
+#[test]
+fn failed_heavy_property_setter_restores_the_last_committed_owner_value() {
+    let _guard = test_lock();
+    REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "AdvancingRejectingPropertyProbe"
+params = { speed = 1.5 }
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            ADVANCING_REJECTING_PROPERTY_DRIVER.to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            ADVANCING_REJECTING_PROPERTY_READER.to_owned(),
+        ),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    for _ in 0..3 {
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    }
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message.contains("speed above 7 is rejected")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rollback owner property 5.0"),
+        "{events:?}"
+    );
+
+    drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
+        5.0_f64.to_bits(),
+        "the rejected second write leaves the last accepted value"
+    );
+}
+
+#[test]
+fn later_property_schema_failure_happens_before_any_custom_setter() {
+    let _guard = test_lock();
+    PROPERTY_SETTER_CALLS.store(0, Ordering::SeqCst);
+    REJECTED_PROPERTY_SPEED_BITS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "LaterPropertyValidationProbe"
+params = { speed = 1.5, later = 2.5 }
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_start()
+  rve.find("target"):script("LaterPropertyValidationProbe"):set("speed", 4)
+end
+return Script"#
+                .to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_update()
+  local target = rve.find("target"):script("LaterPropertyValidationProbe")
+  rve.log_info("preflight properties " .. tostring(target:get("speed")) .. " " .. tostring(target:get("later")))
+end
+return Script"#
+                .to_owned(),
+        ),
+    ]);
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&library)).unwrap();
+
+    for _ in 0..3 {
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    }
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message.contains("later")
+                && event.message.contains("тип float")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "preflight properties 1.5 2.5"),
+        "{events:?}"
+    );
+    drop(host);
+    assert_eq!(PROPERTY_SETTER_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        REJECTED_PROPERTY_SPEED_BITS.load(Ordering::SeqCst),
+        1.5_f64.to_bits()
+    );
+}
+
+#[test]
+fn script_ref_get_observes_declared_lua_params_after_the_callback_commits() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/owner.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/owner.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        ("owner.lua".to_owned(), LUA_PROPERTY_OWNER.to_owned()),
+        ("reader.lua".to_owned(), LUA_PROPERTY_READER.to_owned()),
+    ]);
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua owner property 2.5"),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.message.contains("lua undeclared false")
+                && event.message.contains("is not declared by the script")
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn lua_owner_params_use_the_schema_coerced_value_after_commit() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/owner.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/owner.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "owner.lua".to_owned(),
+            LUA_PROPERTY_OWNER_INTEGER.to_owned(),
+        ),
+        ("reader.lua".to_owned(), LUA_PROPERTY_READER.to_owned()),
+    ]);
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua owner property 2.0"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua stored property 2.0"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn failed_lua_callback_rolls_back_declared_params_before_script_ref_reads() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/owner.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.lite_scripts]]
+path = "/owner.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        ("owner.lua".to_owned(), LUA_PROPERTY_OWNER_FAILS.to_owned()),
+        ("reader.lua".to_owned(), LUA_PROPERTY_READER.to_owned()),
+    ]);
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "lua owner property 1.5"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("reject after staging property")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn abi_script_ref_reports_undeclared_property_details_to_failed_callbacks() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+[[objects]]
+id = "reader"
+[[objects.heavy_scripts]]
+name = "InvalidScriptRefProbe"
+"#,
+    );
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message == "property \"missing\" is not declared by the script"
+        }),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn abi_script_ref_reports_stale_instance_details_to_failed_callbacks() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+[[objects]]
+id = "reader"
+[[objects.heavy_scripts]]
+name = "StaleScriptRefProbe"
+"#,
+    );
+    let library = library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event.message == "script instance is no longer alive"
+        }),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn legacy_heavy_property_writes_are_rejected_before_they_change_the_mirror() {
+    let _guard = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/driver.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "target"
+[[objects.heavy_scripts]]
+name = "PropertyProbe"
+params = { speed = 1.5 }
+[[objects]]
+id = "driver"
+[[objects.lite_scripts]]
+path = "/driver.lua"
+[[objects]]
+id = "reader"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+"#,
+    );
+    let sources = BTreeMap::from([
+        (
+            "driver.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_update()
+  local accepted, result = pcall(function()
+    return rve.find("target"):script("PropertyProbe"):set("speed", 4)
+  end)
+  rve.log_info("legacy property write " .. tostring(accepted) .. " " .. tostring(result))
+end
+return Script"#
+                .to_owned(),
+        ),
+        (
+            "reader.lua".to_owned(),
+            r#"local Script = {}
+function Script:on_update()
+  local speed = rve.find("target"):script("PropertyProbe"):get("speed")
+  rve.log_info("legacy property value " .. tostring(speed))
+end
+return Script"#
+                .to_owned(),
+        ),
+    ]);
+    let legacy = legacy_library(21);
+    let mut host = ScriptHost::load(&world, "scene", &sources, Some(&legacy)).unwrap();
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let messages = message_list(&mut host);
+    assert!(
+        messages.iter().any(|message| {
+            message.starts_with("legacy property write false")
+                && message.contains("target script does not support external property writes")
+        }),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "legacy property value 1.5")
+    );
+    assert!(
+        messages.iter().all(|message| message == "probe speed 1.5"
+            || message.starts_with("legacy property write false")
+            || message == "legacy property value 1.5"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn abi_v20_module_loads_on_the_v22_host_and_runs_without_property_writes() {
+    let _guard = test_lock();
+    run_legacy_descriptor_module_without_property_writes(20);
+}
+
+/// ABI v21 (save callbacks, historical descriptor layout) must not be read as the wide v22
+/// descriptor: its exact-sized table would be overread otherwise.
+#[test]
+fn abi_v21_module_loads_on_the_v22_host_and_runs_without_property_writes() {
+    let _guard = test_lock();
+    run_legacy_descriptor_module_without_property_writes(21);
+}
+
+fn run_legacy_descriptor_module_without_property_writes(abi_version: u32) {
+    let library = legacy_library(abi_version);
+    assert!(library.script("Probe").unwrap().set_property.is_none());
+
+    let mut world = scripted_world("Probe", "{}");
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    let messages = message_list(&mut host);
+    assert!(
+        messages.iter().any(|message| message == "start:default"),
+        "ABI v{abi_version} descriptors load and run on the ABI v22 host: {messages:?}"
+    );
+}
+
+fn legacy_library(abi_version: u32) -> crate::ScriptLibrary {
+    let current = sdk_module();
+    // SAFETY: the SDK macro owns an immutable descriptor table for the process lifetime.
+    let current_descriptors =
+        unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV20] = Box::leak(
+        current_descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV20 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+                on_fixed_update: descriptor.on_fixed_update,
+                on_late_update: descriptor.on_late_update,
+                on_timer: descriptor.on_timer,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }));
+    // SAFETY: the module and exact-sized v20 descriptor array are leaked for the test lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    assert_eq!(library.abi_version(), abi_version);
+    library
 }

@@ -3,8 +3,8 @@ use crate::actions::InputActions;
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lifecycle::{
     Lifecycle, MAX_SPAWNED_OBJECTS_PER_FRAME, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSlot,
-    PrefabStatus, SpawnArgs, SpawnRequest, SpawnedObject, WorldChanges, check_spawn_request,
-    prefab_display, prefab_key,
+    PrefabSpec, PrefabStatus, SpawnArgs, SpawnRequest, SpawnedObject, WorldChanges,
+    check_spawn_request, prefab_display, prefab_key,
 };
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LitePhysicsEvent,
@@ -15,6 +15,9 @@ use crate::net::{
     networked_template, validate_message,
 };
 use crate::physics::PhysicsScriptState;
+use crate::save_writer::SaveWriter;
+use crate::scene_state::{SceneState, SharedSceneState, canonical_scene_path};
+use crate::script_refs::{ScriptRefCapabilities, ScriptRefEntry, ScriptRefs};
 use crate::timeline::{CoroutineWait, DueTimer, ScriptCoroutine, ScriptTimeline, TimerCallback};
 use crate::transaction::{
     MAX_MESSAGE_BYTES_PER_FRAME, MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage,
@@ -37,14 +40,15 @@ use engine_project::InputSettings;
 use engine_scene::{
     AnimationRequest, AudioRequest, ComponentKind, LocalTransform, NetEvent, NetId, NetMode,
     NetRequest, ObjectHandle, ParamKind, ParamSchema, ParamValue, PeerId, PrefabTemplate,
-    RigidBodyKind, SpawnOptions, World,
+    RigidBodyKind, SceneReplacement, SpawnOptions, World,
 };
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
-use rve_sdk::abi::RveScriptDesc;
+use rve_sdk::abi::{RVE_PROPERTY_PHASE_COMMIT, RVE_PROPERTY_PHASE_VALIDATE, RveScriptDesc};
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -208,6 +212,17 @@ pub struct ScriptHost {
     commands: LuaCommands,
     commands_generation: CommandGeneration,
     transaction: ScriptTransaction,
+    /// Справочник экземпляров для `obj:script`; общий с транзакциями.
+    script_refs: ScriptRefs,
+    /// Объявленные сцены проекта, текущая сцена и запрос `rve.scene.load`; общие с транзакциями.
+    scene_state: SharedSceneState,
+    save_values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
+    save_flush_requested: Rc<Cell<bool>>,
+    save_generation: Rc<Cell<u64>>,
+    save_writer: Option<SaveWriter>,
+    persisted_save_generation: u64,
+    pending_save_generations: BTreeSet<u64>,
+    save_write_failed: bool,
     timeline: Rc<RefCell<ScriptTimeline>>,
     time_scale: Rc<Cell<f32>>,
     fixed_step: FixedStepClock,
@@ -424,6 +439,9 @@ impl ScriptHost {
         let commands_generation = Rc::new(Cell::new(0));
         let timeline = Rc::new(RefCell::new(ScriptTimeline::default()));
         let time_scale = Rc::new(Cell::new(1.0));
+        let save_values = Rc::new(RefCell::new(BTreeMap::new()));
+        let save_flush_requested = Rc::new(Cell::new(false));
+        let save_generation = Rc::new(Cell::new(0));
         let call_deadline = lite::CallDeadline::new(call_time_limit, interrupt.interrupted.clone());
         let lua_state = lite::create_lua(
             events.clone(),
@@ -441,8 +459,20 @@ impl ScriptHost {
         let loaded_library = library.and_then(ScriptLibrary::shared_library);
         let heavy = library.map(heavy_scripts).unwrap_or_default();
         let heavy_abi_version = library.map_or(0, ScriptLibrary::abi_version);
+        let script_refs = ScriptRefs::default();
         let mut transaction = ScriptTransaction::with_ui(ui.clone());
+        transaction.attach_script_refs(script_refs.clone());
+        let scene_state = Rc::new(RefCell::new(SceneState {
+            current: scene_name.to_owned(),
+            ..SceneState::default()
+        }));
+        transaction.attach_scene_state(scene_state.clone());
         transaction.attach_time_state(timeline.clone(), time_scale.clone());
+        transaction.attach_save_state(
+            save_values.clone(),
+            save_flush_requested.clone(),
+            save_generation.clone(),
+        );
         let fixed_step = FixedStepClock::new(60, 8).expect("default fixed-step config is valid");
         let mut host = Self {
             lua,
@@ -464,6 +494,15 @@ impl ScriptHost {
             commands,
             commands_generation,
             transaction,
+            script_refs,
+            scene_state,
+            save_values,
+            save_flush_requested,
+            save_generation,
+            save_writer: None,
+            persisted_save_generation: 0,
+            pending_save_generations: BTreeSet::new(),
+            save_write_failed: false,
             timeline,
             time_scale,
             fixed_step,
@@ -573,6 +612,16 @@ impl ScriptHost {
                         object_id: &object.id,
                         object_name: &object.name,
                         params: &params,
+                        property_names: schema
+                            .as_ref()
+                            .map(|schema| {
+                                schema
+                                    .specs()
+                                    .iter()
+                                    .map(|spec| spec.name.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         transform,
                         object_refs: &object_refs,
                         object_handle: object.handle,
@@ -584,6 +633,17 @@ impl ScriptHost {
                     message: error.to_string(),
                 })?;
                 let serial = host.next_serial();
+                host.register_script_ref(
+                    serial,
+                    object.handle,
+                    path,
+                    schema.as_ref(),
+                    &params,
+                    ScriptRefCapabilities {
+                        property_write_supported: true,
+                        enabled: script.enabled,
+                    },
+                );
                 host.insert_instance(ScriptInstance {
                     handle: object.handle,
                     source: event_source(scene_name, &object.id, path),
@@ -678,6 +738,17 @@ impl ScriptHost {
                             });
                         }
                     };
+                    host.register_script_ref(
+                        serial,
+                        object.handle,
+                        &script.name,
+                        schema.as_ref(),
+                        &params,
+                        ScriptRefCapabilities {
+                            property_write_supported: descriptor.set_property.is_some(),
+                            enabled: script.enabled,
+                        },
+                    );
                     host.instances[owner] = Some(ScriptInstance {
                         handle: object.handle,
                         source,
@@ -708,6 +779,53 @@ impl ScriptHost {
     /// at the next phase or lite-call boundary; ABI scripts continue to run.
     pub fn interrupt_handle(&self) -> ScriptInterruptHandle {
         self.interrupt.clone()
+    }
+
+    /// Replaces save values before callbacks start. Save files are owned by the runtime host.
+    pub fn set_save_values(&mut self, values: BTreeMap<String, ParamValue>) -> Result<(), String> {
+        if self.started {
+            return Err("save values can only be loaded before scripts start".to_owned());
+        }
+        crate::transaction::validate_save_values(&values)?;
+        *self.save_values.borrow_mut() = values;
+        Ok(())
+    }
+
+    /// Loads this project's save file and enables asynchronous persistence before callbacks start.
+    pub fn load_save_file(&mut self, path: &Path) -> Result<(), String> {
+        if self.started || self.destroyed || self.save_writer.is_some() {
+            return Err("save file must be attached once before scripts start".to_owned());
+        }
+        let (writer, values) = match SaveWriter::open(path) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.report_save_failure(format!(
+                    "save persistence unavailable; using in-memory data and leaving the file unchanged: {error}"
+                ));
+                return Err(error);
+            }
+        };
+        self.set_save_values(values)?;
+        self.persisted_save_generation = self.save_generation();
+        self.pending_save_generations.clear();
+        self.save_writer = Some(writer);
+        self.report_save_recovered();
+        Ok(())
+    }
+
+    /// Returns the committed save data for persistence by the runtime.
+    pub fn save_values(&self) -> BTreeMap<String, ParamValue> {
+        self.save_values.borrow().clone()
+    }
+
+    /// Generation of committed save mutations, for nonblocking persistence outside callbacks.
+    pub fn save_generation(&self) -> u64 {
+        self.save_generation.get()
+    }
+
+    /// Whether an explicit `save.flush()` request was committed since the last check.
+    pub fn take_save_flush_requested(&self) -> bool {
+        self.save_flush_requested.replace(false)
     }
 
     /// Replaces the input snapshot used by the next update and its lifecycle callbacks.
@@ -785,6 +903,146 @@ impl ScriptHost {
                 ),
             });
         }
+        self.check_prefab_template(world, &template, sources)?;
+
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        let slot = lifecycle
+            .prefabs
+            .get_mut(&key)
+            .expect("prefab slot was checked above");
+        slot.register(template);
+        slot.status = match kind {
+            PrefabKind::Fast => PrefabStatus::Resident,
+            PrefabKind::Heavy => PrefabStatus::Loaded,
+        };
+        if kind == PrefabKind::Heavy {
+            let waiting = std::mem::take(&mut lifecycle.waiting);
+            let (ready, rest): (Vec<SpawnRequest>, Vec<SpawnRequest>) = waiting
+                .into_iter()
+                .partition(|request| request.prefab == key);
+            lifecycle.waiting = rest;
+            lifecycle.queued.extend(ready);
+            lifecycle.begin_unload_if_idle(path);
+        }
+        Ok(())
+    }
+
+    /// Проверяет быстрые префабы сцены, которую загружает `rve.scene.load`, не меняя состояние
+    /// префабов. Слоты `catalog`, которых ещё нет, попадут в список; тяжёлый слот с тем же путём
+    /// — отказ, потому что проектный список считает префаб тяжёлым. Шаблон уже резидентного
+    /// префаба пропускается: экземпляры прежней сцены живут со своим шаблоном. Классы, которые
+    /// скомпилированы для проверки, попадают в кеш; кеш не виден скриптам.
+    pub fn check_scene_prefabs(
+        &mut self,
+        world: &World,
+        catalog: &PrefabCatalog,
+        templates: &BTreeMap<String, Arc<PrefabTemplate>>,
+        sources: &BTreeMap<String, String>,
+    ) -> Result<ScenePrefabs, ScriptLoadError> {
+        let mut slots = Vec::new();
+        {
+            let lifecycle = self.lifecycle.borrow();
+            for (path, spec) in catalog.iter() {
+                let key = prefab_key(path).map_err(|message| ScriptLoadError::Prefab {
+                    path: path.to_owned(),
+                    message,
+                })?;
+                match lifecycle.prefabs.get(&key) {
+                    Some(slot) if slot.kind != PrefabKind::Fast => {
+                        return Err(ScriptLoadError::Prefab {
+                            path: prefab_display(&key),
+                            message: "the scene declares the prefab as fast, but the project lists it as heavy".to_owned(),
+                        });
+                    }
+                    Some(_) => {}
+                    None if spec.kind == PrefabKind::Fast => slots.push((key, spec)),
+                    None => {
+                        return Err(ScriptLoadError::Prefab {
+                            path: prefab_display(&key),
+                            message: "the prefab is not in the project prefab list".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        let mut registrations = Vec::new();
+        for (path, template) in templates {
+            let key = prefab_key(path).map_err(|message| ScriptLoadError::Prefab {
+                path: path.to_owned(),
+                message,
+            })?;
+            let status = {
+                let lifecycle = self.lifecycle.borrow();
+                lifecycle
+                    .prefabs
+                    .get(&key)
+                    .map(|slot| (slot.kind, slot.status))
+            };
+            let status = match status {
+                Some(status) => status,
+                None => {
+                    let planned = slots.iter().any(|(slot, _)| *slot == key);
+                    if !planned {
+                        return Err(ScriptLoadError::Prefab {
+                            path: prefab_display(&key),
+                            message: "the prefab is not in the project prefab list".to_owned(),
+                        });
+                    }
+                    (PrefabKind::Fast, PrefabStatus::Unloaded)
+                }
+            };
+            match status {
+                (PrefabKind::Fast, PrefabStatus::Resident) => continue,
+                (PrefabKind::Fast, PrefabStatus::Unloaded) => {}
+                (PrefabKind::Heavy, _) => {
+                    return Err(ScriptLoadError::Prefab {
+                        path: prefab_display(&key),
+                        message: "the scene declares the prefab as fast, but the project lists it as heavy".to_owned(),
+                    });
+                }
+                (_, other) => {
+                    return Err(ScriptLoadError::Prefab {
+                        path: prefab_display(&key),
+                        message: format!(
+                            "the prefab is {}, not waiting for registration",
+                            other.as_str()
+                        ),
+                    });
+                }
+            }
+            self.check_prefab_template(world, template, sources)?;
+            registrations.push((key, Arc::clone(template)));
+        }
+        Ok(ScenePrefabs {
+            slots,
+            templates: registrations,
+        })
+    }
+
+    /// Применяет проверенные [`ScenePrefabs`]. Отказа не бывает: проверка прошла на этом же
+    /// состоянии, а слоты не удаляются между проверкой и применением.
+    pub fn apply_scene_prefabs(&mut self, prefabs: ScenePrefabs) {
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        for (key, spec) in prefabs.slots {
+            lifecycle.prefabs.insert(key, PrefabSlot::new(spec));
+        }
+        for (key, template) in prefabs.templates {
+            let slot = lifecycle
+                .prefabs
+                .get_mut(&key)
+                .expect("prefab slot was checked before the scene switch");
+            slot.register(template);
+            slot.status = PrefabStatus::Resident;
+        }
+    }
+
+    /// Компилирует недостающие классы шаблона и проверяет его параметры и ссылки по `world`.
+    fn check_prefab_template(
+        &mut self,
+        world: &World,
+        template: &PrefabTemplate,
+        sources: &BTreeMap<String, String>,
+    ) -> Result<(), ScriptLoadError> {
         for (script_path, source) in sources {
             if self.classes.contains_key(script_path) {
                 continue;
@@ -847,26 +1105,6 @@ impl ScriptHost {
                 })?;
             }
         }
-
-        let mut lifecycle = self.lifecycle.borrow_mut();
-        let slot = lifecycle
-            .prefabs
-            .get_mut(&key)
-            .expect("prefab slot was checked above");
-        slot.register(template);
-        slot.status = match kind {
-            PrefabKind::Fast => PrefabStatus::Resident,
-            PrefabKind::Heavy => PrefabStatus::Loaded,
-        };
-        if kind == PrefabKind::Heavy {
-            let waiting = std::mem::take(&mut lifecycle.waiting);
-            let (ready, rest): (Vec<SpawnRequest>, Vec<SpawnRequest>) = waiting
-                .into_iter()
-                .partition(|request| request.prefab == key);
-            lifecycle.waiting = rest;
-            lifecycle.queued.extend(ready);
-            lifecycle.begin_unload_if_idle(path);
-        }
         Ok(())
     }
 
@@ -917,6 +1155,188 @@ impl ScriptHost {
                 &request,
                 format!("prefab {:?} failed to load: {error}", prefab_display(&key)),
             );
+        }
+    }
+
+    /// Задаёт включённые сцены проекта: только они могут стать целью `rve.scene.load`.
+    /// Пути принимаются с ведущим слешем и без него; неверный путь возвращает ошибку и список
+    /// не меняет.
+    pub fn set_enabled_scenes(&mut self, paths: &[String]) -> Result<(), String> {
+        let canonical = paths
+            .iter()
+            .map(|path| canonical_scene_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.scene_state.borrow_mut().enabled = canonical;
+        Ok(())
+    }
+
+    /// Имя текущей сцены: путь, с которым она загружена или на который заменена.
+    pub fn current_scene(&self) -> String {
+        self.scene_state.borrow().current.clone()
+    }
+
+    /// Запрос `rve.scene.load` или `ctx.load_scene`, принятый последним кадром. Его должен
+    /// выполнить вызывающий код после кадра: загрузить сцену и передать её в [`Self::replace_scene`].
+    pub fn take_scene_request(&mut self) -> Option<String> {
+        self.scene_state.borrow_mut().request.take()
+    }
+
+    /// Пишет Error, если вызывающий код не смог загрузить запрошенную сцену. Текущая сцена не меняется.
+    pub fn report_scene_failure(&mut self, path: &str, message: &str) {
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Error,
+            source: self.scene_name.clone(),
+            message: format!("failed to load scene {path:?}: {message}"),
+        });
+    }
+
+    /// Заменяет несохраняемую часть текущей сцены сценой `scene` (см. [`World::replace_nonpersistent`]).
+    ///
+    /// Порядок: проверка мира и классов новой сцены, затем создание её экземпляров на копии мира.
+    /// Любой отказ до этого шага оставляет текущую сцену без изменений. Затем `on_disable` и
+    /// `on_destroy` получают несохраняемые экземпляры, мир заменяется, учёт удалённых объектов
+    /// обновляется. Сохраняемые объекты и их экземпляры сохраняют хендлы, таймеры, корутины,
+    /// свойства и звук.
+    pub fn replace_scene(
+        &mut self,
+        world: &mut World,
+        scene: World,
+        sources: &BTreeMap<String, String>,
+        scene_name: &str,
+        time: ScriptTime,
+    ) -> Result<SceneReplacement, String> {
+        world
+            .check_scene_replacement(&scene)
+            .map_err(|error| error.to_string())?;
+        for object in scene.objects() {
+            for script in &object.heavy_scripts {
+                if !self.heavy.contains_key(&script.name) {
+                    return Err(format!(
+                        "object {:?}: heavy script {:?} is not registered",
+                        object.id, script.name
+                    ));
+                }
+            }
+            for script in &object.lite_scripts {
+                let path = script.path.as_str();
+                if self.classes.contains_key(path) {
+                    continue;
+                }
+                let source = sources
+                    .get(path)
+                    .ok_or_else(|| format!("lite script {path:?} source was not provided"))?;
+                let class = self.compile_registered_class(world, path, source)?;
+                self.classes.insert(path.to_owned(), class);
+            }
+        }
+
+        // Экземпляры новой сцены создаются на копии, где несохраняемая часть уже заменена:
+        // их хендлы совпадают с теми, что получит настоящий мир при замене ниже.
+        let previous_name = std::mem::replace(&mut self.scene_name, scene_name.to_owned());
+        let mut trial = world.clone();
+        let planned = match trial.replace_nonpersistent(scene.clone()) {
+            Ok(planned) => planned,
+            Err(error) => {
+                self.scene_name = previous_name;
+                return Err(error.to_string());
+            }
+        };
+        if let Err(message) = self.create_instances(&mut trial, &planned.added) {
+            self.scene_name = previous_name;
+            return Err(message);
+        }
+
+        let roots = world
+            .objects()
+            .iter()
+            .filter(|object| !object.keep_on_load && object.parent.is_none())
+            .map(|object| object.handle)
+            .collect::<Vec<_>>();
+        let doomed: HashSet<ObjectHandle> = world.subtree(&roots).into_iter().collect();
+        let doomed_ids: HashSet<String> = doomed
+            .iter()
+            .filter_map(|handle| world.object(*handle))
+            .map(|object| object.id.clone())
+            .collect();
+        self.retire_bodies(world, &doomed);
+        self.call_destroy_instances(world, &doomed, time);
+        // Проверка и план выполнены выше на копии с теми же слотами: отказ здесь означает ошибку
+        // в инварианте, а не в данных сцены. Экземпляры новой сцены уже созданы, поэтому
+        // отказ не оставляет полуприменённого состояния и должен остановить процесс.
+        let replacement = world
+            .replace_nonpersistent(scene)
+            .expect("scene replacement was validated on a copy of the world before teardown");
+        assert_eq!(
+            replacement.added, planned.added,
+            "scene replacement must assign the handles planned on the copy"
+        );
+        self.cancel_requests_of(world, &previous_name, &doomed, &doomed_ids);
+        self.forget_despawned(&replacement.removed);
+        self.rename_script_sources(&previous_name, scene_name);
+        {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            lifecycle
+                .changes
+                .despawned
+                .extend(replacement.removed.iter().copied());
+            lifecycle.changes.scene_replaced = Some(replacement.clone());
+        }
+        self.scene_state.borrow_mut().current = scene_name.to_owned();
+        Ok(replacement)
+    }
+
+    /// Снимает заявки spawn и destroy, поставленные скриптами удаляемых объектов. Источник заявки
+    /// имеет вид `сцена/объект/скрипт`; заявки сохраняемых объектов остаются в очереди.
+    fn cancel_requests_of(
+        &mut self,
+        world: &World,
+        previous: &str,
+        doomed: &HashSet<ObjectHandle>,
+        doomed_ids: &HashSet<String>,
+    ) {
+        let owned = |source: &str| {
+            source
+                .strip_prefix(previous)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .and_then(|rest| rest.split('/').next())
+                .is_some_and(|id| doomed_ids.contains(id))
+        };
+        let (cancelled, kept_queued, kept_waiting) = {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            let (queued_cancelled, queued_kept): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut lifecycle.queued)
+                    .into_iter()
+                    .partition(|request| owned(&request.source));
+            let (waiting_cancelled, waiting_kept): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut lifecycle.waiting)
+                    .into_iter()
+                    .partition(|request| owned(&request.source));
+            lifecycle
+                .destroys
+                .retain(|request| !doomed.contains(&request.handle));
+            let cancelled = queued_cancelled
+                .into_iter()
+                .chain(waiting_cancelled)
+                .collect::<Vec<_>>();
+            (cancelled, queued_kept, waiting_kept)
+        };
+        {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            lifecycle.queued = kept_queued.into_iter().collect();
+            lifecycle.waiting = kept_waiting;
+        }
+        for request in cancelled {
+            self.release_spawn(world, &request);
+        }
+    }
+
+    /// Переименовывает источники экземпляров сохраняемых объектов на имя новой сцены.
+    fn rename_script_sources(&mut self, previous: &str, next: &str) {
+        let prefix = format!("{previous}/");
+        for instance in self.instances.iter_mut().flatten() {
+            if let Some(rest) = instance.source.strip_prefix(&prefix) {
+                instance.source = format!("{next}/{rest}");
+            }
         }
     }
 
@@ -1029,6 +1449,7 @@ impl ScriptHost {
         self.open_scene_canvases(world);
         self.sync_activity(world, time, u64::MAX);
         self.apply_lifecycle(world, time);
+        self.persist_save_changes();
     }
 
     /// Runs on_update for enabled instances, starting the host first if needed.
@@ -1093,6 +1514,7 @@ impl ScriptHost {
         self.fire_timers(world, time);
         self.sync_phase_boundary(world, time);
         self.run_phase(world, Phase::LateUpdate(frame_time.dt), time);
+        self.persist_save_changes();
     }
 
     /// Возвращает время последнего `update` по фазам; `Start` и `Destroy` сюда не входят.
@@ -1118,6 +1540,107 @@ impl ScriptHost {
         self.due_coroutines.clear();
         self.remove_all_commands();
         self.release_all_pending(world);
+        self.process_save_acknowledgements();
+        if let Some(writer) = self.save_writer.take() {
+            let generation = self.save_generation();
+            match writer.finish(generation, self.save_values()) {
+                Ok(()) => {
+                    self.persisted_save_generation = self.persisted_save_generation.max(generation);
+                    self.pending_save_generations
+                        .retain(|pending| *pending > generation);
+                    self.report_save_recovered();
+                }
+                Err(error) => self.report_save_failure(format!("final save flush failed: {error}")),
+            }
+        }
+    }
+
+    fn persist_save_changes(&mut self) {
+        self.process_save_acknowledgements();
+        let generation = self.save_generation();
+        if generation != self.persisted_save_generation
+            && !self.pending_save_generations.contains(&generation)
+            && let Some(writer) = self.save_writer.as_ref()
+        {
+            match writer.snapshot(generation, self.save_values()) {
+                Ok(true) => {
+                    self.pending_save_generations.insert(generation);
+                }
+                Ok(false) => {}
+                Err(error) => self.report_save_failure(error),
+            }
+        }
+        if self.take_save_flush_requested() {
+            if let Some(writer) = self.save_writer.as_ref() {
+                let result = writer.flush(generation, self.save_values());
+                self.process_save_acknowledgements();
+                match result {
+                    Ok(()) => {
+                        self.persisted_save_generation =
+                            self.persisted_save_generation.max(generation);
+                        self.pending_save_generations
+                            .retain(|pending| *pending > generation);
+                        self.report_save_recovered();
+                    }
+                    Err(error) => {
+                        self.report_save_failure(format!("explicit save flush failed: {error}"))
+                    }
+                }
+            } else {
+                self.report_save_failure(
+                    "save.flush() was requested without a save path; data remains in memory"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    fn process_save_acknowledgements(&mut self) {
+        let acknowledgements = self
+            .save_writer
+            .as_ref()
+            .map(SaveWriter::drain_acknowledgements)
+            .unwrap_or_default();
+        for acknowledgement in acknowledgements {
+            self.pending_save_generations
+                .remove(&acknowledgement.generation);
+            match acknowledgement.result {
+                Ok(()) => {
+                    self.persisted_save_generation = self
+                        .persisted_save_generation
+                        .max(acknowledgement.generation);
+                    self.report_save_recovered();
+                }
+                Err(error) => self.report_save_failure(format!(
+                    "save snapshot generation {} failed: {error}",
+                    acknowledgement.generation
+                )),
+            }
+        }
+    }
+
+    fn report_save_failure(&mut self, message: String) {
+        if self.save_write_failed {
+            return;
+        }
+        self.save_write_failed = true;
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Error,
+            source: self.scene_name.clone(),
+            message,
+        });
+    }
+
+    fn report_save_recovered(&mut self) {
+        if !self.save_write_failed {
+            return;
+        }
+        self.save_write_failed = false;
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Info,
+            source: self.scene_name.clone(),
+            message: "save persistence recovered".to_owned(),
+        });
     }
 
     /// Takes all log and runtime-error events accumulated since the previous drain.
@@ -1809,6 +2332,7 @@ impl ScriptHost {
                 };
                 let is_target = match message.target {
                     MessageTarget::Object(handle) => instance.handle == handle,
+                    MessageTarget::Instance { serial, .. } => instance.serial == serial,
                     MessageTarget::Broadcast => true,
                 };
                 if !instance.enabled || !instance.running || !is_target {
@@ -2353,6 +2877,7 @@ impl ScriptHost {
         }
         let Self {
             instances,
+            script_refs,
             events,
             active_source,
             active_call,
@@ -2414,6 +2939,7 @@ impl ScriptHost {
             _ => None,
         });
         let transaction_ptr = transaction as *mut ScriptTransaction;
+        let mut lua_properties_after = None;
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
             ScriptKind::Lite(lite_instance) => {
                 *active_source.borrow_mut() = instance.source.clone();
@@ -2444,6 +2970,33 @@ impl ScriptHost {
                         return CallOutcome::Failed(error.to_string());
                     }
                 };
+                // Только свойства, записанные другим скриптом: собственные записи `self.params`
+                // Lua-таблица хранит сама и не должна откатываться к значению зеркала.
+                let pending_params = {
+                    let mut refs = script_refs.borrow_mut();
+                    refs.iter_mut()
+                        .find(|entry| {
+                            entry.serial == instance.serial && !entry.dirty_properties.is_empty()
+                        })
+                        .map(|entry| {
+                            let dirty = std::mem::take(&mut entry.dirty_properties);
+                            dirty
+                                .iter()
+                                .filter_map(|name| {
+                                    entry
+                                        .properties
+                                        .get(name)
+                                        .map(|value| (name.clone(), value.clone()))
+                                })
+                                .collect::<BTreeMap<_, _>>()
+                        })
+                };
+                if let Some(properties) = pending_params
+                    && let Err(error) = lite_instance.write_params(lua, &properties)
+                {
+                    transaction.discard();
+                    return CallOutcome::Failed(error.to_string());
+                }
                 let has_callback = match phase {
                     Phase::Message => lite_instance.has_message_callback(),
                     Phase::Enable => lite_instance.has_callback("on_enable"),
@@ -2452,7 +3005,7 @@ impl ScriptHost {
                     }
                     _ => Ok(true),
                 };
-                has_callback
+                let result = has_callback
                     .and_then(|has_callback| {
                         if !has_callback {
                             return Ok(None);
@@ -2591,7 +3144,24 @@ impl ScriptHost {
                         };
                         callback.and_then(|()| lite_instance.transform()).map(Some)
                     })
-                    .map_err(|error| error.to_string())
+                    .and_then(|transform| {
+                        let Some(transform) = transform else {
+                            return Ok(None);
+                        };
+                        let mut properties = lite_instance.declared_properties(lua)?;
+                        for (name, value) in &mut properties {
+                            // SAFETY: the transaction remains owned by this callback.
+                            *value = unsafe { (*transaction_ptr).script_set_current(name, value) }
+                                .map_err(|error| LuaError::runtime(error.message()))?;
+                        }
+                        lite_instance.stage_params(lua, &properties)?;
+                        lua_properties_after = Some(properties);
+                        Ok(Some(transform))
+                    });
+                if result.is_err() {
+                    let _ = lite_instance.restore_params(lua);
+                }
+                result.map_err(|error| error.to_string())
             }
             ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
                 let Some(self_object) = abi_object_handle(instance.handle) else {
@@ -2601,6 +3171,114 @@ impl ScriptHost {
                         "object handle cannot be represented by the script ABI".to_owned(),
                     );
                 };
+                // Записи свойств другого скрипта доходят модулю до его следующего callback.
+                let writes = {
+                    let mut refs = script_refs.borrow_mut();
+                    refs.iter_mut()
+                        .find(|entry| {
+                            entry.serial == instance.serial && !entry.dirty_properties.is_empty()
+                        })
+                        .map(|entry| {
+                            let dirty = std::mem::take(&mut entry.dirty_properties);
+                            dirty
+                                .iter()
+                                .filter_map(|name| {
+                                    entry
+                                        .properties
+                                        .get(name)
+                                        .map(|value| (name.clone(), value.clone()))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                for (name, value) in &writes {
+                    let call = AbiScriptCall {
+                        self_object,
+                        // SAFETY: the transaction is owned by this call until it commits or discards.
+                        transaction: unsafe { &mut *transaction_ptr },
+                        events,
+                        source: &instance.source,
+                        commands,
+                        commands_generation,
+                        command_owner: index,
+                        commands_allowed: true,
+                    };
+                    if let Err(message) = script.invoke_set_property(
+                        time,
+                        name,
+                        value,
+                        RVE_PROPERTY_PHASE_VALIDATE,
+                        call,
+                    ) {
+                        for (pending_name, _) in &writes {
+                            settle_script_ref_write(
+                                script_refs,
+                                instance.serial,
+                                pending_name,
+                                false,
+                            );
+                        }
+                        // SAFETY: the synchronous delivery returned, so no call-scoped borrow remains.
+                        unsafe { (*transaction_ptr).discard() };
+                        return CallOutcome::Failed(message);
+                    }
+                }
+                // Validate every host-side write before invoking any user setter. These writes are
+                // staged now so schema errors also happen before the infallible commit phase.
+                for (name, value) in &writes {
+                    // SAFETY: this callback exclusively owns the transaction until it returns.
+                    if let Err(error) =
+                        unsafe { (*transaction_ptr).script_set_current(name, value) }
+                    {
+                        for (pending_name, _) in &writes {
+                            settle_script_ref_write(
+                                script_refs,
+                                instance.serial,
+                                pending_name,
+                                false,
+                            );
+                        }
+                        // SAFETY: no callback-scoped transaction borrow remains.
+                        unsafe { (*transaction_ptr).discard() };
+                        return CallOutcome::Failed(error.message());
+                    }
+                }
+                for (name, value) in &writes {
+                    let call = AbiScriptCall {
+                        self_object,
+                        // SAFETY: the transaction is owned by this call until it commits or discards.
+                        transaction: unsafe { &mut *transaction_ptr },
+                        events,
+                        source: &instance.source,
+                        commands,
+                        commands_generation,
+                        command_owner: index,
+                        commands_allowed: true,
+                    };
+                    if let Err(message) = script.invoke_set_property(
+                        time,
+                        name,
+                        value,
+                        RVE_PROPERTY_PHASE_COMMIT,
+                        call,
+                    ) {
+                        for (pending_name, _) in &writes {
+                            settle_script_ref_write(
+                                script_refs,
+                                instance.serial,
+                                pending_name,
+                                false,
+                            );
+                        }
+                        // SAFETY: the synchronous delivery returned, so no call-scoped borrow remains.
+                        unsafe { (*transaction_ptr).discard() };
+                        return CallOutcome::Failed(message);
+                    }
+                }
+                for (name, _) in &writes {
+                    settle_script_ref_write(script_refs, instance.serial, name, true);
+                }
                 let call = AbiScriptCall {
                     self_object,
                     // SAFETY: this is the only transaction borrow for the synchronous ABI call.
@@ -2670,11 +3348,17 @@ impl ScriptHost {
         };
 
         if matches!(&instance.kind, ScriptKind::Lite(_)) && interrupt.is_interrupted() {
+            if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                let _ = lite_instance.restore_params(lua);
+            }
             // SAFETY: the callback and its call-scoped transaction borrow have returned.
             unsafe { (*transaction_ptr).discard() };
             return CallOutcome::Interrupted;
         }
         if matches!(&instance.kind, ScriptKind::Lite(_)) && call_deadline.is_expired() {
+            if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                let _ = lite_instance.restore_params(lua);
+            }
             // SAFETY: the callback and its call-scoped transaction borrow have returned.
             unsafe { (*transaction_ptr).discard() };
             return CallOutcome::Failed(call_deadline.timeout_message());
@@ -2688,6 +3372,9 @@ impl ScriptHost {
                         || (*transaction_ptr).set_local_transform(instance.handle, transform)
                 };
                 if !staged {
+                    if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                        let _ = lite_instance.restore_params(lua);
+                    }
                     // SAFETY: the transaction is still owned by this host call.
                     unsafe { (*transaction_ptr).discard() };
                     return CallOutcome::Failed(
@@ -2696,12 +3383,18 @@ impl ScriptHost {
                 }
             }
             Ok(Some(_)) => {
+                if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                    let _ = lite_instance.restore_params(lua);
+                }
                 // SAFETY: the callback and its call-scoped transaction borrow have returned.
                 unsafe { (*transaction_ptr).discard() };
                 return CallOutcome::Failed("script produced a non-finite transform".to_owned());
             }
             Ok(None) => {}
             Err(message) => {
+                if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                    let _ = lite_instance.restore_params(lua);
+                }
                 // SAFETY: the callback and its call-scoped transaction borrow have returned.
                 unsafe { (*transaction_ptr).discard() };
                 return CallOutcome::Failed(message);
@@ -2723,12 +3416,22 @@ impl ScriptHost {
             )
         } {
             Ok(mutations) => {
+                if let Some(properties) = lua_properties_after
+                    && let ScriptKind::Lite(lite_instance) = &mut instance.kind
+                {
+                    lite_instance.commit_properties(properties);
+                }
                 // SAFETY: commit returned, so no call-scoped borrow of the transaction remains.
                 *cursor = unsafe { (*transaction_ptr).cursor() };
                 actions.queue_mutations(mutations);
                 CallOutcome::Committed
             }
-            Err(message) => CallOutcome::Failed(message),
+            Err(message) => {
+                if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                    let _ = lite_instance.restore_params(lua);
+                }
+                CallOutcome::Failed(message)
+            }
         }
     }
 
@@ -2755,6 +3458,14 @@ impl ScriptHost {
                 .find(|instance| instance.serial == serial)
             {
                 instance.user_enabled = enabled;
+            }
+            if let Some(entry) = self
+                .script_refs
+                .borrow_mut()
+                .iter_mut()
+                .find(|entry| entry.serial == serial)
+            {
+                entry.enabled = enabled;
             }
         }
         self.apply_queued_spawns(world);
@@ -3007,6 +3718,16 @@ impl ScriptHost {
                         object_id: &id,
                         object_name: &name,
                         params: &params,
+                        property_names: schema
+                            .as_ref()
+                            .map(|schema| {
+                                schema
+                                    .specs()
+                                    .iter()
+                                    .map(|spec| spec.name.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         transform,
                         object_refs: &object_refs,
                         object_handle: handle,
@@ -3015,6 +3736,17 @@ impl ScriptHost {
                 )
                 .map_err(|error| error.to_string())?;
                 let serial = self.next_serial();
+                self.register_script_ref(
+                    serial,
+                    handle,
+                    path,
+                    schema.as_ref(),
+                    &params,
+                    ScriptRefCapabilities {
+                        property_write_supported: true,
+                        enabled: script.enabled,
+                    },
+                );
                 let index = self.insert_instance(ScriptInstance {
                     handle,
                     source: event_source(&self.scene_name, &id, path),
@@ -3087,6 +3819,17 @@ impl ScriptHost {
                         return Err(message);
                     }
                 };
+                self.register_script_ref(
+                    serial,
+                    handle,
+                    &script.name,
+                    schema.as_ref(),
+                    &params,
+                    ScriptRefCapabilities {
+                        property_write_supported: descriptor.set_property.is_some(),
+                        enabled: script.enabled,
+                    },
+                );
                 self.instances[owner] = Some(ScriptInstance {
                     handle,
                     source,
@@ -3164,7 +3907,25 @@ impl ScriptHost {
         time: ScriptTime,
     ) -> Option<Vec<ObjectHandle>> {
         let doomed: HashSet<ObjectHandle> = world.subtree(targets).into_iter().collect();
+        self.retire_bodies(world, &doomed);
+        self.call_destroy_instances(world, &doomed, time);
+        let removed = match world.despawn_many(targets) {
+            Ok(removed) => removed,
+            Err(error) => {
+                self.events.borrow_mut().push(ScriptEvent {
+                    level: ScriptEventLevel::Error,
+                    source: self.scene_name.clone(),
+                    message: error.to_string(),
+                });
+                return None;
+            }
+        };
+        self.forget_despawned(&removed);
+        Some(removed)
+    }
 
+    /// Физические тела удаляемых объектов уходят в очередь retire до удаления из мира.
+    fn retire_bodies(&mut self, world: &World, doomed: &HashSet<ObjectHandle>) {
         let retired = doomed
             .iter()
             .filter_map(|&handle| {
@@ -3173,13 +3934,19 @@ impl ScriptHost {
                 Some((handle, binding.body, object.id.clone(), object.name.clone()))
             })
             .collect::<Vec<_>>();
-        {
-            let mut lifecycle = self.lifecycle.borrow_mut();
-            for (handle, body, id, name) in retired {
-                lifecycle.retire(handle, body, id, name);
-            }
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        for (handle, body, id, name) in retired {
+            lifecycle.retire(handle, body, id, name);
         }
+    }
 
+    /// `on_destroy` стартовавших включённых экземпляров удаляемых объектов; ошибка отключает экземпляр.
+    fn call_destroy_instances(
+        &mut self,
+        world: &mut World,
+        doomed: &HashSet<ObjectHandle>,
+        time: ScriptTime,
+    ) {
         let time_error = lite::set_time(&self.lua_time, self.frame_time)
             .err()
             .map(|error| error.to_string());
@@ -3197,23 +3964,16 @@ impl ScriptHost {
                 CallOutcome::Failed(message) => self.fail_instance(index, message),
             }
         }
+    }
 
-        let removed = match world.despawn_many(targets) {
-            Ok(removed) => removed,
-            Err(error) => {
-                self.events.borrow_mut().push(ScriptEvent {
-                    level: ScriptEventLevel::Error,
-                    source: self.scene_name.clone(),
-                    message: error.to_string(),
-                });
-                return None;
-            }
-        };
+    /// Учёт объектов, уже удалённых из мира: таймеры удаления, корни префабов, экземпляры, сеть,
+    /// канвасы UI.
+    fn forget_despawned(&mut self, removed: &[ObjectHandle]) {
         let removed_set: HashSet<ObjectHandle> = removed.iter().copied().collect();
         {
             let mut lifecycle = self.lifecycle.borrow_mut();
             let mut prefabs = Vec::new();
-            for handle in &removed {
+            for handle in removed {
                 lifecycle.scheduled.remove(handle);
                 if let Some(prefab) = lifecycle.roots.remove(handle)
                     && let Some(slot) = lifecycle.prefabs.get_mut(&prefab)
@@ -3237,11 +3997,10 @@ impl ScriptHost {
                 self.remove_instance(index);
             }
         }
-        for handle in &removed {
+        for handle in removed {
             self.net.borrow_mut().clear_object(*handle);
         }
-        self.close_owned_canvases(&removed);
-        Some(removed)
+        self.close_owned_canvases(removed);
     }
 
     fn take_waiting(&mut self, root: ObjectHandle) -> Option<SpawnRequest> {
@@ -3329,10 +4088,36 @@ impl ScriptHost {
         self.free_instances.push(index);
     }
 
+    /// Регистрирует экземпляр в справочнике `obj:script`; значения свойств берутся из `params`.
+    fn register_script_ref(
+        &mut self,
+        serial: u64,
+        object: ObjectHandle,
+        key: &str,
+        schema: Option<&engine_scene::ParamSchema>,
+        properties: &BTreeMap<String, ParamValue>,
+        capabilities: ScriptRefCapabilities,
+    ) {
+        self.script_refs.borrow_mut().push(ScriptRefEntry {
+            serial,
+            object,
+            key: key.to_owned(),
+            schema: schema.cloned().map(Rc::new),
+            properties: properties.clone(),
+            property_write_supported: capabilities.property_write_supported,
+            enabled: capabilities.enabled,
+            dirty_properties: BTreeSet::new(),
+            dirty_original_properties: BTreeMap::new(),
+        });
+    }
+
     /// Снимает экземпляр: сначала его команды консоли, затем освобождает слот.
     fn remove_instance(&mut self, index: usize) {
         self.remove_commands_for_owner(index);
         if let Some(instance) = self.instances[index].take() {
+            self.script_refs
+                .borrow_mut()
+                .retain(|entry| entry.serial != instance.serial);
             self.timeline.borrow_mut().cancel_owner(instance.serial);
             self.lifecycle.borrow_mut().forget_instance(instance.serial);
             self.free_instances.push(index);
@@ -3458,6 +4243,19 @@ enum CallOutcome {
     Failed(String),
 }
 
+fn settle_script_ref_write(refs: &ScriptRefs, serial: u64, name: &str, accepted: bool) {
+    let mut refs = refs.borrow_mut();
+    let Some(entry) = refs.iter_mut().find(|entry| entry.serial == serial) else {
+        return;
+    };
+    entry.dirty_properties.remove(name);
+    if accepted {
+        entry.dirty_original_properties.remove(name);
+    } else if let Some(previous) = entry.dirty_original_properties.remove(name) {
+        entry.properties.insert(name.to_owned(), previous);
+    }
+}
+
 struct ActiveCallGuard<'lua> {
     active_call: ActiveCall,
     active_owner: ActiveOwner,
@@ -3530,6 +4328,12 @@ fn resolve_params(
         Some(schema) => schema.resolve(params),
         None => Ok(params.clone()),
     }
+}
+
+/// Быстрые префабы сцены после проверки [`ScriptHost::check_scene_prefabs`], ещё не применённые.
+pub struct ScenePrefabs {
+    slots: Vec<(String, PrefabSpec)>,
+    templates: Vec<(String, Arc<PrefabTemplate>)>,
 }
 
 fn resolve_object_refs(
@@ -3700,9 +4504,21 @@ mod audio_tests;
 #[cfg(test)]
 mod component_tests;
 #[cfg(test)]
+#[path = "host/keep_on_load_tests.rs"]
+mod keep_on_load_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod net_tests;
+#[cfg(test)]
+#[path = "host/save_tests.rs"]
+mod save_tests;
+#[cfg(test)]
+#[path = "host/scene_replace_tests.rs"]
+mod scene_replace_tests;
+#[cfg(test)]
+#[path = "host/script_ref_tests.rs"]
+mod script_ref_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

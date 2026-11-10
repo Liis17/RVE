@@ -8,6 +8,7 @@ use crate::pipeline::ScriptControl;
 use crate::prefabs::{
     LoadedPrefab, MaterialReply, PrefabReady, PrefabReply, RenderResourceRequest,
 };
+use crate::scene_switch::SceneUploadReply;
 use flume::{Receiver, RecvTimeoutError, Sender};
 use std::io::BufRead;
 use std::sync::Arc;
@@ -54,10 +55,21 @@ pub(crate) fn run_resource_responder(
                     break;
                 }
             }
+            Ok(RenderResourceRequest::Scene(upload)) => {
+                // Без GPU загрузка сцены не создаёт ресурсов: ответ пустой.
+                let reply = ScriptControl::Scene(Box::new(SceneUploadReply {
+                    generation: upload.generation,
+                    result: Ok(Box::default()),
+                }));
+                if script_tx.send(reply).is_err() {
+                    break;
+                }
+            }
             Ok(
                 RenderResourceRequest::Particle(_)
                 | RenderResourceRequest::Release { .. }
-                | RenderResourceRequest::ReleaseMaterials { .. },
+                | RenderResourceRequest::ReleaseMaterials { .. }
+                | RenderResourceRequest::ReleaseScene { .. },
             ) => {}
             Err(RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::Acquire) {

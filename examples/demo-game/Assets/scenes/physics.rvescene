@@ -404,3 +404,15 @@ path = "/scripts/hud.lua"
 
 [[assets]]
 path = "/scripts/hud.lua"
+
+[[objects]]
+id = "scene-tour-guide"
+name = "Scene Tour Guide"
+keep_on_load = true
+[[objects.lite_scripts]]
+path = "/scripts/scene_probe.lua"
+[[objects.heavy_scripts]]
+name = "SceneReferenceProbe"
+
+[[assets]]
+path = "/scripts/scene_probe.lua"

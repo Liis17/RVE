@@ -878,7 +878,7 @@ fn expand_without_overrides_skips_only_that_instance() {
 #[test]
 fn documents_without_instances_validate_as_before() {
     let path = format!(
-        "{}/../../examples/demo-game/Assets/scenes/second.rvescene",
+        "{}/../../examples/demo-game/Assets/scenes/physics.rvescene",
         env!("CARGO_MANIFEST_DIR")
     );
     let text = std::fs::read_to_string(&path).unwrap();

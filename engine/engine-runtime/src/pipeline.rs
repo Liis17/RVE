@@ -19,7 +19,11 @@ use crate::profiling::{
 };
 use crate::scene::{
     MaterialAssetView, MaterialUploadCaches, ObjectModel, ParticleSource, PreparedMaterialAssets,
-    PreparedPrefabs, PreparedRenderAssets, particle_emitter_desc, upload_object_levels,
+    PreparedPrefabs, PreparedRenderAssets, SceneParticles, particle_emitter_desc,
+    upload_object_levels, upload_scene,
+};
+use crate::scene_switch::{
+    SceneCommit, SceneGpuIds, SceneLoader, SceneSwitch, SceneUpload, SceneUploadReply,
 };
 use engine_animation::{AnimationBridge, AnimationEvent};
 use engine_assets::{Model, ModelAnimation, TextureData};
@@ -30,7 +34,7 @@ use engine_gui::paint::UiPaint;
 use engine_network::SpawnedRoot;
 use engine_physics::{
     BodyChange, BodyHandle, ModelGeometry, PhysicsClient, PhysicsCommand, PhysicsInitialization,
-    PhysicsReceive, PhysicsSceneSync, PhysicsStepResult, ShapeCache,
+    PhysicsReceive, PhysicsSceneSync, PhysicsSceneSyncError, PhysicsStepResult, ShapeCache,
 };
 use engine_render::UiTextureId;
 use engine_render::{
@@ -171,6 +175,13 @@ pub(crate) struct GpuSceneTable {
     pub particles: HashMap<ObjectHandle, ParticleEmitterId>,
     /// Описания эмиттеров быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub particle_templates: HashMap<String, Vec<Option<ParticleEmitterDesc>>>,
+    /// Scene cache owners for particle textures retained by active scene objects.
+    pub particle_texture_owners: HashMap<ObjectHandle, u64>,
+    /// Scene cache owners for particle textures retained by resident fast-prefab templates.
+    pub particle_template_owners: HashMap<String, u64>,
+    /// Описания эмиттеров объектов загруженной при замене сцены: эмиттер создаёт render thread
+    /// по заявке `ParticleRequest::Create` с финальным хендлом объекта.
+    pub particle_descs: HashMap<ObjectHandle, ParticleEmitterDesc>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
     /// Скелеты и анимации моделей для моста анимации; вершины сюда не входят.
     pub animation_models: HashMap<String, Arc<Model>>,
@@ -182,6 +193,8 @@ pub(crate) struct GpuSceneTable {
     pub joint_counts: HashMap<ObjectHandle, u32>,
     /// UI-текстуры картинок сцены по пути; создаются при загрузке GPU-ресурсов.
     pub ui_images: HashMap<String, UiTextureId>,
+    /// Поколения сцен, владеющие UI-картинками в `VulkanBackend::game_ui`.
+    pub ui_scene_owners: HashSet<u64>,
     /// Экранные шейдеры камер по пути `.glsl`; создаются при загрузке сцены и освобождаются с ней.
     pub screen_shaders: HashMap<String, engine_render::ScreenShaderId>,
 }
@@ -231,6 +244,8 @@ impl std::fmt::Debug for dyn FrameLatency {
 pub(crate) enum ScriptReply {
     Prefab(PrefabReply),
     Material(Box<MaterialReply>),
+    /// Ответ render thread на загрузку GPU-ресурсов новой сцены.
+    Scene(Box<SceneUploadReply>),
 }
 
 #[derive(Debug)]
@@ -245,6 +260,8 @@ pub(crate) enum ScriptControl {
     Prefab(PrefabReply),
     /// Ответ render thread на замену материала объекта скриптом.
     Material(Box<MaterialReply>),
+    /// Ответ render thread на загрузку GPU-ресурсов новой сцены.
+    Scene(Box<SceneUploadReply>),
     Shutdown,
 }
 
@@ -400,6 +417,17 @@ pub(crate) trait RenderBackend: Send {
     }
     /// Уничтожает материалы, которыми уже не пользуются снимки; вызывается после их `last_seq`.
     fn release_materials(&mut self, _materials: &[MaterialId]) {}
+
+    /// Загружает GPU-ресурсы новой сцены. Без GPU ответ пустой.
+    fn submit_scene(&mut self, upload: SceneUpload) -> SceneUploadReply {
+        SceneUploadReply {
+            generation: upload.generation,
+            result: Ok(Box::default()),
+        }
+    }
+
+    /// Уничтожает GPU-ресурсы сцены, которые уже не используются снимками.
+    fn release_scene_resources(&mut self, _ids: &SceneGpuIds) {}
 }
 
 pub(crate) trait ExitRequester: Send + Sync {
@@ -408,6 +436,9 @@ pub(crate) trait ExitRequester: Send + Sync {
 
 pub(crate) struct ScriptThreadConfig {
     pub scene_name: String,
+    pub save_path: Option<PathBuf>,
+    /// Включённые сцены проекта: только они принимаются `rve.scene.load`.
+    pub enabled_scenes: Vec<String>,
     pub sources: std::collections::BTreeMap<String, String>,
     pub input_settings: engine_project::InputSettings,
     pub scripts_library: Option<PathBuf>,
@@ -441,6 +472,10 @@ pub(crate) struct ScriptThreadConfig {
     pub prefab_loader: Sender<LoaderRequest>,
     /// Заявки render thread: выгрузка тяжёлых префабов.
     pub render_resources: Sender<RenderResourceRequest>,
+    /// Загрузчик сцен для `rve.scene.load`; `None` — замена сцены отключена.
+    pub scene_loader: Option<SceneLoader>,
+    /// Есть ли render thread с GPU: загрузку сцены тогда выполняет он, иначе scripts thread.
+    pub gpu_render: bool,
     /// Сетевой поток и режим моста; `None` — offline, мост не подключается.
     pub network: Option<NetworkSession>,
     /// Число тиков, после которого цикл останавливается сам (`rve-server --frames`); `None` — без предела.
@@ -561,9 +596,8 @@ impl VulkanBackend {
     pub fn with_material_uploads(
         mut self,
         assets: Arc<PreparedRenderAssets>,
-        mut caches: MaterialUploadCaches,
+        caches: MaterialUploadCaches,
     ) -> Self {
-        caches.pin_scene_resources();
         self.material_assets = Some(assets);
         self.material_caches = caches;
         self
@@ -630,6 +664,9 @@ impl VulkanBackend {
 
     fn destroy_materials(&mut self, materials: &[MaterialId]) {
         for &material in materials {
+            if Some(material) == self.material_caches.error_material {
+                continue;
+            }
             if let Err(error) = self.renderer.destroy_material(material) {
                 log::error!("материал не уничтожен: {error}");
             }
@@ -665,7 +702,7 @@ impl VulkanBackend {
     }
 
     pub fn with_ui_images(mut self, images: HashMap<String, UiTextureId>) -> Self {
-        self.game_ui = GameUi::with_scene_images(images);
+        self.game_ui = GameUi::with_scene_images_for_owner(0, images);
         self
     }
 
@@ -828,10 +865,79 @@ impl RenderBackend for VulkanBackend {
         }
     }
 
+    fn submit_scene(&mut self, upload: SceneUpload) -> SceneUploadReply {
+        let SceneUpload { generation, assets } = upload;
+        let result = match upload_scene(
+            &mut self.renderer,
+            &assets,
+            &mut self.material_caches,
+            SceneParticles::Descriptions,
+            generation,
+        ) {
+            Ok(mut table) => {
+                self.scene_skin_instances.extend(table.skin_instance_ids());
+                self.scene_screen_shaders.extend(table.screen_shader_ids());
+                self.game_ui.adopt_scene_images_for_owner(
+                    &mut self.renderer,
+                    generation,
+                    std::mem::take(&mut table.ui_images),
+                );
+                table.ui_scene_owners.clear();
+                table.ui_scene_owners.insert(generation);
+                self.material_assets = Some(assets);
+                Ok(Box::new(table))
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        SceneUploadReply { generation, result }
+    }
+
+    fn release_scene_resources(&mut self, ids: &SceneGpuIds) {
+        // Запасной материал кэша переиспользуется следующими загрузками: его не уничтожаем.
+        let cached_error_material = self.material_caches.error_material;
+        for skin in &ids.skins {
+            if let Err(error) = self.renderer.destroy_skin_instance(*skin) {
+                log::error!("экземпляр skinning сцены не уничтожен: {error}");
+            }
+        }
+        self.scene_skin_instances
+            .retain(|skin| !ids.skins.contains(skin));
+        for mesh in &ids.meshes {
+            if let Err(error) = self.renderer.destroy_mesh(*mesh) {
+                log::error!("меш сцены не уничтожен: {error}");
+            }
+        }
+        for material in &ids.materials {
+            if Some(*material) == cached_error_material {
+                continue;
+            }
+            if let Err(error) = self.renderer.destroy_material(*material) {
+                log::error!("материал сцены не уничтожен: {error}");
+            }
+        }
+        self.material_caches
+            .release_materials(&mut self.renderer, ids.materials.iter().copied());
+        self.material_caches
+            .release_scene_textures(&mut self.renderer, ids.cache_owners.iter().copied());
+        self.material_caches.prune_unowned(&mut self.renderer);
+        for owner in &ids.ui_scene_owners {
+            self.game_ui
+                .release_scene_images(&mut self.renderer, *owner);
+        }
+        for shader in &ids.screen_shaders {
+            if let Err(error) = self.renderer.destroy_screen_shader(*shader) {
+                log::error!("экранный шейдер сцены не уничтожен: {error}");
+            }
+        }
+        // Шейдер, уничтоженный здесь, не должен уйти повторно при выгрузке (`release_scene`).
+        self.scene_screen_shaders
+            .retain(|shader| !ids.screen_shaders.contains(shader));
+    }
+
     fn release_materials(&mut self, materials: &[MaterialId]) {
         self.destroy_materials(materials);
         self.material_caches
-            .release_materials(&mut self.renderer, materials);
+            .release_materials(&mut self.renderer, materials.iter().copied());
     }
 
     fn apply_particle_commands(&mut self, commands: &[engine_scene::world::ParticleCommand]) {
@@ -1175,6 +1281,8 @@ fn scripts_thread(
 ) {
     let ScriptThreadConfig {
         scene_name,
+        save_path,
+        enabled_scenes,
         sources,
         input_settings,
         scripts_library,
@@ -1203,6 +1311,8 @@ fn scripts_thread(
         frame_limit,
         ui,
         ui_text_focus,
+        scene_loader,
+        gpu_render,
         ..
     } = config;
     let library = match load_script_library(
@@ -1239,6 +1349,17 @@ fn scripts_thread(
             return;
         }
     };
+    if let Some(path) = save_path
+        && let Err(error) = scripts.load_save_file(&path)
+    {
+        log::warn!("save data is unavailable at {}: {error}", path.display());
+    }
+    if let Err(error) = scripts.set_enabled_scenes(&enabled_scenes) {
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(ScriptStartupError::Load(error)));
+        }
+        return;
+    }
     for (path, template) in &prefabs.templates {
         if let Err(error) = scripts.register_prefab(&world, path, Arc::clone(template), &sources) {
             if let Some(ready_tx) = ready_tx.take() {
@@ -1338,6 +1459,9 @@ fn scripts_thread(
             Ok(ScriptControl::Prefab(reply)) => {
                 pending_prefab.push_back(ScriptReply::Prefab(reply))
             }
+            Ok(ScriptControl::Scene(reply)) => {
+                pending_prefab.push_back(ScriptReply::Scene(reply));
+            }
             Ok(ScriptControl::Material(reply)) => {
                 pending_prefab.push_back(ScriptReply::Material(reply))
             }
@@ -1356,6 +1480,7 @@ fn scripts_thread(
         Arc::clone(&status.profile),
         scripts_groups(),
     );
+    let mut scene_switch = SceneSwitch::new(SceneGpuIds::of_table(&gpu_scene));
     let mut frame_number = 0_u64;
     let mut last_tick = clock.now();
     let mut sim_time = 0.0_f64;
@@ -1437,6 +1562,10 @@ fn scripts_thread(
                         pending_prefab.push_back(ScriptReply::Prefab(reply));
                         false
                     }
+                    ScriptControl::Scene(reply) => {
+                        pending_prefab.push_back(ScriptReply::Scene(reply));
+                        false
+                    }
                     ScriptControl::Material(reply) => {
                         pending_prefab.push_back(ScriptReply::Material(reply));
                         false
@@ -1513,6 +1642,9 @@ fn scripts_thread(
                     Ok(ScriptControl::Background(false)) | Ok(ScriptControl::Go(_)) => {}
                     Ok(ScriptControl::Prefab(reply)) => {
                         pending_prefab.push_back(ScriptReply::Prefab(reply))
+                    }
+                    Ok(ScriptControl::Scene(reply)) => {
+                        pending_prefab.push_back(ScriptReply::Scene(reply));
                     }
                     Ok(ScriptControl::Material(reply)) => {
                         pending_prefab.push_back(ScriptReply::Material(reply))
@@ -1599,6 +1731,7 @@ fn scripts_thread(
             &mut prefab_loads,
             &mut material_sync,
             &mut ui_registry,
+            &mut scene_switch,
         );
         material_sync.apply_replies(&world, &mut gpu_scene, &material_resources, frame_number);
         timings.record(
@@ -1641,6 +1774,25 @@ fn scripts_thread(
         scripts.set_input(input_frame);
         let update_started = Instant::now();
         scripts.update_frame(&mut world, frame_time);
+        if let Some(path) = scripts.take_scene_request() {
+            if network.is_some() {
+                scripts.report_scene_failure(
+                    &path,
+                    "смена сцены при активной сети пока не поддерживается",
+                );
+            } else {
+                match scene_switch.request(scene_loader.as_ref(), &path) {
+                    Ok(upload) if gpu_render => {
+                        prefab_loads.send_render(RenderResourceRequest::Scene(Box::new(upload)));
+                    }
+                    Ok(upload) => scene_switch.accept(SceneUploadReply {
+                        generation: upload.generation,
+                        result: Ok(Box::default()),
+                    }),
+                    Err(error) => scripts.report_scene_failure(&path, &error),
+                }
+            }
+        }
         let rumble = scripts.take_rumble_requests();
         if accepting_input {
             gamepads.rumble_frame(
@@ -1672,6 +1824,25 @@ fn scripts_thread(
         log_animation_warnings(&mut animation);
         let world_changes_started = Instant::now();
         net::apply(&mut network, &mut world, &mut scripts);
+        for (path, error) in scene_switch.apply(SceneCommit {
+            world: &mut world,
+            scripts: &mut scripts,
+            gpu_scene: &mut gpu_scene,
+            spawn_physics: &mut spawn_physics,
+            physics: physics_sync.as_mut(),
+            prefabs: &mut prefab_loads,
+            audio: audio.as_mut(),
+            animation: &mut animation,
+            ui_registry: &mut ui_registry,
+            time: ScriptTime {
+                elapsed: clock.now().as_secs_f64(),
+                frame: frame_number,
+            },
+            sequence: frame_number,
+        }) {
+            scripts.report_scene_failure(&path, &error);
+        }
+        print_script_events(scripts.drain_events());
         spawned_roots.extend(apply_world_changes(
             &mut world,
             &mut scripts,
@@ -1890,7 +2061,7 @@ fn receive_physics_interruptibly(
 
 /// Состояние физики spawn-объектов, которое копится до ближайшего шага физики.
 #[derive(Default)]
-struct SpawnPhysics {
+pub(crate) struct SpawnPhysics {
     /// Формы мешей, построенные для spawn-объектов; переиспользуются между spawn одной модели.
     shapes: ShapeCache,
     /// Геометрия моделей для коллайдеров мешей.
@@ -1907,6 +2078,28 @@ struct SpawnPhysics {
 impl SpawnPhysics {
     /// Добавляет геометрию тяжёлого префаба. Путь, уже занятый сценой или другим префабом,
     /// не заменяется: содержимое одной модели одинаково.
+    /// Геометрия моделей замены сцены. Без счётчика ссылок: её не выгружают тяжёлые префабы.
+    /// Вставляет тела объектов, добавленных заменой сцены. Пробная сборка физики сцены проверила
+    /// те же объекты до замены (`SceneLoader::prepare`), поэтому отказ здесь нарушает инвариант.
+    pub(crate) fn insert_scene_bodies(
+        &mut self,
+        sync: &mut PhysicsSceneSync,
+        world: &World,
+        objects: &[ObjectHandle],
+    ) -> Result<(), PhysicsSceneSyncError> {
+        let inserted = sync.insert_objects(world, objects, &self.geometry, &mut self.shapes)?;
+        self.changes.extend(inserted);
+        Ok(())
+    }
+
+    pub(crate) fn add_scene_geometry(&mut self, models: Vec<ModelGeometry>) {
+        for model in models {
+            if !self.geometry.iter().any(|known| known.path == model.path) {
+                self.geometry.push(model);
+            }
+        }
+    }
+
     fn add_heavy_geometry(&mut self, models: Vec<ModelGeometry>) {
         for model in models {
             if let Some(users) = self.heavy_users.get_mut(&model.path) {
@@ -2009,6 +2202,7 @@ fn apply_world_changes(
         if changes.spawned.is_empty()
             && changes.despawned.is_empty()
             && changes.prefab_requests.is_empty()
+            && changes.scene_replaced.is_none()
         {
             return roots;
         }
@@ -2120,6 +2314,9 @@ fn apply_changes(
                 }),
         );
     }
+    if let Some(replacement) = &changes.scene_replaced {
+        apply_scene_added(world, &replacement.added, &mut requests);
+    }
     apply_prefab_requests(
         world,
         scripts,
@@ -2131,6 +2328,26 @@ fn apply_changes(
     if let Some(audio) = audio {
         audio.apply(requests, world);
     }
+}
+
+/// Звук объектов, добавленных заменой сцены: источники с `play_on_start`. Физика вставляется в
+/// коммите замены (`SceneSwitch::commit`), удалённые объекты уже обработаны по `despawned`.
+fn apply_scene_added(world: &World, added: &[ObjectHandle], requests: &mut Vec<AudioRequest>) {
+    requests.extend(
+        added
+            .iter()
+            .copied()
+            .filter(|&object| world.is_alive(object))
+            .filter(|&object| {
+                world
+                    .audio_source(object)
+                    .is_some_and(|audio| audio.play_on_start)
+            })
+            .map(|object| AudioRequest::PlaySource {
+                object,
+                voice: VoiceId::allocate(),
+            }),
+    );
 }
 
 /// Загрузка и выгрузка тяжёлых префабов. Выгрузка снимает GPU-уровни и геометрию, отправляет
@@ -2345,11 +2562,16 @@ fn drain_prefab_replies(
     prefabs: &mut PrefabLoads,
     materials: &mut MaterialSync,
     ui_registry: &mut UiRegistry,
+    scenes: &mut SceneSwitch,
 ) {
     while let Some(reply) = pending.pop_front() {
         let reply = match reply {
             ScriptReply::Material(reply) => {
                 materials.accept(*reply);
+                continue;
+            }
+            ScriptReply::Scene(reply) => {
+                scenes.accept(*reply);
                 continue;
             }
             ScriptReply::Prefab(reply) => reply,
@@ -2373,12 +2595,15 @@ fn drain_prefab_replies(
                     material_models,
                     ui,
                 } = cpu;
-                if let Err(error) = ui_registry.register(scripts, &ui) {
-                    prefabs.forget(&token.path);
-                    scripts.prefab_failed(world, &token.path, &error);
-                    prefabs.release(token);
-                    continue;
-                }
+                let ui_registration = match ui_registry.prepare(&ui) {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        prefabs.forget(&token.path);
+                        scripts.prefab_failed(world, &token.path, &error);
+                        prefabs.release(token);
+                        continue;
+                    }
+                };
                 if let Err(error) = scripts.register_prefab(world, &token.path, template, &sources)
                 {
                     prefabs.forget(&token.path);
@@ -2386,6 +2611,7 @@ fn drain_prefab_replies(
                     prefabs.release(token);
                     continue;
                 }
+                ui_registry.commit(scripts, ui_registration);
                 let geometry_paths = geometry.iter().map(|model| model.path.clone()).collect();
                 spawn_physics.add_heavy_geometry(geometry);
                 gpu_scene.prefabs.insert(token.path.clone(), gpu);
@@ -2446,9 +2672,12 @@ fn detach_material_sources(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandl
     }
 }
 
-fn detach_object_render_data(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
+pub(crate) fn detach_object_render_data(gpu_scene: &mut GpuSceneTable, handles: &[ObjectHandle]) {
     detach_objects(&mut gpu_scene.by_object, handles);
     detach_material_sources(gpu_scene, handles);
+    for handle in handles {
+        gpu_scene.particle_texture_owners.remove(handle);
+    }
 }
 
 fn detach_objects<T>(by_object: &mut HashMap<ObjectHandle, Vec<Vec<T>>>, handles: &[ObjectHandle]) {
@@ -2718,7 +2947,7 @@ fn build_animation(world: &World, gpu_scene: &GpuSceneTable) -> AnimationBridge 
 
 /// Убирает skinning у объектов, чья палитра моста не совпала с числом костей меша: такой объект
 /// рисуется статично и не валит кадр. Экземпляры остаются у renderer до его завершения.
-fn drop_mismatched_skins(
+pub(crate) fn drop_mismatched_skins(
     world: &World,
     gpu_scene: &mut GpuSceneTable,
     animation: &AnimationBridge,
@@ -2747,7 +2976,7 @@ fn drop_mismatched_skins(
     mismatched
 }
 
-fn log_animation_warnings(animation: &mut AnimationBridge) {
+pub(crate) fn log_animation_warnings(animation: &mut AnimationBridge) {
     for warning in animation.take_warnings() {
         log::warn!("[animation] {warning}");
     }
@@ -3191,6 +3420,9 @@ fn send_snapshot(
             ScriptSelection::Control(Ok(ScriptControl::Prefab(reply))) => {
                 pending_prefab.push_back(ScriptReply::Prefab(reply));
             }
+            ScriptSelection::Control(Ok(ScriptControl::Scene(reply))) => {
+                pending_prefab.push_back(ScriptReply::Scene(reply));
+            }
             ScriptSelection::Control(Ok(ScriptControl::Material(reply))) => {
                 pending_prefab.push_back(ScriptReply::Material(reply));
             }
@@ -3224,6 +3456,9 @@ fn wait_background_tick(
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
             Ok(ScriptControl::Prefab(reply)) => {
                 pending_prefab.push_back(ScriptReply::Prefab(reply))
+            }
+            Ok(ScriptControl::Scene(reply)) => {
+                pending_prefab.push_back(ScriptReply::Scene(reply));
             }
             Ok(ScriptControl::Material(reply)) => {
                 pending_prefab.push_back(ScriptReply::Material(reply))
@@ -3353,6 +3588,8 @@ struct PendingRelease {
 }
 
 enum ReleaseTarget {
+    /// GPU-ресурсы сцены, которые больше не используются снимками.
+    Scene(Box<SceneGpuIds>),
     Prefab(PrefabToken),
     Materials(Vec<MaterialId>),
 }
@@ -3623,6 +3860,16 @@ fn handle_resource_request(
                 last_seq,
             });
         }
+        RenderResourceRequest::Scene(upload) => {
+            let reply = backend.submit_scene(*upload);
+            let _ = script_tx.send(ScriptControl::Scene(Box::new(reply)));
+        }
+        RenderResourceRequest::ReleaseScene { ids, last_seq } => {
+            releases.push(PendingRelease {
+                target: ReleaseTarget::Scene(ids),
+                last_seq,
+            });
+        }
     }
 }
 
@@ -3648,6 +3895,7 @@ fn finish_releases(
         match &release.target {
             ReleaseTarget::Prefab(token) => backend.release_prefab(token),
             ReleaseTarget::Materials(materials) => backend.release_materials(materials),
+            ReleaseTarget::Scene(ids) => backend.release_scene_resources(ids),
         }
         false
     });
@@ -3839,6 +4087,7 @@ mod tests {
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
+    use crate::prefabs::ParticleRequest;
     use crate::prefabs::{
         LoadedPrefab, LoaderRequest, PrefabCpu, PrefabLoads, PrefabReady, PrefabReply, PrefabToken,
         RenderResourceRequest,
@@ -3846,6 +4095,7 @@ mod tests {
     use crate::prefabs::{MaterialLevels, MaterialReply, MaterialRequest};
     use crate::profiling::{PhaseWindow, SOURCE_RENDER, render_groups, render_phase};
     use crate::scene::{ObjectModel, PreparedMaterialAssets, PreparedPrefabs};
+    use crate::scene_switch::{SceneLoader, SceneUploadReply};
     use engine_animation::AnimationBridge;
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
@@ -3875,6 +4125,7 @@ mod tests {
     use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
     use engine_window::CursorState;
     use flume::Receiver;
+    use flume::Sender;
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
@@ -3928,9 +4179,13 @@ return Input
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "input.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
                 input_settings: InputSettings {
@@ -4907,9 +5162,13 @@ return Script
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "scene.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources,
                 input_settings: engine_project::InputSettings::default(),
@@ -6145,9 +6404,13 @@ return Script
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
@@ -6275,9 +6538,13 @@ return Clock
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("clock.lua".to_owned(), script.to_owned())]),
                 input_settings: engine_project::InputSettings::default(),
@@ -6386,9 +6653,13 @@ return Script
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-start.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("probe.lua".to_owned(), script.to_owned())]),
@@ -6508,9 +6779,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-teleport.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("move.lua".to_owned(), script.to_owned())]),
@@ -6687,9 +6962,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "physics-failure.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
@@ -6771,9 +7050,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7090,9 +7373,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([(
                     "scripts/bad.lua".to_owned(),
@@ -7153,9 +7440,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7212,9 +7503,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7286,9 +7581,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                scene_loader: None,
+                gpu_render: false,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
@@ -7462,6 +7761,38 @@ return Move
         frame_limit: Option<u64>,
         background: bool,
     ) -> TestScripts {
+        start_test_scripts_wired(
+            world,
+            sources,
+            prefabs,
+            physics,
+            clock,
+            frame_limit,
+            background,
+            SceneWiring::default(),
+        )
+    }
+
+    /// Подключение замены сцены: загрузчик, канал render thread и включённые сцены проекта.
+    /// Без канала render thread замена применяется на scripts thread (headless).
+    #[derive(Default)]
+    struct SceneWiring {
+        loader: Option<SceneLoader>,
+        render_resources: Option<Sender<RenderResourceRequest>>,
+        enabled_scenes: Vec<String>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_test_scripts_wired(
+        world: World,
+        sources: &[(&str, &str)],
+        prefabs: PreparedPrefabs,
+        physics: Option<(PhysicsClient, PhysicsInitialization)>,
+        clock: Arc<FakeClock>,
+        frame_limit: Option<u64>,
+        background: bool,
+        wiring: SceneWiring,
+    ) -> TestScripts {
         let mut modules = ModuleHost::new();
         let (script_tx, script_rx) = flume::unbounded();
         let (frame_tx, frame_rx) = flume::bounded(1);
@@ -7478,9 +7809,13 @@ return Move
             &mut modules,
             world,
             ScriptThreadConfig {
+                gpu_render: wiring.render_resources.is_some(),
+                scene_loader: wiring.loader,
                 ui: Default::default(),
                 ui_text_focus: Default::default(),
                 scene_name: "spawn.rvescene".to_owned(),
+                enabled_scenes: wiring.enabled_scenes,
+                save_path: None,
                 cursor: CursorControl::default(),
                 sources: sources
                     .iter()
@@ -7505,7 +7840,9 @@ return Move
                 prefabs,
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
-                render_resources: flume::unbounded().0,
+                render_resources: wiring
+                    .render_resources
+                    .unwrap_or_else(|| flume::unbounded().0),
                 network: None,
                 frame_limit,
                 #[cfg(feature = "dev-console")]
@@ -7545,6 +7882,256 @@ return Move
         scripts.modules.join_named(SCRIPTS_THREAD).unwrap();
         assert!(scripts.modules.shutdown().is_empty());
         worker.join().unwrap();
+    }
+
+    /// Временная папка с файлами сцен для загрузчика; удаляется в `Drop`.
+    struct SceneDir(std::path::PathBuf);
+
+    impl SceneDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("rve-pipeline-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, relative: &str, text: &str) {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+    }
+
+    impl Drop for SceneDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn headless_scene_switch_applies_physics_without_a_render_thread() {
+        const SWITCHER: &str = r#"
+local Switcher = {}
+function Switcher:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 2 then
+    rve.scene.load("levels/b.rvescene")
+  end
+end
+return Switcher
+"#;
+        const START: &str = "[[assets]]
+path = \"switcher.lua\"
+[[objects]]
+id = \"camera\"
+[objects.camera]
+active = true
+[[objects]]
+id = \"player\"
+keep_on_load = true
+[[objects.lite_scripts]]
+path = \"switcher.lua\"
+[[objects]]
+id = \"crate\"
+[objects.collider]
+shape = \"sphere\"
+radius = 0.25
+[objects.rigid_body]
+kind = \"dynamic\"
+";
+        const NEXT: &str = "[[objects]]
+id = \"camera_b\"
+[objects.camera]
+active = true
+[[objects]]
+id = \"boss\"
+[objects.collider]
+shape = \"sphere\"
+radius = 0.5
+[objects.rigid_body]
+kind = \"dynamic\"
+";
+
+        let dir = SceneDir::new("headless-switch");
+        dir.write("levels/b.rvescene", NEXT);
+        let resources = engine_resources::ResourceSystem::start(engine_resources::ResourceConfig {
+            root: dir.0.clone(),
+            source_mode: engine_resources::SourceMode::Loose,
+            worker_count: 1,
+            ..engine_resources::ResourceConfig::default()
+        })
+        .unwrap();
+        let loader = SceneLoader::new(
+            resources.handle(),
+            engine_project::PhysicsSettings::default(),
+            false,
+        );
+        let world =
+            World::from_document(&SceneDocument::parse("levels/a.rvescene", START).unwrap())
+                .unwrap();
+        let (client, initialization, steps, worker) = fake_physics(&world);
+        let scripts = start_test_scripts_wired(
+            world,
+            &[("switcher.lua", SWITCHER)],
+            PreparedPrefabs::default(),
+            Some((client, initialization)),
+            Arc::new(FakeClock::default()),
+            None,
+            false,
+            SceneWiring {
+                loader: Some(loader),
+                render_resources: None,
+                enabled_scenes: vec!["levels/b.rvescene".to_owned()],
+            },
+        );
+        scripts.thread.ready.recv().unwrap().unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(Box::default()))
+            .unwrap();
+
+        let (mut inserted, mut removed) = (0, 0);
+        for _ in 0..20 {
+            let step = next_step(&scripts, &steps);
+            for change in &step.changes {
+                match change {
+                    BodyChange::Insert { .. } => inserted += 1,
+                    BodyChange::Remove { .. } => removed += 1,
+                }
+            }
+            if inserted > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            inserted, 1,
+            "без render thread замена применяется на scripts thread"
+        );
+        assert_eq!(removed, 1, "тело старой сцены снято");
+        stop_test_scripts(scripts, worker);
+    }
+
+    #[test]
+    fn scene_switch_uploads_through_render_thread_then_applies_physics_of_the_new_scene() {
+        const SWITCHER: &str = r#"
+local Switcher = {}
+function Switcher:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 2 then
+    rve.scene.load("levels/b.rvescene")
+  end
+end
+return Switcher
+"#;
+        const START: &str = "[[assets]]\npath = \"switcher.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"player\"\nkeep_on_load = true\n[[objects.lite_scripts]]\npath = \"switcher.lua\"\n[[objects]]\nid = \"crate\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+        const NEXT: &str = "[[objects]]\nid = \"camera_b\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"boss\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+
+        let dir = SceneDir::new("switch");
+        dir.write("levels/b.rvescene", NEXT);
+        let resources = engine_resources::ResourceSystem::start(engine_resources::ResourceConfig {
+            root: dir.0.clone(),
+            source_mode: engine_resources::SourceMode::Loose,
+            worker_count: 1,
+            ..engine_resources::ResourceConfig::default()
+        })
+        .unwrap();
+        let loader = SceneLoader::new(
+            resources.handle(),
+            engine_project::PhysicsSettings::default(),
+            false,
+        );
+        let (render_tx, render_rx) = flume::unbounded();
+        let world =
+            World::from_document(&SceneDocument::parse("levels/a.rvescene", START).unwrap())
+                .unwrap();
+        let (client, initialization, steps, worker) = fake_physics(&world);
+        let scripts = start_test_scripts_wired(
+            world,
+            &[("switcher.lua", SWITCHER)],
+            PreparedPrefabs::default(),
+            Some((client, initialization)),
+            Arc::new(FakeClock::default()),
+            None,
+            false,
+            SceneWiring {
+                loader: Some(loader),
+                render_resources: Some(render_tx),
+                enabled_scenes: vec!["levels/b.rvescene".to_owned()],
+            },
+        );
+        scripts.thread.ready.recv().unwrap().unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(Box::default()))
+            .unwrap();
+
+        // Заявка приходит render thread, пока цикл крутит кадры; физические шаги и кадры забираем.
+        let upload = (0..20)
+            .find_map(|_| {
+                let _ = next_step(&scripts, &steps);
+                match render_rx.try_recv() {
+                    Ok(RenderResourceRequest::Scene(upload)) => Some(upload),
+                    Ok(_) => panic!("render thread получил не заявку сцены"),
+                    Err(_) => None,
+                }
+            })
+            .expect("запрос rve.scene.load должен уйти на render thread");
+        assert_eq!(upload.generation, 1);
+
+        // До ответа render thread мир не меняется: физика не получает вставок новой сцены.
+        for _ in 0..3 {
+            let step = next_step(&scripts, &steps);
+            assert!(
+                !step
+                    .changes
+                    .iter()
+                    .any(|change| matches!(change, BodyChange::Insert { .. })),
+                "до ответа render thread вставок нет: {:?}",
+                step.changes
+            );
+        }
+
+        scripts
+            .control
+            .send(ScriptControl::Scene(Box::new(SceneUploadReply {
+                generation: upload.generation,
+                result: Ok(Box::default()),
+            })))
+            .unwrap();
+
+        // После ответа замена применяется: тело 'crate' снимается, тело 'boss' вставляется.
+        let mut inserted = 0;
+        let mut removed = 0;
+        for _ in 0..20 {
+            let step = next_step(&scripts, &steps);
+            for change in &step.changes {
+                match change {
+                    BodyChange::Insert { .. } => inserted += 1,
+                    BodyChange::Remove { .. } => removed += 1,
+                }
+            }
+            if inserted > 0 {
+                break;
+            }
+        }
+        assert_eq!(inserted, 1, "вставлено тело новой сцены");
+        assert_eq!(
+            removed, 1,
+            "снято тело старой сцены, персистентное `player` без тела"
+        );
+        // Удаление объекта очищает его эмиттеры (`ParticleRequest::Destroy`); заявок сцены нет.
+        for request in render_rx.try_iter() {
+            match request {
+                RenderResourceRequest::Particle(ParticleRequest::Destroy(_)) => {}
+                RenderResourceRequest::Scene(_) => panic!("вторая заявка сцены"),
+                RenderResourceRequest::ReleaseScene { ids, .. } => {
+                    panic!("освобождение без живых ссылок: {} мешей", ids.meshes.len())
+                }
+                _ => panic!("неожиданная заявка render thread"),
+            }
+        }
+        stop_test_scripts(scripts, worker);
     }
 
     #[test]
@@ -7951,6 +8538,7 @@ return Gun
                 &mut self.loads,
                 &mut self.material,
                 &mut crate::game_ui::UiRegistry::default(),
+                &mut crate::scene_switch::SceneSwitch::default(),
             );
         }
 

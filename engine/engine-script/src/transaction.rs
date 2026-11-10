@@ -7,6 +7,8 @@ use crate::lifecycle::{
 use crate::lite::EventQueue;
 use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::{BindingUpdate, PhysicsScriptState};
+use crate::scene_state::{SharedSceneState, check_scene_request};
+use crate::script_refs::{ScriptRefError, ScriptRefs, coerce_property, find_entry, find_serial};
 use crate::timeline::{CoroutineWait, ScriptCoroutine, ScriptTimeline, TimelineOp, TimerCallback};
 use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
@@ -55,6 +57,9 @@ pub(crate) const MAX_RUMBLE_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_NAME_BYTES: usize = 256;
 pub(crate) const MAX_MESSAGE_TARGET_ID_BYTES: usize = 256;
+const MAX_SAVE_KEY_BYTES: usize = 128;
+const MAX_SAVE_KEYS: usize = 4_096;
+const MAX_SAVE_BYTES: usize = 1_048_576;
 
 #[derive(Clone)]
 pub(crate) struct ScriptObjectRef {
@@ -111,7 +116,20 @@ impl MessageValueBudget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MessageTarget {
     Object(ObjectHandle),
+    /// Один экземпляр скрипта (`obj:script(key):send`); остальные экземпляры объекта не получают.
+    Instance {
+        object: ObjectHandle,
+        serial: u64,
+    },
     Broadcast,
+}
+
+/// Заявка записи объявленного свойства экземпляра, применяется после успешного коммита.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PropertyWrite {
+    pub(crate) serial: u64,
+    pub(crate) name: String,
+    pub(crate) value: ParamValue,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -260,6 +278,11 @@ pub(crate) struct ScriptTransaction {
     pub(crate) ui: Rc<RefCell<UiScriptState>>,
     /// Журнал UI-записей текущего вызова: откат при ошибке, отложенные закрытия.
     pub(crate) ui_journal: UiJournal,
+    save_values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
+    save_flush_requested: Rc<Cell<bool>>,
+    save_generation: Rc<Cell<u64>>,
+    pending_save: BTreeMap<String, Option<ParamValue>>,
+    pending_save_flush: bool,
     lifecycle: Rc<RefCell<Lifecycle>>,
     lifecycle_writes: bool,
     instance_serial: u64,
@@ -277,6 +300,16 @@ pub(crate) struct ScriptTransaction {
     component_writes: ComponentWrites,
     /// Новое значение `set_enabled` экземпляра; применяется в `commit_lifecycle`.
     pending_script_enabled: Option<bool>,
+    /// Справочник экземпляров хоста; читается для `obj:script`, меняется только при коммите.
+    script_refs: ScriptRefs,
+    /// Состояние смены сцен хоста: список сцен проекта и запрос на загрузку.
+    scene_state: SharedSceneState,
+    /// Запрос `rve.scene.load` этого вызова; переносится в состояние хоста при коммите.
+    pending_scene_request: Option<String>,
+    /// Записи свойств чужих и своих экземпляров; применяются при коммите и синхронизируют Lua.
+    pending_properties: Vec<PropertyWrite>,
+    /// Заявки `enabled` для экземпляров по серийному номеру; применяются на границе фазы.
+    pending_remote_enabled: Vec<(u64, bool)>,
     instance_enabled: bool,
     timeline: Rc<RefCell<ScriptTimeline>>,
     time_scale: Rc<Cell<f32>>,
@@ -295,6 +328,103 @@ struct PendingPush {
 }
 
 impl ScriptTransaction {
+    pub(crate) fn attach_save_state(
+        &mut self,
+        values: Rc<RefCell<BTreeMap<String, ParamValue>>>,
+        flush_requested: Rc<Cell<bool>>,
+        generation: Rc<Cell<u64>>,
+    ) {
+        self.save_values = values;
+        self.save_flush_requested = flush_requested;
+        self.save_generation = generation;
+    }
+
+    pub(crate) fn save_get(&self, key: &str) -> Option<ParamValue> {
+        self.pending_save
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| self.save_values.borrow().get(key).cloned())
+    }
+
+    pub(crate) fn save_set(&mut self, key: &str, value: ParamValue) -> Result<(), String> {
+        self.require_writable("save writes")?;
+        validate_save_key(key)?;
+        validate_save_value(&value, 0)?;
+        {
+            let stored = self.save_values.borrow();
+            let mut values = BTreeMap::new();
+            for (stored_key, stored_value) in stored.iter() {
+                if stored_key == key {
+                    continue;
+                }
+                match self.pending_save.get(stored_key) {
+                    Some(Some(value)) => {
+                        values.insert(stored_key.as_str(), value);
+                    }
+                    Some(None) => {}
+                    None => {
+                        values.insert(stored_key.as_str(), stored_value);
+                    }
+                }
+            }
+            for (pending_key, pending_value) in &self.pending_save {
+                if pending_key != key
+                    && !stored.contains_key(pending_key)
+                    && let Some(value) = pending_value
+                {
+                    values.insert(pending_key.as_str(), value);
+                }
+            }
+            values.insert(key, &value);
+            if values.len() > MAX_SAVE_KEYS
+                || save_values_size(values.iter().map(|(key, value)| (*key, *value)))
+                    > MAX_SAVE_BYTES
+            {
+                return Err("save data exceeds the 4096 key or 1 MiB limit".to_owned());
+            }
+            crate::save_file::encoded_save_data_refs_len(values)
+                .map_err(|_| "encoded save data exceeds the 1 MiB limit".to_owned())?;
+        }
+        self.pending_save.insert(key.to_owned(), Some(value));
+        Ok(())
+    }
+
+    pub(crate) fn save_delete(&mut self, key: &str) -> Result<bool, String> {
+        self.require_writable("save writes")?;
+        validate_save_key(key)?;
+        let existed = self.save_get(key).is_some();
+        self.pending_save.insert(key.to_owned(), None);
+        Ok(existed)
+    }
+
+    pub(crate) fn save_has(&self, key: &str) -> Result<bool, String> {
+        validate_save_key(key)?;
+        Ok(self.save_get(key).is_some())
+    }
+
+    pub(crate) fn save_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .save_values
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for (key, value) in &self.pending_save {
+            if value.is_some() {
+                keys.insert(key.clone());
+            } else {
+                keys.remove(key);
+            }
+        }
+        keys.into_iter().collect()
+    }
+
+    pub(crate) fn save_flush(&mut self) -> Result<(), String> {
+        self.require_writable("save flush")?;
+        self.pending_save_flush = true;
+        Ok(())
+    }
+
     pub(crate) fn attach_time_state(
         &mut self,
         timeline: Rc<RefCell<ScriptTimeline>>,
@@ -471,6 +601,76 @@ fn validate_timer(delay: f64, repeat: Option<f64>) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_save_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > MAX_SAVE_KEY_BYTES || key.chars().any(char::is_control) {
+        return Err(format!(
+            "save key must contain 1..={MAX_SAVE_KEY_BYTES} non-control UTF-8 bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_save_values(values: &BTreeMap<String, ParamValue>) -> Result<(), String> {
+    if values.len() > MAX_SAVE_KEYS
+        || save_values_size(values.iter().map(|(key, value)| (key.as_str(), value)))
+            > MAX_SAVE_BYTES
+    {
+        return Err("save data exceeds the 4096 key or 1 MiB limit".to_owned());
+    }
+    for (key, value) in values {
+        validate_save_key(key)?;
+        validate_save_value(value, 0)?;
+    }
+    Ok(())
+}
+
+fn validate_save_value(value: &ParamValue, depth: usize) -> Result<(), String> {
+    if depth > MAX_MESSAGE_DEPTH {
+        return Err(format!("save value nesting exceeds {MAX_MESSAGE_DEPTH}"));
+    }
+    match value {
+        ParamValue::Float(value) if !value.is_finite() => {
+            Err("save numbers must be finite".to_owned())
+        }
+        ParamValue::String(value) if value.len() > MAX_MESSAGE_STRING_BYTES => Err(format!(
+            "save strings exceed {MAX_MESSAGE_STRING_BYTES} bytes"
+        )),
+        ParamValue::Object(value) if value.len() > MAX_MESSAGE_TARGET_ID_BYTES => Err(format!(
+            "save object references exceed {MAX_MESSAGE_TARGET_ID_BYTES} bytes"
+        )),
+        ParamValue::Array(values) if values.len() > MAX_MESSAGE_ELEMENTS => Err(format!(
+            "save arrays exceed {MAX_MESSAGE_ELEMENTS} elements"
+        )),
+        ParamValue::Array(values) => {
+            for value in values {
+                validate_save_value(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn save_values_size<'a>(values: impl Iterator<Item = (&'a str, &'a ParamValue)>) -> usize {
+    fn value_size(value: &ParamValue) -> usize {
+        match value {
+            ParamValue::Bool(_) => 1,
+            ParamValue::Int(_) | ParamValue::Float(_) => 8,
+            ParamValue::String(value) => value.len(),
+            ParamValue::Object(value) => value.len().saturating_add(16),
+            ParamValue::Asset(value) => value.as_str().len().saturating_add(16),
+            ParamValue::Array(values) => values.iter().fold(8_usize, |size, value| {
+                size.saturating_add(value_size(value))
+            }),
+        }
+    }
+    values.fold(0_usize, |size, (key, value)| {
+        size.saturating_add(key.len())
+            .saturating_add(value_size(value))
+            .saturating_add(8)
+    })
+}
+
 impl Default for ScriptTransaction {
     fn default() -> Self {
         Self {
@@ -518,6 +718,11 @@ impl Default for ScriptTransaction {
             pending_net: Vec::new(),
             ui: Rc::new(RefCell::new(UiScriptState::default())),
             ui_journal: UiJournal::default(),
+            save_values: Rc::new(RefCell::new(BTreeMap::new())),
+            save_flush_requested: Rc::new(Cell::new(false)),
+            save_generation: Rc::new(Cell::new(0)),
+            pending_save: BTreeMap::new(),
+            pending_save_flush: false,
             lifecycle: Rc::new(RefCell::new(Lifecycle::default())),
             lifecycle_writes: false,
             instance_serial: 0,
@@ -529,6 +734,11 @@ impl Default for ScriptTransaction {
             pending_edits: Vec::new(),
             component_writes: ComponentWrites::default(),
             pending_script_enabled: None,
+            script_refs: ScriptRefs::default(),
+            scene_state: SharedSceneState::default(),
+            pending_scene_request: None,
+            pending_properties: Vec::new(),
+            pending_remote_enabled: Vec::new(),
             instance_enabled: true,
             timeline: Rc::new(RefCell::new(ScriptTimeline::default())),
             time_scale: Rc::new(Cell::new(1.0)),
@@ -538,6 +748,134 @@ impl Default for ScriptTransaction {
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod save_validation_tests {
+    use super::{
+        MAX_SAVE_BYTES, MAX_SAVE_KEYS, ScriptTransaction, save_values_size, validate_save_values,
+    };
+    use engine_scene::ParamValue;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    #[test]
+    fn save_accepts_documented_key_array_and_nesting_boundaries() {
+        let mut nested = ParamValue::Int(0);
+        for _ in 0..engine_scene::MAX_MESSAGE_DEPTH {
+            nested = ParamValue::Array(vec![nested]);
+        }
+        let values = BTreeMap::from([
+            ("é".repeat(64), nested),
+            (
+                "array".to_owned(),
+                ParamValue::Array(vec![
+                    ParamValue::Bool(true);
+                    engine_scene::MAX_MESSAGE_ELEMENTS
+                ]),
+            ),
+        ]);
+        assert!(validate_save_values(&values).is_ok());
+    }
+
+    #[test]
+    fn save_rejects_excess_keys_depth_elements_and_total_size() {
+        let mut too_many_keys = (0..MAX_SAVE_KEYS)
+            .map(|index| (format!("k{index}"), ParamValue::Int(0)))
+            .collect::<BTreeMap<_, _>>();
+        too_many_keys.insert("overflow".to_owned(), ParamValue::Int(0));
+        assert!(validate_save_values(&too_many_keys).is_err());
+
+        let mut too_deep = ParamValue::Int(0);
+        for _ in 0..=engine_scene::MAX_MESSAGE_DEPTH {
+            too_deep = ParamValue::Array(vec![too_deep]);
+        }
+        assert!(validate_save_values(&BTreeMap::from([("deep".to_owned(), too_deep,)])).is_err());
+
+        let too_many_elements = ParamValue::Array(vec![
+            ParamValue::Bool(true);
+            engine_scene::MAX_MESSAGE_ELEMENTS + 1
+        ]);
+        assert!(
+            validate_save_values(&BTreeMap::from([("array".to_owned(), too_many_elements,)]))
+                .is_err()
+        );
+
+        let oversized = (0..18)
+            .map(|index| (format!("k{index}"), ParamValue::String("x".repeat(60_000))))
+            .collect();
+        assert!(validate_save_values(&oversized).is_err());
+    }
+
+    #[test]
+    fn rejected_save_write_does_not_stage_or_mutate_existing_values() {
+        let values = Rc::new(RefCell::new(
+            (0..MAX_SAVE_KEYS)
+                .map(|index| (format!("k{index}"), ParamValue::Int(0)))
+                .collect::<BTreeMap<_, _>>(),
+        ));
+        let original = values.borrow().clone();
+        let mut transaction = ScriptTransaction {
+            writable: true,
+            ..ScriptTransaction::default()
+        };
+        transaction.attach_save_state(
+            values.clone(),
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+        );
+
+        assert!(
+            transaction
+                .save_set("overflow", ParamValue::Bool(true))
+                .is_err()
+        );
+        assert!(transaction.pending_save.is_empty());
+        assert_eq!(*values.borrow(), original);
+    }
+
+    #[test]
+    fn save_set_rejects_toml_escaping_overhead_without_staging_the_value() {
+        let values = Rc::new(RefCell::new(BTreeMap::new()));
+        let mut transaction = ScriptTransaction {
+            writable: true,
+            ..ScriptTransaction::default()
+        };
+        transaction.attach_save_state(
+            values.clone(),
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+        );
+        for index in 0..2 {
+            transaction.pending_save.insert(
+                format!("k{index}"),
+                Some(ParamValue::String("\0".repeat(65_536))),
+            );
+        }
+        let candidate = transaction
+            .pending_save
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone().unwrap()))
+            .chain(std::iter::once((
+                "k2".to_owned(),
+                ParamValue::String("\0".repeat(65_536)),
+            )))
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            save_values_size(candidate.iter().map(|(key, value)| (key.as_str(), value)))
+                < MAX_SAVE_BYTES
+        );
+        assert!(crate::encode_save_data(&candidate).is_err());
+
+        assert!(
+            transaction
+                .save_set("k2", ParamValue::String("\0".repeat(65_536)))
+                .is_err()
+        );
+        assert!(!transaction.pending_save.contains_key("k2"));
+        assert!(values.borrow().is_empty());
     }
 }
 
@@ -637,6 +975,8 @@ impl ScriptTransaction {
         self.instance_enabled = init.instance_enabled;
         self.pending_edits.clear();
         self.pending_script_enabled = None;
+        self.pending_save.clear();
+        self.pending_save_flush = false;
         self.pending_timeline.clear();
         self.pending_time_scale = None;
         self.pending_spawns.clear();
@@ -1839,6 +2179,7 @@ impl ScriptTransaction {
     pub(crate) fn stage_edit(&mut self, edit: ObjectEdit) -> bool {
         let target = match &edit {
             ObjectEdit::SetActive { object, .. }
+            | ObjectEdit::SetKeepOnLoad { object, .. }
             | ObjectEdit::SetTag { object, .. }
             | ObjectEdit::SetLayer { object, .. }
             | ObjectEdit::SetParent { object, .. }
@@ -1862,10 +2203,27 @@ impl ScriptTransaction {
             ObjectEdit::SetLayer { layer, .. } => *layer < LAYER_COUNT,
             _ => true,
         };
+        // Структурные правки меняют состав сохраняемых корней и поддеревьев удаляемых. Замена
+        // сцены строит план на этом составе до teardown, поэтому в `on_disable` и `on_destroy`
+        // они отказываются. Сохраняемый объект не получает родителя ни в одной фазе: отказ
+        // возвращает `false` до записи, как и `set_keep_on_load` под родителем.
+        let refused_structure = match &edit {
+            ObjectEdit::SetParent { object, parent, .. } => {
+                !self.lifecycle_writes
+                    || (parent.is_some() && self.keep_on_load(*object) == Some(true))
+            }
+            ObjectEdit::SetKeepOnLoad { .. } => !self.lifecycle_writes,
+            _ => false,
+        };
         let is_static = self.world().and_then(|world| world.is_static(target));
+        let object_exists = self
+            .world()
+            .and_then(|world| world.object(target))
+            .is_some();
         if !self.writable
             || !value_valid
-            || is_static.is_none()
+            || refused_structure
+            || !object_exists
             || (moves && is_static == Some(true))
         {
             return false;
@@ -1899,7 +2257,9 @@ impl ScriptTransaction {
         let local_only = self.pending_edits.iter().all(|edit| {
             !matches!(
                 edit,
-                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
+                ObjectEdit::SetActive { .. }
+                    | ObjectEdit::SetKeepOnLoad { .. }
+                    | ObjectEdit::SetParent { .. }
             )
         }) && self.pose_edits_are_local(world);
         if !local_only {
@@ -1938,7 +2298,9 @@ impl ScriptTransaction {
                     .check_world_rotation(*object, *rotation_deg)
                     .map_err(|error| error.to_string())?,
                 // Исключены условием local_only выше.
-                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. } => {}
+                ObjectEdit::SetActive { .. }
+                | ObjectEdit::SetKeepOnLoad { .. }
+                | ObjectEdit::SetParent { .. } => {}
             }
         }
         Ok(())
@@ -2178,6 +2540,27 @@ impl ScriptTransaction {
         Some(true)
     }
 
+    pub(crate) fn keep_on_load(&self, handle: ObjectHandle) -> Option<bool> {
+        self.pending_edits
+            .iter()
+            .rev()
+            .find_map(|edit| match edit {
+                ObjectEdit::SetKeepOnLoad { object, keep } if *object == handle => Some(*keep),
+                _ => None,
+            })
+            .or_else(|| self.world()?.keep_on_load(handle))
+    }
+
+    pub(crate) fn set_keep_on_load(&mut self, handle: ObjectHandle, keep: bool) -> bool {
+        if keep && self.parent(handle).flatten().is_some() {
+            return false;
+        }
+        self.stage_edit(ObjectEdit::SetKeepOnLoad {
+            object: handle,
+            keep,
+        })
+    }
+
     /// Родитель с учётом заявок этого вызова; внешний `None` — объект мёртв.
     pub(crate) fn parent(&self, handle: ObjectHandle) -> Option<Option<ObjectHandle>> {
         let committed = self.world()?.object(handle)?.parent;
@@ -2266,6 +2649,180 @@ impl ScriptTransaction {
         }
         self.pending_script_enabled = Some(enabled);
         true
+    }
+
+    pub(crate) fn attach_script_refs(&mut self, refs: ScriptRefs) {
+        self.script_refs = refs;
+    }
+
+    /// Серийный номер экземпляра `key` на объекте по справочнику хоста.
+    pub(crate) fn script_ref(&self, object: ObjectHandle, key: &str) -> Option<u64> {
+        find_serial(&self.script_refs.borrow(), object, key)
+    }
+
+    /// Значение объявленного свойства с учётом записей этого вызова.
+    pub(crate) fn script_get(&self, serial: u64, name: &str) -> Result<ParamValue, ScriptRefError> {
+        let serial = if serial == 0 {
+            self.instance_serial
+        } else {
+            serial
+        };
+        if let Some(write) = self
+            .pending_properties
+            .iter()
+            .rev()
+            .find(|write| write.serial == serial && write.name == name)
+        {
+            return Ok(write.value.clone());
+        }
+        let refs = self.script_refs.borrow();
+        let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+        if entry
+            .schema
+            .as_ref()
+            .is_none_or(|schema| schema.get(name).is_none())
+        {
+            return Err(ScriptRefError::Undeclared(name.to_owned()));
+        }
+        entry
+            .properties
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ScriptRefError::Undeclared(name.to_owned()))
+    }
+
+    /// Ставит запись свойства после проверки по схеме экземпляра; применяется при коммите.
+    pub(crate) fn script_set(
+        &mut self,
+        serial: u64,
+        name: &str,
+        value: &ParamValue,
+    ) -> Result<(), ScriptRefError> {
+        if !self.writable {
+            return Err(ScriptRefError::Invalid(
+                "script properties can only be set from update callbacks".to_owned(),
+            ));
+        }
+        let value = {
+            let refs = self.script_refs.borrow();
+            let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+            if !entry.property_write_supported {
+                return Err(ScriptRefError::Invalid(
+                    "target script does not support external property writes".to_owned(),
+                ));
+            }
+            coerce_property(entry, name, value)?
+        };
+        self.pending_properties.push(PropertyWrite {
+            serial,
+            name: name.to_owned(),
+            value,
+        });
+        Ok(())
+    }
+
+    /// Stages a write made by this instance so the shared property mirror follows owner state.
+    pub(crate) fn script_set_current(
+        &mut self,
+        name: &str,
+        value: &ParamValue,
+    ) -> Result<ParamValue, ScriptRefError> {
+        if !self.writable {
+            return Err(ScriptRefError::Invalid(
+                "script properties can only be set from update callbacks".to_owned(),
+            ));
+        }
+        let serial = self.instance_serial;
+        let value = {
+            let refs = self.script_refs.borrow();
+            let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+            coerce_property(entry, name, value)?
+        };
+        self.pending_properties.push(PropertyWrite {
+            serial,
+            name: name.to_owned(),
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
+    /// Адресное сообщение одному экземпляру; остальные экземпляры объекта его не получают.
+    pub(crate) fn script_send(
+        &mut self,
+        serial: u64,
+        name: &str,
+        value: ParamValue,
+        value_size: usize,
+    ) -> Result<(), QueueMessageError> {
+        if !self.writable {
+            return Err(QueueMessageError::ReadOnly);
+        }
+        let object = {
+            let refs = self.script_refs.borrow();
+            find_entry(&refs, serial)
+                .map(|entry| entry.object)
+                .ok_or(QueueMessageError::UnknownTarget)?
+        };
+        self.push_message(
+            MessageTarget::Instance { object, serial },
+            name,
+            value,
+            value_size,
+        )
+    }
+
+    /// `enabled` экземпляра с учётом заявок этого вызова.
+    pub(crate) fn script_enabled_of(&self, serial: u64) -> Result<bool, ScriptRefError> {
+        if let Some((_, enabled)) = self
+            .pending_remote_enabled
+            .iter()
+            .rev()
+            .find(|(pending, _)| *pending == serial)
+        {
+            return Ok(*enabled);
+        }
+        let refs = self.script_refs.borrow();
+        find_entry(&refs, serial)
+            .map(|entry| entry.enabled)
+            .ok_or(ScriptRefError::Dead)
+    }
+
+    /// Заявка `enabled` для экземпляра по серийному номеру; применяется на границе фазы.
+    pub(crate) fn set_script_enabled_of(
+        &mut self,
+        serial: u64,
+        enabled: bool,
+    ) -> Result<(), ScriptRefError> {
+        if !self.writable {
+            return Err(ScriptRefError::Invalid(
+                "script enabled state can only be set from update callbacks".to_owned(),
+            ));
+        }
+        if find_entry(&self.script_refs.borrow(), serial).is_none() {
+            return Err(ScriptRefError::Dead);
+        }
+        self.pending_remote_enabled.push((serial, enabled));
+        Ok(())
+    }
+
+    pub(crate) fn attach_scene_state(&mut self, state: SharedSceneState) {
+        self.scene_state = state;
+    }
+
+    /// Запрос загрузки сцены: путь должен быть объявлен и включён в проекте. Запрос последнего
+    /// успешного вызова кадра отдаёт хост после конца кадра.
+    pub(crate) fn request_scene_load(&mut self, path: &str) -> Result<(), String> {
+        if !self.writable || !self.lifecycle_writes {
+            return Err("scenes can only be loaded from update callbacks".to_owned());
+        }
+        let canonical = check_scene_request(&self.scene_state.borrow(), path)?;
+        self.pending_scene_request = Some(canonical);
+        Ok(())
+    }
+
+    /// Имя текущей сцены.
+    pub(crate) fn current_scene(&self) -> String {
+        self.scene_state.borrow().current.clone()
     }
 
     pub(crate) fn object_id(&self, handle: ObjectHandle) -> Option<&str> {
@@ -2628,6 +3185,20 @@ impl ScriptTransaction {
             self.discard();
             return Err("script wrote a transform for an unknown object".to_owned());
         }
+        let script_targets_alive = {
+            let refs = self.script_refs.borrow();
+            self.pending_properties
+                .iter()
+                .all(|write| find_entry(&refs, write.serial).is_some())
+                && self
+                    .pending_remote_enabled
+                    .iter()
+                    .all(|(serial, _)| find_entry(&refs, *serial).is_some())
+        };
+        if !script_targets_alive {
+            self.discard();
+            return Err(ScriptRefError::Dead.message());
+        }
         if let Some(error) = self
             .pending_camera_settings
             .values()
@@ -2738,6 +3309,7 @@ impl ScriptTransaction {
         }
         self.commit_ui();
         self.commit_lifecycle(events);
+        self.commit_script_refs();
 
         self.physics
             .borrow_mut()
@@ -2788,6 +3360,24 @@ impl ScriptTransaction {
             self.time_scale.set(scale);
         }
         self.timeline.borrow_mut().apply(&mut self.pending_timeline);
+        if !self.pending_save.is_empty() {
+            let mut values = self.save_values.borrow_mut();
+            for (key, value) in std::mem::take(&mut self.pending_save) {
+                match value {
+                    Some(value) => {
+                        values.insert(key, value);
+                    }
+                    None => {
+                        values.remove(&key);
+                    }
+                }
+            }
+            self.save_generation
+                .set(self.save_generation.get().wrapping_add(1));
+        }
+        if std::mem::take(&mut self.pending_save_flush) {
+            self.save_flush_requested.set(true);
+        }
         for request in &self.pending_audio {
             match request {
                 AudioRequest::PlayClip { voice, params, .. } => {
@@ -2848,8 +3438,46 @@ impl ScriptTransaction {
         }
     }
 
+    /// Применяет записи свойств и заявки `enabled` чужих экземпляров. Цели проверены до коммита.
+    fn commit_script_refs(&mut self) {
+        if let Some(path) = self.pending_scene_request.take() {
+            self.scene_state.borrow_mut().request = Some(path);
+        }
+        let writes = std::mem::take(&mut self.pending_properties);
+        {
+            let mut refs = self.script_refs.borrow_mut();
+            for write in &writes {
+                if let Some(entry) = refs.iter_mut().find(|entry| entry.serial == write.serial) {
+                    if write.serial != self.instance_serial
+                        && !entry.dirty_properties.contains(&write.name)
+                        && let Some(previous) = entry.properties.get(&write.name)
+                    {
+                        entry
+                            .dirty_original_properties
+                            .insert(write.name.clone(), previous.clone());
+                    }
+                    entry
+                        .properties
+                        .insert(write.name.clone(), write.value.clone());
+                    if write.serial != self.instance_serial {
+                        entry.dirty_properties.insert(write.name.clone());
+                    } else {
+                        entry.dirty_original_properties.remove(&write.name);
+                    }
+                }
+            }
+        }
+        let mut lifecycle = self.lifecycle.borrow_mut();
+        lifecycle
+            .enabled_writes
+            .append(&mut self.pending_remote_enabled);
+    }
+
     pub(crate) fn discard(&mut self) {
         self.discard_ui();
+        self.pending_properties.clear();
+        self.pending_remote_enabled.clear();
+        self.pending_scene_request = None;
         if !self.world.is_null() {
             // SAFETY: `world` is the live reference from `begin`, cleared only below; releasing a
             // reservation needs just a shared borrow and touches no other state of the world.
@@ -2865,6 +3493,8 @@ impl ScriptTransaction {
         self.pending_dead_warnings.clear();
         self.pending_edits.clear();
         self.pending_script_enabled = None;
+        self.pending_save.clear();
+        self.pending_save_flush = false;
         self.pending_timeline.clear();
         self.pending_time_scale = None;
         self.pending_transforms.clear();

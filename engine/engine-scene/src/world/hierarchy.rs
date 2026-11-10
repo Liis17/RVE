@@ -18,6 +18,10 @@ pub enum ObjectEdit {
         object: ObjectHandle,
         active: bool,
     },
+    SetKeepOnLoad {
+        object: ObjectHandle,
+        keep: bool,
+    },
     SetTag {
         object: ObjectHandle,
         tag: String,
@@ -115,7 +119,8 @@ impl World {
     /// при этом сдвиг, вызванный неравномерным масштабом родителя, не восстанавливается точно.
     ///
     /// Отказывает для циклов, родителя-самого объекта, dynamic rigid body и character controller
-    /// (они остаются корнями) и для переноса активной камеры под неактивного родителя.
+    /// (они остаются корнями), сохраняемого объекта (`keep_on_load` только у корней) и для переноса
+    /// активной камеры под неактивного родителя.
     pub fn set_parent(
         &mut self,
         handle: ObjectHandle,
@@ -132,6 +137,9 @@ impl World {
         }
         self.reject_static(index)?;
         if let Some(parent_index) = parent_index {
+            if self.objects[index].keep_on_load {
+                return Err(self.object_error(index, "keep_on_load is only valid on a root object"));
+            }
             let mut cursor = Some(parent_index);
             while let Some(current) = cursor {
                 if current == index {
@@ -298,6 +306,18 @@ impl World {
     pub fn apply_edit(&mut self, edit: &ObjectEdit) -> Result<(), SceneError> {
         match edit {
             ObjectEdit::SetActive { object, active } => self.set_active(*object, *active),
+            ObjectEdit::SetKeepOnLoad { object, keep } => {
+                let index = self.live_index_or_error(*object)?;
+                if self.objects[index].parent.is_some() && *keep {
+                    return Err(SceneError::new(
+                        &self.source_label,
+                        Some(&self.objects[index].id),
+                        "keep_on_load is only valid on a root object",
+                    ));
+                }
+                self.objects[index].keep_on_load = *keep;
+                Ok(())
+            }
             ObjectEdit::SetTag { object, tag } => self.set_tag(*object, tag.clone()),
             ObjectEdit::SetLayer { object, layer } => self.set_layer(*object, *layer),
             ObjectEdit::SetParent {
