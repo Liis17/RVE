@@ -135,6 +135,7 @@ impl World {
         if self.objects[index].parent == parent {
             return Ok(());
         }
+        self.reject_static(index)?;
         if let Some(parent_index) = parent_index {
             if self.objects[index].keep_on_load {
                 return Err(self.object_error(index, "keep_on_load is only valid on a root object"));
@@ -228,6 +229,7 @@ impl World {
     }
 
     fn local_position_for_world(&self, index: usize, position: Vec3) -> Result<Vec3, SceneError> {
+        self.reject_static(index)?;
         if !position.is_finite() {
             return Err(self.object_error(index, "мировая позиция должна быть конечной"));
         }
@@ -279,6 +281,7 @@ impl World {
         index: usize,
         rotation_deg: Vec3,
     ) -> Result<Vec3, SceneError> {
+        self.reject_static(index)?;
         if !rotation_deg.is_finite() {
             return Err(self.object_error(index, "мировой поворот должен быть конечным"));
         }

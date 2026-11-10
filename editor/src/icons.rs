@@ -72,6 +72,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         active: _,
         tag: _,
         layer: _,
+        is_static: _,
         transform: _,
         camera,
         mesh_renderer,

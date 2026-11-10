@@ -35,7 +35,7 @@ fn world() -> World {
             "[[assets]]\npath = \"/target.lua\"\n",
             "[[assets]]\npath = \"/other.lua\"\n",
             "[[objects]]\nid = \"driver\"\n[[objects.lite_scripts]]\npath = \"/driver.lua\"\n",
-            "[[objects]]\nid = \"target\"\n",
+            "[[objects]]\nid = \"target\"\nstatic = true\n",
             "[[objects.lite_scripts]]\npath = \"/target.lua\"\n",
             "[[objects.lite_scripts]]\npath = \"/other.lua\"\n",
             "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
@@ -83,11 +83,14 @@ fn script_ref_reads_declared_properties_and_rejects_bad_writes() {
     let driver = format!(
         r#"
 local Script = {{}}
+local calls = 0
 function Script:on_update()
+  calls = calls + 1
   local s = rve.find("target"):script("{TARGET}")
   assert(s ~= nil)
-  assert(s:get("speed") == 1.5)
+  assert(s:get("speed") == (calls == 1 and 1.5 or 7))
   assert(s:get("count") == 2)
+  assert(rve.find("target"):set_world_position({{x = 9, y = 0, z = 0}}) == false)
   assert(rve.find("target"):script("/missing.lua") == nil)
   s:set("speed", 7)
   assert(s:get("speed") == 7)
@@ -102,11 +105,19 @@ return Script
 "#
     );
     let mut world = world();
+    let target = world.handle("target").unwrap();
+    assert_eq!(world.is_static(target), Some(true));
     let mut host = load(&world, &driver);
 
     host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
 
     assert!(logs(&mut host).contains(&"driver ok".to_owned()));
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(
+        logs(&mut host).contains(&"target update 7".to_owned()),
+        "the static object's ScriptRef property write reaches the owner"
+    );
+    assert_eq!(world.world_position(target), Some(glam::Vec3::ZERO));
 }
 
 #[test]

@@ -62,6 +62,34 @@ fn finish_edit(state: &mut EditorState, response: &egui::Response) {
 }
 
 /// Применяет изменение копии компонента, если значение поменялось.
+/// Флаг `static`; кнопка делает статическими всех собственных потомков сцены.
+fn static_toggle(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
+    let id = object.id.as_str();
+    let mut is_static = object.is_static;
+    let toggled = ui
+        .checkbox(&mut is_static, "")
+        .on_hover_text("Transform and parent never change at runtime")
+        .changed();
+    let has_children = state.scene.as_ref().is_some_and(|scene| {
+        scene
+            .document()
+            .objects
+            .iter()
+            .any(|child| child.parent.as_deref() == Some(id))
+    });
+    let children = has_children
+        && ui
+            .add_enabled(
+                object.is_static,
+                egui::Button::new("Apply to children").small(),
+            )
+            .on_hover_text("Mark every child object static")
+            .clicked();
+    if toggled || children {
+        state.edit_scene(|scene| scene.set_static(id, is_static, children));
+    }
+}
+
 fn commit(
     state: &mut EditorState,
     id: &str,
@@ -111,6 +139,14 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
         .scene
         .as_ref()
         .is_some_and(|scene| scene.is_prefab_part(id));
+    // Флаг static хранится только у собственных объектов сцены, не у частей и корней экземпляров.
+    let own = state.scene.as_ref().is_some_and(|scene| {
+        scene
+            .document()
+            .objects
+            .iter()
+            .any(|candidate| candidate.id == id)
+    });
     let mut name_reverted = false;
     egui::Grid::new("object_fields")
         .num_columns(2)
@@ -159,6 +195,10 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
 
             ui.label("Layer");
             ui.add_enabled_ui(!part, |ui| layer_combo(ui, state, object));
+            ui.end_row();
+
+            ui.label("Static");
+            ui.add_enabled_ui(own, |ui| static_toggle(ui, state, object));
             ui.end_row();
         });
     if name_reverted {

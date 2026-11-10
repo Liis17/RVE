@@ -70,17 +70,30 @@ fn sources() -> BTreeMap<String, String> {
 }
 
 fn old_scene(extra_keeper_params: &str) -> World {
+    old_scene_with_keeper(extra_keeper_params, false)
+}
+
+fn old_static_scene() -> World {
+    old_scene_with_keeper("", true)
+}
+
+fn old_scene_with_keeper(extra_keeper_params: &str, static_keeper: bool) -> World {
+    let keeper_fields = if static_keeper {
+        "static = true\n[objects.transform]\nposition = [1.0, 2.0, 3.0]\n"
+    } else {
+        ""
+    };
     let document = SceneDocument::parse(
         "old.rvescene",
         &format!(
             concat!(
                 "[[assets]]\npath = \"/keeper.lua\"\n[[assets]]\npath = \"/old.lua\"\n",
-                "[[objects]]\nid = \"keeper\"\nkeep_on_load = true\n",
+                "[[objects]]\nid = \"keeper\"\nkeep_on_load = true\n{}\n",
                 "[[objects.lite_scripts]]\npath = \"/keeper.lua\"\n{}",
                 "[[objects]]\nid = \"old\"\n[[objects.lite_scripts]]\npath = \"/old.lua\"\n",
                 "[[objects]]\nid = \"cam_old\"\n[objects.camera]\nactive = true\n",
             ),
-            extra_keeper_params
+            keeper_fields, extra_keeper_params
         ),
     )
     .unwrap();
@@ -88,15 +101,25 @@ fn old_scene(extra_keeper_params: &str) -> World {
 }
 
 fn new_scene(extra_script: &str) -> World {
+    new_scene_with_static(extra_script, false)
+}
+
+fn new_scene_with_static(extra_script: &str, include_static: bool) -> World {
+    let static_object = if include_static {
+        "[[objects]]\nid = \"replacement_static\"\nstatic = true\n"
+    } else {
+        ""
+    };
     let document = SceneDocument::parse(
         "new.rvescene",
         &format!(
             concat!(
                 "[[assets]]\npath = \"/new.lua\"\n",
+                "{}",
                 "[[objects]]\nid = \"new\"\n[[objects.lite_scripts]]\npath = \"/new.lua\"\n{}",
                 "[[objects]]\nid = \"cam_new\"\n[objects.camera]\nactive = true\n",
             ),
-            extra_script
+            static_object, extra_script
         ),
     )
     .unwrap();
@@ -124,16 +147,19 @@ fn messages(host: &mut ScriptHost) -> Vec<String> {
 
 #[test]
 fn scene_switch_keeps_persistent_instance_state_and_destroys_old_scripts_once() {
-    let mut world = old_scene("");
+    let mut world = old_static_scene();
     let keeper = world.handle("keeper").unwrap();
     let old = world.handle("old").unwrap();
+    let keeper_position = glam::Vec3::new(1.0, 2.0, 3.0);
+    assert_eq!(world.is_static(keeper), Some(true));
+    assert_eq!(world.world_position(keeper), Some(keeper_position));
     let mut host = load(&world);
     host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
     assert!(messages(&mut host).contains(&"keeper update 1".to_owned()));
 
     host.replace_scene(
         &mut world,
-        new_scene(""),
+        new_scene_with_static("", true),
         &sources(),
         "new",
         ScriptTime::default(),
@@ -158,8 +184,14 @@ fn scene_switch_keeps_persistent_instance_state_and_destroys_old_scripts_once() 
     assert!(!after.contains(&"old update".to_owned()), "{after:?}");
 
     assert_eq!(world.handle("keeper"), Some(keeper));
+    assert_eq!(world.is_static(keeper), Some(true));
+    assert_eq!(world.world_position(keeper), Some(keeper_position));
     assert!(!world.is_alive(old));
     assert!(world.handle("new").is_some());
+    assert_eq!(
+        world.is_static(world.handle("replacement_static").unwrap()),
+        Some(true)
+    );
     assert_eq!(world.active_camera(), world.handle("cam_new").unwrap());
 }
 

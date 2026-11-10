@@ -82,6 +82,12 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         json!({"type":"object","properties":{"id":{"type":"string"},"active":{"type":"boolean"}},"required":["id","active"],"additionalProperties":false}),
         Permission::EditScene,
     ));
+    tools.push(ToolSpec::new(
+        "set_static",
+        "Set an own scene object's static flag. Turning it off also clears descendants; children=true marks descendants static too.",
+        json!({"type":"object","properties":{"id":{"type":"string"},"static":{"type":"boolean"},"children":{"type":"boolean"}},"required":["id","static"],"additionalProperties":false}),
+        Permission::EditScene,
+    ));
     for name in ["undo", "redo"] {
         tools.push(ToolSpec::new(
             name,
@@ -114,6 +120,7 @@ pub(super) fn call(
         "remove_component" => remove_component(arguments, state),
         "set_script_param" => set_script_param(arguments, state),
         "set_camera_active" => set_camera_active(arguments, state),
+        "set_static" => set_static(arguments, state),
         "undo" => history(state, false),
         "redo" => history(state, true),
         _ => Err(format!("unknown or unimplemented tool: {tool}")),
@@ -378,6 +385,24 @@ fn set_camera_active(arguments: &Value, state: &mut EditorState) -> Result<Value
     Ok(json!({"id": id, "active": active}))
 }
 
+fn set_static(arguments: &Value, state: &mut EditorState) -> Result<Value, String> {
+    let id = required_string(arguments, "id")?;
+    let is_static = arguments
+        .get("static")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "static must be a boolean".to_owned())?;
+    let children = match arguments.get("children") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "children must be a boolean".to_owned())?,
+    };
+    let scene = scene_mut(state)?;
+    scene.end_continuous_edit();
+    scene.set_static(id, is_static, children)?;
+    Ok(json!({"id": id, "static": is_static}))
+}
+
 fn history(state: &mut EditorState, redo: bool) -> Result<Value, String> {
     let scene = scene_mut(state)?;
     scene.end_continuous_edit();
@@ -617,6 +642,40 @@ mod tests {
                 .unwrap(),
             document
         );
+    }
+
+    #[test]
+    fn set_static_marks_the_object_and_rejects_bad_arguments() {
+        let mut fixture = TempProject::new();
+        let is_static = |fixture: &TempProject| {
+            fixture
+                .state
+                .scene
+                .as_ref()
+                .unwrap()
+                .object("camera")
+                .unwrap()
+                .is_static
+        };
+        assert!(call("set_static", &json!({"id":"camera"}), &mut fixture.state).is_err());
+        assert!(
+            call(
+                "set_static",
+                &json!({"id":"camera","static":true,"children":"yes"}),
+                &mut fixture.state
+            )
+            .is_err()
+        );
+        assert!(!is_static(&fixture));
+
+        let result = call(
+            "set_static",
+            &json!({"id":"camera","static":true}),
+            &mut fixture.state,
+        )
+        .unwrap();
+        assert_eq!(result, json!({"id":"camera","static":true}));
+        assert!(is_static(&fixture));
     }
 
     #[test]

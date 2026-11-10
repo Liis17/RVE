@@ -274,7 +274,20 @@ impl SceneDocument {
                     format!("родитель {parent:?} не существует"),
                 ));
             }
+            if let Some(parent) = &object.parent
+                && object.is_static
+                && object_indices
+                    .get(parent.as_str())
+                    .is_some_and(|&index| !self.objects[index].is_static)
+            {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    format!("родитель {parent:?} статического объекта должен быть статическим"),
+                ));
+            }
             validate_transform(source, object)?;
+            validate_static_object(source, object)?;
             validate_physics_components(source, object)?;
             validate_network_object(source, object)?;
             if let Some(camera) = &object.camera {
@@ -653,6 +666,11 @@ pub struct SceneObject {
     /// Слой `0..32` из `[layers]` проекта.
     #[serde(default, skip_serializing_if = "is_default_layer")]
     pub layer: u8,
+    /// Статический объект: трансформация и родитель не меняются после загрузки. Предки тоже
+    /// статические; dynamic/kinematic rigid body, character controller, animator и
+    /// network transform запрещены. Основа для оптимизаций неподвижной геометрии.
+    #[serde(rename = "static", default, skip_serializing_if = "is_false")]
+    pub is_static: bool,
     #[serde(default)]
     pub transform: SceneTransform,
     #[serde(default)]
@@ -703,6 +721,7 @@ impl Default for SceneObject {
             keep_on_load: false,
             tag: String::new(),
             layer: 0,
+            is_static: false,
             transform: SceneTransform::default(),
             camera: None,
             mesh_renderer: None,
@@ -1382,6 +1401,35 @@ fn validate_transform(source: &str, object: &SceneObject) -> Result<(), SceneErr
         }
     }
     Ok(())
+}
+
+/// Компоненты, которые двигают объект, несовместимы с `static`.
+fn validate_static_object(source: &str, object: &SceneObject) -> Result<(), SceneError> {
+    if !object.is_static {
+        return Ok(());
+    }
+    let moving = if object
+        .rigid_body
+        .is_some_and(|body| body.kind != RigidBodyKind::Static)
+    {
+        Some("dynamic или kinematic rigid_body")
+    } else if object.character_controller.is_some() {
+        Some("character_controller")
+    } else if object.animator.is_some() {
+        Some("animator")
+    } else if object.network_transform.is_some() {
+        Some("network_transform")
+    } else {
+        None
+    };
+    match moving {
+        Some(component) => Err(SceneError::new(
+            source,
+            Some(&object.id),
+            format!("статический объект не может иметь {component}"),
+        )),
+        None => Ok(()),
+    }
 }
 
 fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(), SceneError> {
@@ -2198,6 +2246,74 @@ id = "camera"
 
     fn parse(input: &str) -> Result<SceneDocument, super::SceneError> {
         SceneDocument::parse("scenes/test.rvescene", input)
+    }
+
+    #[test]
+    fn static_flag_round_trips_and_is_omitted_when_false() {
+        let document = parse(&format!(
+            "{VALID}[[objects]]\nid = \"rock\"\nstatic = true\n[[objects]]\nid = \"crate\"\n"
+        ))
+        .unwrap();
+        assert!(document.objects[1].is_static);
+        assert!(!document.objects[2].is_static);
+
+        let saved = document.to_toml().unwrap();
+        assert_eq!(saved.matches("static = true").count(), 1, "{saved}");
+        assert!(!saved.contains("static = false"), "{saved}");
+        assert_eq!(parse(&saved).unwrap().objects, document.objects);
+    }
+
+    #[test]
+    fn static_object_requires_static_ancestors() {
+        let scene = |parent_static: &str| {
+            format!(
+                "{VALID}[[objects]]\nid = \"base\"\n{parent_static}[[objects]]\nid = \"rock\"\nparent = \"base\"\nstatic = true\n"
+            )
+        };
+        error(&scene(""), "статического объекта должен быть статическим");
+        assert!(parse(&scene("static = true\n")).is_ok());
+        let dynamic_child = format!(
+            "{VALID}[[objects]]\nid = \"base\"\nstatic = true\n[[objects]]\nid = \"lamp\"\nparent = \"base\"\n"
+        );
+        assert!(
+            parse(&dynamic_child).is_ok(),
+            "нестатический потомок допустим"
+        );
+    }
+
+    #[test]
+    fn static_object_rejects_components_that_move_it() {
+        let rock = |components: &str| {
+            format!("{VALID}[[objects]]\nid = \"rock\"\nstatic = true\n{components}")
+        };
+        let collider = "[objects.collider]\n";
+        error(
+            &rock(&format!(
+                "{collider}[objects.rigid_body]\nkind = \"dynamic\"\n"
+            )),
+            "dynamic или kinematic rigid_body",
+        );
+        error(
+            &rock(&format!(
+                "{collider}[objects.rigid_body]\nkind = \"kinematic\"\n"
+            )),
+            "dynamic или kinematic rigid_body",
+        );
+        assert!(
+            parse(&rock(&format!(
+                "{collider}[objects.rigid_body]\nkind = \"static\"\n"
+            )))
+            .is_ok()
+        );
+        assert!(parse(&rock(collider)).is_ok());
+        error(
+            &rock("[objects.character_controller]\n"),
+            "character_controller",
+        );
+        error(
+            &rock("[objects.network_identity]\n[objects.network_transform]\n"),
+            "network_transform",
+        );
     }
 
     fn error(input: &str, contains: &str) {

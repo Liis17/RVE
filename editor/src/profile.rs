@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use engine_core::profile::{ProfileGroup, ProfileReport, ProfileRow, ProfileValue, RollingStat};
-use engine_render::{FrameProfile, GpuPass, GpuViewTimings, ProfiledView, ViewportId};
+use engine_render::{DrawStats, FrameProfile, GpuPass, GpuViewTimings, ProfiledView, ViewportId};
 use engine_resources::{ResourceSampler, ResourceStats};
 use engine_script::ScriptUpdateProfile;
 
@@ -52,6 +52,8 @@ pub struct EditorProfile {
     scene: Vec<RollingStat>,
     game: Vec<RollingStat>,
     play: Vec<RollingStat>,
+    /// Счётчики draw'ов последнего кадра renderer по всем видам.
+    draws: Option<DrawStats>,
     resources: ResourceSampler,
     next_resource_sample: Option<Instant>,
 }
@@ -63,6 +65,7 @@ impl Default for EditorProfile {
             scene: windows(GpuPass::COUNT + 1),
             game: windows(GpuPass::COUNT + 1),
             play: windows(PLAY_LABELS.len()),
+            draws: None,
             resources: ResourceSampler::default(),
             next_resource_sample: None,
         }
@@ -89,6 +92,7 @@ impl EditorProfile {
         for (window, elapsed) in self.cpu.iter_mut().zip(phases) {
             window.push(elapsed);
         }
+        self.record_draws(frame.draws);
         let views = frame
             .gpu
             .iter()
@@ -101,6 +105,12 @@ impl EditorProfile {
             ProfiledView::Viewport(game),
             views,
         );
+    }
+
+    /// Запоминает счётчики draw'ов; вкладка показывает последний кадр. Отдельно от `record_frame`,
+    /// потому что `ViewportId` вне `engine-render` не создаётся.
+    fn record_draws(&mut self, draws: DrawStats) {
+        self.draws = Some(draws);
     }
 
     /// Снимает статистику запросов ресурсов не чаще [`RESOURCE_SAMPLE_INTERVAL`].
@@ -144,6 +154,7 @@ impl EditorProfile {
                 group("GPU Scene", &gpu_labels, &self.scene),
                 group("GPU Game", &gpu_labels, &self.game),
                 group("Play", &PLAY_LABELS, &self.play),
+                draws_group(self.draws),
                 self.resources.profile_group(),
             ],
         }
@@ -189,6 +200,24 @@ fn record_view(windows: &mut [RollingStat], view: Option<GpuViewTimings>) {
     windows[GpuPass::COUNT].push(view.total);
 }
 
+/// Счётчики последнего кадра; до первого кадра значения отсутствуют.
+fn draws_group(draws: Option<DrawStats>) -> ProfileGroup {
+    let values = draws.map(|draws| draws.values());
+    ProfileGroup {
+        name: "Draws (last frame)",
+        rows: DrawStats::LABELS
+            .iter()
+            .enumerate()
+            .map(|(index, &label)| ProfileRow {
+                label,
+                value: values.map_or(ProfileValue::Missing, |values| {
+                    ProfileValue::Count(u64::from(values[index]))
+                }),
+            })
+            .collect(),
+    }
+}
+
 fn group(name: &'static str, labels: &[&'static str], windows: &[RollingStat]) -> ProfileGroup {
     ProfileGroup {
         name,
@@ -207,7 +236,7 @@ fn group(name: &'static str, labels: &[&'static str], windows: &[RollingStat]) -
 mod tests {
     use super::{EditorProfile, PlayStep, RESOURCE_SAMPLE_INTERVAL, record_gpu, windows};
     use engine_core::profile::{ProfileReport, ProfileValue};
-    use engine_render::{GpuPass, GpuViewTimings, ProfiledView};
+    use engine_render::{DrawStats, GpuPass, GpuViewTimings, ProfiledView};
     use engine_resources::ResourceStats;
     use std::time::{Duration, Instant};
 
@@ -292,7 +321,41 @@ mod tests {
         let names: Vec<&str> = report.groups.iter().map(|group| group.name).collect();
         assert_eq!(
             names,
-            ["Renderer CPU", "GPU Scene", "GPU Game", "Play", "Resources"]
+            [
+                "Renderer CPU",
+                "GPU Scene",
+                "GPU Game",
+                "Play",
+                "Draws (last frame)",
+                "Resources"
+            ]
+        );
+    }
+
+    #[test]
+    fn draw_counts_are_missing_until_a_frame_and_then_show_the_last_frame() {
+        let mut profile = EditorProfile::default();
+        assert_eq!(
+            row_value(&profile.report(), "Draws (last frame)", "scene draw calls"),
+            Some(ProfileValue::Missing)
+        );
+        let draws = |scene_draw_calls| DrawStats {
+            scene_draw_calls,
+            scene_culled: 2,
+            shadow_draw_calls: 8,
+            shadow_culled: 1,
+        };
+        profile.record_draws(draws(3));
+        profile.record_draws(draws(5));
+
+        let report = profile.report();
+        assert_eq!(
+            row_value(&report, "Draws (last frame)", "scene draw calls"),
+            Some(ProfileValue::Count(5))
+        );
+        assert_eq!(
+            row_value(&report, "Draws (last frame)", "shadow culled"),
+            Some(ProfileValue::Count(1))
         );
     }
 

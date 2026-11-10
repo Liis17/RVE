@@ -249,6 +249,8 @@ pub struct WorldObject {
     pub tag: String,
     /// Слой объекта `0..32`.
     pub layer: u8,
+    /// Трансформация и родитель неизменны; см. [`crate::document::SceneObject::is_static`].
+    pub is_static: bool,
     pub transform: LocalTransform,
     pub mesh_renderer: Option<crate::document::MeshRenderer>,
     pub lod_group: Option<LodGroup>,
@@ -887,7 +889,26 @@ impl World {
         transform: LocalTransform,
     ) -> Result<(), SceneError> {
         let index = self.live_index_or_error(handle)?;
+        self.reject_static(index)?;
         self.objects[index].transform = transform;
+        Ok(())
+    }
+
+    /// Статический ли объект; `None` для неизвестного handle.
+    pub fn is_static(&self, handle: ObjectHandle) -> Option<bool> {
+        self.object(handle).map(|object| object.is_static)
+    }
+
+    /// Ошибка для записи позы или родителя статического объекта.
+    pub(crate) fn reject_static(&self, index: usize) -> Result<(), SceneError> {
+        let object = &self.objects[index];
+        if object.is_static {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                "трансформация и родитель статического объекта не меняются",
+            ));
+        }
         Ok(())
     }
 
@@ -922,6 +943,7 @@ impl World {
         }
 
         let index = self.live_index_or_error(handle)?;
+        self.reject_static(index)?;
         let object = &mut self.objects[index];
         if object.parent.is_some() {
             return Err(SceneError::new(
@@ -1104,6 +1126,12 @@ impl World {
             return Err(self.component_error(
                 index,
                 "rigid_body требует конечные значения, демпфирование >= 0 и массу > 0 для dynamic",
+            ));
+        }
+        if body.kind != RigidBodyKind::Static && self.objects[index].is_static {
+            return Err(self.component_error(
+                index,
+                "статический объект не может иметь dynamic или kinematic rigid_body",
             ));
         }
         if body.kind == RigidBodyKind::Dynamic && self.objects[index].parent.is_some() {
@@ -1652,6 +1680,13 @@ impl World {
                     "dynamic rigid_body и character_controller spawn-объекта допускаются только без родителя",
                 ));
             }
+            if root.is_static && self.is_static(parent) == Some(false) {
+                return Err(SceneError::new(
+                    source,
+                    Some(root_id),
+                    "родитель статического spawn-объекта должен быть статическим",
+                ));
+            }
         }
         let ids = spawned_ids(root_id, template);
         if let Some(id) = ids.iter().find(|id| id.len() > MAX_EXPANDED_ID_BYTES) {
@@ -1951,6 +1986,7 @@ fn world_object(
         keep_on_load: object.keep_on_load,
         tag: object.tag.clone(),
         layer: object.layer,
+        is_static: object.is_static,
         transform: object.transform.into(),
         mesh_renderer: object.mesh_renderer.clone(),
         lod_group: object.lod_group.clone(),

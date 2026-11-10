@@ -850,3 +850,31 @@ fn spawn_refuses_a_keep_on_load_root_under_a_parent_and_releases_reservations() 
     assert_eq!(world.keep_on_load(free[0]), Some(true));
     assert_eq!(world.object(free[0]).unwrap().parent, None);
 }
+
+#[test]
+fn static_prefab_spawns_only_under_a_static_parent_or_as_a_root() {
+    let scene = format!(
+        "{CAMERA_SCENE}\n[[objects]]\nid = \"rig\"\n[[objects]]\nid = \"ground\"\nstatic = true\n"
+    );
+    let mut world = world(&scene);
+    let rock = template("[[objects]]\nid = \"rock\"\nstatic = true\n");
+    let under = |parent| SpawnOptions {
+        parent: Some(parent),
+        position: Some(Vec3::new(4.0, 0.0, 0.0)),
+        ..SpawnOptions::default()
+    };
+
+    let rig = world.handle("rig").unwrap();
+    let error = spawn(&mut world, &rock, under(rig)).unwrap_err();
+    assert!(error.message.contains("должен быть статическим"), "{error}");
+
+    let ground = world.handle("ground").unwrap();
+    let placed = spawn(&mut world, &rock, under(ground)).unwrap();
+    assert_eq!(world.is_static(placed[0]), Some(true));
+    assert_eq!(
+        world.world_position(placed[0]),
+        Some(Vec3::new(4.0, 0.0, 0.0))
+    );
+    let root = spawn(&mut world, &rock, SpawnOptions::default()).unwrap();
+    assert_eq!(world.is_static(root[0]), Some(true));
+}

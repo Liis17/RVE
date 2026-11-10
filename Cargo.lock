@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.12.0"
+version = "0.14.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.26.2"
+version = "0.27.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "blake3",
  "engine-files",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.22.2"
+version = "0.23.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3236,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "engine-assets",
  "engine-core",
