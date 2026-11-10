@@ -389,6 +389,18 @@ mod tests {
     }
 
     #[test]
+    fn static_object_cannot_have_an_animator() {
+        let message =
+            parse(&source("").replace("id = \"hero\"\n", "id = \"hero\"\nstatic = true\n"))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            message.contains("статический объект не может иметь animator"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn animator_needs_mesh_renderer_and_no_lod_group() {
         let without_mesh =
             format!("{ASSETS}{CAMERA}[[objects]]\nid = \"hero\"\n[objects.animator]\n");

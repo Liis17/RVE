@@ -654,3 +654,74 @@ fn own_transform_write_with_unrelated_pose_and_tag_commits_together() {
     );
     assert_eq!(world.tag(kid), Some("spin"));
 }
+
+const STATIC_WRITES: &str = r#"
+local Script = {}
+function Script:on_start()
+  local rock = rve.find("rock")
+  local moved = rock:get_transform()
+  moved.position = {x = 5, y = 0, z = 0}
+  rve.log("transform:" .. tostring(rock:set_transform(moved)))
+  rve.log("pos:" .. tostring(rock:set_world_position({x = 1, y = 2, z = 3})))
+  rve.log("rot:" .. tostring(rock:set_world_rotation({x = 0, y = 90, z = 0})))
+  rve.log("parent:" .. tostring(rock:set_parent(nil, true)))
+  rve.log("active:" .. tostring(rock:set_active(false)))
+  rve.log("tag:" .. tostring(rock:set_tag("prop")))
+  rve.log("self:" .. tostring(self.object:set_world_position({x = 7, y = 0, z = 0})))
+end
+return Script
+"#;
+
+#[test]
+fn static_object_rejects_pose_writes_without_rolling_back_other_writes() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/writer.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "ground"
+static = true
+[[objects]]
+id = "rock"
+parent = "ground"
+static = true
+[[objects]]
+id = "writer"
+[[objects.lite_scripts]]
+path = "/writer.lua"
+"#,
+    );
+    let rock = world.handle("rock").unwrap();
+    let writer = world.handle("writer").unwrap();
+    let before = world.world_matrix(rock).unwrap();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("writer.lua", STATIC_WRITES)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, frame());
+
+    assert_eq!(
+        event_messages(&mut host),
+        [
+            "transform:false",
+            "pos:false",
+            "rot:false",
+            "parent:false",
+            "active:true",
+            "tag:true",
+            "self:true"
+        ]
+    );
+    assert_eq!(world.world_matrix(rock).unwrap(), before);
+    assert_eq!(world.tag(rock), Some("prop"));
+    assert_eq!(
+        world.world_position(writer),
+        Some(glam::Vec3::new(7.0, 0.0, 0.0))
+    );
+}

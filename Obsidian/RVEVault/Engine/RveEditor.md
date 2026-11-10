@@ -111,6 +111,8 @@ Project → Create и контекстное меню папки создают 
 
 ### Параметры скриптов
 
+Inspector показывает флаг `Static` собственных объектов сцены (у частей и корней экземпляров префаба флаг недоступен: он задаётся в самом префабе). `scene_edit::set_static` меняет его одной записью истории: включение затрагивает объект, а кнопка `Apply to children` — и потомков; выключение снимает флаг со всего поддерева, потому что предки статического объекта должны быть статическими. В режиме редактирования статический объект двигается как обычно; запрет действует в Play и runtime.
+
 Inspector показывает `params` скрипта по его схеме ([[Engine/EngineScene#Схема параметров скриптов]]), если схема есть.
 
 - Lua: схема `properties` читается `engine_script::lite_properties` при первом показе компонента и кэшируется в `EditorState::lite_schemas`. Чтение ограничено 5 секундами, после этого chunk прерывается. Изменение исходного `.lua` помечает запись для перечитывания при следующем показе; при ошибке прежняя успешная схема остаётся активной.
@@ -322,7 +324,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 | Право | Инструменты |
 |---|---|
 | Read (всегда) | `editor_status`, `list_assets`, `list_project_files`, `read_text_file`, `get_project_settings`, `get_scene_hierarchy` (`source`: `edit` или `play`), `get_object`, `get_component`, `describe_components`, `get_asset_settings`, `get_script_params_schema`, `get_console_log`, `capture_view` |
-| Edit scene | `select_objects`, `create_object`, `delete_objects`, `duplicate_objects`, `set_parent`, `rename_object`, `change_id`, `set_transform`, `set_component` (по умолчанию слияние с текущим значением), `remove_component`, `set_script_param`, `set_camera_active`, `undo`, `redo` |
+| Edit scene | `select_objects`, `create_object`, `delete_objects`, `duplicate_objects`, `set_parent`, `rename_object`, `change_id`, `set_transform`, `set_component` (по умолчанию слияние с текущим значением), `remove_component`, `set_script_param`, `set_camera_active`, `set_static` (`children` также помечает потомков), `undo`, `redo` |
 | Write assets | `save_scene`, `open_scene`, `new_scene`, `open_project`, `write_asset_settings`, `create_folder`, `write_text_file`, `rename_asset`, `delete_asset`, `import_files`, `create_prefab`, `apply_to_prefab` |
 | Play | `play_start`, `play_stop`, `play_pause`, `play_resume`, `console_command` |
 | Build | `build_scripts`, `build_player`, `build_status` |

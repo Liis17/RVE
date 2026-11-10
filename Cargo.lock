@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "blake3",
  "engine-files",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -3155,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "egui",
  "egui-winit",
