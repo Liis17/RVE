@@ -79,11 +79,30 @@ struct AbiConsoleCommand {
 }
 
 struct AbiConsoleForeign;
+struct QuitProbe {
+    fail_after_quit: bool,
+}
 
 fn camera_control_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(CameraControl {
         panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
     }))
+}
+
+fn quit_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(QuitProbe {
+        fail_after_quit: matches!(params.get("fail_after_quit"), Some(Value::Bool(true))),
+    }))
+}
+
+impl Script for QuitProbe {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        assert!(ctx.quit());
+        if self.fail_after_quit {
+            panic!("quit probe failed after requesting exit");
+        }
+        ctx.log_info("quit probe succeeded");
+    }
 }
 
 fn reference_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
@@ -968,6 +987,9 @@ fn sdk_module() -> &'static RveModule {
         "StaleScriptRefProbe" => stale_script_ref_factory,
         "ScriptRefProbe" => script_ref_probe_factory,
         "PlatformProbe" => platform_probe_factory,
+        "QuitProbe" => quit_probe_factory {
+            fail_after_quit: bool = false,
+        },
         "PropertyProbe" => property_probe_factory {
             speed: f32 = 1.5 (0.0..=10.0),
         },
@@ -5488,6 +5510,37 @@ path = "/target.lua"
     );
 }
 
+#[test]
+fn abi_context_quit_is_committed_only_after_a_successful_callback() {
+    let _guard = test_lock();
+    for (fail_after_quit, expected) in [(true, false), (false, true)] {
+        let mut world = world(&format!(
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+             [[objects.heavy_scripts]]\nname = \"QuitProbe\"\n\
+             [objects.heavy_scripts.params]\nfail_after_quit = {fail_after_quit}\n"
+        ));
+        let mut host = load_host(&world, &library());
+
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+        assert_eq!(host.take_quit_request(), expected);
+        assert!(!host.take_quit_request());
+        let events = host.drain_events();
+        if fail_after_quit {
+            assert!(events.iter().any(|event| {
+                event.level == ScriptEventLevel::Error
+                    && event.message.contains("failed after requesting exit")
+            }));
+        } else {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.message == "quit probe succeeded")
+            );
+        }
+    }
+}
+
 /// Heavy probe with one declared property; logs the value its callbacks observe.
 struct PropertyProbe;
 
@@ -6395,15 +6448,15 @@ return Script"#
 }
 
 #[test]
-fn abi_v20_module_loads_on_the_v22_host_and_runs_without_property_writes() {
+fn abi_v20_module_loads_on_the_v23_host_and_runs_without_property_writes() {
     let _guard = test_lock();
     run_legacy_descriptor_module_without_property_writes(20);
 }
 
-/// ABI v21 (save callbacks, historical descriptor layout) must not be read as the wide v22
+/// ABI v21 (save callbacks, historical descriptor layout) must not be read as the wide v23
 /// descriptor: its exact-sized table would be overread otherwise.
 #[test]
-fn abi_v21_module_loads_on_the_v22_host_and_runs_without_property_writes() {
+fn abi_v21_module_loads_on_the_v23_host_and_runs_without_property_writes() {
     let _guard = test_lock();
     run_legacy_descriptor_module_without_property_writes(21);
 }
@@ -6424,7 +6477,7 @@ fn run_legacy_descriptor_module_without_property_writes(abi_version: u32) {
     let messages = message_list(&mut host);
     assert!(
         messages.iter().any(|message| message == "start:default"),
-        "ABI v{abi_version} descriptors load and run on the ABI v22 host: {messages:?}"
+        "ABI v{abi_version} descriptors load and run on the ABI v23 host: {messages:?}"
     );
 }
 

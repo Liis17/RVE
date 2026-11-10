@@ -570,6 +570,7 @@ pub(crate) fn create_lua(
     rve.set("spawn", spawn_function(&lua, active_call.clone())?)?;
     rve.set("destroy", destroy_function(&lua, active_call.clone())?)?;
     rve.set("scene", scene_table(&lua, active_call.clone())?)?;
+    rve.set("app", app_table(&lua, active_call.clone())?)?;
     rve.set("prefabs", prefabs_table(&lua, active_call.clone())?)?;
     rve.set("send", send_function(&lua, active_call.clone())?)?;
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
@@ -5251,6 +5252,20 @@ fn scene_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
         })?,
     )?;
     Ok(scene)
+}
+
+/// `rve.app`: `quit()` запрашивает штатное завершение после успешного callback.
+fn app_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let app = lua.create_table()?;
+    app.set(
+        "quit",
+        lua.create_function(move |_, ()| {
+            with_active_call(&active_call, |transaction| {
+                transaction.request_quit().map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    Ok(app)
 }
 #[cfg(test)]
 mod tests {

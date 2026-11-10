@@ -1351,6 +1351,11 @@ impl PlaySession {
         self.host.complete_file_dialog(id, paths);
     }
 
+    /// Returns whether a successful script callback requested stopping editor Play mode.
+    pub fn take_quit_request(&mut self) -> bool {
+        self.host.take_quit_request()
+    }
+
     /// Сообщает о неудачной загрузке запрошенной сцены; текущая сцена продолжает работать.
     pub fn report_scene_failure(&mut self, path: &str, message: &str) {
         self.host.report_scene_failure(path, message);

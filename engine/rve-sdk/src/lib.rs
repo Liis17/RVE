@@ -1833,6 +1833,16 @@ impl<'a> Context<'a> {
         unsafe { callback(self.host.ctx, RveStr::from_str_ref(path)) }
     }
 
+    /// Requests graceful application shutdown after the current successful callback.
+    /// Returns `false` when this host lacks the callback or disallows writes in this phase.
+    pub fn quit(&mut self) -> bool {
+        let Some(callback) = self.host.app_quit else {
+            return false;
+        };
+        // SAFETY: the host context is valid for the duration of this guest callback.
+        unsafe { callback(self.host.ctx) }
+    }
+
     /// Returns the name of the current scene, or `None` if the host does not report one.
     pub fn current_scene(&self) -> Option<String> {
         let callback = self.host.scene_current?;

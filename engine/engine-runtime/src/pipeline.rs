@@ -1826,6 +1826,9 @@ fn scripts_thread(
         let update_started = Instant::now();
         scripts.update_frame(&mut world, frame_time);
         platform.after_update(&mut scripts);
+        if scripts.take_quit_request() {
+            break;
+        }
         if let Some(path) = scripts.take_scene_request() {
             if network.is_some() {
                 scripts.report_scene_failure(
@@ -4668,6 +4671,8 @@ distance=2.0
     }
 
     static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static QUIT_UPDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static QUIT_DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct InputObservation {
@@ -4724,10 +4729,28 @@ distance=2.0
         Ok(Box::new(TickProbe))
     }
 
+    struct QuitProbe;
+
+    impl Script for QuitProbe {
+        fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+            assert!(ctx.quit());
+            QUIT_UPDATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_destroy(&mut self, _ctx: &mut Context<'_>) {
+            QUIT_DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn quit_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(QuitProbe))
+    }
+
     fn script_module() -> &'static rve_sdk::abi::RveModule {
         rve_sdk::script_module! {
             "DestroyProbe" => destroy_probe_factory,
             "TickProbe" => tick_probe_factory,
+            "QuitProbe" => quit_probe_factory,
         }
     }
 
@@ -7616,6 +7639,80 @@ return Move
         assert!(!interrupt.is_interrupted());
         assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
         modules.join_named(super::SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn script_quit_stops_the_headless_pipeline_gracefully_with_success_status() {
+        QUIT_UPDATE_CALLS.store(0, Ordering::SeqCst);
+        QUIT_DESTROY_CALLS.store(0, Ordering::SeqCst);
+        let document = SceneDocument::parse(
+            "startup.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects.heavy_scripts]]\nname = \"QuitProbe\"\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let mut modules = ModuleHost::new();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, _frame_rx) = flume::unbounded();
+        let (render_tx, render_rx) = flume::unbounded();
+        let interrupt = ScriptInterruptHandle::new();
+        let status = Arc::new(RuntimeStatus::default());
+        let script_thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_loader: None,
+                platform: Default::default(),
+                gpu_render: false,
+                ui: Default::default(),
+                ui_text_focus: Default::default(),
+                scene_name: "startup.rvescene".to_owned(),
+                enabled_scenes: Vec::new(),
+                save_path: None,
+                cursor: CursorControl::default(),
+                sources: BTreeMap::new(),
+                input_settings: engine_project::InputSettings::default(),
+                scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
+                script_module: Some(script_module()),
+                interrupt: interrupt.clone(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                gamepad_devices: false,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::clone(&status),
+                input: test_input(),
+                physics_client: None,
+                physics_initialization: None,
+                audio: None,
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
+            },
+        )
+        .unwrap();
+
+        script_thread.ready.recv().unwrap().unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
+        script_thread
+            .stopped
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the headless scripts loop should stop on ctx.quit()");
+
+        assert_eq!(QUIT_UPDATE_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(QUIT_DESTROY_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(status.exit_code(), 0);
+        assert!(!interrupt.is_interrupted());
+        assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
+        modules.join_named(SCRIPTS_THREAD).unwrap();
         assert!(modules.shutdown().is_empty());
     }
 

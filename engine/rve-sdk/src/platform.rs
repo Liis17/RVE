@@ -1,4 +1,4 @@
-//! Window control and system file dialogs for heavy scripts (ABI v23).
+//! Window control and system file dialogs for heavy scripts (ABI v24).
 //!
 //! Heavy scripts are native code, so files are read and written with `std::fs`. Dialogs go
 //! through the host: it parents them to the game window and runs them without blocking frames.
@@ -119,7 +119,7 @@ fn optional_str(value: &Option<String>) -> RveStr {
 
 impl Context<'_> {
     /// Returns whether the window is in borderless fullscreen; `false` without a window or on
-    /// hosts older than ABI v23.
+    /// hosts older than ABI v24.
     pub fn is_fullscreen(&self) -> bool {
         let Some(callback) = self.host.window_fullscreen else {
             return false;

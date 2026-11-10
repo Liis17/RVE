@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3210,7 +3210,7 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.20.0"
+version = "0.21.0"
 
 [[package]]
 name = "rve-server"

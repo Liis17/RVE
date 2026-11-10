@@ -1,4 +1,4 @@
-//! ABI-функции окна и системных диалогов (ABI v23). Отказ ставит ошибку вызова, как исключение Lua.
+//! ABI-функции окна и системных диалогов (ABI v24). Отказ ставит ошибку вызова, как исключение Lua.
 
 use super::*;
 use crate::platform::{FileDialogFilter, FileDialogKind, FileDialogRequest};

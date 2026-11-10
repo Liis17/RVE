@@ -135,6 +135,8 @@ Inspector показывает `params` скрипта по его схеме ([
 
 Play начинает с первой включённой `[[scenes]]` записи проекта (`ProjectSettings::starting_scene`): editor читает её в отдельный `EditorScene`, не заменяя открытую edit-сцену или prefab. Сохранения этой сессии изолированы в `<project>/.rve/playersave/save.toml`; runtime-user path редактора не использует.
 
+`rve.app.quit()`/`Context::quit()` после Play шага останавливают `PlaySession` через обычный Stop: вызывается `on_destroy`, запрос логируется с уровнем Info, редактор возвращается в edit mode. Запрос не закрывает окно редактора.
+
 Системные диалоги скриптов (`rve.dialog`, `ctx.open_file_dialog`) редактор открывает синхронным `rfd::FileDialog` после кадра (`apply_play_platform_requests`) и возвращает результат сессии; `rve.window.set_fullscreen` и `screenshot` в Play не выполняются и пишут предупреждение в лог.
 
 Spawn и destroy в Play идут тем же путём, что в runtime. Быстрые шаблоны регистрируются до старта сессии. Тяжёлые префабы из `prefabs.rveprefabs` загружает фоновый поток `rve-editor-prefab-load` тем же CPU-путём подготовки; ответ возвращается в сессию. После каждого `step` и команды консоли сессия применяет `drain_world_changes`: вставляет тела новых объектов, снимает тела удалённых и откатывает spawn, который физика отвергла. Остановка Play не ждёт незавершённую загрузку.
