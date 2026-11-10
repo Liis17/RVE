@@ -25,6 +25,7 @@ use clusters::{ClusterBounds, DepthRange, GpuLocalLight, camera_cluster_bounds};
 use culling::{Frustum, LocalBounds, back_to_front_order};
 pub use environment::{EnvironmentId, EnvironmentSource, ProceduralSky};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::{CStr, CString};
@@ -1171,6 +1172,45 @@ impl GpuFrameTimings {
 pub struct FrameProfile {
     pub cpu: RenderCpuTimings,
     pub gpu: Option<GpuFrameTimings>,
+    /// Draw calls и отсечение мешей, записанные этим вызовом.
+    pub draws: DrawStats,
+}
+
+/// Счётчики mesh draw'ов одного вызова `render_frame*`, суммарно по видам и проходам.
+///
+/// Draw одного [`DrawCommand`] считается в каждом проходе, который его записал или отсёк:
+/// depth prepass, opaque/mask, blend и wireframe — в `scene_*`, каждый каскад и слой
+/// локальной тени — в `shadow_*`. Skinned draw'ы не отсекаются и попадают только в `*_draw_calls`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrawStats {
+    /// Записанные `vkCmdDrawIndexed` мешей в проходах сцены.
+    pub scene_draw_calls: u32,
+    /// Draw'ы, пропущенные проходами сцены по frustum камеры.
+    pub scene_culled: u32,
+    /// Записанные `vkCmdDrawIndexed` в directional и local shadow проходах.
+    pub shadow_draw_calls: u32,
+    /// Shadow casters, пропущенные по frustum источника.
+    pub shadow_culled: u32,
+}
+
+impl DrawStats {
+    /// Подписи значений [`DrawStats::values`] для профайлеров.
+    pub const LABELS: [&'static str; 4] = [
+        "scene draw calls",
+        "scene culled",
+        "shadow draw calls",
+        "shadow culled",
+    ];
+
+    /// Значения в порядке [`DrawStats::LABELS`].
+    pub fn values(&self) -> [u32; 4] {
+        [
+            self.scene_draw_calls,
+            self.scene_culled,
+            self.shadow_draw_calls,
+            self.shadow_culled,
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2447,6 +2487,7 @@ impl Renderer {
             uploads,
             ..RenderCpuTimings::default()
         };
+        let draw_stats = Cell::new(DrawStats::default());
         self.retired.slot_completed(frame_slot);
         self.retired_swapchains
             .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
@@ -2940,6 +2981,7 @@ impl Renderer {
                 skin_draws: skin::skin_draws_for(skin_plan.as_ref(), 0),
                 shadow_cascades: frame.shadow_cascades,
                 local_shadow_matrices: &prepared.local_shadow_matrices,
+                stats: &draw_stats,
             };
             let scene = ScenePass {
                 pipeline: scene_pipeline,
@@ -2984,6 +3026,7 @@ impl Renderer {
                 depth_prepass: post_frame.plan.depth_prepass && prepass_pipeline.is_some(),
                 projection_scale: [frame.camera.projection[0][0], frame.camera.projection[1][1]],
                 particles: particle_pass,
+                stats: &draw_stats,
             };
             let frame_resources = &mut self.frames[frame_slot];
             let overlay = match (&frame_resources.overlay_buffer.buffer, overlay_resources) {
@@ -3175,7 +3218,11 @@ impl Renderer {
             Err(SubmitAndPresentError::AfterSubmit(_)) => true,
         };
         self.commit_particle_frame(particles_submitted);
-        self.pending_frame_profile = Some(FrameProfile { cpu, gpu });
+        self.pending_frame_profile = Some(FrameProfile {
+            cpu,
+            gpu,
+            draws: draw_stats.get(),
+        });
         match submitted {
             Ok(outcome) => Ok(outcome),
             Err(SubmitAndPresentError::BeforeSubmit(error)) => {
@@ -3323,6 +3370,7 @@ impl Renderer {
             uploads,
             ..RenderCpuTimings::default()
         };
+        let draw_stats = Cell::new(DrawStats::default());
         self.retired.slot_completed(frame_slot);
         self.retired_swapchains
             .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
@@ -3937,6 +3985,7 @@ impl Renderer {
                             skin_draws: skin::skin_draws_for(skin_plan.as_ref(), index),
                             shadow_cascades: frame.shadow_cascades,
                             local_shadow_matrices,
+                            stats: &draw_stats,
                         },
                         ScenePass {
                             pipeline: scene_pipeline,
@@ -3993,6 +4042,7 @@ impl Renderer {
                                 pipelines,
                                 frame_set: *frame_set,
                             }),
+                            stats: &draw_stats,
                         },
                         *tonemap_set,
                         *output_set,
@@ -4416,7 +4466,11 @@ impl Renderer {
             Err(SubmitAndPresentError::AfterSubmit(_)) => true,
         };
         self.commit_particle_frame(particles_submitted);
-        self.pending_frame_profile = Some(FrameProfile { cpu, gpu });
+        self.pending_frame_profile = Some(FrameProfile {
+            cpu,
+            gpu,
+            draws: draw_stats.get(),
+        });
         match submitted {
             Ok(outcome) => Ok(outcome),
             Err(SubmitAndPresentError::BeforeSubmit(error)) => {
@@ -12190,6 +12244,8 @@ struct ScenePass<'a> {
     /// (proj[0][0], proj[1][1]) камеры для восстановления позиции по глубине в AO.
     projection_scale: [f32; 2],
     particles: Option<ParticlePass<'a>>,
+    /// Счётчики draw'ов кадра, общие для всех видов и проходов.
+    stats: &'a Cell<DrawStats>,
 }
 
 /// Depth-only shadow pass. It shares the frame set and model transforms with the scene pass.
@@ -12204,6 +12260,7 @@ struct ShadowPass<'a> {
     skin_draws: &'a [Option<skin::SkinDrawBuffers>],
     shadow_cascades: &'a [[[f32; 4]; 4]],
     local_shadow_matrices: &'a [[[f32; 4]; 4]],
+    stats: &'a Cell<DrawStats>,
 }
 
 /// Вызовы UI внутри rendering pass: пайплайн, общие буферы слота и вызовы.
@@ -12361,6 +12418,7 @@ fn record_draws(
                 .bounds
                 .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
         {
+            update_stats(scene.stats, |stats| stats.scene_culled += 1);
             continue;
         }
         let (current, previous) = scene.skin_draws.get(index).copied().flatten().map_or(
@@ -12407,7 +12465,14 @@ fn record_draws(
             );
             device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
         }
+        update_stats(scene.stats, |stats| stats.scene_draw_calls += 1);
     }
+}
+
+fn update_stats(stats: &Cell<DrawStats>, update: impl FnOnce(&mut DrawStats)) {
+    let mut value = stats.get();
+    update(&mut value);
+    stats.set(value);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12566,6 +12631,7 @@ fn record_shadow_draws(
         };
         // Skinned draw'ы не отсекаются по bind-pose AABB: поза меняется каждый кадр.
         if draw.skin.is_none() && shadow_caster_is_outside(draw, mesh.bounds, frustum) {
+            update_stats(shadow.stats, |stats| stats.shadow_culled += 1);
             continue;
         }
         let vertex_buffer = shadow
@@ -12614,6 +12680,7 @@ fn record_shadow_draws(
             );
             device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, cascade_index);
         }
+        update_stats(shadow.stats, |stats| stats.shadow_draw_calls += 1);
     }
 }
 

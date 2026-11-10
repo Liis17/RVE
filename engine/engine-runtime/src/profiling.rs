@@ -7,7 +7,7 @@
 use engine_core::profile::{
     ProfileBoard, ProfileGroup, ProfileReport, ProfileRow, ProfileValue, RollingStat, StatSummary,
 };
-use engine_render::{FrameProfile, GpuPass};
+use engine_render::{DrawStats, FrameProfile, GpuPass};
 use engine_resources::{ResourceHandle, ResourceSampler};
 use engine_script::ScriptUpdateProfile;
 use std::sync::Arc;
@@ -17,6 +17,9 @@ pub(crate) const SOURCE_SCRIPTS: &str = "scripts";
 pub(crate) const SOURCE_RENDER: &str = "render";
 pub(crate) const SOURCE_RESOURCES: &str = "resources";
 pub(crate) const SOURCE_STARTUP: &str = "startup";
+
+/// Заголовок группы счётчиков draw'ов последнего кадра в отчёте потока рендера.
+pub(crate) const DRAWS_GROUP: &str = "Draws (last frame)";
 
 /// Число последних замеров, по которым считаются last, avg и max.
 const SAMPLE_WINDOW: usize = 240;
@@ -146,6 +149,8 @@ pub(crate) struct PhaseWindow {
     groups: Vec<PhaseGroup>,
     next_publish: Option<Instant>,
     resources: Option<ResourceFeed>,
+    /// Счётчики draw'ов последнего кадра интервала; `None`, если кадров не было.
+    draws: Option<DrawStats>,
 }
 
 impl PhaseWindow {
@@ -173,6 +178,7 @@ impl PhaseWindow {
             groups,
             next_publish: None,
             resources: None,
+            draws: None,
         }
     }
 
@@ -204,6 +210,11 @@ impl PhaseWindow {
         }
     }
 
+    /// Запоминает счётчики draw'ов кадра; в отчёт попадают счётчики последнего кадра интервала.
+    pub(crate) fn record_draws(&mut self, draws: DrawStats) {
+        self.draws = Some(draws);
+    }
+
     /// Публикует отчёт, если с прошлой публикации прошёл интервал. Первый вызов публикует сразу.
     pub(crate) fn publish_if_due(&mut self, now: Instant) {
         if self.next_publish.is_some_and(|next| now < next) {
@@ -212,6 +223,8 @@ impl PhaseWindow {
         self.next_publish = Some(now + PUBLISH_INTERVAL);
         self.retire_untouched();
         self.board.publish(self.source, self.report());
+        // Интервал без кадров не показывает счётчики прошлого интервала.
+        self.draws = None;
         if let Some(resources) = &mut self.resources {
             resources.sampler.sample(resources.handle.stats());
             self.board.publish(
@@ -237,6 +250,17 @@ impl PhaseWindow {
 
     /// Строит отчёт по текущим окнам. Метки без замеров, в том числе сброшенные, получают `None`.
     pub(crate) fn report(&self) -> ProfileReport {
+        let draws = self.draws.map(|draws| ProfileGroup {
+            name: DRAWS_GROUP,
+            rows: DrawStats::LABELS
+                .iter()
+                .zip(draws.values())
+                .map(|(&label, value)| ProfileRow {
+                    label,
+                    value: ProfileValue::Count(u64::from(value)),
+                })
+                .collect(),
+        });
         ProfileReport {
             groups: self
                 .groups
@@ -253,6 +277,7 @@ impl PhaseWindow {
                         })
                         .collect(),
                 })
+                .chain(draws)
                 .collect(),
         }
     }
@@ -273,6 +298,7 @@ pub(crate) fn record_frame_profile(window: &mut PhaseWindow, frame: &FrameProfil
     window.record(RENDERER, RECORD, cpu.record);
     window.record(RENDERER, SUBMIT, cpu.submit);
     window.record(RENDERER, PRESENT, cpu.present);
+    window.record_draws(frame.draws);
     let Some(gpu) = frame.gpu else {
         return;
     };
@@ -512,6 +538,12 @@ mod tests {
                 ],
                 output_ui: None,
             }),
+            draws: DrawStats {
+                scene_draw_calls: 7,
+                scene_culled: 2,
+                shadow_draw_calls: 5,
+                shadow_culled: 1,
+            },
         };
 
         record_frame_profile(&mut window, &frame);
@@ -528,6 +560,63 @@ mod tests {
             row(&report, render_phase::RENDERER, "prepare").map(|s| s.last),
             Some(ms(1))
         );
+    }
+
+    fn draw_counts(report: &ProfileReport) -> Option<Vec<(&'static str, ProfileValue)>> {
+        report
+            .groups
+            .iter()
+            .find(|group| group.name == DRAWS_GROUP)
+            .map(|group| {
+                group
+                    .rows
+                    .iter()
+                    .map(|row| (row.label, row.value))
+                    .collect()
+            })
+    }
+
+    #[test]
+    fn frame_draw_stats_are_reported_as_counts_of_the_last_frame() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        assert_eq!(draw_counts(&window.report()), None);
+
+        let frame = |scene_draw_calls| FrameProfile {
+            draws: DrawStats {
+                scene_draw_calls,
+                scene_culled: 3,
+                shadow_draw_calls: 9,
+                shadow_culled: 0,
+            },
+            ..FrameProfile::default()
+        };
+        record_frame_profile(&mut window, &frame(4));
+        record_frame_profile(&mut window, &frame(6));
+
+        assert_eq!(
+            draw_counts(&window.report()),
+            Some(vec![
+                ("scene draw calls", ProfileValue::Count(6)),
+                ("scene culled", ProfileValue::Count(3)),
+                ("shadow draw calls", ProfileValue::Count(9)),
+                ("shadow culled", ProfileValue::Count(0)),
+            ])
+        );
+    }
+
+    #[test]
+    fn draw_stats_disappear_after_an_interval_without_frames() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        let start = Instant::now();
+        record_frame_profile(&mut window, &FrameProfile::default());
+        window.publish_if_due(start);
+        assert!(draw_counts(&board.reports()[0].1).is_some());
+
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        assert_eq!(draw_counts(&board.reports()[0].1), None);
     }
 
     #[test]

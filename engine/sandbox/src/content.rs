@@ -1,8 +1,9 @@
 //! Содержимое кадра sandbox: демонстрационная сцена или модель из assets.
 
 use crate::scene::{
-    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, material_sphere_meshes, materials_plane_mesh,
-    plane_mesh, shadows_light_direction, sinusoidal_normal_texture,
+    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, STRESS_FLOOR_HALF_EXTENT, Scene, material_sphere_meshes,
+    materials_plane_mesh, plane_mesh, shadows_light_direction, sinusoidal_normal_texture,
+    tiled_plane_mesh,
 };
 use engine_assets::{Model, ModelAlphaMode, ModelMaterial, TextureData};
 use engine_render::{
@@ -34,6 +35,8 @@ pub struct Content {
     pub motion: Scene,
     /// Переводит содержимое в куб со стороной 1 с центром в начале координат.
     pub fit: Mat4,
+    /// Мировые трансформации копий подвижных мешей; окружение рисуется один раз.
+    pub copies: Vec<Mat4>,
 }
 
 impl Content {
@@ -52,8 +55,8 @@ impl Content {
             },
             environment: false,
         }];
-        if scene == Scene::Shadows {
-            let (vertices, indices) = plane_mesh();
+        if matches!(scene, Scene::Shadows | Scene::Stress) {
+            let (vertices, indices) = floor_mesh(scene);
             meshes.push(Mesh {
                 vertices,
                 indices,
@@ -69,6 +72,7 @@ impl Content {
             textures,
             motion: scene,
             fit: Mat4::IDENTITY,
+            copies: scene.copies(),
         }
     }
 
@@ -126,6 +130,7 @@ impl Content {
             textures,
             motion: Scene::Materials,
             fit: Mat4::IDENTITY,
+            copies: Scene::Materials.copies(),
         }
     }
 
@@ -154,11 +159,11 @@ impl Content {
                 environment: false,
             })
             .collect::<Vec<_>>();
-        if matches!(scene, Scene::Shadows | Scene::Materials) {
+        if matches!(scene, Scene::Shadows | Scene::Materials | Scene::Stress) {
             let (vertices, indices) = if scene == Scene::Materials {
                 materials_plane_mesh()
             } else {
-                plane_mesh()
+                floor_mesh(scene)
             };
             meshes.push(Mesh {
                 vertices,
@@ -172,6 +177,7 @@ impl Content {
             textures: model.textures,
             motion: scene,
             fit,
+            copies: scene.copies(),
         }
     }
 
@@ -188,6 +194,12 @@ impl Content {
         self.motion.model(elapsed) * self.fit
     }
 
+    /// Мировые трансформации всех копий подвижных мешей в момент `elapsed`.
+    pub fn models(&self, elapsed: f32) -> impl Iterator<Item = Mat4> + '_ {
+        let model = self.model(elapsed);
+        self.copies.iter().map(move |copy| *copy * model)
+    }
+
     pub fn view_projection(
         &self,
         elapsed: f32,
@@ -200,7 +212,10 @@ impl Content {
     }
 
     pub fn light(&self, elapsed: f32) -> DirectionalLight {
-        if !matches!(self.motion, Scene::Shadows | Scene::Materials) {
+        if !matches!(
+            self.motion,
+            Scene::Shadows | Scene::Materials | Scene::Stress
+        ) {
             return DirectionalLight::default();
         }
         DirectionalLight {
@@ -233,7 +248,10 @@ impl Content {
             }));
             return lights;
         }
-        if !matches!(self.motion, Scene::Shadows | Scene::Materials) {
+        if !matches!(
+            self.motion,
+            Scene::Shadows | Scene::Materials | Scene::Stress
+        ) {
             return Vec::new();
         }
         vec![
@@ -254,7 +272,7 @@ impl Content {
     }
 
     pub fn local_light_shadows(&self) -> Vec<LocalLightShadow> {
-        if self.motion != Scene::Shadows {
+        if !matches!(self.motion, Scene::Shadows | Scene::Stress) {
             return Vec::new();
         }
         let mut shadows = Vec::with_capacity(2);
@@ -310,6 +328,15 @@ impl Content {
     }
 }
 
+/// Пол сцен с тенями: малый квадрат для `Shadows`, широкий пол под сеткой `Stress`.
+fn floor_mesh(scene: Scene) -> (Vec<Vertex>, Vec<u32>) {
+    if scene == Scene::Stress {
+        tiled_plane_mesh(STRESS_FLOOR_HALF_EXTENT, STRESS_FLOOR_HALF_EXTENT)
+    } else {
+        plane_mesh()
+    }
+}
+
 fn fit_to_unit_cube(min: Vec3, max: Vec3) -> Mat4 {
     let size = (max - min).max_element();
     let scale = if size > 0.0 && size.is_finite() {
@@ -323,12 +350,12 @@ fn fit_to_unit_cube(min: Vec3, max: Vec3) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use super::{CameraSettings, Content, fit_to_unit_cube};
-    use crate::scene::{Scene, cube_mesh};
+    use crate::scene::{STRESS_FLOOR_HALF_EXTENT, STRESS_GRID, Scene, cube_mesh};
     use engine_assets::{
         Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex, TextureData,
     };
     use engine_render::LocalLight;
-    use glam::Vec3;
+    use glam::{Mat4, Vec3};
 
     fn texture(value: u8) -> TextureData {
         TextureData {
@@ -376,6 +403,60 @@ mod tests {
             textures: vec![texture(7)],
             skeleton: None,
             animations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stress_scene_places_a_static_cube_grid_on_its_floor_with_shadowed_lights() {
+        let content = Content::from_scene(Scene::Stress);
+
+        assert_eq!(content.copies.len(), STRESS_GRID * STRESS_GRID);
+        let first = content.models(0.0).collect::<Vec<_>>();
+        assert_eq!(first, content.models(10.0).collect::<Vec<_>>());
+        let (cube, _) = cube_mesh();
+        for model in &first {
+            let points = cube
+                .iter()
+                .map(|vertex| model.transform_point3(Vec3::from(vertex.position)))
+                .collect::<Vec<_>>();
+            let bottom = points.iter().map(|point| point.y).fold(f32::MAX, f32::min);
+            assert!((bottom + 1.0).abs() < 1e-5, "куб стоит на полу: {bottom}");
+            assert!(points.iter().all(|point| {
+                point.x.abs() < STRESS_FLOOR_HALF_EXTENT && point.z.abs() < STRESS_FLOOR_HALF_EXTENT
+            }));
+        }
+        let mut positions = first
+            .iter()
+            .map(|model| model.w_axis.truncate().to_array().map(f32::to_bits))
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), first.len(), "копии не совпадают");
+
+        let environments = content
+            .meshes
+            .iter()
+            .filter(|mesh| mesh.environment)
+            .count();
+        assert_eq!((content.meshes.len(), environments), (2, 1));
+        assert_eq!(content.local_light_shadows().len(), 2);
+        assert_eq!(
+            content
+                .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn non_stress_scenes_draw_a_single_copy() {
+        for scene in [
+            Scene::Cube,
+            Scene::Shadows,
+            Scene::Materials,
+            Scene::Clustered,
+        ] {
+            assert_eq!(Content::from_scene(scene).copies, vec![Mat4::IDENTITY]);
         }
     }
 
