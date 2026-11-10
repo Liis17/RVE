@@ -612,9 +612,12 @@ fn conservative_advance(
         if distance.distance <= skin + tolerance {
             // Касательное движение вдоль поверхности в пределах skin не попадание: шум нормали
             // (~1e-7) иначе даёт попадание на fraction 0, которое перекрывает настоящее препятствие.
+            // Заход остатка смещения за разделяющую плоскость ограничен половиной зазора, поэтому
+            // длинный почти касательный бросок не входит в выпуклое препятствие.
             let approach = displacement.dot(distance.normal);
-            return Ok((approach > GRAZING_APPROACH * displacement.length())
-                .then_some((fraction as f32, distance)));
+            let grazing = approach <= GRAZING_APPROACH * displacement.length()
+                && approach * (1.0 - fraction as f32) <= 0.5 * distance.distance;
+            return Ok((!grazing && approach > 0.0).then_some((fraction as f32, distance)));
         }
         let closing_speed = displacement.dot(distance.normal) as f64;
         if closing_speed <= 0.0 {
@@ -850,6 +853,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(into.map(|(fraction, _)| fraction), Some(0.0));
+        // Длинный бросок под тем же малым углом зашёл бы в пол глубже зазора: это попадание.
+        let long = super::conservative_advance(
+            Vec3::new(50.0, -0.04, 0.0),
+            skin,
+            super::CAST_DISTANCE_TOLERANCE,
+            |_| Ok(noisy_floor),
+        )
+        .unwrap();
+        assert_eq!(long.map(|(fraction, _)| fraction), Some(0.0));
     }
 
     #[test]

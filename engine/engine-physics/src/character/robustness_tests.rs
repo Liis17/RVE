@@ -2,7 +2,7 @@
 //! из боксов и из одной triangle mesh. После каждого кадра капсула не должна проникать в статику.
 
 use super::CharacterController;
-use crate::world::{BodyDesc, BodyHandle, PhysicsWorld};
+use crate::world::{BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsWorld};
 use crate::{Pose, Shape, TriMesh, collide};
 use glam::{EulerRot, Quat, Vec3};
 use std::sync::Arc;
@@ -240,6 +240,19 @@ fn pitched_character_object_keeps_an_upright_capsule_on_stairs() {
         &yaws(-40, 40, 10),
         -60.0,
     );
+    // Без проникновения капсула не должна и застревать: наклонённый персонаж поднимается на площадку.
+    for as_mesh in [false, true] {
+        let end = walk(
+            &colliders(&stairs(), as_mesh),
+            standing_start(-1.0, 0.0),
+            0.0,
+            -60.0,
+            120,
+            DT,
+        )
+        .unwrap();
+        assert!(end.x > 3.0, "mesh={as_mesh}: {end}");
+    }
 }
 
 #[test]
@@ -468,4 +481,61 @@ fn ramp_climbs_steep_slope_blocks_and_neither_sinks() {
     check_sweep("steep", &steep, start, &yaws(-60, 80, 10), DT);
     let end = walk(&steep, start, 0.0, 0.0, 90, DT).unwrap();
     assert!(end.y < start.y + 0.35, "{end}");
+}
+
+#[test]
+fn capsule_is_pushed_out_of_a_kinematic_body_but_not_a_dynamic_one() {
+    // Наехавшая kinematic-платформа выталкивает капсулу; dynamic-тела разводит solver, а не контроллер.
+    let controller = controller();
+    let start = standing_start(-controller.radius + 0.1, 0.0);
+    let wall = block_shape((Vec3::new(0.0, 0.0, -2.0), Vec3::new(0.2, 3.0, 2.0)));
+    for (kind, pushed_out) in [(BodyKind::Kinematic, true), (BodyKind::Dynamic, false)] {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        world
+            .insert_body(BodyDesc::new(
+                kind,
+                wall.1,
+                ColliderDesc::new(wall.0.clone()),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = controller
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::new(start, Quat::IDENTITY).unwrap(),
+                Vec3::ZERO,
+            )
+            .unwrap();
+        let x = start.x + result.translation.x;
+        if pushed_out {
+            assert!(x <= -controller.radius + 1.0e-3, "{kind:?}: {x}");
+        } else {
+            assert_eq!(result.translation, Vec3::ZERO, "{kind:?}");
+        }
+    }
+}
+
+#[test]
+fn clip_to_planes_slides_along_the_crease_and_stops_in_a_triple_corner() {
+    let wall_x = Vec3::X;
+    let wall_z = Vec3::Z;
+    // Остаток уже на плоскости `wall_z`, но идёт в прежнюю стену `wall_x`: остаётся ход по ребру.
+    let along = super::clip_to_planes(Vec3::new(0.3, 0.2, 0.0), &[wall_x], wall_z);
+    assert!(
+        along.abs_diff_eq(Vec3::new(0.0, 0.2, 0.0), 1.0e-6),
+        "{along}"
+    );
+    // Остаток, уходящий от прежней стены, не меняется.
+    let away = Vec3::new(-0.3, 0.2, 0.0);
+    assert_eq!(super::clip_to_planes(away, &[wall_x], wall_z), away);
+    // Ребро двух стен идёт в третью плоскость (пол): движение останавливается.
+    let floor = -Vec3::Y;
+    let stopped = super::clip_to_planes(Vec3::new(0.3, -0.2, 0.0), &[wall_x, floor], wall_z);
+    assert_eq!(stopped, Vec3::ZERO);
+    // Параллельная плоскость не даёт ребра: тоже стоп.
+    assert_eq!(
+        super::clip_to_planes(Vec3::X, &[wall_x], wall_x),
+        Vec3::ZERO
+    );
 }

@@ -412,9 +412,13 @@ impl CharacterController {
         // Добор к опоре идёт вдоль фактического сдвига после скольжения: запрошенное направление
         // у боковой стены упирается в неё, и добор на ребро ступени был бы нулевым.
         let travelled = stepped.position - raised_pose.position;
-        let dir = Vec3::new(travelled.x, 0.0, travelled.z)
-            .try_normalize()
-            .unwrap_or_else(|| horizontal.normalize());
+        let travelled = Vec3::new(travelled.x, 0.0, travelled.z);
+        // Сдвиг порядка ulp позиции дал бы квантованное направление; тогда берём запрошенное.
+        let dir = if travelled.length_squared() > MOVEMENT_EPSILON_SQUARED {
+            travelled.normalize()
+        } else {
+            horizontal.normalize()
+        };
         let probe = |origin: Vec3| -> Result<Option<QueryHit>, CharacterError> {
             let pose = Pose::new(origin, start_pose.rotation)?;
             Ok(snapshot
