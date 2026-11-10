@@ -9,11 +9,12 @@ use engine_core::Time;
 use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, BootstrapPresentMode, BootstrapReflexMode};
 use engine_render::{
-    AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
-    EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameStatus, LatencyHandle,
-    LatencyMarker, LowLatencyMode, Material, MaterialId, MeshId, ParticleBlend, ParticleCollision,
-    ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape, PostProcess, ProceduralSky, Renderer,
-    RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
+    AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, DrawStats,
+    EnvironmentId, EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameProfile,
+    FrameStatus, LatencyHandle, LatencyMarker, LowLatencyMode, Material, MaterialId, MeshId,
+    ParticleBlend, ParticleCollision, ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape,
+    PostProcess, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{
@@ -31,7 +32,7 @@ use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--post-process /путь.postprocess] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--post-process /путь.postprocess] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles|stress] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -162,7 +163,7 @@ where
                     return Err("флаг --scene указан повторно".to_owned());
                 }
                 let value = args.next().ok_or_else(|| {
-                    "после --scene требуется triangle, cube, shadows, materials, clustered или particles"
+                    "после --scene требуется triangle, cube, shadows, materials, clustered, particles или stress"
                         .to_owned()
                 })?;
                 scene = Some(Scene::parse(&value).ok_or_else(|| {
@@ -519,7 +520,45 @@ struct Sandbox {
     resize_test: ResizeTest,
     debug_overlay: Option<DebugOverlay>,
     particle_emitters: Vec<ParticleEmitterFrame>,
+    profile_summary: ProfileSummary,
     failure: Option<String>,
+}
+
+/// Итог прогона для сравнения замеров: средние CPU-фазы renderer и draw'ы последнего кадра.
+#[derive(Debug, Default)]
+struct ProfileSummary {
+    frames: u32,
+    prepare: Duration,
+    record: Duration,
+    last_draws: DrawStats,
+}
+
+impl ProfileSummary {
+    fn add(&mut self, frame: &FrameProfile) {
+        self.frames += 1;
+        self.prepare += frame.cpu.prepare;
+        self.record += frame.cpu.record;
+        self.last_draws = frame.draws;
+    }
+
+    /// Строка итога; `None`, если renderer не отдал ни одного профиля.
+    fn line(&self) -> Option<String> {
+        if self.frames == 0 {
+            return None;
+        }
+        let average_ms = |total: Duration| total.as_secs_f64() * 1000.0 / f64::from(self.frames);
+        let draws = self.last_draws;
+        Some(format!(
+            "profile: {} frames, renderer CPU avg prepare {:.3} ms, record {:.3} ms; last frame draws scene {} (culled {}), shadow {} (culled {})",
+            self.frames,
+            average_ms(self.prepare),
+            average_ms(self.record),
+            draws.scene_draw_calls,
+            draws.scene_culled,
+            draws.shadow_draw_calls,
+            draws.shadow_culled,
+        ))
+    }
 }
 
 impl Sandbox {
@@ -558,6 +597,7 @@ impl Sandbox {
             resize_test: ResizeTest::default(),
             debug_overlay: None,
             particle_emitters: Vec::new(),
+            profile_summary: ProfileSummary::default(),
             failure: None,
         }
     }
@@ -850,34 +890,46 @@ impl WindowHandler for Sandbox {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
         };
-        let model = self.content.model(elapsed).to_cols_array_2d();
-        let previous_model = self
+        let models = self
             .content
-            .model(self.previous_elapsed.unwrap_or(elapsed))
-            .to_cols_array_2d();
+            .models(elapsed)
+            .zip(
+                self.content
+                    .models(self.previous_elapsed.unwrap_or(elapsed)),
+            )
+            .map(|(model, previous)| (model.to_cols_array_2d(), previous.to_cols_array_2d()))
+            .collect::<Vec<_>>();
+        let identity = [(
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+        )];
         let draws = self
             .meshes
             .iter()
-            .map(|&(mesh, material, environment)| DrawCommand {
-                mesh,
-                material: Some(material),
-                model: if environment {
-                    glam::Mat4::IDENTITY.to_cols_array_2d()
+            .flat_map(|&(mesh, material, environment)| {
+                let transforms = if environment {
+                    &identity[..]
                 } else {
-                    model
-                },
-                previous_model: Some(if environment {
-                    glam::Mat4::IDENTITY.to_cols_array_2d()
-                } else {
-                    previous_model
-                }),
-                lod_level: 0,
-                casts_shadow: true,
-                skin: None,
+                    &models[..]
+                };
+                transforms
+                    .iter()
+                    .map(move |&(model, previous_model)| DrawCommand {
+                        mesh,
+                        material: Some(material),
+                        model,
+                        previous_model: Some(previous_model),
+                        lod_level: 0,
+                        casts_shadow: true,
+                        skin: None,
+                    })
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();
         let frame_profile = renderer.take_frame_profile();
+        if let Some(profile) = &frame_profile {
+            self.profile_summary.add(profile);
+        }
         let overlay = match self.debug_overlay.as_mut() {
             Some(overlay) => {
                 if let Some(profile) = &frame_profile {
@@ -1153,6 +1205,9 @@ fn main_after_vulkan_environment() -> ExitCode {
         }
         (Ok(()), None) => 0,
     };
+    if let Some(line) = app.profile_summary.line() {
+        println!("{line}");
+    }
     app.save_pipeline_cache();
     drop(app);
     if let Err(error) = resources.shutdown() {
@@ -1167,11 +1222,13 @@ fn main_after_vulkan_environment() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraSettings, Content, EnvironmentMode, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox,
-        Scene, parse_args, with_executable_directory,
+        CameraSettings, Content, EnvironmentMode, Options, ProfileSummary, RESIZE_SIZE,
+        RESTORE_SIZE, Sandbox, Scene, parse_args, with_executable_directory,
     };
     use engine_assets::Assets;
+    use engine_render::{DrawStats, FrameProfile};
     use engine_resources::{ResourceConfig, ResourceSystem};
+    use std::time::Duration;
 
     fn sandbox(options: Options) -> Sandbox {
         let content = Content::from_scene(options.scene);
@@ -1184,6 +1241,32 @@ mod tests {
             None,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn profile_summary_averages_cpu_phases_and_keeps_last_frame_draws() {
+        let mut summary = ProfileSummary::default();
+        assert_eq!(summary.line(), None);
+        for (record_ms, scene_draw_calls) in [(2, 10), (4, 12)] {
+            let mut frame = FrameProfile {
+                draws: DrawStats {
+                    scene_draw_calls,
+                    scene_culled: 3,
+                    shadow_draw_calls: 7,
+                    shadow_culled: 1,
+                },
+                ..FrameProfile::default()
+            };
+            frame.cpu.record = Duration::from_millis(record_ms);
+            summary.add(&frame);
+        }
+
+        assert_eq!(
+            summary.line().as_deref(),
+            Some(
+                "profile: 2 frames, renderer CPU avg prepare 0.000 ms, record 3.000 ms; last frame draws scene 12 (culled 3), shadow 7 (culled 1)"
+            )
+        );
     }
 
     #[test]
@@ -1383,7 +1466,7 @@ mod tests {
         let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
         assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         assert_eq!(options.texture, None);
-        for scene in ["shadows", "cube", "materials", "clustered"] {
+        for scene in ["shadows", "cube", "materials", "clustered", "stress"] {
             let options = parse_args(["--scene", scene, "--model", "/model/cube.fbx"])
                 .expect("non-triangle scenes may load a model");
             assert_eq!(options.scene, Scene::parse(scene).unwrap());
