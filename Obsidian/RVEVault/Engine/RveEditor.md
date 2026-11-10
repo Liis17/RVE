@@ -280,7 +280,7 @@ File → New Project… принимает имя проекта и родите
 
 ## Build Player
 
-File → Build Player… собирает релиз через [[Engine/RveBuild]] командой `rve-build build <project> --output <папка>/<id проекта>`. `rve-build` запускается дочерним процессом, а не библиотекой: он ищет player рядом со своим exe, загружает cdylib скриптов в свой процесс, а паника сборки не должна ронять редактор.
+File → Build Player… собирает релиз через [[Engine/RveBuild]] командой `rve-build build <project> --output <папка>/<id проекта>`; File → Build Player with Server… и MCP-аргумент `with_server` у `build_player` добавляют `--with-server`. `rve-build` запускается дочерним процессом, а не библиотекой: он ищет player рядом со своим exe, загружает cdylib скриптов в свой процесс, а паника сборки не должна ронять редактор.
 
 - Перед сборкой несохранённая сцена проходит обычный запрос Save/Discard: сборщик читает сцены с диска.
 - `rve-build` ищется рядом с exe редактора, иначе в checkout, из которого собран редактор, запускается `cargo run -p rve-build --locked --` (cargo из `CARGO`, иначе из PATH) с рабочим каталогом в корне workspace. Поэтому старый `rve-build` в `build/debug` побеждает `cargo run`.

@@ -13,8 +13,8 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "build_player",
-            "Start a player build in the requested output directory and return immediately.",
-            json!({"type":"object","properties":{"output_dir":{"type":"string"}},"required":["output_dir"],"additionalProperties":false}),
+            "Start a player build in the requested output directory and return immediately. Set with_server to also ship the dedicated rve-server executable.",
+            json!({"type":"object","properties":{"output_dir":{"type":"string"},"with_server":{"type":"boolean"}},"required":["output_dir"],"additionalProperties":false}),
             Permission::Build,
         ),
         ToolSpec::new(
@@ -37,7 +37,13 @@ pub(super) fn call(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result
                 .get("output_dir")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "output_dir must be a path string".to_owned())?;
-            app.mcp_start_build(Path::new(output))?;
+            let with_server = match arguments.get("with_server") {
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| "with_server must be a boolean".to_owned())?,
+                None => false,
+            };
+            app.mcp_start_build(Path::new(output), with_server)?;
             Ok(json!({"status": "running", "output_dir": output}))
         }
         "build_status" => {
@@ -66,6 +72,19 @@ mod tests {
     use crate::app::EditorApp;
     use crate::state::EditorState;
     use serde_json::json;
+
+    #[test]
+    fn build_player_rejects_a_non_boolean_with_server() {
+        let mut app = EditorApp::new_for_mcp_tests_with_state(EditorState::new(None));
+
+        let error = call(
+            &mut app,
+            "build_player",
+            &json!({"output_dir": "out", "with_server": "yes"}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "with_server must be a boolean");
+    }
 
     #[test]
     fn build_status_returns_last_result_and_output_tail() {

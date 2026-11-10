@@ -605,14 +605,21 @@ impl EditorApp {
         }
     }
 
-    pub(crate) fn mcp_start_build(&mut self, output: &Path) -> Result<(), String> {
+    pub(crate) fn mcp_start_build(
+        &mut self,
+        output: &Path,
+        with_server: bool,
+    ) -> Result<(), String> {
         if self.state.is_playing() {
             return Err("stop Play before building".to_owned());
         }
         if self.state.has_unsaved_changes() {
             return Err("save or discard unsaved changes before building".to_owned());
         }
-        self.run_explicit_path_action(Action::BuildPlayerAt(output.to_owned()))
+        self.run_explicit_path_action(Action::BuildPlayerAt {
+            output: output.to_owned(),
+            with_server,
+        })
     }
 
     pub(crate) fn mcp_refresh_tree(&mut self) {
@@ -640,7 +647,10 @@ impl EditorApp {
                     VirtualPath::parse(&path).map_err(|_| format!("{path}: invalid scene path"))?;
                 self.save_target(target)
             }
-            Action::BuildPlayerAt(output) => self.start_build_at(&output),
+            Action::BuildPlayerAt {
+                output,
+                with_server,
+            } => self.start_build_at(&output, with_server),
             _ => Err("action does not carry an explicit path".to_owned()),
         }
     }
@@ -1090,14 +1100,14 @@ impl EditorApp {
                     self.state.log.error(error);
                 }
             }
-            Action::BuildPlayerAt(output) => {
-                if let Err(error) = self.run_explicit_path_action(Action::BuildPlayerAt(output)) {
+            action @ Action::BuildPlayerAt { .. } => {
+                if let Err(error) = self.run_explicit_path_action(action) {
                     self.state.log.error(error);
                 }
             }
             Action::NewProject | Action::CreateProject { .. } => {}
             Action::Exit => self.exit = true,
-            Action::BuildPlayer => self.start_build(),
+            Action::BuildPlayer { with_server } => self.start_build(with_server),
             Action::CreatePrefab(id) => {
                 if let Err(error) = self.create_prefab(&id) {
                     self.state.log.error(error);
@@ -1109,7 +1119,7 @@ impl EditorApp {
 
     /// Запускает `rve-build` в выбранный каталог `<папка>/<id проекта>`; сцена уже
     /// сохранена, потому что сборщик читает её с диска.
-    fn start_build(&mut self) {
+    fn start_build(&mut self, with_server: bool) {
         if self.state.build.is_some() {
             self.state.log.error("Сборка уже идёт");
             return;
@@ -1122,12 +1132,12 @@ impl EditorApp {
             return;
         };
         let output = folder.join(id);
-        if let Err(error) = self.start_build_at(&output) {
+        if let Err(error) = self.start_build_at(&output, with_server) {
             self.state.log.error(error);
         }
     }
 
-    fn start_build_at(&mut self, output: &Path) -> Result<(), String> {
+    fn start_build_at(&mut self, output: &Path, with_server: bool) -> Result<(), String> {
         if self.state.build.is_some() {
             return Err("a build is already running".to_owned());
         }
@@ -1153,7 +1163,7 @@ impl EditorApp {
             &crate::build::checkout_workspace(),
             std::env::var_os("CARGO"),
         )?;
-        let command = tool.command(&project_dir, &output);
+        let command = tool.command(&project_dir, &output, with_server);
         let job = crate::build::BuildJob::spawn(command, output.clone())
             .map_err(|error| format!("rve-build: {error}"))?;
         self.state.build_output_tail.clear();
@@ -1737,18 +1747,11 @@ impl EditorApp {
                 }
                 Action::ImportFiles(files) => self.import(&files),
                 Action::RefreshTree => self.refresh_tree_only(),
-                Action::BuildPlayer => {
+                action @ (Action::BuildPlayer { .. } | Action::BuildPlayerAt { .. }) => {
                     if self.state.is_playing() {
                         self.state.log.error("Сначала остановите Play-режим");
                     } else {
-                        self.run_guarded(Action::BuildPlayer);
-                    }
-                }
-                Action::BuildPlayerAt(output) => {
-                    if self.state.is_playing() {
-                        self.state.log.error("Сначала остановите Play-режим");
-                    } else {
-                        self.run_guarded(Action::BuildPlayerAt(output));
+                        self.run_guarded(action);
                     }
                 }
                 Action::Discard(then) => {

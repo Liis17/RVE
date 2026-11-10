@@ -39,7 +39,13 @@ fn main() {
             project_dir,
             output,
             vulkan_sdk,
-        }) => match player::build_distribution(&project_dir, &output, vulkan_sdk.as_deref()) {
+            with_server,
+        }) => match player::build_distribution(
+            &project_dir,
+            &output,
+            vulkan_sdk.as_deref(),
+            with_server,
+        ) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("rve-build: {error}");

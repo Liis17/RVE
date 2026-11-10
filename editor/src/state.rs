@@ -63,9 +63,14 @@ pub enum Action {
     /// Отразить собственную файловую операцию в дереве Project.
     RefreshTree,
     /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
-    BuildPlayer,
+    BuildPlayer {
+        with_server: bool,
+    },
     /// Собрать релиз в явно заданный каталог без системного диалога.
-    BuildPlayerAt(PathBuf),
+    BuildPlayerAt {
+        output: PathBuf,
+        with_server: bool,
+    },
     /// Сохранить поддерево объекта в новый префаб и заменить его экземпляром.
     CreatePrefab(String),
     /// Перенести overrides объекта экземпляра в файл префаба.
