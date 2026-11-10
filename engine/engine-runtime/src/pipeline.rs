@@ -189,6 +189,8 @@ pub(crate) struct GpuSceneTable {
     pub joint_counts: HashMap<ObjectHandle, u32>,
     /// UI-текстуры картинок сцены по пути; создаются при загрузке GPU-ресурсов.
     pub ui_images: HashMap<String, UiTextureId>,
+    /// Поколения сцен, владеющие UI-картинками в `VulkanBackend::game_ui`.
+    pub ui_scene_owners: HashSet<u64>,
     /// Экранные шейдеры камер по пути `.glsl`; создаются при загрузке сцены и освобождаются с ней.
     pub screen_shaders: HashMap<String, engine_render::ScreenShaderId>,
 }
@@ -694,7 +696,7 @@ impl VulkanBackend {
     }
 
     pub fn with_ui_images(mut self, images: HashMap<String, UiTextureId>) -> Self {
-        self.game_ui = GameUi::with_scene_images(images);
+        self.game_ui = GameUi::with_scene_images_for_owner(0, images);
         self
     }
 
@@ -869,8 +871,13 @@ impl RenderBackend for VulkanBackend {
                 self.material_caches.pin_scene_resources();
                 self.scene_skin_instances.extend(table.skin_instance_ids());
                 self.scene_screen_shaders.extend(table.screen_shader_ids());
-                self.game_ui
-                    .adopt_scene_images(&mut self.renderer, std::mem::take(&mut table.ui_images));
+                self.game_ui.adopt_scene_images_for_owner(
+                    &mut self.renderer,
+                    generation,
+                    std::mem::take(&mut table.ui_images),
+                );
+                table.ui_scene_owners.clear();
+                table.ui_scene_owners.insert(generation);
                 self.material_assets = Some(assets);
                 Ok(Box::new(table))
             }
@@ -882,6 +889,13 @@ impl RenderBackend for VulkanBackend {
     fn release_scene_resources(&mut self, ids: &SceneGpuIds) {
         // Запасной материал кэша переиспользуется следующими загрузками: его не уничтожаем.
         let cached_error_material = self.material_caches.error_material;
+        for skin in &ids.skins {
+            if let Err(error) = self.renderer.destroy_skin_instance(*skin) {
+                log::error!("экземпляр skinning сцены не уничтожен: {error}");
+            }
+        }
+        self.scene_skin_instances
+            .retain(|skin| !ids.skins.contains(skin));
         for mesh in &ids.meshes {
             if let Err(error) = self.renderer.destroy_mesh(*mesh) {
                 log::error!("меш сцены не уничтожен: {error}");
@@ -895,13 +909,10 @@ impl RenderBackend for VulkanBackend {
                 log::error!("материал сцены не уничтожен: {error}");
             }
         }
-        for skin in &ids.skins {
-            if let Err(error) = self.renderer.destroy_skin_instance(*skin) {
-                log::error!("экземпляр skinning сцены не уничтожен: {error}");
-            }
+        for owner in &ids.ui_scene_owners {
+            self.game_ui
+                .release_scene_images(&mut self.renderer, *owner);
         }
-        self.scene_skin_instances
-            .retain(|skin| !ids.skins.contains(skin));
         for shader in &ids.screen_shaders {
             if let Err(error) = self.renderer.destroy_screen_shader(*shader) {
                 log::error!("экранный шейдер сцены не уничтожен: {error}");
@@ -3560,7 +3571,7 @@ struct PendingRelease {
 
 enum ReleaseTarget {
     /// GPU-ресурсы сцены, которые больше не используются снимками.
-    Scene(SceneGpuIds),
+    Scene(Box<SceneGpuIds>),
     Prefab(PrefabToken),
     Materials(Vec<MaterialId>),
 }

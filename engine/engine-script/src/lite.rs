@@ -931,12 +931,16 @@ pub(crate) struct LuaInstance {
     instance: Table,
     transform: mlua::AnyUserData,
     active_call: ActiveCall,
+    property_names: Vec<String>,
+    property_values: ScriptParams,
+    object_refs: std::collections::HashMap<String, ScriptObjectRef>,
 }
 
 pub(crate) struct LuaInstanceInit<'a> {
     pub(crate) object_id: &'a str,
     pub(crate) object_name: &'a str,
     pub(crate) params: &'a ScriptParams,
+    pub(crate) property_names: Vec<String>,
     pub(crate) transform: ScriptTransform,
     pub(crate) object_refs: &'a std::collections::HashMap<String, ScriptObjectRef>,
     pub(crate) object_handle: ObjectHandle,
@@ -983,6 +987,17 @@ impl LuaInstance {
             instance,
             transform,
             active_call,
+            property_values: init
+                .property_names
+                .iter()
+                .filter_map(|name| {
+                    init.params
+                        .get(name)
+                        .map(|value| (name.clone(), value.clone()))
+                })
+                .collect(),
+            property_names: init.property_names,
+            object_refs: init.object_refs.clone(),
         })
     }
 
@@ -1009,6 +1024,36 @@ impl LuaInstance {
 
     pub(crate) fn invoke_late_update(&self, dt: f32) -> mlua::Result<()> {
         self.invoke("on_late_update", (self.instance.clone(), dt))
+    }
+
+    pub(crate) fn declared_properties(&self, lua: &Lua) -> mlua::Result<ScriptParams> {
+        let params: Table = self.instance.get("params")?;
+        self.property_names
+            .iter()
+            .map(|name| {
+                let value: Value = params.get(name.as_str())?;
+                let value = match value {
+                    Value::Nil => ParamValue::Object(String::new()),
+                    value => lua_message_param_value_with_size(lua, &self.active_call, value)?.0,
+                };
+                Ok((name.clone(), value))
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_params(&self, lua: &Lua) -> mlua::Result<()> {
+        let params: Table = self.instance.get("params")?;
+        for (name, value) in &self.property_values {
+            params.set(
+                name.as_str(),
+                param_value(lua, value, &self.active_call, Some(&self.object_refs))?,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_properties(&mut self, properties: ScriptParams) {
+        self.property_values = properties;
     }
 
     pub(crate) fn invoke_timer(&self, callback: &Function, id: u64) -> mlua::Result<()> {
@@ -5094,18 +5139,67 @@ impl LuaInstance {
     /// Записывает объявленные свойства в Lua-таблицу `params`. Вызывается перед вызовом экземпляра,
     /// если другой скрипт изменил его свойства.
     pub(crate) fn write_params(
-        &self,
+        &mut self,
+        lua: &Lua,
+        properties: &std::collections::BTreeMap<String, ParamValue>,
+    ) -> mlua::Result<()> {
+        self.stage_params(lua, properties)?;
+        for (name, value) in properties {
+            self.property_values.insert(name.clone(), value.clone());
+        }
+        Ok(())
+    }
+
+    /// Writes canonical callback values into `self.params` without committing their rollback base.
+    pub(crate) fn stage_params(
+        &mut self,
         lua: &Lua,
         properties: &std::collections::BTreeMap<String, ParamValue>,
     ) -> mlua::Result<()> {
         let params: Table = self.instance.get("params")?;
+        self.cache_object_refs(properties);
         for (name, value) in properties {
             params.set(
                 name.as_str(),
-                param_value(lua, value, &self.active_call, None)?,
+                param_value(lua, value, &self.active_call, Some(&self.object_refs))?,
             )?;
         }
         Ok(())
+    }
+
+    fn cache_object_refs(&mut self, properties: &ScriptParams) {
+        fn collect<'a>(value: &'a ParamValue, ids: &mut Vec<&'a str>) {
+            match value {
+                ParamValue::Object(id) if !id.is_empty() => ids.push(id),
+                ParamValue::Array(values) => {
+                    for value in values {
+                        collect(value, ids);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut ids = Vec::new();
+        for value in properties.values() {
+            collect(value, &mut ids);
+        }
+        for id in ids {
+            if self.object_refs.contains_key(id) {
+                continue;
+            }
+            let resolved = with_active_call(&self.active_call, |transaction| {
+                Ok(transaction.handle_by_id(id).and_then(|handle| {
+                    transaction
+                        .object_identity(handle)
+                        .map(|(_, name)| (handle, name.to_owned()))
+                }))
+            });
+            if let Ok(Some((handle, name))) = resolved {
+                self.object_refs
+                    .insert(id.to_owned(), ScriptObjectRef { handle, name });
+            }
+        }
     }
 }
 

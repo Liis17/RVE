@@ -12,6 +12,16 @@ struct SaveFile {
     values: BTreeMap<String, ParamValue>,
 }
 
+#[derive(Serialize)]
+struct EncodedSaveFile<'a> {
+    values: &'a BTreeMap<String, ParamValue>,
+}
+
+#[derive(Serialize)]
+struct EncodedSaveFileRefs<'a> {
+    values: BTreeMap<&'a str, &'a ParamValue>,
+}
+
 /// Decodes a bounded save TOML document into validated script values.
 pub fn decode_save_data(source: &str) -> Result<BTreeMap<String, ParamValue>, String> {
     if source.len() > MAX_SAVE_FILE_BYTES {
@@ -25,19 +35,28 @@ pub fn decode_save_data(source: &str) -> Result<BTreeMap<String, ParamValue>, St
 /// Encodes validated script values into deterministic TOML.
 pub fn encode_save_data(values: &BTreeMap<String, ParamValue>) -> Result<String, String> {
     validate_save_values(values)?;
-    let source = toml::to_string_pretty(&SaveFile {
-        values: values.clone(),
-    })
-    .map_err(|error| error.to_string())?;
+    let source =
+        toml::to_string_pretty(&EncodedSaveFile { values }).map_err(|error| error.to_string())?;
     if source.len() > MAX_SAVE_FILE_BYTES {
         return Err("save file exceeds 1 MiB".to_owned());
     }
     Ok(source)
 }
 
+pub(crate) fn encoded_save_data_refs_len(
+    values: BTreeMap<&str, &ParamValue>,
+) -> Result<usize, String> {
+    let source = toml::to_string_pretty(&EncodedSaveFileRefs { values })
+        .map_err(|error| error.to_string())?;
+    if source.len() > MAX_SAVE_FILE_BYTES {
+        return Err("save file exceeds 1 MiB".to_owned());
+    }
+    Ok(source.len())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode_save_data, encode_save_data};
+    use super::{decode_save_data, encode_save_data, encoded_save_data_refs_len};
     use engine_scene::ParamValue;
     use std::collections::BTreeMap;
 
@@ -60,6 +79,16 @@ mod tests {
         );
         let text = encode_save_data(&values).unwrap();
         assert_eq!(encode_save_data(&values).unwrap(), text);
+        assert_eq!(
+            encoded_save_data_refs_len(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value))
+                    .collect()
+            )
+            .unwrap(),
+            text.len()
+        );
         assert_eq!(decode_save_data(&text).unwrap(), values);
     }
 

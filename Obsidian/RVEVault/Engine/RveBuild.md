@@ -270,7 +270,7 @@ MoltenVK (Apache-2.0).
 ресурсов. Сцена `physics` объявляет быстрые префабы пули и следа (`bullet.rveprefab`,
 `bullet_hole.rveprefab` с `max_instances = 100`): они попадают в архив `scene-physics`.
 `prefabs.rveprefabs` добавляет тяжёлую `tower.rveprefab`, которую не использует ни одна
-сцена, поэтому она лежит в `shared`. CI собирает проект без графического запуска; фактический Vulkan runtime
+сцена, поэтому она лежит в `shared`. F6 (`SceneCycle`) переключает `physics` и `second`; корневой `scene-tour-guide` с `keep_on_load` переносит Lua и Rust ScriptRef демонстрацию между ними, а `second` раскрывает экземпляр `satellite.rveprefab`. CI собирает проект без графического запуска; фактический Vulkan runtime
 требует совместимое устройство.
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,

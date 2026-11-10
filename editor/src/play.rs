@@ -3417,6 +3417,8 @@ path = \"boss.lua\"
             ["camera", "crate", "enemy", "player"]
         );
         assert_eq!(session.host.current_scene(), "levels/a.rvescene");
+        assert!(session.drain_ui_detach().is_empty());
+        assert!(session.drain_ui_images().is_empty());
         assert!(
             !messages(&mut session)
                 .iter()

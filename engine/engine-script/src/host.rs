@@ -17,7 +17,7 @@ use crate::net::{
 use crate::physics::PhysicsScriptState;
 use crate::save_writer::SaveWriter;
 use crate::scene_state::{SceneState, SharedSceneState, canonical_scene_path};
-use crate::script_refs::{ScriptRefEntry, ScriptRefs};
+use crate::script_refs::{ScriptRefCapabilities, ScriptRefEntry, ScriptRefs};
 use crate::timeline::{CoroutineWait, DueTimer, ScriptCoroutine, ScriptTimeline, TimerCallback};
 use crate::transaction::{
     MAX_MESSAGE_BYTES_PER_FRAME, MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage,
@@ -221,6 +221,8 @@ pub struct ScriptHost {
     save_generation: Rc<Cell<u64>>,
     save_writer: Option<SaveWriter>,
     persisted_save_generation: u64,
+    pending_save_generations: BTreeSet<u64>,
+    save_write_failed: bool,
     timeline: Rc<RefCell<ScriptTimeline>>,
     time_scale: Rc<Cell<f32>>,
     fixed_step: FixedStepClock,
@@ -499,6 +501,8 @@ impl ScriptHost {
             save_generation,
             save_writer: None,
             persisted_save_generation: 0,
+            pending_save_generations: BTreeSet::new(),
+            save_write_failed: false,
             timeline,
             time_scale,
             fixed_step,
@@ -608,6 +612,16 @@ impl ScriptHost {
                         object_id: &object.id,
                         object_name: &object.name,
                         params: &params,
+                        property_names: schema
+                            .as_ref()
+                            .map(|schema| {
+                                schema
+                                    .specs()
+                                    .iter()
+                                    .map(|spec| spec.name.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         transform,
                         object_refs: &object_refs,
                         object_handle: object.handle,
@@ -625,7 +639,10 @@ impl ScriptHost {
                     path,
                     schema.as_ref(),
                     &params,
-                    script.enabled,
+                    ScriptRefCapabilities {
+                        property_write_supported: true,
+                        enabled: script.enabled,
+                    },
                 );
                 host.insert_instance(ScriptInstance {
                     handle: object.handle,
@@ -727,7 +744,10 @@ impl ScriptHost {
                         &script.name,
                         schema.as_ref(),
                         &params,
-                        script.enabled,
+                        ScriptRefCapabilities {
+                            property_write_supported: descriptor.set_property.is_some(),
+                            enabled: script.enabled,
+                        },
                     );
                     host.instances[owner] = Some(ScriptInstance {
                         handle: object.handle,
@@ -776,10 +796,20 @@ impl ScriptHost {
         if self.started || self.destroyed || self.save_writer.is_some() {
             return Err("save file must be attached once before scripts start".to_owned());
         }
-        let (writer, values) = SaveWriter::open(path)?;
+        let (writer, values) = match SaveWriter::open(path) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.report_save_failure(format!(
+                    "save persistence unavailable; using in-memory data and leaving the file unchanged: {error}"
+                ));
+                return Err(error);
+            }
+        };
         self.set_save_values(values)?;
         self.persisted_save_generation = self.save_generation();
+        self.pending_save_generations.clear();
         self.save_writer = Some(writer);
+        self.report_save_recovered();
         Ok(())
     }
 
@@ -1510,36 +1540,107 @@ impl ScriptHost {
         self.due_coroutines.clear();
         self.remove_all_commands();
         self.release_all_pending(world);
-        self.persist_save_changes();
-        if let Some(writer) = self.save_writer.take()
-            && let Err(error) = writer.finish(self.save_values())
-        {
-            log::error!("final save flush failed: {error}");
+        self.process_save_acknowledgements();
+        if let Some(writer) = self.save_writer.take() {
+            let generation = self.save_generation();
+            match writer.finish(generation, self.save_values()) {
+                Ok(()) => {
+                    self.persisted_save_generation = self.persisted_save_generation.max(generation);
+                    self.pending_save_generations
+                        .retain(|pending| *pending > generation);
+                    self.report_save_recovered();
+                }
+                Err(error) => self.report_save_failure(format!("final save flush failed: {error}")),
+            }
         }
     }
 
     fn persist_save_changes(&mut self) {
+        self.process_save_acknowledgements();
         let generation = self.save_generation();
-        if generation != self.persisted_save_generation {
-            if let Some(writer) = self.save_writer.as_ref() {
-                if writer.snapshot(self.save_values()) {
-                    self.persisted_save_generation = generation;
+        if generation != self.persisted_save_generation
+            && !self.pending_save_generations.contains(&generation)
+            && let Some(writer) = self.save_writer.as_ref()
+        {
+            match writer.snapshot(generation, self.save_values()) {
+                Ok(true) => {
+                    self.pending_save_generations.insert(generation);
                 }
-            } else {
-                self.persisted_save_generation = generation;
+                Ok(false) => {}
+                Err(error) => self.report_save_failure(error),
             }
         }
         if self.take_save_flush_requested() {
             if let Some(writer) = self.save_writer.as_ref() {
-                if let Err(error) = writer.flush(self.save_values()) {
-                    log::error!("explicit save flush failed: {error}");
-                } else {
-                    self.persisted_save_generation = generation;
+                let result = writer.flush(generation, self.save_values());
+                self.process_save_acknowledgements();
+                match result {
+                    Ok(()) => {
+                        self.persisted_save_generation =
+                            self.persisted_save_generation.max(generation);
+                        self.pending_save_generations
+                            .retain(|pending| *pending > generation);
+                        self.report_save_recovered();
+                    }
+                    Err(error) => {
+                        self.report_save_failure(format!("explicit save flush failed: {error}"))
+                    }
                 }
             } else {
-                log::warn!("save.flush() was requested but no save path is available");
+                self.report_save_failure(
+                    "save.flush() was requested without a save path; data remains in memory"
+                        .to_owned(),
+                );
             }
         }
+    }
+
+    fn process_save_acknowledgements(&mut self) {
+        let acknowledgements = self
+            .save_writer
+            .as_ref()
+            .map(SaveWriter::drain_acknowledgements)
+            .unwrap_or_default();
+        for acknowledgement in acknowledgements {
+            self.pending_save_generations
+                .remove(&acknowledgement.generation);
+            match acknowledgement.result {
+                Ok(()) => {
+                    self.persisted_save_generation = self
+                        .persisted_save_generation
+                        .max(acknowledgement.generation);
+                    self.report_save_recovered();
+                }
+                Err(error) => self.report_save_failure(format!(
+                    "save snapshot generation {} failed: {error}",
+                    acknowledgement.generation
+                )),
+            }
+        }
+    }
+
+    fn report_save_failure(&mut self, message: String) {
+        if self.save_write_failed {
+            return;
+        }
+        self.save_write_failed = true;
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Error,
+            source: self.scene_name.clone(),
+            message,
+        });
+    }
+
+    fn report_save_recovered(&mut self) {
+        if !self.save_write_failed {
+            return;
+        }
+        self.save_write_failed = false;
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Info,
+            source: self.scene_name.clone(),
+            message: "save persistence recovered".to_owned(),
+        });
     }
 
     /// Takes all log and runtime-error events accumulated since the previous drain.
@@ -2838,6 +2939,7 @@ impl ScriptHost {
             _ => None,
         });
         let transaction_ptr = transaction as *mut ScriptTransaction;
+        let mut lua_properties_after = None;
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
             ScriptKind::Lite(lite_instance) => {
                 *active_source.borrow_mut() = instance.source.clone();
@@ -2903,7 +3005,7 @@ impl ScriptHost {
                     }
                     _ => Ok(true),
                 };
-                has_callback
+                let result = has_callback
                     .and_then(|has_callback| {
                         if !has_callback {
                             return Ok(None);
@@ -3042,7 +3144,24 @@ impl ScriptHost {
                         };
                         callback.and_then(|()| lite_instance.transform()).map(Some)
                     })
-                    .map_err(|error| error.to_string())
+                    .and_then(|transform| {
+                        let Some(transform) = transform else {
+                            return Ok(None);
+                        };
+                        let mut properties = lite_instance.declared_properties(lua)?;
+                        for (name, value) in &mut properties {
+                            // SAFETY: the transaction remains owned by this callback.
+                            *value = unsafe { (*transaction_ptr).script_set_current(name, value) }
+                                .map_err(|error| LuaError::runtime(error.message()))?;
+                        }
+                        lite_instance.stage_params(lua, &properties)?;
+                        lua_properties_after = Some(properties);
+                        Ok(Some(transform))
+                    });
+                if result.is_err() {
+                    let _ = lite_instance.restore_params(lua);
+                }
+                result.map_err(|error| error.to_string())
             }
             ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
                 let Some(self_object) = abi_object_handle(instance.handle) else {
@@ -3073,7 +3192,7 @@ impl ScriptHost {
                         })
                         .unwrap_or_default()
                 };
-                for (name, value) in &writes {
+                for (write_index, (name, value)) in writes.iter().enumerate() {
                     let call = AbiScriptCall {
                         self_object,
                         // SAFETY: the transaction is owned by this call until it commits or discards.
@@ -3086,10 +3205,19 @@ impl ScriptHost {
                         commands_allowed: true,
                     };
                     if let Err(message) = script.invoke_set_property(time, name, value, call) {
+                        for (pending_name, _) in writes.iter().skip(write_index) {
+                            settle_script_ref_write(
+                                script_refs,
+                                instance.serial,
+                                pending_name,
+                                false,
+                            );
+                        }
                         // SAFETY: the synchronous delivery returned, so no call-scoped borrow remains.
                         unsafe { (*transaction_ptr).discard() };
                         return CallOutcome::Failed(message);
                     }
+                    settle_script_ref_write(script_refs, instance.serial, name, true);
                 }
                 let call = AbiScriptCall {
                     self_object,
@@ -3160,11 +3288,17 @@ impl ScriptHost {
         };
 
         if matches!(&instance.kind, ScriptKind::Lite(_)) && interrupt.is_interrupted() {
+            if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                let _ = lite_instance.restore_params(lua);
+            }
             // SAFETY: the callback and its call-scoped transaction borrow have returned.
             unsafe { (*transaction_ptr).discard() };
             return CallOutcome::Interrupted;
         }
         if matches!(&instance.kind, ScriptKind::Lite(_)) && call_deadline.is_expired() {
+            if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                let _ = lite_instance.restore_params(lua);
+            }
             // SAFETY: the callback and its call-scoped transaction borrow have returned.
             unsafe { (*transaction_ptr).discard() };
             return CallOutcome::Failed(call_deadline.timeout_message());
@@ -3178,6 +3312,9 @@ impl ScriptHost {
                         || (*transaction_ptr).set_local_transform(instance.handle, transform)
                 };
                 if !staged {
+                    if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                        let _ = lite_instance.restore_params(lua);
+                    }
                     // SAFETY: the transaction is still owned by this host call.
                     unsafe { (*transaction_ptr).discard() };
                     return CallOutcome::Failed(
@@ -3186,12 +3323,18 @@ impl ScriptHost {
                 }
             }
             Ok(Some(_)) => {
+                if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                    let _ = lite_instance.restore_params(lua);
+                }
                 // SAFETY: the callback and its call-scoped transaction borrow have returned.
                 unsafe { (*transaction_ptr).discard() };
                 return CallOutcome::Failed("script produced a non-finite transform".to_owned());
             }
             Ok(None) => {}
             Err(message) => {
+                if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                    let _ = lite_instance.restore_params(lua);
+                }
                 // SAFETY: the callback and its call-scoped transaction borrow have returned.
                 unsafe { (*transaction_ptr).discard() };
                 return CallOutcome::Failed(message);
@@ -3213,12 +3356,22 @@ impl ScriptHost {
             )
         } {
             Ok(mutations) => {
+                if let Some(properties) = lua_properties_after
+                    && let ScriptKind::Lite(lite_instance) = &mut instance.kind
+                {
+                    lite_instance.commit_properties(properties);
+                }
                 // SAFETY: commit returned, so no call-scoped borrow of the transaction remains.
                 *cursor = unsafe { (*transaction_ptr).cursor() };
                 actions.queue_mutations(mutations);
                 CallOutcome::Committed
             }
-            Err(message) => CallOutcome::Failed(message),
+            Err(message) => {
+                if let ScriptKind::Lite(lite_instance) = &mut instance.kind {
+                    let _ = lite_instance.restore_params(lua);
+                }
+                CallOutcome::Failed(message)
+            }
         }
     }
 
@@ -3505,6 +3658,16 @@ impl ScriptHost {
                         object_id: &id,
                         object_name: &name,
                         params: &params,
+                        property_names: schema
+                            .as_ref()
+                            .map(|schema| {
+                                schema
+                                    .specs()
+                                    .iter()
+                                    .map(|spec| spec.name.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         transform,
                         object_refs: &object_refs,
                         object_handle: handle,
@@ -3519,7 +3682,10 @@ impl ScriptHost {
                     path,
                     schema.as_ref(),
                     &params,
-                    script.enabled,
+                    ScriptRefCapabilities {
+                        property_write_supported: true,
+                        enabled: script.enabled,
+                    },
                 );
                 let index = self.insert_instance(ScriptInstance {
                     handle,
@@ -3599,7 +3765,10 @@ impl ScriptHost {
                     &script.name,
                     schema.as_ref(),
                     &params,
-                    script.enabled,
+                    ScriptRefCapabilities {
+                        property_write_supported: descriptor.set_property.is_some(),
+                        enabled: script.enabled,
+                    },
                 );
                 self.instances[owner] = Some(ScriptInstance {
                     handle,
@@ -3867,7 +4036,7 @@ impl ScriptHost {
         key: &str,
         schema: Option<&engine_scene::ParamSchema>,
         properties: &BTreeMap<String, ParamValue>,
-        enabled: bool,
+        capabilities: ScriptRefCapabilities,
     ) {
         self.script_refs.borrow_mut().push(ScriptRefEntry {
             serial,
@@ -3875,8 +4044,10 @@ impl ScriptHost {
             key: key.to_owned(),
             schema: schema.cloned().map(Rc::new),
             properties: properties.clone(),
-            enabled,
+            property_write_supported: capabilities.property_write_supported,
+            enabled: capabilities.enabled,
             dirty_properties: BTreeSet::new(),
+            dirty_original_properties: BTreeMap::new(),
         });
     }
 
@@ -4010,6 +4181,19 @@ enum CallOutcome {
     Committed,
     Interrupted,
     Failed(String),
+}
+
+fn settle_script_ref_write(refs: &ScriptRefs, serial: u64, name: &str, accepted: bool) {
+    let mut refs = refs.borrow_mut();
+    let Some(entry) = refs.iter_mut().find(|entry| entry.serial == serial) else {
+        return;
+    };
+    entry.dirty_properties.remove(name);
+    if accepted {
+        entry.dirty_original_properties.remove(name);
+    } else if let Some(previous) = entry.dirty_original_properties.remove(name) {
+        entry.properties.insert(name.to_owned(), previous);
+    }
 }
 
 struct ActiveCallGuard<'lua> {

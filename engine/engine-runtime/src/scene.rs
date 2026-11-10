@@ -1491,177 +1491,410 @@ pub(crate) enum SceneParticles {
     Descriptions,
 }
 
+trait SceneUploadCleanupGpu {
+    type Mesh: Copy + Eq + Hash;
+    type Material: Copy + Eq + Hash;
+    type Skin: Copy + Eq + Hash;
+    type ScreenShader: Copy + Eq + Hash;
+    type Particle: Copy + Eq + Hash;
+    type UiTexture: Copy + Eq + Hash;
+    type Texture: Copy + Eq + Hash;
+    type SurfaceShader: Copy + Eq + Hash;
+
+    fn destroy_mesh(&mut self, id: Self::Mesh) -> Result<(), String>;
+    fn destroy_material(&mut self, id: Self::Material) -> Result<(), String>;
+    fn destroy_skin(&mut self, id: Self::Skin) -> Result<(), String>;
+    fn destroy_screen_shader(&mut self, id: Self::ScreenShader) -> Result<(), String>;
+    fn destroy_particle(&mut self, id: Self::Particle) -> Result<(), String>;
+    fn destroy_ui_texture(&mut self, id: Self::UiTexture) -> Result<(), String>;
+    fn destroy_texture(&mut self, id: Self::Texture) -> Result<(), String>;
+    fn destroy_surface_shader(&mut self, id: Self::SurfaceShader) -> Result<(), String>;
+}
+
+impl SceneUploadCleanupGpu for Renderer {
+    type Mesh = MeshId;
+    type Material = MaterialId;
+    type Skin = engine_render::SkinId;
+    type ScreenShader = engine_render::ScreenShaderId;
+    type Particle = engine_render::ParticleEmitterId;
+    type UiTexture = engine_render::UiTextureId;
+    type Texture = TextureId;
+    type SurfaceShader = ShaderId;
+
+    fn destroy_mesh(&mut self, id: Self::Mesh) -> Result<(), String> {
+        Renderer::destroy_mesh(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_material(&mut self, id: Self::Material) -> Result<(), String> {
+        Renderer::destroy_material(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_skin(&mut self, id: Self::Skin) -> Result<(), String> {
+        Renderer::destroy_skin_instance(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_screen_shader(&mut self, id: Self::ScreenShader) -> Result<(), String> {
+        Renderer::destroy_screen_shader(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_particle(&mut self, id: Self::Particle) -> Result<(), String> {
+        Renderer::destroy_particle_emitter(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_ui_texture(&mut self, id: Self::UiTexture) -> Result<(), String> {
+        Renderer::free_ui_texture(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_texture(&mut self, id: Self::Texture) -> Result<(), String> {
+        Renderer::destroy_texture(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_surface_shader(&mut self, id: Self::SurfaceShader) -> Result<(), String> {
+        Renderer::destroy_surface_shader(self, id).map_err(|error| error.to_string())
+    }
+}
+
+struct SceneUploadResources<G: SceneUploadCleanupGpu> {
+    meshes: HashSet<G::Mesh>,
+    materials: HashSet<G::Material>,
+    skins: HashSet<G::Skin>,
+    screen_shaders: HashSet<G::ScreenShader>,
+    particles: HashSet<G::Particle>,
+    ui_textures: HashSet<G::UiTexture>,
+    textures: HashSet<G::Texture>,
+    surface_shaders: HashSet<G::SurfaceShader>,
+}
+
+impl<G: SceneUploadCleanupGpu> Default for SceneUploadResources<G> {
+    fn default() -> Self {
+        Self {
+            meshes: HashSet::new(),
+            materials: HashSet::new(),
+            skins: HashSet::new(),
+            screen_shaders: HashSet::new(),
+            particles: HashSet::new(),
+            ui_textures: HashSet::new(),
+            textures: HashSet::new(),
+            surface_shaders: HashSet::new(),
+        }
+    }
+}
+
+impl<G: SceneUploadCleanupGpu> SceneUploadResources<G> {
+    fn rollback(&mut self, gpu: &mut G) {
+        for id in self.particles.drain() {
+            if let Err(error) = gpu.destroy_particle(id) {
+                log::error!("failed to release partially uploaded scene particle: {error}");
+            }
+        }
+        for id in self.skins.drain() {
+            if let Err(error) = gpu.destroy_skin(id) {
+                log::error!("failed to release partially uploaded scene skin: {error}");
+            }
+        }
+        for id in self.materials.drain() {
+            if let Err(error) = gpu.destroy_material(id) {
+                log::error!("failed to release partially uploaded scene material: {error}");
+            }
+        }
+        for id in self.meshes.drain() {
+            if let Err(error) = gpu.destroy_mesh(id) {
+                log::error!("failed to release partially uploaded scene mesh: {error}");
+            }
+        }
+        for id in self.screen_shaders.drain() {
+            if let Err(error) = gpu.destroy_screen_shader(id) {
+                log::error!("failed to release partially uploaded scene screen shader: {error}");
+            }
+        }
+        for id in self.ui_textures.drain() {
+            if let Err(error) = gpu.destroy_ui_texture(id) {
+                log::error!("failed to release partially uploaded scene UI texture: {error}");
+            }
+        }
+        for id in self.surface_shaders.drain() {
+            if let Err(error) = gpu.destroy_surface_shader(id) {
+                log::error!("failed to release partially uploaded scene surface shader: {error}");
+            }
+        }
+        for id in self.textures.drain() {
+            if let Err(error) = gpu.destroy_texture(id) {
+                log::error!("failed to release partially uploaded scene texture: {error}");
+            }
+        }
+    }
+}
+
+fn remove_new_cached_textures<T: Copy + Eq + Hash>(
+    cache: &mut GpuTextureCache<T>,
+    original: &HashSet<T>,
+) -> HashSet<T> {
+    let created = cache
+        .ids()
+        .difference(original)
+        .copied()
+        .collect::<HashSet<_>>();
+    for id in &created {
+        cache.remove_id(*id);
+    }
+    created
+}
+
+fn restore_shader_cache<S: Copy + Eq + Hash>(
+    cache: &mut HashMap<String, Result<S, String>>,
+    original_paths: &HashSet<String>,
+) -> HashSet<S> {
+    let created = cache
+        .values()
+        .filter_map(|shader| shader.as_ref().ok())
+        .copied()
+        .collect::<HashSet<_>>();
+    let original = cache
+        .iter()
+        .filter(|(path, _)| original_paths.contains(*path))
+        .filter_map(|(_, shader)| shader.as_ref().ok())
+        .copied()
+        .collect::<HashSet<_>>();
+    cache.retain(|path, _| original_paths.contains(path));
+    created.difference(&original).copied().collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback_scene_upload<G: SceneUploadCleanupGpu>(
+    gpu: &mut G,
+    original_textures: &HashSet<G::Texture>,
+    original_shader_paths: &HashSet<String>,
+    original_error_material: Option<G::Material>,
+    texture_cache: &mut GpuTextureCache<G::Texture>,
+    shader_cache: &mut HashMap<String, Result<G::SurfaceShader, String>>,
+    material_cache: &HashMap<String, G::Material>,
+    error_material: &mut Option<G::Material>,
+    created: &mut SceneUploadResources<G>,
+) {
+    created.materials.extend(material_cache.values().copied());
+    if let Some(material) = *error_material
+        && Some(material) != original_error_material
+    {
+        created.materials.insert(material);
+    }
+    if let Some(material) = original_error_material {
+        created.materials.remove(&material);
+    }
+    created.textures = remove_new_cached_textures(texture_cache, original_textures);
+    created.surface_shaders = restore_shader_cache(shader_cache, original_shader_paths);
+    created.rollback(gpu);
+    *error_material = original_error_material;
+}
+
 pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
     caches: &mut MaterialUploadCaches,
     particles: SceneParticles,
 ) -> Result<GpuSceneTable, RenderError> {
+    let original_textures = caches.textures.ids();
+    let original_shader_paths = caches.shaders.keys().cloned().collect::<HashSet<_>>();
+    let original_error_material = caches.error_material;
     let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
     let mut texture_cache = std::mem::take(&mut caches.textures);
     let mut shader_cache = std::mem::take(&mut caches.shaders);
     let mut material_cache = HashMap::<String, MaterialId>::new();
     let mut error_material = caches.error_material.take();
+    let mut created = SceneUploadResources::<Renderer>::default();
     let material_assets = MaterialAssetView::from_scene(assets);
     // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
     let animated = animated_model_paths(assets);
 
-    for (path, model) in &assets.models {
-        let skinned = animated.contains(path.as_str()) && model.skeleton.is_some();
-        let joint_count = model
-            .skeleton
-            .as_ref()
-            .map_or(0, |skeleton| skeleton.joints.len() as u32);
-        let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
-        for mesh in &model.meshes {
-            let vertices = mesh
-                .vertices
-                .iter()
-                .map(|vertex| Vertex {
-                    position: vertex.position,
-                    normal: vertex.normal,
-                    uv: vertex.uv,
-                    color: [1.0; 3],
-                })
-                .collect::<Vec<_>>();
-            let mesh_id = match &mesh.skin {
-                Some(skin) if skinned => renderer.create_skinned_mesh(
-                    &vertices,
-                    &skin_vertices(skin),
-                    &mesh.indices,
-                    joint_count,
-                )?,
-                _ => renderer.create_mesh(&vertices, &mesh.indices)?,
-            };
-            let resolved = resolve_material(&mesh.material, None, None);
-            let material_id = upload_resolved_material(
-                renderer,
-                &resolved,
-                path,
-                model,
-                material_assets,
-                &mut texture_cache,
-                &mut material_cache,
-                None,
-                None,
-            )?;
-            gpu_meshes.push((mesh_id, material_id));
-        }
-        gpu_models.insert(path.clone(), gpu_meshes);
-    }
-
-    let mut table = GpuSceneTable {
-        environments: assets.environments.clone(),
-        animation_clips: assets.clips.clone(),
-        material_sources: assets
-            .objects
-            .iter()
-            .map(|(handle, object)| (*handle, object.clone()))
-            .collect(),
-        material_templates: assets
-            .prefabs
-            .iter()
-            .map(|(path, models)| (path.clone(), models.clone()))
-            .collect(),
-        ..GpuSceneTable::default()
-    };
-    for (path, image) in &assets.ui_images {
-        let texture = renderer.create_ui_texture(image.size[0], image.size[1], &image.rgba)?;
-        table.ui_images.insert(path.clone(), texture);
-    }
-    table.screen_shaders = upload_screen_shaders(renderer, &assets.screen_shaders);
-    for path in &animated {
-        // Мосту нужны скелет и клипы; вершины остаются только в GPU-таблице.
-        if let Some(model) = assets.models.get(*path) {
-            table.animation_models.insert(
-                (*path).to_owned(),
-                Arc::new(Model {
-                    meshes: Vec::new(),
-                    textures: Vec::new(),
-                    skeleton: model.skeleton.clone(),
-                    animations: model.animations.clone(),
-                }),
-            );
-        }
-    }
-    for (handle, object) in &assets.objects {
-        let levels = upload_object_levels(
-            renderer,
-            material_assets,
-            &gpu_models,
-            &mut texture_cache,
-            &mut shader_cache,
-            &mut material_cache,
-            &mut error_material,
-            None,
-            object,
-        )?;
-        if object.animated
-            && let Some((model_path, _)) = object.levels.first()
-            && let Some(skeleton) = assets
-                .models
-                .get(model_path)
-                .and_then(|model| model.skeleton.as_ref())
-        {
-            // Экземпляр skinning на каждую часть уровня 0: выходные вершины живут отдельно.
-            let mut instances = Vec::with_capacity(levels[0].len());
-            for (mesh_id, _) in &levels[0] {
-                instances.push(renderer.create_skin_instance(*mesh_id)?);
-            }
-            table.skin_instances.insert(*handle, instances);
-            table
-                .joint_counts
-                .insert(*handle, skeleton.joints.len() as u32);
-        }
-        table.by_object.insert(*handle, levels);
-    }
-    for (path, objects) in &assets.prefabs {
-        let mut templates = Vec::with_capacity(objects.len());
-        for object in objects {
-            templates.push(match object {
-                Some(object) => upload_object_levels(
+    let result = (|| -> Result<GpuSceneTable, RenderError> {
+        for (path, model) in &assets.models {
+            let skinned = animated.contains(path.as_str()) && model.skeleton.is_some();
+            let joint_count = model
+                .skeleton
+                .as_ref()
+                .map_or(0, |skeleton| skeleton.joints.len() as u32);
+            let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
+            for mesh in &model.meshes {
+                let vertices = mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| Vertex {
+                        position: vertex.position,
+                        normal: vertex.normal,
+                        uv: vertex.uv,
+                        color: [1.0; 3],
+                    })
+                    .collect::<Vec<_>>();
+                let mesh_id = match &mesh.skin {
+                    Some(skin) if skinned => renderer.create_skinned_mesh(
+                        &vertices,
+                        &skin_vertices(skin),
+                        &mesh.indices,
+                        joint_count,
+                    )?,
+                    _ => renderer.create_mesh(&vertices, &mesh.indices)?,
+                };
+                created.meshes.insert(mesh_id);
+                let resolved = resolve_material(&mesh.material, None, None);
+                let material_id = upload_resolved_material(
                     renderer,
+                    &resolved,
+                    path,
+                    model,
                     material_assets,
-                    &gpu_models,
                     &mut texture_cache,
-                    &mut shader_cache,
                     &mut material_cache,
-                    &mut error_material,
                     None,
-                    object,
-                )?,
-                None => Vec::new(),
-            });
+                    None,
+                )?;
+                gpu_meshes.push((mesh_id, material_id));
+            }
+            gpu_models.insert(path.clone(), gpu_meshes);
         }
-        table.prefabs.insert(path.clone(), templates);
-    }
-    for (handle, source) in &assets.particles {
-        let desc = particle_desc(renderer, assets, &mut texture_cache, source)?;
-        match particles {
-            SceneParticles::Emitters => {
+
+        let mut table = GpuSceneTable {
+            environments: assets.environments.clone(),
+            animation_clips: assets.clips.clone(),
+            ui_scene_owners: HashSet::from([0]),
+            material_sources: assets
+                .objects
+                .iter()
+                .map(|(handle, object)| (*handle, object.clone()))
+                .collect(),
+            material_templates: assets
+                .prefabs
+                .iter()
+                .map(|(path, models)| (path.clone(), models.clone()))
+                .collect(),
+            ..GpuSceneTable::default()
+        };
+        for (path, image) in &assets.ui_images {
+            let texture = renderer.create_ui_texture(image.size[0], image.size[1], &image.rgba)?;
+            created.ui_textures.insert(texture);
+            table.ui_images.insert(path.clone(), texture);
+        }
+        table.screen_shaders = upload_screen_shaders(renderer, &assets.screen_shaders);
+        created
+            .screen_shaders
+            .extend(table.screen_shaders.values().copied());
+        for path in &animated {
+            // Мосту нужны скелет и клипы; вершины остаются только в GPU-таблице.
+            if let Some(model) = assets.models.get(*path) {
+                table.animation_models.insert(
+                    (*path).to_owned(),
+                    Arc::new(Model {
+                        meshes: Vec::new(),
+                        textures: Vec::new(),
+                        skeleton: model.skeleton.clone(),
+                        animations: model.animations.clone(),
+                    }),
+                );
+            }
+        }
+        for (handle, object) in &assets.objects {
+            let levels = upload_object_levels(
+                renderer,
+                material_assets,
+                &gpu_models,
+                &mut texture_cache,
+                &mut shader_cache,
+                &mut material_cache,
+                &mut error_material,
+                None,
+                object,
+            )?;
+            if object.animated
+                && let Some((model_path, _)) = object.levels.first()
+                && let Some(skeleton) = assets
+                    .models
+                    .get(model_path)
+                    .and_then(|model| model.skeleton.as_ref())
+            {
+                // Экземпляр skinning на каждую часть уровня 0: выходные вершины живут отдельно.
+                let mut instances = Vec::with_capacity(levels[0].len());
+                for (mesh_id, _) in &levels[0] {
+                    let instance = renderer.create_skin_instance(*mesh_id)?;
+                    created.skins.insert(instance);
+                    instances.push(instance);
+                }
+                table.skin_instances.insert(*handle, instances);
                 table
-                    .particles
-                    .insert(*handle, renderer.create_particle_emitter(desc)?);
+                    .joint_counts
+                    .insert(*handle, skeleton.joints.len() as u32);
             }
-            SceneParticles::Descriptions => {
-                table.particle_descs.insert(*handle, desc);
+            table.by_object.insert(*handle, levels);
+        }
+        for (path, objects) in &assets.prefabs {
+            let mut templates = Vec::with_capacity(objects.len());
+            for object in objects {
+                templates.push(match object {
+                    Some(object) => upload_object_levels(
+                        renderer,
+                        material_assets,
+                        &gpu_models,
+                        &mut texture_cache,
+                        &mut shader_cache,
+                        &mut material_cache,
+                        &mut error_material,
+                        None,
+                        object,
+                    )?,
+                    None => Vec::new(),
+                });
+            }
+            table.prefabs.insert(path.clone(), templates);
+        }
+        for (handle, source) in &assets.particles {
+            let desc = particle_desc(renderer, assets, &mut texture_cache, source)?;
+            match particles {
+                SceneParticles::Emitters => {
+                    let emitter = renderer.create_particle_emitter(desc)?;
+                    created.particles.insert(emitter);
+                    table.particles.insert(*handle, emitter);
+                }
+                SceneParticles::Descriptions => {
+                    table.particle_descs.insert(*handle, desc);
+                }
             }
         }
-    }
-    for (path, sources) in &assets.prefab_particles {
-        let mut descs = Vec::with_capacity(sources.len());
-        for source in sources {
-            descs.push(match source {
-                Some(source) => Some(particle_desc(renderer, assets, &mut texture_cache, source)?),
-                None => None,
-            });
+        for (path, sources) in &assets.prefab_particles {
+            let mut descs = Vec::with_capacity(sources.len());
+            for source in sources {
+                descs.push(match source {
+                    Some(source) => {
+                        Some(particle_desc(renderer, assets, &mut texture_cache, source)?)
+                    }
+                    None => None,
+                });
+            }
+            table.particle_templates.insert(path.clone(), descs);
         }
-        table.particle_templates.insert(path.clone(), descs);
+        Ok(table)
+    })();
+    match result {
+        Ok(table) => {
+            caches.textures = texture_cache;
+            caches.shaders = shader_cache;
+            caches.error_material = error_material;
+            Ok(table)
+        }
+        Err(error) => {
+            rollback_scene_upload(
+                renderer,
+                &original_textures,
+                &original_shader_paths,
+                original_error_material,
+                &mut texture_cache,
+                &mut shader_cache,
+                &material_cache,
+                &mut error_material,
+                &mut created,
+            );
+            caches.textures = texture_cache;
+            caches.shaders = shader_cache;
+            caches.error_material = error_material;
+            Err(error)
+        }
     }
-    caches.textures = texture_cache;
-    caches.shaders = shader_cache;
-    caches.error_material = error_material;
-    Ok(table)
 }
 
 /// Пути моделей уровня 0 у объектов сцены с `animator`.
@@ -2166,7 +2399,7 @@ mod tests {
     };
     use engine_script::{
         Key, MouseButton, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, ScriptEventLevel,
-        ScriptHost, ScriptInput, ScriptLoadOptions, ScriptTime,
+        ScriptHost, ScriptInput, ScriptLibrary, ScriptLoadOptions, ScriptTime,
     };
     use std::cell::Cell;
     use std::collections::BTreeMap;
@@ -2230,6 +2463,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.system.shutdown();
         }
+    }
+
+    struct DemoSceneReferenceProbe;
+
+    impl rve_sdk::Script for DemoSceneReferenceProbe {}
+
+    fn demo_scene_reference_probe(_: &rve_sdk::Params) -> Result<Box<dyn rve_sdk::Script>, String> {
+        Ok(Box::new(DemoSceneReferenceProbe))
+    }
+
+    fn demo_scene_script_library() -> ScriptLibrary {
+        let module = rve_sdk::script_module! {
+            "SceneReferenceProbe" => demo_scene_reference_probe,
+        };
+        // SAFETY: the SDK macro keeps the module and descriptor table in static storage.
+        unsafe { ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap()
     }
 
     const CAMERA_SCENE: &str = r#"
@@ -2327,11 +2576,12 @@ id = "camera"
         };
         assert_eq!(resolved("ice-pad").map(|m| m.static_friction), Some(0.05));
         assert_eq!(resolved("rubber-ball").map(|m| m.bounciness), Some(0.9));
+        let library = demo_scene_script_library();
         engine_script::ScriptHost::load(
             &prepared.world,
             "/scenes/physics.rvescene",
             &prepared.sources,
-            None,
+            Some(&library),
         )
         .unwrap_or_else(|error| panic!("physics scripts: {error}"));
         let geometry = prepared.physics_geometry();
@@ -2393,11 +2643,12 @@ id = "camera"
         );
 
         // Регистрация компилирует Lua пули и проверяет её params до старта сцены.
+        let library = demo_scene_script_library();
         ScriptHost::load_with_options(
             &prepared.world,
             "/scenes/physics.rvescene",
             &prepared.sources,
-            None,
+            Some(&library),
             ScriptLoadOptions {
                 prefabs: prepared.prefabs.catalog.clone(),
                 ..ScriptLoadOptions::default()
@@ -2426,11 +2677,12 @@ id = "camera"
         let heavy =
             engine_project::PrefabCatalogFile::load(demo.join("prefabs.rveprefabs")).unwrap();
         crate::add_heavy_prefabs(&mut prepared.prefabs.catalog, &heavy).unwrap();
+        let library = demo_scene_script_library();
         let mut host = ScriptHost::load_with_options(
             &prepared.world,
             &prepared.name,
             &prepared.sources,
-            None,
+            Some(&library),
             ScriptLoadOptions {
                 input: project.input,
                 prefabs: prepared.prefabs.catalog.clone(),
@@ -3770,5 +4022,250 @@ mod material_resource_ownership_tests {
         // A failed upload can cache dependencies before material creation, but no material owns them.
         assert!(!ownership.keeps_texture(4));
         assert!(!ownership.keeps_shader(14));
+    }
+}
+
+#[cfg(test)]
+mod scene_upload_rollback_tests {
+    use super::{
+        GpuTextureCache, SceneUploadCleanupGpu, SceneUploadResources, TextureColorSpace,
+        remove_new_cached_textures, restore_shader_cache, rollback_scene_upload,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    enum Kind {
+        Mesh,
+        Material,
+        ErrorMaterial,
+        Skin,
+        ScreenShader,
+        Particle,
+        UiTexture,
+        Texture,
+        SurfaceShader,
+    }
+
+    #[derive(Debug)]
+    struct MockGpu {
+        fail_at: Kind,
+        next_id: usize,
+        live: HashSet<(Kind, usize)>,
+        destroyed: Vec<(Kind, usize)>,
+    }
+
+    impl MockGpu {
+        fn create(&mut self, kind: Kind) -> Result<usize, ()> {
+            if self.fail_at == kind {
+                return Err(());
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            self.live.insert((
+                if kind == Kind::ErrorMaterial {
+                    Kind::Material
+                } else {
+                    kind
+                },
+                id,
+            ));
+            Ok(id)
+        }
+
+        fn release(&mut self, kind: Kind, id: usize) -> Result<(), String> {
+            if !self.live.remove(&(kind, id)) {
+                return Err(format!("{kind:?} {id} was released more than once"));
+            }
+            self.destroyed.push((kind, id));
+            Ok(())
+        }
+    }
+
+    impl SceneUploadCleanupGpu for MockGpu {
+        type Mesh = usize;
+        type Material = usize;
+        type Skin = usize;
+        type ScreenShader = usize;
+        type Particle = usize;
+        type UiTexture = usize;
+        type Texture = usize;
+        type SurfaceShader = usize;
+
+        fn destroy_mesh(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::Mesh, id)
+        }
+        fn destroy_material(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::Material, id)
+        }
+        fn destroy_skin(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::Skin, id)
+        }
+        fn destroy_screen_shader(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::ScreenShader, id)
+        }
+        fn destroy_particle(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::Particle, id)
+        }
+        fn destroy_ui_texture(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::UiTexture, id)
+        }
+        fn destroy_texture(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::Texture, id)
+        }
+        fn destroy_surface_shader(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::SurfaceShader, id)
+        }
+    }
+
+    #[test]
+    fn failures_at_each_upload_stage_release_only_created_ids_once() {
+        let stages = [
+            Kind::Mesh,
+            Kind::Material,
+            Kind::ErrorMaterial,
+            Kind::Texture,
+            Kind::SurfaceShader,
+            Kind::UiTexture,
+            Kind::ScreenShader,
+            Kind::Skin,
+            Kind::Particle,
+        ];
+        for fail_at in stages {
+            let mut gpu = MockGpu {
+                fail_at,
+                next_id: 2,
+                live: HashSet::from([
+                    (Kind::Texture, 1),
+                    (Kind::Material, 1),
+                    (Kind::SurfaceShader, 1),
+                ]),
+                destroyed: Vec::new(),
+            };
+            let original_textures = HashSet::from([1]);
+            let original_shader_paths = HashSet::from(["old.glsl".to_owned()]);
+            let mut texture_cache = GpuTextureCache::<usize>::default();
+            texture_cache
+                .model
+                .insert(("old.png".to_owned(), 0, TextureColorSpace::Srgb), 1);
+            let mut shader_cache = HashMap::from([("old.glsl".to_owned(), Ok(1))]);
+            let mut material_cache = HashMap::new();
+            let original_error_material = Some(1);
+            let mut error_material = original_error_material;
+            let mut resources = SceneUploadResources::<MockGpu>::default();
+            let mut failed = false;
+            for kind in stages {
+                let id = match gpu.create(kind) {
+                    Ok(id) => id,
+                    Err(()) => {
+                        failed = true;
+                        break;
+                    }
+                };
+                match kind {
+                    Kind::Mesh => {
+                        resources.meshes.insert(id);
+                    }
+                    Kind::Material => {
+                        material_cache.insert("uploaded".to_owned(), id);
+                    }
+                    Kind::ErrorMaterial => {
+                        error_material = Some(id);
+                    }
+                    Kind::Texture => {
+                        texture_cache
+                            .scene
+                            .insert(("new.png".to_owned(), TextureColorSpace::Srgb), id);
+                    }
+                    Kind::SurfaceShader => {
+                        shader_cache.insert("new.glsl".to_owned(), Ok(id));
+                    }
+                    Kind::Skin => {
+                        resources.skins.insert(id);
+                    }
+                    Kind::ScreenShader => {
+                        resources.screen_shaders.insert(id);
+                    }
+                    Kind::Particle => {
+                        resources.particles.insert(id);
+                    }
+                    Kind::UiTexture => {
+                        resources.ui_textures.insert(id);
+                    }
+                }
+            }
+            assert!(failed, "mock failure stage {fail_at:?} was not reached");
+            rollback_scene_upload(
+                &mut gpu,
+                &original_textures,
+                &original_shader_paths,
+                original_error_material,
+                &mut texture_cache,
+                &mut shader_cache,
+                &material_cache,
+                &mut error_material,
+                &mut resources,
+            );
+            assert_eq!(
+                gpu.live,
+                HashSet::from([
+                    (Kind::Texture, 1),
+                    (Kind::Material, 1),
+                    (Kind::SurfaceShader, 1),
+                ])
+            );
+            assert_eq!(texture_cache.ids(), original_textures);
+            assert_eq!(
+                shader_cache,
+                HashMap::from([("old.glsl".to_owned(), Ok(1))])
+            );
+            assert_eq!(error_material, original_error_material);
+            let destroyed = gpu.destroyed.iter().copied().collect::<HashSet<_>>();
+            assert_eq!(destroyed.len(), gpu.destroyed.len(), "{fail_at:?}: {gpu:?}");
+            resources.rollback(&mut gpu);
+            assert_eq!(
+                gpu.destroyed.len(),
+                destroyed.len(),
+                "{fail_at:?}: double release"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_upload_restores_texture_and_shader_cache_entries() {
+        let mut textures = GpuTextureCache::<usize>::default();
+        textures
+            .model
+            .insert(("model.png".to_owned(), 0, TextureColorSpace::Srgb), 1);
+        textures
+            .scene
+            .insert(("scene.png".to_owned(), TextureColorSpace::Linear), 2);
+        textures
+            .scene
+            .insert(("new.png".to_owned(), TextureColorSpace::Srgb), 3);
+        assert_eq!(
+            remove_new_cached_textures(&mut textures, &HashSet::from([1, 2])),
+            HashSet::from([3])
+        );
+        assert_eq!(textures.ids(), HashSet::from([1, 2]));
+
+        let mut shaders = HashMap::from([
+            ("old.glsl".to_owned(), Ok(10_usize)),
+            ("broken-old.glsl".to_owned(), Err("old failure".to_owned())),
+            ("new.glsl".to_owned(), Ok(11_usize)),
+            ("broken-new.glsl".to_owned(), Err("new failure".to_owned())),
+        ]);
+        assert_eq!(
+            restore_shader_cache(
+                &mut shaders,
+                &HashSet::from(["old.glsl".to_owned(), "broken-old.glsl".to_owned(),])
+            ),
+            HashSet::from([11])
+        );
+        assert_eq!(shaders.len(), 2);
+        assert_eq!(shaders.get("old.glsl"), Some(&Ok(10)));
+        assert_eq!(
+            shaders.get("broken-old.glsl"),
+            Some(&Err("old failure".to_owned()))
+        );
     }
 }

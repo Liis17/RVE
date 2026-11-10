@@ -829,7 +829,7 @@ fn abi_param_kind(kind: u32, argument: &str) -> Option<ParamKind> {
 #[cfg(test)]
 mod abi22_compat_tests {
     use super::ScriptLibrary;
-    use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveHeader, RveModule};
+    use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveHeader, RveModule, RveScriptDescV20};
     use rve_sdk::{Params, Script};
 
     struct Probe;
@@ -840,23 +840,61 @@ mod abi22_compat_tests {
         Ok(Box::new(Probe))
     }
 
+    fn second_probe(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(Probe))
+    }
+
     #[test]
-    fn abi21_and_abi20_module_layouts_load_on_abi22_host() {
+    fn abi21_and_abi20_two_descriptor_tables_use_the_historical_stride() {
         assert_eq!(RVE_SCRIPT_ABI_VERSION, 22);
-        let current = rve_sdk::script_module! { "Probe" => probe };
+        let current = rve_sdk::script_module! {
+            "Probe" => probe,
+            "SecondProbe" => second_probe,
+        };
+        // SAFETY: the SDK macro owns an immutable process-lifetime descriptor table.
+        let descriptors =
+            unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+        let legacy: &'static [RveScriptDescV20] = Box::leak(
+            descriptors
+                .iter()
+                .map(|descriptor| RveScriptDescV20 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    ui_event: descriptor.ui_event,
+                    on_enable: descriptor.on_enable,
+                    on_disable: descriptor.on_disable,
+                    on_fixed_update: descriptor.on_fixed_update,
+                    on_late_update: descriptor.on_late_update,
+                    on_timer: descriptor.on_timer,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
         for abi_version in [20, 21] {
             let legacy = Box::leak(Box::new(RveModule {
                 header: RveHeader {
                     abi_version,
                     header_size: std::mem::size_of::<RveHeader>() as u32,
                 },
-                scripts: current.scripts,
-                script_count: current.script_count,
+                scripts: legacy.as_ptr().cast(),
+                script_count: legacy.len(),
             }));
-            // SAFETY: the module, descriptor table, names and callbacks are process-lifetime values.
+            // SAFETY: the module and exact-sized historical descriptor table are process-lifetime values.
             let library =
                 unsafe { ScriptLibrary::from_module(std::ptr::from_ref(legacy)) }.unwrap();
             assert_eq!(library.abi_version(), abi_version);
+            assert!(library.script("Probe").is_some());
+            assert!(library.script("SecondProbe").is_some());
             assert!(library.schema("Probe").is_none());
         }
     }

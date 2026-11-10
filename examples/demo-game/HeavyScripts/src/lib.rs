@@ -23,8 +23,6 @@ impl Script for Bobber {
             .set("bobber_starts", &Value::Int(starts.saturating_add(1)))
         {
             context.log_warn(format!("Bobber save write failed: {error}"));
-        } else if let Err(error) = context.save().flush() {
-            context.log_warn(format!("Bobber save flush failed: {error}"));
         }
         let forward = Quat::look_rotation(Vec3::Z, Vec3::Y).rotate_vec3(Vec3::Z);
         context.log_info(format!("Bobber math forward {forward:?}"));
@@ -95,6 +93,41 @@ impl Script for PhysicsProbe {
     }
 }
 
+struct SceneReferenceProbe;
+
+impl Script for SceneReferenceProbe {
+    fn on_start(&mut self, context: &mut Context<'_>) {
+        let Some(reference) = context
+            .object()
+            .script(context, "/scripts/scene_probe.lua")
+        else {
+            context.log_warn("SceneReferenceProbe could not find scene_probe.lua");
+            return;
+        };
+        let Some(Value::Float(speed)) = reference.get(context, "spin_speed") else {
+            context.log_warn("SceneReferenceProbe could not read spin_speed");
+            return;
+        };
+        let next_speed = Value::Float(speed + 15.0);
+        if !reference.set(context, "spin_speed", &next_speed) {
+            context.log_warn("SceneReferenceProbe could not write spin_speed");
+            return;
+        }
+        if !reference.send(
+            context,
+            "rust_script_ref",
+            &Value::String("SceneReferenceProbe".to_owned()),
+        ) {
+            context.log_warn("SceneReferenceProbe could not send its message");
+            return;
+        }
+        context.log_info(format!(
+            "Rust ScriptRef changed spin_speed from {speed:.1} to {:.1}",
+            speed + 15.0
+        ));
+    }
+}
+
 /// The host has already checked parameters against the schema below and filled defaults.
 fn float(params: &Params, name: &str) -> f32 {
     match params.get(name) {
@@ -115,10 +148,15 @@ fn create_physics_probe(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(PhysicsProbe { reported: false }))
 }
 
+fn create_scene_reference_probe(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(SceneReferenceProbe))
+}
+
 rve_sdk::export_scripts! {
     "Bobber" => create_bobber {
         amplitude: f32 = 0.15 (0.0..=10.0) "Amplitude",
         speed: f32 = 1.4 (0.0..=20.0) "Speed",
     },
     "PhysicsProbe" => create_physics_probe,
+    "SceneReferenceProbe" => create_scene_reference_probe,
 }

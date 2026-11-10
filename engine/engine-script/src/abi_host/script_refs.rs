@@ -11,13 +11,13 @@ pub(super) unsafe extern "C" fn host_object_script(
 ) -> bool {
     guarded(ctx, false, |context| {
         if out.is_null() {
-            context.error = Some("object_script received a null output pointer".to_owned());
+            context.script_ref_error("object_script received a null output pointer".to_owned());
             return false;
         }
         let key = match unsafe { read_abi_str(key) } {
             Ok(key) => normalize_script_key(key),
             Err(error) => {
-                context.error = Some(format!("script key is invalid: {error:?}"));
+                context.script_ref_error(format!("script key is invalid: {error:?}"));
                 return false;
             }
         };
@@ -41,19 +41,20 @@ pub(super) unsafe extern "C" fn host_script_ref_get(
 ) -> bool {
     guarded(ctx, false, |context| {
         if out.is_null() {
-            context.error = Some("script_ref_get received a null output pointer".to_owned());
+            context.script_ref_error("script_ref_get received a null output pointer".to_owned());
             return false;
         }
         let name = match unsafe { read_abi_str(name) } {
             Ok(name) => name.to_owned(),
             Err(error) => {
-                context.error = Some(format!("property name is invalid: {error:?}"));
+                context.script_ref_error(format!("property name is invalid: {error:?}"));
                 return false;
             }
         };
         let value = match context.transaction.script_get(script, &name) {
             Ok(value) => value,
-            Err(_) => {
+            Err(error) => {
+                context.script_ref_error(error.message());
                 return false;
             }
         };
@@ -100,20 +101,31 @@ pub(super) unsafe extern "C" fn host_script_ref_set(
         let name = match unsafe { read_abi_str(name) } {
             Ok(name) => name.to_owned(),
             Err(error) => {
-                context.error = Some(format!("property name is invalid: {error:?}"));
+                context.script_ref_error(format!("property name is invalid: {error:?}"));
                 return false;
             }
         };
         let value = match decode_guest_value(context, value) {
             Ok(value) => value,
             Err(error) => {
-                context.error = Some(error);
+                context.script_ref_error(error);
                 return false;
             }
         };
-        match context.transaction.script_set(script, &name, &value) {
+        let result = if script == 0 {
+            context
+                .transaction
+                .script_set_current(&name, &value)
+                .map(|_| ())
+        } else {
+            context.transaction.script_set(script, &name, &value)
+        };
+        match result {
             Ok(()) => true,
-            Err(_) => false,
+            Err(error) => {
+                context.script_ref_error(error.message());
+                false
+            }
         }
     })
 }
@@ -129,7 +141,7 @@ pub(super) unsafe extern "C" fn host_script_ref_send(
             return false;
         }
         if name.len > MAX_MESSAGE_NAME_BYTES {
-            context.error = Some(format!(
+            context.script_ref_error(format!(
                 "message name exceeds {MAX_MESSAGE_NAME_BYTES} bytes"
             ));
             return false;
@@ -137,7 +149,7 @@ pub(super) unsafe extern "C" fn host_script_ref_send(
         let name = match unsafe { read_abi_str(name) } {
             Ok(name) => name.to_owned(),
             Err(error) => {
-                context.error = Some(format!("invalid message name: {error:?}"));
+                context.script_ref_error(format!("invalid message name: {error:?}"));
                 return false;
             }
         };
@@ -150,7 +162,7 @@ pub(super) unsafe extern "C" fn host_script_ref_send(
         } {
             Ok(value) => value,
             Err(error) => {
-                context.error = Some(error);
+                context.script_ref_error(error);
                 return false;
             }
         };
@@ -160,7 +172,7 @@ pub(super) unsafe extern "C" fn host_script_ref_send(
         {
             Ok(()) => true,
             Err(error) => {
-                context.error = Some(format!("script send failed: {error:?}"));
+                context.script_ref_error(format!("script send failed: {error:?}"));
                 false
             }
         }
@@ -174,6 +186,8 @@ pub(super) unsafe extern "C" fn host_script_ref_enabled(
 ) -> bool {
     guarded(ctx, false, |context| {
         if out.is_null() {
+            context
+                .script_ref_error("script_ref_enabled received a null output pointer".to_owned());
             return false;
         }
         match context.transaction.script_enabled_of(script) {
@@ -182,7 +196,10 @@ pub(super) unsafe extern "C" fn host_script_ref_enabled(
                 unsafe { *out = enabled };
                 true
             }
-            Err(_) => false,
+            Err(error) => {
+                context.script_ref_error(error.message());
+                false
+            }
         }
     })
 }
@@ -195,7 +212,10 @@ pub(super) unsafe extern "C" fn host_script_ref_set_enabled(
     guarded(ctx, false, |context| {
         match context.transaction.set_script_enabled_of(script, enabled) {
             Ok(()) => true,
-            Err(_) => false,
+            Err(error) => {
+                context.script_ref_error(error.message());
+                false
+            }
         }
     })
 }

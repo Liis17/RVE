@@ -350,20 +350,40 @@ impl ScriptTransaction {
         self.require_writable("save writes")?;
         validate_save_key(key)?;
         validate_save_value(&value, 0)?;
-        let mut values = self.save_values.borrow().clone();
-        for (key, value) in &self.pending_save {
-            match value {
-                Some(value) => {
-                    values.insert(key.clone(), value.clone());
+        {
+            let stored = self.save_values.borrow();
+            let mut values = BTreeMap::new();
+            for (stored_key, stored_value) in stored.iter() {
+                if stored_key == key {
+                    continue;
                 }
-                None => {
-                    values.remove(key);
+                match self.pending_save.get(stored_key) {
+                    Some(Some(value)) => {
+                        values.insert(stored_key.as_str(), value);
+                    }
+                    Some(None) => {}
+                    None => {
+                        values.insert(stored_key.as_str(), stored_value);
+                    }
                 }
             }
-        }
-        values.insert(key.to_owned(), value.clone());
-        if values.len() > MAX_SAVE_KEYS || save_values_size(&values) > MAX_SAVE_BYTES {
-            return Err("save data exceeds the 4096 key or 1 MiB limit".to_owned());
+            for (pending_key, pending_value) in &self.pending_save {
+                if pending_key != key
+                    && !stored.contains_key(pending_key)
+                    && let Some(value) = pending_value
+                {
+                    values.insert(pending_key.as_str(), value);
+                }
+            }
+            values.insert(key, &value);
+            if values.len() > MAX_SAVE_KEYS
+                || save_values_size(values.iter().map(|(key, value)| (*key, *value)))
+                    > MAX_SAVE_BYTES
+            {
+                return Err("save data exceeds the 4096 key or 1 MiB limit".to_owned());
+            }
+            crate::save_file::encoded_save_data_refs_len(values)
+                .map_err(|_| "encoded save data exceeds the 1 MiB limit".to_owned())?;
         }
         self.pending_save.insert(key.to_owned(), Some(value));
         Ok(())
@@ -591,7 +611,10 @@ fn validate_save_key(key: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_save_values(values: &BTreeMap<String, ParamValue>) -> Result<(), String> {
-    if values.len() > MAX_SAVE_KEYS || save_values_size(values) > MAX_SAVE_BYTES {
+    if values.len() > MAX_SAVE_KEYS
+        || save_values_size(values.iter().map(|(key, value)| (key.as_str(), value)))
+            > MAX_SAVE_BYTES
+    {
         return Err("save data exceeds the 4096 key or 1 MiB limit".to_owned());
     }
     for (key, value) in values {
@@ -628,7 +651,7 @@ fn validate_save_value(value: &ParamValue, depth: usize) -> Result<(), String> {
     }
 }
 
-fn save_values_size(values: &BTreeMap<String, ParamValue>) -> usize {
+fn save_values_size<'a>(values: impl Iterator<Item = (&'a str, &'a ParamValue)>) -> usize {
     fn value_size(value: &ParamValue) -> usize {
         match value {
             ParamValue::Bool(_) => 1,
@@ -641,7 +664,7 @@ fn save_values_size(values: &BTreeMap<String, ParamValue>) -> usize {
             }),
         }
     }
-    values.iter().fold(0_usize, |size, (key, value)| {
+    values.fold(0_usize, |size, (key, value)| {
         size.saturating_add(key.len())
             .saturating_add(value_size(value))
             .saturating_add(8)
@@ -730,7 +753,9 @@ impl Default for ScriptTransaction {
 
 #[cfg(test)]
 mod save_validation_tests {
-    use super::{MAX_SAVE_KEYS, ScriptTransaction, validate_save_values};
+    use super::{
+        MAX_SAVE_BYTES, MAX_SAVE_KEYS, ScriptTransaction, save_values_size, validate_save_values,
+    };
     use engine_scene::ParamValue;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
@@ -809,6 +834,48 @@ mod save_validation_tests {
         );
         assert!(transaction.pending_save.is_empty());
         assert_eq!(*values.borrow(), original);
+    }
+
+    #[test]
+    fn save_set_rejects_toml_escaping_overhead_without_staging_the_value() {
+        let values = Rc::new(RefCell::new(BTreeMap::new()));
+        let mut transaction = ScriptTransaction {
+            writable: true,
+            ..ScriptTransaction::default()
+        };
+        transaction.attach_save_state(
+            values.clone(),
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+        );
+        for index in 0..2 {
+            transaction.pending_save.insert(
+                format!("k{index}"),
+                Some(ParamValue::String("\0".repeat(65_536))),
+            );
+        }
+        let candidate = transaction
+            .pending_save
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone().unwrap()))
+            .chain(std::iter::once((
+                "k2".to_owned(),
+                ParamValue::String("\0".repeat(65_536)),
+            )))
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            save_values_size(candidate.iter().map(|(key, value)| (key.as_str(), value)))
+                < MAX_SAVE_BYTES
+        );
+        assert!(crate::encode_save_data(&candidate).is_err());
+
+        assert!(
+            transaction
+                .save_set("k2", ParamValue::String("\0".repeat(65_536)))
+                .is_err()
+        );
+        assert!(!transaction.pending_save.contains_key("k2"));
+        assert!(values.borrow().is_empty());
     }
 }
 
@@ -2586,6 +2653,11 @@ impl ScriptTransaction {
 
     /// Значение объявленного свойства с учётом записей этого вызова.
     pub(crate) fn script_get(&self, serial: u64, name: &str) -> Result<ParamValue, ScriptRefError> {
+        let serial = if serial == 0 {
+            self.instance_serial
+        } else {
+            serial
+        };
         if let Some(write) = self
             .pending_properties
             .iter()
@@ -2596,6 +2668,13 @@ impl ScriptTransaction {
         }
         let refs = self.script_refs.borrow();
         let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+        if entry
+            .schema
+            .as_ref()
+            .is_none_or(|schema| schema.get(name).is_none())
+        {
+            return Err(ScriptRefError::Undeclared(name.to_owned()));
+        }
         entry
             .properties
             .get(name)
@@ -2618,6 +2697,11 @@ impl ScriptTransaction {
         let value = {
             let refs = self.script_refs.borrow();
             let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+            if !entry.property_write_supported {
+                return Err(ScriptRefError::Invalid(
+                    "target script does not support external property writes".to_owned(),
+                ));
+            }
             coerce_property(entry, name, value)?
         };
         self.pending_properties.push(PropertyWrite {
@@ -2626,6 +2710,31 @@ impl ScriptTransaction {
             value,
         });
         Ok(())
+    }
+
+    /// Stages a write made by this instance so the shared property mirror follows owner state.
+    pub(crate) fn script_set_current(
+        &mut self,
+        name: &str,
+        value: &ParamValue,
+    ) -> Result<ParamValue, ScriptRefError> {
+        if !self.writable {
+            return Err(ScriptRefError::Invalid(
+                "script properties can only be set from update callbacks".to_owned(),
+            ));
+        }
+        let serial = self.instance_serial;
+        let value = {
+            let refs = self.script_refs.borrow();
+            let entry = find_entry(&refs, serial).ok_or(ScriptRefError::Dead)?;
+            coerce_property(entry, name, value)?
+        };
+        self.pending_properties.push(PropertyWrite {
+            serial,
+            name: name.to_owned(),
+            value: value.clone(),
+        });
+        Ok(value)
     }
 
     /// Адресное сообщение одному экземпляру; остальные экземпляры объекта его не получают.
@@ -3334,10 +3443,22 @@ impl ScriptTransaction {
             let mut refs = self.script_refs.borrow_mut();
             for write in &writes {
                 if let Some(entry) = refs.iter_mut().find(|entry| entry.serial == write.serial) {
+                    if write.serial != self.instance_serial
+                        && !entry.dirty_properties.contains(&write.name)
+                        && let Some(previous) = entry.properties.get(&write.name)
+                    {
+                        entry
+                            .dirty_original_properties
+                            .insert(write.name.clone(), previous.clone());
+                    }
                     entry
                         .properties
                         .insert(write.name.clone(), write.value.clone());
-                    entry.dirty_properties.insert(write.name.clone());
+                    if write.serial != self.instance_serial {
+                        entry.dirty_properties.insert(write.name.clone());
+                    } else {
+                        entry.dirty_original_properties.remove(&write.name);
+                    }
                 }
             }
         }

@@ -22,6 +22,10 @@ analog = "Gamepad.LeftStick"
 kind = "button"
 inputs = ["Escape", "Gamepad.Start"]
 
+[input.contexts.game.SceneCycle]
+kind = "button"
+inputs = ["F6"]
+
 [input.contexts.game.fire]
 kind = "button"
 inputs = ["Mouse.Left", "Gamepad.RightTrigger"]
@@ -33,6 +37,10 @@ inputs = ["T", "Gamepad.North"]
 [input.contexts.menu.Escape]
 kind = "button"
 inputs = ["Escape", "Gamepad.Start"]
+
+[input.contexts.menu.SceneCycle]
+kind = "button"
+inputs = ["F6"]
 
 # Первая включённая сцена — стартовая; физическая демо-сцена запускается первой.
 [[scenes]]

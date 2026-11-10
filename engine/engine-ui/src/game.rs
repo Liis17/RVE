@@ -3,7 +3,7 @@
 //! Модуль не зависит от egui: снимок `engine-gui` переводится в `UiPrimitive` и рисуется в
 //! `Frame.ui`. Атлас загружается только при новой версии, картинки считаются по владельцам
 //! (префаб, сессия Play) и по путям сцен: общая картинка живёт, пока её держит хотя бы один
-//! владелец или загрузившая её сцена.
+//! владелец или загруженная сцена.
 
 use engine_gui::paint::{UiDrawList, UiImageData, UiPaint, UiTexture};
 use engine_render::{RenderError, Renderer, UiImage, UiPrimitive, UiTextureId, UiVertex};
@@ -52,8 +52,10 @@ pub struct GameUi<O> {
     /// Загруженная версия атласа и её текстура; `None` — атлас пустой.
     atlas: Option<(u64, Option<UiTextureId>)>,
     images: HashMap<String, (UiTextureId, usize)>,
-    /// Пути, которые держит хотя бы одна сцена: её ссылка не снимается до `release_all`.
+    /// Пути legacy-владельца сцен, снимаемые только через `release_all`.
     scene_paths: HashSet<String>,
+    /// Пути по поколению сцены: устаревшие GPU-ответы также снимают своё владение.
+    scene_owners: HashMap<u64, Vec<String>>,
     owned: HashMap<O, Vec<String>>,
     vertices: Vec<UiVertex>,
     converted: Option<Arc<UiDrawList>>,
@@ -66,6 +68,7 @@ impl<O> Default for GameUi<O> {
             atlas: None,
             images: HashMap::new(),
             scene_paths: HashSet::new(),
+            scene_owners: HashMap::new(),
             owned: HashMap::new(),
             vertices: Vec::new(),
             converted: None,
@@ -100,10 +103,54 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
         }
     }
 
+    /// Принимает картинки под конкретное поколение сцены. Ресурсы этого владельца можно снять,
+    /// если ответ загрузки устарел или сцена больше не использует путь.
+    pub fn adopt_scene_images_for_owner<G: UiTextures<Id = UiTextureId>>(
+        &mut self,
+        gpu: &mut G,
+        owner: u64,
+        images: HashMap<String, UiTextureId>,
+    ) {
+        let paths = self.scene_owners.entry(owner).or_default();
+        for (path, id) in images {
+            if paths.contains(&path) {
+                free_texture(gpu, id);
+                continue;
+            }
+            match self.images.get_mut(&path) {
+                Some((_, users)) => {
+                    *users += 1;
+                    free_texture(gpu, id);
+                }
+                None => {
+                    self.images.insert(path.clone(), (id, 1));
+                }
+            }
+            paths.push(path);
+        }
+    }
+
+    /// Снимает ссылки одного поколения сцены; общие с другими владельцами пути остаются живы.
+    pub fn release_scene_images<G: UiTextures<Id = UiTextureId>>(
+        &mut self,
+        gpu: &mut G,
+        owner: u64,
+    ) {
+        for path in self.scene_owners.remove(&owner).unwrap_or_default() {
+            self.release_image(gpu, &path);
+        }
+    }
+
     /// Картинки сцены, созданные при загрузке: каждая держится сценой до `release_all`.
     pub fn with_scene_images(images: HashMap<String, UiTextureId>) -> Self {
+        Self::with_scene_images_for_owner(0, images)
+    }
+
+    /// Начальные картинки сцены с владельцем, который renderer сможет снять при выгрузке.
+    pub fn with_scene_images_for_owner(owner: u64, images: HashMap<String, UiTextureId>) -> Self {
+        let paths = images.keys().cloned().collect::<Vec<_>>();
         Self {
-            scene_paths: images.keys().cloned().collect(),
+            scene_owners: HashMap::from([(owner, paths)]),
             images: images
                 .into_iter()
                 .map(|(path, id)| (path, (id, 1)))
@@ -154,6 +201,7 @@ impl<O: Eq + Hash + Clone> GameUi<O> {
             free_texture(gpu, id);
         }
         self.scene_paths.clear();
+        self.scene_owners.clear();
         self.owned.clear();
         self.vertices.clear();
         self.converted = None;
@@ -455,6 +503,50 @@ mod tests {
         ui.release_all(&mut gpu);
         assert_eq!(gpu.freed.len(), 4);
         assert_eq!(gpu.freed.last(), Some(&fake_texture(10)));
+    }
+
+    #[test]
+    fn scene_owners_share_paths_and_release_only_their_own_references() {
+        let mut gpu = FakeTextures::default();
+        let mut ui = GameUi::<u8>::default();
+        ui.attach(&mut gpu, 1, &owned_image("ui/p.png")).unwrap();
+        ui.adopt_scene_images_for_owner(
+            &mut gpu,
+            10,
+            HashMap::from([("ui/p.png".to_owned(), fake_texture(90))]),
+        );
+        ui.adopt_scene_images_for_owner(
+            &mut gpu,
+            11,
+            HashMap::from([("ui/p.png".to_owned(), fake_texture(91))]),
+        );
+        assert_eq!(gpu.freed, vec![fake_texture(90), fake_texture(91)]);
+
+        ui.release_scene_images(&mut gpu, 10);
+        ui.detach(&mut gpu, &1);
+        assert_eq!(gpu.freed.len(), 2, "второй scene owner ещё держит путь");
+        ui.release_scene_images(&mut gpu, 11);
+        assert_eq!(
+            gpu.freed,
+            vec![fake_texture(90), fake_texture(91), fake_texture(1)]
+        );
+        ui.release_scene_images(&mut gpu, 11);
+        assert_eq!(
+            gpu.freed.len(),
+            3,
+            "повторное снятие не освобождает id снова"
+        );
+    }
+
+    #[test]
+    fn initial_scene_images_can_be_released_by_their_owner() {
+        let mut gpu = FakeTextures::default();
+        let mut ui = GameUi::<u8>::with_scene_images_for_owner(
+            7,
+            HashMap::from([("ui/p.png".to_owned(), fake_texture(7))]),
+        );
+        ui.release_scene_images(&mut gpu, 7);
+        assert_eq!(gpu.freed, vec![fake_texture(7)]);
     }
 
     #[test]

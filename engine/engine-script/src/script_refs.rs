@@ -21,9 +21,19 @@ pub(crate) struct ScriptRefEntry {
     pub(crate) schema: Option<Rc<ParamSchema>>,
     /// Текущие значения объявленных свойств; источник для чтения через `get`.
     pub(crate) properties: BTreeMap<String, ParamValue>,
+    /// Whether the target can receive writes from another script instance.
+    pub(crate) property_write_supported: bool,
     pub(crate) enabled: bool,
     /// Имена свойств, записанных другим скриптом после последнего вызова: только они попадают в Lua.
     pub(crate) dirty_properties: BTreeSet<String>,
+    /// Values to restore if a heavy script rejects its pending write callback.
+    pub(crate) dirty_original_properties: BTreeMap<String, ParamValue>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScriptRefCapabilities {
+    pub(crate) property_write_supported: bool,
+    pub(crate) enabled: bool,
 }
 
 pub(crate) type ScriptRefs = Rc<RefCell<Vec<ScriptRefEntry>>>;

@@ -93,6 +93,7 @@ pub(crate) struct AbiCallContext<'a> {
     command_owner: usize,
     commands_allowed: bool,
     error: Option<String>,
+    preserve_error: bool,
     action_binding: String,
     /// Текст последнего UI-значения, возвращённого гостю; живёт до конца callback.
     ui_text: String,
@@ -136,6 +137,7 @@ impl<'a> AbiCallContext<'a> {
             command_owner: 0,
             commands_allowed: false,
             error: None,
+            preserve_error: false,
             action_binding: String::new(),
             ui_text: String::new(),
             poisoned: false,
@@ -161,6 +163,7 @@ impl<'a> AbiCallContext<'a> {
             command_owner: command_access.owner,
             commands_allowed: command_access.allowed,
             error: None,
+            preserve_error: false,
             action_binding: String::new(),
             ui_text: String::new(),
             poisoned: false,
@@ -425,6 +428,11 @@ impl<'a> AbiCallContext<'a> {
         Ok(())
     }
 
+    pub(crate) fn script_ref_error(&mut self, message: String) {
+        self.error = Some(message);
+        self.preserve_error = true;
+    }
+
     fn command_result(&mut self, status: RveStatus) -> Result<(), (String, bool)> {
         if self.poisoned {
             return Err((
@@ -570,7 +578,7 @@ impl AbiScriptInstance {
         call: AbiScriptCall<'_>,
     ) -> Result<(), String> {
         let Some(set_property) = self.descriptor.set_property else {
-            return Ok(());
+            return Err("target script does not support external property writes".to_owned());
         };
         let object_refs = message_object_refs(value, call.transaction);
         let value = OwnedAbiValue::new(value, &object_refs);
@@ -915,11 +923,13 @@ fn guarded<T: Copy>(
 
 unsafe extern "C" fn host_set_error(ctx: *mut c_void, message: RveStr) {
     guarded(ctx, (), |context| {
-        context.error = Some(
-            unsafe { read_abi_str(message) }
-                .map(str::to_owned)
-                .unwrap_or_else(|_| "guest supplied an invalid error message".to_owned()),
-        );
+        if !context.preserve_error {
+            context.error = Some(
+                unsafe { read_abi_str(message) }
+                    .map(str::to_owned)
+                    .unwrap_or_else(|_| "guest supplied an invalid error message".to_owned()),
+            );
+        }
     });
 }
 

@@ -1932,6 +1932,7 @@ mod heavy_prefab_tests {
 mod demo_game_tests {
     use super::prepare_project;
     use engine_files::VirtualPath;
+    use std::fs;
     use std::path::Path;
 
     fn path(value: &str) -> VirtualPath {
@@ -1939,7 +1940,7 @@ mod demo_game_tests {
     }
 
     #[test]
-    fn demo_game_packs_fast_prefabs_with_the_physics_scene_and_lists_the_heavy_prefab() {
+    fn demo_game_packs_scene_switch_targets_and_lists_their_script_assets() {
         let demo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/demo-game");
         let build = prepare_project(Path::new(demo)).unwrap();
 
@@ -1963,6 +1964,22 @@ mod demo_game_tests {
             build.assignments[&path("/scripts/shooter.lua")],
             "scene-physics"
         );
+
+        let satellite = path("/prefabs/satellite.rveprefab");
+        assert_eq!(build.assignments[&satellite], "shared");
+        assert!(build.files.contains_key(&satellite));
+        let assets = Path::new(demo).join("Assets");
+        let second = fs::read_to_string(assets.join("scenes/second.rvescene")).unwrap();
+        assert!(second.contains("prefab = \"/prefabs/satellite.rveprefab\""));
+        let physics = fs::read_to_string(assets.join("scenes/physics.rvescene")).unwrap();
+        assert!(physics.contains("id = \"scene-tour-guide\""));
+        assert!(physics.contains("keep_on_load = true"));
+        assert!(build.heavy_scripts.iter().any(|script| {
+            script.name == "SceneReferenceProbe"
+                && script.object == "scene-tour-guide"
+                && script.owner.contains("physics.rvescene")
+        }));
+        assert!(build.files.contains_key(&path("/scripts/scene_probe.lua")));
 
         // Тяжёлый префаб из prefabs.rveprefabs разобран, упакован и не привязан к сцене.
         assert_eq!(build.prefabs.prefabs.len(), 1);

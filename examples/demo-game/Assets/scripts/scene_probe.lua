@@ -1,5 +1,4 @@
--- Демонстрация API смены сцен и ссылок на экземпляры: свойство читается и пишется через
--- obj:script, а корень с keep_on_load сохраняет состояние экземпляра при загрузке другой сцены.
+-- F6 switches between the physics and prefab scenes. This persistent root also shows Lua ScriptRef.
 local Probe = {}
 
 Probe.properties = {
@@ -7,20 +6,25 @@ Probe.properties = {
 }
 
 function Probe:on_start()
-  self.loads_seen = 0
   rve.log_info("scene probe: current scene " .. rve.scene.current())
 end
 
-function Probe:on_update(dt)
-  self.loads_seen = self.loads_seen + 1
-  if self.loads_seen % 600 ~= 0 then
+function Probe:on_update()
+  if not rve.input.action_pressed("SceneCycle") then
     return
   end
-  local self_ref = rve.find(self.object.id):script("/scripts/scene_probe.lua")
-  local speed = self_ref:get("spin_speed")
-  local next_speed = speed < 360 and speed * 1.5 or 45
-  self_ref:set("spin_speed", next_speed)
-  rve.log_info(string.format("scene probe: spin_speed %.1f -> %.1f", speed, next_speed))
+  local current = rve.scene.current()
+  local target = current == "scenes/physics.rvescene"
+    and "scenes/second.rvescene"
+    or "scenes/physics.rvescene"
+  rve.scene.load(target)
+  rve.log_info("scene probe: loading " .. target .. " (F6 returns to physics)")
+end
+
+function Probe:on_message(sender, name, value)
+  if name == "rust_script_ref" then
+    rve.log_info("scene probe received Rust ScriptRef message from " .. sender .. ": " .. value)
+  end
 end
 
 return Probe

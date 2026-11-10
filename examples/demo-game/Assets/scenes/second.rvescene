@@ -9,6 +9,9 @@ path = "/models/props-cube.fbx"
 archive = "props"
 
 [[assets]]
+path = "/prefabs/satellite.rveprefab"
+
+[[assets]]
 path = "/scripts/rotate.lua"
 
 [[assets]]
@@ -59,6 +62,12 @@ position = [1.1, 0.75, 0.0]
 scale = [0.75, 0.75, 0.75]
 [objects.mesh_renderer]
 model = "/models/props-cube.fbx"
+
+[[instances]]
+id = "satellite-demo"
+prefab = "/prefabs/satellite.rveprefab"
+[instances.transform]
+position = [0.0, 2.0, 0.0]
 
 [[objects]]
 id = "worm"

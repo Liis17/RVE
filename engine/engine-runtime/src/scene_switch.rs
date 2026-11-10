@@ -89,6 +89,7 @@ pub(crate) struct SceneGpuIds {
     pub materials: HashSet<MaterialId>,
     pub skins: HashSet<SkinId>,
     pub screen_shaders: HashSet<ScreenShaderId>,
+    pub ui_scene_owners: HashSet<u64>,
 }
 
 impl SceneGpuIds {
@@ -113,6 +114,8 @@ impl SceneGpuIds {
         }
         ids.screen_shaders
             .extend(table.screen_shaders.values().copied());
+        ids.ui_scene_owners
+            .extend(table.ui_scene_owners.iter().copied());
         ids
     }
 
@@ -121,6 +124,7 @@ impl SceneGpuIds {
             && self.materials.is_empty()
             && self.skins.is_empty()
             && self.screen_shaders.is_empty()
+            && self.ui_scene_owners.is_empty()
     }
 
     fn extend(&mut self, other: &Self) {
@@ -129,6 +133,8 @@ impl SceneGpuIds {
         self.skins.extend(other.skins.iter().copied());
         self.screen_shaders
             .extend(other.screen_shaders.iter().copied());
+        self.ui_scene_owners
+            .extend(other.ui_scene_owners.iter().copied());
     }
 
     /// Ресурсы этого набора, которых нет в `live`.
@@ -138,6 +144,7 @@ impl SceneGpuIds {
             materials: difference(&self.materials, &live.materials),
             skins: difference(&self.skins, &live.skins),
             screen_shaders: difference(&self.screen_shaders, &live.screen_shaders),
+            ui_scene_owners: difference(&self.ui_scene_owners, &live.ui_scene_owners),
         }
     }
 
@@ -147,6 +154,7 @@ impl SceneGpuIds {
             materials: overlap(&self.materials, &live.materials),
             skins: overlap(&self.skins, &live.skins),
             screen_shaders: overlap(&self.screen_shaders, &live.screen_shaders),
+            ui_scene_owners: overlap(&self.ui_scene_owners, &live.ui_scene_owners),
         }
     }
 }
@@ -192,7 +200,10 @@ impl SceneCommit<'_> {
     fn release(&self, ids: SceneGpuIds, last_seq: u64) {
         if !ids.is_empty() {
             self.prefabs
-                .send_render(RenderResourceRequest::ReleaseScene { ids, last_seq });
+                .send_render(RenderResourceRequest::ReleaseScene {
+                    ids: Box::new(ids),
+                    last_seq,
+                });
         }
     }
 }
@@ -218,18 +229,17 @@ impl SceneSwitch {
         }
     }
 
-    /// Принимает запрос `rve.scene.load` на загрузку `path`. Новая заявка отменяет ожидающую
-    /// замену: её ответ придёт с устаревшим поколением. Ошибка подготовки тоже отменяет
-    /// ожидающую замену, а текущая сцена продолжает работать.
+    /// Принимает запрос `rve.scene.load` на загрузку `path`. Успешная новая заявка отменяет
+    /// ожидающую замену: её ответ придёт с устаревшим поколением. Ошибка подготовки оставляет
+    /// предыдущую ожидающую замену и текущую сцену без изменений.
     pub(crate) fn request(
         &mut self,
         loader: Option<&SceneLoader>,
         path: &str,
     ) -> Result<SceneUpload, String> {
-        self.generation += 1;
-        self.awaiting = None;
         let loader = loader.ok_or_else(|| "загрузка сцен не подключена".to_owned())?;
         let (prepared, physics_geometry) = loader.prepare(path)?;
+        self.generation += 1;
         let PreparedScene {
             world,
             sources,
@@ -393,6 +403,7 @@ impl SceneSwitch {
         gpu.screen_shaders
             .retain(|path, _| shader_paths.contains(path));
         gpu.screen_shaders.extend(table.screen_shaders);
+        gpu.ui_scene_owners.extend(table.ui_scene_owners);
 
         ctx.animation.replace_objects(
             ctx.world,
@@ -450,7 +461,7 @@ fn rekey<V>(
 
 #[cfg(test)]
 mod tests {
-    use super::{difference, overlap};
+    use super::{SceneGpuIds, difference, overlap};
     use std::collections::HashSet;
 
     fn set(values: &[usize]) -> HashSet<usize> {
@@ -471,6 +482,17 @@ mod tests {
     fn overlap_keeps_resources_that_stay_referenced_after_a_switch() {
         assert_eq!(overlap(&set(&[1, 2]), &set(&[2, 4])), set(&[2]));
         assert!(overlap(&set(&[1]), &set(&[2])).is_empty());
+    }
+
+    #[test]
+    fn scene_ui_owners_retire_by_generation() {
+        let mut old = SceneGpuIds::default();
+        old.ui_scene_owners.insert(4);
+        let mut new = SceneGpuIds::default();
+        new.ui_scene_owners.insert(5);
+
+        assert_eq!(old.minus(&new).ui_scene_owners, HashSet::from([4]));
+        assert!(old.intersect(&new).ui_scene_owners.is_empty());
     }
 }
 
@@ -772,7 +794,7 @@ return Script
             self.render_rx
                 .try_iter()
                 .filter_map(|request| match request {
-                    RenderResourceRequest::ReleaseScene { ids, .. } => Some(ids),
+                    RenderResourceRequest::ReleaseScene { ids, .. } => Some(*ids),
                     _ => None,
                 })
                 .collect()
@@ -918,23 +940,55 @@ return Script
             .unwrap();
         assert!(second.generation > first.generation);
 
+        let mut stale_table = GpuSceneTable::default();
+        stale_table.ui_scene_owners.insert(first.generation);
         rig.switch.accept(SceneUploadReply {
             generation: first.generation,
-            result: Ok(Box::default()),
+            result: Ok(Box::new(stale_table)),
         });
         assert!(
             rig.commit().is_empty(),
             "ответ устаревшего поколения молчит"
         );
         assert_eq!(rig.names(), sorted(&["camera", "enemy", "player"]));
+        assert_eq!(
+            rig.released()[0].ui_scene_owners,
+            HashSet::from([first.generation]),
+            "устаревший ответ снимает UI-владение своего поколения"
+        );
 
+        let mut current_table = GpuSceneTable::default();
+        current_table.ui_scene_owners.insert(second.generation);
         rig.switch.accept(SceneUploadReply {
             generation: second.generation,
-            result: Ok(Box::default()),
+            result: Ok(Box::new(current_table)),
         });
         assert!(rig.commit().is_empty());
         assert_eq!(rig.names(), sorted(&["crate", "camera_c", "player"]));
         assert_eq!(rig.host.current_scene(), "levels/c.rvescene");
+        assert!(rig.gpu.ui_scene_owners.contains(&second.generation));
+    }
+
+    #[test]
+    fn invalid_later_request_keeps_the_previous_pending_scene() {
+        let mut rig = Rig::new();
+        let pending = rig
+            .switch
+            .request(Some(&rig.loader), "levels/b.rvescene")
+            .unwrap();
+
+        assert!(
+            rig.switch
+                .request(Some(&rig.loader), "levels/missing.rvescene")
+                .is_err()
+        );
+        rig.switch.accept(SceneUploadReply {
+            generation: pending.generation,
+            result: Ok(Box::default()),
+        });
+
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/b.rvescene");
     }
 
     #[test]
@@ -1136,6 +1190,7 @@ return Script
         table
             .screen_shaders
             .insert("fx/a.glsl".to_owned(), fake_shader(10));
+        table.ui_scene_owners.insert(1);
         rig.load_with_table("levels/clash.rvescene", table).unwrap();
 
         let failures = rig.commit();
@@ -1146,6 +1201,7 @@ return Script
         assert_eq!(released[0].meshes, HashSet::from([fake_mesh(11)]));
         assert_eq!(released[0].materials, HashSet::from([fake_material(11)]));
         assert_eq!(released[0].screen_shaders, HashSet::from([fake_shader(10)]));
+        assert_eq!(released[0].ui_scene_owners, HashSet::from([1]));
         assert!(rig.gpu.screen_shaders.is_empty());
     }
 

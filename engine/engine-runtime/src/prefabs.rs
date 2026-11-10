@@ -95,7 +95,7 @@ pub(crate) enum RenderResourceRequest {
     /// Ресурсы загруженной сцены, которые больше не нужны scripts thread. Освобождаются, когда
     /// render thread принял снимки с `seq ≥ last_seq`.
     ReleaseScene {
-        ids: crate::scene_switch::SceneGpuIds,
+        ids: Box<crate::scene_switch::SceneGpuIds>,
         last_seq: u64,
     },
 }

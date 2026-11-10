@@ -2,21 +2,34 @@ use engine_scene::ParamValue;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 
 const MAX_SAVE_FILE_BYTES: u64 = 1_048_576;
 
 enum SaveMessage {
-    Snapshot(BTreeMap<String, ParamValue>),
-    Flush(BTreeMap<String, ParamValue>, SyncSender<Result<(), String>>),
-    Shutdown(Option<BTreeMap<String, ParamValue>>),
+    Snapshot {
+        generation: u64,
+        values: BTreeMap<String, ParamValue>,
+    },
+    Flush {
+        generation: u64,
+        values: BTreeMap<String, ParamValue>,
+        reply: SyncSender<SaveAck>,
+    },
+    Shutdown,
+}
+
+pub(crate) struct SaveAck {
+    pub(crate) generation: u64,
+    pub(crate) result: Result<(), String>,
 }
 
 /// Persistence runs off the scripts thread; only explicit flush and shutdown wait for disk I/O.
 pub(crate) struct SaveWriter {
     path: PathBuf,
     sender: SyncSender<SaveMessage>,
+    acknowledgements: Receiver<SaveAck>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -24,34 +37,28 @@ impl SaveWriter {
     pub(crate) fn open(path: &Path) -> Result<(Self, BTreeMap<String, ParamValue>), String> {
         let values = read_values(path)?;
         let (sender, receiver) = mpsc::sync_channel(1);
+        let (ack_sender, acknowledgements) = mpsc::channel();
         let worker_path = path.to_owned();
         let worker = thread::Builder::new()
             .name("rve-save".to_owned())
             .spawn(move || {
                 while let Ok(message) = receiver.recv() {
                     match message {
-                        SaveMessage::Snapshot(values) => {
-                            if let Err(error) = write_values(&worker_path, &values) {
-                                log::error!(
-                                    "failed to save user data {}: {error}",
-                                    worker_path.display()
-                                );
-                            }
+                        SaveMessage::Snapshot { generation, values } => {
+                            let result = write_values(&worker_path, &values);
+                            let _ = ack_sender.send(SaveAck { generation, result });
                         }
-                        SaveMessage::Flush(values, reply) => {
-                            let _ = reply.send(write_values(&worker_path, &values));
+                        SaveMessage::Flush {
+                            generation,
+                            values,
+                            reply,
+                        } => {
+                            let _ = reply.send(SaveAck {
+                                generation,
+                                result: write_values(&worker_path, &values),
+                            });
                         }
-                        SaveMessage::Shutdown(values) => {
-                            if let Some(values) = values
-                                && let Err(error) = write_values(&worker_path, &values)
-                            {
-                                log::error!(
-                                    "failed to save user data {}: {error}",
-                                    worker_path.display()
-                                );
-                            }
-                            break;
-                        }
+                        SaveMessage::Shutdown => break,
                     }
                 }
             })
@@ -60,6 +67,7 @@ impl SaveWriter {
             Self {
                 path: path.to_owned(),
                 sender,
+                acknowledgements,
                 worker: Some(worker),
             },
             values,
@@ -67,37 +75,70 @@ impl SaveWriter {
     }
 
     /// Queues a snapshot without waiting. `false` means a previous snapshot is still queued.
-    pub(crate) fn snapshot(&self, values: BTreeMap<String, ParamValue>) -> bool {
-        match self.sender.try_send(SaveMessage::Snapshot(values)) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => false,
-            Err(TrySendError::Disconnected(_)) => {
-                log::error!("save writer for {} has stopped", self.path.display());
-                false
-            }
+    pub(crate) fn snapshot(
+        &self,
+        generation: u64,
+        values: BTreeMap<String, ParamValue>,
+    ) -> Result<bool, String> {
+        match self
+            .sender
+            .try_send(SaveMessage::Snapshot { generation, values })
+        {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(format!(
+                "save writer for {} has stopped",
+                self.path.display()
+            )),
         }
     }
 
     /// Persists the supplied snapshot and waits for the atomic replace to complete.
-    pub(crate) fn flush(&self, values: BTreeMap<String, ParamValue>) -> Result<(), String> {
+    pub(crate) fn flush(
+        &self,
+        generation: u64,
+        values: BTreeMap<String, ParamValue>,
+    ) -> Result<(), String> {
         let (reply, result) = mpsc::sync_channel(1);
         self.sender
-            .send(SaveMessage::Flush(values, reply))
+            .send(SaveMessage::Flush {
+                generation,
+                values,
+                reply,
+            })
             .map_err(|error| format!("save writer stopped: {error}"))?;
-        result
+        let ack = result
             .recv()
-            .map_err(|error| format!("save writer did not return a result: {error}"))?
+            .map_err(|error| format!("save writer did not return a result: {error}"))?;
+        if ack.generation != generation {
+            return Err(
+                "save writer returned an acknowledgement for the wrong generation".to_owned(),
+            );
+        }
+        ack.result
     }
 
     /// Writes the final snapshot after script `on_destroy` and joins the worker.
-    pub(crate) fn finish(mut self, values: BTreeMap<String, ParamValue>) -> Result<(), String> {
-        self.flush(values)?;
-        self.stop(None);
-        Ok(())
+    pub(crate) fn finish(
+        mut self,
+        generation: u64,
+        values: BTreeMap<String, ParamValue>,
+    ) -> Result<(), String> {
+        let result = self.flush(generation, values);
+        self.stop();
+        result
     }
 
-    fn stop(&mut self, final_values: Option<BTreeMap<String, ParamValue>>) {
-        let _ = self.sender.send(SaveMessage::Shutdown(final_values));
+    pub(crate) fn drain_acknowledgements(&self) -> Vec<SaveAck> {
+        let mut acknowledgements = Vec::new();
+        while let Ok(acknowledgement) = self.acknowledgements.try_recv() {
+            acknowledgements.push(acknowledgement);
+        }
+        acknowledgements
+    }
+
+    fn stop(&mut self) {
+        let _ = self.sender.send(SaveMessage::Shutdown);
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
@@ -108,7 +149,7 @@ impl SaveWriter {
 
 impl Drop for SaveWriter {
     fn drop(&mut self) {
-        self.stop(None);
+        self.stop();
     }
 }
 
@@ -149,13 +190,13 @@ mod tests {
         let (writer, initial) = SaveWriter::open(&path).unwrap();
         assert!(initial.is_empty());
         let first = BTreeMap::from([("score".to_owned(), ParamValue::Int(12))]);
-        writer.flush(first.clone()).unwrap();
+        writer.flush(1, first.clone()).unwrap();
         let second = BTreeMap::from([("score".to_owned(), ParamValue::Int(44))]);
-        writer.finish(second.clone()).unwrap();
+        writer.finish(2, second.clone()).unwrap();
 
         let (writer, loaded) = SaveWriter::open(&path).unwrap();
         assert_eq!(loaded, second);
-        writer.finish(loaded.clone()).unwrap();
+        writer.finish(2, loaded.clone()).unwrap();
         assert_eq!(read_values(&path).unwrap(), second);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -173,6 +214,43 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(fs::read(sentinel).unwrap(), b"old data");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_write_failure_is_acknowledged_and_same_generation_retries() {
+        let directory = temp_dir();
+        fs::create_dir_all(&directory).unwrap();
+        let blocked_parent = directory.join("blocked");
+        fs::create_dir(&blocked_parent).unwrap();
+        let path = blocked_parent.join("save.toml");
+        let (writer, initial) = SaveWriter::open(&path).unwrap();
+        assert!(initial.is_empty());
+        fs::remove_dir(&blocked_parent).unwrap();
+        fs::write(&blocked_parent, b"keep this file").unwrap();
+        let values = BTreeMap::from([("score".to_owned(), ParamValue::Int(7))]);
+
+        assert!(writer.snapshot(1, values.clone()).unwrap());
+        assert!(writer.flush(1, values.clone()).is_err());
+        let first_ack = writer
+            .drain_acknowledgements()
+            .into_iter()
+            .find(|ack| ack.generation == 1)
+            .expect("background write acknowledgement");
+        assert!(first_ack.result.is_err());
+
+        fs::remove_file(&blocked_parent).unwrap();
+        fs::create_dir(&blocked_parent).unwrap();
+        assert!(writer.snapshot(1, values.clone()).unwrap());
+        writer.flush(1, values.clone()).unwrap();
+        let retry_ack = writer
+            .drain_acknowledgements()
+            .into_iter()
+            .find(|ack| ack.generation == 1)
+            .expect("retry acknowledgement");
+        assert!(retry_ack.result.is_ok());
+        writer.finish(1, values.clone()).unwrap();
+        assert_eq!(read_values(&path).unwrap(), values);
         fs::remove_dir_all(directory).unwrap();
     }
 
