@@ -47,7 +47,10 @@ void main() {
             ivec2 depth_pixel = clamp(ivec2((vec2(raw_pixel) + 0.5) * raw_to_depth), ivec2(0), size - 1);
             float sample_depth_value = texelFetch(depth_image, depth_pixel, 0).r;
             float sample_z = linear_depth(sample_depth_value);
-            float spatial = exp(-float(x * x + y * y) * 0.25);
+            // Расстояние от центра пикселя выхода до центра текселя в текселях сырого AO: в полном
+            // разрешении это (x, y), в половинном учитывается положение пикселя внутри текселя.
+            vec2 offset = ((vec2(pixel) + 0.5) - (vec2(raw_pixel) + 0.5) * raw_to_depth) / raw_to_depth;
+            float spatial = exp(-dot(offset, offset) * 0.25);
             float depth_weight = exp(-abs(sample_z - center_z) * 8.0 / max(center_z, 1e-3));
             float weight = spatial * depth_weight;
             total += texelFetch(raw_ao_image, raw_pixel, 0).r * weight;

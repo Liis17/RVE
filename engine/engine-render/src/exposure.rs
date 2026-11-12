@@ -36,6 +36,8 @@ pub(crate) const EXPOSURE_SCALE_OFFSET: u64 = (HISTOGRAM_BYTES + size_of::<f32>(
 /// Интервал между кадрами, после которого кадр считается паузой (свёрнутое окно, загрузка,
 /// модальный цикл resize), а не обычным шагом: адаптация берёт шаг предыдущего кадра.
 const MAX_ADAPTATION_STEP_MS: f32 = 250.0;
+/// Шаг, который запоминает snap-кадр после паузы: интервал простоя шагом не считается.
+const DEFAULT_ADAPTATION_STEP_MS: f32 = 1000.0 / 60.0;
 /// Размер workgroup histogram-прохода: 16x16 пикселей, 256 бинов на группу.
 const HISTOGRAM_GROUP_SIZE: u32 = 16;
 
@@ -166,10 +168,15 @@ impl ExposureHistory {
         }
         let measured_delta_ms = measured_delta_ms.max(0.0);
         let frame = match self.last {
+            // Snap-кадр после простоя не должен запомнить интервал паузы как шаг адаптации.
             None => ExposureFrame {
                 snap: true,
                 extent,
-                delta_ms: measured_delta_ms,
+                delta_ms: if measured_delta_ms > MAX_ADAPTATION_STEP_MS {
+                    DEFAULT_ADAPTATION_STEP_MS
+                } else {
+                    measured_delta_ms
+                },
             },
             Some(last) => {
                 let interrupted =
@@ -626,10 +633,17 @@ mod tests {
     }
 
     #[test]
-    fn consistently_slow_view_keeps_its_own_step_after_a_snap() {
-        // Вид, который стабильно рендерится медленнее лимита, адаптируется по своему шагу.
+    fn snap_after_a_pause_does_not_store_the_pause_as_the_step() {
+        // Ручной режим → auto после простоя: следующий прерванный кадр не должен прыгнуть.
         let mut history = ExposureHistory::default();
-        submitted_auto(&mut history, EXTENT, 400.0);
-        assert_eq!(plan(history, false, EXTENT, 400.0).delta_ms, 400.0);
+        let snap = plan(history, false, EXTENT, 1000.0);
+        assert!(snap.snap);
+        assert_eq!(snap.delta_ms, DEFAULT_ADAPTATION_STEP_MS);
+        history.submitted(Some(snap));
+        assert_eq!(
+            plan(history, false, (640, 360), 900.0).delta_ms,
+            DEFAULT_ADAPTATION_STEP_MS
+        );
+        assert_eq!(plan(history, false, EXTENT, 40.0).delta_ms, 40.0);
     }
 }
