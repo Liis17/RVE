@@ -3,11 +3,13 @@
 
 use engine_assets::{Assets, Model};
 use engine_files::VirtualPath;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-type LoadFn = Arc<dyn Fn(&str) -> Result<LoadedModel, String> + Send + Sync>;
+type LoadFn = Arc<dyn Fn(&str, &AtomicBool) -> Result<LoadedModel, String> + Send + Sync>;
+type Request = (u64, String, Arc<AtomicBool>);
 type LoadResult = (u64, String, Result<LoadedModel, String>);
 
 #[derive(Debug)]
@@ -25,26 +27,34 @@ pub struct ModelLoader {
     generation: u64,
     pending: HashSet<String>,
     stale: HashSet<String>,
+    /// Флаг отмены незавершённого разбора: устаревший разбор прерывается, а не доигрывается.
+    cancels: HashMap<String, Arc<AtomicBool>>,
 }
 
 struct Worker {
-    requests: Sender<(u64, String)>,
+    requests: Sender<Request>,
     results: Receiver<LoadResult>,
 }
 
 impl Worker {
     fn start(load: LoadFn) -> std::io::Result<Self> {
-        let (requests, request_rx) = channel::<(u64, String)>();
+        let (requests, request_rx) = channel::<Request>();
         let (result_tx, results) = channel();
         // Поток завершается, когда очередь удаляет отправитель запросов.
         std::thread::Builder::new()
             .name("rve-editor-models".to_owned())
             .spawn(move || {
-                for (generation, path) in request_rx {
-                    // Паника разбора не должна оставлять модель в очереди навсегда.
-                    let model =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&path)))
-                            .unwrap_or_else(|_| Err("паника при разборе модели".to_owned()));
+                for (generation, path, cancel) in request_rx {
+                    // Отменённый в очереди запрос не разбирается.
+                    let model = if cancel.load(Ordering::Relaxed) {
+                        Err(format!("{path}: загрузка отменена"))
+                    } else {
+                        // Паника разбора не должна оставлять модель в очереди навсегда.
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            load(&path, &cancel)
+                        }))
+                        .unwrap_or_else(|_| Err("паника при разборе модели".to_owned()))
+                    };
                     if result_tx.send((generation, path, model)).is_err() {
                         break;
                     }
@@ -57,8 +67,13 @@ impl Worker {
 impl ModelLoader {
     /// Загружает модели из ресурсов проекта; прежняя очередь сбрасывается.
     pub fn restart(&mut self, assets: Assets) {
-        self.restart_with(Arc::new(move |path: &str| {
-            let model = assets.load_model(path).map_err(|error| error.to_string())?;
+        self.restart_with(Arc::new(move |path: &str, cancel: &AtomicBool| {
+            let model = assets
+                .load_model_cancellable(path, cancel)
+                .map_err(|error| error.to_string())?;
+            if cancel.load(Ordering::Relaxed) {
+                return Err(format!("{path}: загрузка отменена"));
+            }
             let (dependencies, dependency_warning) = match assets
                 .model_dependencies(path)
                 .map_err(|error| error.to_string())
@@ -81,6 +96,10 @@ impl ModelLoader {
     }
 
     fn restart_with(&mut self, load: LoadFn) {
+        for cancel in self.cancels.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.cancels.clear();
         self.load = Some(load);
         self.worker = None;
         self.generation += 1;
@@ -100,14 +119,16 @@ impl ModelLoader {
         if self.worker.is_none() {
             self.worker = Worker::start(Arc::clone(load)).ok();
         }
+        let cancel = Arc::new(AtomicBool::new(false));
         let sent = self.worker.as_ref().is_some_and(|worker| {
             worker
                 .requests
-                .send((self.generation, path.to_owned()))
+                .send((self.generation, path.to_owned(), Arc::clone(&cancel)))
                 .is_ok()
         });
         if sent {
             self.pending.insert(path.to_owned());
+            self.cancels.insert(path.to_owned(), cancel);
         }
         sent
     }
@@ -116,10 +137,11 @@ impl ModelLoader {
         self.pending.contains(path)
     }
 
-    /// Перезагружает модель; незавершённый результат помечается устаревшим.
+    /// Перезагружает модель; незавершённый разбор прерывается и запрашивается заново.
     pub fn reload(&mut self, path: &str) -> bool {
         if self.pending.contains(path) {
             self.stale.insert(path.to_owned());
+            self.cancel(path);
             true
         } else {
             self.request(path)
@@ -129,6 +151,15 @@ impl ModelLoader {
     /// Помечает все незавершённые разборы устаревшими после изменения PNG или каталога.
     pub fn stale_pending(&mut self) {
         self.stale.extend(self.pending.iter().cloned());
+        for cancel in self.cancels.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cancel(&self, path: &str) {
+        if let Some(cancel) = self.cancels.get(path) {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn pending_paths(&self) -> impl Iterator<Item = &str> {
@@ -156,6 +187,7 @@ impl ModelLoader {
             if generation != self.generation || !self.pending.remove(&path) {
                 continue;
             }
+            self.cancels.remove(&path);
             if self.stale.remove(&path) {
                 self.request(&path);
                 continue;
@@ -209,7 +241,7 @@ mod tests {
         let counted = Arc::clone(&calls);
         let mut loader = ModelLoader::default();
         assert!(!loader.request("a.fbx"));
-        loader.restart_with(Arc::new(move |path: &str| {
+        loader.restart_with(Arc::new(move |path: &str, _: &AtomicBool| {
             counted.fetch_add(1, Ordering::SeqCst);
             if path == "bad.fbx" {
                 Err("broken".to_owned())
@@ -235,7 +267,7 @@ mod tests {
     #[test]
     fn a_panicking_parser_reports_an_error_and_the_queue_keeps_working() {
         let mut loader = ModelLoader::default();
-        loader.restart_with(Arc::new(|path: &str| {
+        loader.restart_with(Arc::new(|path: &str, _: &AtomicBool| {
             if path == "crash.fbx" {
                 panic!("broken parser");
             }
@@ -288,14 +320,14 @@ mod tests {
         let gate = Arc::new(Mutex::new(gate));
         let mut loader = ModelLoader::default();
         let old_gate = Arc::clone(&gate);
-        loader.restart_with(Arc::new(move |_: &str| {
+        loader.restart_with(Arc::new(move |_: &str, _: &AtomicBool| {
             old_gate.lock().unwrap().recv().unwrap();
             Ok(loaded_model(&[]))
         }));
         assert!(loader.request("old.fbx"));
         // Старый поток остаётся у теста, чтобы дождаться его опоздавшего результата.
         let stale = loader.worker.take().unwrap();
-        loader.restart_with(Arc::new(|_: &str| Ok(loaded_model(&[]))));
+        loader.restart_with(Arc::new(|_: &str, _: &AtomicBool| Ok(loaded_model(&[]))));
         assert!(!loader.has_pending());
         release.send(()).unwrap();
         // Результат старого поколения не принимается, даже если пришёл.
@@ -318,8 +350,11 @@ mod tests {
         let mut loader = ModelLoader::default();
         let worker_gate = Arc::clone(&gate);
         let worker_calls = Arc::clone(&calls);
-        loader.restart_with(Arc::new(move |_: &str| {
+        let (started_tx, started) = channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        loader.restart_with(Arc::new(move |_: &str, _: &AtomicBool| {
             if worker_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                started_tx.lock().unwrap().send(()).unwrap();
                 worker_gate.lock().unwrap().recv().unwrap();
                 Ok(loaded_model(&["old.png"]))
             } else {
@@ -327,6 +362,8 @@ mod tests {
             }
         }));
         assert!(loader.request("ship.fbx"));
+        // Перезагрузка приходит, когда первый разбор уже идёт.
+        started.recv().unwrap();
         assert!(loader.reload("ship.fbx"));
         release.send(()).unwrap();
         let mut done = Vec::new();
@@ -349,13 +386,17 @@ mod tests {
         let mut loader = ModelLoader::default();
         let worker_gate = Arc::clone(&gate);
         let worker_calls = Arc::clone(&calls);
-        loader.restart_with(Arc::new(move |_: &str| {
+        let (started_tx, started) = channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        loader.restart_with(Arc::new(move |_: &str, _: &AtomicBool| {
             if worker_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                started_tx.lock().unwrap().send(()).unwrap();
                 worker_gate.lock().unwrap().recv().unwrap();
             }
             Ok(loaded_model(&["textures/ship.png"]))
         }));
         assert!(loader.request("ship.fbx"));
+        started.recv().unwrap();
         loader.stale_pending();
         release.send(()).unwrap();
         let mut done = Vec::new();
@@ -368,5 +409,71 @@ mod tests {
             done[0].1.as_ref().unwrap().dependencies[0].as_str(),
             "textures/ship.png"
         );
+    }
+
+    #[test]
+    fn reload_cancels_the_running_parse_instead_of_waiting_for_it() {
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started) = channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let mut loader = ModelLoader::default();
+        loader.restart_with(Arc::new(move |_: &str, cancel: &AtomicBool| {
+            if worker_cancelled.load(Ordering::SeqCst) == 0 {
+                started_tx.lock().unwrap().send(()).unwrap();
+                // Разбор «не заканчивается», пока его не отменят.
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                worker_cancelled.fetch_add(1, Ordering::SeqCst);
+                return Err("отменено".to_owned());
+            }
+            Ok(loaded_model(&["new.png"]))
+        }));
+        assert!(loader.request("ship.fbx"));
+        started.recv().unwrap();
+        assert!(loader.reload("ship.fbx"));
+        let mut done = Vec::new();
+        while loader.has_pending() {
+            done.extend(loader.wait_finished());
+        }
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].1.as_ref().unwrap().dependencies[0].as_str(),
+            "new.png"
+        );
+    }
+
+    #[test]
+    fn a_request_cancelled_while_queued_is_not_parsed() {
+        let (release, gate) = channel::<()>();
+        let gate = Mutex::new(gate);
+        let (started_tx, started) = channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let parsed = Arc::new(Mutex::new(Vec::new()));
+        let worker_parsed = Arc::clone(&parsed);
+        let mut loader = ModelLoader::default();
+        loader.restart_with(Arc::new(move |path: &str, _: &AtomicBool| {
+            if path == "busy.fbx" {
+                started_tx.lock().unwrap().send(()).unwrap();
+                gate.lock().unwrap().recv().unwrap();
+            }
+            worker_parsed.lock().unwrap().push(path.to_owned());
+            Ok(loaded_model(&[]))
+        }));
+        assert!(loader.request("busy.fbx"));
+        started.recv().unwrap();
+        // Второй запрос ждёт в очереди и отменяется до начала разбора.
+        assert!(loader.request("queued.fbx"));
+        assert!(loader.reload("queued.fbx"));
+        release.send(()).unwrap();
+        let mut done = Vec::new();
+        while loader.has_pending() {
+            done.extend(loader.wait_finished());
+        }
+        assert_eq!(*parsed.lock().unwrap(), ["busy.fbx", "queued.fbx"]);
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|(_, result)| result.is_ok()));
     }
 }

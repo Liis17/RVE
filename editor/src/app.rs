@@ -757,9 +757,15 @@ impl EditorApp {
         }
     }
 
-    /// Превью или модели ещё готовятся в фоне: окно должно проснуться, чтобы показать их.
+    /// Превью, модели или изображения сцены ещё готовятся в фоне: окно должно проснуться,
+    /// чтобы показать их.
     fn background_pending(&self) -> bool {
-        self.state.previews.has_pending() || self.state.model_loader.has_pending()
+        self.state.previews.has_pending()
+            || self.state.model_loader.has_pending()
+            || self
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.scene.images_pending())
     }
 
     /// Записывает недавние проекты и раскладку панелей; ошибка только пишется в Console.
@@ -787,8 +793,9 @@ impl EditorApp {
         let Some(mut settings) = self.preferences.take_pending() else {
             return;
         };
+        settings.hash_known_token();
         if settings.enabled
-            && settings.token.is_empty()
+            && settings.token_hash.is_empty()
             && let Err(error) = settings.regenerate_token()
         {
             self.state
@@ -803,6 +810,15 @@ impl EditorApp {
     }
 
     fn apply_asset_changes(&mut self, changes: AssetChanges) {
+        let scene_file_changed = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(EditorScene::path)
+            .is_some_and(|path| changes.rescan || changes.contains_path_or_parent(path));
+        if scene_file_changed {
+            self.state.check_scene_file();
+        }
         if let (Some(editor), Some(project)) = (&mut self.state.ui_document, &self.state.project) {
             editor.refresh_external(project, &changes);
         }
@@ -2120,6 +2136,7 @@ pub(crate) fn console_modal_open(state: &EditorState) -> bool {
         || state.project_dialog.is_some()
         || state.new_project_dialog.is_some()
         || state.recovery_prompt.is_some()
+        || state.external_scene_prompt.is_some()
         || state.apply_prompt.is_some()
 }
 
@@ -2792,7 +2809,7 @@ impl WindowHandler for EditorApp {
         {
             self.state.log.error(error);
         }
-        if self.user_settings.mcp.enabled && self.user_settings.mcp.token.is_empty() {
+        if self.user_settings.mcp.enabled && self.user_settings.mcp.token_hash.is_empty() {
             if let Err(error) = self.user_settings.mcp.regenerate_token() {
                 self.state
                     .log
@@ -2918,6 +2935,10 @@ impl WindowHandler for EditorApp {
         }
         if let Some(changes) = self.asset_changes.take_ready(now) {
             self.apply_asset_changes(changes);
+            window.request_redraw();
+        }
+        if self.state.scene_file_check_pending && !self.state.is_playing() {
+            self.state.check_scene_file();
             window.request_redraw();
         }
         // Вне Play очередь геймпадов дренируется без доставки в скрипты; в Play опрос идёт в кадре.

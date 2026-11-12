@@ -225,6 +225,11 @@ pub struct EditorState {
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
     pub recovery_prompt: Option<RecoveryPrompt>,
+    /// Файл открытой сцены изменён вне редактора при несохранённых правках: текст файла,
+    /// ожидающий решения пользователя.
+    pub external_scene_prompt: Option<String>,
+    /// Проверка файла сцены отложена до конца Play: во время Play документ не меняется.
+    pub scene_file_check_pending: bool,
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     /// Ресурс, на который перешёл Inspector.
@@ -339,6 +344,8 @@ impl EditorState {
             actions: Vec::new(),
             unsaved_prompt: None,
             recovery_prompt: None,
+            external_scene_prompt: None,
+            scene_file_check_pending: false,
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_selection: None,
@@ -624,6 +631,75 @@ impl EditorState {
         self.game_camera = None;
         self.pending_frame = None;
         self.inspected_asset = None;
+        self.external_scene_prompt = None;
+        self.scene_file_check_pending = false;
+    }
+
+    /// Сверяет открытую сцену с её файлом после события watcher. Сцену без несохранённых правок
+    /// перечитывает сразу, при правках спрашивает пользователя. Своё сохранение и повтор того же
+    /// содержимого не считаются внешним изменением; отсутствующий файл не трогает сцену.
+    pub fn check_scene_file(&mut self) {
+        if self.is_playing() {
+            self.scene_file_check_pending = true;
+            return;
+        }
+        self.scene_file_check_pending = false;
+        let (Some(project), Some(scene)) = (self.project.as_ref(), self.scene.as_mut()) else {
+            return;
+        };
+        let Some(path) = scene.path().cloned() else {
+            return;
+        };
+        let Ok(text) = project
+            .assets_dir
+            .resolve(path.as_str())
+            .and_then(std::fs::read_to_string)
+        else {
+            return;
+        };
+        if !scene.differs_from_disk(&text) {
+            return;
+        }
+        if scene.is_dirty() {
+            self.external_scene_prompt = Some(text);
+            return;
+        }
+        match scene.reload_from_disk(&text) {
+            Ok(()) => self.log.info(format!(
+                "/{}: перечитана после изменения на диске",
+                path.as_str()
+            )),
+            Err(error) => {
+                // Повреждённый файл не заменяет сцену; повтор того же текста не сообщается снова.
+                scene.acknowledge_disk_text(&text);
+                self.log.error(format!(
+                    "/{}: изменение на диске не применено: {error}",
+                    path.as_str()
+                ));
+            }
+        }
+        self.advance_mcp_generation();
+    }
+
+    /// Решение по [`Self::external_scene_prompt`]: перечитать файл, отбросив правки, или оставить
+    /// правки, и тогда следующее сохранение перезапишет файл.
+    pub fn resolve_external_scene(&mut self, reload: bool) {
+        let Some(text) = self.external_scene_prompt.take() else {
+            return;
+        };
+        let Some(scene) = self.scene.as_mut() else {
+            return;
+        };
+        if !reload {
+            scene.acknowledge_disk_text(&text);
+            return;
+        }
+        if let Err(error) = scene.reload_from_disk(&text) {
+            scene.acknowledge_disk_text(&text);
+            self.log
+                .error(format!("Сцена не перечитана, правки сохранены: {error}"));
+        }
+        self.advance_mcp_generation();
     }
 
     /// Список тяжёлых префабов относится к проекту, который открыт сейчас: при открытии другого
@@ -1264,5 +1340,114 @@ settings = "/cameras/problem.camerasettings"
         assert!(state.project_prefabs.is_none());
         assert!(!state.has_unsaved_changes());
         assert!(ProjectPrefabs::open(&temp.0).entries().is_empty());
+    }
+
+    const DISK_SCENE: &str = "[[objects]]\nid = \"cam\"\n[objects.camera]\n";
+
+    fn scene_ids(state: &EditorState) -> Vec<String> {
+        state
+            .scene
+            .as_ref()
+            .unwrap()
+            .document()
+            .objects
+            .iter()
+            .map(|object| object.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn external_scene_changes_reload_a_clean_scene_and_ask_before_dropping_edits() {
+        let temp = TempProject::new(None);
+        let file = temp.0.join("Assets/s.rvescene");
+        fs::write(&file, DISK_SCENE).unwrap();
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(&temp.0).unwrap());
+        let path = VirtualPath::parse("s.rvescene").unwrap();
+        state.scene = Some(EditorScene::parse(path.clone(), DISK_SCENE, no_prefabs()).unwrap());
+
+        // Событие без изменения содержимого и собственное сохранение не трогают сцену.
+        state.check_scene_file();
+        state
+            .scene
+            .as_mut()
+            .unwrap()
+            .save(&file, path.clone())
+            .unwrap();
+        state.check_scene_file();
+        assert!(state.external_scene_prompt.is_none());
+        assert!(!state.scene.as_ref().unwrap().can_undo());
+
+        // Сцена без правок перечитывается молча, выделение сохраняется.
+        state.scene.as_mut().unwrap().select(Some("cam"));
+        let outside = format!("{DISK_SCENE}\n[[objects]]\nid = \"box\"\n");
+        fs::write(&file, &outside).unwrap();
+        state.check_scene_file();
+        assert_eq!(scene_ids(&state), ["cam", "box"]);
+        assert!(!state.scene.as_ref().unwrap().is_dirty());
+        assert_eq!(state.scene.as_ref().unwrap().selection(), Some("cam"));
+        assert!(state.external_scene_prompt.is_none());
+
+        // С несохранёнными правками — вопрос; Keep оставляет правки и не спрашивает повторно.
+        state
+            .scene
+            .as_mut()
+            .unwrap()
+            .create_object(&NewObject::Empty, None)
+            .unwrap();
+        let edited = scene_ids(&state);
+        let second = format!("{outside}\n[[objects]]\nid = \"wall\"\n");
+        fs::write(&file, &second).unwrap();
+        state.check_scene_file();
+        assert_eq!(
+            state.external_scene_prompt.as_deref(),
+            Some(second.as_str())
+        );
+        assert_eq!(scene_ids(&state), edited);
+        state.resolve_external_scene(false);
+        assert!(state.external_scene_prompt.is_none());
+        assert!(state.scene.as_ref().unwrap().is_dirty());
+        state.check_scene_file();
+        assert!(state.external_scene_prompt.is_none());
+
+        // Reload заменяет документ файлом, а Undo возвращает правки.
+        let third = format!("{outside}\n[[objects]]\nid = \"door\"\n");
+        fs::write(&file, &third).unwrap();
+        state.check_scene_file();
+        state.resolve_external_scene(true);
+        assert_eq!(scene_ids(&state), ["cam", "box", "door"]);
+        assert!(!state.scene.as_ref().unwrap().is_dirty());
+        assert!(state.scene.as_mut().unwrap().undo());
+        assert_eq!(scene_ids(&state), edited);
+    }
+
+    #[test]
+    fn broken_external_scene_keeps_the_document_and_reports_once() {
+        let temp = TempProject::new(None);
+        let file = temp.0.join("Assets/s.rvescene");
+        fs::write(&file, DISK_SCENE).unwrap();
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(&temp.0).unwrap());
+        let path = VirtualPath::parse("s.rvescene").unwrap();
+        state.scene = Some(EditorScene::parse(path, DISK_SCENE, no_prefabs()).unwrap());
+        let errors = |state: &EditorState| {
+            state
+                .log
+                .entries()
+                .filter(|entry| entry.level == crate::console::LogLevel::Error)
+                .count()
+        };
+
+        fs::write(&file, "objects = [").unwrap();
+        state.check_scene_file();
+        state.check_scene_file();
+        assert_eq!(scene_ids(&state), ["cam"]);
+        assert_eq!(errors(&state), 1);
+
+        // Удалённый файл не меняет открытую сцену.
+        fs::remove_file(&file).unwrap();
+        state.check_scene_file();
+        assert_eq!(scene_ids(&state), ["cam"]);
+        assert_eq!(errors(&state), 1);
     }
 }

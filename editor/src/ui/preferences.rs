@@ -47,18 +47,29 @@ pub fn show(ctx: &egui::Context, preferences: &mut Preferences, status: &McpStat
                 ui.label("Bearer token");
                 ui.add_sized(
                     [ui.available_width() - 110.0, 24.0],
-                    egui::TextEdit::singleline(&mut preferences.draft.token).password(true),
+                    egui::TextEdit::singleline(&mut preferences.draft.token)
+                        .password(true)
+                        .hint_text(if preferences.draft.token_hash.is_empty() {
+                            "not set"
+                        } else {
+                            "stored as hash"
+                        }),
                 );
                 if ui
-                    .add_enabled(
-                        !preferences.draft.token.is_empty(),
-                        egui::Button::new("Copy"),
-                    )
+                    .add_enabled(preferences.draft.token_known(), egui::Button::new("Copy"))
                     .clicked()
                 {
                     ctx.copy_text(preferences.draft.token.clone());
                 }
             });
+            if !preferences.draft.token_known() && !preferences.draft.token_hash.is_empty() {
+                ui.label(
+                    "Only a hash of the token is stored. Connected clients keep working; \
+                     press Regenerate to get a new token for another client.",
+                );
+            } else if preferences.draft.token_known() {
+                ui.label("The token is shown only until the editor restarts; copy it now.");
+            }
             ui.horizontal(|ui| {
                 if ui.button("Regenerate").clicked()
                     && let Err(error) = preferences.draft.regenerate_token()
@@ -67,7 +78,7 @@ pub fn show(ctx: &egui::Context, preferences: &mut Preferences, status: &McpStat
                 }
                 if ui
                     .add_enabled(
-                        !preferences.draft.token.is_empty(),
+                        preferences.draft.token_known(),
                         egui::Button::new("Copy connection command"),
                     )
                     .clicked()

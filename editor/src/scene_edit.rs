@@ -260,6 +260,9 @@ pub struct EditorScene {
     coalesce: Option<String>,
     /// Растёт при каждом изменении документа; потребители по нему обновляют производные данные.
     revision: u64,
+    /// Текст файла на диске на момент открытия, сохранения или последнего перечитывания;
+    /// `None` — неизвестен (новая сцена или восстановление из автосохранения).
+    disk_text: Option<String>,
 }
 
 impl EditorScene {
@@ -272,7 +275,9 @@ impl EditorScene {
     /// Разбирает сцену или, для пути `.rveprefab`, префаб.
     pub fn parse(path: VirtualPath, contents: &str, loader: PrefabLoader) -> Result<Self, String> {
         let document = parse_document(&path, contents).map_err(|error| error.to_string())?;
-        Self::from_document(document, Some(path), loader)
+        let mut scene = Self::from_document(document, Some(path), loader)?;
+        scene.disk_text = Some(contents.to_owned());
+        Ok(scene)
     }
 
     /// Сцена из автосохранения: путь прежний, а изменения считаются несохранёнными.
@@ -316,6 +321,7 @@ impl EditorScene {
             redo: Vec::new(),
             coalesce: None,
             revision: 0,
+            disk_text: None,
         })
     }
 
@@ -1759,7 +1765,19 @@ impl EditorScene {
                 path.as_str()
             ));
         }
-        let contents = self.document.to_toml().map_err(|error| error.to_string())?;
+        let generated = self.document.to_toml().map_err(|error| error.to_string())?;
+        // Комментарии и оформление прежнего файла переносятся в новый текст.
+        let contents = self
+            .disk_text
+            .as_deref()
+            .and_then(|previous| {
+                crate::toml_preserve::preserve_formatting(previous, &generated, |text| {
+                    parse_document(&path, text)
+                        .and_then(|document| document.to_toml())
+                        .is_ok_and(|text| text == generated)
+                })
+            })
+            .unwrap_or(generated);
         let reparsed = parse_document(&path, &contents)
             .map_err(|error| format!("сериализованная сцена не прошла проверку: {error}"))?;
         // Префаб, включающий сам себя под новым путём, отклоняется до записи.
@@ -1768,7 +1786,96 @@ impl EditorScene {
         self.document = reparsed;
         self.path = Some(path);
         self.dirty = false;
+        self.disk_text = Some(contents);
         Ok(())
+    }
+
+    /// Текст файла отличается от последнего известного редактору: файл изменили вне редактора.
+    pub fn differs_from_disk(&self, text: &str) -> bool {
+        self.disk_text.as_deref() != Some(text)
+    }
+
+    /// Запоминает текст файла без перечитывания: пользователь оставил свои правки, и следующее
+    /// событие с тем же содержимым больше не считается внешним изменением.
+    pub fn acknowledge_disk_text(&mut self, text: &str) {
+        self.disk_text = Some(text.to_owned());
+    }
+
+    /// Заменяет документ содержимым файла отдельным шагом undo и помечает сцену сохранённой.
+    /// Выделение сохраняется для объектов, оставшихся в сцене.
+    pub fn reload_from_disk(&mut self, text: &str) -> Result<(), String> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| "сцена ещё не сохранялась".to_owned())?;
+        let next = parse_document(&path, text).map_err(|error| error.to_string())?;
+        self.end_continuous_edit();
+        self.edit(None, |document| {
+            *document = next;
+            Ok(())
+        })?;
+        self.end_continuous_edit();
+        self.dirty = false;
+        self.disk_text = Some(text.to_owned());
+        let visible = self
+            .expansion
+            .document
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        self.selection.retain(|id| visible.contains(id.as_str()));
+        Ok(())
+    }
+
+    /// Число ссылок документа на переименовываемый или удаляемый ресурс.
+    pub fn count_asset_references(&self, remap: &crate::asset_refs::PathRemap) -> usize {
+        self.document
+            .to_toml()
+            .ok()
+            .and_then(|text| crate::asset_refs::count_in_text(&text, remap).ok())
+            .unwrap_or(0)
+    }
+
+    /// Переносит путь документа, если переименован его файл или папка с ним.
+    pub fn follow_rename(&mut self, remap: &crate::asset_refs::PathRemap) {
+        if let Some(path) = self.path.as_ref()
+            && let Some(moved) = remap.map_asset_path(path.as_str())
+            && let Ok(moved) = VirtualPath::parse(&moved)
+        {
+            self.path = Some(moved);
+        }
+    }
+
+    /// Переводит ссылки документа на переименованный ресурс отдельным шагом undo.
+    ///
+    /// `on_disk` — файл документа на диске уже переписан тем же переименованием: тогда сцена,
+    /// не имевшая несохранённых правок, остаётся сохранённой.
+    pub fn remap_asset_paths(
+        &mut self,
+        remap: &crate::asset_refs::PathRemap,
+        on_disk: bool,
+    ) -> Result<bool, String> {
+        let text = self.document.to_toml().map_err(|error| error.to_string())?;
+        let Some(rewritten) = crate::asset_refs::rewrite_text(&text, remap)? else {
+            return Ok(false);
+        };
+        let label = self
+            .path
+            .clone()
+            .unwrap_or_else(|| VirtualPath::parse("untitled.rvescene").expect("valid path"));
+        let next = parse_document(&label, &rewritten).map_err(|error| error.to_string())?;
+        let was_dirty = self.dirty;
+        self.end_continuous_edit();
+        self.edit(None, |document| {
+            *document = next;
+            Ok(())
+        })?;
+        self.end_continuous_edit();
+        if on_disk && !was_dirty {
+            self.dirty = false;
+        }
+        Ok(true)
     }
 }
 
@@ -3971,6 +4078,31 @@ mod tests {
     }
 
     #[test]
+    fn save_keeps_comments_of_the_opened_file() {
+        let original = include_str!("../../examples/demo-game/Assets/scenes/physics.rvescene");
+        let comments = original
+            .lines()
+            .filter(|line| line.contains('#'))
+            .collect::<Vec<_>>();
+        assert!(comments.len() > 5);
+        let directory = TempDir::new();
+        let file = directory.0.join("physics.rvescene");
+        let mut scene =
+            EditorScene::parse(path("/physics.rvescene"), original, no_prefabs()).unwrap();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.save(&file, path("/physics.rvescene")).unwrap();
+        let saved = fs::read_to_string(&file).unwrap();
+        for comment in &comments {
+            assert!(saved.contains(comment), "{comment:?} потерян:\n{saved}");
+        }
+        assert!(saved.contains(&format!("id = \"{id}\"")));
+
+        // Повторное сохранение без правок не меняет файл.
+        scene.save(&file, path("/physics.rvescene")).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), saved);
+    }
+
+    #[test]
     fn failed_save_keeps_the_scene_dirty_and_the_previous_path() {
         let directory = TempDir::new();
         let missing = directory.0.join("missing/a.rvescene");
@@ -4005,8 +4137,10 @@ mod tests {
         let mut scene = original;
         scene.save(&file, label.clone()).unwrap();
         let saved = fs::read_to_string(&file).unwrap();
-        assert_eq!(saved, expected);
+        let source_text = fs::read_to_string(source).unwrap();
+        assert_eq!(saved, source_text, "сохранение без правок не меняет файл");
         let reopened = EditorScene::parse(label, &saved, project.prefab_loader()).unwrap();
+        assert_eq!(reopened.document().to_toml().unwrap(), expected);
         assert_eq!(
             reopened.object("orbit.moon").unwrap().name.as_deref(),
             Some("Moon")

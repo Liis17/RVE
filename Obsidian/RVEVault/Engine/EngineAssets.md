@@ -25,6 +25,7 @@ Parent: [[Index]]
 | `Assets::load_texture(&self, asset_path) -> Result<TextureData, AssetError>` | Требует расширение `.png` (регистр не важен), читает resource bytes и декодирует их |
 | `Assets::load_hdr(&self, asset_path) -> Result<HdrImageData, AssetError>` | Требует расширение `.hdr` (регистр не важен), использует тот же loose/packed resource source и декодирует Radiance RGBE |
 | `Assets::load_model(&self, asset_path) -> Result<Model, AssetError>` | Требует расширение `.fbx`, читает FBX в память и загружает используемые FBX-текстуры PNG |
+| `Assets::load_model_cancellable(&self, asset_path, cancel: &AtomicBool)` | Как `load_model`, но при `cancel = true` возвращает `Cancelled`: флаг проверяется до чтения, в `progress_cb` ufbx во время разбора и перед каждым узлом при сборке мешей |
 | `Assets::model_dependencies(&self, asset_path) -> Result<Vec<String>, AssetError>` | Возвращает уникальные внешние PNG как ведущие `/` virtual paths в порядке base-color, normal, roughness, metallic, emissive, occlusion и opacity. Проверяет кандидаты через общий с `load_model` resolver и `stat` того же loose/packed источника, не читая и не декодируя PNG. Embedded-текстуры и metallic/roughness-карты классических шейдеров пропускаются; отсутствующая внешняя текстура даёт тот же `MissingTexture`. FBX без треугольников, но с анимационными stacks (клип-only файл), возвращает пустой список; сборка вызывает эту функцию для каждого объявленного FBX |
 | `Assets::load_animations(&self, asset_path) -> Result<Vec<ModelAnimation>, AssetError>` | Требует расширение `.fbx` и хотя бы один stack с ключами, иначе `Decode` («в FBX нет анимационных стеков»). Имя клипа — stem файла, если stack один; иначе `stem:stack`. Ключи запекаются через `bake_anim` |
 | `Model::skeleton: Option<ModelSkeleton>` | Узлы (имя, родитель, `rest` TRS, `inherit_mode`, `inherit_scale_node`) в порядке родитель-первым и `joints` (индекс узла и `inverse_bind` по столбцам). Один узел может быть joint несколько раз с разными `inverse_bind` |
@@ -38,7 +39,7 @@ Parent: [[Index]]
 | `ModelMesh` | Часть модели с одним материалом: `vertices`, `indices` (каждые три — треугольник) и `material` |
 | `ModelMaterial` | Линейный `base_color`, HDR `emissive`, `opacity`, `alpha_mode` (`Opaque`/`Blend`), `double_sided`, `occlusion_strength`, metallic/roughness, scale нормали и необязательные индексы base-color, metallic-roughness, normal, emissive и occlusion PNG в `Model::textures`; default — белый opaque dielectric с roughness 1, чёрным emissive, `double_sided = false` и AO strength 1 |
 | `ModelVertex` | `position` в метрах, единичная `normal` и `uv` от левого верхнего угла текстуры; оси +X вправо, +Y вверх, +Z к зрителю |
-| `AssetError` | `InvalidPath`, `UnsupportedFormat` (не то расширение), `Io` (ошибка чтения, в том числе отсутствие файла), `Decode` (повреждённый PNG или FBX, модель без треугольников) и `MissingTexture` со списком проверенных путей; реализует `Display` и `Error` |
+| `AssetError` | `InvalidPath`, `UnsupportedFormat` (не то расширение), `Io` (ошибка чтения, в том числе отсутствие файла), `Decode` (повреждённый PNG или FBX, модель без треугольников), `MissingTexture` со списком проверенных путей и `Cancelled` (загрузка прервана флагом отмены); реализует `Display` и `Error` |
 
 ## Загрузка FBX
 

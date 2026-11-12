@@ -3,6 +3,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod asset_refs;
 mod asset_watch;
 mod assets_fs;
 mod autosave;
@@ -28,6 +29,7 @@ mod project_tags;
 mod scene_edit;
 mod settings;
 mod state;
+mod toml_preserve;
 mod ui;
 mod ui_editor;
 mod viewport;

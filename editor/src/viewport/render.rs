@@ -8,6 +8,7 @@ use crate::state::MaterialPreviewPrimitive;
 use crate::viewport::animation::{
     AnimationPreview, EditorAnimation, PreviewStatus, project_preview_bridge,
 };
+use crate::viewport::image_loader::{DecodedImage, ImageKind, ImageLoader};
 use crate::viewport::model_loader::ModelLoader;
 use engine_animation::{AnimationBridge, PaletteRemap};
 use engine_assets::{Assets, Model, ModelAlphaMode, ModelSkeleton};
@@ -151,6 +152,11 @@ pub struct SceneRenderer {
     reported_material_errors: HashSet<String>,
     reported_material_warnings: HashSet<String>,
     environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
+    /// Фоновое декодирование PNG и HDR и корень проекта, для которого оно запущено.
+    images: ImageLoader,
+    images_root: Option<std::path::PathBuf>,
+    /// Цветовые пространства, в которых ждут декодирования PNG по пути.
+    texture_wants: HashMap<String, HashSet<TextureColorSpace>>,
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
     failed_environment: Option<EditorEnvironmentKey>,
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
@@ -361,6 +367,9 @@ impl SceneRenderer {
             failed_reloads: HashSet::new(),
             model_versions: HashMap::new(),
             textures: HashMap::new(),
+            images: ImageLoader::default(),
+            images_root: None,
+            texture_wants: HashMap::new(),
             texture_revisions: HashMap::new(),
             next_texture_revision: 0,
             asset_materials: HashMap::new(),
@@ -420,6 +429,8 @@ impl SceneRenderer {
             renderer.destroy_environment(environment)?;
         }
         self.environment_sources.clear();
+        self.images_root = None;
+        self.texture_wants.clear();
         self.model_dependencies.clear();
         self.failed_reloads.clear();
         self.failed_environment = None;
@@ -489,6 +500,7 @@ impl SceneRenderer {
         log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
         let mut active_environments = HashSet::new();
+        self.accept_images(renderer, project, log)?;
         let finished = loader.finished();
         if !finished.is_empty() {
             // Экземпляры ссылаются на меши, которые сейчас могут быть заменены: освобождаем их заранее.
@@ -576,19 +588,11 @@ impl SceneRenderer {
             {
                 let path = path.as_str();
                 active_environments.insert(path.to_owned());
-                if !self.environment_sources.contains_key(path) {
-                    let source = match project.assets.load_hdr(path) {
-                        Ok(image) => Some(Arc::new(EnvironmentSource::Equirect {
-                            width: image.width,
-                            height: image.height,
-                            rgb: image.rgb,
-                        })),
-                        Err(error) => {
-                            log.error(format!("{path}: {error}"));
-                            None
-                        }
-                    };
-                    self.environment_sources.insert(path.to_owned(), source);
+                if !self.environment_sources.contains_key(path)
+                    && !self.images.request(ImageKind::Hdr, path)
+                {
+                    log.error(format!("{path}: фоновая загрузка недоступна"));
+                    self.environment_sources.insert(path.to_owned(), None);
                 }
             }
             let Some(mesh) = &object.mesh_renderer else {
@@ -792,54 +796,11 @@ impl SceneRenderer {
             .cloned()
             .collect::<Vec<_>>();
         for (path, color_space) in texture_keys {
-            let key = (path.clone(), color_space);
-            let previous = self.textures.get(&key).copied().flatten();
-            let had_previous = previous.is_some();
-            match project.assets.load_texture(&path) {
-                Ok(data) => {
-                    let replacement = match renderer.create_texture_with_color_space(
-                        data.width,
-                        data.height,
-                        &data.rgba,
-                        color_space,
-                    ) {
-                        Ok(replacement) => replacement,
-                        Err(error) if is_resource_error(&error) => {
-                            let (current, _, error) =
-                                cache_update(previous, Err(error.to_string()));
-                            self.textures.insert(key, current);
-                            if let Some(error) = error {
-                                let message = if had_previous {
-                                    format!("{path}: {error}; сохранена прежняя версия текстуры")
-                                } else {
-                                    format!("{path}: {error}")
-                                };
-                                log.error(message);
-                            }
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let (current, old, _) = cache_update(previous, Ok(replacement));
-                    self.textures.insert(key, current);
-                    self.bump_texture_revision((path.clone(), color_space));
-                    if let Some(old) = old {
-                        renderer.destroy_texture(old)?;
-                    }
-                }
-                Err(error) => {
-                    let (current, _, error) = cache_update(previous, Err(error.to_string()));
-                    self.textures.insert(key, current);
-                    if let Some(error) = error {
-                        let message = if had_previous {
-                            format!("{path}: {error}; сохранена прежняя версия текстуры")
-                        } else {
-                            format!("{path}: {error}")
-                        };
-                        log.error(message);
-                    }
-                }
-            }
+            self.texture_wants
+                .entry(path.clone())
+                .or_default()
+                .insert(color_space);
+            self.images.reload(ImageKind::Texture, &path);
         }
 
         // Изменённый `.glsl` (при rescan — все кэшированные) перекомпилируется; ошибка оставляет
@@ -907,77 +868,7 @@ impl SceneRenderer {
             .cloned()
             .collect::<Vec<_>>();
         for path in environment_paths {
-            let previous = self.environment_sources.get(&path).cloned().flatten();
-            let had_previous = previous.is_some();
-            match project.assets.load_hdr(&path) {
-                Ok(image) => {
-                    let replacement = Arc::new(EnvironmentSource::Equirect {
-                        width: image.width,
-                        height: image.height,
-                        rgb: image.rgb,
-                    });
-                    let key = EditorEnvironmentKey::Hdr(path.clone());
-                    let current_matches = self
-                        .current_environment
-                        .as_ref()
-                        .is_some_and(|(current, _)| current == &key);
-                    let gpu_replacement = if current_matches {
-                        match renderer.create_environment(&replacement) {
-                            Ok(environment) => Some(environment),
-                            Err(error) if is_resource_error(&error) => {
-                                let transition = environment_transition(
-                                    self.current_environment
-                                        .as_ref()
-                                        .map(|(current, _)| current),
-                                    &key,
-                                    EnvironmentCreation::ResourceError,
-                                );
-                                let (current, _, _) =
-                                    cache_update(previous, Err(error.to_string()));
-                                self.environment_sources.insert(path.clone(), current);
-                                if transition == EnvironmentTransition::Keep {
-                                    log.error(format!(
-                                        "{path}: {error}; сохранено прежнее окружение"
-                                    ));
-                                } else {
-                                    log.error(format!("{path}: {error}"));
-                                    if let Some((_, previous)) = self.current_environment.take() {
-                                        renderer.destroy_environment(previous)?;
-                                    }
-                                }
-                                self.failed_environment = Some(key);
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    } else {
-                        None
-                    };
-                    self.environment_sources
-                        .insert(path.clone(), Some(replacement));
-                    if let Some(environment) = gpu_replacement {
-                        let previous = self.current_environment.replace((key, environment));
-                        self.failed_environment = None;
-                        if let Some((_, previous)) = previous {
-                            renderer.destroy_environment(previous)?;
-                        }
-                    } else if self.failed_environment.as_ref() == Some(&key) {
-                        self.failed_environment = None;
-                    }
-                }
-                Err(error) => {
-                    let (current, _, error) = cache_update(previous, Err(error.to_string()));
-                    self.environment_sources.insert(path.clone(), current);
-                    if let Some(error) = error {
-                        let message = if had_previous {
-                            format!("{path}: {error}; сохранена прежняя версия HDR")
-                        } else {
-                            format!("{path}: {error}")
-                        };
-                        log.error(message);
-                    }
-                }
-            }
+            self.images.reload(ImageKind::Hdr, &path);
         }
 
         let pending = loader
@@ -1007,6 +898,201 @@ impl SceneRenderer {
         Ok(())
     }
 
+    /// Применяет декодированную PNG к кэшу текстуры в цветовом пространстве `color_space`.
+    /// Первая загрузка и перезагрузка идут одним путём: ошибка сохраняет прежнюю текстуру.
+    fn apply_texture(
+        &mut self,
+        renderer: &mut Renderer,
+        log: &mut ConsoleLog,
+        path: String,
+        color_space: TextureColorSpace,
+        result: Result<&engine_assets::TextureData, String>,
+    ) -> Result<(), RenderError> {
+        let key = (path.clone(), color_space);
+        let previous = self.textures.get(&key).copied().flatten();
+        let had_previous = previous.is_some();
+        match result {
+            Ok(data) => {
+                let replacement = match renderer.create_texture_with_color_space(
+                    data.width,
+                    data.height,
+                    &data.rgba,
+                    color_space,
+                ) {
+                    Ok(replacement) => replacement,
+                    Err(error) if is_resource_error(&error) => {
+                        let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                        self.textures.insert(key, current);
+                        if let Some(error) = error {
+                            let message = if had_previous {
+                                format!("{path}: {error}; сохранена прежняя версия текстуры")
+                            } else {
+                                format!("{path}: {error}")
+                            };
+                            log.error(message);
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                let (current, old, _) = cache_update(previous, Ok(replacement));
+                self.textures.insert(key, current);
+                self.bump_texture_revision((path.clone(), color_space));
+                if let Some(old) = old {
+                    renderer.destroy_texture(old)?;
+                }
+            }
+            Err(error) => {
+                let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                self.textures.insert(key, current);
+                if let Some(error) = error {
+                    let message = if had_previous {
+                        format!("{path}: {error}; сохранена прежняя версия текстуры")
+                    } else {
+                        format!("{path}: {error}")
+                    };
+                    log.error(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Применяет декодированный HDR к источникам окружения; текущее GPU-окружение этого пути
+    /// пересоздаётся. Ошибка сохраняет прежний источник.
+    fn apply_hdr(
+        &mut self,
+        renderer: &mut Renderer,
+        log: &mut ConsoleLog,
+        path: String,
+        result: Result<engine_assets::HdrImageData, String>,
+    ) -> Result<(), RenderError> {
+        let previous = self.environment_sources.get(&path).cloned().flatten();
+        let had_previous = previous.is_some();
+        match result {
+            Ok(image) => {
+                let replacement = Arc::new(EnvironmentSource::Equirect {
+                    width: image.width,
+                    height: image.height,
+                    rgb: image.rgb,
+                });
+                let key = EditorEnvironmentKey::Hdr(path.clone());
+                let current_matches = self
+                    .current_environment
+                    .as_ref()
+                    .is_some_and(|(current, _)| current == &key);
+                let gpu_replacement = if current_matches {
+                    match renderer.create_environment(&replacement) {
+                        Ok(environment) => Some(environment),
+                        Err(error) if is_resource_error(&error) => {
+                            let transition = environment_transition(
+                                self.current_environment
+                                    .as_ref()
+                                    .map(|(current, _)| current),
+                                &key,
+                                EnvironmentCreation::ResourceError,
+                            );
+                            let (current, _, _) = cache_update(previous, Err(error.to_string()));
+                            self.environment_sources.insert(path.clone(), current);
+                            if transition == EnvironmentTransition::Keep {
+                                log.error(format!("{path}: {error}; сохранено прежнее окружение"));
+                            } else {
+                                log.error(format!("{path}: {error}"));
+                                if let Some((_, previous)) = self.current_environment.take() {
+                                    renderer.destroy_environment(previous)?;
+                                }
+                            }
+                            self.failed_environment = Some(key);
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                self.environment_sources
+                    .insert(path.clone(), Some(replacement));
+                if let Some(environment) = gpu_replacement {
+                    let previous = self.current_environment.replace((key, environment));
+                    self.failed_environment = None;
+                    if let Some((_, previous)) = previous {
+                        renderer.destroy_environment(previous)?;
+                    }
+                } else if self.failed_environment.as_ref() == Some(&key) {
+                    self.failed_environment = None;
+                }
+            }
+            Err(error) => {
+                let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                self.environment_sources.insert(path.clone(), current);
+                if let Some(error) = error {
+                    let message = if had_previous {
+                        format!("{path}: {error}; сохранена прежняя версия HDR")
+                    } else {
+                        format!("{path}: {error}")
+                    };
+                    log.error(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Принимает изображения, декодированные в фоне, и создаёт для них GPU-ресурсы.
+    fn accept_images(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        log: &mut ConsoleLog,
+    ) -> Result<(), RenderError> {
+        self.ensure_image_loader(project);
+        for (kind, path, result) in self.images.finished() {
+            match (kind, result) {
+                (ImageKind::Texture, result) => {
+                    let data = result.map(|image| match image {
+                        DecodedImage::Texture(data) => data,
+                        DecodedImage::Hdr(_) => unreachable!("запрос текстуры вернул HDR"),
+                    });
+                    let wants = self.texture_wants.remove(&path).unwrap_or_default();
+                    for color_space in wants {
+                        self.apply_texture(
+                            renderer,
+                            log,
+                            path.clone(),
+                            color_space,
+                            data.as_ref().map_err(Clone::clone),
+                        )?;
+                    }
+                }
+                (ImageKind::Hdr, result) => {
+                    let image = result.map(|image| match image {
+                        DecodedImage::Hdr(image) => image,
+                        DecodedImage::Texture(_) => unreachable!("запрос HDR вернул текстуру"),
+                    });
+                    self.apply_hdr(renderer, log, path, image)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Декодер изображений работает с ресурсами открытого проекта; смена проекта
+    /// перезапускает его, и результаты прежнего проекта отбрасываются.
+    fn ensure_image_loader(&mut self, project: &OpenProject) {
+        if self.images_root.as_deref() != Some(project.root.as_path()) {
+            self.images.restart(project.assets.clone());
+            self.images_root = Some(project.root.clone());
+            self.texture_wants.clear();
+        }
+    }
+
+    /// Есть изображения, которые ещё декодируются: окно должно проснуться, чтобы показать их.
+    pub fn images_pending(&self) -> bool {
+        self.images.has_pending()
+    }
+
+    /// Запрашивает текстуру, если её ещё нет в кэше. PNG декодируется в фоне: до готовности
+    /// материал рисуется без неё, а готовая текстура повышает ревизию и пересобирает материалы.
     fn sync_texture(
         &mut self,
         renderer: &mut Renderer,
@@ -1019,32 +1105,23 @@ impl SceneRenderer {
         if self.textures.contains_key(&key) {
             return Ok(());
         }
-        let gpu = match project.assets.load_texture(path) {
-            Ok(data) => match renderer.create_texture_with_color_space(
-                data.width,
-                data.height,
-                &data.rgba,
-                color_space,
-            ) {
-                Ok(texture) => Some(texture),
-                Err(error) if is_resource_error(&error) => {
-                    log.error(format!("{path}: {error}"));
-                    None
-                }
-                Err(error) => return Err(error),
-            },
-            Err(error) => {
-                log.error(format!("{path}: {error}"));
-                None
-            }
-        };
-        self.textures.insert(key, gpu);
-        if self
-            .textures
-            .get(&(path.to_owned(), color_space))
-            .is_some_and(Option::is_some)
+        self.accept_images(renderer, project, log)?;
+        if self.textures.contains_key(&key)
+            || self
+                .texture_wants
+                .get(path)
+                .is_some_and(|wants| wants.contains(&color_space))
         {
-            self.bump_texture_revision((path.to_owned(), color_space));
+            return Ok(());
+        }
+        if self.images.request(ImageKind::Texture, path) {
+            self.texture_wants
+                .entry(path.to_owned())
+                .or_default()
+                .insert(color_space);
+        } else {
+            log.error(format!("{path}: фоновая загрузка недоступна"));
+            self.textures.insert(key, None);
         }
         Ok(())
     }
@@ -2218,6 +2295,12 @@ impl SceneRenderer {
             return Ok(());
         }
         if self.failed_environment.as_ref() == Some(&key) {
+            return Ok(());
+        }
+        if let Some(path) = &state.component.hdr
+            && !self.environment_sources.contains_key(path.as_str())
+        {
+            // HDR ещё декодируется в фоне: остаётся прежнее окружение или окружение по умолчанию.
             return Ok(());
         }
         let source = if let Some(path) = &state.component.hdr {
