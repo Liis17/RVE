@@ -13,7 +13,7 @@ Parent: [[Index]]
 | `engine/engine-scene/src/transform.rs` | `Transform` | Положение, вращение и масштаб с матрицей `T · R · S` |
 | `engine/engine-scene/src/camera.rs` | `Camera`, `OrbitCamera` | Перспективная камера и горизонтальная орбита вокруг цели |
 | `engine/engine-scene/src/camera_settings.rs` | `CameraSettings` | Настройки проекции, render scale, clear color и anti-aliasing для `.camerasettings`; устаревший блок `color` |
-| `engine/engine-scene/src/post_process.rs` | `PostProcessSettings`, `resolve_post_process` | Постобработка камеры из `.postprocess`, см. [[EnginePostProcess]] |
+| `engine/engine-scene/src/post_process.rs`, `engine/engine-scene/src/color_lut.rs` | `PostProcessSettings`, `resolve_post_process`, `CubeLut` | Постобработка камеры из `.postprocess` и разбор её LUT `.cube`, см. [[EnginePostProcess]] |
 | `engine/engine-scene/src/physics_material.rs` | `PhysicsMaterialSettings`, `CombineMode` | Физический материал коллайдера для `.rvephysmat`: трение покоя и скольжения, отскок, правила совмещения; загрузка разрешённого значения в объект |
 | `engine/engine-scene/src/light.rs` | `sun_direction`, `OrbitingSun`, `ShadowSettings`, `cascade_view_projections`, `point_shadow_view_projections`, `spot_shadow_view_projection` | Направление света, camera-relative каскады и Vulkan-depth матрицы point/spot shadow views без зависимости от renderer |
 | `engine/engine-scene/src/document.rs` | `SceneDocument`, компоненты, `ParamValue`, `SceneError` | Схема `.rvescene`, TOML-сериализация и проверка документов, ссылок и базисов |
