@@ -785,9 +785,14 @@ pub(crate) fn record_local_shadow_layers(
         width: LOCAL_SHADOW_MAP_RESOLUTION,
         height: LOCAL_SHADOW_MAP_RESOLUTION,
     };
-    for layer in 0..MAX_LOCAL_SHADOW_LAYERS {
+    for (layer, &layer_view) in image
+        .layer_views
+        .iter()
+        .enumerate()
+        .take(MAX_LOCAL_SHADOW_LAYERS)
+    {
         let depth_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(image.layer_views[layer])
+            .image_view(layer_view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
