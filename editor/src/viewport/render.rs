@@ -24,9 +24,9 @@ use engine_render::{
     ViewportId,
 };
 use engine_render::{
-    SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage, ScreenShaders,
+    ColorLutId, SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage,
+    ScreenShaders,
 };
-use engine_scene::PostProcessSettings;
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
 use engine_scene::light::{
@@ -40,6 +40,7 @@ use engine_scene::{
     ParticleShapeComponent, ResolvedMaterialAsset, SceneFrame, ShaderAsset, ShaderColorSpace,
     ShaderPropertyKind, Tonemapper, World,
 };
+use engine_scene::{CubeLut, PostProcessSettings};
 use engine_scene::{ScreenShaderRef, ScreenShaderStage as ScreenShaderStageDoc};
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -103,6 +104,9 @@ pub struct SceneRenderer {
     screen_shaders: HashMap<String, EditorScreenShader>,
     /// Начало отсчёта времени для экранных шейдеров (`rve.time`).
     screen_shader_started: Instant,
+    /// LUT цветокоррекции по каноническому пути `.cube`; `None` — LUT не загрузилась (ошибка уже в
+    /// консоли), камера рисуется без неё.
+    color_luts: HashMap<String, Option<ColorLutId>>,
     pub material_preview_viewport: Option<ViewportId>,
     models: HashMap<String, Option<GpuModel>>,
     model_dependencies: HashMap<String, Vec<VirtualPath>>,
@@ -353,6 +357,7 @@ impl SceneRenderer {
             particles_playing: None,
             screen_shaders: HashMap::new(),
             screen_shader_started: Instant::now(),
+            color_luts: HashMap::new(),
             playing: false,
             environment_sources: HashMap::new(),
             current_environment: None,
@@ -426,6 +431,9 @@ impl SceneRenderer {
             .filter_map(|(_, entry)| entry.id)
         {
             renderer.destroy_screen_shader(shader)?;
+        }
+        for lut in self.color_luts.drain().filter_map(|(_, lut)| lut) {
+            renderer.destroy_color_lut(lut)?;
         }
         for mesh in self.preview_meshes.drain().map(|(_, mesh)| mesh) {
             renderer.destroy_mesh(mesh)?;
@@ -652,6 +660,35 @@ impl SceneRenderer {
         }
     }
 
+    /// Создаёт LUT цветокоррекции постобработки, если её ещё нет в кэше. Ошибка пишется в консоль
+    /// один раз и не мешает кадру: камера рисуется без LUT, пока файл не изменится.
+    pub fn sync_color_lut(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        post: &PostProcessSettings,
+        log: &mut ConsoleLog,
+    ) {
+        let Some(path) = post.color_grading.lut_path() else {
+            return;
+        };
+        if self.color_luts.contains_key(path.as_str()) {
+            return;
+        }
+        let lut = match load_color_lut(renderer, project, path.as_str()) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                log.error(format!("LUT цветокоррекции: {error}"));
+                None
+            }
+        };
+        self.color_luts.insert(path.as_str().to_owned(), lut);
+    }
+
+    fn color_lut(&self, post: &PostProcessSettings) -> Option<ColorLutId> {
+        cached_color_lut(&self.color_luts, post)
+    }
+
     /// Экранные шейдеры вида. Scene-вид их не применяет: искажения мешали бы редактированию.
     fn screen_shader_view(&self, screens: &[ScreenShaderRef], with_grid: bool) -> ScreenShaders {
         let mut view = ScreenShaders {
@@ -799,6 +836,28 @@ impl SceneRenderer {
                         "экранный шейдер: {error}; сохранена прежняя версия"
                     ));
                     screen_errors.insert(path, error);
+                }
+            }
+        }
+
+        // Изменённая `.cube` пересоздаётся; ошибка оставляет прежнюю LUT.
+        let changed_luts = self
+            .color_luts
+            .keys()
+            .filter(|path| key_matches_changes(changes, path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in changed_luts {
+            match load_color_lut(renderer, project, &path) {
+                Ok(id) => {
+                    if let Some(previous) = self.color_luts.insert(path, Some(id)).flatten() {
+                        renderer.destroy_color_lut(previous)?;
+                    }
+                }
+                Err(error) => {
+                    log.error(format!(
+                        "LUT цветокоррекции: {error}; сохранена прежняя версия"
+                    ));
                 }
             }
         }
@@ -1719,7 +1778,7 @@ impl SceneRenderer {
         width: u32,
         height: u32,
         settings: CameraSettings,
-        post: PostProcessSettings,
+        post: &PostProcessSettings,
         screens: &[ScreenShaderRef],
         light: &LightState,
         local_lights: &'a [LocalLight],
@@ -1769,7 +1828,7 @@ impl SceneRenderer {
             },
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
-                post: render_post_process(&post, with_grid),
+                post: render_post_process(post, self.color_lut(post), with_grid),
                 screen_shaders: self.screen_shader_view(screens, with_grid),
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
@@ -2643,6 +2702,35 @@ struct EditorScreenShader {
     id: Option<ScreenShaderId>,
 }
 
+/// LUT постобработки из кэша; ключи — канонические пути без ведущего `/`, поэтому поиск в кадре
+/// не выделяет память. LUT, которая не загрузилась, даёт `None`.
+fn cached_color_lut(
+    luts: &HashMap<String, Option<ColorLutId>>,
+    post: &PostProcessSettings,
+) -> Option<ColorLutId> {
+    let path = post.color_grading.lut.as_deref()?;
+    luts.get(path.strip_prefix('/').unwrap_or(path))
+        .copied()
+        .flatten()
+}
+
+/// Читает и разбирает `.cube` из проекта и создаёт LUT renderer.
+fn load_color_lut(
+    renderer: &mut Renderer,
+    project: &OpenProject,
+    path: &str,
+) -> Result<ColorLutId, String> {
+    let file = project
+        .assets_dir
+        .resolve(path)
+        .map_err(|error| format!("/{path}: {error}"))?;
+    let source = std::fs::read_to_string(&file).map_err(|error| format!("/{path}: {error}"))?;
+    let lut = CubeLut::parse(format!("/{path}"), &source).map_err(|error| error.to_string())?;
+    renderer
+        .create_color_lut(lut.size(), lut.texels())
+        .map_err(|error| format!("/{path}: {error}"))
+}
+
 /// Читает `.glsl` из проекта и создаёт шейдер renderer; текст ошибки годится для инспектора.
 fn load_screen_shader(
     renderer: &mut Renderer,
@@ -3150,7 +3238,11 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
 
 /// Переводит постобработку камеры в настройки renderer. Scene-вид редактора не выполняет DoF и
 /// motion blur: эти эффекты мешают редактированию, остальные эффекты совпадают с Game-видом.
-fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProcess {
+fn render_post_process(
+    post: &PostProcessSettings,
+    lut: Option<ColorLutId>,
+    scene_view: bool,
+) -> PostProcess {
     let exposure = if post.exposure.enabled {
         Exposure {
             mode: match post.exposure.mode {
@@ -3182,7 +3274,7 @@ fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProc
     };
     let bloom = post.bloom;
     let ao = post.ambient_occlusion;
-    let grading = post.color_grading;
+    let grading = &post.color_grading;
     let vignette = post.vignette;
     let aberration = post.chromatic_aberration;
     let grain = post.film_grain;
@@ -3215,6 +3307,8 @@ fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProc
             lift: grading.lift,
             gamma: grading.gamma,
             gain: grading.gain,
+            lut,
+            lut_intensity: grading.lut_intensity,
         },
         vignette: engine_render::Vignette {
             enabled: vignette.enabled,
@@ -3325,6 +3419,34 @@ mod tests {
     use engine_scene::{
         EnvironmentComponent, LodLevel, PrefabTemplate, ProceduralSkyComponent, SpawnOptions,
     };
+
+    fn fake_lut(value: usize) -> ColorLutId {
+        // SAFETY: ColorLutId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    #[test]
+    fn color_lut_is_found_by_canonical_path_and_mapped_in_both_views() {
+        let luts = HashMap::from([
+            ("luts/film.cube".to_owned(), Some(fake_lut(3))),
+            ("luts/broken.cube".to_owned(), None),
+        ]);
+        let mut post = PostProcessSettings::default();
+        assert_eq!(cached_color_lut(&luts, &post), None);
+        post.color_grading.lut = Some("/luts/film.cube".to_owned());
+        assert_eq!(cached_color_lut(&luts, &post), Some(fake_lut(3)));
+        post.color_grading.lut = Some("luts/film.cube".to_owned());
+        assert_eq!(cached_color_lut(&luts, &post), Some(fake_lut(3)));
+        post.color_grading.lut = Some("/luts/broken.cube".to_owned());
+        assert_eq!(cached_color_lut(&luts, &post), None, "LUT с ошибкой");
+
+        post.color_grading.lut_intensity = 0.3;
+        for scene_view in [false, true] {
+            let mapped = render_post_process(&post, Some(fake_lut(3)), scene_view);
+            assert_eq!(mapped.color_grading.lut, Some(fake_lut(3)));
+            assert_eq!(mapped.color_grading.lut_intensity, 0.3);
+        }
+    }
 
     #[test]
     fn hot_reload_rebuilds_only_new_revisions_that_have_not_failed() {

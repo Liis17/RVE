@@ -24,7 +24,7 @@ use engine_scene::{
     ShaderAsset, ShaderColorSpace, ShaderLighting, ShaderPropertyKind, TextureFallback, World,
     expand,
 };
-use engine_scene::{CameraSettings, PostProcessSettings, resolve_post_process};
+use engine_scene::{CameraSettings, CubeLut, PostProcessSettings, resolve_post_process};
 use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
 use glam::Vec3;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -65,6 +65,9 @@ pub(crate) struct PreparedRenderAssets {
     /// Исходники `.glsl` экранных шейдеров камер по пути. Заполняются только для игрового клиента:
     /// headless-сервер шейдеры не читает.
     pub screen_shaders: BTreeMap<String, String>,
+    /// 3D LUT цветокоррекции камер по каноническому пути `.cube`. Как и экранные шейдеры,
+    /// читаются только игровым клиентом.
+    pub color_luts: BTreeMap<String, CubeLut>,
 }
 
 #[derive(Default)]
@@ -476,6 +479,7 @@ fn prepare_scene_with_model_loader(
         scene_hash,
         render_assets: PreparedRenderAssets {
             screen_shaders: BTreeMap::new(),
+            color_luts: BTreeMap::new(),
             models,
             textures,
             material_assets,
@@ -1515,6 +1519,71 @@ pub(crate) fn load_screen_shader_sources(
     sources
 }
 
+/// Создание LUT цветокоррекции; шов для тестов без GPU. Реализован для [`Renderer`].
+pub(crate) trait ColorLutGpu {
+    type Lut: Copy;
+
+    fn create_color_lut(&mut self, lut: &CubeLut) -> Result<Self::Lut, RenderError>;
+}
+
+impl ColorLutGpu for Renderer {
+    type Lut = engine_render::ColorLutId;
+
+    fn create_color_lut(&mut self, lut: &CubeLut) -> Result<Self::Lut, RenderError> {
+        Renderer::create_color_lut(self, lut.size(), lut.texels())
+    }
+}
+
+/// Создаёт LUT по разобранным файлам. Ошибка записывается в лог, LUT пропускается, и камера
+/// рисуется без неё, как с пропущенным экранным шейдером.
+pub(crate) fn upload_color_luts<G: ColorLutGpu>(
+    gpu: &mut G,
+    luts: &BTreeMap<String, CubeLut>,
+) -> HashMap<String, G::Lut> {
+    let mut ids = HashMap::with_capacity(luts.len());
+    for (path, lut) in luts {
+        match gpu.create_color_lut(lut) {
+            Ok(id) => {
+                ids.insert(path.clone(), id);
+            }
+            Err(error) => log::error!("LUT /{path} пропущена: {error}"),
+        }
+    }
+    ids
+}
+
+/// Канонические пути LUT цветокоррекции всех камер мира без повторов.
+pub(crate) fn color_lut_paths(world: &World) -> BTreeSet<String> {
+    world
+        .objects()
+        .iter()
+        .filter_map(|object| object.post_process.as_ref())
+        .filter_map(|post| post.color_grading.lut_path())
+        .map(|path| path.as_str().to_owned())
+        .collect()
+}
+
+/// Читает и разбирает LUT камер. Файл, который не читается или не разбирается, пропускается с
+/// записью в лог: `rve-build` проверяет LUT при сборке, а в разработке сцена продолжает работать.
+pub(crate) fn load_color_luts(
+    resources: &ResourceHandle,
+    world: &World,
+) -> BTreeMap<String, CubeLut> {
+    let mut luts = BTreeMap::new();
+    for path in color_lut_paths(world) {
+        let parsed = read_utf8(resources, &path).and_then(|source| {
+            CubeLut::parse(format!("/{path}"), &source).map_err(|error| error.to_string())
+        });
+        match parsed {
+            Ok(lut) => {
+                luts.insert(path, lut);
+            }
+            Err(error) => log::error!("LUT не загружена: {error}"),
+        }
+    }
+    luts
+}
+
 /// Как загрузка сцены отдаёт частицы объектов: эмиттеры создаются сразу, как при старте, либо
 /// отдаются описаниями, которые замена сцены создаёт по финальному хендлу объекта.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1528,6 +1597,7 @@ trait SceneUploadCleanupGpu {
     type Material: Copy + Eq + Hash;
     type Skin: Copy + Eq + Hash;
     type ScreenShader: Copy + Eq + Hash;
+    type ColorLut: Copy + Eq + Hash;
     type Particle: Copy + Eq + Hash;
     type UiTexture: Copy + Eq + Hash;
     type Texture: Copy + Eq + Hash;
@@ -1537,6 +1607,7 @@ trait SceneUploadCleanupGpu {
     fn destroy_material(&mut self, id: Self::Material) -> Result<(), String>;
     fn destroy_skin(&mut self, id: Self::Skin) -> Result<(), String>;
     fn destroy_screen_shader(&mut self, id: Self::ScreenShader) -> Result<(), String>;
+    fn destroy_color_lut(&mut self, id: Self::ColorLut) -> Result<(), String>;
     fn destroy_particle(&mut self, id: Self::Particle) -> Result<(), String>;
     fn destroy_ui_texture(&mut self, id: Self::UiTexture) -> Result<(), String>;
     fn destroy_texture(&mut self, id: Self::Texture) -> Result<(), String>;
@@ -1548,6 +1619,7 @@ impl SceneUploadCleanupGpu for Renderer {
     type Material = MaterialId;
     type Skin = engine_render::SkinId;
     type ScreenShader = engine_render::ScreenShaderId;
+    type ColorLut = engine_render::ColorLutId;
     type Particle = engine_render::ParticleEmitterId;
     type UiTexture = engine_render::UiTextureId;
     type Texture = TextureId;
@@ -1567,6 +1639,10 @@ impl SceneUploadCleanupGpu for Renderer {
 
     fn destroy_screen_shader(&mut self, id: Self::ScreenShader) -> Result<(), String> {
         Renderer::destroy_screen_shader(self, id).map_err(|error| error.to_string())
+    }
+
+    fn destroy_color_lut(&mut self, id: Self::ColorLut) -> Result<(), String> {
+        Renderer::destroy_color_lut(self, id).map_err(|error| error.to_string())
     }
 
     fn destroy_particle(&mut self, id: Self::Particle) -> Result<(), String> {
@@ -1591,6 +1667,7 @@ struct SceneUploadResources<G: SceneUploadCleanupGpu> {
     materials: HashSet<G::Material>,
     skins: HashSet<G::Skin>,
     screen_shaders: HashSet<G::ScreenShader>,
+    color_luts: HashSet<G::ColorLut>,
     particles: HashSet<G::Particle>,
     ui_textures: HashSet<G::UiTexture>,
     textures: HashSet<G::Texture>,
@@ -1604,6 +1681,7 @@ impl<G: SceneUploadCleanupGpu> Default for SceneUploadResources<G> {
             materials: HashSet::new(),
             skins: HashSet::new(),
             screen_shaders: HashSet::new(),
+            color_luts: HashSet::new(),
             particles: HashSet::new(),
             ui_textures: HashSet::new(),
             textures: HashSet::new(),
@@ -1637,6 +1715,11 @@ impl<G: SceneUploadCleanupGpu> SceneUploadResources<G> {
         for id in self.screen_shaders.drain() {
             if let Err(error) = gpu.destroy_screen_shader(id) {
                 log::error!("failed to release partially uploaded scene screen shader: {error}");
+            }
+        }
+        for id in self.color_luts.drain() {
+            if let Err(error) = gpu.destroy_color_lut(id) {
+                log::error!("failed to release partially uploaded scene color LUT: {error}");
             }
         }
         for id in self.ui_textures.drain() {
@@ -1811,6 +1894,10 @@ pub(crate) fn upload_scene(
         created
             .screen_shaders
             .extend(table.screen_shaders.values().copied());
+        table.color_luts = upload_color_luts(renderer, &assets.color_luts);
+        created
+            .color_luts
+            .extend(table.color_luts.values().copied());
         for path in &animated {
             // Мосту нужны скелет и клипы; вершины остаются только в GPU-таблице.
             if let Some(model) = assets.models.get(*path) {
@@ -2437,10 +2524,11 @@ fn upload_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuTextureCache, MaterialAssetView, MaterialTextureSource, PreparedMaterialAssets,
-        PreparedPrefabs, ScreenShaderGpu, get_or_insert_gpu, load_scene,
-        load_screen_shader_sources, material_cache_key, prepare_scene_with_model_loader,
-        resolve_material, resolve_material_asset, screen_shader_paths, upload_screen_shaders,
+        ColorLutGpu, CubeLut, GpuTextureCache, MaterialAssetView, MaterialTextureSource,
+        PreparedMaterialAssets, PreparedPrefabs, ScreenShaderGpu, color_lut_paths,
+        get_or_insert_gpu, load_color_luts, load_scene, load_screen_shader_sources,
+        material_cache_key, prepare_scene_with_model_loader, resolve_material,
+        resolve_material_asset, screen_shader_paths, upload_color_luts, upload_screen_shaders,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
@@ -3127,6 +3215,94 @@ id = "camera"
     /// Сцена с двумя камерами, которые ссылаются на общий шейдер; `broken` и `missing` — плохие пути.
     fn screen_shader_scene() -> &'static str {
         "[[assets]]\npath = \"/fx/vhs.glsl\"\n[[assets]]\npath = \"/fx/broken.glsl\"\n[[assets]]\npath = \"/fx/missing.glsl\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects.camera.screen_shaders]]\nshader = \"/fx/vhs.glsl\"\nstage = \"after_post\"\n[[objects.camera.screen_shaders]]\nshader = \"/fx/broken.glsl\"\nstage = \"before_post\"\n[[objects]]\nid = \"second\"\n[objects.camera]\n[[objects.camera.screen_shaders]]\nshader = \"/fx/vhs.glsl\"\nstage = \"after_post\"\n[[objects.camera.screen_shaders]]\nshader = \"/fx/missing.glsl\"\nstage = \"after_post\"\n"
+    }
+
+    /// Создание LUT без GPU: LUT стороны 3 отклоняется, остальные получают номер создания.
+    #[derive(Default)]
+    struct FakeLutGpu {
+        created: Vec<u32>,
+    }
+
+    impl ColorLutGpu for FakeLutGpu {
+        type Lut = usize;
+
+        fn create_color_lut(&mut self, lut: &CubeLut) -> Result<usize, RenderError> {
+            self.created.push(lut.size());
+            if lut.size() == 3 {
+                return Err(RenderError::InvalidConfig("тестовая ошибка LUT"));
+            }
+            Ok(self.created.len())
+        }
+    }
+
+    fn cube_source(size: u32) -> String {
+        let mut source = format!("LUT_3D_SIZE {size}\n");
+        for _ in 0..size.pow(3) {
+            source.push_str("0.5 0.5 0.5\n");
+        }
+        source
+    }
+
+    #[test]
+    fn color_luts_of_camera_post_processes_are_read_once_and_bad_luts_are_skipped() {
+        let project = TempProject::new();
+        let camera = |id: &str, post: &str| {
+            let active = id == "a";
+            format!(
+                "[[objects]]\nid = \"{id}\"\n[objects.camera]\nactive = {active}\npost_process = \"/post/{post}.postprocess\"\n"
+            )
+        };
+        let scene = format!(
+            "[[assets]]\npath = \"/post/film.postprocess\"\n[[assets]]\npath = \"/post/odd.postprocess\"\n[[assets]]\npath = \"/post/broken.postprocess\"\n[[assets]]\npath = \"/post/missing.postprocess\"\n{}{}{}{}{}",
+            camera("a", "film"),
+            camera("b", "film"),
+            camera("c", "odd"),
+            camera("d", "broken"),
+            camera("e", "missing"),
+        );
+        project.write("scene.rvescene", scene.as_bytes());
+        let post =
+            |lut: &str| format!("[color_grading]\nenabled = true\nlut = \"/luts/{lut}.cube\"\n");
+        project.write("post/film.postprocess", post("film").as_bytes());
+        project.write("post/odd.postprocess", post("odd").as_bytes());
+        project.write("post/broken.postprocess", post("broken").as_bytes());
+        project.write("post/missing.postprocess", post("missing").as_bytes());
+        project.write("luts/film.cube", cube_source(2).as_bytes());
+        project.write("luts/odd.cube", cube_source(3).as_bytes());
+        project.write("luts/broken.cube", b"LUT_1D_SIZE 2\n");
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        assert_eq!(
+            color_lut_paths(&prepared.world)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [
+                "luts/broken.cube",
+                "luts/film.cube",
+                "luts/missing.cube",
+                "luts/odd.cube"
+            ],
+            "пути всех камер без повторов"
+        );
+        let luts = load_color_luts(&resources.system.handle(), &prepared.world);
+        assert_eq!(
+            luts.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["luts/film.cube", "luts/odd.cube"],
+            "нечитаемая и неразборчивая LUT пропущены"
+        );
+        let mut gpu = FakeLutGpu::default();
+        let ids = upload_color_luts(&mut gpu, &luts);
+        assert_eq!(gpu.created.len(), 2, "каждый путь создаётся один раз");
+        assert!(ids.contains_key("luts/film.cube"));
+        assert!(
+            !ids.contains_key("luts/odd.cube"),
+            "ошибка GPU пропускает LUT"
+        );
     }
 
     /// Создание шейдеров без GPU: `broken` отклоняется, остальные получают номер создания.
@@ -4178,6 +4354,7 @@ mod scene_upload_rollback_tests {
         ErrorMaterial,
         Skin,
         ScreenShader,
+        ColorLut,
         Particle,
         UiTexture,
         Texture,
@@ -4224,6 +4401,7 @@ mod scene_upload_rollback_tests {
         type Material = usize;
         type Skin = usize;
         type ScreenShader = usize;
+        type ColorLut = usize;
         type Particle = usize;
         type UiTexture = usize;
         type Texture = usize;
@@ -4240,6 +4418,9 @@ mod scene_upload_rollback_tests {
         }
         fn destroy_screen_shader(&mut self, id: usize) -> Result<(), String> {
             self.release(Kind::ScreenShader, id)
+        }
+        fn destroy_color_lut(&mut self, id: usize) -> Result<(), String> {
+            self.release(Kind::ColorLut, id)
         }
         fn destroy_particle(&mut self, id: usize) -> Result<(), String> {
             self.release(Kind::Particle, id)
@@ -4265,6 +4446,7 @@ mod scene_upload_rollback_tests {
             Kind::SurfaceShader,
             Kind::UiTexture,
             Kind::ScreenShader,
+            Kind::ColorLut,
             Kind::Skin,
             Kind::Particle,
         ];
@@ -4322,6 +4504,9 @@ mod scene_upload_rollback_tests {
                     }
                     Kind::ScreenShader => {
                         resources.screen_shaders.insert(id);
+                    }
+                    Kind::ColorLut => {
+                        resources.color_luts.insert(id);
                     }
                     Kind::Particle => {
                         resources.particles.insert(id);

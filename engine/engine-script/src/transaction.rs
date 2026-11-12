@@ -2366,7 +2366,7 @@ impl ScriptTransaction {
         }
         for (handle, settings) in &self.pending_post_process {
             world
-                .set_post_process(*handle, *settings)
+                .set_post_process(*handle, settings.clone())
                 .map_err(|error| error.to_string())?;
         }
         for ((handle, slot), state) in &self.pending_screen_shaders {
@@ -3011,8 +3011,8 @@ impl ScriptTransaction {
     pub(crate) fn post_process(&self, handle: ObjectHandle) -> Option<PostProcessSettings> {
         self.pending_post_process
             .get(&handle)
-            .copied()
-            .or_else(|| self.world()?.post_process(handle).copied())
+            .cloned()
+            .or_else(|| self.world()?.post_process(handle).cloned())
     }
 
     pub(crate) fn set_post_process(
@@ -3027,13 +3027,21 @@ impl ScriptTransaction {
         true
     }
 
+    /// Запись из Rust-модуля. `RvePostProcessSettings` не содержит LUT, поэтому LUT и её
+    /// интенсивность берутся из текущей постобработки камеры, а не сбрасываются.
     pub(crate) fn set_post_process_from_abi(
         &mut self,
         handle: u64,
-        settings: PostProcessSettings,
+        mut settings: PostProcessSettings,
     ) -> bool {
-        self.object_from_abi_handle(handle)
-            .is_some_and(|handle| self.set_post_process(handle, settings))
+        let Some(handle) = self.object_from_abi_handle(handle) else {
+            return false;
+        };
+        if let Some(current) = self.post_process(handle) {
+            settings.color_grading.lut = current.color_grading.lut;
+            settings.color_grading.lut_intensity = current.color_grading.lut_intensity;
+        }
+        self.set_post_process(handle, settings)
     }
 
     /// Число экранных шейдеров камеры; `None`, если объект не камера.

@@ -376,16 +376,10 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         assert!(error.to_string().contains("0 и 180"));
     }
 
-    #[test]
-    fn rejects_invalid_postprocess_during_project_preparation() {
-        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-postprocess").unwrap();
-        create_demo_like_project(project_root.path());
-        let assets = project_root.path().join("Assets");
-        fs::write(
-            assets.join("cameras/post.postprocess"),
-            "[bloom]\nenabled = true\nintensity = -1.0\n",
-        )
-        .unwrap();
+    /// Записывает `/cameras/post.postprocess` и подключает его к камере главной сцены.
+    fn attach_post_process(project: &Path, post: &str) {
+        let assets = project.join("Assets");
+        fs::write(assets.join("cameras/post.postprocess"), post).unwrap();
         let scene = assets.join("scenes/main.rvescene");
         let source = fs::read_to_string(&scene).unwrap();
         let patched = source
@@ -404,6 +398,62 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
             "fixture scene must reference the post process file"
         );
         fs::write(&scene, patched).unwrap();
+    }
+
+    const LUT_POST: &str = "[color_grading]\nenabled = true\nlut = \"/luts/film.cube\"\n";
+
+    #[test]
+    fn packs_the_color_lut_of_a_postprocess_with_its_owner() {
+        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-lut").unwrap();
+        create_demo_like_project(project_root.path());
+        attach_post_process(project_root.path(), LUT_POST);
+        let luts = project_root.path().join("Assets/luts");
+        fs::create_dir_all(&luts).unwrap();
+        fs::write(
+            luts.join("film.cube"),
+            "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        )
+        .unwrap();
+        fs::write(luts.join("unused.cube"), "LUT_3D_SIZE 2\n").unwrap();
+        let project = prepare_project(project_root.path()).unwrap();
+        let archives_dir = project_root.path().join("out-assets");
+        let registry = build_project_archives(&project, &archives_dir).unwrap();
+        let assignments = file_assignments(&registry);
+        assert_eq!(
+            assignments["/luts/film.cube"],
+            assignments["/cameras/post.postprocess"]
+        );
+        assert!(!assignments.contains_key("/luts/unused.cube"));
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_color_lut_during_project_preparation() {
+        for (name, contents) in [("missing", None), ("invalid", Some("LUT_1D_SIZE 2\n"))] {
+            let project_root =
+                TempDir::create(&std::env::temp_dir(), &format!("rve-build-lut-{name}")).unwrap();
+            create_demo_like_project(project_root.path());
+            attach_post_process(project_root.path(), LUT_POST);
+            if let Some(contents) = contents {
+                let luts = project_root.path().join("Assets/luts");
+                fs::create_dir_all(&luts).unwrap();
+                fs::write(luts.join("film.cube"), contents).unwrap();
+            }
+            let error = prepare_project(project_root.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("/luts/film.cube"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_postprocess_during_project_preparation() {
+        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-postprocess").unwrap();
+        create_demo_like_project(project_root.path());
+        attach_post_process(
+            project_root.path(),
+            "[bloom]\nenabled = true\nintensity = -1.0\n",
+        );
         let error = prepare_project(project_root.path()).unwrap_err();
         assert!(
             error.to_string().contains("/cameras/post.postprocess"),

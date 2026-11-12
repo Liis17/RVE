@@ -8,7 +8,7 @@ use crate::screen_shader::{ScreenChain, ScreenShaderStage, ScreenShaders};
 use crate::{DebugView, Tonemapper};
 
 /// Число `vec4` в push constants composite-прохода (tonemap.frag).
-pub const COMPOSITE_PUSH_VECTORS: usize = 6;
+pub const COMPOSITE_PUSH_VECTORS: usize = 7;
 /// Размер push constants composite-прохода в байтах.
 pub const COMPOSITE_PUSH_CONSTANTS_SIZE: usize = COMPOSITE_PUSH_VECTORS * 16;
 /// Число `vec4` в push constants output-прохода (output.frag).
@@ -116,6 +116,9 @@ impl PostProcess {
                 .all(|value| in_range(value, 0.0, 4.0))
         {
             return Err("color grading lift, gamma и gain вне допустимых диапазонов");
+        }
+        if !in_range(grading.lut_intensity, 0.0, 1.0) {
+            return Err("color grading lut_intensity должен находиться в [0, 1]");
         }
         let vignette = self.vignette;
         if !(in_range(vignette.intensity, 0.0, 1.0)
@@ -263,7 +266,11 @@ impl Default for AmbientOcclusion {
     }
 }
 
-/// Цветокоррекция в linear HDR до tonemapping и lift/gamma/gain после него.
+/// Идентификатор 3D LUT цветокоррекции, созданной [`crate::Renderer::create_color_lut`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColorLutId(pub(crate) usize);
+
+/// Цветокоррекция в linear HDR до tonemapping, lift/gamma/gain после него и 3D LUT в конце.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorGrading {
     pub enabled: bool,
@@ -274,6 +281,10 @@ pub struct ColorGrading {
     pub lift: [f32; 3],
     pub gamma: [f32; 3],
     pub gain: [f32; 3],
+    /// 3D LUT, применяемая к sRGB-кодированному цвету после lift/gamma/gain; `None` — без LUT.
+    pub lut: Option<ColorLutId>,
+    /// Доля LUT в `[0, 1]`: 0 — исходный цвет, 1 — полностью цвет LUT.
+    pub lut_intensity: f32,
 }
 
 impl Default for ColorGrading {
@@ -287,6 +298,8 @@ impl Default for ColorGrading {
             lift: [0.0; 3],
             gamma: [1.0; 3],
             gain: [1.0; 3],
+            lut: None,
+            lut_intensity: 1.0,
         }
     }
 }
@@ -547,6 +560,11 @@ pub fn composite_params(
         } else {
             (0.0, 0.0, 1.0, [0.0; 3])
         };
+    // LUT применяется только при включённой цветокоррекции; 0 выключает выборку в шейдере.
+    let lut_intensity = match grading.lut {
+        Some(_) if plan.color_grading => grading.lut_intensity,
+        _ => 0.0,
+    };
     // Флаги композита: бит 0 — bloom, бит 1 — экспозиция по гистограмме (читается из буфера).
     let flags =
         f32::from(u8::from(plan.bloom_mips > 0)) + 2.0 * f32::from(u8::from(plan.auto_exposure));
@@ -573,8 +591,14 @@ pub fn composite_params(
                 vignette_color[2],
                 vignette_roundness,
             ],
+            [lut_intensity, 0.0, 0.0, 0.0],
         ],
     }
+}
+
+/// LUT, которую composite вида должен привязать: `None` — встроенная identity LUT.
+pub fn planned_color_lut(post: &PostProcess, plan: &PostPlan) -> Option<ColorLutId> {
+    post.color_grading.lut.filter(|_| plan.color_grading)
 }
 
 /// Число бинов гистограммы экспозиции (совпадает с exposure_histogram.wgsl).
@@ -941,6 +965,7 @@ mod tests {
                 [1.0, 1.0, 1.0, 0.0],
                 [1.0, 1.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
             ]
         );
     }
@@ -984,6 +1009,52 @@ mod tests {
         assert_eq!(f32::from_ne_bytes(bytes[32..36].try_into().unwrap()), 0.25);
         assert_eq!(f32::from_ne_bytes(bytes[36..40].try_into().unwrap()), 0.5);
         assert_eq!(f32::from_ne_bytes(bytes[40..44].try_into().unwrap()), 0.75);
+    }
+
+    #[test]
+    fn color_lut_applies_only_with_enabled_grading_in_lit_view() {
+        let mut post = PostProcess::default();
+        post.color_grading.lut = Some(ColorLutId(4));
+        post.color_grading.lut_intensity = 0.6;
+        let disabled = build_plan(&post, DebugView::Lit, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &disabled, DebugView::Lit).vectors[6][0],
+            0.0
+        );
+        assert_eq!(planned_color_lut(&post, &disabled), None);
+
+        post.color_grading.enabled = true;
+        let lit = build_plan(&post, DebugView::Lit, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &lit, DebugView::Lit).vectors[6][0],
+            0.6
+        );
+        assert_eq!(planned_color_lut(&post, &lit), Some(ColorLutId(4)));
+        let bytes = composite_params(&post, &lit, DebugView::Lit).to_bytes();
+        assert_eq!(f32::from_ne_bytes(bytes[96..100].try_into().unwrap()), 0.6);
+
+        let wireframe = build_plan(&post, DebugView::Wireframe, (64, 64), (64, 64));
+        assert_eq!(planned_color_lut(&post, &wireframe), None);
+    }
+
+    #[test]
+    fn enabled_grading_without_lut_keeps_lut_intensity_zero() {
+        let mut post = PostProcess::default();
+        post.color_grading.enabled = true;
+        let lit = build_plan(&post, DebugView::Lit, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &lit, DebugView::Lit).vectors[6][0],
+            0.0
+        );
+    }
+
+    #[test]
+    fn lut_intensity_outside_unit_range_is_rejected() {
+        for intensity in [-0.01, 1.01, f32::NAN] {
+            let mut post = PostProcess::default();
+            post.color_grading.lut_intensity = intensity;
+            assert!(post.validate().is_err(), "{intensity}");
+        }
     }
 
     #[test]
@@ -1274,7 +1345,7 @@ mod tests {
 
     #[test]
     fn push_constant_sizes_fit_the_shared_layout() {
-        assert_eq!(COMPOSITE_PUSH_CONSTANTS_SIZE, 96);
+        assert_eq!(COMPOSITE_PUSH_CONSTANTS_SIZE, 112);
         assert_eq!(OUTPUT_PUSH_CONSTANTS_SIZE, 32);
     }
 

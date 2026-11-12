@@ -15,7 +15,7 @@ use std::sync::Arc;
 use engine_animation::AnimationBridge;
 use engine_assets::Assets;
 use engine_project::PhysicsSettings;
-use engine_render::{MaterialId, MeshId, ScreenShaderId, SkinId};
+use engine_render::{ColorLutId, MaterialId, MeshId, ScreenShaderId, SkinId};
 use engine_resources::ResourceHandle;
 use engine_scene::{ObjectHandle, World};
 use engine_script::{ScriptHost, ScriptTime};
@@ -24,8 +24,8 @@ use crate::game_ui::{PreparedUi, UiRegistry};
 use crate::pipeline::{GpuSceneTable, SpawnPhysics, detach_object_render_data};
 use crate::prefabs::{ParticleRequest, PrefabLoads, RenderResourceRequest};
 use crate::scene::{
-    PreparedPrefabs, PreparedRenderAssets, PreparedScene, load_scene, load_screen_shader_sources,
-    screen_shader_paths,
+    PreparedPrefabs, PreparedRenderAssets, PreparedScene, color_lut_paths, load_color_luts,
+    load_scene, load_screen_shader_sources, screen_shader_paths,
 };
 
 /// Загрузчик сцен проекта: читает `.rvescene` и ассеты тем же `ResourceHandle`, что и старт.
@@ -33,7 +33,7 @@ use crate::scene::{
 pub(crate) struct SceneLoader {
     resources: ResourceHandle,
     physics: PhysicsSettings,
-    /// Исходники экранных шейдеров нужны только GPU-клиенту, как при старте.
+    /// Исходники экранных шейдеров и LUT нужны только GPU-клиенту, как при старте.
     screen_shaders: bool,
 }
 
@@ -61,6 +61,7 @@ impl SceneLoader {
         if self.screen_shaders {
             prepared.render_assets.screen_shaders =
                 load_screen_shader_sources(&self.resources, &prepared.world);
+            prepared.render_assets.color_luts = load_color_luts(&self.resources, &prepared.world);
         }
         let geometry = prepared.physics_geometry();
         prepared.build_physics(&geometry, &self.physics)?;
@@ -89,6 +90,7 @@ pub(crate) struct SceneGpuIds {
     pub materials: HashSet<MaterialId>,
     pub skins: HashSet<SkinId>,
     pub screen_shaders: HashSet<ScreenShaderId>,
+    pub color_luts: HashSet<ColorLutId>,
     pub ui_scene_owners: HashSet<u64>,
     /// Scene generations that own cached particle textures.
     pub cache_owners: HashSet<u64>,
@@ -116,6 +118,7 @@ impl SceneGpuIds {
         }
         ids.screen_shaders
             .extend(table.screen_shaders.values().copied());
+        ids.color_luts.extend(table.color_luts.values().copied());
         ids.ui_scene_owners
             .extend(table.ui_scene_owners.iter().copied());
         ids.cache_owners
@@ -130,6 +133,7 @@ impl SceneGpuIds {
             && self.materials.is_empty()
             && self.skins.is_empty()
             && self.screen_shaders.is_empty()
+            && self.color_luts.is_empty()
             && self.ui_scene_owners.is_empty()
             && self.cache_owners.is_empty()
     }
@@ -140,6 +144,7 @@ impl SceneGpuIds {
         self.skins.extend(other.skins.iter().copied());
         self.screen_shaders
             .extend(other.screen_shaders.iter().copied());
+        self.color_luts.extend(other.color_luts.iter().copied());
         self.ui_scene_owners
             .extend(other.ui_scene_owners.iter().copied());
         self.cache_owners.extend(other.cache_owners.iter().copied());
@@ -152,6 +157,7 @@ impl SceneGpuIds {
             materials: difference(&self.materials, &live.materials),
             skins: difference(&self.skins, &live.skins),
             screen_shaders: difference(&self.screen_shaders, &live.screen_shaders),
+            color_luts: difference(&self.color_luts, &live.color_luts),
             ui_scene_owners: difference(&self.ui_scene_owners, &live.ui_scene_owners),
             cache_owners: difference(&self.cache_owners, &live.cache_owners),
         }
@@ -163,6 +169,7 @@ impl SceneGpuIds {
             materials: overlap(&self.materials, &live.materials),
             skins: overlap(&self.skins, &live.skins),
             screen_shaders: overlap(&self.screen_shaders, &live.screen_shaders),
+            color_luts: overlap(&self.color_luts, &live.color_luts),
             ui_scene_owners: overlap(&self.ui_scene_owners, &live.ui_scene_owners),
             cache_owners: overlap(&self.cache_owners, &live.cache_owners),
         }
@@ -422,6 +429,10 @@ impl SceneSwitch {
         gpu.screen_shaders
             .retain(|path, _| shader_paths.contains(path));
         gpu.screen_shaders.extend(table.screen_shaders);
+        // LUT живут по путям постобработки камер мира по тому же правилу, что экранные шейдеры.
+        let lut_paths = color_lut_paths(ctx.world);
+        gpu.color_luts.retain(|path, _| lut_paths.contains(path));
+        gpu.color_luts.extend(table.color_luts);
         gpu.ui_scene_owners.extend(table.ui_scene_owners);
 
         ctx.animation.replace_objects(
@@ -518,7 +529,7 @@ mod tests {
 #[cfg(test)]
 mod commit_tests {
     use super::*;
-    use engine_render::ScreenShaderId;
+    use engine_render::{ColorLutId, ScreenShaderId};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_script::{PrefabStatus, ScriptFrameTime, ScriptLoadOptions};
     use std::fs;
@@ -909,6 +920,11 @@ return Script
 
     fn fake_material(value: usize) -> MaterialId {
         // SAFETY: MaterialId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    fn fake_lut(value: usize) -> ColorLutId {
+        // SAFETY: ColorLutId — обёртка над одним usize; любое значение допустимо для теста.
         unsafe { std::mem::transmute(value) }
     }
 
@@ -1339,6 +1355,9 @@ return Script
         table
             .screen_shaders
             .insert("fx/a.glsl".to_owned(), fake_shader(10));
+        table
+            .color_luts
+            .insert("luts/a.cube".to_owned(), fake_lut(12));
         table.ui_scene_owners.insert(1);
         rig.load_with_table("levels/clash.rvescene", table).unwrap();
 
@@ -1350,8 +1369,10 @@ return Script
         assert_eq!(released[0].meshes, HashSet::from([fake_mesh(11)]));
         assert_eq!(released[0].materials, HashSet::from([fake_material(11)]));
         assert_eq!(released[0].screen_shaders, HashSet::from([fake_shader(10)]));
+        assert_eq!(released[0].color_luts, HashSet::from([fake_lut(12)]));
         assert_eq!(released[0].ui_scene_owners, HashSet::from([1]));
         assert!(rig.gpu.screen_shaders.is_empty());
+        assert!(rig.gpu.color_luts.is_empty());
     }
 
     #[test]

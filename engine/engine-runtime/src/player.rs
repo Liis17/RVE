@@ -903,6 +903,7 @@ impl WindowHandler for PlayerWindow<'_> {
                 .with_scene_skin_instances(gpu_scene.skin_instance_ids())
                 .with_ui_images(std::mem::take(&mut gpu_scene.ui_images))
                 .with_scene_screen_shaders(gpu_scene.screen_shader_ids())
+                .with_scene_color_luts(gpu_scene.color_lut_ids())
                 .with_material_uploads(Arc::clone(&self.render_assets), material_caches);
         let backend = match self.platform.take_screenshot_queue() {
             Some(screenshots) => backend.with_screenshots(screenshots),

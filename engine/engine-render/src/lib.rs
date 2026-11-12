@@ -41,6 +41,7 @@ use ui::{
 mod ambient_occlusion;
 mod bloom;
 mod clusters;
+mod color_lut;
 mod culling;
 mod exposure;
 mod filters;
@@ -53,6 +54,11 @@ use ambient_occlusion::{AoPipelines, AoRecord, AoTarget, record_ambient_occlusio
 use bloom::{
     BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
 };
+use color_lut::{
+    COLOR_LUT_FORMAT, IDENTITY_LUT_SIZE, color_lut_bytes, identity_color_lut, validate_color_lut,
+    write_composite_lut,
+};
+pub use color_lut::{MAX_COLOR_LUT_SIZE, MIN_COLOR_LUT_SIZE};
 #[cfg(windows)]
 use exposure::{EXPOSURE_SCALE_OFFSET, buffer_barrier as exposure_buffer_barrier};
 use exposure::{
@@ -71,7 +77,7 @@ pub use particles::{
 };
 pub use post::{
     AmbientOcclusion, AmbientOcclusionQuality, Bloom, ChromaticAberration, ColorGrading,
-    DepthOfField, Exposure, ExposureMode, FilmGrain, MotionBlur, PostProcess, Vignette,
+    ColorLutId, DepthOfField, Exposure, ExposureMode, FilmGrain, MotionBlur, PostProcess, Vignette,
 };
 use post::{COMPOSITE_PUSH_CONSTANTS_SIZE, OUTPUT_PUSH_CONSTANTS_SIZE, PostFrame};
 #[cfg(any(test, all(windows, feature = "dlss")))]
@@ -1506,6 +1512,8 @@ pub struct Renderer {
     viewport_output_pipeline: Option<vk::Pipeline>,
     /// Пайплайны экранных шейдеров по `ScreenShaderId`; `None` — шейдер уничтожен.
     screen_shaders: Vec<Option<ScreenShaderPipelines>>,
+    /// 3D LUT цветокоррекции по `ColorLutId`; индекс 0 — встроенная identity LUT, `None` — уничтожена.
+    color_luts: Vec<Option<DeviceImage>>,
     /// Layout экранных проходов; создаётся вместе с первым шейдером.
     screen_shader_layout: Option<ScreenShaderLayout>,
     overlay_pipeline_layout: Option<vk::PipelineLayout>,
@@ -1704,6 +1712,7 @@ impl Renderer {
             max_texture_size: 0,
             meshes: Vec::new(),
             textures: Vec::new(),
+            color_luts: Vec::new(),
             materials: Vec::new(),
             surface_shaders: Vec::new(),
             ui_textures: Vec::new(),
@@ -2511,6 +2520,39 @@ impl Renderer {
         Ok(())
     }
 
+    /// Создаёт 3D LUT цветокоррекции стороны `size` из `size³` узлов RGB; красный меняется быстрее
+    /// всего, затем зелёный и синий (порядок `.cube`). Вход LUT — sRGB-кодированный цвет в `[0, 1]`.
+    /// Загрузка синхронная; ошибка проверки не меняет состояние renderer.
+    pub fn create_color_lut(
+        &mut self,
+        size: u32,
+        texels: &[[f32; 3]],
+    ) -> Result<ColorLutId, RenderError> {
+        validate_color_lut(size, texels)?;
+        let lut = self.upload_color_lut(size, &color_lut_bytes(texels))?;
+        self.color_luts.push(Some(lut));
+        Ok(ColorLutId(self.color_luts.len() - 1))
+    }
+
+    /// Удаляет LUT; изображение освобождается после кадров, которые могли его читать.
+    /// Ссылка на удалённую LUT в `PostProcess` даёт `InvalidConfig`.
+    pub fn destroy_color_lut(&mut self, lut: ColorLutId) -> Result<(), RenderError> {
+        let unknown =
+            || RenderError::InvalidTexture("ColorLutId не принадлежит renderer".to_owned());
+        // Встроенная identity LUT не выдаётся наружу.
+        if lut.0 == 0 {
+            return Err(unknown());
+        }
+        let image = self
+            .color_luts
+            .get_mut(lut.0)
+            .and_then(Option::take)
+            .ok_or_else(unknown)?;
+        self.retired
+            .retire(RetiredResource::Image(Box::new(image)), 0);
+        Ok(())
+    }
+
     /// Проверяет параметры экранных шейдеров вида и то, что каждый проход ссылается на живой шейдер.
     fn validate_screen_shaders(&self, shaders: &ScreenShaders) -> Result<(), RenderError> {
         shaders.validate().map_err(RenderError::InvalidConfig)?;
@@ -2555,6 +2597,7 @@ impl Renderer {
         validate_overlay(frame.overlay)?;
         validate_frame_ui(frame.ui)?;
         self.validate_screen_shaders(&frame.view.screen_shaders)?;
+        self.validate_color_lut(&frame.view.post)?;
         let view = effective_view_settings(frame.view, frame.debug_view);
         self.miss_unlisted_viewports(&[]);
         let output_extent = self
@@ -3178,6 +3221,11 @@ impl Renderer {
                 bloom_pipelines,
                 exposure_pipelines,
                 exposure_dt_ms,
+                color_lut: color_lut_view(
+                    &self.color_luts,
+                    post::planned_color_lut(&view.post, &post_frame.plan),
+                )
+                .ok_or(RenderError::InvalidState("LUT цветокоррекции отсутствует"))?,
                 reset_history: frame.reset_history,
                 filter_pipelines,
                 ao_pipelines,
@@ -3444,6 +3492,7 @@ impl Renderer {
             validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
             validate_draws(frame.draws, &self.meshes, &self.materials)?;
             self.validate_screen_shaders(&frame.view.screen_shaders)?;
+            self.validate_color_lut(&frame.view.post)?;
             self.validate_skin_draws(frame)?;
             self.viewports
                 .get(viewport.0)
@@ -4132,6 +4181,7 @@ impl Renderer {
                 (!tickets.is_empty()).then_some((entry.0, tickets))
             })
             .collect::<Vec<_>>();
+        let color_luts = &self.color_luts;
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -4208,6 +4258,15 @@ impl Renderer {
                             bloom_pipelines,
                             exposure_pipelines,
                             exposure_dt_ms: *frame_delta_ms,
+                            // Ссылка проверена до acquire; identity LUT существует всегда.
+                            color_lut: color_lut_view(
+                                color_luts,
+                                post::planned_color_lut(
+                                    &effective_view_settings(frame.view, frame.debug_view).post,
+                                    &post_frame.plan,
+                                ),
+                            )
+                            .unwrap_or_default(),
                             reset_history: frame.reset_history,
                             filter_pipelines,
                             ao_pipelines,
@@ -4384,6 +4443,7 @@ impl Renderer {
                         view_exposure,
                     ),
                     exposure_buffer,
+                    lut: pass.color_lut,
                     screen_before: chain_record(
                         target.screen_before.as_mut(),
                         &pass.post.screen_before,
@@ -5475,6 +5535,7 @@ impl Renderer {
         self.create_particle_pipelines()?;
         self.create_environment_resources()?;
         self.create_default_environment()?;
+        self.create_identity_color_lut()?;
         self.create_mesh_pipeline()?;
         self.create_skybox_pipeline()?;
         self.create_shadow_pipeline()?;
@@ -5747,10 +5808,16 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let post_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&post_bindings);
-        // SAFETY: composite, output and fullscreen post shaders read bindings 0, 1 and (composite) 2.
+        // SAFETY: composite, output and fullscreen post shaders read bindings 0, 1 and
+        // (composite) 2-4: bloom, exposure buffer and 3D LUT.
         self.post_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&post_layout_info, None) }?);
 
@@ -5913,7 +5980,7 @@ impl Renderer {
         let post_pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(post_set_count * 2),
+                .descriptor_count(post_set_count * 3),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(post_set_count),
@@ -6098,6 +6165,97 @@ impl Renderer {
         self.brdf_image =
             Some(self.upload_16bit_image(64, 64, vk::Format::R16G16_SFLOAT, 4, &lut_bytes)?);
         Ok(())
+    }
+
+    /// Встроенная identity LUT (`ColorLutId` 0): composite всегда читает binding 4.
+    fn create_identity_color_lut(&mut self) -> Result<(), RenderError> {
+        let lut = self.upload_color_lut(
+            IDENTITY_LUT_SIZE,
+            &color_lut_bytes(&identity_color_lut(IDENTITY_LUT_SIZE)),
+        )?;
+        self.color_luts.push(Some(lut));
+        Ok(())
+    }
+
+    /// Загружает 3D LUT RGBA16F стороны `size` одной синхронной отправкой.
+    fn upload_color_lut(&self, size: u32, bytes: &[u8]) -> Result<DeviceImage, RenderError> {
+        let device = self.device()?;
+        let image = DeviceImage::new_3d(
+            self.instance()?,
+            device,
+            self.physical_device,
+            size,
+            COLOR_LUT_FORMAT,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        )?;
+        let staging = HostBuffer::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            bytes,
+        )?;
+        self.submit_once(|command_buffer| {
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::NONE,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    color_subresource_range(),
+                ),
+            );
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(color_subresource_layers())
+                .image_extent(vk::Extent3D {
+                    width: size,
+                    height: size,
+                    depth: size,
+                })];
+            // SAFETY: staging holds size³ RGBA16F texels and the image is transfer-dst.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging.buffer,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                )
+            };
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    color_subresource_range(),
+                ),
+            );
+        })?;
+        Ok(image)
+    }
+
+    /// Проверяет, что LUT цветокоррекции вида создана и не уничтожена.
+    fn validate_color_lut(&self, post: &PostProcess) -> Result<(), RenderError> {
+        match post.color_grading.lut {
+            Some(lut) if lut.0 == 0 || color_lut_view(&self.color_luts, Some(lut)).is_none() => {
+                Err(RenderError::InvalidConfig(
+                    "LUT цветокоррекции не создана или уничтожена",
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn create_default_environment(&mut self) -> Result<(), RenderError> {
@@ -8247,6 +8405,7 @@ impl Drop for Renderer {
         self.builtin_user_uniform.take();
         self.surface_shaders.clear();
         self.textures.clear();
+        self.color_luts.clear();
         if let Some(device) = self.device.as_ref() {
             if let Some(pool) = self.frame_descriptor_pool.take() {
                 // SAFETY: the device is idle; destroying the pool frees its frame sets.
@@ -10519,7 +10678,7 @@ fn allocate_post_image_sets(
     let pool_sizes = [
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(4),
+            .descriptor_count(6),
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER)
             .descriptor_count(2),
@@ -10530,7 +10689,7 @@ fn allocate_post_image_sets(
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(2)
         .pool_sizes(&pool_sizes);
-    // SAFETY: the pool holds one tonemap and one output descriptor set (two sampled images each).
+    // SAFETY: the pool holds one tonemap and one output descriptor set (three sampled images each).
     let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
     let layouts = [layout; 2];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
@@ -10686,6 +10845,24 @@ fn acquire_image(
     Ok(Some((image_index, suboptimal)))
 }
 
+/// View LUT для composite: `None` — встроенная identity LUT (индекс 0).
+fn color_lut_view(luts: &[Option<DeviceImage>], lut: Option<ColorLutId>) -> Option<vk::ImageView> {
+    luts.get(lut.map_or(0, |lut| lut.0))
+        .and_then(Option::as_ref)
+        .map(|image| image.view)
+}
+
+/// Форма изображения `DeviceImage`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageShape {
+    /// 2D-изображение или 2D-массив.
+    Flat,
+    /// Cube-совместимое изображение из шести слоёв.
+    Cube,
+    /// 3D-изображение заданной глубины.
+    Volume(u32),
+}
+
 struct DeviceImage {
     device: ash::Device,
     image: vk::Image,
@@ -10765,7 +10942,32 @@ impl DeviceImage {
             usage,
             subresource_range,
             array_layers,
-            false,
+            ImageShape::Flat,
+        )
+    }
+
+    /// 3D-изображение `size³` с одним mip-уровнем (LUT цветокоррекции).
+    fn new_3d(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        size: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Self, RenderError> {
+        Self::new_with_layers_kind(
+            instance,
+            device,
+            physical_device,
+            vk::Extent2D {
+                width: size,
+                height: size,
+            },
+            format,
+            usage,
+            color_mip_subresource_range(0, 1),
+            1,
+            ImageShape::Volume(size),
         )
     }
 
@@ -10791,7 +10993,7 @@ impl DeviceImage {
             usage,
             color_mip_subresource_range(0, mip_levels),
             6,
-            true,
+            ImageShape::Cube,
         )
     }
 
@@ -10805,8 +11007,13 @@ impl DeviceImage {
         usage: vk::ImageUsageFlags,
         subresource_range: vk::ImageSubresourceRange,
         array_layers: u32,
-        cube_compatible: bool,
+        shape: ImageShape,
     ) -> Result<Self, RenderError> {
+        let cube_compatible = shape == ImageShape::Cube;
+        let depth = match shape {
+            ImageShape::Volume(depth) => depth,
+            ImageShape::Flat | ImageShape::Cube => 1,
+        };
         if array_layers == 0 {
             return Err(RenderError::InvalidConfig(
                 "image должен иметь хотя бы один слой",
@@ -10820,12 +11027,16 @@ impl DeviceImage {
             } else {
                 vk::ImageCreateFlags::empty()
             })
-            .image_type(vk::ImageType::TYPE_2D)
+            .image_type(if depth > 1 {
+                vk::ImageType::TYPE_3D
+            } else {
+                vk::ImageType::TYPE_2D
+            })
             .format(format)
             .extent(vk::Extent3D {
                 width: extent.width,
                 height: extent.height,
-                depth: 1,
+                depth,
             })
             .mip_levels(subresource_range.level_count)
             .array_layers(array_layers)
@@ -10870,6 +11081,8 @@ impl DeviceImage {
             .image(target.image)
             .view_type(if cube_compatible {
                 vk::ImageViewType::CUBE
+            } else if depth > 1 {
+                vk::ImageViewType::TYPE_3D
             } else if array_layers == 1 {
                 vk::ImageViewType::TYPE_2D
             } else {
@@ -11596,6 +11809,7 @@ fn record_frame(
             exposure,
         ),
         exposure_buffer,
+        lut: scene.color_lut,
         screen_before: chain_record(
             target.screen_before.as_mut(),
             &scene.post.screen_before,
@@ -12544,6 +12758,8 @@ struct ScenePass<'a> {
     exposure_pipelines: Option<ExposurePipelines>,
     /// Время кадра вида для адаптации экспозиции.
     exposure_dt_ms: f32,
+    /// 3D LUT composite вида: LUT цветокоррекции или встроенная identity LUT.
+    color_lut: vk::ImageView,
     reset_history: bool,
     filter_pipelines: Option<FilterPipelines>,
     ao_pipelines: Option<AoPipelines>,
@@ -13033,6 +13249,8 @@ struct PostPasses<'a> {
     filters: Option<FilterRecord<'a>>,
     bloom: Option<BloomRecord<'a>>,
     exposure_buffer: vk::Buffer,
+    /// 3D LUT composite: LUT вида или встроенная identity LUT.
+    lut: vk::ImageView,
     sampler: vk::Sampler,
     /// Экранные шейдеры до фильтров; `None`, если вид их не использует.
     screen_before: Option<ScreenChainRecord<'a>>,
@@ -13060,6 +13278,7 @@ fn record_tonemap_pass(
         mut filters,
         bloom,
         exposure_buffer,
+        lut,
         sampler,
         mut screen_before,
         mut screen_after,
@@ -13118,6 +13337,7 @@ fn record_tonemap_pass(
     });
     write_composite_bloom(device, set, bloom_view.unwrap_or(final_image.view));
     write_composite_exposure(device, set, exposure_buffer);
+    write_composite_lut(device, set, lut);
     if final_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
         let (source_stage, source_access) = match final_layout {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (

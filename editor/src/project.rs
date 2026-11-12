@@ -172,7 +172,7 @@ impl OpenProject {
 
     /// Последние валидные настройки `.postprocess`, загруженные редактором.
     pub fn cached_post_process(&self, path: &str) -> Option<PostProcessSettings> {
-        self.post_process.borrow().get(path).copied()
+        self.post_process.borrow().get(path).cloned()
     }
 
     /// Сохраняет `.postprocess` без создания неназначенного файла.
@@ -196,7 +196,7 @@ impl OpenProject {
         std::fs::write(file, source).map_err(|error| format!("{path}: {error}"))?;
         self.post_process
             .borrow_mut()
-            .insert(path.as_str().to_owned(), *settings);
+            .insert(path.as_str().to_owned(), settings.clone());
         Ok(())
     }
 
@@ -356,12 +356,9 @@ impl OpenProject {
                 .camera_settings(camera.handle)
                 .copied()
                 .unwrap_or_default();
-            let post = camera.post_process.as_ref().map(|path| post_by_path[path]);
+            let post = camera.post_process.as_ref().map(|path| &post_by_path[path]);
             world
-                .set_post_process(
-                    camera.handle,
-                    resolve_post_process(&settings, post.as_ref()),
-                )
+                .set_post_process(camera.handle, resolve_post_process(&settings, post))
                 .map_err(|error| error.to_string())?;
         }
         self.camera_settings.borrow_mut().extend(settings_by_path);
@@ -411,14 +408,14 @@ impl OpenProject {
             });
             match settings {
                 Ok(settings) => {
-                    post_by_path.insert(path.clone(), settings);
+                    post_by_path.insert(path.clone(), settings.clone());
                     self.post_process
                         .borrow_mut()
                         .insert(path.clone(), settings);
                 }
                 Err(error) => {
                     errors.push(error);
-                    if let Some(settings) = self.post_process.borrow().get(path).copied() {
+                    if let Some(settings) = self.post_process.borrow().get(path).cloned() {
                         post_by_path.insert(path.clone(), settings);
                     }
                 }
@@ -717,7 +714,7 @@ mod tests {
             .document;
         let mut world = World::from_document(&expanded).unwrap();
         project.apply_camera_settings(&mut world).unwrap();
-        let post = *world.post_process(world.active_camera()).unwrap();
+        let post = world.post_process(world.active_camera()).unwrap();
         assert!(post.bloom.enabled);
         assert!(post.ambient_occlusion.enabled);
     }

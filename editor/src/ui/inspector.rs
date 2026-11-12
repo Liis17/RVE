@@ -4338,14 +4338,22 @@ fn show_post_process_editor(ui: &mut egui::Ui, state: &mut EditorState, path: &V
     let draft_id = egui::Id::new(("post_process_draft", path.as_str()));
     let mut draft = ui
         .data(|data| data.get_temp::<engine_scene::PostProcessSettings>(draft_id))
-        .unwrap_or(cached);
+        .unwrap_or_else(|| cached.clone());
     let mut save = false;
     let mut revert = false;
+    // `.cube` не выделены в отдельный AssetKind: LUT ищутся среди прочих файлов по расширению.
+    let mut lut_options = vec![NO_LUT.to_owned()];
+    lut_options.extend(
+        state
+            .assets_of_kind(AssetKind::Other)
+            .into_iter()
+            .filter(|path| path.ends_with(".cube")),
+    );
     egui::CollapsingHeader::new("Post Process")
         .id_salt(draft_id)
         .default_open(false)
         .show(ui, |ui| {
-            post_process_sections(ui, &mut draft);
+            post_process_sections(ui, &mut draft, &lut_options);
             ui.horizontal(|ui| {
                 save = ui
                     .add_enabled(draft != cached, egui::Button::new("Save"))
@@ -4366,8 +4374,16 @@ fn show_post_process_editor(ui: &mut egui::Ui, state: &mut EditorState, path: &V
     }
 }
 
-/// Все секции эффектов; поля связаны с полями `PostProcessSettings`.
-fn post_process_sections(ui: &mut egui::Ui, post: &mut engine_scene::PostProcessSettings) {
+/// Пункт выбора LUT, означающий цветокоррекцию без LUT.
+const NO_LUT: &str = "None";
+
+/// Все секции эффектов; поля связаны с полями `PostProcessSettings`. `lut_options` — `None` и
+/// пути `.cube` проекта.
+fn post_process_sections(
+    ui: &mut egui::Ui,
+    post: &mut engine_scene::PostProcessSettings,
+    lut_options: &[String],
+) {
     use engine_scene::{AmbientOcclusionQuality, ExposureMode, Tonemapper};
     egui::CollapsingHeader::new("Exposure")
         .id_salt("pp_exposure")
@@ -4510,6 +4526,19 @@ fn post_process_sections(ui: &mut egui::Ui, post: &mut engine_scene::PostProcess
             drag_rgb(ui, "Lift", &mut post.color_grading.lift, -1.0..=1.0);
             drag_rgb(ui, "Gamma", &mut post.color_grading.gamma, 0.001..=4.0);
             drag_rgb(ui, "Gain", &mut post.color_grading.gain, 0.0..=4.0);
+            ui.horizontal(|ui| {
+                ui.label("LUT");
+                let current = post.color_grading.lut.as_deref().unwrap_or(NO_LUT);
+                if let Some(chosen) = asset_picker(ui, "pp_grading_lut", current, lut_options) {
+                    post.color_grading.lut = (chosen != NO_LUT).then_some(chosen);
+                }
+            });
+            drag_f32(
+                ui,
+                "LUT intensity",
+                &mut post.color_grading.lut_intensity,
+                0.0..=1.0,
+            );
         });
     egui::CollapsingHeader::new("Vignette")
         .id_salt("pp_vignette")
