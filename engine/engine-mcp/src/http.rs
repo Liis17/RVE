@@ -4,13 +4,19 @@ use crate::{
         SUPPORTED_PROTOCOL_VERSIONS, Session, error, initialize_client_version, initialize_result,
         parse_request, success,
     },
-    server::{Shared, TOOL_CALL_TIMEOUT, ToolCall, WaitResult, wait_for_result},
+    server::{
+        InFlight, KEEPALIVE_INTERVAL, Shared, TOOL_CALL_TIMEOUT, ToolCall, WaitResult,
+        wait_for_result,
+    },
 };
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::{self, Read},
-    sync::Arc,
+    io::{self, Read, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tiny_http::{Header, Request, Response, Server, StatusCode};
@@ -282,11 +288,66 @@ pub(crate) enum PostOutcome {
     },
     Empty(u16),
     /// A tool call was queued for the editor thread; the caller waits for its response.
-    AwaitTool {
-        id: Value,
-        response: flume::Receiver<ToolResult>,
-        deadline: Instant,
-    },
+    AwaitTool(AwaitTool),
+}
+
+/// Ожидание ответа главного потока на поставленный вызов.
+#[derive(Debug)]
+pub(crate) struct AwaitTool {
+    pub id: Value,
+    pub response: flume::Receiver<ToolResult>,
+    pub deadline: Instant,
+    /// Ключ в `Shared::inflight`; запись удаляется, когда ожидание заканчивается.
+    pub key: String,
+    pub cancel: flume::Receiver<()>,
+    /// Свой отправитель отмены: канал не разрывается, даже если запись реестра заменена.
+    pub _cancel_keep: flume::Sender<()>,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+/// Чем закончилось ожидание вызова.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AwaitEnd {
+    Response(ToolResult),
+    /// Остановка сервера, deadline или потеря ответа главного потока.
+    Failed(WaitResult),
+    /// Клиент прислал `notifications/cancelled`.
+    Cancelled,
+    /// Запись в соединение не удалась: клиент отключился.
+    ClientGone,
+}
+
+/// Соединение, в которое пишутся проверки, пока вызов ждёт главный поток.
+pub(crate) trait KeepAlive {
+    /// Пишет проверку; первая проверка начинает потоковый ответ. Ошибка — клиент отключился.
+    fn keepalive(&mut self) -> io::Result<()>;
+}
+
+/// Ждёт ответ на вызов. Пока ответа нет, раз в `tick` пишет проверку соединения; если клиент
+/// отключился или отменил вызов, вызов помечается брошенным, и главный поток его не выполняет.
+pub(crate) fn await_tool(
+    wait: &AwaitTool,
+    shutdown: &flume::Receiver<()>,
+    tick: Duration,
+    connection: &mut impl KeepAlive,
+) -> AwaitEnd {
+    loop {
+        match wait_for_result(&wait.response, shutdown, &wait.cancel, wait.deadline, tick) {
+            WaitResult::Response(result) => return AwaitEnd::Response(result),
+            WaitResult::Tick => {
+                if connection.keepalive().is_err() {
+                    wait.cancelled.store(true, Ordering::Release);
+                    return AwaitEnd::ClientGone;
+                }
+            }
+            WaitResult::Cancelled => return AwaitEnd::Cancelled,
+            other => {
+                // Ответа уже никто не ждёт: главный поток не должен выполнять вызов.
+                wait.cancelled.store(true, Ordering::Release);
+                return AwaitEnd::Failed(other);
+            }
+        }
+    }
 }
 
 fn handle_post(
@@ -317,19 +378,106 @@ fn handle_post(
             respond_json(request, status, body, &extra);
         }
         PostOutcome::Empty(status) => respond_empty(request, status),
-        PostOutcome::AwaitTool {
-            id,
-            response,
-            deadline,
-        } => match wait_for_result(&response, shutdown, deadline) {
-            WaitResult::Response(result) => {
-                respond_json(request, 200, success(Some(id), result.to_value()), &[])
+        PostOutcome::AwaitTool(wait) => {
+            let mut connection = Connection::Pending(Some(request));
+            let end = await_tool(&wait, shutdown, KEEPALIVE_INTERVAL, &mut connection);
+            shared.inflight.lock().unwrap().remove(&wait.key);
+            let body = match &end {
+                AwaitEnd::Response(result) => success(Some(wait.id), result.to_value()),
+                AwaitEnd::Cancelled => error(Some(wait.id), -32800, "Request cancelled", None),
+                AwaitEnd::Failed(result) => {
+                    let failure = wait_failure(result.clone())
+                        .expect("non-response wait outcomes map to an HTTP failure");
+                    match connection {
+                        Connection::Pending(Some(request)) => {
+                            respond_failure(request, failure);
+                            return;
+                        }
+                        // Заголовки 200 уже отправлены: ошибка уходит JSON-RPC ответом.
+                        _ => error(Some(wait.id), -32603, failure_text(failure), None),
+                    }
+                }
+                AwaitEnd::ClientGone => return,
+            };
+            connection.finish(&body);
+        }
+    }
+}
+
+/// Соединение ожидающего вызова. Быстрый ответ уходит обычным JSON; если ответа нет дольше
+/// интервала проверки, начинается chunked-ответ `application/json`, и каждая проверка пишет
+/// перевод строки, который JSON допускает перед значением. Ошибка такой записи означает, что
+/// клиент закрыл соединение: иначе tiny_http об этом не сообщает.
+enum Connection {
+    Pending(Option<Request>),
+    Streaming(Box<dyn Write + Send>),
+    /// HTTP/1.0 не поддерживает chunked: соединение не проверяется.
+    Unchecked(Option<Request>),
+    Closed,
+}
+
+impl KeepAlive for Connection {
+    fn keepalive(&mut self) -> io::Result<()> {
+        match self {
+            Connection::Pending(request) => {
+                let request = request
+                    .take()
+                    .expect("pending connection holds its request");
+                if *request.http_version() < tiny_http::HTTPVersion(1, 1) {
+                    *self = Connection::Unchecked(Some(request));
+                    return Ok(());
+                }
+                let mut writer = request.into_writer();
+                let started = writer
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Transfer-Encoding: chunked\r\nCache-Control: no-store\r\n\r\n",
+                    )
+                    .and_then(|()| write_chunk(&mut writer, b"\n"));
+                *self = match started {
+                    Ok(()) => Connection::Streaming(writer),
+                    Err(error) => {
+                        *self = Connection::Closed;
+                        return Err(error);
+                    }
+                };
+                Ok(())
             }
-            result => respond_failure(
-                request,
-                wait_failure(result).expect("non-response wait outcomes map to an HTTP failure"),
-            ),
-        },
+            Connection::Streaming(writer) => write_chunk(writer, b"\n"),
+            Connection::Unchecked(_) | Connection::Closed => Ok(()),
+        }
+    }
+}
+
+impl Connection {
+    fn finish(self, body: &Value) {
+        let bytes = serde_json::to_vec(body).expect("serializing a JSON value cannot fail");
+        match self {
+            Connection::Pending(Some(request)) | Connection::Unchecked(Some(request)) => {
+                respond_raw(request, 200, &bytes, "application/json", &[]);
+            }
+            Connection::Streaming(mut writer) => {
+                let _ = write_chunk(&mut writer, &bytes)
+                    .and_then(|()| writer.write_all(b"0\r\n\r\n"))
+                    .and_then(|()| writer.flush());
+            }
+            Connection::Pending(None) | Connection::Unchecked(None) | Connection::Closed => {}
+        }
+    }
+}
+
+fn write_chunk(writer: &mut dyn Write, data: &[u8]) -> io::Result<()> {
+    write!(writer, "{:x}\r\n", data.len())?;
+    writer.write_all(data)?;
+    writer.write_all(b"\r\n")?;
+    writer.flush()
+}
+
+fn failure_text(failure: HttpFailure) -> &'static str {
+    match failure {
+        HttpFailure::ServiceUnavailable => "Server is shutting down",
+        HttpFailure::GatewayTimeout => "Tool call timed out",
+        _ => "Tool call failed",
     }
 }
 
@@ -420,6 +568,9 @@ pub(crate) fn post_outcome(body: &[u8], headers: Headers<'_>, shared: &Shared) -
     drop(sessions);
 
     let Some(id) = rpc.id else {
+        if rpc.method == "notifications/cancelled" {
+            cancel_request(shared, session_id, &rpc.params);
+        }
         return PostOutcome::Empty(202);
     };
     match rpc.method.as_str() {
@@ -441,7 +592,7 @@ pub(crate) fn post_outcome(body: &[u8], headers: Headers<'_>, shared: &Shared) -
                 session_id: None,
             }
         }
-        "tools/call" => tool_call_outcome(id, &rpc.params, shared),
+        "tools/call" => tool_call_outcome(id, &rpc.params, shared, session_id),
         _ => PostOutcome::Json {
             status: 200,
             body: error(Some(id), -32601, "Method not found", None),
@@ -463,7 +614,7 @@ fn insert_session(sessions: &mut HashMap<String, Session>, id: String, session: 
     sessions.insert(id, session);
 }
 
-fn tool_call_outcome(id: Value, params: &Value, shared: &Shared) -> PostOutcome {
+fn tool_call_outcome(id: Value, params: &Value, shared: &Shared, session_id: &str) -> PostOutcome {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return PostOutcome::Json {
             status: 200,
@@ -496,14 +647,50 @@ fn tool_call_outcome(id: Value, params: &Value, shared: &Shared) -> PostOutcome 
     let deadline = Instant::now() + TOOL_CALL_TIMEOUT;
     let generation = shared.generation.load(std::sync::atomic::Ordering::Acquire);
     let (call, response) = pending_tool_call(name, arguments, permission, deadline, generation);
+    let cancelled = Arc::clone(&call.cancelled);
+    let (signal, cancel) = flume::bounded(1);
+    let key = inflight_key(session_id, &id);
+    shared.inflight.lock().unwrap().insert(
+        key.clone(),
+        InFlight {
+            cancelled: Arc::clone(&cancelled),
+            signal: signal.clone(),
+        },
+    );
     if shared.calls.send(call).is_err() {
+        shared.inflight.lock().unwrap().remove(&key);
         return PostOutcome::Failure(HttpFailure::ServiceUnavailable);
     }
     (shared.wake)();
-    PostOutcome::AwaitTool {
+    PostOutcome::AwaitTool(AwaitTool {
         id,
         response,
         deadline,
+        key,
+        cancel,
+        _cancel_keep: signal,
+        cancelled,
+    })
+}
+
+/// Ключ ожидающего вызова: JSON-RPC id уникален только в пределах сессии.
+fn inflight_key(session_id: &str, id: &Value) -> String {
+    format!("{session_id}\n{id}")
+}
+
+/// `notifications/cancelled`: помечает вызов сессии брошенным, если он ещё ждёт. Поздняя или
+/// неизвестная отмена игнорируется, как разрешает протокол.
+fn cancel_request(shared: &Shared, session_id: &str, params: &Value) {
+    let Some(request_id) = params.get("requestId") else {
+        return;
+    };
+    if let Some(inflight) = shared
+        .inflight
+        .lock()
+        .unwrap()
+        .get(&inflight_key(session_id, request_id))
+    {
+        inflight.cancel();
     }
 }
 
@@ -523,6 +710,7 @@ fn pending_tool_call(
             required_permission: permission,
             generation,
             responder,
+            cancelled: Arc::new(AtomicBool::new(false)),
         },
         response,
     )
@@ -530,7 +718,7 @@ fn pending_tool_call(
 
 fn wait_failure(result: WaitResult) -> Option<HttpFailure> {
     match result {
-        WaitResult::Response(_) => None,
+        WaitResult::Response(_) | WaitResult::Cancelled | WaitResult::Tick => None,
         WaitResult::Shutdown => Some(HttpFailure::ServiceUnavailable),
         WaitResult::Deadline => Some(HttpFailure::GatewayTimeout),
         WaitResult::Disconnected => Some(HttpFailure::InternalServerError),
@@ -899,6 +1087,7 @@ mod tests {
             generation: Arc::new(AtomicU64::new(0)),
             calls,
             wake: Arc::new(|| {}),
+            inflight: Mutex::new(HashMap::new()),
         };
         (shared, receiver)
     }
@@ -976,9 +1165,8 @@ mod tests {
                 .contains("Requires permission: edit_scene")
         );
 
-        let PostOutcome::AwaitTool {
-            response, deadline, ..
-        } = post_outcome(call, rpc_headers("POST", Some(session)), &shared)
+        let PostOutcome::AwaitTool(wait) =
+            post_outcome(call, rpc_headers("POST", Some(session)), &shared)
         else {
             panic!("tools/call after initialization must queue the call");
         };
@@ -988,7 +1176,13 @@ mod tests {
         assert!(queued.respond(ToolResult::text("done")));
         let (_shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
         assert_eq!(
-            wait_for_result(&response, &shutdown_rx, deadline),
+            wait_for_result(
+                &wait.response,
+                &shutdown_rx,
+                &wait.cancel,
+                wait.deadline,
+                Duration::from_secs(5)
+            ),
             WaitResult::Response(ToolResult::text("done"))
         );
 
@@ -1002,5 +1196,176 @@ mod tests {
             panic!("a deleted session must not be accepted");
         };
         assert_eq!(failure, HttpFailure::NotFound);
+    }
+
+    use super::{AwaitEnd, KeepAlive, await_tool};
+    use std::io;
+
+    /// Сессия после `initialize` и `notifications/initialized` с инструментом `probe`.
+    fn ready_session() -> (Shared, flume::Receiver<ToolCall>, String) {
+        let (shared, calls) = shared_with(vec![ToolSpec::new(
+            "probe",
+            "Probe.",
+            json!({"type": "object"}),
+            Permission::Read,
+        )]);
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let PostOutcome::Json {
+            session_id: Some(session),
+            ..
+        } = post_outcome(initialize, rpc_headers("POST", None), &shared)
+        else {
+            panic!("initialize must create a session");
+        };
+        let initialized = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        post_outcome(initialized, rpc_headers("POST", Some(&session)), &shared);
+        (shared, calls, session)
+    }
+
+    /// Соединение теста: считает проверки и отказывает с заданной по счёту.
+    struct FakeConnection {
+        writes: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl KeepAlive for FakeConnection {
+        fn keepalive(&mut self) -> io::Result<()> {
+            self.writes += 1;
+            if Some(self.writes) == self.fail_at {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_notification_abandons_the_waiting_call_of_that_session_only() {
+        let (shared, calls, session) = ready_session();
+        let call =
+            br#"{"jsonrpc":"2.0","id":"call-7","method":"tools/call","params":{"name":"probe"}}"#;
+        let PostOutcome::AwaitTool(wait) =
+            post_outcome(call, rpc_headers("POST", Some(&session)), &shared)
+        else {
+            panic!("tools/call must queue the call");
+        };
+        let queued = calls.try_recv().unwrap();
+
+        // Отмена другого id и отмена из чужой сессии вызов не трогают.
+        let other = br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"call-8"}}"#;
+        assert!(matches!(
+            post_outcome(other, rpc_headers("POST", Some(&session)), &shared),
+            PostOutcome::Empty(202)
+        ));
+        let (_, _, foreign) = ready_session();
+        shared.sessions.lock().unwrap().insert(foreign.clone(), {
+            let mut session = Session::new("2025-11-25".to_owned(), 1);
+            session.accept("notifications/initialized").unwrap();
+            session
+        });
+        let cancel = br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"call-7","reason":"user"}}"#;
+        post_outcome(cancel, rpc_headers("POST", Some(&foreign)), &shared);
+        assert!(!queued.is_abandoned());
+
+        assert!(matches!(
+            post_outcome(cancel, rpc_headers("POST", Some(&session)), &shared),
+            PostOutcome::Empty(202)
+        ));
+        assert!(
+            queued.is_abandoned(),
+            "главный поток не выполнит отменённый вызов"
+        );
+        let (_shutdown_tx, shutdown) = flume::unbounded::<()>();
+        let mut connection = FakeConnection {
+            writes: 0,
+            fail_at: None,
+        };
+        assert_eq!(
+            await_tool(&wait, &shutdown, Duration::from_secs(5), &mut connection),
+            AwaitEnd::Cancelled
+        );
+    }
+
+    #[test]
+    fn client_disconnect_found_by_a_failed_keepalive_abandons_the_call() {
+        let (shared, calls, session) = ready_session();
+        let call = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe"}}"#;
+        let PostOutcome::AwaitTool(wait) =
+            post_outcome(call, rpc_headers("POST", Some(&session)), &shared)
+        else {
+            panic!("tools/call must queue the call");
+        };
+        let queued = calls.try_recv().unwrap();
+        let (_shutdown_tx, shutdown) = flume::unbounded::<()>();
+        let mut connection = FakeConnection {
+            writes: 0,
+            fail_at: Some(2),
+        };
+        assert_eq!(
+            await_tool(&wait, &shutdown, Duration::from_millis(1), &mut connection),
+            AwaitEnd::ClientGone
+        );
+        assert_eq!(connection.writes, 2);
+        assert!(queued.is_abandoned());
+    }
+
+    #[test]
+    fn keepalives_continue_until_the_response_arrives() {
+        let (shared, calls, session) = ready_session();
+        let call = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe"}}"#;
+        let PostOutcome::AwaitTool(wait) =
+            post_outcome(call, rpc_headers("POST", Some(&session)), &shared)
+        else {
+            panic!("tools/call must queue the call");
+        };
+        let queued = calls.try_recv().unwrap();
+        // Ответ приходит из «главного потока» только после первой проверки соединения.
+        struct RespondAfterFirst {
+            call: Option<ToolCall>,
+            writes: usize,
+        }
+        impl KeepAlive for RespondAfterFirst {
+            fn keepalive(&mut self) -> io::Result<()> {
+                self.writes += 1;
+                if let Some(call) = self.call.take() {
+                    assert!(!call.is_abandoned());
+                    call.respond(ToolResult::text("late"));
+                }
+                Ok(())
+            }
+        }
+        let mut connection = RespondAfterFirst {
+            call: Some(queued),
+            writes: 0,
+        };
+        let (_shutdown_tx, shutdown) = flume::unbounded::<()>();
+        assert_eq!(
+            await_tool(&wait, &shutdown, Duration::from_millis(1), &mut connection),
+            AwaitEnd::Response(ToolResult::text("late"))
+        );
+        assert_eq!(connection.writes, 1);
+    }
+
+    #[test]
+    fn deadline_or_shutdown_marks_the_call_abandoned() {
+        let (shared, calls, session) = ready_session();
+        let call = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe"}}"#;
+        let PostOutcome::AwaitTool(wait) =
+            post_outcome(call, rpc_headers("POST", Some(&session)), &shared)
+        else {
+            panic!("tools/call must queue the call");
+        };
+        let queued = calls.try_recv().unwrap();
+        let (shutdown_tx, shutdown) = flume::unbounded::<()>();
+        drop(shutdown_tx);
+        let mut connection = FakeConnection {
+            writes: 0,
+            fail_at: None,
+        };
+        assert_eq!(
+            await_tool(&wait, &shutdown, Duration::from_secs(5), &mut connection),
+            AwaitEnd::Failed(WaitResult::Shutdown)
+        );
+        assert!(queued.is_abandoned());
     }
 }
