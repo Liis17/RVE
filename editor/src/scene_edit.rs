@@ -1765,7 +1765,19 @@ impl EditorScene {
                 path.as_str()
             ));
         }
-        let contents = self.document.to_toml().map_err(|error| error.to_string())?;
+        let generated = self.document.to_toml().map_err(|error| error.to_string())?;
+        // Комментарии и оформление прежнего файла переносятся в новый текст.
+        let contents = self
+            .disk_text
+            .as_deref()
+            .and_then(|previous| {
+                crate::toml_preserve::preserve_formatting(previous, &generated, |text| {
+                    parse_document(&path, text)
+                        .and_then(|document| document.to_toml())
+                        .is_ok_and(|text| text == generated)
+                })
+            })
+            .unwrap_or(generated);
         let reparsed = parse_document(&path, &contents)
             .map_err(|error| format!("сериализованная сцена не прошла проверку: {error}"))?;
         // Префаб, включающий сам себя под новым путём, отклоняется до записи.
@@ -4066,6 +4078,31 @@ mod tests {
     }
 
     #[test]
+    fn save_keeps_comments_of_the_opened_file() {
+        let original = include_str!("../../examples/demo-game/Assets/scenes/physics.rvescene");
+        let comments = original
+            .lines()
+            .filter(|line| line.contains('#'))
+            .collect::<Vec<_>>();
+        assert!(comments.len() > 5);
+        let directory = TempDir::new();
+        let file = directory.0.join("physics.rvescene");
+        let mut scene =
+            EditorScene::parse(path("/physics.rvescene"), original, no_prefabs()).unwrap();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.save(&file, path("/physics.rvescene")).unwrap();
+        let saved = fs::read_to_string(&file).unwrap();
+        for comment in &comments {
+            assert!(saved.contains(comment), "{comment:?} потерян:\n{saved}");
+        }
+        assert!(saved.contains(&format!("id = \"{id}\"")));
+
+        // Повторное сохранение без правок не меняет файл.
+        scene.save(&file, path("/physics.rvescene")).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), saved);
+    }
+
+    #[test]
     fn failed_save_keeps_the_scene_dirty_and_the_previous_path() {
         let directory = TempDir::new();
         let missing = directory.0.join("missing/a.rvescene");
@@ -4100,8 +4137,10 @@ mod tests {
         let mut scene = original;
         scene.save(&file, label.clone()).unwrap();
         let saved = fs::read_to_string(&file).unwrap();
-        assert_eq!(saved, expected);
+        let source_text = fs::read_to_string(source).unwrap();
+        assert_eq!(saved, source_text, "сохранение без правок не меняет файл");
         let reopened = EditorScene::parse(label, &saved, project.prefab_loader()).unwrap();
+        assert_eq!(reopened.document().to_toml().unwrap(), expected);
         assert_eq!(
             reopened.object("orbit.moon").unwrap().name.as_deref(),
             Some("Moon")

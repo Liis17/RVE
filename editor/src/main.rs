@@ -29,6 +29,7 @@ mod project_tags;
 mod scene_edit;
 mod settings;
 mod state;
+mod toml_preserve;
 mod ui;
 mod ui_editor;
 mod viewport;
