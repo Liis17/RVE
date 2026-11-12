@@ -38,7 +38,7 @@ Parent: [[Index]]
 | `editor/src/play.rs` | `PlaySession`, `PlayPhysics`, `PlayAudio`, `HeavyLoads`, `Watchdog` | Копия мира, скрипты, per-Play physics thread, звуковой поток, фоновая загрузка тяжёлых префабов, прерывание зависшего Lua и мост анимации Play |
 | `editor/src/viewport/animation.rs` | `EditorAnimation`, `AnimationPreview`, `PreviewStatus`, `project_bridge`, `project_preview_bridge` | Мост превью выбранного аниматора, его настройки и сведения для инспектора; Play-мост строится через `project_bridge` |
 | `editor/src/play_cursor.rs` | `PlayCursor`, `play_cursor_captured`, `sync`, `focus_game_tab` | Захват курсора панелью Game во время Play и состояние, отправляемое в окно |
-| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
+| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `ImageLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
 | `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `scene_assets`, `project_prefabs`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
 | `editor/src/project_prefabs.rs` | `ProjectPrefabs` | Редактируемый список `prefabs.rveprefabs` подокна Project Prefabs: проверка правок, явное сохранение |
 
@@ -65,6 +65,10 @@ Parent: [[Index]]
 Окно работает в `RedrawMode::OnDemand`: кадр запрашивают события egui-winit, отложенный repaint egui через `WindowHandler::next_wakeup`, незавершённые превью и модели и пропущенный кадр. В Play вне паузы кадр запрашивается постоянно. Срок автосохранения тоже входит в `next_wakeup`, а копия пишется в `WindowHandler::update`, поэтому последняя правка перед простоем записывается без перерисовки. Вызовы MCP будят окно через `WindowProxy::wake`; пока `capture_view` активен, `next_wakeup` возвращает опрос каждые 16 мс (см. «MCP-сервер» ниже и [[Engine/EngineMcp]]).
 
 Модели FBX разбирает `ModelLoader` в потоке `rve-editor-models`, а загрузку готовой модели в GPU выполняет `SceneRenderer::sync_assets` на главном потоке; до готовности объект не рисуется и не выбирается, ошибка пишется в Console. Смена проекта перезапускает очередь с новым поколением, и результаты, начатые раньше, отбрасываются. Наведение камеры на новую модель (`pending_frame`) ждёт окончания её загрузки.
+
+Каждый запрос модели получает флаг отмены (`Assets::load_model_cancellable`, [[Engine/EngineAssets]]): перезагрузка модели во время разбора, изменение PNG или каталога (`stale_pending`) и смена проекта прерывают текущий разбор, и устаревшая модель запрашивается заново, а не доразбирается.
+
+PNG-текстуры сцены и материалов и HDR environments декодирует `ImageLoader` (`editor/src/viewport/image_loader.rs`) в потоке `rve-editor-images`; `SceneRenderer` владеет им и перезапускает при смене корня проекта. Главный поток только создаёт GPU-ресурс в `accept_images` (в начале `sync_assets` и при запросе текстуры). Пока PNG декодируется, материал рисуется без неё; готовая текстура повышает ревизию и пересобирает материалы. Пока декодируется HDR, остаётся прежнее окружение или окружение по умолчанию, ошибка «источник недоступен» не пишется. Первая загрузка и перезагрузка после изменения файла идут одним путём: ошибка сохраняет прежний ресурс. Ожидающие изображения будят окно так же, как модели.
 
 ## Автообновление ресурсов
 
@@ -380,7 +384,6 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - Несохранённый список Project Prefabs учитывается в окне несохранённых изменений наравне со сценой: Save сохраняет и список, Discard его отбрасывает. Список сбрасывается при открытии другого проекта и при Reload; Play читает `prefabs.rveprefabs` с диска при старте, поэтому несохранённые правки в него не попадают.
 - Внешнее изменение `.rvescene` обновляет дерево Project, но не перечитывает открытую сцену. Переименование и удаление файла в Project не обновляют ссылки в сценах, включая префабы.
 - Edit-world кэшируется по revision сцены. Если `.camerasettings` отсутствует или невалиден, редактор сообщает ошибку один раз за revision сцены и использует последнюю валидную версию, если она есть; иначе остаются defaults. Play и runtime продолжают считать такую ошибку фатальной.
-- Текстуры PNG сцены и HDR environments загружаются синхронно при первом появлении, модели FBX и превью PNG/HDR — в фоне. Начатый разбор FBX нельзя прервать; после изменения файла устаревший результат отбрасывается и модель запрашивается снова.
 - Автосохранение работает в цикле кадра, но во время Play документ не меняется, а перед Play копия записывается, поэтому зависший скрипт не теряет правки.
 - Ctrl+C в терминале не закрывает редактор (`engine_platform::ignore_console_interrupt`).
 - Egui смешивает цвета в гамма-пространстве; при sRGB swapchain смешивание идёт в линейном, поэтому полупрозрачные элементы выглядят немного иначе, чем в типичных приложениях egui.

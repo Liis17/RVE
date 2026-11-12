@@ -754,9 +754,15 @@ impl EditorApp {
         }
     }
 
-    /// Превью или модели ещё готовятся в фоне: окно должно проснуться, чтобы показать их.
+    /// Превью, модели или изображения сцены ещё готовятся в фоне: окно должно проснуться,
+    /// чтобы показать их.
     fn background_pending(&self) -> bool {
-        self.state.previews.has_pending() || self.state.model_loader.has_pending()
+        self.state.previews.has_pending()
+            || self.state.model_loader.has_pending()
+            || self
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.scene.images_pending())
     }
 
     /// Записывает недавние проекты и раскладку панелей; ошибка только пишется в Console.
