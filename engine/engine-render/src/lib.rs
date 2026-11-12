@@ -164,7 +164,17 @@ const WHITE_LINEAR_TEXTURE: usize = 1;
 const FLAT_NORMAL_TEXTURE: usize = 2;
 const BLACK_TEXTURE: usize = 3;
 const DEFAULT_MATERIAL: usize = 0;
-const PUSH_CONSTANTS_SIZE: usize = 3 * size_of::<[[f32; 4]; 4]>() + size_of::<[u32; 4]>();
+/// Push constants mesh- и shadow-проходов: `uvec4 params` (LOD и слой тени).
+const PUSH_CONSTANTS_SIZE: usize = size_of::<[u32; 4]>();
+/// Данные экземпляра draw'а в вершинном буфере кадра: model, три столбца матрицы
+/// нормалей и model прошлого кадра (`mesh.vert`, локации 5–15; `shadow.vert` читает model).
+const INSTANCE_STRIDE: usize = MESH_INSTANCE_VECTORS as usize * size_of::<[f32; 4]>();
+/// Число `vec4` в данных экземпляра.
+const MESH_INSTANCE_VECTORS: u32 = 4 + 3 + 4;
+/// Привязка данных экземпляров в mesh-пайплайнах (после текущих и прошлых вершин).
+const MESH_INSTANCE_BINDING: u32 = 2;
+/// Привязка данных экземпляров в shadow-пайплайнах.
+const SHADOW_INSTANCE_BINDING: u32 = 1;
 const FRAME_UNIFORMS_SIZE: usize =
     (5 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 9 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
@@ -2635,6 +2645,16 @@ impl Renderer {
             .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
         let skin_plan = self.plan_skin(&[frame], frame_slot)?;
         let skin_record = self.skin_record(skin_plan.as_ref());
+        let (instance_buffer, _) = self.frames[frame_slot].write_instances(
+            &instance,
+            &device,
+            self.physical_device,
+            [frame.draws],
+        )?;
+        let instances = InstanceRange {
+            buffer: instance_buffer,
+            first: 0,
+        };
         if view.anti_aliasing.is_temporal() {
             ensure_temporal_history(
                 &instance,
@@ -3134,6 +3154,7 @@ impl Renderer {
                 materials: &self.materials,
                 draws: frame.draws,
                 skin_draws: skin::skin_draws_for(skin_plan.as_ref(), 0),
+                instances,
                 shadow_cascades: frame.shadow_cascades,
                 local_shadow_matrices: &prepared.local_shadow_matrices,
                 stats: &draw_stats,
@@ -3156,6 +3177,7 @@ impl Renderer {
                 surface_shaders: &self.surface_shaders,
                 draws: frame.draws,
                 skin_draws: skin::skin_draws_for(skin_plan.as_ref(), 0),
+                instances,
                 view_projection: multiply_4x4(frame.camera.projection, frame.camera.view),
                 #[cfg(windows)]
                 fsr_camera: fsr_camera_parameters(frame.camera.projection),
@@ -4108,6 +4130,13 @@ impl Renderer {
                 entry.1.camera.position,
             )?);
         }
+        // Индексы совпадают с `rendered`: пропущенный вид без размера не получает экземпляров.
+        let (instance_buffer, instance_bases) = self.frames[frame_slot].write_instances(
+            &instance,
+            &device,
+            self.physical_device,
+            rendered.iter().map(|entry| entry.1.draws),
+        )?;
         let mut gpu_layout = GpuProfileLayout::default();
         let bloom_pipelines = self.bloom_pipelines;
         let exposure_pipelines = self.exposure_pipelines;
@@ -4156,6 +4185,10 @@ impl Renderer {
                             materials: &self.materials,
                             draws: frame.draws,
                             skin_draws: skin::skin_draws_for(skin_plan.as_ref(), index),
+                            instances: InstanceRange {
+                                buffer: instance_buffer,
+                                first: instance_bases[index],
+                            },
                             shadow_cascades: frame.shadow_cascades,
                             local_shadow_matrices,
                             stats: &draw_stats,
@@ -4178,6 +4211,10 @@ impl Renderer {
                             surface_shaders: &self.surface_shaders,
                             draws: frame.draws,
                             skin_draws: skin::skin_draws_for(skin_plan.as_ref(), index),
+                            instances: InstanceRange {
+                                buffer: instance_buffer,
+                                first: instance_bases[index],
+                            },
                             view_projection: multiply_4x4(
                                 frame.camera.projection,
                                 frame.camera.view,
@@ -7155,6 +7192,7 @@ impl Renderer {
                 .binding(1)
                 .stride(size_of::<Vertex>() as u32)
                 .input_rate(vk::VertexInputRate::VERTEX),
+            instance_binding(MESH_INSTANCE_BINDING),
         ];
         let vertex_attributes = [
             vk::VertexInputAttributeDescription::default()
@@ -7182,7 +7220,14 @@ impl Renderer {
                 .binding(1)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(std::mem::offset_of!(Vertex, position) as u32),
-        ];
+        ]
+        .into_iter()
+        .chain(instance_attributes(
+            MESH_INSTANCE_BINDING,
+            5,
+            MESH_INSTANCE_VECTORS,
+        ))
+        .collect::<Vec<_>>();
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
             .vertex_attribute_descriptions(&vertex_attributes);
@@ -7483,6 +7528,7 @@ impl Renderer {
                 .binding(1)
                 .stride(size_of::<Vertex>() as u32)
                 .input_rate(vk::VertexInputRate::VERTEX),
+            instance_binding(MESH_INSTANCE_BINDING),
         ];
         let vertex_attributes = [
             vk::VertexInputAttributeDescription::default()
@@ -7510,7 +7556,14 @@ impl Renderer {
                 .binding(1)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(std::mem::offset_of!(Vertex, position) as u32),
-        ];
+        ]
+        .into_iter()
+        .chain(instance_attributes(
+            MESH_INSTANCE_BINDING,
+            5,
+            MESH_INSTANCE_VECTORS,
+        ))
+        .collect::<Vec<_>>();
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
             .vertex_attribute_descriptions(&vertex_attributes);
@@ -9094,6 +9147,8 @@ struct FrameResources {
     submission_generation: u64,
     /// Палитры skinning этого слота; растут до следующей степени двойки.
     skin_palettes: GrowingBuffer,
+    /// Данные экземпляров mesh draw'ов слота ([`pack_instances`]).
+    instances: GrowingBuffer,
 }
 
 impl FrameResources {
@@ -9118,6 +9173,7 @@ impl FrameResources {
             gpu_layout: GpuProfileLayout::default(),
             submission_generation: 0,
             skin_palettes: GrowingBuffer::default(),
+            instances: GrowingBuffer::default(),
         };
         // SAFETY: creating an unsignaled binary semaphore uses a valid default create info.
         frame.image_available =
@@ -9184,6 +9240,38 @@ impl FrameResources {
             vk::BufferUsageFlags::VERTEX_BUFFER,
             overlay_vertex_bytes(vertices),
         )
+    }
+
+    /// Копирует данные экземпляров draw'ов всех видов в буфер слота и возвращает
+    /// буфер с индексом первого экземпляра каждого вида; без draw'ов буфер null.
+    ///
+    /// Вызывается после ожидания fence слота, когда GPU уже не читает прежние данные.
+    fn write_instances<'a>(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        views: impl IntoIterator<Item = &'a [DrawCommand]>,
+    ) -> Result<(vk::Buffer, Vec<u32>), RenderError> {
+        let (bytes, bases) = pack_instances(views);
+        if bytes.is_empty() {
+            return Ok((vk::Buffer::null(), bases));
+        }
+        self.instances.write(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &bytes,
+        )?;
+        let buffer = self
+            .instances
+            .buffer
+            .as_ref()
+            .ok_or(RenderError::InvalidState(
+                "буфер экземпляров кадра отсутствует",
+            ))?;
+        Ok((buffer.buffer, bases))
     }
 
     /// Копирует UI кадра (всех видов и swapchain, если упакован вместе) в буферы слота.
@@ -12418,6 +12506,7 @@ struct ScenePass<'a> {
     draws: &'a [DrawCommand],
     /// Буферы вершин skinned draw'ов по индексу draw; `None` у статических.
     skin_draws: &'a [Option<skin::SkinDrawBuffers>],
+    instances: InstanceRange,
     view_projection: [[f32; 4]; 4],
     #[cfg(windows)]
     fsr_camera: [f32; 3],
@@ -12447,6 +12536,13 @@ struct ScenePass<'a> {
     stats: &'a Cell<DrawStats>,
 }
 
+/// Экземпляры draw'ов вида в буфере кадра: draw `i` читает экземпляр `first + i`.
+#[derive(Clone, Copy)]
+struct InstanceRange {
+    buffer: vk::Buffer,
+    first: u32,
+}
+
 /// Depth-only shadow pass. It shares the frame set and model transforms with the scene pass.
 struct ShadowPass<'a> {
     pipeline: vk::Pipeline,
@@ -12457,6 +12553,7 @@ struct ShadowPass<'a> {
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     skin_draws: &'a [Option<skin::SkinDrawBuffers>],
+    instances: InstanceRange,
     shadow_cascades: &'a [[[f32; 4]; 4]],
     local_shadow_matrices: &'a [[[f32; 4]; 4]],
     stats: &'a Cell<DrawStats>,
@@ -12557,60 +12654,21 @@ fn record_draws(
         })
     });
     let draw_count = sorted.as_ref().map_or(scene.draws.len(), Vec::len);
-    let mut bound_pipeline: Option<PipelineChoice> = None;
-    let mut rasterization_state = None;
-    for position in 0..draw_count {
+    let visible = (0..draw_count).filter_map(|position| {
         let index = sorted
             .as_ref()
             .map_or(position, |indices| indices[position]);
         let draw = &scene.draws[index];
-        let Some(material) = material_for_draw(scene.materials, draw) else {
-            continue;
-        };
-        let Some(pipeline_choice) = select_pipeline_choice(
+        let material = material_for_draw(scene.materials, draw)?;
+        let pipeline_choice = select_pipeline_choice(
             material.shader,
             material.alpha_mode,
             pass,
             scene.depth_prepass,
-        ) else {
-            continue;
-        };
-        if bound_pipeline != Some(pipeline_choice) {
-            let pipeline = match pipeline_choice {
-                PipelineChoice::Builtin(DrawPipeline::Prepass) => scene.prepass_pipeline,
-                PipelineChoice::Builtin(DrawPipeline::Opaque) if scene.depth_prepass => {
-                    Some(scene.opaque_equal_pipeline.unwrap_or(scene.pipeline))
-                }
-                PipelineChoice::Builtin(DrawPipeline::Opaque) => Some(scene.pipeline),
-                PipelineChoice::Builtin(DrawPipeline::Mask) => Some(scene.mask_pipeline),
-                PipelineChoice::Builtin(DrawPipeline::Blend) => Some(scene.blend_pipeline),
-                PipelineChoice::Builtin(DrawPipeline::Overdraw) => Some(scene.overdraw_pipeline),
-                PipelineChoice::Builtin(DrawPipeline::Wireframe) => {
-                    Some(scene.wireframe_pipeline.unwrap_or(scene.pipeline))
-                }
-                PipelineChoice::Surface(shader, variant) => scene
-                    .surface_shaders
-                    .get(shader.0)
-                    .and_then(Option::as_ref)
-                    .map(|shader| match variant {
-                        SurfacePipelineVariant::Opaque => shader.pipelines.opaque,
-                        SurfacePipelineVariant::OpaqueAfterPrepass => shader.pipelines.opaque_equal,
-                        SurfacePipelineVariant::Mask => shader.pipelines.mask,
-                        SurfacePipelineVariant::Blend => shader.pipelines.blend,
-                    }),
-            };
-            let Some(pipeline) = pipeline else { continue };
-            // SAFETY: the selected pipeline matches the active dynamic-rendering attachments.
-            unsafe {
-                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
-            };
-            bound_pipeline = Some(pipeline_choice);
-        }
-
+        )?;
+        let pipeline = scene_pipeline(scene, pipeline_choice)?;
         // Индексы проверены validate_draws до начала кадра.
-        let Some(mesh) = scene.meshes[draw.mesh.0].as_ref() else {
-            continue;
-        };
+        let mesh = scene.meshes[draw.mesh.0].as_ref()?;
         // Skinned draw'ы не отсекаются по bind-pose AABB: поза меняется каждый кадр.
         if draw.skin.is_none()
             && mesh
@@ -12618,26 +12676,53 @@ fn record_draws(
                 .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
         {
             update_stats(scene.stats, |stats| stats.scene_culled += 1);
-            continue;
+            return None;
         }
-        let (current, previous) = scene.skin_draws.get(index).copied().flatten().map_or(
-            (mesh.vertex_buffer.buffer, mesh.vertex_buffer.buffer),
-            |buffers| (buffers.current, buffers.previous),
+        let vertex_buffers = scene.skin_draws.get(index).copied().flatten().map_or(
+            [mesh.vertex_buffer.buffer, mesh.vertex_buffer.buffer],
+            |buffers| [buffers.current, buffers.previous],
         );
-        let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
-        if rasterization_state != Some(next_rasterization_state) {
+        Some((
+            index,
+            SceneDrawKey {
+                pipeline,
+                material_set: material.set,
+                vertex_buffers,
+                index_buffer: mesh.index_buffer.buffer,
+                index_count: mesh.index_count,
+                rasterization: draw_rasterization_state(material.double_sided, &draw.model),
+                lod_level: draw.lod_level,
+            },
+        ))
+    });
+    // SAFETY: the frame-slot instance buffer stays alive until this frame's fence completes.
+    unsafe {
+        device.cmd_bind_vertex_buffers(command_buffer, 2, &[scene.instances.buffer], &[0]);
+    }
+    let mut bound_pipeline = None;
+    let mut rasterization_state = None;
+    for batch in batch_draws(visible) {
+        let key = batch.key;
+        if bound_pipeline != Some(key.pipeline) {
+            // SAFETY: the selected pipeline matches the active dynamic-rendering attachments.
+            unsafe {
+                device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    key.pipeline,
+                )
+            };
+            bound_pipeline = Some(key.pipeline);
+        }
+        if rasterization_state != Some(key.rasterization) {
             // SAFETY: the graphics pipeline declares both values as dynamic Vulkan 1.3 states.
             unsafe {
-                device.cmd_set_cull_mode(command_buffer, next_rasterization_state.0);
-                device.cmd_set_front_face(command_buffer, next_rasterization_state.1);
+                device.cmd_set_cull_mode(command_buffer, key.rasterization.0);
+                device.cmd_set_front_face(command_buffer, key.rasterization.1);
             }
-            rasterization_state = Some(next_rasterization_state);
+            rasterization_state = Some(key.rasterization);
         }
-        let push_constants = push_constant_bytes(
-            &draw.model,
-            draw.previous_model.as_ref().unwrap_or(&draw.model),
-            draw.lod_level,
-        );
+        let push_constants = push_constant_bytes(key.lod_level, 0);
         // SAFETY: mesh buffers and material descriptors stay alive until this frame's fence completes.
         unsafe {
             device.cmd_bind_descriptor_sets(
@@ -12645,13 +12730,13 @@ fn record_draws(
                 vk::PipelineBindPoint::GRAPHICS,
                 scene.pipeline_layout,
                 1,
-                &[material.set],
+                &[key.material_set],
                 &[],
             );
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &[current, previous], &[0, 0]);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &key.vertex_buffers, &[0, 0]);
             device.cmd_bind_index_buffer(
                 command_buffer,
-                mesh.index_buffer.buffer,
+                key.index_buffer,
                 0,
                 vk::IndexType::UINT32,
             );
@@ -12662,9 +12747,95 @@ fn record_draws(
                 0,
                 &push_constants,
             );
-            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+            device.cmd_draw_indexed(
+                command_buffer,
+                key.index_count,
+                batch.count,
+                0,
+                0,
+                scene.instances.first + batch.first as u32,
+            );
         }
         update_stats(scene.stats, |stats| stats.scene_draw_calls += 1);
+    }
+}
+
+/// Состояние, общее для экземпляров одного instanced-вызова сцены.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SceneDrawKey {
+    pipeline: vk::Pipeline,
+    material_set: vk::DescriptorSet,
+    /// Текущие и прошлые вершины: у skinned draw'а — выходные копии его экземпляра.
+    vertex_buffers: [vk::Buffer; 2],
+    index_buffer: vk::Buffer,
+    index_count: u32,
+    rasterization: (vk::CullModeFlags, vk::FrontFace),
+    lod_level: u8,
+}
+
+/// Состояние, общее для экземпляров одного instanced-вызова shadow pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShadowDrawKey {
+    material_set: vk::DescriptorSet,
+    vertex_buffer: vk::Buffer,
+    index_buffer: vk::Buffer,
+    index_count: u32,
+    rasterization: (vk::CullModeFlags, vk::FrontFace),
+}
+
+/// Instanced-вызов: экземпляры draw'ов `first..first + count` с общим состоянием `key`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DrawBatch<K> {
+    first: usize,
+    count: u32,
+    key: K,
+}
+
+/// Склеивает идущие подряд видимые draw'ы с равным состоянием в instanced-вызовы.
+///
+/// Элементы объединяются, только если их индексы draw'ов тоже идут подряд: экземпляры
+/// вызова лежат в буфере кадра непрерывно, а порядок рисования (в том числе сортировка
+/// blend-прохода) не меняется.
+fn batch_draws<K: PartialEq>(
+    items: impl IntoIterator<Item = (usize, K)>,
+) -> impl Iterator<Item = DrawBatch<K>> {
+    let mut items = items.into_iter().peekable();
+    std::iter::from_fn(move || {
+        let (first, key) = items.next()?;
+        let mut count = 1_u32;
+        while items
+            .next_if(|(index, next)| *index == first + count as usize && *next == key)
+            .is_some()
+        {
+            count += 1;
+        }
+        Some(DrawBatch { first, count, key })
+    })
+}
+
+fn scene_pipeline(scene: &ScenePass<'_>, choice: PipelineChoice) -> Option<vk::Pipeline> {
+    match choice {
+        PipelineChoice::Builtin(DrawPipeline::Prepass) => scene.prepass_pipeline,
+        PipelineChoice::Builtin(DrawPipeline::Opaque) if scene.depth_prepass => {
+            Some(scene.opaque_equal_pipeline.unwrap_or(scene.pipeline))
+        }
+        PipelineChoice::Builtin(DrawPipeline::Opaque) => Some(scene.pipeline),
+        PipelineChoice::Builtin(DrawPipeline::Mask) => Some(scene.mask_pipeline),
+        PipelineChoice::Builtin(DrawPipeline::Blend) => Some(scene.blend_pipeline),
+        PipelineChoice::Builtin(DrawPipeline::Overdraw) => Some(scene.overdraw_pipeline),
+        PipelineChoice::Builtin(DrawPipeline::Wireframe) => {
+            Some(scene.wireframe_pipeline.unwrap_or(scene.pipeline))
+        }
+        PipelineChoice::Surface(shader, variant) => scene
+            .surface_shaders
+            .get(shader.0)
+            .and_then(Option::as_ref)
+            .map(|shader| match variant {
+                SurfacePipelineVariant::Opaque => shader.pipelines.opaque,
+                SurfacePipelineVariant::OpaqueAfterPrepass => shader.pipelines.opaque_equal,
+                SurfacePipelineVariant::Mask => shader.pipelines.mask,
+                SurfacePipelineVariant::Blend => shader.pipelines.blend,
+            }),
     }
 }
 
@@ -12817,21 +12988,17 @@ fn record_shadow_draws(
         );
     }
     let frustum = Some(Frustum::from_view_projection(light_view_projection));
-    let mut rasterization_state = None;
-    for (index, draw) in shadow_casters(shadow.draws, |draw| {
+    let visible = shadow_casters(shadow.draws, |draw| {
         material_for_draw(shadow.materials, draw)
             .map_or(AlphaMode::Opaque, |material| material.alpha_mode)
-    }) {
-        let Some(material) = material_for_draw(shadow.materials, draw) else {
-            continue;
-        };
-        let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
-            continue;
-        };
+    })
+    .filter_map(|(index, draw)| {
+        let material = material_for_draw(shadow.materials, draw)?;
+        let mesh = shadow.meshes[draw.mesh.0].as_ref()?;
         // Skinned draw'ы не отсекаются по bind-pose AABB: поза меняется каждый кадр.
         if draw.skin.is_none() && shadow_caster_is_outside(draw, mesh.bounds, frustum) {
             update_stats(shadow.stats, |stats| stats.shadow_culled += 1);
-            continue;
+            return None;
         }
         let vertex_buffer = shadow
             .skin_draws
@@ -12839,20 +13006,40 @@ fn record_shadow_draws(
             .copied()
             .flatten()
             .map_or(mesh.vertex_buffer.buffer, |buffers| buffers.current);
-        let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
-        if rasterization_state != Some(next_rasterization_state) {
+        Some((
+            index,
+            ShadowDrawKey {
+                material_set: material.set,
+                vertex_buffer,
+                index_buffer: mesh.index_buffer.buffer,
+                index_count: mesh.index_count,
+                rasterization: draw_rasterization_state(material.double_sided, &draw.model),
+            },
+        ))
+    });
+    let push_constants = push_constant_bytes(0, cascade_index);
+    // SAFETY: the instance buffer outlives the frame; the push range matches the pipeline layout.
+    unsafe {
+        device.cmd_bind_vertex_buffers(command_buffer, 1, &[shadow.instances.buffer], &[0]);
+        device.cmd_push_constants(
+            command_buffer,
+            shadow.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            &push_constants,
+        );
+    }
+    let mut rasterization_state = None;
+    for batch in batch_draws(visible) {
+        let key = batch.key;
+        if rasterization_state != Some(key.rasterization) {
             // SAFETY: the shadow graphics pipeline declares both values as dynamic Vulkan 1.3 states.
             unsafe {
-                device.cmd_set_cull_mode(command_buffer, next_rasterization_state.0);
-                device.cmd_set_front_face(command_buffer, next_rasterization_state.1);
+                device.cmd_set_cull_mode(command_buffer, key.rasterization.0);
+                device.cmd_set_front_face(command_buffer, key.rasterization.1);
             }
-            rasterization_state = Some(next_rasterization_state);
+            rasterization_state = Some(key.rasterization);
         }
-        let push_constants = push_constant_bytes(
-            &draw.model,
-            draw.previous_model.as_ref().unwrap_or(&draw.model),
-            draw.lod_level,
-        );
         // SAFETY: draw ids were checked before recording; material descriptors and buffers stay alive.
         unsafe {
             device.cmd_bind_descriptor_sets(
@@ -12860,24 +13047,24 @@ fn record_shadow_draws(
                 vk::PipelineBindPoint::GRAPHICS,
                 shadow.pipeline_layout,
                 1,
-                &[material.set],
+                &[key.material_set],
                 &[],
             );
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer], &[0]);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[key.vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(
                 command_buffer,
-                mesh.index_buffer.buffer,
+                key.index_buffer,
                 0,
                 vk::IndexType::UINT32,
             );
-            device.cmd_push_constants(
+            device.cmd_draw_indexed(
                 command_buffer,
-                shadow.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
+                key.index_count,
+                batch.count,
                 0,
-                &push_constants,
+                0,
+                shadow.instances.first + batch.first as u32,
             );
-            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, cascade_index);
         }
         update_stats(shadow.stats, |stats| stats.shadow_draw_calls += 1);
     }
@@ -14194,10 +14381,14 @@ fn create_shadow_graphics_pipeline(
             .module(fragment_module.handle)
             .name(c"main"),
     ];
-    let vertex_bindings = [vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(size_of::<Vertex>() as u32)
-        .input_rate(vk::VertexInputRate::VERTEX)];
+    let vertex_bindings = [
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX),
+        instance_binding(SHADOW_INSTANCE_BINDING),
+    ];
+    // Shadow читает только столбцы model в начале данных экземпляра.
     let vertex_attributes = [
         vk::VertexInputAttributeDescription::default()
             .location(0)
@@ -14209,7 +14400,10 @@ fn create_shadow_graphics_pipeline(
             .binding(0)
             .format(vk::Format::R32G32_SFLOAT)
             .offset(std::mem::offset_of!(Vertex, uv) as u32),
-    ];
+    ]
+    .into_iter()
+    .chain(instance_attributes(SHADOW_INSTANCE_BINDING, 2, 4))
+    .collect::<Vec<_>>();
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&vertex_bindings)
         .vertex_attribute_descriptions(&vertex_attributes);
@@ -16316,18 +16510,60 @@ fn multiply_4x4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 }
 
 /// Push constants: model, normal matrix, previous model and one uvec4 of draw parameters.
-fn push_constant_bytes(
-    model: &[[f32; 4]; 4],
-    previous_model: &[[f32; 4]; 4],
-    lod_level: u8,
-) -> [u8; PUSH_CONSTANTS_SIZE] {
-    let normal_from_model = normal_matrix(model);
+/// Привязка данных экземпляров с шагом [`INSTANCE_STRIDE`] на instance.
+fn instance_binding(binding: u32) -> vk::VertexInputBindingDescription {
+    vk::VertexInputBindingDescription::default()
+        .binding(binding)
+        .stride(INSTANCE_STRIDE as u32)
+        .input_rate(vk::VertexInputRate::INSTANCE)
+}
+
+/// Атрибуты `vec4` первых `count` векторов данных экземпляра на локациях от `first_location`.
+fn instance_attributes(
+    binding: u32,
+    first_location: u32,
+    count: u32,
+) -> impl Iterator<Item = vk::VertexInputAttributeDescription> {
+    (0..count).map(move |vector| {
+        vk::VertexInputAttributeDescription::default()
+            .location(first_location + vector)
+            .binding(binding)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(vector * size_of::<[f32; 4]>() as u32)
+    })
+}
+
+/// `params.x` — LOD для отладочного вида, `params.y` — каскад или слой тени.
+fn push_constant_bytes(lod_level: u8, shadow_layer: u32) -> [u8; PUSH_CONSTANTS_SIZE] {
     let mut bytes = [0; PUSH_CONSTANTS_SIZE];
-    bytes[..64].copy_from_slice(&float_bytes::<64>(model.as_flattened()));
-    bytes[64..128].copy_from_slice(&float_bytes::<64>(normal_from_model.as_flattened()));
-    bytes[128..192].copy_from_slice(&float_bytes::<64>(previous_model.as_flattened()));
-    bytes[192..196].copy_from_slice(&(lod_level as u32).to_ne_bytes());
+    bytes[..4].copy_from_slice(&(lod_level as u32).to_ne_bytes());
+    bytes[4..8].copy_from_slice(&shadow_layer.to_ne_bytes());
     bytes
+}
+
+/// Упаковывает данные экземпляров всех видов подряд в порядке draw'ов.
+///
+/// Возвращает байты и для каждого вида индекс экземпляра его первого draw'а:
+/// draw `i` вида `v` читает экземпляр `bases[v] + i`.
+fn pack_instances<'a>(views: impl IntoIterator<Item = &'a [DrawCommand]>) -> (Vec<u8>, Vec<u32>) {
+    let mut bytes = Vec::new();
+    let mut bases = Vec::new();
+    for draws in views {
+        bases.push((bytes.len() / INSTANCE_STRIDE) as u32);
+        bytes.reserve(draws.len() * INSTANCE_STRIDE);
+        for draw in draws {
+            let normal_from_model = normal_matrix(&draw.model);
+            bytes.extend_from_slice(&float_bytes::<64>(draw.model.as_flattened()));
+            bytes.extend_from_slice(&float_bytes::<48>(normal_from_model[..3].as_flattened()));
+            bytes.extend_from_slice(&float_bytes::<64>(
+                draw.previous_model
+                    .as_ref()
+                    .unwrap_or(&draw.model)
+                    .as_flattened(),
+            ));
+        }
+    }
+    (bytes, bases)
 }
 
 fn float_bytes<const N: usize>(values: &[f32]) -> [u8; N] {
@@ -16637,6 +16873,10 @@ mod tests {
         GpuPass, GpuProfileLayout, GpuViewTimings, LocalShadowKind, MAX_PROFILED_VIEWS,
         OUTPUT_QUERY_FIRST, ProfiledView, SelectedLocalLight, TIMESTAMP_QUERY_COUNT,
         VIEW_QUERY_COUNT, ViewportId, available_timestamps, decode_output, decode_view,
+    };
+    use super::{
+        INSTANCE_STRIDE, MESH_INSTANCE_BINDING, MESH_INSTANCE_VECTORS, SHADOW_INSTANCE_BINDING,
+        batch_draws, instance_attributes, instance_binding, pack_instances,
     };
     use ash::vk;
     use std::time::{Duration, Instant};
@@ -17185,12 +17425,12 @@ mod tests {
                 | vk::FormatFeatureFlags::STORAGE_IMAGE,
             velocity_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE,
-            max_push_constants_size: 207,
+            max_push_constants_size: 15,
         };
         let reasons = evaluate_device(&facts, &[]).reasons;
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("maxPushConstantsSize"));
-        assert!(reasons[0].contains("208"));
+        assert!(reasons[0].contains("16"));
     }
 
     #[test]
@@ -18990,25 +19230,110 @@ mod tests {
     }
 
     #[test]
-    fn push_constants_hold_model_and_normal_matrices_column_by_column() {
+    fn push_constants_hold_lod_and_shadow_layer() {
+        let bytes = push_constant_bytes(6, 3);
+        assert_eq!(PUSH_CONSTANTS_SIZE, 16);
+        assert_eq!(u32::from_ne_bytes(bytes[..4].try_into().unwrap()), 6);
+        assert_eq!(u32::from_ne_bytes(bytes[4..8].try_into().unwrap()), 3);
+        assert_eq!(&bytes[8..], &[0; 8]);
+    }
+
+    fn instance_draw(model: [[f32; 4]; 4], previous_model: Option<[[f32; 4]; 4]>) -> DrawCommand {
+        DrawCommand {
+            mesh: MeshId(0),
+            material: None,
+            model,
+            previous_model,
+            lod_level: 0,
+            casts_shadow: true,
+            skin: None,
+        }
+    }
+
+    #[test]
+    fn instances_hold_model_normal_and_previous_model_column_by_column() {
         let mut model = IDENTITY;
         model[0][0] = 2.0;
         model[3] = [5.0, 6.0, 7.0, 1.0];
         let mut previous_model = IDENTITY;
         previous_model[3] = [2.0, 3.0, 4.0, 1.0];
-        let bytes = push_constant_bytes(&model, &previous_model, 6);
-        let values = floats(&bytes[..192]);
-        assert_eq!(PUSH_CONSTANTS_SIZE, 208);
-        assert_eq!(values.len(), 48);
+        let (bytes, bases) = pack_instances([&[instance_draw(model, Some(previous_model))][..]]);
+        assert_eq!(bases, [0]);
+        assert_eq!(INSTANCE_STRIDE, 176);
+        let values = floats(&bytes);
+        assert_eq!(values.len(), 44);
         assert_eq!(&values[..4], &[2.0, 0.0, 0.0, 0.0]);
         assert_eq!(&values[12..16], &[5.0, 6.0, 7.0, 1.0]);
         // Матрица нормалей пропорциональна обратной транспонированной: масштаб X делит нормаль X.
         assert_eq!(&values[16..20], &[1.0, 0.0, 0.0, 0.0]);
         assert_eq!(&values[20..24], &[0.0, 2.0, 0.0, 0.0]);
-        assert_eq!(&values[32..36], &[1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(&values[44..48], &[2.0, 3.0, 4.0, 1.0]);
-        assert_eq!(u32::from_ne_bytes(bytes[192..196].try_into().unwrap()), 6);
-        assert_eq!(&bytes[196..], &[0; 12]);
+        assert_eq!(&values[24..28], &[0.0, 0.0, 2.0, 0.0]);
+        assert_eq!(&values[28..32], &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&values[40..44], &[2.0, 3.0, 4.0, 1.0]);
+    }
+
+    #[test]
+    fn instances_reuse_model_without_previous_and_place_views_back_to_back() {
+        let mut model = IDENTITY;
+        model[3] = [1.0, 2.0, 3.0, 1.0];
+        let first = [instance_draw(IDENTITY, None), instance_draw(model, None)];
+        let second = [instance_draw(model, None)];
+        let (bytes, bases) = pack_instances([&first[..], &[], &second[..]]);
+        assert_eq!(bases, [0, 2, 2]);
+        assert_eq!(bytes.len(), 3 * INSTANCE_STRIDE);
+        let values = floats(&bytes[INSTANCE_STRIDE..2 * INSTANCE_STRIDE]);
+        // Без previous_model прошлый кадр совпадает с текущим: motion vector нулевой.
+        assert_eq!(&values[..16], &values[28..44]);
+        assert_eq!(&values[12..16], &[1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(pack_instances([&[][..]]), (Vec::new(), vec![0]));
+    }
+
+    #[test]
+    fn instance_attributes_cover_mesh_and_shadow_shader_locations() {
+        let mesh = instance_attributes(MESH_INSTANCE_BINDING, 5, MESH_INSTANCE_VECTORS)
+            .map(|attribute| (attribute.location, attribute.binding, attribute.offset))
+            .collect::<Vec<_>>();
+        assert_eq!(mesh.len(), 11);
+        assert_eq!(mesh.first(), Some(&(5, 2, 0)));
+        // Локация 15 — последняя из 16, гарантированных Vulkan для vertex input.
+        assert_eq!(mesh.last(), Some(&(15, 2, 160)));
+        let shadow = instance_attributes(SHADOW_INSTANCE_BINDING, 2, 4)
+            .map(|attribute| (attribute.location, attribute.offset))
+            .collect::<Vec<_>>();
+        assert_eq!(shadow, [(2, 0), (3, 16), (4, 32), (5, 48)]);
+        let binding = instance_binding(MESH_INSTANCE_BINDING);
+        assert_eq!(binding.stride, INSTANCE_STRIDE as u32);
+        assert_eq!(binding.input_rate, vk::VertexInputRate::INSTANCE);
+    }
+
+    #[test]
+    fn batch_draws_merges_adjacent_draws_with_equal_state() {
+        let batches = batch_draws([(0, 'a'), (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b')])
+            .map(|batch| (batch.first, batch.count, batch.key))
+            .collect::<Vec<_>>();
+        assert_eq!(batches, [(0, 3, 'a'), (3, 2, 'b')]);
+    }
+
+    #[test]
+    fn batch_draws_splits_on_culled_gaps_and_state_changes_without_reordering() {
+        // Draw 2 отсечён, 4 с другим состоянием: экземпляры вызова должны идти подряд.
+        let batches = batch_draws([(0, 'a'), (1, 'a'), (3, 'a'), (4, 'b'), (5, 'a')])
+            .map(|batch| (batch.first, batch.count, batch.key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            [(0, 2, 'a'), (3, 1, 'a'), (4, 1, 'b'), (5, 1, 'a')]
+        );
+    }
+
+    #[test]
+    fn batch_draws_keeps_sorted_blend_order_and_merges_only_ascending_runs() {
+        // Сортировка от дальнего к ближнему: убывающие индексы не склеиваются.
+        let batches = batch_draws([(5, 'a'), (4, 'a'), (1, 'a'), (2, 'a')])
+            .map(|batch| (batch.first, batch.count))
+            .collect::<Vec<_>>();
+        assert_eq!(batches, [(5, 1), (4, 1), (1, 2)]);
+        assert_eq!(batch_draws(std::iter::empty::<(usize, ())>()).count(), 0);
     }
 
     #[test]
