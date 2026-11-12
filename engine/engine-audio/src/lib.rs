@@ -4,6 +4,7 @@
 //! - поток `rve-audio` (здесь, [`AudioEngine::run`]) владеет кешем клипов, очередью ожидающих
 //!   воспроизведений и выходным потоком `cpal`; он же освобождает слоты голосов;
 //! - `rve-audio-decode` декодирует прочитанные байты, чтобы не блокировать цикл;
+//! - `rve-audio-stream` читает и декодирует по частям клипы с `stream = true` ([`stream`]);
 //! - audio callback работает только с [`mixer::Mixer`]: команды и завершённые голоса идут через
 //!   SPSC-кольца `rtrb`, память и блокировки в нём не используются.
 //!
@@ -12,8 +13,10 @@
 
 pub mod bridge;
 pub mod decode;
+mod effects;
 pub mod mixer;
 pub mod output;
+pub mod stream;
 
 pub use bridge::AudioBridge;
 pub use decode::{Clip, DecodeError};
@@ -21,17 +24,19 @@ pub use mixer::{Distances, PlayRequest, Rolloff};
 
 use decode::{MAX_CLIP_FILE_BYTES, decode};
 use engine_resources::{ResourceHandle, ResourceRequest};
-use engine_scene::{AudioGroup, VoiceId};
+use engine_scene::{AudioGroup, AudioGroupEffects, VoiceId};
 use flume::{Receiver, Selector, Sender, TrySendError};
-use mixer::{MixerCommand, Spatial, VOICE_SLOTS};
+use mixer::{MixerCommand, RETIRED_CAPACITY, Spatial, VOICE_SLOTS};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
+use stream::{ByteSource, OpenSource, StreamEvent, StreamJob, StreamReader, stream_loop};
 
 /// Бюджет декодированных клипов в кеше (512 МБ).
 const CACHE_LIMIT_BYTES: usize = 512 * 1024 * 1024;
@@ -95,6 +100,10 @@ pub(crate) enum Command {
         request: PlayRequest,
     },
     Stop(VoiceId),
+    FadeOut {
+        voice: VoiceId,
+        seconds: f32,
+    },
     StopAll,
     SetPaused(bool),
     SetMonoOutput(bool),
@@ -105,6 +114,10 @@ pub(crate) enum Command {
     SetGroupVolume {
         group: AudioGroup,
         volume: f32,
+    },
+    SetGroupEffects {
+        group: AudioGroup,
+        effects: AudioGroupEffects,
     },
     Preload(Vec<String>),
     /// Отвечает, когда поток дошёл до этой команды: все предыдущие уже обработаны.
@@ -256,6 +269,12 @@ impl AudioHandle {
         self.send(Command::Stop(voice))
     }
 
+    /// Как [`AudioHandle::stop`], но голос затухает `seconds` секунд от текущей громкости.
+    /// Значения короче стандартного затухания (около 5 мс) дают обычную остановку.
+    pub fn stop_fade(&self, voice: VoiceId, seconds: f32) -> Result<(), AudioError> {
+        self.send(Command::FadeOut { voice, seconds })
+    }
+
     pub fn stop_all(&self) -> Result<(), AudioError> {
         self.send(Command::StopAll)
     }
@@ -277,7 +296,18 @@ impl AudioHandle {
         self.send(Command::SetGroupVolume { group, volume })
     }
 
-    /// Загружает клипы заранее; ошибки приходят событием [`AudioEvent::Failed`].
+    /// Задаёт фильтры и реверберацию шины группы; `Master` обрабатывает общую сумму.
+    /// Значения проверяет вызывающий (`engine_scene::group_effects_problem`).
+    pub fn set_group_effects(
+        &self,
+        group: AudioGroup,
+        effects: AudioGroupEffects,
+    ) -> Result<(), AudioError> {
+        self.send(Command::SetGroupEffects { group, effects })
+    }
+
+    /// Загружает клипы заранее; ошибки приходят событием [`AudioEvent::Failed`]. Клипы
+    /// со стримингом предзагружать не нужно: они не попадают в кеш.
     pub fn preload(&self, paths: Vec<String>) -> Result<(), AudioError> {
         self.send(Command::Preload(paths))
     }
@@ -355,6 +385,8 @@ pub struct AudioEngine {
     ended_rx: Consumer<VoiceId>,
     mixer_tx: Producer<MixerCommand>,
     mixer_rx: Consumer<MixerCommand>,
+    retired_tx: Producer<StreamReader>,
+    retired_rx: Consumer<StreamReader>,
     lanes: Arc<Mutex<Lanes>>,
     spatial: Arc<Spatial>,
     stopping: Arc<AtomicBool>,
@@ -366,6 +398,7 @@ impl AudioEngine {
         let (events_tx, events_rx) = flume::unbounded();
         let (ended_tx, ended_rx) = RingBuffer::new(mixer::ENDED_CAPACITY);
         let (mixer_tx, mixer_rx) = RingBuffer::new(MIXER_CAPACITY);
+        let (retired_tx, retired_rx) = RingBuffer::new(RETIRED_CAPACITY);
         let lanes = Arc::new(Mutex::new(Lanes::default()));
         let spatial = Arc::new(Spatial::new());
         let stopping = Arc::new(AtomicBool::new(false));
@@ -388,6 +421,8 @@ impl AudioEngine {
             ended_rx,
             mixer_tx,
             mixer_rx,
+            retired_tx,
+            retired_rx,
             lanes,
             spatial,
             stopping,
@@ -406,6 +441,8 @@ impl AudioEngine {
             mut ended_rx,
             mixer_tx,
             mixer_rx,
+            retired_tx,
+            mut retired_rx,
             lanes,
             spatial,
             stopping,
@@ -423,9 +460,24 @@ impl AudioEngine {
             log::warn!("декодер звука не запущен: {error}; клипы не загрузятся");
         }
 
+        let (stream_tx, stream_jobs) = flume::unbounded::<StreamJob>();
+        let (stream_events_tx, stream_events) = flume::unbounded::<StreamEvent>();
+        let keepalive_stream_events = stream_events_tx.clone();
+        let stream_cancel = Arc::new(AtomicBool::new(false));
+        let streamer_cancel = Arc::clone(&stream_cancel);
+        let open_stream = stream_source(config.resources.clone());
+        let streamer = thread::Builder::new()
+            .name("rve-audio-stream".into())
+            .spawn(move || {
+                stream_loop(stream_jobs, stream_events_tx, open_stream, &streamer_cancel)
+            });
+        if let Err(error) = &streamer {
+            log::warn!("поток стриминга звука не запущен: {error}; стрим-клипы не зазвучат");
+        }
+
         let read = read_source(config.resources);
         let (output, mixer) = if config.output {
-            match output::open(mixer_rx, ended_tx, Arc::clone(&spatial)) {
+            match output::open(mixer_rx, ended_tx, retired_tx, Arc::clone(&spatial)) {
                 Ok(output) => (Some(output), Some(mixer_tx)),
                 Err(error) => {
                     let message =
@@ -452,6 +504,8 @@ impl AudioEngine {
             outbox: VecDeque::new(),
             events: events_tx,
             decode_tx,
+            stream_tx: streamer.is_ok().then_some(stream_tx),
+            streams: Vec::new(),
         };
         loop {
             if stopping.load(Ordering::Acquire) {
@@ -462,6 +516,7 @@ impl AudioEngine {
             let incoming = Selector::new()
                 .recv(&commands, Incoming::Command)
                 .recv(&decoded_rx, Incoming::Decoded)
+                .recv(&stream_events, Incoming::Stream)
                 .wait_timeout(if core.mixer.is_some() || !core.loading.is_empty() {
                     READ_POLL
                 } else {
@@ -475,11 +530,16 @@ impl AudioEngine {
                 }
                 Ok(Incoming::Command(Err(_))) => break,
                 Ok(Incoming::Decoded(Ok(decoded))) => core.decoded(decoded),
-                // `keepalive_decoded` живёт до конца `run`, поэтому отключения не бывает.
-                Ok(Incoming::Decoded(Err(_))) | Err(_) => {}
+                Ok(Incoming::Stream(Ok(event))) => core.stream_event(event),
+                // `keepalive_*` живут до конца `run`, поэтому отключения не бывает.
+                Ok(Incoming::Decoded(Err(_))) | Ok(Incoming::Stream(Err(_))) | Err(_) => {}
             }
             while let Ok(voice) = ended_rx.pop() {
                 core.voice_ended(voice);
+            }
+            // Кольца завершённых стрим-голосов освобождаются здесь, а не в callback.
+            while let Ok(reader) = retired_rx.pop() {
+                drop(reader);
             }
             core.flush_mixer();
             core.poll_reads();
@@ -488,11 +548,16 @@ impl AudioEngine {
         cancel_decode.store(true, Ordering::Relaxed);
         // Сначала останавливаем устройство: голоса микшера держат `Arc<Clip>`, и их последняя
         // ссылка не должна освободиться в callback. Кеш `core` живёт дольше потока вывода.
+        stream_cancel.store(true, Ordering::Relaxed);
         drop(output);
         drop(core);
         drop(keepalive_decoded);
+        drop(keepalive_stream_events);
         if let Ok(decoder) = decoder {
             let _ = decoder.join();
+        }
+        if let Ok(streamer) = streamer {
+            let _ = streamer.join();
         }
     }
 }
@@ -500,6 +565,7 @@ impl AudioEngine {
 enum Incoming {
     Command(Result<Command, flume::RecvError>),
     Decoded(Result<Decoded, flume::RecvError>),
+    Stream(Result<StreamEvent, flume::RecvError>),
 }
 
 type ReadPoll = Box<dyn FnMut() -> Option<Result<Vec<u8>, String>>>;
@@ -538,6 +604,10 @@ struct Core {
     outbox: VecDeque<MixerCommand>,
     events: Sender<AudioEvent>,
     decode_tx: Sender<DecodeJob>,
+    /// Задания потоку стриминга; `None`, если поток не запустился.
+    stream_tx: Option<Sender<StreamJob>>,
+    /// Стрим-голоса, которые ждут заполнения кольца.
+    streams: Vec<Pending>,
 }
 
 impl Core {
@@ -554,6 +624,10 @@ impl Core {
                 self.cancel_pending(|pending| pending.voice == voice);
                 self.send_mixer(MixerCommand::Stop { voice });
             }
+            Command::FadeOut { voice, seconds } => {
+                self.cancel_pending(|pending| pending.voice == voice);
+                self.send_mixer(MixerCommand::FadeOut { voice, seconds });
+            }
             Command::StopAll => {
                 self.cancel_pending(|_| true);
                 self.send_mixer(MixerCommand::StopAll);
@@ -564,6 +638,7 @@ impl Core {
                 for pending in self
                     .pending
                     .iter_mut()
+                    .chain(self.streams.iter_mut())
                     .filter(|pending| pending.voice == voice)
                 {
                     pending.request.volume = volume;
@@ -572,6 +647,9 @@ impl Core {
             }
             Command::SetGroupVolume { group, volume } => {
                 self.send_mixer(MixerCommand::SetGroupVolume { group, volume });
+            }
+            Command::SetGroupEffects { group, effects } => {
+                self.send_mixer(MixerCommand::SetGroupEffects { group, effects });
             }
             Command::Preload(paths) => {
                 for path in paths {
@@ -587,6 +665,9 @@ impl Core {
     }
 
     fn play(&mut self, voice: VoiceId, lane: usize, path: String, request: PlayRequest) {
+        if request.stream {
+            return self.play_stream(voice, lane, path, request);
+        }
         if let Some(clip) = self.cache.get(&path).cloned() {
             return self.start_voice(voice, lane, clip, request);
         }
@@ -600,6 +681,74 @@ impl Core {
             request,
         });
         self.ensure_loaded(&path);
+    }
+
+    /// Просит поток стриминга открыть клип; голос уйдёт микшеру, когда кольцо заполнится.
+    fn play_stream(&mut self, voice: VoiceId, lane: usize, path: String, request: PlayRequest) {
+        if self.mixer.is_none() || self.failed.contains(&path) {
+            return self.voice_ended(voice);
+        }
+        let job = StreamJob {
+            voice,
+            path: path.clone(),
+            looping: request.looping,
+        };
+        let sent = self
+            .stream_tx
+            .as_ref()
+            .is_some_and(|stream| stream.send(job).is_ok());
+        if !sent {
+            self.voice_ended(voice);
+            return self.fail(&path, "поток стриминга не запущен");
+        }
+        self.streams.push(Pending {
+            voice,
+            lane,
+            path,
+            request,
+        });
+    }
+
+    /// Ответ потока стриминга: готовое кольцо уходит микшеру, ошибка завершает голоса клипа.
+    fn stream_event(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::Ready { voice, reader } => {
+                let Some(index) = self
+                    .streams
+                    .iter()
+                    .position(|pending| pending.voice == voice)
+                else {
+                    // Голос остановили, пока стрим открывался: кольцо освобождается здесь.
+                    return;
+                };
+                let pending = self.streams.remove(index);
+                if self.mixer.is_none() {
+                    return self.voice_ended(voice);
+                }
+                self.send_mixer(MixerCommand::PlayStream {
+                    voice,
+                    lane: pending.lane,
+                    stream: reader,
+                    request: pending.request,
+                });
+            }
+            StreamEvent::OpenFailed {
+                voice,
+                path,
+                message,
+            } => {
+                if self.failed.contains(&path) {
+                    self.cancel_pending(|pending| pending.voice == voice);
+                } else {
+                    self.fail(&path, message);
+                }
+            }
+            StreamEvent::Broken { path, message } => {
+                if !self.failed.contains(&path) {
+                    self.fail(&path, message);
+                }
+            }
+        }
     }
 
     /// Запускает чтение клипа, если его нет в кеше и он не загружается и не декодируется.
@@ -700,11 +849,16 @@ impl Core {
     }
 
     /// Убирает ожидающие голоса, которые подходят под `matches`, и завершает их: микшер их не видел.
+    /// Касается и клипов, ждущих загрузки, и стримов, ждущих заполнения кольца.
     fn cancel_pending(&mut self, matches: impl Fn(&Pending) -> bool) {
-        let (cancelled, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.pending)
-            .into_iter()
-            .partition(|pending| matches(pending));
-        self.pending = waiting;
+        let mut cancelled = Vec::new();
+        for list in [&mut self.pending, &mut self.streams] {
+            let (removed, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(list)
+                .into_iter()
+                .partition(|pending| matches(pending));
+            *list = waiting;
+            cancelled.extend(removed);
+        }
         for pending in cancelled {
             self.voice_ended(pending.voice);
         }
@@ -763,6 +917,43 @@ fn decode_loop(jobs: Receiver<DecodeJob>, results: Sender<Decoded>, cancel: &Ato
         if results.send(Decoded { path, result }).is_err() {
             break;
         }
+    }
+}
+
+/// Диапазоны файла ресурсов для потока стриминга; ожидание блокирует только этот поток.
+struct ResourceBytes {
+    resources: ResourceHandle,
+    path: String,
+    len: u64,
+}
+
+impl ByteSource for ResourceBytes {
+    fn size(&self) -> u64 {
+        self.len
+    }
+
+    fn read(&mut self, range: Range<u64>) -> Result<Vec<u8>, String> {
+        self.resources
+            .read_range(&self.path, range)
+            .and_then(|request| request.wait())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn stream_source(resources: Option<ResourceHandle>) -> OpenSource {
+    match resources {
+        Some(resources) => Box::new(move |path: &str| {
+            let stat = resources
+                .stat(path)
+                .and_then(|request| request.wait())
+                .map_err(|error| error.to_string())?;
+            Ok(Box::new(ResourceBytes {
+                resources: resources.clone(),
+                path: path.to_owned(),
+                len: stat.size,
+            }) as Box<dyn ByteSource>)
+        }),
+        None => Box::new(|_path: &str| Err("ресурсы проекта не подключены".to_owned())),
     }
 }
 

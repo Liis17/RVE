@@ -2326,7 +2326,7 @@ fn apply_changes(
         changes
             .despawned
             .iter()
-            .map(|&object| AudioRequest::StopSource { object }),
+            .map(|&object| AudioRequest::StopSource { object, fade: 0.0 }),
     );
     if let Some(sync) = physics.as_deref_mut() {
         spawn_physics
@@ -9618,7 +9618,7 @@ mod activity_tests {
         world.set_active(ball, false).unwrap();
         let hidden = apply_activity_changes(&mut world, Some(&mut sync), &mut spawn);
         assert!(
-            matches!(hidden.as_slice(), [AudioRequest::StopSource { object }] if *object == ball),
+            matches!(hidden.as_slice(), [AudioRequest::StopSource { object, .. }] if *object == ball),
             "{hidden:?}"
         );
         assert_eq!(spawn.changes, [BodyChange::Remove { handle: body }]);

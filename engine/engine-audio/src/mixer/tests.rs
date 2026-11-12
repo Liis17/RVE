@@ -1,4 +1,5 @@
 use super::*;
+use crate::stream::Frame;
 
 const RATE: u32 = 48_000;
 
@@ -20,6 +21,8 @@ fn request(looping: bool) -> PlayRequest {
         rolloff: Rolloff::Inverse,
         pitch: 1.0,
         force_mono: false,
+        fade_in: 0.0,
+        stream: false,
     }
 }
 
@@ -689,4 +692,326 @@ fn lowpass_recovers_when_its_state_becomes_non_finite() {
         tail.iter().any(|value| value.abs() > 1e-3),
         "голос замолчал"
     );
+}
+
+fn effects_lowpass(hz: f32) -> AudioGroupEffects {
+    AudioGroupEffects {
+        lowpass_hz: hz,
+        ..AudioGroupEffects::default()
+    }
+}
+
+fn sine_clip(frequency: f32, frames: usize) -> Arc<Clip> {
+    let samples = (0..frames)
+        .map(|index| (2.0 * std::f32::consts::PI * frequency * index as f32 / RATE as f32).sin())
+        .collect();
+    clip(RATE, 1, samples)
+}
+
+fn peak(values: &[f32]) -> f32 {
+    values
+        .iter()
+        .fold(0.0f32, |peak, value| peak.max(value.abs()))
+}
+
+#[test]
+fn evicted_voice_fades_out_in_a_tail_instead_of_being_cut() {
+    let mut mixer = mixer();
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![0.5; 100_000]),
+        request(false),
+    );
+    let _ = render_mono(&mut mixer, 256);
+    // Как при полном пуле: Stop вытесненного, затем Play нового в ту же полосу.
+    mixer.apply(MixerCommand::Stop { voice: voice(1) });
+    play(
+        &mut mixer,
+        2,
+        0,
+        clip(RATE, 1, vec![0.0; 100_000]),
+        request(false),
+    );
+    assert_eq!(
+        drain(&mut mixer),
+        vec![voice(1)],
+        "VoiceEnded вытесненного приходит сразу: полоса уже у нового голоса"
+    );
+    assert_eq!(mixer.fading_tails(), 1);
+
+    let out = render_mono(&mut mixer, 512);
+    let fade = (FADE_SECONDS * RATE as f32).ceil() as usize;
+    assert!((out[0] - 0.5).abs() < 1e-6, "без обрыва: {}", out[0]);
+    let largest_step = out
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        largest_step <= 0.5 / fade as f32 + 1e-6,
+        "шаг {largest_step}"
+    );
+    assert!(out[fade..].iter().all(|value| *value == 0.0));
+    assert_eq!(mixer.fading_tails(), 0);
+    assert_eq!(mixer.active_voices(), 1, "новый голос звучит дальше");
+    assert!(
+        drain(&mut mixer).is_empty(),
+        "хвост не повторяет VoiceEnded"
+    );
+}
+
+#[test]
+fn fade_in_ramps_from_silence_to_full_volume_over_its_duration() {
+    let mut mixer = mixer();
+    // Длиннее блока 256 кадров, в котором громкость голоса сглаживается от нуля.
+    let seconds = 0.05;
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![1.0; 100_000]),
+        PlayRequest {
+            fade_in: seconds,
+            ..request(false)
+        },
+    );
+    let frames = (seconds * RATE as f32).ceil() as usize;
+    let out = render_mono(&mut mixer, frames * 2);
+    assert_eq!(out[0], 0.0, "первый кадр тихий");
+    assert!(
+        (out[frames / 2] - 0.5).abs() < 0.01,
+        "середина: {}",
+        out[frames / 2]
+    );
+    assert!(
+        out.windows(2).all(|pair| pair[1] >= pair[0] - 1e-6),
+        "рост без провалов"
+    );
+    assert!((out[frames + 1] - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn fade_out_on_request_lasts_its_duration_and_short_values_use_the_default() {
+    let mut mixer = mixer();
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![1.0; 200_000]),
+        request(true),
+    );
+    let _ = render_mono(&mut mixer, 256);
+    mixer.apply(MixerCommand::FadeOut {
+        voice: voice(1),
+        seconds: 0.05,
+    });
+    let frames = (0.05 * RATE as f32).ceil() as usize;
+    let out = render_mono(&mut mixer, frames + 256);
+    assert!(
+        (out[frames / 2] - 0.5).abs() < 0.01,
+        "середина: {}",
+        out[frames / 2]
+    );
+    assert!(out[frames - 1] > 0.0);
+    assert!(out[frames..].iter().all(|value| *value == 0.0));
+    assert_eq!(drain(&mut mixer), vec![voice(1)]);
+
+    play(
+        &mut mixer,
+        2,
+        0,
+        clip(RATE, 1, vec![1.0; 200_000]),
+        request(true),
+    );
+    mixer.apply(MixerCommand::FadeOut {
+        voice: voice(2),
+        seconds: 0.0,
+    });
+    let out = render_mono(&mut mixer, 512);
+    let default = (FADE_SECONDS * RATE as f32).ceil() as usize;
+    assert!(out[default..].iter().all(|value| *value == 0.0));
+}
+
+#[test]
+fn a_second_stop_can_shorten_a_fade_but_never_extend_it() {
+    let mut mixer = mixer();
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![1.0; 200_000]),
+        request(true),
+    );
+    mixer.apply(MixerCommand::Stop { voice: voice(1) });
+    mixer.apply(MixerCommand::FadeOut {
+        voice: voice(1),
+        seconds: 1.0,
+    });
+    let out = render_mono(&mut mixer, 1024);
+    let default = (FADE_SECONDS * RATE as f32).ceil() as usize;
+    assert!(out[default..].iter().all(|value| *value == 0.0));
+    assert_eq!(drain(&mut mixer), vec![voice(1)]);
+}
+
+#[test]
+fn group_lowpass_filters_only_its_own_group() {
+    let mut mixer = mixer();
+    mixer.apply(MixerCommand::SetGroupEffects {
+        group: AudioGroup::Effects,
+        effects: effects_lowpass(300.0),
+    });
+    play(&mut mixer, 1, 0, sine_clip(6000.0, 48_000), request(true));
+    let filtered = render_mono(&mut mixer, 4800);
+    assert!(
+        peak(&filtered[2400..]) < 0.05,
+        "{}",
+        peak(&filtered[2400..])
+    );
+
+    let mut mixer = super::Mixer::new(RATE, Arc::new(Spatial::new()));
+    mixer.apply(MixerCommand::SetGroupEffects {
+        group: AudioGroup::Effects,
+        effects: effects_lowpass(300.0),
+    });
+    play(
+        &mut mixer,
+        1,
+        0,
+        sine_clip(6000.0, 48_000),
+        PlayRequest {
+            group: AudioGroup::Music,
+            ..request(true)
+        },
+    );
+    let untouched = render_mono(&mut mixer, 4800);
+    assert!(peak(&untouched[2400..]) > 0.9);
+}
+
+#[test]
+fn master_effects_process_the_whole_mix_and_reset_turns_them_off() {
+    let mut mixer = mixer();
+    mixer.apply(MixerCommand::SetGroupEffects {
+        group: AudioGroup::Master,
+        effects: effects_lowpass(300.0),
+    });
+    play(
+        &mut mixer,
+        1,
+        0,
+        sine_clip(6000.0, 96_000),
+        PlayRequest {
+            group: AudioGroup::Ambient,
+            ..request(true)
+        },
+    );
+    let filtered = render_mono(&mut mixer, 4800);
+    assert!(peak(&filtered[2400..]) < 0.05);
+    mixer.apply(MixerCommand::SetGroupEffects {
+        group: AudioGroup::Master,
+        effects: AudioGroupEffects::default(),
+    });
+    let restored = render_mono(&mut mixer, 4800);
+    assert!(peak(&restored[2400..]) > 0.9);
+}
+
+#[test]
+fn group_reverb_keeps_sounding_after_the_voice_ends() {
+    let mut mixer = mixer();
+    mixer.apply(MixerCommand::SetGroupEffects {
+        group: AudioGroup::Effects,
+        effects: AudioGroupEffects {
+            reverb: Some(engine_scene::AudioReverb {
+                room_size: 0.8,
+                damping: 0.2,
+                wet: 1.0,
+            }),
+            ..AudioGroupEffects::default()
+        },
+    });
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![1.0; 256]),
+        request(false),
+    );
+    let _ = render_mono(&mut mixer, 512);
+    assert_eq!(drain(&mut mixer), vec![voice(1)]);
+    let tail = render_mono(&mut mixer, 4800);
+    assert!(peak(&tail) > 0.0, "хвост реверберации звучит без голосов");
+}
+
+#[test]
+fn stream_voice_plays_its_frames_ends_and_returns_its_ring() {
+    let frames: Vec<Frame> = (0..600).map(|index| [index as f32 / 1000.0; 2]).collect();
+    let (_producer, reader) = crate::stream::test_reader(&frames, RATE, true);
+    let mut mixer = mixer();
+    mixer.apply(MixerCommand::PlayStream {
+        voice: voice(1),
+        lane: 0,
+        stream: reader,
+        request: request(false),
+    });
+    let out = render_stereo(&mut mixer, 1024);
+    // Первый блок сглаживает громкость от нуля; дальше кадры идут без изменений.
+    for index in 256..598 {
+        assert!(
+            (out[index * 2] - index as f32 / 1000.0).abs() < 1e-6,
+            "кадр {index}: {}",
+            out[index * 2]
+        );
+    }
+    assert!(out[1200..].iter().all(|value| *value == 0.0));
+    assert_eq!(drain(&mut mixer), vec![voice(1)]);
+    let mut returned = 0;
+    mixer.drain_retired(|_reader| {
+        returned += 1;
+        Ok(())
+    });
+    assert_eq!(
+        returned, 1,
+        "кольцо возвращено, а не освобождено в callback"
+    );
+}
+
+#[test]
+fn stream_underrun_is_silence_and_the_voice_keeps_playing() {
+    let (mut producer, reader) = crate::stream::test_reader(&[[0.5; 2]; 4], RATE, false);
+    let mut mixer = mixer();
+    mixer.apply(MixerCommand::PlayStream {
+        voice: voice(1),
+        lane: 0,
+        stream: reader,
+        request: request(false),
+    });
+    let out = render_mono(&mut mixer, 256);
+    assert!(out[..3].iter().all(|value| *value > 0.0));
+    assert!(out[8..].iter().all(|value| *value == 0.0));
+    assert_eq!(mixer.active_voices(), 1, "голос ждёт новых кадров");
+    let _ = producer.push([0.25; 2]);
+    let _ = render_mono(&mut mixer, 1);
+    assert!(drain(&mut mixer).is_empty());
+}
+
+#[test]
+fn retired_rings_stay_queued_while_the_sink_is_full() {
+    let mut mixer = mixer();
+    for id in 1..=2 {
+        let (_producer, reader) = crate::stream::test_reader(&[], RATE, true);
+        mixer.apply(MixerCommand::PlayStream {
+            voice: voice(id),
+            lane: id as usize,
+            stream: reader,
+            request: request(false),
+        });
+    }
+    let _ = render_mono(&mut mixer, 16);
+    mixer.drain_retired(Err);
+    let mut returned = 0;
+    mixer.drain_retired(|_reader| {
+        returned += 1;
+        Ok(())
+    });
+    assert_eq!(returned, 2);
 }

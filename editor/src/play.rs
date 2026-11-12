@@ -1272,7 +1272,7 @@ impl PlaySession {
         }
         let mut requests: Vec<AudioRequest> = despawned
             .iter()
-            .map(|&object| AudioRequest::StopSource { object })
+            .map(|&object| AudioRequest::StopSource { object, fade: 0.0 })
             .collect();
         if let Some(physics) = &mut self.physics {
             physics
@@ -1890,7 +1890,7 @@ return Rotate
         session.world.set_active(ball, false).unwrap();
         let hidden = session.apply_activity_changes();
         assert!(
-            matches!(hidden.as_slice(), [AudioRequest::StopSource { object }] if *object == ball),
+            matches!(hidden.as_slice(), [AudioRequest::StopSource { object, .. }] if *object == ball),
             "{hidden:?}"
         );
 

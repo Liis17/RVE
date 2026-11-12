@@ -2179,14 +2179,27 @@ fn add_audio_object_api(
     let stop_active = active_call.clone();
     object.set(
         "stop_sound",
-        lua.create_function(move |_, _arguments: MultiValue| {
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let arguments = method_arguments(lua, arguments, handle)?;
+            let fade = match arguments.as_slice() {
+                [] => 0.0,
+                [value] => audio_fade(value, "object.stop_sound")?,
+                _ => {
+                    return Err(LuaError::runtime(
+                        "object.stop_sound expects an optional fade in seconds",
+                    ));
+                }
+            };
             if !object_alive(&stop_active, handle)? {
                 return Ok(false);
             }
             with_active_call(&stop_active, |transaction| {
                 require_audio_source(transaction, handle, "object.stop_sound")?;
                 transaction
-                    .stage_audio(AudioRequest::StopSource { object: handle })
+                    .stage_audio(AudioRequest::StopSource {
+                        object: handle,
+                        fade,
+                    })
                     .map_err(LuaError::runtime)?;
                 Ok(true)
             })
@@ -2616,6 +2629,22 @@ fn require_audio_source(
 }
 
 /// Громкость из Lua: конечное число не меньше нуля.
+/// Длительность затухания в секундах: конечная, `0..=MAX_AUDIO_FADE`.
+fn audio_fade(value: &Value, name: &str) -> mlua::Result<f32> {
+    let seconds = match value {
+        Value::Integer(value) => *value as f64,
+        Value::Number(value) => *value,
+        _ => return Err(LuaError::runtime(format!("{name} expects a numeric fade"))),
+    };
+    let max = f64::from(engine_scene::MAX_AUDIO_FADE);
+    if !seconds.is_finite() || !(0.0..=max).contains(&seconds) {
+        return Err(LuaError::runtime(format!(
+            "{name} fade must be a finite number of seconds from 0 to {max}"
+        )));
+    }
+    Ok(seconds as f32)
+}
+
 fn audio_volume(value: &Value, name: &str) -> mlua::Result<f32> {
     let volume = match value {
         Value::Integer(value) => *value as f64,
@@ -2679,6 +2708,12 @@ fn audio_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
                 if let Some(position) = options.get::<Option<Table>>("position")? {
                     params.position = Some(read_vector(&position, "rve.audio.play position")?);
                 }
+                if let Some(stream) = options.get::<Option<bool>>("stream")? {
+                    params.stream = stream;
+                }
+                if let Some(fade_in) = options.get::<Option<Value>>("fade_in")? {
+                    params.fade_in = audio_fade(&fade_in, "rve.audio.play")?;
+                }
             }
             with_active_call(&play_active, |transaction| {
                 let voice = VoiceId::allocate();
@@ -2697,14 +2732,35 @@ fn audio_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
     let stop_active = active_call.clone();
     audio.set(
         "stop",
-        lua.create_function(move |_, id: i64| {
+        lua.create_function(move |_, (id, fade): (i64, Option<Value>)| {
             let voice = u64::try_from(id)
                 .ok()
                 .and_then(VoiceId::from_raw)
                 .ok_or_else(|| LuaError::runtime("rve.audio.stop expects a voice id"))?;
+            let fade = match fade {
+                Some(fade) => audio_fade(&fade, "rve.audio.stop")?,
+                None => 0.0,
+            };
             with_active_call(&stop_active, |transaction| {
                 transaction
-                    .stage_audio(AudioRequest::StopVoice { voice })
+                    .stage_audio(AudioRequest::StopVoice { voice, fade })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let effects_active = active_call.clone();
+    audio.set(
+        "set_group_effects",
+        lua.create_function(move |_, (group, effects): (String, Option<Table>)| {
+            let group = audio_group(&group, true)?;
+            let effects = match effects {
+                Some(table) => component_api::read_group_effects(&table)?,
+                None => engine_scene::AudioGroupEffects::default(),
+            };
+            with_active_call(&effects_active, |transaction| {
+                transaction
+                    .stage_audio(AudioRequest::SetGroupEffects { group, effects })
                     .map_err(LuaError::runtime)
             })
         })?,

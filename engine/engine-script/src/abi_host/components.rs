@@ -10,9 +10,9 @@ use engine_scene::{
 };
 use rve_sdk::abi::{
     RVE_AUDIO_ROLLOFF_INVERSE, RVE_AUDIO_ROLLOFF_LINEAR, RVE_LIGHT_DIRECTIONAL, RVE_LIGHT_POINT,
-    RVE_LIGHT_SPOT, RVE_PARTICLE_BURST, RVE_PARTICLE_RESTART, RveAudioPlayExParams,
-    RveAudioSourceState, RveEnvironmentState, RveLightState, RveMeshMaterialParams,
-    RveProceduralSky, RveStr,
+    RVE_LIGHT_SPOT, RVE_PARTICLE_BURST, RVE_PARTICLE_RESTART, RveAudioGroupEffects,
+    RveAudioPlayExParams, RveAudioPlayback, RveAudioSourceState, RveEnvironmentState,
+    RveLightState, RveMeshMaterialParams, RveProceduralSky, RveStr,
 };
 
 /// Most LOD levels one `lod_set` call may carry; a larger count is refused before allocating.
@@ -518,6 +518,8 @@ fn clip_params_ex(
         min_distance: params.min_distance,
         max_distance: params.max_distance,
         force_mono: params.force_mono,
+        stream: false,
+        fade_in: 0.0,
     })
 }
 
@@ -590,6 +592,167 @@ fn audio_source_from_abi(
         rolloff,
         pitch: value.pitch,
         force_mono: value.force_mono,
+        stream: current.stream,
+        fade_in: current.fade_in,
+    })
+}
+
+pub(super) unsafe extern "C" fn host_audio_get_source_playback(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut RveAudioPlayback,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(audio) = context.transaction.audio_settings(handle) else {
+            return false;
+        };
+        // SAFETY: the output was checked non-null and points to the guest's writable stack slot.
+        unsafe {
+            *out = RveAudioPlayback {
+                stream: audio.stream,
+                fade_in: audio.fade_in,
+            }
+        };
+        true
+    })
+}
+
+pub(super) unsafe extern "C" fn host_audio_set_source_playback(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const RveAudioPlayback,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("audio_set_source_playback received a null value".to_owned());
+            return false;
+        }
+        // SAFETY: the value was checked non-null and is readable for this synchronous callback.
+        let value = unsafe { *value };
+        let Some(handle) = live_object(context, object, "audio_set_source_playback") else {
+            return false;
+        };
+        let Some(current) = context.transaction.audio_settings(handle) else {
+            context.error = Some("audio_set_source_playback requires an audio_source".to_owned());
+            return false;
+        };
+        let settings = AudioSourceComponent {
+            stream: value.stream,
+            fade_in: value.fade_in,
+            ..current
+        };
+        let staged = context.transaction.stage_audio_settings(handle, settings);
+        component_result(context, staged)
+    })
+}
+
+pub(super) unsafe extern "C" fn host_audio_play_clip_playback(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioPlayExParams,
+    playback: *const RveAudioPlayback,
+    out_voice: *mut u64,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        if params.is_null() || playback.is_null() || out_voice.is_null() {
+            return audio_result(
+                context,
+                Err("play_clip_playback received a null pointer".to_owned()),
+            );
+        }
+        // SAFETY: the guest passes valid pointers for this synchronous callback.
+        let (params, playback) = unsafe { (&*params, *playback) };
+        let result = clip_params_ex(&mut *context.transaction, params).and_then(|clip| {
+            // SAFETY: the guest keeps the path string alive for this synchronous callback.
+            let path = unsafe { read_abi_str(path) }
+                .map_err(|_| "play_clip_playback received an invalid path".to_owned())?;
+            let path =
+                VirtualPath::parse(path).map_err(|error| format!("play_clip_playback: {error}"))?;
+            let voice = VoiceId::allocate();
+            context.transaction.stage_audio(AudioRequest::PlayClip {
+                voice,
+                path,
+                params: ClipParams {
+                    stream: playback.stream,
+                    fade_in: playback.fade_in,
+                    ..clip
+                },
+            })?;
+            // SAFETY: out_voice was checked non-null and is writable for this callback.
+            unsafe { *out_voice = voice.get() };
+            Ok(())
+        });
+        audio_result(context, result)
+    })
+}
+
+pub(super) unsafe extern "C" fn host_audio_stop_source_fade(
+    ctx: *mut c_void,
+    object: u64,
+    fade: f32,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        audio_source_call(context, object, "stop_sound_fade", |transaction, handle| {
+            transaction.stage_audio(AudioRequest::StopSource {
+                object: handle,
+                fade,
+            })
+        })
+    })
+}
+
+pub(super) unsafe extern "C" fn host_audio_stop_voice_fade(
+    ctx: *mut c_void,
+    voice: u64,
+    fade: f32,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = VoiceId::from_raw(voice)
+            .ok_or_else(|| "stop_voice_fade expects a nonzero voice id".to_owned())
+            .and_then(|voice| {
+                context
+                    .transaction
+                    .stage_audio(AudioRequest::StopVoice { voice, fade })
+            });
+        audio_result(context, result)
+    })
+}
+
+pub(super) unsafe extern "C" fn host_audio_set_group_effects(
+    ctx: *mut c_void,
+    group: u32,
+    effects: *const RveAudioGroupEffects,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        if effects.is_null() {
+            return audio_result(
+                context,
+                Err("set_group_effects received a null pointer".to_owned()),
+            );
+        }
+        // SAFETY: the guest passes a valid effects pointer for this synchronous callback.
+        let effects = unsafe { *effects };
+        let result = audio_group(group).and_then(|group| {
+            let effects = engine_scene::AudioGroupEffects {
+                lowpass_hz: effects.lowpass_hz,
+                highpass_hz: effects.highpass_hz,
+                reverb: effects.has_reverb.then_some(engine_scene::AudioReverb {
+                    room_size: effects.reverb.room_size,
+                    damping: effects.reverb.damping,
+                    wet: effects.reverb.wet,
+                }),
+            };
+            context
+                .transaction
+                .stage_audio(AudioRequest::SetGroupEffects { group, effects })
+        });
+        audio_result(context, result)
     })
 }
 

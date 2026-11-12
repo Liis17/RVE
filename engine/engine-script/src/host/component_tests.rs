@@ -98,7 +98,9 @@ function Script:on_update()
   rve.find("fire"):particles_emit(12)
   rve.find("sky"):set_environment({ intensity = 2.0, sky = { sun_size_deg = 2.0 } })
   rve.find("tower"):set_lod_distances({ 20.0 }, 80.0)
-  rve.find("speaker"):set_audio_source({ volume = 0.5, spatial_blend = 0.25, rolloff = "linear", pitch = 2.0 })
+  rve.find("speaker"):set_audio_source({ volume = 0.5, spatial_blend = 0.25, rolloff = "linear", pitch = 2.0, stream = true, fade_in = 3.0 })
+  local audio = rve.find("speaker"):get_audio_source()
+  assert(audio.stream == true and audio.fade_in == 3.0)
   rve.audio.play("/audio/hum.wav", { follow = rve.find("speaker"), spatial_blend = 1.0, force_mono = true })
 end
 return Script
@@ -162,6 +164,8 @@ return Script
     assert_eq!(audio.spatial_blend, 0.25);
     assert_eq!(audio.rolloff, AudioRolloff::Linear);
     assert_eq!(audio.pitch, 2.0);
+    assert!(audio.stream);
+    assert_eq!(audio.fade_in, 3.0);
     assert_eq!(
         audio.clip.as_str(),
         "audio/hum.wav",
@@ -219,6 +223,7 @@ fn missing_components_and_bad_ranges_are_refused_at_the_call() {
         r#"rve.find("tower"):set_lod_distances({ 30.0, 20.0 }, nil)"#,
         r#"rve.find("sky"):set_environment({ intensity = -1.0 })"#,
         r#"rve.find("speaker"):set_audio_source({ pitch = 0.0 })"#,
+        r#"rve.find("speaker"):set_audio_source({ fade_in = -1.0 })"#,
         r#"rve.audio.play("/audio/hum.wav", { spatial_blend = 2.0, position = {x=0, y=0, z=0} })"#,
     ] {
         let (mut world, mut host) = load(&format!(

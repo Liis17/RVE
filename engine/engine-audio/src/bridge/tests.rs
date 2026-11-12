@@ -285,7 +285,10 @@ fn stop_source_and_group_volume_reach_the_handle() {
     rig.take();
     rig.bridge.apply(
         [
-            AudioRequest::StopSource { object: shot },
+            AudioRequest::StopSource {
+                object: shot,
+                fade: 0.0,
+            },
             AudioRequest::SetGroupVolume {
                 group: AudioGroup::Music,
                 volume: 0.5,
@@ -313,8 +316,13 @@ fn rejected_stop_keeps_the_source_tracked_so_a_later_stop_reaches_its_voice() {
     for _ in 0..crate::COMMAND_CAPACITY {
         rig.handle.preload(Vec::new()).unwrap();
     }
-    rig.bridge
-        .apply([AudioRequest::StopSource { object: shot }], &world);
+    rig.bridge.apply(
+        [AudioRequest::StopSource {
+            object: shot,
+            fade: 0.0,
+        }],
+        &world,
+    );
     assert_eq!(rig.bridge.sources.get(&shot), Some(&voice(1)));
     assert!(
         rig.handle.lane_of(voice(1)).is_some(),
@@ -322,8 +330,13 @@ fn rejected_stop_keeps_the_source_tracked_so_a_later_stop_reaches_its_voice() {
     );
 
     rig.take();
-    rig.bridge
-        .apply([AudioRequest::StopSource { object: shot }], &world);
+    rig.bridge.apply(
+        [AudioRequest::StopSource {
+            object: shot,
+            fade: 0.0,
+        }],
+        &world,
+    );
     assert!(matches!(rig.take().as_slice(), [Command::Stop(stopped)] if *stopped == voice(1)));
     assert!(rig.bridge.sources.is_empty());
 }
@@ -445,4 +458,111 @@ fn set_voice_position_detaches_the_follow_object() {
     let moved = world(&SCENE.replace("position = [3.0, 0.0, 0.0]", "position = [-4.0, 0.0, 0.0]"));
     rig.bridge.sync_positions(&moved);
     assert_eq!(rig.handle.spatial().emitter(lane), Some([9.0, 9.0, 9.0]));
+}
+
+const STREAM_SCENE: &str = r#"
+[[assets]]
+path = "/audio/hum.wav"
+[[assets]]
+path = "/music/theme.ogg"
+
+[[objects]]
+id = "camera"
+[objects.camera]
+
+[[objects]]
+id = "music"
+[objects.audio_source]
+clip = "/music/theme.ogg"
+group = "music"
+looping = true
+stream = true
+fade_in = 2.0
+
+[[objects]]
+id = "hum"
+[objects.audio_source]
+clip = "/audio/hum.wav"
+"#;
+
+#[test]
+fn stream_sources_are_not_preloaded_and_play_with_stream_and_fade_in() {
+    let mut rig = Rig::new();
+    let world = world(STREAM_SCENE);
+    rig.bridge.start(&world);
+    match rig.take().as_slice() {
+        [Command::Preload(paths)] => assert_eq!(paths, &["audio/hum.wav".to_owned()]),
+        other => panic!("ожидался Preload: {other:?}"),
+    }
+    let music = world.handle("music").unwrap();
+    rig.bridge.apply([play_source(music, voice(1))], &world);
+    match rig.take().as_slice() {
+        [Command::Play { path, request, .. }] => {
+            assert_eq!(path, "music/theme.ogg");
+            assert!(request.stream);
+            assert_eq!(request.fade_in, 2.0);
+        }
+        other => panic!("ожидался Play: {other:?}"),
+    }
+}
+
+#[test]
+fn stops_with_a_fade_and_group_effects_reach_the_handle() {
+    let mut rig = Rig::new();
+    let world = world(SCENE);
+    let shot = world.handle("shot").unwrap();
+    rig.bridge.apply([play_source(shot, voice(1))], &world);
+    rig.bridge.apply(
+        [AudioRequest::PlayClip {
+            voice: voice(2),
+            path: engine_files::VirtualPath::parse("audio/hum.wav").unwrap(),
+            params: ClipParams {
+                stream: true,
+                fade_in: 0.5,
+                ..ClipParams::default()
+            },
+        }],
+        &world,
+    );
+    match rig.take().as_slice() {
+        [_, Command::Play { request, .. }] => {
+            assert!(request.stream);
+            assert_eq!(request.fade_in, 0.5);
+        }
+        other => panic!("ожидались два Play: {other:?}"),
+    }
+    let effects = engine_scene::AudioGroupEffects {
+        highpass_hz: 200.0,
+        ..engine_scene::AudioGroupEffects::default()
+    };
+    rig.bridge.apply(
+        [
+            AudioRequest::StopSource {
+                object: shot,
+                fade: 1.5,
+            },
+            AudioRequest::StopVoice {
+                voice: voice(2),
+                fade: 3.0,
+            },
+            AudioRequest::SetGroupEffects {
+                group: AudioGroup::Effects,
+                effects,
+            },
+        ],
+        &world,
+    );
+    let sent = rig.take();
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [
+                Command::FadeOut { voice: source, seconds: 1.5 },
+                Command::FadeOut { voice: clip, seconds: 3.0 },
+                Command::SetGroupEffects { group: AudioGroup::Effects, effects: sent_effects },
+            ] if *source == voice(1) && *clip == voice(2) && *sent_effects == effects
+        ),
+        "{sent:?}"
+    );
+    assert!(rig.bridge.sources.is_empty());
 }

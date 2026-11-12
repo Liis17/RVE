@@ -350,6 +350,68 @@ impl Script for AudioProbe {
     }
 }
 
+struct AudioPlaybackProbe;
+
+fn audio_playback_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AudioPlaybackProbe))
+}
+
+impl Script for AudioPlaybackProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let actor = ctx.find("actor").expect("actor exists");
+        let before = actor.audio_playback(ctx).expect("source exists");
+        assert!(!before.stream && before.fade_in == 0.0);
+        let playback = rve_sdk::abi::RveAudioPlayback {
+            stream: true,
+            fade_in: 1.5,
+        };
+        actor.set_audio_playback(ctx, &playback).unwrap();
+        assert_eq!(actor.audio_playback(ctx), Some(playback));
+        assert!(
+            actor
+                .set_audio_playback(
+                    ctx,
+                    &rve_sdk::abi::RveAudioPlayback {
+                        stream: false,
+                        fade_in: -1.0,
+                    },
+                )
+                .is_err()
+        );
+        actor.stop_sound_fade(ctx, 0.5).unwrap();
+        let params = rve_sdk::abi::RveAudioPlayExParams {
+            group: rve_sdk::abi::RVE_AUDIO_GROUP_MUSIC,
+            volume: 1.0,
+            ..Default::default()
+        };
+        let voice = ctx
+            .play_clip_playback("/audio/hum.wav", &params, &playback)
+            .unwrap();
+        ctx.stop_voice_fade(voice, 2.0).unwrap();
+        let effects = rve_sdk::abi::RveAudioGroupEffects {
+            lowpass_hz: 800.0,
+            has_reverb: true,
+            reverb: rve_sdk::abi::RveAudioReverb {
+                room_size: 0.5,
+                damping: 0.5,
+                wet: 0.25,
+            },
+            ..Default::default()
+        };
+        ctx.set_group_effects(rve_sdk::AudioGroup::Music, &effects)
+            .unwrap();
+        let invalid = rve_sdk::abi::RveAudioGroupEffects {
+            highpass_hz: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            ctx.set_group_effects(rve_sdk::AudioGroup::Music, &invalid),
+            Err(rve_sdk::AudioError::Rejected)
+        );
+        ctx.log_info("ABI v25 audio API staged");
+    }
+}
+
 impl Script for AudioRejected {
     fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
         let actor = ctx.find("actor").expect("actor exists");
@@ -966,6 +1028,7 @@ fn sdk_module() -> &'static RveModule {
         "JumpProbe" => jump_probe_factory,
         "AudioProbe" => audio_probe_factory,
         "AudioRejected" => audio_rejected_factory,
+        "AudioPlaybackProbe" => audio_playback_probe_factory,
         "RumbleProbe" => rumble_probe_factory,
         "InputActionsProbe" => input_actions_probe_factory,
         "SpawnDriver" => spawn_driver_factory,
@@ -1529,7 +1592,7 @@ name = "AudioProbe"
     };
     assert!(matches!(
         requests[3],
-        AudioRequest::StopVoice { voice } if voice == played
+        AudioRequest::StopVoice { voice, fade } if voice == played && fade == 0.0
     ));
     assert!(matches!(
         requests[4],
@@ -1542,6 +1605,57 @@ name = "AudioProbe"
         message_list(&mut host)
             .iter()
             .any(|message| message == "ABI audio API staged")
+    );
+}
+
+#[test]
+fn abi_v25_audio_callbacks_stage_fades_effects_and_playback() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/audio/hum.wav"
+[[objects]]
+id = "actor"
+[objects.audio_source]
+clip = "/audio/hum.wav"
+[[objects.heavy_scripts]]
+name = "AudioPlaybackProbe"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let actor = world.handle("actor").unwrap();
+    let audio = world.audio_source(actor).unwrap();
+    assert!(audio.stream && audio.fade_in == 1.5, "{audio:?}");
+    let requests = host.drain_audio_requests();
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    assert!(matches!(requests[0], AudioRequest::StopSource { fade, .. } if fade == 0.5));
+    let played = match &requests[1] {
+        AudioRequest::PlayClip { voice, params, .. } => {
+            assert!(params.stream && params.fade_in == 1.5);
+            assert_eq!(params.group, engine_scene::AudioGroup::Music);
+            *voice
+        }
+        other => panic!("ожидался PlayClip: {other:?}"),
+    };
+    assert!(matches!(
+        requests[2],
+        AudioRequest::StopVoice { voice, fade } if voice == played && fade == 2.0
+    ));
+    match requests[3] {
+        AudioRequest::SetGroupEffects { group, effects } => {
+            assert_eq!(group, engine_scene::AudioGroup::Music);
+            assert_eq!(effects.lowpass_hz, 800.0);
+            assert_eq!(effects.reverb.map(|reverb| reverb.wet), Some(0.25));
+        }
+        ref other => panic!("ожидался SetGroupEffects: {other:?}"),
+    }
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "ABI v25 audio API staged")
     );
 }
 
