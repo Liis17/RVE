@@ -16,6 +16,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Версия крейта (SemVer).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -172,6 +173,10 @@ pub enum AssetError {
         texture: String,
         tried: Vec<PathBuf>,
     },
+    /// Загрузка прервана флагом отмены вызывающего.
+    Cancelled {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for AssetError {
@@ -187,6 +192,7 @@ impl fmt::Display for AssetError {
             ),
             Self::Io { path, error } => write!(f, "{}: {error}", path.display()),
             Self::Decode { path, message } => write!(f, "{}: {message}", path.display()),
+            Self::Cancelled { path } => write!(f, "{}: загрузка отменена", path.display()),
             Self::MissingTexture {
                 model,
                 texture,
@@ -297,10 +303,21 @@ impl Assets {
     /// Внешняя текстура ищется по пути, записанному в FBX относительно файла модели,
     /// а затем по имени файла рядом с моделью. Встроенные в FBX PNG тоже поддерживаются.
     pub fn load_model(&self, asset_path: &str) -> Result<Model, AssetError> {
+        self.load_model_cancellable(asset_path, &AtomicBool::new(false))
+    }
+
+    /// Как [`Self::load_model`], но разбор прерывается с [`AssetError::Cancelled`], как только
+    /// `cancel` становится `true`: флаг проверяется во время разбора FBX и между частями модели.
+    pub fn load_model_cancellable(
+        &self,
+        asset_path: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Model, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
+        check_cancel(cancel, &path)?;
         let bytes = self.read_asset(asset_path, &path)?;
-        load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self)
+        load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self, cancel)
     }
 
     /// Загружает клипы из FBX, в котором нет мешей, например файл Mixamo только с анимацией.
@@ -767,17 +784,28 @@ fn write_hdr_pixel(rgb: &mut [f32], index: usize, rgbe: [u8; 4]) {
     rgb[output + 2] = (f32::from(rgbe[2]) + 0.5) * scale;
 }
 
+fn check_cancel(cancel: &AtomicBool, path: &Path) -> Result<(), AssetError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(AssetError::Cancelled {
+            path: path.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn load_fbx(
     bytes: &[u8],
     virtual_path: &str,
     path: &Path,
     assets: &Assets,
+    cancel: &AtomicBool,
 ) -> Result<Model, AssetError> {
     let decode_error = |message: String| AssetError::Decode {
         path: path.to_owned(),
         message,
     };
-    let scene = load_fbx_scene(bytes, virtual_path, path)?;
+    let scene = load_fbx_scene_cancellable(bytes, virtual_path, path, cancel)?;
     // Скелет нужен при skin или анимациях с ключами: тогда все части получают связи с костями.
     let needs_skeleton = !scene.skin_deformers.is_empty()
         || animation::has_animated_stack(&scene).map_err(decode_error)?;
@@ -792,6 +820,7 @@ fn load_fbx(
     let mut texture_cache = ModelTextureCache::default();
     let mut triangle = Vec::new();
     for node in scene.nodes.iter() {
+        check_cancel(cancel, path)?;
         let Some(mesh) = node.mesh.as_ref() else {
             continue;
         };
@@ -1438,7 +1467,24 @@ fn load_fbx_scene(
     virtual_path: &str,
     path: &Path,
 ) -> Result<ufbx::SceneRoot, AssetError> {
+    load_fbx_scene_cancellable(bytes, virtual_path, path, &AtomicBool::new(false))
+}
+
+fn load_fbx_scene_cancellable(
+    bytes: &[u8],
+    virtual_path: &str,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<ufbx::SceneRoot, AssetError> {
+    let progress = |_: &ufbx::Progress| {
+        if cancel.load(Ordering::Relaxed) {
+            ufbx::ProgressResult::Cancel
+        } else {
+            ufbx::ProgressResult::Continue
+        }
+    };
     let options = ufbx::LoadOpts {
+        progress_cb: ufbx::ProgressCb::Ref(&progress),
         filename: virtual_path.into(),
         path_separator: b'/',
         load_external_files: false,
@@ -1454,7 +1500,9 @@ fn load_fbx_scene(
         generate_missing_normals: true,
         ..Default::default()
     };
-    ufbx::load_memory(bytes, options).map_err(|error| AssetError::Decode {
+    let scene = ufbx::load_memory(bytes, options);
+    check_cancel(cancel, path)?;
+    scene.map_err(|error| AssetError::Decode {
         path: path.to_owned(),
         message: format!("ошибка FBX: {error:?}"),
     })
@@ -2120,6 +2168,42 @@ mod tests {
         assert_eq!(
             resource_error(&stopped_error).map(ResourceError::kind),
             Some(ResourceErrorKind::Stopped)
+        );
+    }
+
+    #[test]
+    fn cancelled_fbx_load_stops_with_a_cancelled_error() {
+        let temp = TempAssets::new("cancel");
+        temp.write("model/quad.fbx", quad_fbx(None).as_bytes());
+        let assets = temp.assets();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = AtomicBool::new(true);
+        let error = assets
+            .load_model_cancellable("/model/quad.fbx", &cancel)
+            .unwrap_err();
+        assert!(matches!(error, AssetError::Cancelled { .. }), "{error}");
+        assert!(error.to_string().contains("отменена"));
+
+        // Флаг, выставленный во время разбора, тоже даёт отмену, а не ошибку FBX.
+        let bytes = quad_fbx(None);
+        let Err(error) = super::load_fbx_scene_cancellable(
+            bytes.as_bytes(),
+            "model/quad.fbx",
+            Path::new("quad.fbx"),
+            &cancel,
+        ) else {
+            panic!("отменённый разбор вернул сцену");
+        };
+        assert!(matches!(error, AssetError::Cancelled { .. }), "{error}");
+
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            assets
+                .load_model_cancellable("/model/quad.fbx", &cancel)
+                .unwrap()
+                .meshes
+                .len(),
+            1
         );
     }
 
