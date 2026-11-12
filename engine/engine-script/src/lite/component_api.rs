@@ -666,6 +666,8 @@ fn audio_table(lua: &Lua, audio: &AudioSourceComponent) -> mlua::Result<Table> {
     )?;
     table.set("pitch", audio.pitch)?;
     table.set("force_mono", audio.force_mono)?;
+    table.set("stream", audio.stream)?;
+    table.set("fade_in", audio.fade_in)?;
     Ok(table)
 }
 
@@ -688,6 +690,8 @@ fn audio_from_table(
             "rolloff",
             "pitch",
             "force_mono",
+            "stream",
+            "fade_in",
         ],
         "audio source",
     )?;
@@ -744,7 +748,40 @@ fn audio_from_table(
     if let Some(force_mono) = bool_field(table, "force_mono")? {
         audio.force_mono = force_mono;
     }
+    if let Some(stream) = bool_field(table, "stream")? {
+        audio.stream = stream;
+    }
+    if let Some(fade_in) = number_field(table, "fade_in")? {
+        audio.fade_in = fade_in;
+    }
     Ok(audio)
+}
+
+/// Таблица `rve.audio.set_group_effects`: `lowpass` и `highpass` (Гц, `0` или отсутствие —
+/// выключено) и `reverb = { room_size, damping, wet }`. Диапазоны проверяет транзакция.
+pub(super) fn read_group_effects(table: &Table) -> mlua::Result<engine_scene::AudioGroupEffects> {
+    reject_unknown_fields(
+        table,
+        &["lowpass", "highpass", "reverb"],
+        "audio group effects",
+    )?;
+    let reverb = match table.get::<Value>("reverb")? {
+        Value::Nil => None,
+        Value::Table(reverb) => {
+            reject_unknown_fields(&reverb, &["room_size", "damping", "wet"], "audio reverb")?;
+            Some(engine_scene::AudioReverb {
+                room_size: number_field(&reverb, "room_size")?.unwrap_or(0.5),
+                damping: number_field(&reverb, "damping")?.unwrap_or(0.5),
+                wet: number_field(&reverb, "wet")?.unwrap_or(0.3),
+            })
+        }
+        _ => return Err(LuaError::runtime("reverb must be a table")),
+    };
+    Ok(engine_scene::AudioGroupEffects {
+        lowpass_hz: number_field(table, "lowpass")?.unwrap_or(0.0),
+        highpass_hz: number_field(table, "highpass")?.unwrap_or(0.0),
+        reverb,
+    })
 }
 
 /// Опции `rve.audio.play`, которые относятся к пространственному звуку: `follow`, `min_distance`,

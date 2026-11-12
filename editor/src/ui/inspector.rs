@@ -1823,6 +1823,19 @@ fn show_audio_source(
                     ui.label("Force mono");
                     let force_mono = ui.checkbox(&mut value.force_mono, "");
                     ui.end_row();
+                    ui.label("Stream").on_hover_text(
+                        "Декодировать клип по частям при воспроизведении: длинная музыка не \
+                         держится в памяти целиком",
+                    );
+                    let stream = ui.checkbox(&mut value.stream, "");
+                    ui.end_row();
+                    ui.label("Fade in, s");
+                    let fade_in = ui.add(
+                        egui::DragValue::new(&mut value.fade_in)
+                            .speed(0.05)
+                            .range(0.0..=engine_scene::MAX_AUDIO_FADE),
+                    );
+                    ui.end_row();
                     ui.label("Min distance");
                     let min = ui.add(
                         egui::DragValue::new(&mut value.min_distance)
@@ -1845,6 +1858,8 @@ fn show_audio_source(
                         | rolloff
                         | pitch
                         | force_mono
+                        | stream
+                        | fade_in
                         | min
                         | max;
                     commit(state, id, "audio_source", &response, |object| {

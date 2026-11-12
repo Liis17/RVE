@@ -76,17 +76,17 @@ pub fn decode(extension: &str, bytes: &[u8], cancel: &AtomicBool) -> Result<Clip
 }
 
 #[derive(Clone, Copy)]
-enum WavSamples {
+pub(crate) enum WavSamples {
     Pcm { bits: u16 },
     Float,
 }
 
 #[derive(Clone, Copy)]
-struct WavFormat {
-    samples: WavSamples,
-    channels: u16,
-    sample_rate: u32,
-    bytes_per_sample: usize,
+pub(crate) struct WavFormat {
+    pub(crate) samples: WavSamples,
+    pub(crate) channels: u16,
+    pub(crate) sample_rate: u32,
+    pub(crate) bytes_per_sample: usize,
 }
 
 /// Разбирает RIFF/WAVE: PCM 8/16/24/32 бит и float32, включая WAVE_FORMAT_EXTENSIBLE.
@@ -123,7 +123,7 @@ pub fn decode_wav(bytes: &[u8]) -> Result<Clip, DecodeError> {
     Err(corrupt("нет chunk data"))
 }
 
-fn parse_fmt(body: &[u8]) -> Result<WavFormat, DecodeError> {
+pub(crate) fn parse_fmt(body: &[u8]) -> Result<WavFormat, DecodeError> {
     let mut tag = u16::from_le_bytes([body[0], body[1]]);
     let channels = u16::from_le_bytes([body[2], body[3]]);
     let sample_rate = u32_le(body, 4);
@@ -182,7 +182,7 @@ fn read_data(data: &[u8], format: WavFormat) -> Result<Clip, DecodeError> {
     })
 }
 
-fn convert(chunk: &[u8], kind: WavSamples) -> Result<f32, DecodeError> {
+pub(crate) fn convert(chunk: &[u8], kind: WavSamples) -> Result<f32, DecodeError> {
     Ok(match kind {
         WavSamples::Pcm { bits: 8 } => (f32::from(chunk[0]) - 128.0) / 128.0,
         WavSamples::Pcm { bits: 16 } => {

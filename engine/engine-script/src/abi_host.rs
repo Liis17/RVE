@@ -430,6 +430,12 @@ impl<'a> AbiCallContext<'a> {
             file_dialog_open: Some(host_file_dialog_open),
             file_dialog_poll: Some(host_file_dialog_poll),
             interrupt: std::ptr::null(),
+            audio_stop_source_fade: Some(components::host_audio_stop_source_fade),
+            audio_stop_voice_fade: Some(components::host_audio_stop_voice_fade),
+            audio_set_group_effects: Some(components::host_audio_set_group_effects),
+            audio_play_clip_playback: Some(components::host_audio_play_clip_playback),
+            audio_get_source_playback: Some(components::host_audio_get_source_playback),
+            audio_set_source_playback: Some(components::host_audio_set_source_playback),
         }
     }
 
@@ -1900,7 +1906,10 @@ unsafe extern "C" fn host_audio_play_source(ctx: *mut c_void, object: u64) -> u3
 unsafe extern "C" fn host_audio_stop_source(ctx: *mut c_void, object: u64) -> u32 {
     guarded(ctx, RveStatus::Error as u32, |context| {
         audio_source_call(context, object, "stop_sound", |transaction, handle| {
-            transaction.stage_audio(AudioRequest::StopSource { object: handle })
+            transaction.stage_audio(AudioRequest::StopSource {
+                object: handle,
+                fade: 0.0,
+            })
         })
     })
 }
@@ -1971,7 +1980,7 @@ unsafe extern "C" fn host_audio_stop_voice(ctx: *mut c_void, voice: u64) -> u32 
             .and_then(|voice| {
                 context
                     .transaction
-                    .stage_audio(AudioRequest::StopVoice { voice })
+                    .stage_audio(AudioRequest::StopVoice { voice, fade: 0.0 })
             });
         audio_result(context, result)
     })

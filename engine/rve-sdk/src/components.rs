@@ -270,7 +270,58 @@ impl Object {
     }
 }
 
+impl Object {
+    /// Reads the audio source's streaming and fade-in settings; `None` without an audio source
+    /// or on a host before ABI v26.
+    pub fn audio_playback(&self, ctx: &Context<'_>) -> Option<abi::RveAudioPlayback> {
+        let callback = ctx.host.audio_get_source_playback?;
+        let mut out = abi::RveAudioPlayback::default();
+        // SAFETY: the output points to a live stack value for this synchronous callback.
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut out) }.then_some(out)
+    }
+
+    /// Replaces the audio source's streaming and fade-in settings; they apply to its next start.
+    pub fn set_audio_playback(
+        &self,
+        ctx: &mut Context<'_>,
+        playback: &abi::RveAudioPlayback,
+    ) -> Result<(), ComponentError> {
+        let callback = ctx
+            .host
+            .audio_set_source_playback
+            .ok_or(ComponentError::Unavailable)?;
+        // SAFETY: the settings point to a live value for this synchronous callback.
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, playback) })
+    }
+}
+
 impl Context<'_> {
+    /// Starts a clip like [`Context::play_clip_spatial`] with streaming and fade-in options.
+    /// Needs ABI v26.
+    pub fn play_clip_playback(
+        &mut self,
+        path: &str,
+        params: &abi::RveAudioPlayExParams,
+        playback: &abi::RveAudioPlayback,
+    ) -> Result<u64, AudioError> {
+        let callback = self
+            .host
+            .audio_play_clip_playback
+            .ok_or(AudioError::Unavailable)?;
+        let mut voice = 0;
+        // SAFETY: path, params, playback and output storage remain valid during this script call.
+        audio_status(unsafe {
+            callback(
+                self.host.call_ctx(),
+                abi::RveStr::from_str_ref(path),
+                params,
+                playback,
+                &mut voice,
+            )
+        })?;
+        Ok(voice)
+    }
+
     /// Starts a clip with spatial options: follow object, distances, blend and mono.
     pub fn play_clip_spatial(
         &mut self,

@@ -993,6 +993,18 @@ fn audio_status(status: u32) -> Result<(), AudioError> {
 /// engine-scene, поэтому константа повторяется здесь.
 pub const MAX_AUDIO_VOLUME: f32 = 4.0;
 
+/// Наибольшая длительность fade-in и fade-out в секундах. Совпадает с
+/// `engine_scene::MAX_AUDIO_FADE`.
+pub const MAX_AUDIO_FADE: f32 = 60.0;
+
+fn audio_fade(seconds: f32) -> Result<f32, AudioError> {
+    if seconds.is_finite() && (0.0..=MAX_AUDIO_FADE).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err(AudioError::InvalidInput)
+    }
+}
+
 fn audio_volume(volume: f32) -> Result<f32, AudioError> {
     if volume.is_finite() && (0.0..=MAX_AUDIO_VOLUME).contains(&volume) {
         Ok(volume)
@@ -1014,6 +1026,18 @@ impl Object {
         let callback = ctx.host.audio_stop_source.ok_or(AudioError::Unavailable)?;
         // SAFETY: host callback is valid during this guest callback.
         audio_status(unsafe { callback(ctx.host.call_ctx(), self.handle) })
+    }
+
+    /// Stops this object's current `audio_source` voice, fading out over `seconds`
+    /// (`0..=MAX_AUDIO_FADE`; zero is the short click-free stop). Needs ABI v26.
+    pub fn stop_sound_fade(&self, ctx: &mut Context<'_>, seconds: f32) -> Result<(), AudioError> {
+        let seconds = audio_fade(seconds)?;
+        let callback = ctx
+            .host
+            .audio_stop_source_fade
+            .ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this guest callback.
+        audio_status(unsafe { callback(ctx.host.call_ctx(), self.handle, seconds) })
     }
 
     /// Sets the volume of this object's current voice and of its next starts.
@@ -1064,6 +1088,32 @@ impl Context<'_> {
         let callback = self.host.audio_stop_voice.ok_or(AudioError::Unavailable)?;
         // SAFETY: host callback is valid during this script call.
         audio_status(unsafe { callback(self.host.call_ctx(), voice) })
+    }
+
+    /// Stops one voice, fading out over `seconds` (`0..=MAX_AUDIO_FADE`). Needs ABI v26.
+    pub fn stop_voice_fade(&mut self, voice: u64, seconds: f32) -> Result<(), AudioError> {
+        let seconds = audio_fade(seconds)?;
+        let callback = self
+            .host
+            .audio_stop_voice_fade
+            .ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this script call.
+        audio_status(unsafe { callback(self.host.call_ctx(), voice, seconds) })
+    }
+
+    /// Sets one group's low-pass, high-pass and reverb; `Master` processes the whole mix and
+    /// `RveAudioGroupEffects::default()` turns every effect off. Needs ABI v26.
+    pub fn set_group_effects(
+        &mut self,
+        group: AudioGroup,
+        effects: &abi::RveAudioGroupEffects,
+    ) -> Result<(), AudioError> {
+        let callback = self
+            .host
+            .audio_set_group_effects
+            .ok_or(AudioError::Unavailable)?;
+        // SAFETY: effects point to a live value for this script call.
+        audio_status(unsafe { callback(self.host.call_ctx(), group.code(), effects) })
     }
 
     /// Sets one mixer group's volume; `Master` multiplies every group.

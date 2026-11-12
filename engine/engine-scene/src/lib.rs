@@ -29,8 +29,9 @@ pub use animation::{
 };
 pub use asset_kind::AssetKind;
 pub use audio::{
-    AudioGroup, AudioRequest, AudioRolloff, AudioSourceComponent, ClipParams, MAX_AUDIO_PITCH,
-    MAX_AUDIO_VOLUME, VoiceId, activity_audio_requests,
+    AudioGroup, AudioGroupEffects, AudioRequest, AudioReverb, AudioRolloff, AudioSourceComponent,
+    ClipParams, MAX_AUDIO_FADE, MAX_AUDIO_FILTER_HZ, MAX_AUDIO_PITCH, MAX_AUDIO_VOLUME,
+    MIN_AUDIO_FILTER_HZ, VoiceId, activity_audio_requests, fade_problem, group_effects_problem,
 };
 pub use light::ShadowSettings;
 pub use material_asset::{

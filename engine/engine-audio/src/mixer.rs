@@ -1,12 +1,15 @@
 //! Микшер голосов без устройства: фиксированный пул, линейный ресемплинг, затухание,
-//! constant-power панорама, группы громкости и fade-out при остановке.
+//! constant-power панорама, группы громкости с эффектами шины, fade-in и fade-out.
 //!
 //! Всё, что вызывается из audio callback ([`Mixer::apply`], [`Mixer::render`]), не выделяет
 //! память, не берёт блокировок и не освобождает клипы: голос держит `Arc<Clip>`, а кеш
-//! загрузчика хранит ту же ссылку. Граница с потоком `rve-audio` — SPSC-кольца `rtrb`.
+//! загрузчика хранит ту же ссылку. Кольцо стрим-голоса возвращается потоку `rve-audio`
+//! через [`Mixer::drain_retired`]. Граница с потоком `rve-audio` — SPSC-кольца `rtrb`.
 
 use crate::decode::Clip;
-use engine_scene::{AudioGroup, VoiceId};
+use crate::effects::Bus;
+use crate::stream::{Frame, Pull, StreamReader};
+use engine_scene::{AudioGroup, AudioGroupEffects, VoiceId};
 use std::f32::consts::FRAC_PI_4;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -15,8 +18,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const VOICE_SLOTS: usize = 64;
 /// Длина блока внутреннего микширования в кадрах.
 const BLOCK_FRAMES: usize = 256;
-/// Длительность fade-out при остановке голоса.
+/// Длительность fade-out при остановке голоса и наименьшее затухание по запросу.
 const FADE_SECONDS: f32 = 0.005;
+/// Голоса, вытесненные из полосы, затухают здесь, не занимая полос.
+const TAIL_SLOTS: usize = VOICE_SLOTS;
+/// Полоса затухающего вытесненного голоса: позиция излучателя больше не читается.
+const NO_LANE: usize = usize::MAX;
+/// Стрим-голоса, которые callback держит до возврата потоку `rve-audio`.
+pub const RETIRED_CAPACITY: usize = VOICE_SLOTS + TAIL_SLOTS;
+const GROUPS: usize = 4;
 /// Сколько раз callback перечитывает позицию, пока писатель её меняет; дальше берётся прежняя.
 const SEQ_READ_ATTEMPTS: usize = 4;
 /// Очередь завершённых голосов, которую callback держит, пока кольцо к потоку `rve-audio` полно.
@@ -56,10 +66,14 @@ pub struct PlayRequest {
     pub pitch: f32,
     /// Сводит стерео-клип к моно до панорамы.
     pub force_mono: bool,
+    /// Плавное появление в секундах; `0` — сразу на полной громкости.
+    pub fade_in: f32,
+    /// Декодировать по частям в потоке стриминга вместо загрузки клипа в кеш.
+    pub stream: bool,
 }
 
 /// Команды от потока `rve-audio` к callback.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum MixerCommand {
     Play {
         voice: VoiceId,
@@ -67,8 +81,20 @@ pub enum MixerCommand {
         clip: Arc<Clip>,
         request: PlayRequest,
     },
+    /// Стрим-голос: кольцо уже заполнено потоком стриминга.
+    PlayStream {
+        voice: VoiceId,
+        lane: usize,
+        stream: StreamReader,
+        request: PlayRequest,
+    },
     Stop {
         voice: VoiceId,
+    },
+    /// Остановка с затуханием `seconds`; короче [`FADE_SECONDS`] — как `Stop`.
+    FadeOut {
+        voice: VoiceId,
+        seconds: f32,
     },
     StopAll,
     SetPaused(bool),
@@ -82,6 +108,11 @@ pub enum MixerCommand {
     },
     /// Сводит весь вывод к моно; применяется к следующему блоку.
     SetMonoOutput(bool),
+    /// Фильтры и реверберация шины группы; `Master` обрабатывает общую сумму.
+    SetGroupEffects {
+        group: AudioGroup,
+        effects: AudioGroupEffects,
+    },
 }
 
 /// Позиция, правая и передняя оси слушателя.
@@ -197,12 +228,25 @@ impl Default for Spatial {
     }
 }
 
+/// Откуда голос берёт кадры.
+enum Source {
+    Clip {
+        clip: Arc<Clip>,
+        /// Позиция в кадрах клипа.
+        position: f64,
+    },
+    Stream {
+        reader: StreamReader,
+        /// Два соседних кадра для интерполяции и доля между ними.
+        window: [Frame; 2],
+        fraction: f64,
+    },
+}
+
 /// Состояние голоса внутри микшера.
 struct Voice {
     id: VoiceId,
-    clip: Arc<Clip>,
-    /// Позиция в кадрах клипа.
-    position: f64,
+    source: Source,
     /// Кадров клипа на кадр устройства.
     step: f64,
     looping: bool,
@@ -217,17 +261,76 @@ struct Voice {
     gain: f32,
     /// Состояние one-pole low-pass по левому и правому каналу за спиной слушателя.
     lowpass: [f32; 2],
-    /// Fade-out после остановки; `None`, пока голос не останавливают.
-    fade: Option<Fade>,
+    /// Fade-in при запуске и fade-out при остановке.
+    envelope: Envelope,
     /// Последняя прочитанная позиция излучателя: используется, пока писатель её меняет.
     emitter: [f32; 3],
 }
 
-/// Кадры fade-out: всего и осталось.
-#[derive(Clone, Copy)]
-struct Fade {
-    total: u32,
-    left: u32,
+/// Огибающая голоса: множитель `0..=1`, который меняется на `step` за кадр.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Envelope {
+    level: f32,
+    step: f32,
+    /// Кадров до тишины после остановки; `None`, пока голос не останавливают.
+    stopping: Option<u32>,
+}
+
+impl Envelope {
+    fn start(fade_in_frames: u32) -> Self {
+        if fade_in_frames == 0 {
+            Self {
+                level: 1.0,
+                step: 0.0,
+                stopping: None,
+            }
+        } else {
+            Self {
+                level: 0.0,
+                step: 1.0 / fade_in_frames as f32,
+                stopping: None,
+            }
+        }
+    }
+
+    /// Начинает затухание от текущего уровня до нуля за `frames` кадров. Повторная остановка
+    /// может только ускорить уже идущее затухание.
+    fn stop(&mut self, frames: u32) {
+        let frames = frames.max(1);
+        if self.stopping.is_some_and(|left| left <= frames) {
+            return;
+        }
+        self.step = -self.level / frames as f32;
+        self.stopping = Some(frames);
+    }
+
+    /// Голос остановлен и уже затих.
+    fn silent(&self) -> bool {
+        self.stopping.is_some() && self.level <= 0.0
+    }
+
+    /// Сдвигает уровень на кадр; возвращает `true`, когда остановленный голос затих.
+    fn advance(&mut self) -> bool {
+        match self.stopping.as_mut() {
+            Some(left) => {
+                *left -= 1;
+                self.level = (self.level + self.step).max(0.0);
+                if *left == 0 {
+                    self.level = 0.0;
+                    return true;
+                }
+            }
+            None if self.step > 0.0 => {
+                self.level += self.step;
+                if self.level >= 1.0 {
+                    self.level = 1.0;
+                    self.step = 0.0;
+                }
+            }
+            None => {}
+        }
+        false
+    }
 }
 
 /// Завершённые голоса, которые ещё не переданы потоку `rve-audio`.
@@ -241,30 +344,43 @@ pub struct Mixer {
     fade_frames: u32,
     spatial: Arc<Spatial>,
     voices: [Option<Voice>; VOICE_SLOTS],
+    /// Вытесненные голоса, которые доигрывают fade-out без полосы и без `VoiceEnded`.
+    tails: [Option<Voice>; TAIL_SLOTS],
     /// Индексы [`AudioGroup`]: Master, Music, Effects, Ambient.
-    group_gains: [f32; 4],
+    group_gains: [f32; GROUPS],
+    /// Шины групп с эффектами; индекс 0 (Master) обрабатывает общую сумму.
+    buses: [Bus; GROUPS],
+    /// Сумма голосов каждой группы за блок.
+    bus_buffers: [[f32; BLOCK_FRAMES * 2]; GROUPS],
     paused: bool,
     mono_output: bool,
     ended: EndedQueue,
+    /// Кольца стрим-голосов, которые ждут возврата потоку `rve-audio`.
+    retired: [Option<StreamReader>; RETIRED_CAPACITY],
     /// Последний согласованный слушатель: используется, пока писатель его меняет.
     listener: Listener,
 }
 
 impl Mixer {
+    /// Выделяет буферы шин; вызывать до запуска устройства, не в callback.
     pub fn new(device_rate: u32, spatial: Arc<Spatial>) -> Self {
-        let fade_frames = ((FADE_SECONDS * device_rate as f32).ceil() as u32).max(1);
+        let fade_frames = seconds_to_frames(FADE_SECONDS, device_rate).max(1);
         Self {
             device_rate,
             fade_frames,
             spatial,
             voices: std::array::from_fn(|_| None),
-            group_gains: [1.0; 4],
+            tails: std::array::from_fn(|_| None),
+            group_gains: [1.0; GROUPS],
+            buses: std::array::from_fn(|_| Bus::new(device_rate)),
+            bus_buffers: [[0.0; BLOCK_FRAMES * 2]; GROUPS],
             paused: false,
             mono_output: false,
             ended: EndedQueue {
                 items: [None; ENDED_CAPACITY],
                 len: 0,
             },
+            retired: std::array::from_fn(|_| None),
             listener: ([0.0; 3], [0.0; 3], [0.0; 3]),
         }
     }
@@ -277,11 +393,36 @@ impl Mixer {
                 lane,
                 clip,
                 request,
-            } => self.start(voice, lane, clip, request),
-            MixerCommand::Stop { voice } => self.begin_fade(voice),
+            } => {
+                let source = Source::Clip {
+                    clip,
+                    position: 0.0,
+                };
+                self.start(voice, lane, source, request);
+            }
+            MixerCommand::PlayStream {
+                voice,
+                lane,
+                mut stream,
+                request,
+            } => {
+                let first = pull_frame(&mut stream);
+                let second = pull_frame(&mut stream);
+                let source = Source::Stream {
+                    reader: stream,
+                    window: [first, second],
+                    fraction: 0.0,
+                };
+                self.start(voice, lane, source, request);
+            }
+            MixerCommand::Stop { voice } => self.begin_fade(voice, self.fade_frames),
+            MixerCommand::FadeOut { voice, seconds } => {
+                let frames = seconds_to_frames(seconds, self.device_rate).max(self.fade_frames);
+                self.begin_fade(voice, frames);
+            }
             MixerCommand::StopAll => {
                 for slot in self.voices.iter_mut().flatten() {
-                    begin_fade(slot, self.fade_frames);
+                    slot.envelope.stop(self.fade_frames);
                 }
             }
             MixerCommand::SetPaused(paused) => self.paused = paused,
@@ -294,18 +435,29 @@ impl Mixer {
                 self.group_gains[group_index(group)] = volume;
             }
             MixerCommand::SetMonoOutput(mono) => self.mono_output = mono,
+            MixerCommand::SetGroupEffects { group, effects } => {
+                self.buses[group_index(group)].set(effects);
+            }
         }
     }
 
-    fn start(&mut self, id: VoiceId, lane: usize, clip: Arc<Clip>, request: PlayRequest) {
+    fn start(&mut self, id: VoiceId, lane: usize, source: Source, request: PlayRequest) {
         if lane >= VOICE_SLOTS {
+            self.retire_source(source);
             self.push_ended(id);
             return;
         }
         // Слот занят только при вытеснении: слот освобождается по VoiceEnded, поэтому остановленный
-        // голос ещё затухает. Вытесненный голос обрывается без fade: одна дорожка — один голос.
-        if let Some(previous) = self.voices[lane].take() {
+        // голос ещё затухает. Вытесненный голос уходит в хвосты и доигрывает fade-out там; полоса
+        // и `VoiceEnded` достаются ему сразу, поэтому событие не повторяется.
+        if let Some(mut previous) = self.voices[lane].take() {
             self.push_ended(previous.id);
+            previous.envelope.stop(self.fade_frames);
+            previous.lane = NO_LANE;
+            match self.tails.iter_mut().find(|tail| tail.is_none()) {
+                Some(tail) => *tail = Some(previous),
+                None => self.retire(previous),
+            }
         }
         // Некорректный pitch не должен сделать шаг NaN: голос без конца. Вызовы его уже отклоняют.
         let pitch = if request.pitch.is_finite() && request.pitch > 0.0 {
@@ -313,11 +465,15 @@ impl Mixer {
         } else {
             1.0
         };
-        let step = f64::from(clip.sample_rate) / f64::from(self.device_rate) * f64::from(pitch);
+        let sample_rate = match &source {
+            Source::Clip { clip, .. } => clip.sample_rate,
+            Source::Stream { reader, .. } => reader.sample_rate,
+        };
+        let step = f64::from(sample_rate) / f64::from(self.device_rate) * f64::from(pitch);
+        let fade_in = seconds_to_frames(request.fade_in, self.device_rate);
         self.voices[lane] = Some(Voice {
             id,
-            clip,
-            position: 0.0,
+            source,
             step,
             looping: request.looping,
             group: request.group,
@@ -329,15 +485,47 @@ impl Mixer {
             lane,
             gain: 0.0,
             lowpass: [0.0; 2],
-            fade: None,
+            envelope: Envelope::start(fade_in),
             emitter: [0.0; 3],
         });
     }
 
-    fn begin_fade(&mut self, id: VoiceId) {
-        let frames = self.fade_frames;
+    fn begin_fade(&mut self, id: VoiceId, frames: u32) {
         if let Some(voice) = self.find_mut(id) {
-            begin_fade(voice, frames);
+            voice.envelope.stop(frames);
+        }
+    }
+
+    /// Освобождает голос: кольцо стрима уходит в очередь возврата, ссылку на клип держит кеш.
+    fn retire(&mut self, voice: Voice) {
+        self.retire_source(voice.source);
+    }
+
+    fn retire_source(&mut self, source: Source) {
+        let Source::Stream { reader, .. } = source else {
+            return;
+        };
+        match self.retired.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some(reader),
+            // Очередь рассчитана на все голоса и хвосты сразу; при переполнении кольцо утекает,
+            // но не освобождается в callback.
+            None => std::mem::forget(reader),
+        }
+    }
+
+    /// Передаёт кольца завершённых стрим-голосов в `send`; отклонённые остаются в очереди.
+    pub fn drain_retired(
+        &mut self,
+        mut send: impl FnMut(StreamReader) -> Result<(), StreamReader>,
+    ) {
+        for slot in &mut self.retired {
+            let Some(reader) = slot.take() else {
+                continue;
+            };
+            if let Err(reader) = send(reader) {
+                *slot = Some(reader);
+                return;
+            }
         }
     }
 
@@ -386,21 +574,50 @@ impl Mixer {
             return;
         }
         let frames = stereo.len() / 2;
+        let samples = frames * 2;
         if let Some(listener) = self.spatial.listener() {
             self.listener = listener;
         }
         let listener = self.listener;
+        for buffer in &mut self.bus_buffers {
+            buffer[..samples].fill(0.0);
+        }
         for slot in 0..VOICE_SLOTS {
             let Some(voice) = self.voices[slot].as_mut() else {
                 continue;
             };
-            let base = self.group_gains[0] * self.group_gains[group_index(voice.group)];
-            let finished = mix_voice(voice, stereo, frames, base, &self.spatial, listener);
-            if finished {
+            let group = group_index(voice.group);
+            let base = self.group_gains[0] * self.group_gains[group];
+            let bus = &mut self.bus_buffers[group][..samples];
+            if mix_voice(voice, bus, frames, base, &self.spatial, listener) {
                 let voice = self.voices[slot].take().expect("голос найден выше");
                 self.push_ended(voice.id);
+                self.retire(voice);
             }
         }
+        for slot in 0..TAIL_SLOTS {
+            let Some(voice) = self.tails[slot].as_mut() else {
+                continue;
+            };
+            let group = group_index(voice.group);
+            let base = self.group_gains[0] * self.group_gains[group];
+            let bus = &mut self.bus_buffers[group][..samples];
+            if mix_voice(voice, bus, frames, base, &self.spatial, listener) {
+                let voice = self.tails[slot].take().expect("хвост найден выше");
+                self.retire(voice);
+            }
+        }
+        // Голоса группы Master идут прямо в сумму; шина Master обрабатывает её целиком.
+        for group in 0..GROUPS {
+            let bus = &mut self.bus_buffers[group][..samples];
+            if group != 0 {
+                self.buses[group].process(bus);
+            }
+            for (out, value) in stereo.iter_mut().zip(bus.iter()) {
+                *out += value;
+            }
+        }
+        self.buses[0].process(stereo);
     }
 
     fn push_ended(&mut self, id: VoiceId) {
@@ -439,6 +656,27 @@ impl Mixer {
     pub(crate) fn active_voices(&self) -> usize {
         self.voices.iter().flatten().count()
     }
+
+    #[cfg(test)]
+    pub(crate) fn fading_tails(&self) -> usize {
+        self.tails.iter().flatten().count()
+    }
+}
+
+fn seconds_to_frames(seconds: f32, rate: u32) -> u32 {
+    if seconds.is_finite() && seconds > 0.0 {
+        (seconds * rate as f32).ceil().min(u32::MAX as f32) as u32
+    } else {
+        0
+    }
+}
+
+/// Кадр из кольца стрима; при опустошении — тишина.
+fn pull_frame(reader: &mut StreamReader) -> Frame {
+    match reader.pull() {
+        Pull::Frame(frame) => frame,
+        Pull::Underrun | Pull::End => [0.0; 2],
+    }
 }
 
 /// Mixes one voice into `stereo` and reports whether it has finished.
@@ -467,8 +705,9 @@ fn mix_voice(
     };
     let target = base_gain * voice.volume * gains.attenuation;
     let start_gain = voice.gain;
-    let channels = usize::from(voice.clip.channels);
-    let frame_count = voice.clip.frames() as f64;
+    if voice.envelope.silent() {
+        return true;
+    }
     // Доля моно-сведения до панорамы: force_mono — полностью; пространственный голос — по
     // spatial_blend, чтобы стерео плавно переходило в моно; 2D-голос сохраняет стерео.
     let mono_mix = if voice.force_mono {
@@ -482,12 +721,8 @@ fn mix_voice(
 
     for index in 0..frames {
         let ramp = (index + 1) as f32 / frames as f32;
-        let mut gain = start_gain + (target - start_gain) * ramp;
-        if let Some(fade) = voice.fade {
-            gain *= fade.left as f32 / fade.total as f32;
-        }
-        let (source_left, source_right) =
-            sample(&voice.clip, channels, voice.position, voice.looping);
+        let gain = (start_gain + (target - start_gain) * ramp) * voice.envelope.level;
+        let ((source_left, source_right), ended) = voice.next_frame();
         let mono = (source_left + source_right) * 0.5;
         let mut left = source_left + (mono - source_left) * mono_mix;
         let mut right = source_right + (mono - source_right) * mono_mix;
@@ -496,32 +731,13 @@ fn mix_voice(
         stereo[index * 2] += left * gain * gains.left;
         stereo[index * 2 + 1] += right * gain * gains.right;
 
-        voice.position += voice.step;
-        if voice.position >= frame_count {
-            if voice.looping {
-                voice.position -= frame_count;
-            } else {
-                finished = true;
-                break;
-            }
-        }
-        if let Some(fade) = voice.fade.as_mut() {
-            fade.left = fade.left.saturating_sub(1);
-            if fade.left == 0 {
-                finished = true;
-                break;
-            }
+        if ended || voice.envelope.advance() {
+            finished = true;
+            break;
         }
     }
     voice.gain = target;
     finished
-}
-
-fn begin_fade(voice: &mut Voice, frames: u32) {
-    voice.fade.get_or_insert(Fade {
-        total: frames,
-        left: frames,
-    });
 }
 
 fn sample(clip: &Clip, channels: usize, position: f64, looping: bool) -> (f32, f32) {
@@ -640,6 +856,46 @@ pub fn linear_attenuation(distance: f32, distances: Distances) -> f32 {
 }
 
 impl Voice {
+    /// Текущий кадр источника; сдвигает позицию на шаг. Второе значение — источник закончился.
+    fn next_frame(&mut self) -> ((f32, f32), bool) {
+        match &mut self.source {
+            Source::Clip { clip, position } => {
+                let channels = usize::from(clip.channels);
+                let value = sample(clip, channels, *position, self.looping);
+                let frame_count = clip.frames() as f64;
+                *position += self.step;
+                if *position >= frame_count {
+                    if self.looping && frame_count > 0.0 {
+                        *position %= frame_count;
+                    } else {
+                        return (value, true);
+                    }
+                }
+                (value, false)
+            }
+            Source::Stream {
+                reader,
+                window,
+                fraction,
+            } => {
+                let t = *fraction as f32;
+                let [a, b] = *window;
+                let value = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+                *fraction += self.step;
+                while *fraction >= 1.0 {
+                    *fraction -= 1.0;
+                    window[0] = window[1];
+                    window[1] = match reader.pull() {
+                        Pull::Frame(frame) => frame,
+                        Pull::Underrun => [0.0; 2],
+                        Pull::End => return (value, true),
+                    };
+                }
+                (value, false)
+            }
+        }
+    }
+
     /// One-pole low-pass по каналу. `alpha >= 1` пропускает вход без изменений и держит состояние
     /// равным входу, чтобы переход к фильтру не давал щелчка.
     fn lowpass_step(&mut self, channel: usize, input: f32, alpha: f32) -> f32 {

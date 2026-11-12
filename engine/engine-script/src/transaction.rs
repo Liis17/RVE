@@ -1092,6 +1092,19 @@ impl ScriptTransaction {
                 return Err("clip follow object is not alive and active".to_owned());
             }
         }
+        match &request {
+            AudioRequest::StopSource { fade, .. } | AudioRequest::StopVoice { fade, .. } => {
+                if let Some(problem) = engine_scene::fade_problem(*fade) {
+                    return Err(problem.to_owned());
+                }
+            }
+            AudioRequest::SetGroupEffects { effects, .. } => {
+                if let Some(problem) = engine_scene::group_effects_problem(effects) {
+                    return Err(problem.to_owned());
+                }
+            }
+            _ => {}
+        }
         if let AudioRequest::SetVoicePosition { voice, .. } = &request
             && self.voice_is_flat(*voice)
         {
@@ -3502,7 +3515,7 @@ impl ScriptTransaction {
                     self.voice_spatial
                         .insert(voice.get(), engine_scene::audio::clip_is_spatial(params));
                 }
-                AudioRequest::StopVoice { voice } => {
+                AudioRequest::StopVoice { voice, .. } => {
                     self.voice_spatial.remove(&voice.get());
                 }
                 _ => {}

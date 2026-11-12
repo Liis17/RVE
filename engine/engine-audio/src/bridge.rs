@@ -98,6 +98,8 @@ impl AudioBridge {
             .objects()
             .iter()
             .filter_map(|object| object.audio_source.as_ref())
+            // Стрим-клипы не попадают в кеш: их предзагрузка держала бы весь клип в памяти.
+            .filter(|audio| !audio.stream)
             .map(|audio| audio.clip.as_str().to_owned())
             .collect();
         clips.sort();
@@ -115,9 +117,9 @@ impl AudioBridge {
                 AudioRequest::PlaySource { object, voice } => {
                     self.play_source(object, voice, world)
                 }
-                AudioRequest::StopSource { object } => {
+                AudioRequest::StopSource { object, fade } => {
                     if let Some(&voice) = self.sources.get(&object)
-                        && self.stop_voice(voice, "остановка источника")
+                        && self.stop_voice_fade(voice, fade, "остановка источника")
                     {
                         self.sources.remove(&object);
                     }
@@ -144,9 +146,9 @@ impl AudioBridge {
                     }
                     self.play_clip(voice, path.as_str(), params, world);
                 }
-                AudioRequest::StopVoice { voice } => {
+                AudioRequest::StopVoice { voice, fade } => {
                     self.followers.remove(&voice);
-                    self.stop_voice(voice, "остановка голоса");
+                    self.stop_voice_fade(voice, fade, "остановка голоса");
                 }
                 AudioRequest::SetVoicePosition { voice, position } => {
                     // Явная позиция отменяет слежение за объектом.
@@ -156,6 +158,10 @@ impl AudioBridge {
                 AudioRequest::SetGroupVolume { group, volume } => {
                     let result = self.handle.set_group_volume(group, volume);
                     self.note(result, "громкость группы");
+                }
+                AudioRequest::SetGroupEffects { group, effects } => {
+                    let result = self.handle.set_group_effects(group, effects);
+                    self.note(result, "эффекты группы");
                 }
             }
         }
@@ -188,6 +194,8 @@ impl AudioBridge {
             rolloff: Rolloff::Inverse,
             pitch: 1.0,
             force_mono: params.force_mono,
+            fade_in: params.fade_in,
+            stream: params.stream,
         };
         let result = match position {
             Some(position) => self.handle.play_at(voice, path, request, position),
@@ -239,7 +247,16 @@ impl AudioBridge {
 
     /// Останавливает голос. При отказе очереди голос остаётся в таблице и помечается отказом.
     fn stop_voice(&mut self, voice: VoiceId, action: &str) -> bool {
-        let result = self.handle.stop(voice);
+        self.stop_voice_fade(voice, 0.0, action)
+    }
+
+    /// Как [`Self::stop_voice`], но с затуханием `fade` секунд; `0` — стандартная остановка.
+    fn stop_voice_fade(&mut self, voice: VoiceId, fade: f32, action: &str) -> bool {
+        let result = if fade > 0.0 {
+            self.handle.stop_fade(voice, fade)
+        } else {
+            self.handle.stop(voice)
+        };
         let stopped = result.is_ok();
         self.note(result, action);
         stopped
@@ -394,6 +411,8 @@ fn source_request(audio: &AudioSourceComponent, volume: f32) -> PlayRequest {
         },
         pitch: audio.pitch,
         force_mono: audio.force_mono,
+        fade_in: audio.fade_in,
+        stream: audio.stream,
     }
 }
 
