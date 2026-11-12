@@ -1974,8 +1974,9 @@ pub struct RveHost {
 }
 
 impl RveHost {
-    /// Whether the host asked the running callback to stop (ABI v25).
-    pub fn is_interrupted(&self) -> bool {
+    /// Whether the host asked the running callback to stop (ABI v25). Crate-private: the field
+    /// is public, so a safe public method could dereference an arbitrary pointer.
+    pub(crate) fn is_interrupted(&self) -> bool {
         // SAFETY: a non-null flag stays valid for the whole callback per the ABI contract.
         !self.interrupt.is_null() && unsafe { (*self.interrupt).load(Ordering::Acquire) }
     }
