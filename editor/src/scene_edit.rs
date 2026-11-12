@@ -1770,6 +1770,56 @@ impl EditorScene {
         self.dirty = false;
         Ok(())
     }
+
+    /// Число ссылок документа на переименовываемый или удаляемый ресурс.
+    pub fn count_asset_references(&self, remap: &crate::asset_refs::PathRemap) -> usize {
+        self.document
+            .to_toml()
+            .ok()
+            .and_then(|text| crate::asset_refs::count_in_text(&text, remap).ok())
+            .unwrap_or(0)
+    }
+
+    /// Переносит путь документа, если переименован его файл или папка с ним.
+    pub fn follow_rename(&mut self, remap: &crate::asset_refs::PathRemap) {
+        if let Some(path) = self.path.as_ref()
+            && let Some(moved) = remap.map_asset_path(path.as_str())
+            && let Ok(moved) = VirtualPath::parse(&moved)
+        {
+            self.path = Some(moved);
+        }
+    }
+
+    /// Переводит ссылки документа на переименованный ресурс отдельным шагом undo.
+    ///
+    /// `on_disk` — файл документа на диске уже переписан тем же переименованием: тогда сцена,
+    /// не имевшая несохранённых правок, остаётся сохранённой.
+    pub fn remap_asset_paths(
+        &mut self,
+        remap: &crate::asset_refs::PathRemap,
+        on_disk: bool,
+    ) -> Result<bool, String> {
+        let text = self.document.to_toml().map_err(|error| error.to_string())?;
+        let Some(rewritten) = crate::asset_refs::rewrite_text(&text, remap)? else {
+            return Ok(false);
+        };
+        let label = self
+            .path
+            .clone()
+            .unwrap_or_else(|| VirtualPath::parse("untitled.rvescene").expect("valid path"));
+        let next = parse_document(&label, &rewritten).map_err(|error| error.to_string())?;
+        let was_dirty = self.dirty;
+        self.end_continuous_edit();
+        self.edit(None, |document| {
+            *document = next;
+            Ok(())
+        })?;
+        self.end_continuous_edit();
+        if on_disk && !was_dirty {
+            self.dirty = false;
+        }
+        Ok(true)
+    }
 }
 
 fn is_prefab_path(path: &VirtualPath) -> bool {
