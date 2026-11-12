@@ -93,7 +93,16 @@ pub fn rewrite_text(text: &str, remap: &PathRemap) -> Result<Option<String>, Str
         count: 0,
     };
     visitor.visit_document_mut(&mut document);
-    Ok((visitor.count > 0).then(|| document.to_string()))
+    if visitor.count == 0 {
+        return Ok(None);
+    }
+    let rewritten = document.to_string();
+    // toml_edit пишет `\n`; файл с окончаниями `\r\n` (checkout Windows) их сохраняет.
+    Ok(Some(if text.contains("\r\n") {
+        rewritten.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        rewritten
+    }))
 }
 
 struct Rewrite<'a> {
@@ -269,6 +278,12 @@ mod tests {
             "без ссылок текст не переписывается"
         );
         assert!(count_in_text("a = [", &remap).is_err());
+        let crlf = "# c\r\npath = \"/models/a.fbx\"\r\n";
+        assert_eq!(
+            rewrite_text(crlf, &remap).unwrap().unwrap(),
+            "# c\r\npath = \"/models/b.fbx\"\r\n",
+            "окончания строк Windows сохраняются"
+        );
     }
 
     struct TempProject(PathBuf);
