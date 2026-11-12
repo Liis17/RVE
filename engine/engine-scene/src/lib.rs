@@ -5,6 +5,7 @@ pub mod asset_kind;
 pub mod audio;
 pub mod camera;
 pub mod camera_settings;
+pub mod color_lut;
 pub mod document;
 pub mod light;
 pub mod material_asset;
@@ -28,8 +29,9 @@ pub use animation::{
 };
 pub use asset_kind::AssetKind;
 pub use audio::{
-    AudioGroup, AudioRequest, AudioRolloff, AudioSourceComponent, ClipParams, MAX_AUDIO_PITCH,
-    MAX_AUDIO_VOLUME, VoiceId, activity_audio_requests,
+    AudioGroup, AudioGroupEffects, AudioRequest, AudioReverb, AudioRolloff, AudioSourceComponent,
+    ClipParams, MAX_AUDIO_FADE, MAX_AUDIO_FILTER_HZ, MAX_AUDIO_PITCH, MAX_AUDIO_VOLUME,
+    MIN_AUDIO_FILTER_HZ, VoiceId, activity_audio_requests, fade_problem, group_effects_problem,
 };
 pub use light::ShadowSettings;
 pub use material_asset::{
@@ -58,10 +60,11 @@ pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,
     ProjectionSettings, Tonemapper,
 };
+pub use color_lut::{CubeLut, CubeLutError, MAX_CUBE_LUT_SIZE, MIN_CUBE_LUT_SIZE};
 pub use document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
-    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LAYER_COUNT, LiteScript,
-    LodGroup, LodLevel, MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS,
+    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LAYER_COUNT, LOD_HYSTERESIS,
+    LiteScript, LodGroup, LodLevel, MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS,
     MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue, PointLightComponent,
     ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset, SceneDocument,
     SceneError, SceneObject, SceneTransform, ScreenShaderRef, ScreenShaderStage,
@@ -80,7 +83,8 @@ pub use prefab::{
     expand_without_overrides,
 };
 pub use world::{
-    EnvironmentState, LightState, LocalLightState, LocalTransform, MAX_GENERATION,
-    MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle, ParticleEmitterInstance, SceneFrame,
-    SceneReplacement, SceneWarning, SpawnOptions, World, WorldObject,
+    EnvironmentState, LOD_REFERENCE_FOV, LightState, LocalLightState, LocalTransform, LodSelector,
+    MAX_GENERATION, MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle,
+    ParticleEmitterInstance, SceneFrame, SceneReplacement, SceneWarning, SpawnOptions, World,
+    WorldObject,
 };

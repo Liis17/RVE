@@ -1,5 +1,6 @@
 //! Список тяжёлых префабов проекта `prefabs.rveprefabs`: правка в редакторе и явное сохранение.
 
+use crate::asset_refs::PathRemap;
 use crate::scene_edit::write_atomic;
 use engine_project::{PREFAB_CATALOG_FILE_NAME, PrefabCatalogEntry, PrefabCatalogFile};
 use std::path::{Path, PathBuf};
@@ -95,6 +96,32 @@ impl ProjectPrefabs {
         })
     }
 
+    /// Число записей списка в памяти, указывающих на переименовываемый или удаляемый ресурс.
+    pub fn count_references(&self, remap: &PathRemap) -> usize {
+        self.file
+            .prefabs
+            .iter()
+            .filter(|entry| remap.map(&entry.path).is_some())
+            .count()
+    }
+
+    /// Переводит пути списка на переименованный ресурс. `on_disk` — файл уже переписан тем же
+    /// переименованием, поэтому меняется и сохранённая копия: признак несохранённых правок
+    /// остаётся прежним.
+    pub fn remap_paths(&mut self, remap: &PathRemap, on_disk: bool) {
+        let remap_file = |file: &mut PrefabCatalogFile| {
+            for entry in &mut file.prefabs {
+                if let Some(mapped) = remap.map(&entry.path) {
+                    entry.path = mapped;
+                }
+            }
+        };
+        remap_file(&mut self.file);
+        if on_disk {
+            remap_file(&mut self.saved);
+        }
+    }
+
     /// Записывает список в `prefabs.rveprefabs` атомарно.
     pub fn save(&mut self) -> Result<(), String> {
         let result = self.ensure_loaded().and_then(|()| {
@@ -142,6 +169,19 @@ impl ProjectPrefabs {
                 "{PREFAB_CATALOG_FILE_NAME} не загружен: исправьте файл и перечитайте список"
             ))
         }
+    }
+}
+
+/// Список тяжёлых префабов для Play: открытый в редакторе список того же проекта, включая
+/// несохранённые правки, иначе файл `prefabs.rveprefabs`. Правки уже прошли тот же разбор, что и
+/// файл, поэтому Play видит ровно то, что показывает подокно Project Prefabs.
+pub fn play_catalog(
+    root: &Path,
+    edited: Option<&ProjectPrefabs>,
+) -> Result<PrefabCatalogFile, String> {
+    match edited {
+        Some(list) if list.loaded && list.root == root => Ok(list.file.clone()),
+        _ => PrefabCatalogFile::load(root.join(PREFAB_CATALOG_FILE_NAME)),
     }
 }
 
@@ -274,5 +314,55 @@ mod tests {
         assert!(prefabs.save().is_err());
         assert!(!prefabs.is_dirty());
         assert_eq!(project.read(), broken);
+    }
+
+    #[test]
+    fn play_uses_unsaved_edits_of_the_same_project_and_the_file_otherwise() {
+        let temp = TempProject::new();
+        temp.write("[[prefabs]]\npath = \"/prefabs/a.rveprefab\"\n");
+        let mut prefabs = ProjectPrefabs::open(&temp.0);
+        prefabs.add("prefabs/b.rveprefab").unwrap();
+        assert!(prefabs.is_dirty());
+        let catalog = play_catalog(&temp.0, Some(&prefabs)).unwrap();
+        let paths = catalog
+            .prefabs
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["/prefabs/a.rveprefab", "/prefabs/b.rveprefab"]);
+        assert!(prefabs.is_dirty(), "Play не сохраняет список");
+
+        // Без открытого списка или для другого проекта читается файл.
+        assert_eq!(play_catalog(&temp.0, None).unwrap().prefabs.len(), 1);
+        let other = TempProject::new();
+        assert_eq!(
+            play_catalog(&other.0, Some(&prefabs))
+                .unwrap()
+                .prefabs
+                .len(),
+            0
+        );
+
+        // Повреждённый файл без загруженного списка остаётся ошибкой Play.
+        temp.write("[[prefabs]");
+        let broken = ProjectPrefabs::open(&temp.0);
+        assert!(play_catalog(&temp.0, Some(&broken)).is_err());
+    }
+
+    #[test]
+    fn remap_follows_a_renamed_folder_and_keeps_the_unsaved_flag() {
+        let temp = TempProject::new();
+        temp.write("[[prefabs]]\npath = \"/old/a.rveprefab\"\n");
+        let mut prefabs = ProjectPrefabs::open(&temp.0);
+        let remap = PathRemap::new("old", "new");
+        assert_eq!(prefabs.count_references(&remap), 1);
+        prefabs.remap_paths(&remap, true);
+        assert_eq!(paths(&prefabs), ["/new/a.rveprefab"]);
+        assert!(!prefabs.is_dirty(), "файл уже переписан на диске");
+
+        prefabs.add("old/b.rveprefab").unwrap();
+        prefabs.remap_paths(&remap, false);
+        assert_eq!(paths(&prefabs), ["/new/a.rveprefab", "/new/b.rveprefab"]);
+        assert!(prefabs.is_dirty());
     }
 }

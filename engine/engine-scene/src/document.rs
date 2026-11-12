@@ -1041,6 +1041,10 @@ pub fn mesh_collider_model(
 
 pub const MAX_LOD_LEVELS: usize = 6;
 
+/// Доля порога, на которую метрика LOD должна опуститься ниже него, чтобы вернуть более
+/// детальный уровень: без этого запаса объект на границе уровней мерцает между ними.
+pub const LOD_HYSTERESIS: f32 = 0.1;
+
 /// Дополнительные уровни модели, выбираемые по расстоянию до объекта.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1063,6 +1067,37 @@ impl LodGroup {
                 .take_while(|level| distance >= level.distance)
                 .count(),
         )
+    }
+
+    /// Выбирает уровень с гистерезисом. `previous` — выбор прошлого кадра: `None` — его нет,
+    /// `Some(None)` — объект был отсечён. Переход на более дальний уровень происходит ровно на
+    /// пороге, а возврат на более детальный — только когда `distance` опустится ниже начала
+    /// прошлого уровня на [`LOD_HYSTERESIS`].
+    pub fn select_level(&self, distance: f32, previous: Option<Option<usize>>) -> Option<usize> {
+        let current = self.level_for_distance(distance);
+        let Some(previous) = previous else {
+            return current;
+        };
+        let culled_rank = self.levels.len() + 1;
+        let rank = |level: Option<usize>| level.unwrap_or(culled_rank);
+        // Прошлый выбор от другой конфигурации группы игнорируется.
+        let previous_valid = match previous {
+            Some(level) => level <= self.levels.len(),
+            None => self.cull_distance.is_some(),
+        };
+        if !previous_valid || rank(current) >= rank(previous) {
+            return current;
+        }
+        let start = match previous {
+            Some(0) => 0.0,
+            Some(level) => self.levels[level - 1].distance,
+            None => self.cull_distance.unwrap_or(f32::INFINITY),
+        };
+        if distance >= start * (1.0 - LOD_HYSTERESIS) {
+            previous
+        } else {
+            current
+        }
     }
 }
 
@@ -2431,6 +2466,42 @@ id = "camera"
         assert_eq!(group.level_for_distance(20.0), Some(2));
         assert_eq!(group.level_for_distance(29.99), Some(2));
         assert_eq!(group.level_for_distance(30.0), None);
+    }
+
+    #[test]
+    fn lod_selection_returns_to_finer_level_only_below_hysteresis_band() {
+        let group = LodGroup {
+            levels: vec![
+                LodLevel {
+                    model: "/models/lod1.fbx".to_owned(),
+                    texture: None,
+                    distance: 10.0,
+                },
+                LodLevel {
+                    model: "/models/lod2.fbx".to_owned(),
+                    texture: None,
+                    distance: 20.0,
+                },
+            ],
+            cull_distance: Some(30.0),
+        };
+        // Без истории и при удалении выбор совпадает с порогами.
+        assert_eq!(group.select_level(9.99, None), Some(0));
+        assert_eq!(group.select_level(10.0, Some(Some(0))), Some(1));
+        assert_eq!(group.select_level(30.0, Some(Some(2))), None);
+        // Колебание у порога не возвращает детальный уровень, пока метрика в полосе 10%.
+        assert_eq!(group.select_level(9.5, Some(Some(1))), Some(1));
+        assert_eq!(group.select_level(9.0, Some(Some(1))), Some(1));
+        assert_eq!(group.select_level(8.99, Some(Some(1))), Some(0));
+        assert_eq!(group.select_level(27.5, Some(None)), None);
+        assert_eq!(group.select_level(26.9, Some(None)), Some(2));
+        // Резкое приближение сразу выбирает уровень по порогам.
+        assert_eq!(group.select_level(5.0, Some(Some(2))), Some(0));
+        // Прошлый выбор вне группы игнорируется.
+        assert_eq!(group.select_level(9.5, Some(Some(5))), Some(0));
+        let mut uncapped = group.clone();
+        uncapped.cull_distance = None;
+        assert_eq!(uncapped.select_level(25.0, Some(None)), Some(2));
     }
 
     #[test]

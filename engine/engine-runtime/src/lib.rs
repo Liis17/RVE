@@ -72,6 +72,10 @@ const SCRIPTS_READY_GRACE: Duration = Duration::from_secs(2);
 
 /// Runs an RVE game using the release layout or a loose-file development project.
 pub fn run_player() -> ExitCode {
+    // Ctrl+C в терминале не закрывает движок: он завершается окном, скриптом или `quit`.
+    if let Err(error) = engine_platform::ignore_console_interrupt() {
+        eprintln!("Не удалось отключить Ctrl+C: {error}");
+    }
     let args = match PlayerArgs::parse_for_build(
         std::env::args_os().skip(1),
         cfg!(feature = "dev-console"),
@@ -112,6 +116,10 @@ pub fn run_player() -> ExitCode {
 /// Scripts run in background ticks at `[network].tick_hz`. Stops on `--frames`, `quit` on stdin,
 /// or a fatal error.
 pub fn run_server() -> ExitCode {
+    // Ctrl+C в терминале не закрывает движок: он завершается окном, скриптом или `quit`.
+    if let Err(error) = engine_platform::ignore_console_interrupt() {
+        eprintln!("Не удалось отключить Ctrl+C: {error}");
+    }
     let args = match PlayerArgs::parse_server(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(error) => {
@@ -409,6 +417,7 @@ fn run_from_args(
     if !headless {
         // Исходники экранных шейдеров читает только игровой клиент; headless их не открывает.
         render_assets.screen_shaders = scene::load_screen_shader_sources(&resource_handle, &world);
+        render_assets.color_luts = scene::load_color_luts(&resource_handle, &world);
     }
     let ui_text_focus = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (script_tx, script_rx) = flume::unbounded();

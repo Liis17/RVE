@@ -12,12 +12,12 @@ Parent: [[Index]]
 |---|---|---|
 | `engine/engine-render/src/screen_shader.rs` | `compile_screen_shader`, `ScreenShaderStage`, `ScreenShaderError`, `check_interface`, `screen_push_constants`, `ScreenShaders`, `ScreenShaderPass`, `ScreenShaderPipelines`, `ScreenShaderScratch`, `record_screen_chain` | Prelude, компиляция naga, проверка IR, упаковка push constants, ресурсы и запись проходов |
 | `engine/engine-render/src/post.rs` | `ScreenChain`, `PostFrame::screen_before`, `PostFrame::screen_after` | Отбор проходов стадии для вида (без Vulkan) |
-| `engine/engine-render/src/lib.rs` | `Renderer::create_screen_shader`, `Renderer::destroy_screen_shader`, `GpuPass::ScreenShaderBefore`, `GpuPass::ScreenShaderAfter`, `record_tonemap_pass`, `ViewSettings::screen_shaders` | API renderer, встраивание в кадр и перепривязка output-набора |
+| `engine/engine-render/src/resources/api.rs`, `engine/engine-render/src/profile.rs`, `engine/engine-render/src/passes/postprocess.rs`, `engine/engine-render/src/types.rs` | `Renderer::create_screen_shader`, `Renderer::destroy_screen_shader`, `GpuPass::ScreenShaderBefore`, `GpuPass::ScreenShaderAfter`, `record_tonemap_pass`, `ViewSettings::screen_shaders` | API renderer, встраивание в кадр и перепривязка output-набора |
 | `engine/engine-scene/src/document.rs` | `ScreenShaderRef`, `ScreenShaderStage`, `validate_screen_shaders`, `MAX_SCREEN_SHADERS`, `MAX_SCREEN_SHADER_PARAMS` | Формат в `CameraComponent::screen_shaders` и проверка ссылок |
 | `engine/engine-scene/src/world.rs` | `World::screen_shaders`, `World::set_screen_shader`, `SceneFrame::screen_shaders` | Состояние камеры в мире и выдача активной камеры кадру |
 | `engine/engine-scene/src/prefab.rs` | проверка override камеры | Тот же контракт для камер в префабах и их override |
 | `engine/engine-runtime/src/scene.rs` | `screen_shader_paths`, `load_screen_shader_sources`, `ScreenShaderGpu`, `upload_screen_shaders`, `PreparedRenderAssets::screen_shaders` | Чтение исходников и создание шейдеров при загрузке сцены |
-| `engine/engine-runtime/src/pipeline.rs` | `screen_shader_view`, `enabled_screen_passes`, `GpuSceneTable::screen_shaders`, `FrameSnapshot::screen_shaders` | Маппинг кадра в `ViewSettings`; освобождение при замене сцены по живым путям камер и при выгрузке |
+| `engine/engine-runtime/src/pipeline.rs`, `engine/engine-runtime/src/pipeline/snapshot.rs` | `screen_shader_view`, `enabled_screen_passes`, `GpuSceneTable::screen_shaders`, `FrameSnapshot::screen_shaders` | Маппинг кадра в `ViewSettings`; освобождение при замене сцены по живым путям камер и при выгрузке |
 | `engine/rve-sdk/src/abi.rs`, `engine/rve-sdk/src/lib.rs` | `RveScreenShaderState`, `RveHost::screen_shader_count`, `get_screen_shader`, `set_screen_shader` | Script ABI 14 и гостевые методы камеры |
 | `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/transaction.rs`, `engine/engine-script/src/lite.rs` | `host_get_screen_shader`, `ScriptTransaction::set_screen_shader`, Lua `screen_shader` | Хост ABI, очередь транзакции и Lua-API |
 | `editor/src/viewport/render.rs`, `editor/src/ui/inspector.rs`, `editor/src/scene_edit.rs`, `editor/src/app.rs` | `SceneRenderer::sync_screen_shaders`, `reload_changed`, `show_screen_shaders`, `EditorScene::set_camera_screen_shaders` | Инспектор, undo, горячая перезагрузка и Game-вид |
@@ -68,7 +68,7 @@ Push constants занимают 112 байт. Вход — линейный цв
 
 ### Порядок в кадре
 
-- `before_post` работает после TAA/FSR/DLSS (или после сцены без temporal), до `Filters`: его выход становится входом motion blur, DoF, экспозиции, bloom и composite. Ping-pong идёт в scratch стадии, размер — физический размер входа.
+- `before_post` работает после TAA/FSR/DLSS (или после сцены без temporal), до `Filters`: его выход становится входом motion blur, DoF, bloom и composite. Экспозиция замеряется раньше, до temporal resolve, и выход `before_post` не видит. Ping-pong идёт в scratch стадии, размер — физический размер входа.
 - `after_post` работает после composite. Его выход (или сам composite без шейдеров) становится изображением output-прохода; вызывающий код перепривязывает набор `output_set` текущего кадрового слота к нему. Остальной порядок — в [[Engine/EnginePostProcess]].
 
 Результат цепочки из `n` проходов лежит в ping-pong изображении `(n - 1) % 2` (`chain_output_index`). Поэтому чётность цепочки не влияет на корректность результата.
@@ -116,7 +116,7 @@ Push constants занимают 112 байт. Вход — линейный цв
 
 ## Решения и основания
 
-- Настройки лежат в камере сцены, а не в `.postprocess`: `PostProcessSettings` — `Copy` и отражён плоско в ABI 12, путь к файлу сломал бы это.
+- Настройки лежат в камере сцены, а не в `.postprocess`: `PostProcessSettings` отражён плоско в ABI 12, и пути к файлам шейдеров в нём не передать.
 - Компиляция вынесена в `engine-render` без GPU, чтобы `rve-build` проверял шейдеры тем же кодом, что и renderer; поэтому `naga` стал runtime-зависимостью `engine-render`, а `rve-build` получил зависимость на `engine-render` (см. [[Architecture]]).
 - Проверка IR отклоняет любые лишние ресурсы и интерфейсы: иначе привязки шейдера не совпали бы с layout конвейера, а ошибка проявилась бы только на GPU.
 - Один исходник даёт два варианта: альфа для `after_post` нужна для FXAA, а для `before_post` сохраняется альфа входа.

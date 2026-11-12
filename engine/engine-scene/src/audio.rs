@@ -47,6 +47,10 @@ pub struct ClipParams {
     pub min_distance: f32,
     pub max_distance: f32,
     pub force_mono: bool,
+    /// Декодировать клип по частям во время воспроизведения, не загружая его целиком.
+    pub stream: bool,
+    /// Длительность плавного появления в секундах; `0` — сразу на полной громкости.
+    pub fade_in: f32,
 }
 
 impl Default for ClipParams {
@@ -61,6 +65,8 @@ impl Default for ClipParams {
             min_distance: 1.0,
             max_distance: 30.0,
             force_mono: false,
+            stream: false,
+            fade_in: 0.0,
         }
     }
 }
@@ -73,8 +79,9 @@ pub enum AudioRequest {
         object: ObjectHandle,
         voice: VoiceId,
     },
-    /// `obj:stop_sound()`: остановка текущего голоса источника.
-    StopSource { object: ObjectHandle },
+    /// `obj:stop_sound(fade)`: остановка текущего голоса источника. `fade` — затухание в секундах;
+    /// `0` — короткое затухание без щелчка.
+    StopSource { object: ObjectHandle, fade: f32 },
     /// `obj:set_sound_volume(v)`: громкость текущего голоса и следующих запусков источника.
     SetSourceVolume { object: ObjectHandle, volume: f32 },
     /// `rve.audio.play(path, ...)`: клип без привязки к объекту.
@@ -83,12 +90,71 @@ pub enum AudioRequest {
         path: VirtualPath,
         params: ClipParams,
     },
-    /// `rve.audio.stop(id)`.
-    StopVoice { voice: VoiceId },
+    /// `rve.audio.stop(id, fade)`; `fade` как у [`AudioRequest::StopSource`].
+    StopVoice { voice: VoiceId, fade: f32 },
     /// `rve.audio.set_voice_position(id, pos)`: фиксирует излучатель и снимает слежение за объектом.
     SetVoicePosition { voice: VoiceId, position: [f32; 3] },
     /// `rve.audio.set_group_volume(group, v)`.
     SetGroupVolume { group: AudioGroup, volume: f32 },
+    /// `rve.audio.set_group_effects(group, effects)`: фильтры и реверберация шины группы.
+    SetGroupEffects {
+        group: AudioGroup,
+        effects: AudioGroupEffects,
+    },
+}
+
+/// Реверберация шины группы. Все параметры в диапазоне `0..=1`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioReverb {
+    /// Размер комнаты: длина хвоста.
+    pub room_size: f32,
+    /// Поглощение высоких частот в хвосте.
+    pub damping: f32,
+    /// Доля обработанного сигнала; сухой сигнал остаётся на полной громкости.
+    pub wet: f32,
+}
+
+/// Эффекты шины группы. Частота среза `0` выключает фильтр; `reverb = None` — без реверберации.
+/// Значение по умолчанию выключает всё.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AudioGroupEffects {
+    /// Срез low-pass в Гц: убирает частоты выше.
+    pub lowpass_hz: f32,
+    /// Срез high-pass в Гц: убирает частоты ниже.
+    pub highpass_hz: f32,
+    pub reverb: Option<AudioReverb>,
+}
+
+/// Допустимые частоты среза фильтров групп, Гц.
+pub const MIN_AUDIO_FILTER_HZ: f32 = 10.0;
+pub const MAX_AUDIO_FILTER_HZ: f32 = 22_000.0;
+/// Наибольшая длительность fade-in и fade-out, секунды.
+pub const MAX_AUDIO_FADE: f32 = 60.0;
+
+/// Причина отказа для эффектов группы или `None`.
+pub fn group_effects_problem(effects: &AudioGroupEffects) -> Option<&'static str> {
+    let cutoff = |hz: f32| hz == 0.0 || (MIN_AUDIO_FILTER_HZ..=MAX_AUDIO_FILTER_HZ).contains(&hz);
+    if !cutoff(effects.lowpass_hz) || !cutoff(effects.highpass_hz) {
+        return Some(
+            "частота среза фильтра должна быть 0 (выключен) или в диапазоне 10..=22000 Гц",
+        );
+    }
+    if let Some(reverb) = effects.reverb {
+        let unit = |value: f32| (0.0..=1.0).contains(&value);
+        if !unit(reverb.room_size) || !unit(reverb.damping) || !unit(reverb.wet) {
+            return Some("room_size, damping и wet реверберации должны быть в диапазоне 0..=1");
+        }
+    }
+    None
+}
+
+/// Причина отказа для длительности fade-in или fade-out или `None`.
+pub fn fade_problem(seconds: f32) -> Option<&'static str> {
+    if (0.0..=MAX_AUDIO_FADE).contains(&seconds) {
+        None
+    } else {
+        Some("длительность затухания должна быть конечной и в диапазоне 0..=60 секунд")
+    }
 }
 
 /// Заявки звука на смену действующей активности: источники скрытых объектов останавливаются,
@@ -101,7 +167,7 @@ pub fn activity_audio_requests(
 ) -> Vec<AudioRequest> {
     hidden
         .iter()
-        .map(|&object| AudioRequest::StopSource { object })
+        .map(|&object| AudioRequest::StopSource { object, fade: 0.0 })
         .chain(
             shown
                 .iter()
@@ -162,6 +228,10 @@ pub struct AudioSourceComponent {
     pub pitch: f32,
     /// Сводит клип к моно до панорамы.
     pub force_mono: bool,
+    /// Декодировать клип по частям при воспроизведении: для длинной музыки и ambient.
+    pub stream: bool,
+    /// Плавное появление голоса в секундах; `0` — без него.
+    pub fade_in: f32,
 }
 
 impl AudioSourceComponent {
@@ -179,6 +249,8 @@ impl AudioSourceComponent {
             rolloff: AudioRolloff::default(),
             pitch: default_pitch(),
             force_mono: false,
+            stream: false,
+            fade_in: 0.0,
         }
     }
 }
@@ -211,6 +283,10 @@ struct AudioSourceWire {
     pitch: f32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     force_mono: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    fade_in: f32,
 }
 
 impl From<AudioSourceComponent> for AudioSourceWire {
@@ -230,6 +306,8 @@ impl From<AudioSourceComponent> for AudioSourceWire {
             rolloff: audio.rolloff,
             pitch: audio.pitch,
             force_mono: audio.force_mono,
+            stream: audio.stream,
+            fade_in: audio.fade_in,
         }
     }
 }
@@ -258,12 +336,18 @@ impl TryFrom<AudioSourceWire> for AudioSourceComponent {
             rolloff: wire.rolloff,
             pitch: wire.pitch,
             force_mono: wire.force_mono,
+            stream: wire.stream,
+            fade_in: wire.fade_in,
         })
     }
 }
 
 fn is_default_rolloff(rolloff: &AudioRolloff) -> bool {
     *rolloff == AudioRolloff::Inverse
+}
+
+fn is_zero(value: &f32) -> bool {
+    *value == 0.0
 }
 
 fn is_default_pitch(pitch: &f32) -> bool {
@@ -327,11 +411,14 @@ pub fn clip_is_spatial(params: &ClipParams) -> bool {
     (params.position.is_some() || params.follow.is_some()) && params.spatial_blend > 0.0
 }
 
-/// Причина отказа для пространственных опций клипа скрипта или `None`.
+/// Причина отказа для пространственных опций и `fade_in` клипа скрипта или `None`.
 /// Дистанции проверяются только при `spatial_blend > 0`: у 2D-клипа они не используются.
 pub fn clip_spatial_problem(params: &ClipParams) -> Option<&'static str> {
     if !params.spatial_blend.is_finite() || !(0.0..=1.0).contains(&params.spatial_blend) {
         return Some("spatial_blend должен быть конечным и в диапазоне 0..=1");
+    }
+    if fade_problem(params.fade_in).is_some() {
+        return Some("fade_in должен быть конечным и в диапазоне 0..=60 секунд");
     }
     if params.position.is_some() && params.follow.is_some() {
         return Some("position и follow нельзя задать одновременно");
@@ -363,6 +450,9 @@ pub fn audio_source_problem(audio: &AudioSourceComponent) -> Option<&'static str
     }
     if !audio.pitch.is_finite() || audio.pitch <= 0.0 || audio.pitch > MAX_AUDIO_PITCH {
         return Some("audio_source.pitch должен быть конечным и в диапазоне (0..=4]");
+    }
+    if fade_problem(audio.fade_in).is_some() {
+        return Some("audio_source.fade_in должен быть конечным и в диапазоне 0..=60 секунд");
     }
     if !audio.min_distance.is_finite()
         || !audio.max_distance.is_finite()
@@ -498,6 +588,36 @@ mod tests {
             again.objects[1].audio_source,
             document.objects[1].audio_source
         );
+    }
+
+    #[test]
+    fn stream_and_fade_in_round_trip_and_stay_absent_by_default() {
+        let fields = "clip = \"/audio/loop.ogg\"\nstream = true\nfade_in = 2.5";
+        let document = parse(&source(fields)).unwrap();
+        let audio = document.objects[1].audio_source.clone().unwrap();
+        assert!(audio.stream);
+        assert_eq!(audio.fade_in, 2.5);
+        let text = toml::to_string_pretty(&document).unwrap();
+        assert!(
+            text.contains("stream = true") && text.contains("fade_in = 2.5"),
+            "{text}"
+        );
+        assert_eq!(parse(&text).unwrap().objects[1].audio_source, Some(audio));
+
+        let plain = parse(&source("clip = \"/audio/hum.wav\"")).unwrap();
+        let text = toml::to_string_pretty(&plain).unwrap();
+        assert!(
+            !text.contains("stream") && !text.contains("fade_in"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn fade_in_must_be_finite_and_within_the_limit() {
+        for case in ["fade_in = -1.0", "fade_in = 61.0", "fade_in = nan"] {
+            let fields = format!("clip = \"/audio/hum.wav\"\n{case}");
+            assert!(error_for(&fields).contains("fade_in"), "{case}");
+        }
     }
 
     #[test]
@@ -652,5 +772,59 @@ mod clip_spatial_tests {
             ..ClipParams::default()
         };
         assert!(!clip_is_spatial(&positioned_flat));
+    }
+}
+
+#[cfg(test)]
+mod effects_tests {
+    use super::{AudioGroupEffects, AudioReverb, fade_problem, group_effects_problem};
+
+    #[test]
+    fn group_effects_accept_disabled_and_valid_settings() {
+        assert_eq!(group_effects_problem(&AudioGroupEffects::default()), None);
+        let effects = AudioGroupEffects {
+            lowpass_hz: 800.0,
+            highpass_hz: 120.0,
+            reverb: Some(AudioReverb {
+                room_size: 0.7,
+                damping: 0.5,
+                wet: 0.3,
+            }),
+        };
+        assert_eq!(group_effects_problem(&effects), None);
+    }
+
+    #[test]
+    fn group_effects_reject_out_of_range_cutoffs_and_reverb() {
+        for hz in [5.0, -1.0, 30_000.0, f32::NAN] {
+            let lowpass = AudioGroupEffects {
+                lowpass_hz: hz,
+                ..AudioGroupEffects::default()
+            };
+            let highpass = AudioGroupEffects {
+                highpass_hz: hz,
+                ..AudioGroupEffects::default()
+            };
+            assert!(group_effects_problem(&lowpass).is_some(), "{hz}");
+            assert!(group_effects_problem(&highpass).is_some(), "{hz}");
+        }
+        let reverb = AudioGroupEffects {
+            reverb: Some(AudioReverb {
+                room_size: 1.5,
+                damping: 0.5,
+                wet: f32::NAN,
+            }),
+            ..AudioGroupEffects::default()
+        };
+        assert!(group_effects_problem(&reverb).is_some());
+    }
+
+    #[test]
+    fn fade_must_be_finite_and_within_the_limit() {
+        assert_eq!(fade_problem(0.0), None);
+        assert_eq!(fade_problem(60.0), None);
+        for seconds in [-0.1, 60.5, f32::NAN, f32::INFINITY] {
+            assert!(fade_problem(seconds).is_some(), "{seconds}");
+        }
     }
 }

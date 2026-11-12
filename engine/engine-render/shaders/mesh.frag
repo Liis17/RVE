@@ -106,10 +106,8 @@ layout(set = 2, binding = 3) uniform textureCube prefiltered_map;
 layout(set = 2, binding = 4) uniform texture2D brdf_lut;
 layout(set = 2, binding = 5) uniform sampler brdf_sampler;
 
+// params.x — уровень LOD для отладочного вида; одинаков у всех экземпляров вызова.
 layout(push_constant) uniform PushConstants {
-    mat4 model;
-    mat4 normal_from_model;
-    mat4 previous_model;
     uvec4 params;
 } push_constants;
 

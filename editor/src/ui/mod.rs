@@ -105,6 +105,7 @@ pub fn show_with_mcp(
     show_unsaved_prompt(ui.ctx(), state);
     show_apply_prompt(ui.ctx(), state);
     show_recovery_prompt(ui.ctx(), state);
+    show_external_scene_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
     crate::ui_editor::pending_dialog(ui.ctx(), state);
     show_new_project_dialog(ui.ctx(), state);
@@ -164,6 +165,34 @@ fn show_new_project_dialog(ctx: &egui::Context, state: &mut EditorState) {
     if !close {
         state.new_project_dialog = Some(dialog);
     }
+}
+
+fn show_external_scene_prompt(ctx: &egui::Context, state: &mut EditorState) {
+    if state.external_scene_prompt.is_none() {
+        return;
+    }
+    let name = state
+        .scene
+        .as_ref()
+        .and_then(|scene| scene.path())
+        .map_or_else(String::new, |path| format!("/{}", path.as_str()));
+    egui::Modal::new(egui::Id::new("external_scene_change")).show(ctx, |ui| {
+        ui.set_max_width(380.0);
+        ui.heading("Scene changed on disk");
+        ui.label(format!(
+            "Файл {name} изменён вне редактора, а в сцене есть несохранённые правки."
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Reload from disk").clicked() {
+                state.resolve_external_scene(true);
+            }
+            if ui.button("Keep my changes").clicked() {
+                state.resolve_external_scene(false);
+            }
+        });
+        ui.label("Reload отбрасывает правки (их можно вернуть Undo); Keep — следующее сохранение перезапишет файл.");
+    });
 }
 
 fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {

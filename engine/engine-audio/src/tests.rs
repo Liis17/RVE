@@ -26,6 +26,8 @@ fn request(looping: bool) -> PlayRequest {
         rolloff: Rolloff::Inverse,
         pitch: 1.0,
         force_mono: false,
+        fade_in: 0.0,
+        stream: false,
     }
 }
 
@@ -228,6 +230,7 @@ struct Harness {
     core: Core,
     mixer: rtrb::Consumer<MixerCommand>,
     decode_jobs: Receiver<DecodeJob>,
+    stream_jobs: Receiver<StreamJob>,
     reads: flume::Sender<Result<Vec<u8>, String>>,
     reads_started: Arc<AtomicUsize>,
 }
@@ -255,6 +258,7 @@ impl Harness {
         });
         let (mixer_tx, mixer) = RingBuffer::new(MIXER_CAPACITY);
         let (decode_tx, decode_jobs) = flume::unbounded();
+        let (stream_tx, stream_jobs) = flume::unbounded();
         let core = Core {
             lanes,
             read,
@@ -268,6 +272,8 @@ impl Harness {
             outbox: VecDeque::new(),
             events: events_tx,
             decode_tx,
+            stream_tx: Some(stream_tx),
+            streams: Vec::new(),
         };
         Self {
             handle,
@@ -275,6 +281,7 @@ impl Harness {
             core,
             mixer,
             decode_jobs,
+            stream_jobs,
             reads,
             reads_started,
         }
@@ -671,4 +678,166 @@ fn barrier_returns_after_earlier_commands_have_reported_their_failures() {
     );
     handle.shutdown();
     worker.join().unwrap();
+}
+
+fn stream_request(looping: bool) -> PlayRequest {
+    PlayRequest {
+        stream: true,
+        ..request(looping)
+    }
+}
+
+fn ready_reader() -> StreamReader {
+    crate::stream::test_reader(&[[0.5; 2]; 16], 22_050, true).1
+}
+
+#[test]
+fn stream_play_opens_a_stream_instead_of_reading_the_whole_clip() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "music/theme.ogg", stream_request(true))
+        .unwrap();
+    h.step();
+    assert_eq!(h.reads(), 0, "файл не читается целиком");
+    let job = h.stream_jobs.try_recv().expect("задание потоку стриминга");
+    assert_eq!(
+        (job.voice, job.path.as_str(), job.looping),
+        (voice(1), "music/theme.ogg", true)
+    );
+    assert!(
+        h.sent().is_empty(),
+        "до заполнения кольца микшер голос не видит"
+    );
+
+    h.core.stream_event(StreamEvent::Ready {
+        voice: voice(1),
+        reader: ready_reader(),
+    });
+    assert!(matches!(
+        h.sent().as_slice(),
+        [MixerCommand::PlayStream { voice: started, lane: 0, request, .. }]
+            if *started == voice(1) && request.stream
+    ));
+    assert!(h.core.cache.is_empty(), "стрим не попадает в кеш клипов");
+}
+
+#[test]
+fn stop_before_the_stream_is_ready_ends_the_voice_and_drops_the_late_ring() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "music/theme.ogg", stream_request(false))
+        .unwrap();
+    h.step();
+    h.handle.stop_fade(voice(1), 2.0).unwrap();
+    h.step();
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert_eq!(
+        h.handle.poll_events(),
+        vec![AudioEvent::VoiceEnded(voice(1))]
+    );
+    let _ = h.sent();
+
+    h.core.stream_event(StreamEvent::Ready {
+        voice: voice(1),
+        reader: ready_reader(),
+    });
+    assert!(h.sent().is_empty(), "поздний стрим не запускается");
+}
+
+#[test]
+fn stream_that_fails_to_open_reports_once_and_later_plays_end_at_once() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "music/missing.ogg", stream_request(false))
+        .unwrap();
+    h.step();
+    let _ = h.stream_jobs.try_recv().unwrap();
+    h.core.stream_event(StreamEvent::OpenFailed {
+        voice: voice(1),
+        path: "music/missing.ogg".into(),
+        message: "нет файла".into(),
+    });
+    let events = h.handle.poll_events();
+    assert!(matches!(&events[0], AudioEvent::Failed(message) if message.contains("нет файла")));
+    assert_eq!(events[1], AudioEvent::VoiceEnded(voice(1)));
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+
+    h.handle
+        .play(voice(2), "music/missing.ogg", stream_request(false))
+        .unwrap();
+    h.step();
+    assert!(h.stream_jobs.try_recv().is_err(), "повторного открытия нет");
+    assert_eq!(
+        h.handle.poll_events(),
+        vec![AudioEvent::VoiceEnded(voice(2))]
+    );
+}
+
+#[test]
+fn stream_broken_mid_play_reports_but_does_not_poison_the_clip() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "music/theme.ogg", stream_request(false))
+        .unwrap();
+    h.step();
+    let _ = h.stream_jobs.try_recv().unwrap();
+    h.core.stream_event(StreamEvent::Broken {
+        path: "music/theme.ogg".into(),
+        message: "чтение: диск недоступен".into(),
+    });
+    let events = h.handle.poll_events();
+    assert!(
+        matches!(events.as_slice(), [AudioEvent::Failed(message)] if message.contains("диск недоступен")),
+        "{events:?}"
+    );
+    assert_eq!(
+        h.handle.lane_of(voice(1)),
+        Some(0),
+        "ожидающий голос того же клипа жив"
+    );
+
+    h.handle
+        .play(voice(2), "music/theme.ogg", stream_request(false))
+        .unwrap();
+    h.step();
+    assert!(
+        h.stream_jobs.try_recv().is_ok(),
+        "клип можно запустить снова"
+    );
+}
+
+#[test]
+fn stream_without_an_output_device_ends_at_once_without_opening() {
+    let mut h = Harness::new();
+    h.core.mixer = None;
+    h.handle
+        .play(voice(1), "music/theme.ogg", stream_request(true))
+        .unwrap();
+    h.step();
+    assert!(h.stream_jobs.try_recv().is_err());
+    assert_eq!(
+        h.handle.poll_events(),
+        vec![AudioEvent::VoiceEnded(voice(1))]
+    );
+}
+
+#[test]
+fn fade_out_and_group_effects_reach_the_mixer() {
+    let mut h = Harness::new();
+    let effects = AudioGroupEffects {
+        lowpass_hz: 800.0,
+        ..AudioGroupEffects::default()
+    };
+    h.handle.stop_fade(voice(7), 1.5).unwrap();
+    h.handle
+        .set_group_effects(AudioGroup::Music, effects)
+        .unwrap();
+    h.step();
+    assert!(matches!(
+        h.sent().as_slice(),
+        [
+            MixerCommand::FadeOut { voice: stopped, seconds },
+            MixerCommand::SetGroupEffects { group: AudioGroup::Music, effects: sent },
+        ] if *stopped == voice(7) && *seconds == 1.5 && *sent == effects
+    ));
 }

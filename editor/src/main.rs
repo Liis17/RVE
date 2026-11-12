@@ -3,6 +3,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod asset_refs;
 mod asset_watch;
 mod assets_fs;
 mod autosave;
@@ -28,6 +29,7 @@ mod project_tags;
 mod scene_edit;
 mod settings;
 mod state;
+mod toml_preserve;
 mod ui;
 mod ui_editor;
 mod viewport;
@@ -72,6 +74,10 @@ fn prepare(args: &cli::EditorArgs) -> Result<(WindowConfig, Option<BootstrapRefl
 }
 
 fn main() -> ExitCode {
+    // Ctrl+C в терминале не закрывает редактор: несохранённые правки не теряются.
+    if let Err(error) = engine_platform::ignore_console_interrupt() {
+        eprintln!("Не удалось отключить Ctrl+C: {error}");
+    }
     let args = match cli::parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(error) => {

@@ -10,7 +10,7 @@ use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
 use engine_scene::{
-    CameraSettings, ComponentKind, MaterialAsset, ParamKind, PhysicsMaterialSettings,
+    CameraSettings, ComponentKind, CubeLut, MaterialAsset, ParamKind, PhysicsMaterialSettings,
     PostProcessSettings,
 };
 use engine_scene::{
@@ -486,7 +486,17 @@ fn record_asset_recursive(
         let source = String::from_utf8(bytes).map_err(|error| {
             BuildError::input(format!("постобработка /{path} должна быть UTF-8: {error}"))
         })?;
-        PostProcessSettings::parse(format!("/{path}"), &source)
+        let settings = PostProcessSettings::parse(format!("/{path}"), &source)
+            .map_err(|error| BuildError::input(error.to_string()))?;
+        // LUT цветокоррекции — зависимость файла постобработки: тот же владелец и архив.
+        if let Some(lut) = settings.color_grading.lut_path() {
+            record_asset_recursive(usages, sources, &lut, owner, list_archive, visited)?;
+        }
+    }
+
+    if extension_is(path.as_str(), "cube") {
+        let source = read_asset_text(sources, path, "LUT")?;
+        CubeLut::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(error.to_string()))?;
     }
 

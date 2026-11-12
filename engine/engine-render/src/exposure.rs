@@ -7,7 +7,10 @@
 //! идут через одну graphics queue). Поэтому запись предыдущего кадра вида (compute-адаптация и
 //! чтение composite/bloom) завершается до заполнения гистограммы. Состояние адаптации (`ExposureHistory`)
 //! меняется только после успешного submit, поэтому неотправленный кадр не помечает вид адаптированным.
-//! Композит читает адаптированное значение через binding 3 набора постобработки только в auto-режиме.
+//! Гистограмма считается по HDR цели сцены в render-разрешении до temporal resolve, поэтому FSR/DLSS
+//! получают экспозицию текущего кадра: усреднение пишет в буфер множитель `exp2(ev + adapted_ev)`,
+//! который копируется в 1×1 изображение экспозиции апскейлера. Композит читает адаптированное
+//! значение через binding 3 набора постобработки только в auto-режиме.
 
 use super::bloom::ensure_sampled;
 use super::post::{EXPOSURE_BINS, ExposureAverageParams, exposure_average_params};
@@ -24,8 +27,17 @@ const AVERAGE_SHADER: &[u8] =
 
 /// Размер гистограммы в байтах; очищается перед каждым кадром.
 const HISTOGRAM_BYTES: usize = EXPOSURE_BINS * size_of::<u32>();
-/// Буфер: гистограмма, адаптированный EV и три слова резерва (совпадает с шейдерами).
+/// Буфер: гистограмма, адаптированный EV, множитель экспозиции для апскейлеров и два слова
+/// резерва (совпадает с шейдерами).
 pub(crate) const EXPOSURE_BUFFER_SIZE: usize = HISTOGRAM_BYTES + 4 * size_of::<f32>();
+/// Смещение множителя `exp2(ev + adapted_ev)`; кратно 4, как требует копирование в R32_SFLOAT.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const EXPOSURE_SCALE_OFFSET: u64 = (HISTOGRAM_BYTES + size_of::<f32>()) as u64;
+/// Интервал между кадрами, после которого кадр считается паузой (свёрнутое окно, загрузка,
+/// модальный цикл resize), а не обычным шагом: адаптация берёт шаг предыдущего кадра.
+const MAX_ADAPTATION_STEP_MS: f32 = 250.0;
+/// Шаг, который запоминает snap-кадр после паузы: интервал простоя шагом не считается.
+const DEFAULT_ADAPTATION_STEP_MS: f32 = 1000.0 / 60.0;
 /// Размер workgroup histogram-прохода: 16x16 пикселей, 256 бинов на группу.
 const HISTOGRAM_GROUP_SIZE: u32 = 16;
 
@@ -63,7 +75,7 @@ impl ExposurePipelines {
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_constant_ranges);
-        // SAFETY: the set layout and the 32-byte compute range are valid for both shaders.
+        // SAFETY: the set layout and the ExposureAverageParams compute range are valid for both shaders.
         let layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
             Ok(layout) => layout,
             Err(error) => {
@@ -118,33 +130,75 @@ impl ExposurePipelines {
 }
 
 /// Состояние адаптации вида между кадрами. Меняется только после успешного submit кадра.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ExposureHistory {
-    /// Последний отправленный кадр вида адаптировал экспозицию; иначе следующий auto-кадр делает snap.
-    adapted: bool,
+    /// Последний отправленный кадр вида, если он адаптировал экспозицию; иначе следующий
+    /// auto-кадр делает snap.
+    last: Option<ExposureFrame>,
 }
 
 /// Решение адаптации для auto-кадра вида.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ExposureFrame {
     /// Адаптация стартует с текущей экспозиции, а не с прошлого значения буфера.
     pub(crate) snap: bool,
+    /// Render-разрешение кадра, по которому считается гистограмма.
+    extent: (u32, u32),
+    /// Шаг адаптации в миллисекундах.
+    pub(crate) delta_ms: f32,
 }
 
 impl ExposureHistory {
     /// Решение для кадра: `None`, если вид в ручном режиме и буфер не адаптируется.
     ///
     /// Snap происходит при явном `Frame::reset_history`, при первом адаптирующем кадре вида и
-    /// после ручного кадра. Изменение размера цели сюда не входит, поэтому адаптация его не сбрасывает.
-    pub(crate) fn plan_frame(self, auto: bool, explicit_reset: bool) -> Option<ExposureFrame> {
-        auto.then_some(ExposureFrame {
-            snap: explicit_reset || !self.adapted,
-        })
+    /// после ручного кадра. Resize и паузы адаптацию не сбрасывают и не ускоряют: если
+    /// render-разрешение изменилось или интервал `measured_delta_ms` длиннее
+    /// `MAX_ADAPTATION_STEP_MS`, кадр берёт шаг предыдущего адаптирующего кадра, чтобы время
+    /// простоя не превращалось в скачок экспозиции.
+    pub(crate) fn plan_frame(
+        self,
+        auto: bool,
+        explicit_reset: bool,
+        extent: (u32, u32),
+        measured_delta_ms: f32,
+    ) -> Option<ExposureFrame> {
+        if !auto {
+            return None;
+        }
+        let measured_delta_ms = measured_delta_ms.max(0.0);
+        let frame = match self.last {
+            // Snap-кадр после простоя не должен запомнить интервал паузы как шаг адаптации.
+            None => ExposureFrame {
+                snap: true,
+                extent,
+                delta_ms: if measured_delta_ms > MAX_ADAPTATION_STEP_MS {
+                    DEFAULT_ADAPTATION_STEP_MS
+                } else {
+                    measured_delta_ms
+                },
+            },
+            Some(last) => {
+                let interrupted =
+                    last.extent != extent || measured_delta_ms > MAX_ADAPTATION_STEP_MS;
+                ExposureFrame {
+                    snap: explicit_reset,
+                    extent,
+                    delta_ms: if interrupted {
+                        last.delta_ms
+                    } else {
+                        measured_delta_ms
+                    },
+                }
+            }
+        };
+        Some(frame)
     }
 
     /// Фиксирует отправленный кадр вида; вызывается только после успешного `queue_submit2`.
-    pub(crate) fn submitted(&mut self, auto: bool) {
-        self.adapted = auto;
+    /// `frame` — решение этого кадра, `None` для ручного кадра.
+    pub(crate) fn submitted(&mut self, frame: Option<ExposureFrame>) {
+        self.last = frame;
     }
 }
 
@@ -163,7 +217,10 @@ impl ExposureResources {
             instance,
             device,
             physical_device,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            // TRANSFER_SRC — копирование множителя в изображение экспозиции FSR/DLSS.
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC,
             EXPOSURE_BUFFER_SIZE,
         )?;
         Ok(Self { buffer })
@@ -179,6 +236,8 @@ pub(crate) struct ViewExposure {
 }
 
 /// Готовит экспозицию вида: создаёт его ресурсы при первом кадре и решает адаптацию.
+/// `render_extent` — разрешение HDR цели сцены, `measured_delta_ms` — интервал с прошлого кадра вида.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_view_exposure(
     instance: &ash::Instance,
     device: &ash::Device,
@@ -187,6 +246,8 @@ pub(crate) fn prepare_view_exposure(
     resources: &mut Option<ExposureResources>,
     auto: bool,
     explicit_reset: bool,
+    render_extent: vk::Extent2D,
+    measured_delta_ms: f32,
 ) -> Result<ViewExposure, RenderError> {
     if resources.is_none() {
         *resources = Some(ExposureResources::new(instance, device, physical_device)?);
@@ -198,7 +259,12 @@ pub(crate) fn prepare_view_exposure(
     };
     Ok(ViewExposure {
         buffer: resources.buffer.buffer,
-        adaptation: history.plan_frame(auto, explicit_reset),
+        adaptation: history.plan_frame(
+            auto,
+            explicit_reset,
+            (render_extent.width, render_extent.height),
+            measured_delta_ms,
+        ),
     })
 }
 
@@ -249,7 +315,6 @@ pub(crate) fn exposure_record(
     pipelines: Option<ExposurePipelines>,
     view: ViewExposure,
     post: &PostProcess,
-    frame_delta_ms: f32,
 ) -> Option<ExposureRecord> {
     let pipelines = pipelines?;
     let adaptation = view.adaptation?;
@@ -257,11 +322,12 @@ pub(crate) fn exposure_record(
         set: target.set,
         buffer: view.buffer,
         pipelines,
-        params: exposure_average_params(&post.exposure, frame_delta_ms, adaptation.snap),
+        params: exposure_average_params(&post.exposure, adaptation.delta_ms, adaptation.snap),
     })
 }
 
-/// Записывает гистограмму и адаптацию; после записи буфер готов для composite.
+/// Записывает гистограмму и адаптацию; после записи буфер готов для composite и bloom
+/// (fragment-чтение). Копирование множителя для апскейлера ставит собственный барьер.
 ///
 /// Вызывается только при успешной записи кадра; `ExposureHistory` обновляется после submit.
 pub(crate) fn record_exposure(
@@ -282,14 +348,19 @@ pub(crate) fn record_exposure(
     } = record;
     write_exposure_bindings(device, set, source.view, buffer);
     let set = [set];
-    // Предыдущий кадр вида мог писать буфер в compute и читать его в fragment-стадиях; барьер
-    // упорядочивает заполнение гистограммы после них (см. описание модуля).
+    // Предыдущий кадр вида мог писать буфер в compute, читать его в fragment-стадиях и копировать
+    // множитель в изображение экспозиции FSR/DLSS (transfer); барьер упорядочивает заполнение
+    // гистограммы и через цепочку барьеров запись усреднения после них (см. описание модуля).
     buffer_barrier(
         device,
         command_buffer,
         buffer,
-        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        vk::PipelineStageFlags2::COMPUTE_SHADER
+            | vk::PipelineStageFlags2::FRAGMENT_SHADER
+            | vk::PipelineStageFlags2::ALL_TRANSFER,
+        vk::AccessFlags2::SHADER_STORAGE_READ
+            | vk::AccessFlags2::SHADER_STORAGE_WRITE
+            | vk::AccessFlags2::TRANSFER_READ,
         vk::PipelineStageFlags2::ALL_TRANSFER,
         vk::AccessFlags2::TRANSFER_WRITE,
     );
@@ -339,7 +410,7 @@ pub(crate) fn record_exposure(
         vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
     );
     let push = params.to_bytes();
-    // SAFETY: the average pipeline uses the same layout and its 32-byte push range is written.
+    // SAFETY: the average pipeline uses the same layout and its push range is written in full.
     unsafe {
         device.cmd_bind_pipeline(
             command_buffer,
@@ -416,7 +487,7 @@ pub(crate) fn write_composite_exposure(
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
-fn buffer_barrier(
+pub(crate) fn buffer_barrier(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     buffer: vk::Buffer,
@@ -452,83 +523,127 @@ mod tests {
         assert_eq!(HISTOGRAM_BYTES, EXPOSURE_BUFFER_SIZE - 16);
     }
 
+    const EXTENT: (u32, u32) = (1280, 720);
+    const STEP_MS: f32 = 1000.0 / 60.0;
+
+    fn plan(
+        history: ExposureHistory,
+        reset: bool,
+        extent: (u32, u32),
+        delta: f32,
+    ) -> ExposureFrame {
+        history
+            .plan_frame(true, reset, extent, delta)
+            .expect("auto frame plans adaptation")
+    }
+
     /// Адаптирующий кадр, отправленный успешно: вид адаптирован.
-    fn submitted_auto(history: &mut ExposureHistory) {
-        assert!(history.plan_frame(true, false).is_some());
-        history.submitted(true);
+    fn submitted_auto(history: &mut ExposureHistory, extent: (u32, u32), delta: f32) {
+        let frame = plan(*history, false, extent, delta);
+        history.submitted(Some(frame));
+    }
+
+    #[test]
+    fn upscaler_scale_follows_adapted_value_and_is_texel_aligned() {
+        assert_eq!(EXPOSURE_SCALE_OFFSET, 1028);
+        assert_eq!(EXPOSURE_SCALE_OFFSET % 4, 0);
+        assert!(EXPOSURE_SCALE_OFFSET + 4 <= EXPOSURE_BUFFER_SIZE as u64);
     }
 
     #[test]
     fn first_auto_frame_of_view_snaps() {
-        let history = ExposureHistory::default();
-        let frame = history
-            .plan_frame(true, false)
-            .expect("auto frame plans adaptation");
+        let frame = plan(ExposureHistory::default(), false, EXTENT, STEP_MS);
         assert!(frame.snap);
+        assert_eq!(frame.delta_ms, STEP_MS);
     }
 
     #[test]
     fn manual_frame_does_not_plan_adaptation() {
         let mut history = ExposureHistory::default();
-        assert_eq!(history.plan_frame(false, false), None);
-        history.submitted(false);
-        assert_eq!(history.plan_frame(false, true), None);
+        assert_eq!(history.plan_frame(false, false, EXTENT, STEP_MS), None);
+        history.submitted(None);
+        assert_eq!(history.plan_frame(false, true, EXTENT, STEP_MS), None);
     }
 
     #[test]
-    fn next_auto_frame_adapts_from_previous_value_without_snap() {
+    fn next_auto_frame_adapts_from_previous_value_with_measured_step() {
         let mut history = ExposureHistory::default();
-        submitted_auto(&mut history);
-        let frame = history
-            .plan_frame(true, false)
-            .expect("auto frame plans adaptation");
+        submitted_auto(&mut history, EXTENT, STEP_MS);
+        let frame = plan(history, false, EXTENT, 33.0);
         assert!(!frame.snap);
+        assert_eq!(frame.delta_ms, 33.0);
     }
 
     #[test]
     fn explicit_reset_snaps_even_after_adaptation() {
         let mut history = ExposureHistory::default();
-        submitted_auto(&mut history);
-        let frame = history
-            .plan_frame(true, true)
-            .expect("auto frame plans adaptation");
-        assert!(frame.snap);
+        submitted_auto(&mut history, EXTENT, STEP_MS);
+        assert!(plan(history, true, EXTENT, STEP_MS).snap);
     }
 
     #[test]
     fn switching_from_manual_to_auto_snaps() {
         let mut history = ExposureHistory::default();
-        submitted_auto(&mut history);
-        history.submitted(false);
-        let frame = history
-            .plan_frame(true, false)
-            .expect("auto frame plans adaptation");
-        assert!(frame.snap);
+        submitted_auto(&mut history, EXTENT, STEP_MS);
+        history.submitted(None);
+        assert!(plan(history, false, EXTENT, STEP_MS).snap);
     }
 
     #[test]
     fn failed_submit_keeps_view_unadapted_so_next_frame_snaps() {
         let history = ExposureHistory::default();
         // Кадр спланирован, но submit не выполнен: commit не вызывается.
-        let planned = history
-            .plan_frame(true, false)
-            .expect("auto frame plans adaptation");
-        assert!(planned.snap);
-        let retried = history
-            .plan_frame(true, false)
-            .expect("auto frame plans adaptation");
-        assert!(retried.snap);
+        assert!(plan(history, false, EXTENT, STEP_MS).snap);
+        assert!(plan(history, false, EXTENT, STEP_MS).snap);
     }
 
     #[test]
-    fn resize_does_not_reset_adaptation_because_it_is_not_an_input() {
-        // Пересоздание цели не передаёт сюда ничего: без явного reset адаптация продолжается.
+    fn resize_continues_adaptation_with_previous_step_instead_of_the_stall() {
+        // Регрессия: после resize первый кадр получал интервал простоя (до 1 с) и почти целиком
+        // прыгал к новой цели. Теперь адаптация продолжается без snap и с прежним шагом.
         let mut history = ExposureHistory::default();
-        submitted_auto(&mut history);
-        submitted_auto(&mut history);
-        let frame = history
-            .plan_frame(true, false)
-            .expect("auto frame plans adaptation");
-        assert!(!frame.snap);
+        submitted_auto(&mut history, EXTENT, STEP_MS);
+        submitted_auto(&mut history, EXTENT, STEP_MS);
+        let resized = plan(history, false, (1920, 1080), 1000.0);
+        assert!(!resized.snap);
+        assert_eq!(resized.delta_ms, STEP_MS);
+        history.submitted(Some(resized));
+        let next = plan(history, false, (1920, 1080), 20.0);
+        assert_eq!(next.delta_ms, 20.0);
+    }
+
+    #[test]
+    fn resize_with_a_normal_interval_still_uses_previous_step() {
+        let mut history = ExposureHistory::default();
+        submitted_auto(&mut history, EXTENT, STEP_MS);
+        let resized = plan(history, false, (640, 360), 40.0);
+        assert!(!resized.snap);
+        assert_eq!(resized.delta_ms, STEP_MS);
+    }
+
+    #[test]
+    fn pause_longer_than_the_limit_uses_previous_step() {
+        let mut history = ExposureHistory::default();
+        submitted_auto(&mut history, EXTENT, 20.0);
+        assert_eq!(
+            plan(history, false, EXTENT, MAX_ADAPTATION_STEP_MS).delta_ms,
+            MAX_ADAPTATION_STEP_MS
+        );
+        assert_eq!(plan(history, false, EXTENT, 900.0).delta_ms, 20.0);
+    }
+
+    #[test]
+    fn snap_after_a_pause_does_not_store_the_pause_as_the_step() {
+        // Ручной режим → auto после простоя: следующий прерванный кадр не должен прыгнуть.
+        let mut history = ExposureHistory::default();
+        let snap = plan(history, false, EXTENT, 1000.0);
+        assert!(snap.snap);
+        assert_eq!(snap.delta_ms, DEFAULT_ADAPTATION_STEP_MS);
+        history.submitted(Some(snap));
+        assert_eq!(
+            plan(history, false, (640, 360), 900.0).delta_ms,
+            DEFAULT_ADAPTATION_STEP_MS
+        );
+        assert_eq!(plan(history, false, EXTENT, 40.0).delta_ms, 40.0);
     }
 }

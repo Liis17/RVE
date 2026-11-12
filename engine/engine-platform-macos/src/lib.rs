@@ -46,6 +46,16 @@ fn user_data_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<P
     })
 }
 
+/// Makes the process ignore Ctrl+C (`SIGINT`) from its terminal, so the engine is not closed by
+/// it. The disposition is inherited by child processes. Other signals keep their defaults.
+pub fn ignore_console_interrupt() -> std::io::Result<()> {
+    // SAFETY: installing SIG_IGN for SIGINT runs no handler code and is async-signal-safe.
+    if unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) } == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Atomically replaces a file with POSIX rename semantics.
 pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
@@ -186,6 +196,21 @@ mod tests {
     const VULKAN_CHILD_MODE: &str = "RVE_PLATFORM_VULKAN_TEST_MODE";
     const VULKAN_EXE_DIR: &str = "RVE_PLATFORM_VULKAN_TEST_EXE_DIR";
     static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn ctrl_c_is_ignored_after_ignore_console_interrupt() {
+        ignore_console_interrupt().unwrap();
+        // SAFETY: an all-zero sigaction is a valid output buffer; a null new action only queries.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) },
+            0
+        );
+        assert_eq!(current.sa_sigaction, libc::SIG_IGN);
+        // Without the change this signal would terminate the test process.
+        // SAFETY: raising SIGINT only delivers the now ignored signal to this process.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+    }
 
     #[test]
     fn moltenvk_requires_portability_enumeration_and_subset() {

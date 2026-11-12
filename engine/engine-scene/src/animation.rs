@@ -114,13 +114,6 @@ pub(crate) fn validate_animator(
             "animator требует mesh_renderer",
         ));
     }
-    if object.lod_group.is_some() {
-        return Err(SceneError::new(
-            source,
-            Some(id),
-            "animator несовместим с lod_group: LOD для skinned-мешей не поддерживается",
-        ));
-    }
     validate_animator_fields(source, id, asset_paths, animator)
 }
 
@@ -401,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn animator_needs_mesh_renderer_and_no_lod_group() {
+    fn animator_needs_mesh_renderer_and_accepts_lod_group() {
         let without_mesh =
             format!("{ASSETS}{CAMERA}[[objects]]\nid = \"hero\"\n[objects.animator]\n");
         let message = parse(&without_mesh).unwrap_err().to_string();
@@ -411,8 +404,13 @@ mod tests {
             "{}[objects.lod_group]\n[[objects.lod_group.levels]]\nmodel = \"/models/hero.fbx\"\ndistance = 10.0\n",
             source("")
         );
-        let message = parse(&with_lod).unwrap_err().to_string();
-        assert!(message.contains("lod_group"), "{message}");
+        let document = parse(&with_lod).unwrap();
+        let hero = document
+            .objects
+            .iter()
+            .find(|object| object.id == "hero")
+            .unwrap();
+        assert!(hero.animator.is_some() && hero.lod_group.is_some());
     }
 
     #[test]

@@ -309,3 +309,80 @@ return Script
                 && event.message.contains("нельзя задать одновременно")),
     );
 }
+
+#[test]
+fn fades_streaming_and_group_effects_reach_the_audio_requests() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  local voice = rve.audio.play("/audio/hum.wav", {stream = true, fade_in = 1.5})
+  rve.audio.stop(voice, 2)
+  rve.find("player"):stop_sound(0.5)
+  rve.audio.set_group_effects("music", {lowpass = 800, highpass = 60, reverb = {room_size = 0.8, wet = 0.4}})
+  rve.audio.set_group_effects("master")
+end
+return Script
+"#,
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    let requests = host.drain_audio_requests();
+    assert_eq!(requests.len(), 5, "{requests:?}");
+    assert!(matches!(
+        &requests[0],
+        AudioRequest::PlayClip { params, .. } if params.stream && params.fade_in == 1.5
+    ));
+    assert!(matches!(requests[1], AudioRequest::StopVoice { fade, .. } if fade == 2.0));
+    assert!(matches!(requests[2], AudioRequest::StopSource { fade, .. } if fade == 0.5));
+    match requests[3] {
+        AudioRequest::SetGroupEffects {
+            group: AudioGroup::Music,
+            effects,
+        } => {
+            assert_eq!((effects.lowpass_hz, effects.highpass_hz), (800.0, 60.0));
+            let reverb = effects.reverb.expect("reverb задан");
+            assert_eq!(
+                (reverb.room_size, reverb.damping, reverb.wet),
+                (0.8, 0.5, 0.4)
+            );
+        }
+        ref other => panic!("ожидался SetGroupEffects: {other:?}"),
+    }
+    assert!(matches!(
+        requests[4],
+        AudioRequest::SetGroupEffects {
+            group: AudioGroup::Master,
+            effects,
+        } if effects == engine_scene::AudioGroupEffects::default()
+    ));
+}
+
+#[test]
+fn invalid_fades_and_group_effects_are_script_errors_and_queue_nothing() {
+    for call in [
+        "rve.audio.stop(1, -1)",
+        "rve.audio.stop(1, 61)",
+        "rve.find(\"player\"):stop_sound(\"slow\")",
+        "rve.audio.play(\"/audio/hum.wav\", {fade_in = 100})",
+        "rve.audio.set_group_effects(\"music\", {lowpass = 5})",
+        "rve.audio.set_group_effects(\"music\", {reverb = {wet = 2}})",
+        "rve.audio.set_group_effects(\"music\", {echo = 1})",
+    ] {
+        let (mut world, mut host) = load(&format!(
+            "local Script = {{}}\nfunction Script:on_update()\n  {call}\nend\nreturn Script\n"
+        ));
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+        assert!(host.drain_audio_requests().is_empty(), "{call}");
+        assert!(
+            host.drain_events()
+                .iter()
+                .any(|event| event.level == ScriptEventLevel::Error),
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn sdk_and_scene_agree_on_the_fade_cap() {
+    assert_eq!(rve_sdk::MAX_AUDIO_FADE, engine_scene::MAX_AUDIO_FADE);
+}

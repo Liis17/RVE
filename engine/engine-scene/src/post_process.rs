@@ -5,12 +5,13 @@
 //! tonemapper). Значения по умолчанию соответствуют прежнему поведению цветового пути камеры.
 
 use crate::camera_settings::{CameraColorSettings, CameraSettings, Tonemapper};
+use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 
 /// Полный набор постобработки одной камеры.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PostProcessSettings {
     pub exposure: ExposureSettings,
@@ -104,7 +105,7 @@ impl PostProcessSettings {
             "ambient_occlusion.intensity должен быть в [0, 4], falloff — в [0, 1]",
         )?;
 
-        let grading = self.color_grading;
+        let grading = &self.color_grading;
         check(
             finite_in(grading.temperature, -1.0, 1.0) && finite_in(grading.tint, -1.0, 1.0),
             "color_grading.temperature и color_grading.tint должны находиться в [-1, 1]",
@@ -133,6 +134,17 @@ impl PostProcessSettings {
                 .into_iter()
                 .all(|value| finite_in(value, 0.0, 4.0)),
             "color_grading.gain должен содержать компоненты в [0, 4]",
+        )?;
+        check(
+            finite_in(grading.lut_intensity, 0.0, 1.0),
+            "color_grading.lut_intensity должен находиться в [0, 1]",
+        )?;
+        check(
+            grading
+                .lut
+                .as_deref()
+                .is_none_or(|path| VirtualPath::parse(path).is_ok() && path.ends_with(".cube")),
+            "color_grading.lut должен быть путём к файлу .cube",
         )?;
 
         let vignette = self.vignette;
@@ -315,8 +327,8 @@ pub enum AmbientOcclusionQuality {
     High,
 }
 
-/// Цветокоррекция в linear HDR до tonemapping.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Цветокоррекция в linear HDR до tonemapping, lift/gamma/gain после него и 3D LUT в конце.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ColorGradingSettings {
     pub enabled: bool,
@@ -327,6 +339,21 @@ pub struct ColorGradingSettings {
     pub lift: [f32; 3],
     pub gamma: [f32; 3],
     pub gain: [f32; 3],
+    /// Путь к 3D LUT `.cube` (см. `color_lut`); LUT применяется после lift/gamma/gain.
+    /// Это зависимость файла `.postprocess`, а не ассет сцены: объявлять её в `[[assets]]` не нужно.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lut: Option<String>,
+    /// Доля LUT в `[0, 1]`.
+    pub lut_intensity: f32,
+}
+
+impl ColorGradingSettings {
+    /// Путь LUT в каноническом виде; `None`, если LUT не задана или путь некорректен.
+    pub fn lut_path(&self) -> Option<VirtualPath> {
+        self.lut
+            .as_deref()
+            .and_then(|path| VirtualPath::parse(path).ok())
+    }
 }
 
 impl Default for ColorGradingSettings {
@@ -340,6 +367,8 @@ impl Default for ColorGradingSettings {
             lift: [0.0; 3],
             gamma: [1.0; 3],
             gain: [1.0; 3],
+            lut: None,
+            lut_intensity: 1.0,
         }
     }
 }
@@ -460,7 +489,7 @@ pub fn resolve_post_process(
     post_file: Option<&PostProcessSettings>,
 ) -> PostProcessSettings {
     if let Some(file) = post_file {
-        return *file;
+        return file.clone();
     }
     let mut settings = PostProcessSettings::default();
     if let Some(color) = camera.color {
@@ -518,6 +547,49 @@ impl Error for PostProcessError {}
 mod tests {
     use super::*;
     use crate::camera_settings::CameraSettings;
+
+    #[test]
+    fn color_grading_lut_parses_round_trips_and_is_omitted_when_absent() {
+        let source =
+            "[color_grading]\nenabled = true\nlut = \"/luts/film.cube\"\nlut_intensity = 0.5\n";
+        let settings = PostProcessSettings::parse("graded.postprocess", source).unwrap();
+        assert_eq!(
+            settings.color_grading.lut.as_deref(),
+            Some("/luts/film.cube")
+        );
+        assert_eq!(settings.color_grading.lut_intensity, 0.5);
+        assert_eq!(
+            settings.color_grading.lut_path().unwrap().as_str(),
+            "luts/film.cube"
+        );
+        let written = settings.to_toml().unwrap();
+        assert_eq!(
+            PostProcessSettings::parse("graded.postprocess", &written).unwrap(),
+            settings
+        );
+        let defaults = PostProcessSettings::default().to_toml().unwrap();
+        assert!(!defaults.contains("lut ="), "{defaults}");
+        assert_eq!(
+            PostProcessSettings::default().color_grading.lut_intensity,
+            1.0
+        );
+    }
+
+    #[test]
+    fn color_grading_lut_requires_a_cube_path_and_unit_intensity() {
+        for lut in ["/luts/film.png", "/luts/film.CUBE", "/../film.cube", ""] {
+            let source = format!("[color_grading]\nlut = \"{lut}\"\n");
+            let error = PostProcessSettings::parse("bad.postprocess", &source).unwrap_err();
+            assert!(
+                error.message.contains("color_grading.lut"),
+                "{lut}: {error}"
+            );
+        }
+        for intensity in ["-0.1", "1.5"] {
+            let source = format!("[color_grading]\nlut_intensity = {intensity}\n");
+            assert!(PostProcessSettings::parse("bad.postprocess", &source).is_err());
+        }
+    }
 
     #[test]
     fn empty_file_matches_defaults_and_defaults_keep_effects_off() {

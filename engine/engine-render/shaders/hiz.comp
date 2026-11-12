@@ -1,0 +1,29 @@
+#version 450
+
+// Один уровень Hi-Z пирамиды: каждый texel хранит максимум (самую дальнюю глубину) блока 2x2
+// источника. Нулевой уровень — половина степени двойки, покрывающей depth; чтение за краем
+// источника зажимается к последнему пикселю, поэтому покрытие остаётся консервативным.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D source_image;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D destination_image;
+
+layout(push_constant) uniform PushConstants {
+    // x, y — размер источника; z, w — размер приёмника.
+    ivec4 sizes;
+} push_constants;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= push_constants.sizes.z || pixel.y >= push_constants.sizes.w) {
+        return;
+    }
+    ivec2 last = push_constants.sizes.xy - ivec2(1);
+    ivec2 base = pixel * 2;
+    float d0 = texelFetch(source_image, min(base, last), 0).r;
+    float d1 = texelFetch(source_image, min(base + ivec2(1, 0), last), 0).r;
+    float d2 = texelFetch(source_image, min(base + ivec2(0, 1), last), 0).r;
+    float d3 = texelFetch(source_image, min(base + ivec2(1, 1), last), 0).r;
+    imageStore(destination_image, pixel, vec4(max(max(d0, d1), max(d2, d3)), 0.0, 0.0, 0.0));
+}

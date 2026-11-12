@@ -87,6 +87,7 @@ use rve_sdk::abi::{
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) struct AbiCallContext<'a> {
     self_object: u64,
@@ -118,6 +119,8 @@ pub(crate) struct AbiScriptCall<'a> {
     pub(crate) commands_generation: &'a CommandGeneration,
     pub(crate) command_owner: usize,
     pub(crate) commands_allowed: bool,
+    /// Флаг прерывания Rust-скриптов, см. [`crate::ScriptInterruptHandle::interrupt`].
+    pub(crate) interrupt: &'a AtomicBool,
 }
 
 pub(crate) struct AbiCommandAccess<'a> {
@@ -426,6 +429,13 @@ impl<'a> AbiCallContext<'a> {
             window_screenshot: Some(host_window_screenshot),
             file_dialog_open: Some(host_file_dialog_open),
             file_dialog_poll: Some(host_file_dialog_poll),
+            interrupt: std::ptr::null(),
+            audio_stop_source_fade: Some(components::host_audio_stop_source_fade),
+            audio_stop_voice_fade: Some(components::host_audio_stop_voice_fade),
+            audio_set_group_effects: Some(components::host_audio_set_group_effects),
+            audio_play_clip_playback: Some(components::host_audio_play_clip_playback),
+            audio_get_source_playback: Some(components::host_audio_get_source_playback),
+            audio_set_source_playback: Some(components::host_audio_set_source_playback),
         }
     }
 
@@ -495,7 +505,7 @@ impl AbiScriptInstance {
             AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
         let mut instance = std::ptr::null_mut();
         let status = {
-            let host = context.host(ScriptTime::default());
+            let host = with_interrupt(context.host(ScriptTime::default()), call.interrupt);
             // SAFETY: callback context and borrowed parameters remain live through create.
             unsafe { (descriptor.create)(&host, &params.abi, &mut instance) }
         };
@@ -553,7 +563,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: this instance came from its matching descriptor's successful create call.
             unsafe {
                 match phase {
@@ -613,7 +623,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: the value, name, instance, and host remain live throughout the callback.
             unsafe { set_property(self.instance, &host, name, &value.value, phase) }
         };
@@ -646,7 +656,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: message data, instance, and host remain live throughout the callback.
             unsafe { (self.descriptor.message)(self.instance, &host, sender, name, &value.value) }
         };
@@ -710,7 +720,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             let value = value
                 .as_ref()
                 .map_or(std::ptr::null(), |value| &value.value as *const RveValue);
@@ -757,7 +767,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             let ui_event = RveUiEvent {
                 kind: ui_event_code(event.kind),
                 canvas: canvas_to_abi(event.canvas),
@@ -795,7 +805,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: the tag, instance, and host remain live throughout the callback.
             unsafe { callback(self.instance, &host, RveStr::from_str_ref(tag)) }
         };
@@ -834,7 +844,7 @@ impl AbiScriptInstance {
             normal,
         };
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: the event, instance, and host remain live throughout the callback.
             unsafe { callback(self.instance, &host, event) }
         };
@@ -866,7 +876,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: name and arguments are borrowed for the duration of the synchronous callback.
             unsafe {
                 callback(
@@ -913,6 +923,15 @@ pub(crate) enum AbiPhase {
     FixedUpdate(f32),
     LateUpdate(f32),
     Destroy,
+}
+
+/// Сбрасывает прошлую просьбу прервать Rust-скрипт и передаёт гостю флаг текущего вызова (ABI
+/// v25). Просьба, пришедшая до этого вызова, относилась к уже завершившемуся коду: например,
+/// к зависшему Lua.
+fn with_interrupt(mut host: RveHost, interrupt: &AtomicBool) -> RveHost {
+    interrupt.store(false, Ordering::Release);
+    host.interrupt = interrupt;
+    host
 }
 
 fn guarded<T: Copy>(
@@ -1887,7 +1906,10 @@ unsafe extern "C" fn host_audio_play_source(ctx: *mut c_void, object: u64) -> u3
 unsafe extern "C" fn host_audio_stop_source(ctx: *mut c_void, object: u64) -> u32 {
     guarded(ctx, RveStatus::Error as u32, |context| {
         audio_source_call(context, object, "stop_sound", |transaction, handle| {
-            transaction.stage_audio(AudioRequest::StopSource { object: handle })
+            transaction.stage_audio(AudioRequest::StopSource {
+                object: handle,
+                fade: 0.0,
+            })
         })
     })
 }
@@ -1958,7 +1980,7 @@ unsafe extern "C" fn host_audio_stop_voice(ctx: *mut c_void, voice: u64) -> u32 
             .and_then(|voice| {
                 context
                     .transaction
-                    .stage_audio(AudioRequest::StopVoice { voice })
+                    .stage_audio(AudioRequest::StopVoice { voice, fade: 0.0 })
             });
         audio_result(context, result)
     })
@@ -5337,6 +5359,61 @@ mod tests {
         }
         drop(context);
         assert!(transaction.post_process(world.active_camera()).is_some());
+    }
+
+    #[test]
+    fn abi_post_process_write_keeps_the_camera_lut_that_the_abi_does_not_carry() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let camera = world.active_camera();
+        let mut file_post = PostProcessSettings::default();
+        file_post.color_grading.lut = Some("/luts/film.cube".to_owned());
+        file_post.color_grading.lut_intensity = 0.4;
+        world.set_post_process(camera, file_post).unwrap();
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: Some(camera),
+            source: "scene/camera/Probe",
+            writable: true,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            queued_audio: 0,
+            queued_animation: 0,
+            queued_rumble: 0,
+            net: Default::default(),
+            queued_net: 0,
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+            lifecycle: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::lifecycle::Lifecycle::default(),
+            )),
+            lifecycle_writes: true,
+            instance_serial: 0,
+            instance_enabled: true,
+            cursor: ScriptCursor::default(),
+        });
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+        let host = context.host(ScriptTime::default());
+        let set_post = host.set_post_process.unwrap();
+        let mut updated = post_process_to_abi(PostProcessSettings::default());
+        updated.bloom_enabled = 1;
+        // SAFETY: the post process pointer remains live through the call.
+        unsafe { assert!(set_post(host.ctx, 1, &updated)) };
+        drop(context);
+        let queued = transaction.post_process(camera).unwrap();
+        assert!(queued.bloom.enabled);
+        assert_eq!(queued.color_grading.lut.as_deref(), Some("/luts/film.cube"));
+        assert_eq!(queued.color_grading.lut_intensity, 0.4);
     }
 
     #[test]

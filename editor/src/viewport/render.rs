@@ -8,9 +8,10 @@ use crate::state::MaterialPreviewPrimitive;
 use crate::viewport::animation::{
     AnimationPreview, EditorAnimation, PreviewStatus, project_preview_bridge,
 };
+use crate::viewport::image_loader::{DecodedImage, ImageKind, ImageLoader};
 use crate::viewport::model_loader::ModelLoader;
-use engine_animation::AnimationBridge;
-use engine_assets::{Assets, Model, ModelAlphaMode};
+use engine_animation::{AnimationBridge, PaletteRemap};
+use engine_assets::{Assets, Model, ModelAlphaMode, ModelSkeleton};
 use engine_files::VirtualPath;
 use engine_render::AlphaMode;
 use engine_render::{
@@ -24,9 +25,9 @@ use engine_render::{
     Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_render::{
-    SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage, ScreenShaders,
+    ColorLutId, SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage,
+    ScreenShaders,
 };
-use engine_scene::PostProcessSettings;
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
 use engine_scene::light::{
@@ -35,11 +36,12 @@ use engine_scene::light::{
 use engine_scene::world::ObjectHandle;
 use engine_scene::world::ParticleCommand;
 use engine_scene::{
-    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, MaterialAlphaMode,
-    MaterialAsset, MeshInstance, ParticleBlendMode, ParticleEmitterComponent,
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, LodSelector,
+    MaterialAlphaMode, MaterialAsset, MeshInstance, ParticleBlendMode, ParticleEmitterComponent,
     ParticleShapeComponent, ResolvedMaterialAsset, SceneFrame, ShaderAsset, ShaderColorSpace,
     ShaderPropertyKind, Tonemapper, World,
 };
+use engine_scene::{CubeLut, PostProcessSettings};
 use engine_scene::{ScreenShaderRef, ScreenShaderStage as ScreenShaderStageDoc};
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -57,6 +59,8 @@ struct GpuModel {
     skinned: bool,
     /// Число костей скелета; палитра моста должна иметь такую же длину.
     joint_count: u32,
+    /// Скелет модели: по нему палитра уровня 0 переводится на модель уровня LOD.
+    skeleton: Option<ModelSkeleton>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -92,7 +96,25 @@ struct SkinnedObject<M = MeshId, S = SkinId> {
     joint_count: u32,
     mesh_ids: Vec<M>,
     instances: Vec<S>,
+    /// Уровни LOD: элемент `i` относится к уровню `i + 1`; `None` — модель уровня без скелета
+    /// или не загружена.
+    lods: Vec<Option<LodSkin<M, S>>>,
 }
+
+/// Скиннинг уровня LOD: экземпляры его частей и перевод палитры уровня 0 на скелет уровня.
+/// Без перевода (кости не совпали) экземпляров нет и уровень рисуется в bind pose.
+struct LodSkin<M = MeshId, S = SkinId> {
+    model: String,
+    mesh_ids: Vec<M>,
+    instances: Vec<S>,
+    remap: Option<Arc<PaletteRemap>>,
+}
+
+/// Модель, меши и перевод палитры уровня LOD для создания его экземпляров skinning.
+type NewLodSkin = (String, Vec<MeshId>, Option<Arc<PaletteRemap>>);
+
+/// Желаемые модель и меши уровня 0 и уровней LOD объекта с аниматором.
+type WantedSkin<M> = (String, Vec<M>, Vec<Option<(String, Vec<M>)>>);
 
 /// GPU-ресурсы вьюпорта. Модели и текстуры кэшируются по virtual path; ошибка загрузки
 /// запоминается и пишется в консоль один раз, пока кэш не будет сброшен.
@@ -103,6 +125,9 @@ pub struct SceneRenderer {
     screen_shaders: HashMap<String, EditorScreenShader>,
     /// Начало отсчёта времени для экранных шейдеров (`rve.time`).
     screen_shader_started: Instant,
+    /// LUT цветокоррекции по каноническому пути `.cube`; `None` — LUT не загрузилась (ошибка уже в
+    /// консоли), камера рисуется без неё.
+    color_luts: HashMap<String, Option<ColorLutId>>,
     pub material_preview_viewport: Option<ViewportId>,
     models: HashMap<String, Option<GpuModel>>,
     model_dependencies: HashMap<String, Vec<VirtualPath>>,
@@ -127,6 +152,11 @@ pub struct SceneRenderer {
     reported_material_errors: HashSet<String>,
     reported_material_warnings: HashSet<String>,
     environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
+    /// Фоновое декодирование PNG и HDR и корень проекта, для которого оно запущено.
+    images: ImageLoader,
+    images_root: Option<std::path::PathBuf>,
+    /// Цветовые пространства, в которых ждут декодирования PNG по пути.
+    texture_wants: HashMap<String, HashSet<TextureColorSpace>>,
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
     failed_environment: Option<EditorEnvironmentKey>,
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
@@ -142,6 +172,12 @@ pub struct SceneRenderer {
     motion_history: MotionHistory,
     /// Скиннинг аниматоров сцены по объектам.
     skins: HashMap<ObjectHandle, SkinnedObject>,
+    /// Палитры уровней LOD кадра; в `joint_palette_refs` идут после палитр моста.
+    lod_palettes: Vec<Vec<[[f32; 4]; 4]>>,
+    /// История выбора LOD панелей Scene, Game и камеры захвата для гистерезиса.
+    scene_lod: LodSelector,
+    game_lod: LodSelector,
+    capture_lod: LodSelector,
     /// Мост редактора для превью и отпечаток его аниматоров.
     animation: EditorAnimation,
     /// Счётчик загрузок моделей и сбросов кэша; по нему заново читаются файлы клипов.
@@ -332,6 +368,9 @@ impl SceneRenderer {
             failed_reloads: HashSet::new(),
             model_versions: HashMap::new(),
             textures: HashMap::new(),
+            images: ImageLoader::default(),
+            images_root: None,
+            texture_wants: HashMap::new(),
             texture_revisions: HashMap::new(),
             next_texture_revision: 0,
             asset_materials: HashMap::new(),
@@ -354,6 +393,7 @@ impl SceneRenderer {
             particles_playing: None,
             screen_shaders: HashMap::new(),
             screen_shader_started: Instant::now(),
+            color_luts: HashMap::new(),
             playing: false,
             environment_sources: HashMap::new(),
             current_environment: None,
@@ -368,6 +408,10 @@ impl SceneRenderer {
             capture_draws: Vec::new(),
             motion_history: MotionHistory::default(),
             skins: HashMap::new(),
+            lod_palettes: Vec::new(),
+            scene_lod: LodSelector::default(),
+            game_lod: LodSelector::default(),
+            capture_lod: LodSelector::default(),
             animation: EditorAnimation::default(),
             model_generation: 0,
             skin_mismatch_reported: HashSet::new(),
@@ -387,6 +431,8 @@ impl SceneRenderer {
             renderer.destroy_environment(environment)?;
         }
         self.environment_sources.clear();
+        self.images_root = None;
+        self.texture_wants.clear();
         self.model_dependencies.clear();
         self.failed_reloads.clear();
         self.failed_environment = None;
@@ -429,6 +475,9 @@ impl SceneRenderer {
         {
             renderer.destroy_screen_shader(shader)?;
         }
+        for lut in self.color_luts.drain().filter_map(|(_, lut)| lut) {
+            renderer.destroy_color_lut(lut)?;
+        }
         for mesh in self.preview_meshes.drain().map(|(_, mesh)| mesh) {
             renderer.destroy_mesh(mesh)?;
         }
@@ -453,6 +502,7 @@ impl SceneRenderer {
         log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
         let mut active_environments = HashSet::new();
+        self.accept_images(renderer, project, log)?;
         let finished = loader.finished();
         if !finished.is_empty() {
             // Экземпляры ссылаются на меши, которые сейчас могут быть заменены: освобождаем их заранее.
@@ -540,19 +590,11 @@ impl SceneRenderer {
             {
                 let path = path.as_str();
                 active_environments.insert(path.to_owned());
-                if !self.environment_sources.contains_key(path) {
-                    let source = match project.assets.load_hdr(path) {
-                        Ok(image) => Some(Arc::new(EnvironmentSource::Equirect {
-                            width: image.width,
-                            height: image.height,
-                            rgb: image.rgb,
-                        })),
-                        Err(error) => {
-                            log.error(format!("{path}: {error}"));
-                            None
-                        }
-                    };
-                    self.environment_sources.insert(path.to_owned(), source);
+                if !self.environment_sources.contains_key(path)
+                    && !self.images.request(ImageKind::Hdr, path)
+                {
+                    log.error(format!("{path}: фоновая загрузка недоступна"));
+                    self.environment_sources.insert(path.to_owned(), None);
                 }
             }
             let Some(mesh) = &object.mesh_renderer else {
@@ -654,6 +696,35 @@ impl SceneRenderer {
         }
     }
 
+    /// Создаёт LUT цветокоррекции постобработки, если её ещё нет в кэше. Ошибка пишется в консоль
+    /// один раз и не мешает кадру: камера рисуется без LUT, пока файл не изменится.
+    pub fn sync_color_lut(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        post: &PostProcessSettings,
+        log: &mut ConsoleLog,
+    ) {
+        let Some(path) = post.color_grading.lut_path() else {
+            return;
+        };
+        if self.color_luts.contains_key(path.as_str()) {
+            return;
+        }
+        let lut = match load_color_lut(renderer, project, path.as_str()) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                log.error(format!("LUT цветокоррекции: {error}"));
+                None
+            }
+        };
+        self.color_luts.insert(path.as_str().to_owned(), lut);
+    }
+
+    fn color_lut(&self, post: &PostProcessSettings) -> Option<ColorLutId> {
+        cached_color_lut(&self.color_luts, post)
+    }
+
     /// Экранные шейдеры вида. Scene-вид их не применяет: искажения мешали бы редактированию.
     fn screen_shader_view(&self, screens: &[ScreenShaderRef], with_grid: bool) -> ScreenShaders {
         let mut view = ScreenShaders {
@@ -727,54 +798,11 @@ impl SceneRenderer {
             .cloned()
             .collect::<Vec<_>>();
         for (path, color_space) in texture_keys {
-            let key = (path.clone(), color_space);
-            let previous = self.textures.get(&key).copied().flatten();
-            let had_previous = previous.is_some();
-            match project.assets.load_texture(&path) {
-                Ok(data) => {
-                    let replacement = match renderer.create_texture_with_color_space(
-                        data.width,
-                        data.height,
-                        &data.rgba,
-                        color_space,
-                    ) {
-                        Ok(replacement) => replacement,
-                        Err(error) if is_resource_error(&error) => {
-                            let (current, _, error) =
-                                cache_update(previous, Err(error.to_string()));
-                            self.textures.insert(key, current);
-                            if let Some(error) = error {
-                                let message = if had_previous {
-                                    format!("{path}: {error}; сохранена прежняя версия текстуры")
-                                } else {
-                                    format!("{path}: {error}")
-                                };
-                                log.error(message);
-                            }
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let (current, old, _) = cache_update(previous, Ok(replacement));
-                    self.textures.insert(key, current);
-                    self.bump_texture_revision((path.clone(), color_space));
-                    if let Some(old) = old {
-                        renderer.destroy_texture(old)?;
-                    }
-                }
-                Err(error) => {
-                    let (current, _, error) = cache_update(previous, Err(error.to_string()));
-                    self.textures.insert(key, current);
-                    if let Some(error) = error {
-                        let message = if had_previous {
-                            format!("{path}: {error}; сохранена прежняя версия текстуры")
-                        } else {
-                            format!("{path}: {error}")
-                        };
-                        log.error(message);
-                    }
-                }
-            }
+            self.texture_wants
+                .entry(path.clone())
+                .or_default()
+                .insert(color_space);
+            self.images.reload(ImageKind::Texture, &path);
         }
 
         // Изменённый `.glsl` (при rescan — все кэшированные) перекомпилируется; ошибка оставляет
@@ -805,6 +833,28 @@ impl SceneRenderer {
             }
         }
 
+        // Изменённая `.cube` пересоздаётся; ошибка оставляет прежнюю LUT.
+        let changed_luts = self
+            .color_luts
+            .keys()
+            .filter(|path| key_matches_changes(changes, path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in changed_luts {
+            match load_color_lut(renderer, project, &path) {
+                Ok(id) => {
+                    if let Some(previous) = self.color_luts.insert(path, Some(id)).flatten() {
+                        renderer.destroy_color_lut(previous)?;
+                    }
+                }
+                Err(error) => {
+                    log.error(format!(
+                        "LUT цветокоррекции: {error}; сохранена прежняя версия"
+                    ));
+                }
+            }
+        }
+
         let environment_paths = self
             .environment_sources
             .keys()
@@ -820,77 +870,7 @@ impl SceneRenderer {
             .cloned()
             .collect::<Vec<_>>();
         for path in environment_paths {
-            let previous = self.environment_sources.get(&path).cloned().flatten();
-            let had_previous = previous.is_some();
-            match project.assets.load_hdr(&path) {
-                Ok(image) => {
-                    let replacement = Arc::new(EnvironmentSource::Equirect {
-                        width: image.width,
-                        height: image.height,
-                        rgb: image.rgb,
-                    });
-                    let key = EditorEnvironmentKey::Hdr(path.clone());
-                    let current_matches = self
-                        .current_environment
-                        .as_ref()
-                        .is_some_and(|(current, _)| current == &key);
-                    let gpu_replacement = if current_matches {
-                        match renderer.create_environment(&replacement) {
-                            Ok(environment) => Some(environment),
-                            Err(error) if is_resource_error(&error) => {
-                                let transition = environment_transition(
-                                    self.current_environment
-                                        .as_ref()
-                                        .map(|(current, _)| current),
-                                    &key,
-                                    EnvironmentCreation::ResourceError,
-                                );
-                                let (current, _, _) =
-                                    cache_update(previous, Err(error.to_string()));
-                                self.environment_sources.insert(path.clone(), current);
-                                if transition == EnvironmentTransition::Keep {
-                                    log.error(format!(
-                                        "{path}: {error}; сохранено прежнее окружение"
-                                    ));
-                                } else {
-                                    log.error(format!("{path}: {error}"));
-                                    if let Some((_, previous)) = self.current_environment.take() {
-                                        renderer.destroy_environment(previous)?;
-                                    }
-                                }
-                                self.failed_environment = Some(key);
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    } else {
-                        None
-                    };
-                    self.environment_sources
-                        .insert(path.clone(), Some(replacement));
-                    if let Some(environment) = gpu_replacement {
-                        let previous = self.current_environment.replace((key, environment));
-                        self.failed_environment = None;
-                        if let Some((_, previous)) = previous {
-                            renderer.destroy_environment(previous)?;
-                        }
-                    } else if self.failed_environment.as_ref() == Some(&key) {
-                        self.failed_environment = None;
-                    }
-                }
-                Err(error) => {
-                    let (current, _, error) = cache_update(previous, Err(error.to_string()));
-                    self.environment_sources.insert(path.clone(), current);
-                    if let Some(error) = error {
-                        let message = if had_previous {
-                            format!("{path}: {error}; сохранена прежняя версия HDR")
-                        } else {
-                            format!("{path}: {error}")
-                        };
-                        log.error(message);
-                    }
-                }
-            }
+            self.images.reload(ImageKind::Hdr, &path);
         }
 
         let pending = loader
@@ -920,6 +900,201 @@ impl SceneRenderer {
         Ok(())
     }
 
+    /// Применяет декодированную PNG к кэшу текстуры в цветовом пространстве `color_space`.
+    /// Первая загрузка и перезагрузка идут одним путём: ошибка сохраняет прежнюю текстуру.
+    fn apply_texture(
+        &mut self,
+        renderer: &mut Renderer,
+        log: &mut ConsoleLog,
+        path: String,
+        color_space: TextureColorSpace,
+        result: Result<&engine_assets::TextureData, String>,
+    ) -> Result<(), RenderError> {
+        let key = (path.clone(), color_space);
+        let previous = self.textures.get(&key).copied().flatten();
+        let had_previous = previous.is_some();
+        match result {
+            Ok(data) => {
+                let replacement = match renderer.create_texture_with_color_space(
+                    data.width,
+                    data.height,
+                    &data.rgba,
+                    color_space,
+                ) {
+                    Ok(replacement) => replacement,
+                    Err(error) if is_resource_error(&error) => {
+                        let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                        self.textures.insert(key, current);
+                        if let Some(error) = error {
+                            let message = if had_previous {
+                                format!("{path}: {error}; сохранена прежняя версия текстуры")
+                            } else {
+                                format!("{path}: {error}")
+                            };
+                            log.error(message);
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                let (current, old, _) = cache_update(previous, Ok(replacement));
+                self.textures.insert(key, current);
+                self.bump_texture_revision((path.clone(), color_space));
+                if let Some(old) = old {
+                    renderer.destroy_texture(old)?;
+                }
+            }
+            Err(error) => {
+                let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                self.textures.insert(key, current);
+                if let Some(error) = error {
+                    let message = if had_previous {
+                        format!("{path}: {error}; сохранена прежняя версия текстуры")
+                    } else {
+                        format!("{path}: {error}")
+                    };
+                    log.error(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Применяет декодированный HDR к источникам окружения; текущее GPU-окружение этого пути
+    /// пересоздаётся. Ошибка сохраняет прежний источник.
+    fn apply_hdr(
+        &mut self,
+        renderer: &mut Renderer,
+        log: &mut ConsoleLog,
+        path: String,
+        result: Result<engine_assets::HdrImageData, String>,
+    ) -> Result<(), RenderError> {
+        let previous = self.environment_sources.get(&path).cloned().flatten();
+        let had_previous = previous.is_some();
+        match result {
+            Ok(image) => {
+                let replacement = Arc::new(EnvironmentSource::Equirect {
+                    width: image.width,
+                    height: image.height,
+                    rgb: image.rgb,
+                });
+                let key = EditorEnvironmentKey::Hdr(path.clone());
+                let current_matches = self
+                    .current_environment
+                    .as_ref()
+                    .is_some_and(|(current, _)| current == &key);
+                let gpu_replacement = if current_matches {
+                    match renderer.create_environment(&replacement) {
+                        Ok(environment) => Some(environment),
+                        Err(error) if is_resource_error(&error) => {
+                            let transition = environment_transition(
+                                self.current_environment
+                                    .as_ref()
+                                    .map(|(current, _)| current),
+                                &key,
+                                EnvironmentCreation::ResourceError,
+                            );
+                            let (current, _, _) = cache_update(previous, Err(error.to_string()));
+                            self.environment_sources.insert(path.clone(), current);
+                            if transition == EnvironmentTransition::Keep {
+                                log.error(format!("{path}: {error}; сохранено прежнее окружение"));
+                            } else {
+                                log.error(format!("{path}: {error}"));
+                                if let Some((_, previous)) = self.current_environment.take() {
+                                    renderer.destroy_environment(previous)?;
+                                }
+                            }
+                            self.failed_environment = Some(key);
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                self.environment_sources
+                    .insert(path.clone(), Some(replacement));
+                if let Some(environment) = gpu_replacement {
+                    let previous = self.current_environment.replace((key, environment));
+                    self.failed_environment = None;
+                    if let Some((_, previous)) = previous {
+                        renderer.destroy_environment(previous)?;
+                    }
+                } else if self.failed_environment.as_ref() == Some(&key) {
+                    self.failed_environment = None;
+                }
+            }
+            Err(error) => {
+                let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                self.environment_sources.insert(path.clone(), current);
+                if let Some(error) = error {
+                    let message = if had_previous {
+                        format!("{path}: {error}; сохранена прежняя версия HDR")
+                    } else {
+                        format!("{path}: {error}")
+                    };
+                    log.error(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Принимает изображения, декодированные в фоне, и создаёт для них GPU-ресурсы.
+    fn accept_images(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        log: &mut ConsoleLog,
+    ) -> Result<(), RenderError> {
+        self.ensure_image_loader(project);
+        for (kind, path, result) in self.images.finished() {
+            match (kind, result) {
+                (ImageKind::Texture, result) => {
+                    let data = result.map(|image| match image {
+                        DecodedImage::Texture(data) => data,
+                        DecodedImage::Hdr(_) => unreachable!("запрос текстуры вернул HDR"),
+                    });
+                    let wants = self.texture_wants.remove(&path).unwrap_or_default();
+                    for color_space in wants {
+                        self.apply_texture(
+                            renderer,
+                            log,
+                            path.clone(),
+                            color_space,
+                            data.as_ref().map_err(Clone::clone),
+                        )?;
+                    }
+                }
+                (ImageKind::Hdr, result) => {
+                    let image = result.map(|image| match image {
+                        DecodedImage::Hdr(image) => image,
+                        DecodedImage::Texture(_) => unreachable!("запрос HDR вернул текстуру"),
+                    });
+                    self.apply_hdr(renderer, log, path, image)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Декодер изображений работает с ресурсами открытого проекта; смена проекта
+    /// перезапускает его, и результаты прежнего проекта отбрасываются.
+    fn ensure_image_loader(&mut self, project: &OpenProject) {
+        if self.images_root.as_deref() != Some(project.root.as_path()) {
+            self.images.restart(project.assets.clone());
+            self.images_root = Some(project.root.clone());
+            self.texture_wants.clear();
+        }
+    }
+
+    /// Есть изображения, которые ещё декодируются: окно должно проснуться, чтобы показать их.
+    pub fn images_pending(&self) -> bool {
+        self.images.has_pending()
+    }
+
+    /// Запрашивает текстуру, если её ещё нет в кэше. PNG декодируется в фоне: до готовности
+    /// материал рисуется без неё, а готовая текстура повышает ревизию и пересобирает материалы.
     fn sync_texture(
         &mut self,
         renderer: &mut Renderer,
@@ -932,32 +1107,23 @@ impl SceneRenderer {
         if self.textures.contains_key(&key) {
             return Ok(());
         }
-        let gpu = match project.assets.load_texture(path) {
-            Ok(data) => match renderer.create_texture_with_color_space(
-                data.width,
-                data.height,
-                &data.rgba,
-                color_space,
-            ) {
-                Ok(texture) => Some(texture),
-                Err(error) if is_resource_error(&error) => {
-                    log.error(format!("{path}: {error}"));
-                    None
-                }
-                Err(error) => return Err(error),
-            },
-            Err(error) => {
-                log.error(format!("{path}: {error}"));
-                None
-            }
-        };
-        self.textures.insert(key, gpu);
-        if self
-            .textures
-            .get(&(path.to_owned(), color_space))
-            .is_some_and(Option::is_some)
+        self.accept_images(renderer, project, log)?;
+        if self.textures.contains_key(&key)
+            || self
+                .texture_wants
+                .get(path)
+                .is_some_and(|wants| wants.contains(&color_space))
         {
-            self.bump_texture_revision((path.to_owned(), color_space));
+            return Ok(());
+        }
+        if self.images.request(ImageKind::Texture, path) {
+            self.texture_wants
+                .entry(path.to_owned())
+                .or_default()
+                .insert(color_space);
+        } else {
+            log.error(format!("{path}: фоновая загрузка недоступна"));
+            self.textures.insert(key, None);
         }
         Ok(())
     }
@@ -1437,7 +1603,7 @@ impl SceneRenderer {
     }
 
     /// Строит отдельные draw lists для Scene и Game; сетка добавляется только в Scene.
-    /// Список захвата строится только при `capture_eye`, без захвата работы нет.
+    /// Список захвата строится только при `capture_camera`, без захвата работы нет.
     #[allow(clippy::too_many_arguments)]
     pub fn build_draws(
         &mut self,
@@ -1450,11 +1616,11 @@ impl SceneRenderer {
         frame: &SceneFrame,
         particle_commands: &[ParticleCommand],
         particle_dt: Option<f32>,
-        scene_eye: Vec3,
-        game_eye: Vec3,
+        scene_camera: Camera,
+        game_camera: Camera,
         grid_camera_distance: Option<f32>,
         play_bridge: Option<&AnimationBridge>,
-        capture_eye: Option<Vec3>,
+        capture_camera: Option<Camera>,
     ) -> Result<(), RenderError> {
         let active_asset_paths = active_material_paths(world, preview_asset);
         let preview_shader_path =
@@ -1478,7 +1644,9 @@ impl SceneRenderer {
         self.game_draws.clear();
         self.capture_draws.clear();
         self.sync_particles(renderer, world, frame, particle_commands, particle_dt)?;
-        let palette_index = palette_indices(&self.skins, play_bridge.or(self.animation.bridge()));
+        let bridge = play_bridge.or(self.animation.bridge());
+        let palette_index = palette_indices(&self.skins, bridge);
+        self.lod_palettes.clear();
         let used_object_materials = {
             let mut resources = DrawResources {
                 models: &self.models,
@@ -1489,12 +1657,16 @@ impl SceneRenderer {
                 used_object_materials: HashSet::new(),
                 skins: &self.skins,
                 palette_index: &palette_index,
+                bridge,
+                lod_palettes: &mut self.lod_palettes,
+                lod_palette_index: HashMap::new(),
             };
             append_world_draws(
                 renderer,
                 world,
                 frame,
-                scene_eye,
+                scene_camera,
+                &mut self.scene_lod,
                 &mut resources,
                 &mut self.motion_history,
                 &mut self.scene_draws,
@@ -1503,17 +1675,19 @@ impl SceneRenderer {
                 renderer,
                 world,
                 frame,
-                game_eye,
+                game_camera,
+                &mut self.game_lod,
                 &mut resources,
                 &mut self.motion_history,
                 &mut self.game_draws,
             )?;
-            if let Some(eye) = capture_eye {
+            if let Some(camera) = capture_camera {
                 append_world_draws(
                     renderer,
                     world,
                     frame,
-                    eye,
+                    camera,
+                    &mut self.capture_lod,
                     &mut resources,
                     &mut self.motion_history,
                     &mut self.capture_draws,
@@ -1656,20 +1830,31 @@ impl SceneRenderer {
         renderer: &mut Renderer,
         world: &World,
     ) -> Result<(), RenderError> {
-        let mut wanted: HashMap<ObjectHandle, (String, Vec<MeshId>)> = HashMap::new();
+        let mut wanted: HashMap<ObjectHandle, WantedSkin<MeshId>> = HashMap::new();
+        let skinned_meshes = |path: &str| -> Option<(String, Vec<MeshId>)> {
+            let model = self.models.get(path)?.as_ref()?;
+            model.skinned.then(|| {
+                let mesh_ids = model.meshes.iter().map(|(id, _, _)| *id).collect();
+                (path.to_owned(), mesh_ids)
+            })
+        };
         for object in world.objects() {
             let (Some(_), Some(mesh)) = (&object.animator, &object.mesh_renderer) else {
                 continue;
             };
-            let path = mesh.model.as_str();
-            let Some(Some(model)) = self.models.get(path) else {
+            let Some((path, mesh_ids)) = skinned_meshes(mesh.model.as_str()) else {
                 continue;
             };
-            if !model.skinned {
-                continue;
-            }
-            let mesh_ids = model.meshes.iter().map(|(id, _, _)| *id).collect();
-            wanted.insert(object.handle, (path.to_owned(), mesh_ids));
+            let lod_count = object
+                .lod_group
+                .as_ref()
+                .map_or(0, |group| group.levels.len());
+            let lods = (1..=lod_count)
+                .map(|level| {
+                    lod_model_path(mesh, object.lod_group.as_ref(), level).and_then(skinned_meshes)
+                })
+                .collect();
+            wanted.insert(object.handle, (path, mesh_ids, lods));
         }
         let plan = plan_skin_sync(&self.skins, &wanted);
         for object in plan.release {
@@ -1678,15 +1863,30 @@ impl SceneRenderer {
             }
         }
         for object in plan.create {
-            let Some((model, mesh_ids)) = wanted.remove(&object) else {
+            let Some((model, mesh_ids, lods)) = wanted.remove(&object) else {
                 continue;
             };
-            let joint_count = self
-                .models
-                .get(&model)
-                .and_then(Option::as_ref)
-                .map_or(0, |gpu| gpu.joint_count);
-            let skin = create_skin(renderer, model, joint_count, mesh_ids)?;
+            let base = self.models.get(&model).and_then(Option::as_ref);
+            let joint_count = base.map_or(0, |gpu| gpu.joint_count);
+            let lods = lods
+                .into_iter()
+                .map(|lod| {
+                    lod.map(|(path, mesh_ids)| {
+                        let remap = base
+                            .and_then(|gpu| gpu.skeleton.as_ref())
+                            .zip(
+                                self.models
+                                    .get(&path)
+                                    .and_then(Option::as_ref)
+                                    .and_then(|gpu| gpu.skeleton.as_ref()),
+                            )
+                            .and_then(|(base, lod)| PaletteRemap::new(base, lod))
+                            .map(Arc::new);
+                        (path, mesh_ids, remap)
+                    })
+                })
+                .collect();
+            let skin = create_skin(renderer, model, joint_count, mesh_ids, lods)?;
             self.skins.insert(object, skin);
         }
         Ok(())
@@ -1704,6 +1904,7 @@ impl SceneRenderer {
         palette_objects(&self.skins, bridge)
             .into_iter()
             .filter_map(|object| bridge.palette(object))
+            .chain(self.lod_palettes.iter().map(Vec::as_slice))
             .collect()
     }
 
@@ -1724,7 +1925,7 @@ impl SceneRenderer {
         width: u32,
         height: u32,
         settings: CameraSettings,
-        post: PostProcessSettings,
+        post: &PostProcessSettings,
         screens: &[ScreenShaderRef],
         light: &LightState,
         local_lights: &'a [LocalLight],
@@ -1774,7 +1975,7 @@ impl SceneRenderer {
             },
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
-                post: render_post_process(&post, with_grid),
+                post: render_post_process(post, self.color_lut(post), with_grid),
                 screen_shaders: self.screen_shader_view(screens, with_grid),
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
@@ -2101,6 +2302,12 @@ impl SceneRenderer {
         if self.failed_environment.as_ref() == Some(&key) {
             return Ok(());
         }
+        if let Some(path) = &state.component.hdr
+            && !self.environment_sources.contains_key(path.as_str())
+        {
+            // HDR ещё декодируется в фоне: остаётся прежнее окружение или окружение по умолчанию.
+            return Ok(());
+        }
         let source = if let Some(path) = &state.component.hdr {
             self.environment_sources
                 .get(path.as_str())
@@ -2260,6 +2467,48 @@ struct DrawResources<'a> {
     /// Экземпляры скиннинга и индексы палитр кадра по объекту.
     skins: &'a HashMap<ObjectHandle, SkinnedObject>,
     palette_index: &'a HashMap<ObjectHandle, u32>,
+    /// Мост кадра и палитры уровней LOD, переведённые из его палитр по запросу видов.
+    bridge: Option<&'a AnimationBridge>,
+    lod_palettes: &'a mut Vec<Vec<[[f32; 4]; 4]>>,
+    lod_palette_index: HashMap<(ObjectHandle, usize), u32>,
+}
+
+impl DrawResources<'_> {
+    /// Привязка скиннинга части `mesh_index` уровня `level`. Палитра уровня LOD строится один
+    /// раз за кадр и идёт после палитр моста. Уровень без палитры моста той же длины, что скелет
+    /// объекта, или без перевода костей рисуется без скиннинга.
+    fn skin_binding(
+        &mut self,
+        object: ObjectHandle,
+        level: usize,
+        mesh_index: usize,
+    ) -> Option<SkinBinding> {
+        let skin = self.skins.get(&object)?;
+        let base_index = *self.palette_index.get(&object)?;
+        if level == 0 {
+            return Some(SkinBinding {
+                instance: *skin.instances.get(mesh_index)?,
+                palette: base_index,
+            });
+        }
+        let lod = skin.lods.get(level - 1)?.as_ref()?;
+        let instance = *lod.instances.get(mesh_index)?;
+        let palette = match self.lod_palette_index.get(&(object, level)) {
+            Some(index) => *index,
+            None => {
+                let base = self.bridge?.palette(object)?;
+                let mut out = Vec::new();
+                if !lod.remap.as_ref()?.apply(base, &mut out) {
+                    return None;
+                }
+                self.lod_palettes.push(out);
+                let index = (self.palette_index.len() + self.lod_palettes.len() - 1) as u32;
+                self.lod_palette_index.insert((object, level), index);
+                index
+            }
+        };
+        Some(SkinBinding { instance, palette })
+    }
 }
 
 // Both viewports can reference the same model with different LOD textures in one frame.
@@ -2272,16 +2521,18 @@ fn object_material_key(
     (object, model_path.to_owned(), level, mesh_index)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_world_draws(
     renderer: &mut Renderer,
     world: &World,
     frame: &SceneFrame,
-    eye: Vec3,
+    camera: Camera,
+    lod: &mut LodSelector,
     resources: &mut DrawResources<'_>,
     motion_history: &mut MotionHistory,
     draws: &mut Vec<DrawCommand>,
 ) -> Result<(), RenderError> {
-    for (instance, level) in visible_mesh_levels(world, frame, eye) {
+    for (instance, level) in visible_mesh_levels(world, frame, camera, lod) {
         let Some(object) = world.object(instance.object) else {
             continue;
         };
@@ -2383,18 +2634,7 @@ fn append_world_draws(
                     }
                 }
             };
-            // Скиннинг применяется только к уровню 0: у аниматора LOD-группы нет.
-            let skin = (level == 0)
-                .then(|| {
-                    let object = resources.skins.get(&instance.object)?;
-                    let instance_id = *object.instances.get(mesh_index)?;
-                    let palette = *resources.palette_index.get(&instance.object)?;
-                    Some(SkinBinding {
-                        instance: instance_id,
-                        palette,
-                    })
-                })
-                .flatten();
+            let skin = resources.skin_binding(instance.object, level, mesh_index);
             draws.push(DrawCommand {
                 mesh: *mesh_id,
                 material: Some(material_id),
@@ -2407,18 +2647,20 @@ fn append_world_draws(
             motion_history.record_current(instance.object, instance.model.to_cols_array_2d());
         }
     }
+    lod.finish_frame();
     Ok(())
 }
 
-/// Мешевые экземпляры кадра с уровнем LOD для глаза одного вида. Объект, отсечённый
+/// Мешевые экземпляры кадра с уровнем LOD для камеры одного вида. Объект, отсечённый
 /// `cull_distance` этого вида, пропускается; список кадра при этом не фильтруется по камерам.
 fn visible_mesh_levels<'a>(
     world: &'a World,
     frame: &'a SceneFrame,
-    eye: Vec3,
+    camera: Camera,
+    lod: &'a mut LodSelector,
 ) -> impl Iterator<Item = (&'a MeshInstance, usize)> + 'a {
     frame.meshes.iter().filter_map(move |instance| {
-        let level = world.lod_level(instance.object, eye)?;
+        let level = lod.select(world, instance.object, camera.position, camera.fov_narrow)?;
         Some((instance, level))
     })
 }
@@ -2492,33 +2734,69 @@ fn palette_indices<M, S>(
     })
 }
 
-/// Создаёт по экземпляру скиннинга на каждую часть модели; при ошибке уже созданные освобождаются.
+/// Создаёт по экземпляру скиннинга на каждую часть модели и каждого уровня LOD с переводом
+/// палитры; при ошибке уже созданные освобождаются.
 fn create_skin(
     renderer: &mut Renderer,
     model: String,
     joint_count: u32,
     mesh_ids: Vec<MeshId>,
+    lods: Vec<Option<NewLodSkin>>,
 ) -> Result<SkinnedObject, RenderError> {
     let mut skin = SkinnedObject {
         model,
         joint_count,
         mesh_ids,
         instances: Vec::new(),
+        lods: Vec::with_capacity(lods.len()),
     };
-    for index in 0..skin.mesh_ids.len() {
-        match renderer.create_skin_instance(skin.mesh_ids[index]) {
-            Ok(instance) => skin.instances.push(instance),
-            Err(error) => {
-                release_skin(renderer, skin)?;
-                return Err(error);
+    let created = (|| {
+        for index in 0..skin.mesh_ids.len() {
+            let instance = renderer.create_skin_instance(skin.mesh_ids[index])?;
+            skin.instances.push(instance);
+        }
+        for lod in lods {
+            let Some((model, mesh_ids, remap)) = lod else {
+                skin.lods.push(None);
+                continue;
+            };
+            let mut level = LodSkin {
+                model,
+                mesh_ids,
+                instances: Vec::new(),
+                remap,
+            };
+            if level.remap.is_some() {
+                for index in 0..level.mesh_ids.len() {
+                    match renderer.create_skin_instance(level.mesh_ids[index]) {
+                        Ok(instance) => level.instances.push(instance),
+                        Err(error) => {
+                            skin.lods.push(Some(level));
+                            return Err(error);
+                        }
+                    }
+                }
             }
+            skin.lods.push(Some(level));
+        }
+        Ok(())
+    })();
+    match created {
+        Ok(()) => Ok(skin),
+        Err(error) => {
+            release_skin(renderer, skin)?;
+            Err(error)
         }
     }
-    Ok(skin)
 }
 
 fn release_skin(renderer: &mut Renderer, skin: SkinnedObject) -> Result<(), RenderError> {
-    for instance in skin.instances {
+    let lod_instances = skin
+        .lods
+        .into_iter()
+        .flatten()
+        .flat_map(|level| level.instances);
+    for instance in skin.instances.into_iter().chain(lod_instances) {
         renderer.destroy_skin_instance(instance)?;
     }
     Ok(())
@@ -2537,14 +2815,25 @@ struct SkinSyncPlan {
 /// экземпляров, `wanted` — то же для объектов, которым нужен скиннинг.
 fn plan_skin_sync<M: PartialEq, S>(
     current: &HashMap<ObjectHandle, SkinnedObject<M, S>>,
-    wanted: &HashMap<ObjectHandle, (String, Vec<M>)>,
+    wanted: &HashMap<ObjectHandle, WantedSkin<M>>,
 ) -> SkinSyncPlan {
     let mut release: Vec<ObjectHandle> = current
         .iter()
         .filter(|(object, skin)| {
-            wanted
-                .get(*object)
-                .is_none_or(|(model, mesh_ids)| *model != skin.model || *mesh_ids != skin.mesh_ids)
+            wanted.get(*object).is_none_or(|(model, mesh_ids, lods)| {
+                *model != skin.model
+                    || *mesh_ids != skin.mesh_ids
+                    || lods.len() != skin.lods.len()
+                    || lods.iter().zip(&skin.lods).any(|(wanted, current)| {
+                        match (wanted, current) {
+                            (None, None) => false,
+                            (Some((model, mesh_ids)), Some(current)) => {
+                                *model != current.model || *mesh_ids != current.mesh_ids
+                            }
+                            _ => true,
+                        }
+                    })
+            })
         })
         .map(|(object, _)| *object)
         .collect();
@@ -2646,6 +2935,35 @@ fn model_reload_plan<T>(
 #[derive(Clone, Copy, Debug)]
 struct EditorScreenShader {
     id: Option<ScreenShaderId>,
+}
+
+/// LUT постобработки из кэша; ключи — канонические пути без ведущего `/`, поэтому поиск в кадре
+/// не выделяет память. LUT, которая не загрузилась, даёт `None`.
+fn cached_color_lut(
+    luts: &HashMap<String, Option<ColorLutId>>,
+    post: &PostProcessSettings,
+) -> Option<ColorLutId> {
+    let path = post.color_grading.lut.as_deref()?;
+    luts.get(path.strip_prefix('/').unwrap_or(path))
+        .copied()
+        .flatten()
+}
+
+/// Читает и разбирает `.cube` из проекта и создаёт LUT renderer.
+fn load_color_lut(
+    renderer: &mut Renderer,
+    project: &OpenProject,
+    path: &str,
+) -> Result<ColorLutId, String> {
+    let file = project
+        .assets_dir
+        .resolve(path)
+        .map_err(|error| format!("/{path}: {error}"))?;
+    let source = std::fs::read_to_string(&file).map_err(|error| format!("/{path}: {error}"))?;
+    let lut = CubeLut::parse(format!("/{path}"), &source).map_err(|error| error.to_string())?;
+    renderer
+        .create_color_lut(lut.size(), lut.texels())
+        .map_err(|error| format!("/{path}: {error}"))
 }
 
 /// Читает `.glsl` из проекта и создаёт шейдер renderer; текст ошибки годится для инспектора.
@@ -2813,6 +3131,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
             .skeleton
             .as_ref()
             .map_or(0, |skeleton| skeleton.joints.len() as u32),
+        skeleton: model.skeleton.clone(),
     })
 }
 
@@ -3164,7 +3483,11 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
 
 /// Переводит постобработку камеры в настройки renderer. Scene-вид редактора не выполняет DoF и
 /// motion blur: эти эффекты мешают редактированию, остальные эффекты совпадают с Game-видом.
-fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProcess {
+fn render_post_process(
+    post: &PostProcessSettings,
+    lut: Option<ColorLutId>,
+    scene_view: bool,
+) -> PostProcess {
     let exposure = if post.exposure.enabled {
         Exposure {
             mode: match post.exposure.mode {
@@ -3196,7 +3519,7 @@ fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProc
     };
     let bloom = post.bloom;
     let ao = post.ambient_occlusion;
-    let grading = post.color_grading;
+    let grading = &post.color_grading;
     let vignette = post.vignette;
     let aberration = post.chromatic_aberration;
     let grain = post.film_grain;
@@ -3229,6 +3552,8 @@ fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProc
             lift: grading.lift,
             gamma: grading.gamma,
             gain: grading.gain,
+            lut,
+            lut_intensity: grading.lut_intensity,
         },
         vignette: engine_render::Vignette {
             enabled: vignette.enabled,
@@ -3339,6 +3664,34 @@ mod tests {
     use engine_scene::{
         EnvironmentComponent, LodLevel, PrefabTemplate, ProceduralSkyComponent, SpawnOptions,
     };
+
+    fn fake_lut(value: usize) -> ColorLutId {
+        // SAFETY: ColorLutId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    #[test]
+    fn color_lut_is_found_by_canonical_path_and_mapped_in_both_views() {
+        let luts = HashMap::from([
+            ("luts/film.cube".to_owned(), Some(fake_lut(3))),
+            ("luts/broken.cube".to_owned(), None),
+        ]);
+        let mut post = PostProcessSettings::default();
+        assert_eq!(cached_color_lut(&luts, &post), None);
+        post.color_grading.lut = Some("/luts/film.cube".to_owned());
+        assert_eq!(cached_color_lut(&luts, &post), Some(fake_lut(3)));
+        post.color_grading.lut = Some("luts/film.cube".to_owned());
+        assert_eq!(cached_color_lut(&luts, &post), Some(fake_lut(3)));
+        post.color_grading.lut = Some("/luts/broken.cube".to_owned());
+        assert_eq!(cached_color_lut(&luts, &post), None, "LUT с ошибкой");
+
+        post.color_grading.lut_intensity = 0.3;
+        for scene_view in [false, true] {
+            let mapped = render_post_process(&post, Some(fake_lut(3)), scene_view);
+            assert_eq!(mapped.color_grading.lut, Some(fake_lut(3)));
+            assert_eq!(mapped.color_grading.lut_intensity, 0.3);
+        }
+    }
 
     #[test]
     fn hot_reload_rebuilds_only_new_revisions_that_have_not_failed() {
@@ -3667,15 +4020,26 @@ distance=10.0
         let (frame, _) = world.build_frame();
         let prop = world.handle("prop").unwrap();
         // Обе панельные камеры отсекают объект, а capture-камера рядом с ним видит его уровень 0.
+        let camera = |position: Vec3| Camera {
+            position,
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov_narrow: engine_scene::LOD_REFERENCE_FOV,
+            near: 0.1,
+            far: 100.0,
+        };
         for panel_eye in [Vec3::new(40.0, 0.0, 0.0), Vec3::new(-40.0, 0.0, 0.0)] {
+            let mut lod = LodSelector::default();
             assert!(
-                visible_mesh_levels(&world, &frame, panel_eye)
+                visible_mesh_levels(&world, &frame, camera(panel_eye), &mut lod)
                     .all(|(instance, _)| instance.object != prop)
             );
         }
-        let captured = visible_mesh_levels(&world, &frame, Vec3::new(5.0, 0.0, 0.0))
-            .find(|(instance, _)| instance.object == prop)
-            .map(|(_, level)| level);
+        let mut lod = LodSelector::default();
+        let captured =
+            visible_mesh_levels(&world, &frame, camera(Vec3::new(5.0, 0.0, 0.0)), &mut lod)
+                .find(|(instance, _)| instance.object == prop)
+                .map(|(_, level)| level);
         assert_eq!(captured, Some(0));
     }
 
@@ -4028,15 +4392,16 @@ range = 10
             joint_count: 1,
             mesh_ids: meshes.to_vec(),
             instances: meshes.iter().map(|mesh| mesh + 100).collect(),
+            lods: Vec::new(),
         }
     }
 
-    fn wanted(
-        entries: &[(ObjectHandle, &str, &[u32])],
-    ) -> HashMap<ObjectHandle, (String, Vec<u32>)> {
+    fn wanted(entries: &[(ObjectHandle, &str, &[u32])]) -> HashMap<ObjectHandle, WantedSkin<u32>> {
         entries
             .iter()
-            .map(|(object, model, meshes)| (*object, ((*model).to_owned(), meshes.to_vec())))
+            .map(|(object, model, meshes)| {
+                (*object, ((*model).to_owned(), meshes.to_vec(), Vec::new()))
+            })
             .collect()
     }
 
@@ -4075,6 +4440,51 @@ range = 10
         );
         let other_parts = plan_skin_sync(&current, &wanted(&[(hero, "models/hero.fbx", &[1, 3])]));
         assert_eq!(other_parts, other_model);
+    }
+
+    #[test]
+    fn skin_sync_recreates_instances_when_a_lod_level_model_changes() {
+        let world = skin_world();
+        let hero = world.handle("hero").unwrap();
+        let mut current_skin = skin("models/hero.fbx", &[1]);
+        current_skin.lods = vec![
+            Some(LodSkin {
+                model: "models/hero_lod.fbx".to_owned(),
+                mesh_ids: vec![5],
+                instances: vec![105],
+                remap: None,
+            }),
+            None,
+        ];
+        let current = HashMap::from([(hero, current_skin)]);
+        let wanted_lods = |lods: Vec<Option<(&str, Vec<u32>)>>| {
+            HashMap::from([(
+                hero,
+                (
+                    "models/hero.fbx".to_owned(),
+                    vec![1],
+                    lods.into_iter()
+                        .map(|lod| lod.map(|(model, meshes)| (model.to_owned(), meshes)))
+                        .collect::<Vec<_>>(),
+                ),
+            )])
+        };
+        let same = wanted_lods(vec![Some(("models/hero_lod.fbx", vec![5])), None]);
+        assert_eq!(plan_skin_sync(&current, &same), SkinSyncPlan::default());
+        let recreate = SkinSyncPlan {
+            release: vec![hero],
+            create: vec![hero],
+        };
+        for changed in [
+            wanted_lods(vec![Some(("models/hero_lod.fbx", vec![6])), None]),
+            wanted_lods(vec![
+                Some(("models/hero_lod.fbx", vec![5])),
+                Some(("models/far.fbx", vec![7])),
+            ]),
+            wanted_lods(vec![Some(("models/hero_lod.fbx", vec![5]))]),
+        ] {
+            assert_eq!(plan_skin_sync(&current, &changed), recreate);
+        }
     }
 
     #[test]

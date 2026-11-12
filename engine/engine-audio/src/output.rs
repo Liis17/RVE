@@ -2,10 +2,12 @@
 //!
 //! Callback не выделяет память, не освобождает память и не берёт блокировок: буфер для
 //! конвертации создаётся до запуска потока, команды и завершённые голоса идут через
-//! SPSC-кольца `rtrb`. Команды читаются пачками по [`COMMANDS_PER_CALLBACK`]; завершённые
+//! SPSC-кольца `rtrb`; кольца завершённых стрим-голосов возвращаются потоку `rve-audio`.
+//! Команды читаются пачками по [`COMMANDS_PER_CALLBACK`]; завершённые
 //! голоса, которые не влезли в кольцо, остаются в микшере до следующего вызова.
 
 use crate::mixer::{Mixer, MixerCommand, Spatial};
+use crate::stream::StreamReader;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use engine_scene::VoiceId;
@@ -27,6 +29,7 @@ pub struct Output {
 pub fn open(
     commands: Consumer<MixerCommand>,
     ended: Producer<VoiceId>,
+    retired: Producer<StreamReader>,
     spatial: Arc<Spatial>,
 ) -> Result<Output, String> {
     let host = cpal::default_host();
@@ -42,6 +45,7 @@ pub fn open(
         mixer,
         commands,
         ended,
+        retired,
     };
     let stream = match supported.sample_format() {
         SampleFormat::F32 => build::<f32>(&device, config, state),
@@ -61,6 +65,7 @@ struct CallbackState {
     mixer: Mixer,
     commands: Consumer<MixerCommand>,
     ended: Producer<VoiceId>,
+    retired: Producer<StreamReader>,
 }
 
 fn build<T>(
@@ -89,8 +94,18 @@ where
                     *sample = T::from_sample(*value);
                 }
             }
-            let CallbackState { mixer, ended, .. } = &mut state;
+            let CallbackState {
+                mixer,
+                ended,
+                retired,
+                ..
+            } = &mut state;
             mixer.drain_ended(|voice| ended.push(voice).is_ok());
+            mixer.drain_retired(|reader| {
+                retired
+                    .push(reader)
+                    .map_err(|rtrb::PushError::Full(reader)| reader)
+            });
         },
         |error| log::warn!("ошибка аудиопотока: {error}"),
         None,

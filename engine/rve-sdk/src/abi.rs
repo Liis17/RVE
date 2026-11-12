@@ -1,6 +1,7 @@
 //! C-compatible types shared by an RVE host and a game script library.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
@@ -27,7 +28,9 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// nullable `set_property` callback after the v20 descriptor tail.
 /// Version 23 appends the nullable application-quit callback after the v22 host tail.
 /// Version 24 appends window and file dialog callbacks after the v23 quit callback.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 24;
+/// Version 25 appends the nullable `interrupt` flag after the v24 file dialog callbacks.
+/// Version 26 appends audio fade, group effect and streaming callbacks after the v25 interrupt flag.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 26;
 
 /// Validate an external property write before any `Script::set_property` hook runs.
 pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
@@ -1966,7 +1969,98 @@ pub struct RveHost {
     pub file_dialog_open: Option<RveFileDialogOpenFn>,
     /// Reads a file dialog result by id. Appended in ABI v24.
     pub file_dialog_poll: Option<RveFileDialogPollFn>,
+    /// Host request to abandon the running callback, read atomically by the guest: one byte, zero
+    /// while the callback may continue. Null when the host never interrupts. Appended in ABI v25.
+    pub interrupt: *const AtomicBool,
+    /// Stops an object's audio source voice with a fade in seconds. Appended in ABI v26.
+    pub audio_stop_source_fade: Option<RveAudioObjectFadeFn>,
+    /// Stops a clip voice with a fade in seconds. Appended in ABI v26.
+    pub audio_stop_voice_fade: Option<RveAudioVoiceFadeFn>,
+    /// Sets one audio group's filters and reverb. Appended in ABI v26.
+    pub audio_set_group_effects: Option<RveAudioGroupEffectsFn>,
+    /// `audio_play_clip_ex` with streaming and fade-in options. Appended in ABI v26.
+    pub audio_play_clip_playback: Option<RveAudioPlayClipPlaybackFn>,
+    /// Reads an audio source's streaming and fade-in settings. Appended in ABI v26.
+    pub audio_get_source_playback: Option<RveAudioGetPlaybackFn>,
+    /// Writes an audio source's streaming and fade-in settings. Appended in ABI v26.
+    pub audio_set_source_playback: Option<RveAudioSetPlaybackFn>,
 }
+
+impl RveHost {
+    /// Whether the host asked the running callback to stop (ABI v25). Crate-private: the field
+    /// is public, so a safe public method could dereference an arbitrary pointer.
+    pub(crate) fn is_interrupted(&self) -> bool {
+        // SAFETY: a non-null flag stays valid for the whole callback per the ABI contract.
+        !self.interrupt.is_null() && unsafe { (*self.interrupt).load(Ordering::Acquire) }
+    }
+
+    /// Context pointer for a host callback. Panics once the host interrupted the callback, so a
+    /// script stuck in a loop that calls the engine unwinds to its guarded entry point.
+    pub(crate) fn call_ctx(&self) -> *mut c_void {
+        if self.is_interrupted() {
+            panic!("{RVE_INTERRUPTED_MESSAGE}");
+        }
+        self.ctx
+    }
+}
+
+/// Panic message of a guest callback abandoned through [`RveHost::interrupt`].
+pub const RVE_INTERRUPTED_MESSAGE: &str = "script interrupted by the host";
+
+/// Streaming and fade-in settings of an audio source or clip. Appended in ABI v26.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioPlayback {
+    /// Decodes the clip in parts while it plays instead of loading it whole.
+    pub stream: bool,
+    /// Fade-in in seconds, `0..=MAX_AUDIO_FADE`; zero starts at full volume.
+    pub fade_in: f32,
+}
+
+/// Reverb of an audio group bus; every field is in `0..=1`. Appended in ABI v26.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioReverb {
+    pub room_size: f32,
+    pub damping: f32,
+    /// Share of the processed signal; the dry signal stays at full volume.
+    pub wet: f32,
+}
+
+/// Filters and reverb of an audio group bus. A zero cutoff disables its filter; other cutoffs
+/// are in `10..=22000` Hz. Appended in ABI v26.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioGroupEffects {
+    pub lowpass_hz: f32,
+    pub highpass_hz: f32,
+    pub has_reverb: bool,
+    pub reverb: RveAudioReverb,
+}
+
+/// Stops an object's audio voice with a fade; returns `RveStatus` as a `u32`. Appended in ABI v26.
+pub type RveAudioObjectFadeFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, fade: f32) -> u32;
+/// Stops a voice with a fade; returns `RveStatus` as a `u32`. Appended in ABI v26.
+pub type RveAudioVoiceFadeFn = unsafe extern "C" fn(ctx: *mut c_void, voice: u64, fade: f32) -> u32;
+/// Sets a group's effects; returns `RveStatus` as a `u32`. Appended in ABI v26.
+pub type RveAudioGroupEffectsFn =
+    unsafe extern "C" fn(ctx: *mut c_void, group: u32, effects: *const RveAudioGroupEffects) -> u32;
+/// Starts a clip like `audio_play_clip_ex` with playback options and writes its voice id.
+/// Appended in ABI v26.
+pub type RveAudioPlayClipPlaybackFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioPlayExParams,
+    playback: *const RveAudioPlayback,
+    out_voice: *mut u64,
+) -> u32;
+/// Reads an audio source's playback settings; `false` without an audio source. Appended in v26.
+pub type RveAudioGetPlaybackFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveAudioPlayback) -> bool;
+/// Writes an audio source's playback settings; `false` when rejected. Appended in ABI v26.
+pub type RveAudioSetPlaybackFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const RveAudioPlayback) -> bool;
 
 /// One extension filter of [`RveFileDialog`]; extensions are given without a dot. Appended in
 /// ABI v24.
@@ -2846,7 +2940,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2900,7 +2994,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -2927,7 +3021,7 @@ mod tests {
     fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
         use std::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(size_of::<super::RveScriptTime>(), 40);
         assert_eq!(align_of::<super::RveScriptTime>(), 8);
@@ -2996,7 +3090,7 @@ mod tests {
     fn abi21_callbacks_append_after_the_abi20_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
         assert_eq!(
             offset_of!(super::RveHost, save_set),
             offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()
@@ -3067,7 +3161,7 @@ mod tests {
     fn abi23_app_quit_callback_appends_after_the_scene_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(
             offset_of!(super::RveHost, app_quit),
@@ -3084,7 +3178,7 @@ mod tests {
     fn abi24_window_and_dialog_callbacks_append_after_the_abi23_quit_callback() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
         let pointer = size_of::<usize>();
         assert_eq!(size_of::<Option<super::RveWindowFullscreenFn>>(), pointer);
         assert_eq!(
@@ -3103,13 +3197,50 @@ mod tests {
             offset_of!(super::RveHost, file_dialog_poll),
             offset_of!(super::RveHost, file_dialog_open) + pointer
         );
-        assert_eq!(
-            size_of::<super::RveHost>(),
-            offset_of!(super::RveHost, file_dialog_poll) + pointer
-        );
         assert_eq!(offset_of!(super::RveFileDialog, title), pointer);
         assert_eq!(size_of::<super::RveFileDialog>(), pointer * 9);
         assert_eq!(size_of::<super::RveFileDialogFilter>(), pointer * 4);
         assert_eq!(super::RVE_FILE_DIALOG_PICK_FOLDER, 3);
+    }
+
+    #[test]
+    fn abi25_interrupt_flag_appends_after_the_abi24_dialog_callbacks() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        let pointer = size_of::<usize>();
+        assert_eq!(
+            offset_of!(super::RveHost, interrupt),
+            offset_of!(super::RveHost, file_dialog_poll) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, audio_stop_source_fade),
+            offset_of!(super::RveHost, interrupt) + pointer
+        );
+    }
+
+    #[test]
+    fn abi26_audio_callbacks_append_after_the_abi25_interrupt_flag() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        let pointer = size_of::<usize>();
+        let tail = [
+            offset_of!(super::RveHost, audio_stop_source_fade),
+            offset_of!(super::RveHost, audio_stop_voice_fade),
+            offset_of!(super::RveHost, audio_set_group_effects),
+            offset_of!(super::RveHost, audio_play_clip_playback),
+            offset_of!(super::RveHost, audio_get_source_playback),
+            offset_of!(super::RveHost, audio_set_source_playback),
+        ];
+        assert_eq!(tail[0], offset_of!(super::RveHost, interrupt) + pointer);
+        for pair in tail.windows(2) {
+            assert_eq!(pair[1], pair[0] + pointer);
+        }
+        assert_eq!(size_of::<super::RveHost>(), tail[5] + pointer);
+        assert_eq!(size_of::<super::RveAudioPlayback>(), 8);
+        assert_eq!(offset_of!(super::RveAudioPlayback, fade_in), 4);
+        assert_eq!(size_of::<super::RveAudioGroupEffects>(), 24);
+        assert_eq!(offset_of!(super::RveAudioGroupEffects, reverb), 12);
     }
 }

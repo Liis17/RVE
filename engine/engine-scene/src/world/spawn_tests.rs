@@ -357,8 +357,14 @@ fn spawn_applies_transform_overrides_and_composes_children_and_lod() {
             .abs_diff_eq(Vec3::new(25.0, 0.0, 0.0), 1e-4)
     );
 
-    assert_eq!(world.lod_level(root, Vec3::ZERO), Some(1));
-    assert_eq!(world.lod_level(root, Vec3::new(12.0, 0.0, 0.0)), Some(0));
+    let fov = crate::LOD_REFERENCE_FOV;
+    let mut selector = crate::LodSelector::default();
+    assert_eq!(selector.select(&world, root, Vec3::ZERO, fov), Some(1));
+    let mut selector = crate::LodSelector::default();
+    assert_eq!(
+        selector.select(&world, root, Vec3::new(12.0, 0.0, 0.0), fov),
+        Some(0)
+    );
 }
 
 #[test]

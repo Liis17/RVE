@@ -2323,6 +2323,33 @@ impl Script for NonFiniteHeavy {
     }
 }
 
+/// Handle the `Spin` script raises from inside its own update, like a watchdog thread would.
+static SPIN_INTERRUPT: std::sync::OnceLock<ScriptInterruptHandle> = std::sync::OnceLock::new();
+
+struct SpinHeavy;
+
+fn spin_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(SpinHeavy))
+}
+
+impl Script for SpinHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _: f32) {
+        ctx.log_info("spin:update");
+        SPIN_INTERRUPT
+            .get()
+            .expect("spin interrupt handle is set")
+            .interrupt();
+        // Hangs forever unless the engine call below unwinds after the interrupt.
+        loop {
+            let _ = ctx.input().key_down(rve_sdk::Key::A);
+        }
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info("spin:destroy");
+    }
+}
+
 fn fail_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Err("factory refused parameters".to_owned())
 }
@@ -2335,6 +2362,7 @@ fn test_module() -> &'static rve_sdk::abi::RveModule {
         "KeepAlive" => keep_alive_factory,
         "NonFinite" => non_finite_factory,
         "Fail" => fail_factory,
+        "Spin" => spin_factory,
     }
 }
 
@@ -3082,6 +3110,67 @@ params = { label = "camera-heavy" }
         events
             .iter()
             .all(|event| event.level == ScriptEventLevel::Info)
+    );
+}
+
+#[test]
+fn interrupt_stops_a_hanging_heavy_call_and_other_heavy_scripts_keep_running() {
+    let mut world = world(
+        r#"
+[[objects]]
+id = "spin"
+[[objects.heavy_scripts]]
+name = "Spin"
+[[objects]]
+id = "log"
+[[objects.heavy_scripts]]
+name = "Log"
+params = { label = "log" }
+"#,
+    );
+    let handle = SPIN_INTERRUPT
+        .get_or_init(ScriptInterruptHandle::new)
+        .clone();
+    let library = test_library();
+    let mut host = ScriptHost::load_with_interrupt(
+        &world,
+        "scene",
+        &sources(&[]),
+        Some(&library),
+        handle.clone(),
+    )
+    .unwrap();
+
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    host.destroy(&mut world, ScriptTime::default());
+
+    assert!(handle.is_interrupted());
+    let events = host.drain_events();
+    let messages = events
+        .iter()
+        .map(|event| event.message.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(messages.iter().filter(|m| **m == "spin:update").count(), 1);
+    assert!(!messages.contains(&"spin:destroy"));
+    let errors = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{messages:?}");
+    assert!(
+        errors[0]
+            .message
+            .contains(rve_sdk::abi::RVE_INTERRUPTED_MESSAGE)
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.starts_with("log:"))
+            .copied()
+            .collect::<Vec<_>>(),
+        ["log:start", "log:update", "log:update", "log:destroy"]
     );
 }
 

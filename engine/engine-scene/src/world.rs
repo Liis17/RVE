@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 mod components;
 mod hierarchy;
+mod lod;
 
 pub use components::{
     MAX_PARTICLE_BURST, MeshMaterialParams, ParticleCommand, directional_light_problem,
@@ -34,6 +35,7 @@ pub use components::{
     point_light_problem, procedural_sky_problem, spot_light_problem,
 };
 pub use hierarchy::ObjectEdit;
+pub use lod::{LOD_REFERENCE_FOV, LodSelector};
 
 /// Наибольшее поколение слота. Слот, поколение которого исчерпано, больше не переиспользуется.
 pub const MAX_GENERATION: u32 = i32::MAX as u32;
@@ -965,16 +967,6 @@ impl World {
         self.world_matrices.get(self.dense(handle)?).copied()
     }
 
-    /// Выбирает уровень по расстоянию до мировой позиции объекта.
-    pub fn lod_level(&self, handle: ObjectHandle, eye: Vec3) -> Option<usize> {
-        let index = self.dense(handle)?;
-        let Some(group) = &self.objects[index].lod_group else {
-            return Some(0);
-        };
-        let position = self.world_matrices[index].w_axis.truncate();
-        group.level_for_distance(eye.distance(position))
-    }
-
     /// Камера объекта по текущим мировым матрицам; `None`, если камеры нет или базис невалиден.
     pub fn camera_of(&self, handle: ObjectHandle) -> Option<Camera> {
         let object = self.object(handle)?;
@@ -1505,7 +1497,7 @@ impl World {
 
         let post_process = self
             .object(self.active_camera)
-            .and_then(|object| object.post_process)
+            .and_then(|object| object.post_process.clone())
             .unwrap_or_default();
         let screen_shaders = self
             .object(self.active_camera)
@@ -2319,9 +2311,56 @@ parent="rig"
         let world = World::from_document(&parse(&scene)).unwrap();
         let mesh = world.handle("mesh").unwrap();
         let camera = world.handle("camera").unwrap();
-        assert_eq!(world.lod_level(mesh, Vec3::ZERO), Some(1));
-        assert_eq!(world.lod_level(mesh, Vec3::new(10.0, 0.0, 4.0)), Some(0));
-        assert_eq!(world.lod_level(camera, Vec3::ZERO), Some(0));
+        let fov = crate::LOD_REFERENCE_FOV;
+        let mut selector = crate::LodSelector::default();
+        assert_eq!(selector.select(&world, mesh, Vec3::ZERO, fov), Some(1));
+        let mut selector = crate::LodSelector::default();
+        assert_eq!(
+            selector.select(&world, mesh, Vec3::new(10.0, 0.0, 4.0), fov),
+            Some(0)
+        );
+        assert_eq!(selector.select(&world, camera, Vec3::ZERO, fov), Some(0));
+    }
+
+    #[test]
+    fn lod_distance_accounts_for_world_scale_and_field_of_view() {
+        let scene = format!(
+            "[[assets]]\npath=\"/base.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid=\"root\"\n[objects.transform]\nscale=[2.0,2.0,2.0]\n[[objects]]\nid=\"mesh\"\nparent=\"root\"\n[objects.transform]\nposition=[0.0,0.0,5.0]\nscale=[1.0,2.0,1.0]\n[objects.mesh_renderer]\nmodel=\"/base.fbx\"\n"
+        );
+        let world = World::from_document(&parse(&scene)).unwrap();
+        let mesh = world.handle("mesh").unwrap();
+        let fov = crate::LOD_REFERENCE_FOV;
+        // Позиция (0,0,10), наибольший мировой масштаб 4: метрика 40 / 4.
+        let eye = Vec3::new(0.0, 0.0, 50.0);
+        assert!((world.lod_distance(mesh, eye, fov).unwrap() - 10.0).abs() < 1e-4);
+        // Узкий угол обзора увеличивает объект на экране и уменьшает метрику.
+        let narrow = 2.0 * ((0.5 * fov).tan() * 0.5).atan();
+        assert!((world.lod_distance(mesh, eye, narrow).unwrap() - 5.0).abs() < 1e-4);
+        // Некорректный угол не учитывается.
+        assert!((world.lod_distance(mesh, eye, 0.0).unwrap() - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lod_selector_keeps_coarse_level_inside_hysteresis_and_forgets_unselected_objects() {
+        let scene = format!(
+            "[[assets]]\npath=\"/base.fbx\"\n[[assets]]\npath=\"/lod.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/base.fbx\"\n[objects.lod_group]\n[[objects.lod_group.levels]]\nmodel=\"/lod.fbx\"\ndistance=10.0\n"
+        );
+        let world = World::from_document(&parse(&scene)).unwrap();
+        let mesh = world.handle("mesh").unwrap();
+        let fov = crate::LOD_REFERENCE_FOV;
+        let at = |distance: f32| Vec3::new(0.0, 0.0, distance);
+        let mut selector = crate::LodSelector::default();
+        assert_eq!(selector.select(&world, mesh, at(10.5), fov), Some(1));
+        selector.finish_frame();
+        assert_eq!(selector.select(&world, mesh, at(9.5), fov), Some(1));
+        selector.finish_frame();
+        assert_eq!(selector.select(&world, mesh, at(8.5), fov), Some(0));
+        selector.finish_frame();
+        assert_eq!(selector.select(&world, mesh, at(10.5), fov), Some(1));
+        selector.finish_frame();
+        // Кадр без выбора объекта сбрасывает его историю.
+        selector.finish_frame();
+        assert_eq!(selector.select(&world, mesh, at(9.5), fov), Some(0));
     }
 
     #[test]
@@ -2618,7 +2657,7 @@ id="mesh"
         let mut graded = crate::PostProcessSettings::default();
         graded.bloom.enabled = true;
         graded.bloom.intensity = 2.0;
-        world.set_post_process(main, graded).unwrap();
+        world.set_post_process(main, graded.clone()).unwrap();
         assert_eq!(world.post_process(main), Some(&graded));
         assert_eq!(
             world.post_process(second),
