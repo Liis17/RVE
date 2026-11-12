@@ -38,12 +38,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Дольше этого Lua-вызов считается зависшим и прерывается, чтобы UI ожил.
+/// Дольше этого вызов скрипта считается зависшим и прерывается, чтобы UI ожил.
 const SCRIPT_TIME_LIMIT: Duration = Duration::from_secs(5);
 
-/// Прерывает Lua, если отмеченный участок выполняется дольше предела.
+/// Прерывает скрипты, если отмеченный участок выполняется дольше предела.
 ///
-/// ABI-скрипты прервать нельзя: зависший Rust-скрипт останавливает весь редактор.
+/// Lua прерывается всегда. Rust-скрипт останавливается на ближайшем вызове API движка или
+/// проверке `Context::is_interrupted`; цикл без них по-прежнему останавливает редактор.
 struct Watchdog {
     shared: Arc<WatchdogShared>,
     thread: Option<JoinHandle<()>>,
@@ -62,12 +63,16 @@ struct WatchdogShared {
 }
 
 impl Watchdog {
-    fn start(interrupt: ScriptInterruptHandle) -> std::io::Result<Self> {
+    fn start(interrupt: ScriptInterruptHandle, limit: Duration) -> std::io::Result<Self> {
+        Self::start_with(move || interrupt.interrupt(), limit)
+    }
+
+    fn start_with(fire: impl Fn() + Send + 'static, limit: Duration) -> std::io::Result<Self> {
         let shared = Arc::new(WatchdogShared::default());
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("rve-editor-watchdog".to_owned())
-            .spawn(move || watch(&thread_shared, &interrupt))?;
+            .spawn(move || watch(&thread_shared, &fire, limit))?;
         Ok(Self {
             shared,
             thread: Some(thread),
@@ -94,7 +99,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-fn watch(shared: &WatchdogShared, interrupt: &ScriptInterruptHandle) {
+/// Пока участок не закрыт, срок после срабатывания взводится снова: Rust-вызов прерывается
+/// однократно, и следующий зависший Rust-вызов того же участка тоже должен быть прерван.
+fn watch(shared: &WatchdogShared, fire: &dyn Fn(), limit: Duration) {
     let mut state = lock(&shared.state);
     while !state.stop {
         state = match state.deadline {
@@ -105,8 +112,8 @@ fn watch(shared: &WatchdogShared, interrupt: &ScriptInterruptHandle) {
             Some(deadline) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    interrupt.interrupt();
-                    state.deadline = None;
+                    fire();
+                    state.deadline = Some(now + limit);
                     continue;
                 }
                 shared
@@ -849,7 +856,7 @@ impl PlaySession {
             }
         }
         let interrupt = ScriptInterruptHandle::new();
-        let watchdog = Watchdog::start(interrupt.clone())
+        let watchdog = Watchdog::start(interrupt.clone(), time_limit)
             .map_err(|error| format!("не удалось запустить watchdog скриптов: {error}"))?;
         watchdog.set_deadline(Some(Instant::now() + time_limit));
         let mut host = ScriptHost::load_with_options(
@@ -2418,6 +2425,24 @@ return Hero
         assert!(!session.drain_events().is_empty());
         // Прерывание постоянно: следующий кадр не должен снова зависнуть.
         session.step(0.1).unwrap();
+    }
+
+    #[test]
+    fn watchdog_fires_again_while_the_section_stays_open() {
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        let watchdog = Watchdog::start_with(
+            move || {
+                let _ = fired_tx.send(());
+            },
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        watchdog.set_deadline(Some(Instant::now()));
+        // Второй зависший Rust-вызов участка получает собственное прерывание.
+        for _ in 0..2 {
+            fired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        watchdog.set_deadline(None);
     }
 
     #[test]

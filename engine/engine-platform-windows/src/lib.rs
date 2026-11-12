@@ -46,6 +46,17 @@ fn user_data_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<P
         })
 }
 
+/// Makes the process ignore Ctrl+C from its console, so the engine is not closed by it. Child
+/// processes inherit the setting; Ctrl+Break and closing the console still terminate.
+pub fn ignore_console_interrupt() -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: a null handler with TRUE only toggles the process-wide Ctrl+C ignore flag.
+    if unsafe { SetConsoleCtrlHandler(None, 1) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Atomically replaces a file using the Windows replace-existing operation.
 pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -122,6 +133,11 @@ pub fn load_vulkan() -> Result<Entry, LoadingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignoring_console_ctrl_c_succeeds_without_a_console_window() {
+        ignore_console_interrupt().unwrap();
+    }
 
     #[test]
     fn native_vulkan_requires_no_additional_platform_extensions() {

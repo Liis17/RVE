@@ -408,7 +408,7 @@ impl Script for AudioPlaybackProbe {
             ctx.set_group_effects(rve_sdk::AudioGroup::Music, &invalid),
             Err(rve_sdk::AudioError::Rejected)
         );
-        ctx.log_info("ABI v25 audio API staged");
+        ctx.log_info("ABI v26 audio API staged");
     }
 }
 
@@ -1609,7 +1609,7 @@ name = "AudioProbe"
 }
 
 #[test]
-fn abi_v25_audio_callbacks_stage_fades_effects_and_playback() {
+fn abi_v26_audio_callbacks_stage_fades_effects_and_playback() {
     let _lock = test_lock();
     let mut world = world(
         r#"
@@ -1655,7 +1655,7 @@ name = "AudioPlaybackProbe"
     assert!(
         message_list(&mut host)
             .iter()
-            .any(|message| message == "ABI v25 audio API staged")
+            .any(|message| message == "ABI v26 audio API staged")
     );
 }
 

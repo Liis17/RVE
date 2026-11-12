@@ -111,16 +111,20 @@ impl fmt::Display for ScriptLoadError {
 
 impl Error for ScriptLoadError {}
 
-/// Cloneable, sticky cancellation signal for Lua execution. ABI callbacks run synchronously and
-/// cannot be interrupted.
+/// Cloneable cancellation signal: sticky for Lua execution, one-shot for the running Rust ABI
+/// callback, which stops cooperatively at its next engine call (ABI v25).
 #[derive(Clone, Debug)]
 pub struct ScriptInterruptHandle {
     interrupted: Arc<AtomicBool>,
+    /// Просьба прервать текущий вызов Rust-скрипта. В отличие от `interrupted` не липкая: host
+    /// сбрасывает её перед каждым ABI-вызовом, и следующие Rust-скрипты работают дальше.
+    heavy: Arc<AtomicBool>,
 }
 
 /// Options that control Lua loading and per-call execution.
 ///
-/// The time limit applies to Lua instruction execution; synchronous Rust ABI callbacks cannot be preempted.
+/// The time limit applies to Lua instruction execution; synchronous Rust ABI callbacks cannot be
+/// preempted and stop only through [`ScriptInterruptHandle::interrupt`].
 #[derive(Clone, Debug, Default)]
 pub struct ScriptLoadOptions {
     pub interrupt: ScriptInterruptHandle,
@@ -135,13 +139,20 @@ impl ScriptInterruptHandle {
     pub fn new() -> Self {
         Self {
             interrupted: Arc::new(AtomicBool::new(false)),
+            heavy: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Interrupts current and future Lua execution, including top-level chunks loaded later.
     /// At the next phase or lite-call boundary, the host disables all lite instances and reports
     /// one host-level interruption event if a lite instance exists; heavy scripts continue to run.
+    ///
+    /// A running Rust ABI callback is asked to stop as well: its next engine call panics inside the
+    /// guest, the call fails and that instance is disabled. Later Rust calls are not affected.
+    /// A Rust loop that never calls the engine nor checks `Context::is_interrupted` cannot be
+    /// stopped.
     pub fn interrupt(&self) {
+        self.heavy.store(true, std::sync::atomic::Ordering::Release);
         self.interrupted
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -729,6 +740,7 @@ impl ScriptHost {
                             commands_generation: &host.commands_generation,
                             command_owner: owner,
                             commands_allowed: false,
+                            interrupt: host.interrupt.heavy.as_ref(),
                         },
                     );
                     host.transaction.discard();
@@ -2048,6 +2060,7 @@ impl ScriptHost {
                         commands_generation: &self.commands_generation,
                         command_owner: owner,
                         commands_allowed: true,
+                        interrupt: self.interrupt.heavy.as_ref(),
                     };
                     script
                         .invoke_command(self.current_time, &name, &command.args, call)
@@ -3232,6 +3245,7 @@ impl ScriptHost {
                         commands_generation,
                         command_owner: index,
                         commands_allowed: true,
+                        interrupt: interrupt.heavy.as_ref(),
                     };
                     if let Err(message) = script.invoke_set_property(
                         time,
@@ -3284,6 +3298,7 @@ impl ScriptHost {
                         commands_generation,
                         command_owner: index,
                         commands_allowed: true,
+                        interrupt: interrupt.heavy.as_ref(),
                     };
                     if let Err(message) = script.invoke_set_property(
                         time,
@@ -3318,6 +3333,7 @@ impl ScriptHost {
                     commands_generation,
                     command_owner: index,
                     commands_allowed: true,
+                    interrupt: interrupt.heavy.as_ref(),
                 };
                 match phase {
                     Phase::Message => match message {
@@ -3838,6 +3854,7 @@ impl ScriptHost {
                         commands_generation: &self.commands_generation,
                         command_owner: owner,
                         commands_allowed: false,
+                        interrupt: self.interrupt.heavy.as_ref(),
                     },
                 );
                 self.transaction.discard();

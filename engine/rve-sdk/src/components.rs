@@ -60,7 +60,7 @@ impl Object {
         let callback = ctx.host.light_get?;
         let mut out = abi::RveLightState::default();
         // SAFETY: the output points to a live stack value for this synchronous callback.
-        let found = unsafe { callback(ctx.host.ctx, self.handle, kind.code(), &mut out) };
+        let found = unsafe { callback(ctx.host.call_ctx(), self.handle, kind.code(), &mut out) };
         found.then_some(out)
     }
 
@@ -73,7 +73,7 @@ impl Object {
     ) -> Result<(), ComponentError> {
         let callback = ctx.host.light_set.ok_or(ComponentError::Unavailable)?;
         // SAFETY: the value points to a live value for this synchronous callback.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, kind.code(), light) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, kind.code(), light) })
     }
 
     /// Whether the mesh renderer is drawn; `None` without a mesh renderer.
@@ -81,7 +81,7 @@ impl Object {
         let callback = ctx.host.mesh_get_visible?;
         let mut visible = false;
         // SAFETY: the output points to a live stack value for this synchronous callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &mut visible) }.then_some(visible)
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut visible) }.then_some(visible)
     }
 
     /// Shows or hides the mesh renderer. Hidden meshes leave the frame.
@@ -95,7 +95,7 @@ impl Object {
             .mesh_set_visible
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: host callback is valid during this script call.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, visible) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, visible) })
     }
 
     /// Replaces the material factors that have their `has_*` flag set.
@@ -109,7 +109,7 @@ impl Object {
             .mesh_set_material_params
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: the params point to a live value for this synchronous callback.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, params) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, params) })
     }
 
     /// Replaces the material of every mesh part with the scene's `.rvemat` at `path`. The path must
@@ -125,7 +125,11 @@ impl Object {
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: the path string remains valid for this synchronous callback.
         component_status(unsafe {
-            callback(ctx.host.ctx, self.handle, abi::RveStr::from_str_ref(path))
+            callback(
+                ctx.host.call_ctx(),
+                self.handle,
+                abi::RveStr::from_str_ref(path),
+            )
         })
     }
 
@@ -134,7 +138,7 @@ impl Object {
         let callback = ctx.host.particles_get_playing?;
         let mut playing = false;
         // SAFETY: the output points to a live stack value for this synchronous callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &mut playing) }.then_some(playing)
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut playing) }.then_some(playing)
     }
 
     /// Starts or stops particle spawning; live particles keep simulating.
@@ -148,7 +152,7 @@ impl Object {
             .particles_set_playing
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: host callback is valid during this script call.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, playing) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, playing) })
     }
 
     /// Restarts the emitter cycle at the end of the current frame.
@@ -172,7 +176,7 @@ impl Object {
             .particles_command
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: host callback is valid during this script call.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, kind, count) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, kind, count) })
     }
 
     /// Reads the environment intensity and sky; `None` without an environment component.
@@ -180,7 +184,7 @@ impl Object {
         let callback = ctx.host.environment_get?;
         let mut out = abi::RveEnvironmentState::default();
         // SAFETY: the output points to a live stack value for this synchronous callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &mut out) }.then_some(out)
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut out) }.then_some(out)
     }
 
     /// Writes the environment intensity and, when `has_sky` is set, the procedural sky.
@@ -194,7 +198,7 @@ impl Object {
             .environment_set
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: the state points to a live value for this synchronous callback.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, state) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, state) })
     }
 
     /// Reads LOD distances (at most [`MAX_LOD_READ`] levels) and the cull distance.
@@ -207,7 +211,7 @@ impl Object {
         // SAFETY: all outputs point to live stack values for this synchronous callback.
         let found = unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 distances.as_mut_ptr(),
                 MAX_LOD_READ,
@@ -233,7 +237,7 @@ impl Object {
         // SAFETY: the slice is valid for `distances.len()` reads during this synchronous callback.
         component_status(unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 distances.as_ptr(),
                 distances.len(),
@@ -248,7 +252,7 @@ impl Object {
         let callback = ctx.host.audio_get_source?;
         let mut out = abi::RveAudioSourceState::default();
         // SAFETY: the output points to a live stack value for this synchronous callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &mut out) }.then_some(out)
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut out) }.then_some(out)
     }
 
     /// Replaces the audio source settings; the clip and `[[assets]]` stay as the scene defines.
@@ -262,18 +266,18 @@ impl Object {
             .audio_set_source
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: the settings point to a live value for this synchronous callback.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, settings) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, settings) })
     }
 }
 
 impl Object {
     /// Reads the audio source's streaming and fade-in settings; `None` without an audio source
-    /// or on a host before ABI v25.
+    /// or on a host before ABI v26.
     pub fn audio_playback(&self, ctx: &Context<'_>) -> Option<abi::RveAudioPlayback> {
         let callback = ctx.host.audio_get_source_playback?;
         let mut out = abi::RveAudioPlayback::default();
         // SAFETY: the output points to a live stack value for this synchronous callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &mut out) }.then_some(out)
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut out) }.then_some(out)
     }
 
     /// Replaces the audio source's streaming and fade-in settings; they apply to its next start.
@@ -287,13 +291,13 @@ impl Object {
             .audio_set_source_playback
             .ok_or(ComponentError::Unavailable)?;
         // SAFETY: the settings point to a live value for this synchronous callback.
-        component_status(unsafe { callback(ctx.host.ctx, self.handle, playback) })
+        component_status(unsafe { callback(ctx.host.call_ctx(), self.handle, playback) })
     }
 }
 
 impl Context<'_> {
     /// Starts a clip like [`Context::play_clip_spatial`] with streaming and fade-in options.
-    /// Needs ABI v25.
+    /// Needs ABI v26.
     pub fn play_clip_playback(
         &mut self,
         path: &str,
@@ -308,7 +312,7 @@ impl Context<'_> {
         // SAFETY: path, params, playback and output storage remain valid during this script call.
         audio_status(unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 abi::RveStr::from_str_ref(path),
                 params,
                 playback,
@@ -332,7 +336,7 @@ impl Context<'_> {
         // SAFETY: path, params and output storage remain valid during this script call.
         audio_status(unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 abi::RveStr::from_str_ref(path),
                 params,
                 &mut voice,
@@ -351,6 +355,6 @@ impl Context<'_> {
             .audio_set_voice_position
             .ok_or(AudioError::Unavailable)?;
         // SAFETY: the position points to a live value for this synchronous callback.
-        audio_status(unsafe { callback(self.host.ctx, voice, &position) })
+        audio_status(unsafe { callback(self.host.call_ctx(), voice, &position) })
     }
 }
