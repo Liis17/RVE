@@ -743,10 +743,13 @@ impl Core {
                     self.fail(&path, message);
                 }
             }
+            // Сбой посреди воспроизведения может быть разовым (I/O): голос доигрывает кольцо,
+            // а клип не помечается ошибочным, чтобы следующие запуски и ожидающие голоса жили.
             StreamEvent::Broken { path, message } => {
-                if !self.failed.contains(&path) {
-                    self.fail(&path, message);
-                }
+                let message =
+                    format!("аудиострим {path}: {message}; голос доиграет буфер и остановится");
+                log::warn!("{message}");
+                let _ = self.events.send(AudioEvent::Failed(message));
             }
         }
     }

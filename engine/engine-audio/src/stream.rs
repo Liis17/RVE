@@ -514,11 +514,10 @@ fn refill(active: &mut Vec<Active>, events: &Sender<StreamEvent>) {
     active.retain(|stream| !stream.frames.is_abandoned());
     for stream in active.iter_mut() {
         if let Err(error) = stream.fill() {
-            let message = error.to_string();
-            log::warn!("аудиострим {}: {message}", stream.path);
+            // Лог пишет поток `rve-audio` вместе с событием `Failed`.
             let _ = events.send(StreamEvent::Broken {
                 path: stream.path.clone(),
-                message,
+                message: error.to_string(),
             });
         }
     }

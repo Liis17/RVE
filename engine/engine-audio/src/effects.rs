@@ -17,6 +17,17 @@ const SCALE_ROOM: f32 = 0.28;
 const OFFSET_ROOM: f32 = 0.7;
 const SCALE_DAMP: f32 = 0.4;
 const ALLPASS_FEEDBACK: f32 = 0.5;
+/// Значения хвоста меньше этого обнуляются: затухающие субнормальные числа резко замедляют
+/// арифметику на x86 и могли бы привести к underrun в callback.
+const DENORMAL_FLOOR: f32 = 1.0e-20;
+
+fn flush_denormal(value: f32) -> f32 {
+    if value.abs() < DENORMAL_FLOOR {
+        0.0
+    } else {
+        value
+    }
+}
 
 /// Biquad (RBJ cookbook, transposed direct form II) по двум каналам.
 #[derive(Clone, Copy, Default)]
@@ -88,8 +99,8 @@ impl Comb {
 
     fn process(&mut self, input: f32, feedback: f32, damp: f32) -> f32 {
         let output = self.buffer[self.index];
-        self.filter_store = output * (1.0 - damp) + self.filter_store * damp;
-        self.buffer[self.index] = input + self.filter_store * feedback;
+        self.filter_store = flush_denormal(output * (1.0 - damp) + self.filter_store * damp);
+        self.buffer[self.index] = flush_denormal(input + self.filter_store * feedback);
         self.index = (self.index + 1) % self.buffer.len();
         output
     }
@@ -116,7 +127,7 @@ impl Allpass {
     fn process(&mut self, input: f32) -> f32 {
         let delayed = self.buffer[self.index];
         let output = delayed - input;
-        self.buffer[self.index] = input + delayed * ALLPASS_FEEDBACK;
+        self.buffer[self.index] = flush_denormal(input + delayed * ALLPASS_FEEDBACK);
         self.index = (self.index + 1) % self.buffer.len();
         output
     }

@@ -774,21 +774,36 @@ fn stream_that_fails_to_open_reports_once_and_later_plays_end_at_once() {
 }
 
 #[test]
-fn stream_broken_mid_play_reports_the_clip_once() {
+fn stream_broken_mid_play_reports_but_does_not_poison_the_clip() {
     let mut h = Harness::new();
-    for _ in 0..2 {
-        h.core.stream_event(StreamEvent::Broken {
-            path: "music/theme.ogg".into(),
-            message: "чтение: диск недоступен".into(),
-        });
-    }
-    let failures = h
-        .handle
-        .poll_events()
-        .into_iter()
-        .filter(|event| matches!(event, AudioEvent::Failed(_)))
-        .count();
-    assert_eq!(failures, 1);
+    h.handle
+        .play(voice(1), "music/theme.ogg", stream_request(false))
+        .unwrap();
+    h.step();
+    let _ = h.stream_jobs.try_recv().unwrap();
+    h.core.stream_event(StreamEvent::Broken {
+        path: "music/theme.ogg".into(),
+        message: "чтение: диск недоступен".into(),
+    });
+    let events = h.handle.poll_events();
+    assert!(
+        matches!(events.as_slice(), [AudioEvent::Failed(message)] if message.contains("диск недоступен")),
+        "{events:?}"
+    );
+    assert_eq!(
+        h.handle.lane_of(voice(1)),
+        Some(0),
+        "ожидающий голос того же клипа жив"
+    );
+
+    h.handle
+        .play(voice(2), "music/theme.ogg", stream_request(false))
+        .unwrap();
+    h.step();
+    assert!(
+        h.stream_jobs.try_recv().is_ok(),
+        "клип можно запустить снова"
+    );
 }
 
 #[test]
