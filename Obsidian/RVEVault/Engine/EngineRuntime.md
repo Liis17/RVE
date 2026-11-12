@@ -107,7 +107,7 @@ load_scene и load_prefab_template через engine/engine-runtime/src/scene.rs
 
 Подготавливаются все объявленные в `[[assets]]` `.rvemat` сцены и шаблонов префабов (`prepare_scene_with_model_loader`, `prepare_template`), а не только слоты: скрипт назначает их через `set_material`.
 
-Замена материала скриптом (`MaterialSync` в `scripts_thread`, `pipeline.rs`): `World` отдаёт изменённые объекты (`take_mesh_material_changes`), на каждый объект уходит не больше одной заявки `RenderResourceRequest::Material` с текущими уровнями `GpuSceneTable.by_object`, CPU-описанием модели, переопределениями и путём. `set_material` принимает `.rvemat`, объявленный в ассетах сцены либо в шаблоне prefab этого объекта. Объекты сцены и быстрых prefab используют подготовленные ресурсы сцены. Для тяжёлого prefab `PrefabReady` передаёт CPU-описания уровней, а render thread хранит его `PreparedMaterialAssets` по `PrefabToken`; при разрешении слота проверяются ресурсы prefab и затем общие ресурсы сцены. Эти CPU-ресурсы удаляются при отложенном `Release` точного токена.
+Замена материала скриптом (`MaterialSync` в `pipeline/materials.rs`, вызывается из `scripts_thread` в `pipeline/scripts.rs`): `World` отдаёт изменённые объекты (`take_mesh_material_changes`), на каждый объект уходит не больше одной заявки `RenderResourceRequest::Material` с текущими уровнями `GpuSceneTable.by_object`, CPU-описанием модели, переопределениями и путём. `set_material` принимает `.rvemat`, объявленный в ассетах сцены либо в шаблоне prefab этого объекта. Объекты сцены и быстрых prefab используют подготовленные ресурсы сцены. Для тяжёлого prefab `PrefabReady` передаёт CPU-описания уровней, а render thread хранит его `PreparedMaterialAssets` по `PrefabToken`; при разрешении слота проверяются ресурсы prefab и затем общие ресурсы сцены. Эти CPU-ресурсы удаляются при отложенном `Release` точного токена.
 
 Render thread (`VulkanBackend::submit_material`) вызывает `upload_object_levels`; текстуры и шейдеры переиспользуются через `MaterialUploadCaches`. Зависимости созданных материалов учитываются по `MaterialId` и освобождаются после отложенного `ReleaseMaterials`, когда последний snapshot перестал ссылаться на материал; ресурсы сцены закреплены до завершения renderer. Владение и освобождение ресурсов описаны в [[#Тяжёлые префабы]]. Меши остаются прежними. Только успешный ответ `ScriptReply::Material` заменяет уровни объекта; изменение ревизии во время заявки ставит повтор. Частичные GPU-материалы уничтожаются при ошибке upload, а прежние уровни сохраняются. Созданные материалы принадлежат объекту (`MaterialOwnership`): при следующей замене или удалении объекта они освобождаются через `ReleaseMaterials` после snapshot с `last_seq = frame_number`; материалы загрузки сцены не входят в это владение, потому что могут быть общими. Ответ для уже удалённого объекта освобождает новые материалы сразу. Остаточные renderer-ресурсы уничтожаются при завершении renderer. Headless-ответчик отвечает ошибкой.
 
@@ -148,7 +148,7 @@ Scripts thread регистрирует каждый быстрый шаблон
 - Скриптовый цикл: `sleep()` вызывается до `clock.now()`, затем `SimulationStart`, `InputSample` перед `take_frame()`, `SimulationEnd` после `make_snapshot`. Идентификатор кадра — `frame_number` (он же `snapshot.sequence`).
 - В background-режиме ни sleep, ни маркеров нет: id кадра в этом режиме до present не доходит.
 - Render thread перед `render_frame*` вызывает `set_latency_frame(snapshot.sequence)` в `VulkanBackend::render`.
-- Без handle (Reflex выключен или не поддержан) цикл работает как прежде. Тесты: `reflex_sleep_and_markers_run_in_order_for_the_submitted_sequence`, `reflex_is_not_called_while_scripts_run_in_background`, `scripts_produce_frames_without_a_reflex_handle` (`pipeline.rs`).
+- Без handle (Reflex выключен или не поддержан) цикл работает как прежде. Тесты: `reflex_sleep_and_markers_run_in_order_for_the_submitted_sequence`, `reflex_is_not_called_while_scripts_run_in_background`, `scripts_produce_frames_without_a_reflex_handle` (`pipeline/tests.rs`).
 
 ## Сеть и rve-server
 
@@ -160,7 +160,7 @@ Scripts thread регистрирует каждый быстрый шаблон
 - Пароль берётся из `--password-file` или переменной `RVE_NET_PASSWORD` (контракт — [[Engine/EngineNetwork]]).
 - Два `rve-player` на одной машине требуют `AllowMultipleInstances=true` в bootstrap: singleton lock по `ProjectSettings.id` берёт только player с окном.
 
-Мост подключается до `ScriptHost::start` на потоке скриптов: `on_start` уже видит режим сети. Реализация `WorldSink` — `ScriptNetSink` в `engine/engine-runtime/src/net.rs`; шаги моста вызываются вокруг `update` и применения spawn и despawn (`pipeline.rs`).
+Мост подключается до `ScriptHost::start` на потоке скриптов: `on_start` уже видит режим сети. Реализация `WorldSink` — `ScriptNetSink` в `engine/engine-runtime/src/net.rs`; шаги моста вызываются вокруг `update` и применения spawn и despawn (`pipeline/scripts.rs`).
 
 ### Headless-путь `run_server`
 
@@ -198,7 +198,8 @@ Scripts thread регистрирует каждый быстрый шаблон
 | `engine/engine-runtime/src/hardware.rs` | чистое решение по device/RAM/CPU требованиям |
 | `engine/engine-runtime/src/module_host.rs` | именованные потоки, stop/join в обратном порядке, panic collection и detach |
 | `engine/engine-runtime/src/scene.rs` | CPU-preload сцены и загрузка GPU-таблицы ресурсов |
-| `engine/engine-runtime/src/pipeline.rs` | snapshots, script/render loops, fakeable backend и status guard |
+| `engine/engine-runtime/src/pipeline.rs` | общие контракты потоков: `FrameSnapshot`, `GpuSceneTable`, `ScriptControl`, `RenderControl`, `RuntimeStatus`, `Clock`, `RenderBackend`, конфигурации потоков |
+| `engine/engine-runtime/src/pipeline/` | `scripts.rs` — поток скриптов; `render_thread.rs` — render loop и отложенное освобождение; `backend.rs` — `VulkanBackend`; `snapshot.rs` — сборка `FrameSnapshot`, свет, окружение и `render_post_process`; `changes.rs`, `physics.rs`, `materials.rs`, `prefab_sync.rs`, `particles.rs`, `script_events.rs` — синхронизация мира с физикой, звуком, материалами, префабами и консолью; тесты в `tests.rs` и `*_tests.rs` |
 | `engine/engine-runtime/src/input.rs` | `InputAccumulator`, переходы состояния и кадровые input snapshots |
 | `engine/engine-runtime/src/player.rs` | `WindowHandler`, F8 debug-view control, renderer handoff и shutdown окна |
 | `engine/engine-runtime/src/cursor.rs` | `CursorControl`: состояние курсора скриптов и консоли, отправка в окно и отложенная отправка при подключении |
