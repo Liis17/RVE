@@ -9,4 +9,5 @@ base64.workspace = true
 flume.workspace = true
 getrandom.workspace = true
 serde_json.workspace = true
+blake3.workspace = true
 tiny_http.workspace = true

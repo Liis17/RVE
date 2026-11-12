@@ -1001,6 +1001,7 @@ name = "engine-mcp"
 version = "0.2.0"
 dependencies = [
  "base64",
+ "blake3",
  "flume",
  "getrandom 0.4.3",
  "serde_json",

@@ -790,8 +790,9 @@ impl EditorApp {
         let Some(mut settings) = self.preferences.take_pending() else {
             return;
         };
+        settings.hash_known_token();
         if settings.enabled
-            && settings.token.is_empty()
+            && settings.token_hash.is_empty()
             && let Err(error) = settings.regenerate_token()
         {
             self.state
@@ -2795,7 +2796,7 @@ impl WindowHandler for EditorApp {
         {
             self.state.log.error(error);
         }
-        if self.user_settings.mcp.enabled && self.user_settings.mcp.token.is_empty() {
+        if self.user_settings.mcp.enabled && self.user_settings.mcp.token_hash.is_empty() {
             if let Err(error) = self.user_settings.mcp.regenerate_token() {
                 self.state
                     .log
