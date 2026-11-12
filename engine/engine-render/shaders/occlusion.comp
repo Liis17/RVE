@@ -1,6 +1,8 @@
 #version 450
 
-// Occlusion culling вида. Для каждого draw пишет VkDrawIndexedIndirectCommand (5 uint).
+// Occlusion culling вида. Для каждого draw пишет VkDrawIndexedIndirectCommand (5 uint):
+// instanceCount 0 или 1 и firstInstance — слот экземпляра draw'а, поэтому instanced-батч
+// рисуется одним multi-draw indirect вызовом.
 //
 // Режим 0 (early) готовит в `visible` аргументы первой фазы depth prepass: draw рисуется, если
 // был виден в прошлом кадре этой цели (`history`). Режим 1 (cull) проверяет мировую AABB по Hi-Z,
@@ -43,23 +45,25 @@ layout(push_constant) uniform PushConstants {
     mat4 view_projection;
     // x, y — размер depth в пикселях; z, w — размер нулевого уровня Hi-Z.
     vec4 sizes;
-    // x — число draw'ов; y — режим; z — число уровней Hi-Z.
+    // x — число draw'ов; y — режим; z — число уровней Hi-Z; w — слот экземпляра draw'а 0.
     uvec4 params;
 } push_constants;
 
-void write_command(uint base, uint index_count, uint instance_count, bool late_target) {
+void write_command(uint index, uint index_count, uint instance_count, bool late_target) {
+    uint base = index * 5u;
+    uint first_instance = push_constants.params.w + index;
     if (late_target) {
         late.args[base] = index_count;
         late.args[base + 1u] = instance_count;
         late.args[base + 2u] = 0u;
         late.args[base + 3u] = 0u;
-        late.args[base + 4u] = 0u;
+        late.args[base + 4u] = first_instance;
     } else {
         visible.args[base] = index_count;
         visible.args[base + 1u] = instance_count;
         visible.args[base + 2u] = 0u;
         visible.args[base + 3u] = 0u;
-        visible.args[base + 4u] = 0u;
+        visible.args[base + 4u] = first_instance;
     }
 }
 
@@ -126,18 +130,17 @@ void main() {
         return;
     }
     DrawInput draw = inputs.draws[index];
-    uint base = index * 5u;
     bool tested = (draw.meta.y & FLAG_TEST) != 0u;
     if (push_constants.params.y == 0u) {
         // История могла остаться от другого набора draw'ов или быть неинициализированной:
         // это меняет только число окклюдеров первой фазы.
         uint early = tested ? min(history.values[index], 1u) : 1u;
-        write_command(base, draw.meta.x, early, false);
+        write_command(index, draw.meta.x, early, false);
         return;
     }
-    uint early = visible.args[base + 1u];
+    uint early = visible.args[index * 5u + 1u];
     bool now_visible = !tested || is_visible(draw);
     history.values[index] = now_visible ? 1u : 0u;
-    write_command(base, draw.meta.x, (now_visible || early != 0u) ? 1u : 0u, false);
-    write_command(base, draw.meta.x, (now_visible && early == 0u) ? 1u : 0u, true);
+    write_command(index, draw.meta.x, (now_visible || early != 0u) ? 1u : 0u, false);
+    write_command(index, draw.meta.x, (now_visible && early == 0u) ? 1u : 0u, true);
 }

@@ -2456,11 +2456,11 @@ fn render_scene_frame(
         &scene_frame,
         &particle_commands,
         particle_dt,
-        scene_camera.position,
-        game_camera.position,
+        scene_camera,
+        game_camera,
         grid_camera_distance,
         parts.animation,
-        capture_camera.as_ref().map(|camera| camera.camera.position),
+        capture_camera.as_ref().map(|camera| camera.camera),
     )?;
     scene.sync_environment(renderer, scene_frame.environment.as_ref(), parts.log)?;
     let scene_shadow_cascades = scene_size.map_or_else(Vec::new, |[width, height]| {

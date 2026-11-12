@@ -4,7 +4,9 @@
 //! видимые в прошлом кадре этой цели; из её глубины строится Hi-Z (максимум глубины по
 //! блокам 2x2), и `occlusion.comp` проверяет мировую AABB каждого draw'а. Вторая фаза
 //! дорисовывает в prepass draw'ы, ставшие видимыми, а основной и прозрачный проходы рисуют
-//! через `vkCmdDrawIndexedIndirect` видимые и уже записанные в глубину первой фазой. Ошибочная
+//! видимые и уже записанные в глубину первой фазой. Каждый instanced-батч остаётся одним
+//! multi-draw `vkCmdDrawIndexedIndirect`: команда draw'а несёт `instanceCount` 0/1 и
+//! `firstInstance` его экземпляра. Ошибочная
 //! история влияет только на число окклюдеров первой фазы, но не на корректность: итоговый
 //! тест консервативен.
 //!
@@ -496,6 +498,7 @@ pub(crate) fn record_early(
     command_buffer: vk::CommandBuffer,
     pipelines: OcclusionPipelines,
     target: &OcclusionTarget,
+    instance_base: u32,
 ) {
     // Прошлый кадр цели читал аргументы как indirect и писал их и историю compute-шейдером.
     memory_barrier(
@@ -513,18 +516,21 @@ pub(crate) fn record_early(
         target,
         [[0.0; 4]; 4],
         MODE_EARLY,
+        instance_base,
     );
     publish_indirect(device, command_buffer);
 }
 
 /// Строит Hi-Z из depth первой фазы и пишет итоговые аргументы и аргументы второй фазы.
-/// Depth цели должен быть в `SHADER_READ_ONLY_OPTIMAL`.
+/// Depth цели должен быть в `SHADER_READ_ONLY_OPTIMAL`. `instance_base` — слот экземпляра
+/// первого draw'а вида в буфере экземпляров кадра.
 pub(crate) fn record_cull(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     pipelines: OcclusionPipelines,
     target: &mut OcclusionTarget,
     view_projection: [[f32; 4]; 4],
+    instance_base: u32,
 ) {
     let (source_stage, source_access) = if target.hiz_layout == vk::ImageLayout::UNDEFINED {
         (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
@@ -604,6 +610,7 @@ pub(crate) fn record_cull(
         target,
         view_projection,
         MODE_CULL,
+        instance_base,
     );
     publish_indirect(device, command_buffer);
 }
@@ -615,6 +622,7 @@ fn dispatch_cull(
     target: &OcclusionTarget,
     view_projection: [[f32; 4]; 4],
     mode: u32,
+    instance_base: u32,
 ) {
     let mut push = [0_u8; CULL_PUSH_CONSTANTS_SIZE];
     let floats = view_projection.into_iter().flatten().chain([
@@ -626,7 +634,12 @@ fn dispatch_cull(
     for (chunk, value) in push.as_chunks_mut::<4>().0.iter_mut().zip(floats) {
         chunk.copy_from_slice(&value.to_ne_bytes());
     }
-    let params = [target.draw_count, mode, target.mip_extents.len() as u32, 0];
+    let params = [
+        target.draw_count,
+        mode,
+        target.mip_extents.len() as u32,
+        instance_base,
+    ];
     for (chunk, value) in push[80..].as_chunks_mut::<4>().0.iter_mut().zip(params) {
         chunk.copy_from_slice(&value.to_ne_bytes());
     }
