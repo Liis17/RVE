@@ -53,8 +53,10 @@ use ambient_occlusion::{AoPipelines, AoRecord, AoTarget, record_ambient_occlusio
 use bloom::{
     BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
 };
+#[cfg(windows)]
+use exposure::{EXPOSURE_SCALE_OFFSET, buffer_barrier as exposure_buffer_barrier};
 use exposure::{
-    ExposureHistory, ExposurePipelines, ExposureRecord, ExposureResources, ExposureTarget,
+    ExposureFrame, ExposureHistory, ExposurePipelines, ExposureResources, ExposureTarget,
     ViewExposure, exposure_record, prepare_view_exposure, record_exposure,
     write_composite_exposure,
 };
@@ -1180,14 +1182,15 @@ pub enum GpuPass {
     Wireframe,
     /// Частицы: spawn, симуляция и аддитивные billboards.
     Particles,
+    /// Адаптация экспозиции по гистограмме HDR цели сцены до temporal resolve; отсутствует при
+    /// ручной экспозиции.
+    Exposure,
     /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
     TemporalResolve,
     /// Экранные шейдеры до motion blur и DoF; отсутствуют без пользовательских шейдеров.
     ScreenShaderBefore,
     /// Motion blur и depth of field; отсутствуют, если эффекты выключены.
     Filters,
-    /// Адаптация экспозиции по гистограмме; отсутствует при ручной экспозиции.
-    Exposure,
     /// Bloom: prefilter, downsample и upsample; отсутствует, если эффект выключен.
     Bloom,
     /// Composite: tonemap до вывода на swapchain.
@@ -1211,10 +1214,10 @@ impl GpuPass {
         Self::Transparent,
         Self::Wireframe,
         Self::Particles,
+        Self::Exposure,
         Self::TemporalResolve,
         Self::ScreenShaderBefore,
         Self::Filters,
-        Self::Exposure,
         Self::Bloom,
         Self::Tonemap,
         Self::ScreenShaderAfter,
@@ -2766,6 +2769,8 @@ impl Renderer {
             &mut self.screen_temporal.exposure_resources,
             post_frame.plan.auto_exposure,
             frame.reset_history,
+            render_extent,
+            exposure_dt_ms,
         )?;
         let frame_resources = self
             .frames
@@ -3242,7 +3247,10 @@ impl Renderer {
                     #[cfg(windows)]
                     fsr,
                     #[cfg(windows)]
-                    exposure_ev: view.post.exposure.ev,
+                    exposure: UpscalerExposure::new(
+                        view.post.exposure.ev,
+                        view_exposure.adaptation.map(|_| view_exposure.buffer),
+                    ),
                     #[cfg(windows)]
                     frame_time_delta_ms,
                     #[cfg(windows)]
@@ -3330,7 +3338,7 @@ impl Renderer {
         let temporal_submissions = [TemporalSubmission {
             view: TemporalViewId::Screen,
             plan: temporal_plan,
-            exposure: view_exposure.adaptation.is_some(),
+            exposure: view_exposure.adaptation,
             layouts: view
                 .anti_aliasing
                 .is_temporal()
@@ -4308,6 +4316,8 @@ impl Renderer {
                     &mut entry.temporal.exposure_resources,
                     pass.post.plan.auto_exposure,
                     pass.reset_history,
+                    target.render_extent,
+                    pass.exposure_dt_ms,
                 )?;
                 record_scene(
                     &device,
@@ -4340,16 +4350,31 @@ impl Renderer {
                     }
                     _ => None,
                 };
+                // Экспозиция замеряется по HDR цели сцены до temporal resolve: FSR/DLSS и composite
+                // получают EV этого кадра.
+                let adapted_exposure = exposure_record(
+                    &target.exposure,
+                    pass.exposure_pipelines,
+                    view_exposure,
+                    &pass.view.post,
+                )
+                .map(|record| {
+                    record_exposure(
+                        &device,
+                        command_buffer,
+                        &target.scene.color,
+                        &mut target.scene.layout,
+                        target.render_extent,
+                        record,
+                        pass.timestamps,
+                    );
+                    exposure_buffer
+                });
+                #[cfg(not(windows))]
+                let _ = adapted_exposure;
                 let passes = PostPasses {
                     filters,
                     sampler: target_resources.post_sampler,
-                    exposure: exposure_record(
-                        &target.exposure,
-                        pass.exposure_pipelines,
-                        view_exposure,
-                        &pass.view.post,
-                        pass.exposure_dt_ms,
-                    ),
                     bloom: bloom_record(
                         target.bloom.as_mut(),
                         pass.bloom_pipelines,
@@ -4422,7 +4447,10 @@ impl Renderer {
                             #[cfg(windows)]
                             fsr,
                             #[cfg(windows)]
-                            exposure_ev: pass.view.post.exposure.ev,
+                            exposure: UpscalerExposure::new(
+                                pass.view.post.exposure.ev,
+                                adapted_exposure,
+                            ),
                             #[cfg(windows)]
                             frame_time_delta_ms: *_frame_delta_ms,
                             #[cfg(windows)]
@@ -4537,7 +4565,7 @@ impl Renderer {
                 temporal_submissions.push(TemporalSubmission {
                     view: TemporalViewId::Viewport(*viewport),
                     plan: pass.temporal_plan,
-                    exposure: view_exposure.adaptation.is_some(),
+                    exposure: view_exposure.adaptation,
                     layouts: temporal_outcome
                         .as_ref()
                         .is_some_and(|outcome| outcome.used_taa)
@@ -10112,8 +10140,9 @@ enum TemporalViewId {
 struct TemporalSubmission {
     view: TemporalViewId,
     plan: TemporalPlan,
-    /// Кадр вида адаптирует экспозицию; состояние адаптации фиксируется после успешного submit.
-    exposure: bool,
+    /// Решение адаптации экспозиции кадра вида (`None` — ручной кадр); фиксируется после
+    /// успешного submit.
+    exposure: Option<ExposureFrame>,
     layouts: Option<[vk::ImageLayout; 2]>,
     #[cfg(windows)]
     fsr_used: bool,
@@ -10920,7 +10949,7 @@ struct TemporalResolveRecord<'a> {
     #[cfg(windows)]
     fsr: Option<&'a mut FsrView>,
     #[cfg(windows)]
-    exposure_ev: f32,
+    exposure: UpscalerExposure,
     #[cfg(windows)]
     frame_time_delta_ms: f32,
     #[cfg(windows)]
@@ -10994,7 +11023,7 @@ fn record_temporal_resolve_and_tonemap(
             scene,
             fsr,
             resolve.plan,
-            resolve.exposure_ev,
+            resolve.exposure,
             resolve.frame_time_delta_ms,
             resolve.camera,
         ) {
@@ -11020,7 +11049,7 @@ fn record_temporal_resolve_and_tonemap(
             dlss,
             api,
             resolve.plan,
-            resolve.exposure_ev,
+            resolve.exposure,
             resolve.frame_time_delta_ms,
         ) {
             Ok(()) => {
@@ -11099,6 +11128,123 @@ fn record_temporal_resolve_and_tonemap(
     })
 }
 
+/// Экспозиция, которую получает FSR/DLSS.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum UpscalerExposure {
+    /// Ручная экспозиция: множитель `exp2(ev)` записывается очисткой изображения.
+    Manual(f32),
+    /// Auto exposure: множитель `exp2(ev + adapted_ev)` текущего кадра копируется из буфера вида.
+    /// Адаптация этого кадра уже записана: экспозиция замеряется до temporal resolve.
+    Adapted(vk::Buffer),
+}
+
+#[cfg(windows)]
+impl UpscalerExposure {
+    /// Выбирает источник: адаптированный буфер, только если кадр вида записывает адаптацию.
+    fn new(ev: f32, adapted: Option<vk::Buffer>) -> Self {
+        adapted.map_or(Self::Manual(ev), Self::Adapted)
+    }
+}
+
+/// Записывает 1×1 изображение экспозиции апскейлера и переводит его в чтение стадией `consumer_stage`.
+#[cfg(windows)]
+fn write_upscaler_exposure(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    layout: &mut vk::ImageLayout,
+    exposure: UpscalerExposure,
+    consumer_stage: vk::PipelineStageFlags2,
+) {
+    let (source_stage, source_access) = if *layout == vk::ImageLayout::UNDEFINED {
+        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+    } else {
+        (consumer_stage, vk::AccessFlags2::SHADER_SAMPLED_READ)
+    };
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            image,
+            *layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            source_stage,
+            source_access,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            color_subresource_range(),
+        ),
+    );
+    match exposure {
+        UpscalerExposure::Manual(ev) => {
+            let value = [fsr::exposure_value(ev), 0.0, 0.0, 0.0];
+            // SAFETY: the 1x1 exposure image is in TRANSFER_DST_OPTIMAL and the range covers its only subresource.
+            unsafe {
+                device.cmd_clear_color_image(
+                    command_buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { float32: value },
+                    &[color_subresource_range()],
+                )
+            };
+        }
+        UpscalerExposure::Adapted(buffer) => {
+            // Усреднение экспозиции этого кадра записало множитель в compute-стадии.
+            exposure_buffer_barrier(
+                device,
+                command_buffer,
+                buffer,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            );
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(EXPOSURE_SCALE_OFFSET)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                })];
+            // SAFETY: the buffer holds the R32 scale at a texel-aligned offset and the 1x1 image
+            // is in TRANSFER_DST_OPTIMAL.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                )
+            };
+        }
+    }
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            consumer_stage,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        ),
+    );
+    *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn record_fsr_pass(
@@ -11107,7 +11253,7 @@ fn record_fsr_pass(
     scene: &mut OffscreenTarget,
     fsr: &mut FsrView,
     plan: TemporalPlan,
-    exposure_ev: f32,
+    exposure: UpscalerExposure,
     frame_time_delta_ms: f32,
     camera: [f32; 3],
 ) -> Result<(), String> {
@@ -11129,54 +11275,14 @@ fn record_fsr_pass(
         );
         scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
-    let exposure_src = if fsr.exposure_layout == vk::ImageLayout::UNDEFINED {
-        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
-    } else {
-        (
-            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        )
-    };
-    pipeline_barrier(
+    write_upscaler_exposure(
         device,
         command_buffer,
-        image_layout_barrier(
-            fsr.exposure.image,
-            fsr.exposure_layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            exposure_src.0,
-            exposure_src.1,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            color_subresource_range(),
-        ),
+        fsr.exposure.image,
+        &mut fsr.exposure_layout,
+        exposure,
+        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
     );
-    let exposure = [fsr::exposure_value(exposure_ev), 0.0, 0.0, 0.0];
-    // SAFETY: the 1x1 exposure image is in TRANSFER_DST_OPTIMAL and the range covers its only subresource.
-    unsafe {
-        device.cmd_clear_color_image(
-            command_buffer,
-            fsr.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &vk::ClearColorValue { float32: exposure },
-            &[color_subresource_range()],
-        )
-    };
-    pipeline_barrier(
-        device,
-        command_buffer,
-        image_layout_barrier(
-            fsr.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-            color_subresource_range(),
-        ),
-    );
-    fsr.exposure_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
     if fsr.output_layout == vk::ImageLayout::UNDEFINED {
         pipeline_barrier(
@@ -11262,7 +11368,7 @@ fn record_dlss_pass(
     dlss_view: &mut DlssView,
     api: &dlss::NgxApi,
     plan: TemporalPlan,
-    exposure_ev: f32,
+    exposure: UpscalerExposure,
     frame_time_delta_ms: f32,
 ) -> Result<(), String> {
     for (image, layout, range) in [
@@ -11298,54 +11404,14 @@ fn record_dlss_pass(
         }
     }
 
-    let exposure_source = if dlss_view.exposure_layout == vk::ImageLayout::UNDEFINED {
-        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
-    } else {
-        (
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        )
-    };
-    pipeline_barrier(
+    write_upscaler_exposure(
         device,
         command_buffer,
-        image_layout_barrier(
-            dlss_view.exposure.image,
-            dlss_view.exposure_layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            exposure_source.0,
-            exposure_source.1,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            color_subresource_range(),
-        ),
+        dlss_view.exposure.image,
+        &mut dlss_view.exposure_layout,
+        exposure,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
     );
-    let exposure = [fsr::exposure_value(exposure_ev), 0.0, 0.0, 0.0];
-    // SAFETY: the 1x1 exposure image is in TRANSFER_DST_OPTIMAL and the range covers its only subresource.
-    unsafe {
-        device.cmd_clear_color_image(
-            command_buffer,
-            dlss_view.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &vk::ClearColorValue { float32: exposure },
-            &[color_subresource_range()],
-        )
-    };
-    pipeline_barrier(
-        device,
-        command_buffer,
-        image_layout_barrier(
-            dlss_view.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-            color_subresource_range(),
-        ),
-    );
-    dlss_view.exposure_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
     let (output_stage, output_access) = offscreen_previous_use(dlss_view.output_layout);
     pipeline_barrier(
@@ -11500,16 +11566,27 @@ fn record_frame(
         }
         _ => None,
     };
+    // Экспозиция замеряется по HDR цели сцены до temporal resolve: FSR/DLSS и composite
+    // получают EV этого кадра.
+    if let Some(record) = exposure_record(
+        &target.exposure,
+        scene.exposure_pipelines,
+        exposure,
+        &view.post,
+    ) {
+        record_exposure(
+            device,
+            command_buffer,
+            &target.scene.color,
+            &mut target.scene.layout,
+            target.render_extent,
+            record,
+            scene.timestamps,
+        );
+    }
     let passes = PostPasses {
         filters,
         sampler: post_sampler,
-        exposure: exposure_record(
-            &target.exposure,
-            scene.exposure_pipelines,
-            exposure,
-            &view.post,
-            scene.exposure_dt_ms,
-        ),
         bloom: bloom_record(
             target.bloom.as_mut(),
             scene.bloom_pipelines,
@@ -12954,7 +13031,6 @@ fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
 /// Проходы постобработки вида, которые записываются перед composite.
 struct PostPasses<'a> {
     filters: Option<FilterRecord<'a>>,
-    exposure: Option<ExposureRecord>,
     bloom: Option<BloomRecord<'a>>,
     exposure_buffer: vk::Buffer,
     sampler: vk::Sampler,
@@ -12982,7 +13058,6 @@ fn record_tonemap_pass(
 ) -> vk::ImageView {
     let PostPasses {
         mut filters,
-        exposure,
         bloom,
         exposure_buffer,
         sampler,
@@ -13031,17 +13106,6 @@ fn record_tonemap_pass(
         _ => (source, source_layout),
     };
     write_image_set(device, set, final_image.view, sampler);
-    if let Some(record) = exposure {
-        record_exposure(
-            device,
-            command_buffer,
-            final_image,
-            &mut final_layout,
-            extent,
-            record,
-            timestamps,
-        );
-    }
     let bloom_view = bloom.map(|record| {
         record_bloom(
             device,

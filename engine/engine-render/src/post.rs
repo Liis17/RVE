@@ -580,19 +580,27 @@ pub fn composite_params(
 /// Число бинов гистограммы экспозиции (совпадает с exposure_histogram.wgsl).
 pub const EXPOSURE_BINS: usize = 256;
 /// Push constants усредняющего прохода экспозиции: тайминг и диапазон адаптации.
-/// Раскладка: timing = (dt, скорость роста, скорость падения, snap); range = (min, max, low, high).
+/// Раскладка: timing = (dt, скорость роста, скорость падения, snap); range = (min, max, low, high);
+/// compensation = (ручной EV, резерв) — для множителя экспозиции FSR/DLSS.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExposureAverageParams {
     pub timing: [f32; 4],
     pub range: [f32; 4],
+    pub compensation: [f32; 4],
 }
 
 impl ExposureAverageParams {
     /// Байты push constants в порядке записи.
-    pub fn to_bytes(self) -> [u8; 32] {
-        let mut bytes = [0; 32];
-        for (index, value) in self.timing.iter().chain(&self.range).enumerate() {
+    pub fn to_bytes(self) -> [u8; 48] {
+        let mut bytes = [0; 48];
+        for (index, value) in self
+            .timing
+            .iter()
+            .chain(&self.range)
+            .chain(&self.compensation)
+            .enumerate()
+        {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
         bytes
@@ -619,6 +627,7 @@ pub fn exposure_average_params(
             exposure.low_percent / 100.0,
             exposure.high_percent / 100.0,
         ],
+        compensation: [exposure.ev, 0.0, 0.0, 0.0],
     }
 }
 
@@ -1008,6 +1017,19 @@ mod tests {
             exposure_average_params(&exposure, -5.0, false).timing[0],
             0.0
         );
+    }
+
+    #[test]
+    fn average_params_carry_manual_ev_for_the_upscaler_exposure_scale() {
+        let exposure = Exposure {
+            ev: 1.5,
+            ..Exposure::default()
+        };
+        let params = exposure_average_params(&exposure, 16.0, false);
+        assert_eq!(params.compensation, [1.5, 0.0, 0.0, 0.0]);
+        let bytes = params.to_bytes();
+        assert_eq!(bytes.len(), size_of::<ExposureAverageParams>());
+        assert_eq!(f32::from_ne_bytes(bytes[32..36].try_into().unwrap()), 1.5);
     }
 
     #[test]

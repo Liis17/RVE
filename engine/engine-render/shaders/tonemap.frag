@@ -15,7 +15,7 @@ layout(set = 0, binding = 2) uniform texture2D bloom_image;
 layout(std430, set = 0, binding = 3) readonly buffer ExposureBuffer {
     uint histogram[256];
     float adapted_ev;
-    float pad0;
+    float exposure_scale;
     float pad1;
     float pad2;
 } exposure;
