@@ -1,7 +1,7 @@
 #version 450
 
 // Composite камеры: chromatic aberration, экспозиция, цветокоррекция и tonemapping в linear HDR,
-// затем lift/gamma/gain и vignette в LDR. Выключенные эффекты приходят тождественными значениями
+// затем lift/gamma/gain, 3D LUT и vignette в LDR. Выключенные эффекты приходят тождественными значениями
 // (см. post::composite_params), поэтому шейдер не ветвится по набору эффектов.
 
 layout(location = 0) in vec2 in_uv;
@@ -15,10 +15,14 @@ layout(set = 0, binding = 2) uniform texture2D bloom_image;
 layout(std430, set = 0, binding = 3) readonly buffer ExposureBuffer {
     uint histogram[256];
     float adapted_ev;
-    float pad0;
+    float exposure_scale;
     float pad1;
     float pad2;
 } exposure;
+
+// 3D LUT цветокоррекции: x — красный, y — зелёный, z — синий sRGB-вход (см. color_lut.rs).
+// Без LUT привязана identity LUT, а интенсивность равна 0.
+layout(set = 0, binding = 4) uniform texture3D lut_image;
 
 layout(push_constant) uniform PushConstants {
     // v0: x — экспозиция EV, y — код tonemapper, z — код debug view, w — интенсивность CA.
@@ -33,12 +37,20 @@ layout(push_constant) uniform PushConstants {
     vec4 gain_vignette_smoothness;
     // v5: rgb — цвет vignette, w — roundness vignette.
     vec4 vignette_color_roundness;
+    // v6: x — интенсивность LUT (0 — LUT не применяется).
+    vec4 lut_controls;
 } push_constants;
 
 vec3 linear_to_srgb(vec3 value) {
     vec3 low = value * 12.92;
     vec3 high = 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055;
     return mix(high, low, step(value, vec3(0.0031308)));
+}
+
+vec3 srgb_to_linear(vec3 value) {
+    vec3 low = value / 12.92;
+    vec3 high = pow((value + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, step(value, vec3(0.04045)));
 }
 
 vec3 aces(vec3 color) {
@@ -103,6 +115,20 @@ vec3 lift_gamma_gain(vec3 color) {
     return pow(clamp(color, 0.0, 1.0), 1.0 / gamma) * gain + lift;
 }
 
+// LUT читается по sRGB-кодированному цвету, как её строят редакторы цвета (.cube); координаты
+// сдвигаются к центрам крайних узлов, чтобы 0 и 1 попадали точно в узлы.
+vec3 apply_lut(vec3 color) {
+    float intensity = push_constants.lut_controls.x;
+    if (intensity <= 0.0) {
+        return color;
+    }
+    float size = float(textureSize(sampler3D(lut_image, source_sampler), 0).x);
+    vec3 encoded = linear_to_srgb(clamp(color, 0.0, 1.0));
+    vec3 coordinate = encoded * ((size - 1.0) / size) + 0.5 / size;
+    vec3 graded = textureLod(sampler3D(lut_image, source_sampler), coordinate, 0.0).rgb;
+    return mix(color, srgb_to_linear(max(graded, vec3(0.0))), intensity);
+}
+
 vec3 vignette(vec3 color, vec2 uv) {
     float intensity = push_constants.gamma_vignette_intensity.w;
     if (intensity <= 0.0) {
@@ -154,6 +180,7 @@ void main() {
                 color = clamp(color, 0.0, 1.0);
             }
             color = lift_gamma_gain(color);
+            color = apply_lut(color);
             color = vignette(color, in_uv);
         } else {
             color = clamp(color, 0.0, 1.0);

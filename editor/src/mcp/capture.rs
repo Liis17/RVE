@@ -263,7 +263,7 @@ pub(crate) fn object_camera(world: &World, id: &str) -> Option<CaptureCamera> {
     Some(CaptureCamera {
         camera: world.camera_of(handle)?,
         settings: world.camera_settings(handle).copied().unwrap_or_default(),
-        post: world.post_process(handle).copied().unwrap_or_default(),
+        post: world.post_process(handle).cloned().unwrap_or_default(),
         scene_like: false,
     })
 }

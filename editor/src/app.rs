@@ -2352,7 +2352,7 @@ fn render_scene_frame(
         let game_post = parts
             .world
             .post_process(game_camera_handle)
-            .copied()
+            .cloned()
             .unwrap_or_default();
         let has_light = parts
             .world
@@ -2409,6 +2409,9 @@ fn render_scene_frame(
             &capture_screen_shaders,
             &mut state.screen_shader_errors,
         );
+        // LUT игровой и активной камеры; Scene-вид в Play показывает активную камеру.
+        scene.sync_color_lut(renderer, project, &game_post, &mut state.log);
+        scene.sync_color_lut(renderer, project, &scene_frame.post_process, &mut state.log);
     }
     if let Some((center, radius)) = frame_target
         && state.camera.needs_framing(center, radius)
@@ -2426,7 +2429,7 @@ fn render_scene_frame(
         CameraSettings::default()
     };
     let scene_post = if playing {
-        scene_frame.post_process
+        scene_frame.post_process.clone()
     } else {
         engine_scene::PostProcessSettings::default()
     };
@@ -2452,17 +2455,20 @@ fn render_scene_frame(
             capture::CameraChoice::Editor => Some(capture::CaptureCamera {
                 camera: scene_camera,
                 settings: scene_settings,
-                post: scene_post,
+                post: scene_post.clone(),
                 scene_like: true,
             }),
             capture::CameraChoice::Game => Some(capture::CaptureCamera {
                 camera: game_camera,
                 settings: game_settings,
-                post: game_post,
+                post: game_post.clone(),
                 scene_like: false,
             }),
             capture::CameraChoice::Object(id) => capture::object_camera(&*parts.world, id),
         });
+    if let Some(camera) = &capture_camera {
+        scene.sync_color_lut(renderer, parts.project, &camera.post, parts.log);
+    }
     let (local_lights, local_light_shadows) = render_local_lights(&scene_frame.local_lights);
     scene.begin_motion_frame(game_camera_handle, playing);
     scene.build_draws(
@@ -2545,7 +2551,7 @@ fn render_scene_frame(
             width,
             height,
             scene_settings,
-            scene_post,
+            &scene_post,
             &[],
             &scene_frame.light,
             &local_lights,
@@ -2564,7 +2570,7 @@ fn render_scene_frame(
             width,
             height,
             game_settings,
-            game_post,
+            &game_post,
             &game_screen_shaders,
             &scene_frame.light,
             &local_lights,
@@ -2594,7 +2600,7 @@ fn render_scene_frame(
                 width,
                 height,
                 camera.settings,
-                camera.post,
+                &camera.post,
                 &capture_screen_shaders,
                 &scene_frame.light,
                 &local_lights,

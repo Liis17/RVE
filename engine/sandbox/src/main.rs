@@ -9,7 +9,7 @@ use engine_core::Time;
 use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, BootstrapPresentMode, BootstrapReflexMode};
 use engine_render::{
-    AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, DrawStats,
+    AlphaMode, AntiAliasing as RenderAntiAliasing, ColorLutId, DebugView, DrawCommand, DrawStats,
     EnvironmentId, EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameProfile,
     FrameStatus, LatencyHandle, LatencyMarker, LowLatencyMode, Material, MaterialId, MeshId,
     ParticleBlend, ParticleCollision, ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape,
@@ -18,7 +18,7 @@ use engine_render::{
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{
-    AntiAliasing, CameraSettings, PostProcessSettings, Tonemapper, resolve_post_process,
+    AntiAliasing, CameraSettings, CubeLut, PostProcessSettings, Tonemapper, resolve_post_process,
 };
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use glam::{Mat4, Vec3};
@@ -259,9 +259,30 @@ fn load_post_process(
         .map_err(|error| error.to_string())
 }
 
+/// Читает 3D LUT `.cube`, на которую ссылается цветокоррекция постобработки; `None` без LUT.
+fn load_color_lut(
+    post: &PostProcessSettings,
+    resources: &ResourceHandle,
+) -> Result<Option<CubeLut>, String> {
+    let Some(path) = post.color_grading.lut_path() else {
+        return Ok(None);
+    };
+    let bytes = resources
+        .read_all(format!("/{path}"))
+        .map_err(|error| format!("/{path}: {error}"))?
+        .wait()
+        .map_err(|error| format!("/{path}: {error}"))?;
+    let source = String::from_utf8(bytes)
+        .map_err(|error| format!("/{path}: файл должен быть UTF-8: {error}"))?;
+    CubeLut::parse(format!("/{path}"), &source)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 /// Переводит постобработку в настройки renderer; выключенные exposure и tonemapping дают
 /// тождественные значения. Совпадает с маппингом runtime (`render_post_process`).
-fn render_post_process(post: &PostProcessSettings) -> PostProcess {
+/// `lut` — LUT, созданная renderer для `color_grading.lut`.
+fn render_post_process(post: &PostProcessSettings, lut: Option<ColorLutId>) -> PostProcess {
     let exposure = if post.exposure.enabled {
         Exposure {
             mode: match post.exposure.mode {
@@ -288,7 +309,7 @@ fn render_post_process(post: &PostProcessSettings) -> PostProcess {
     } else {
         RenderTonemapper::None
     };
-    let (bloom, ao, grading) = (post.bloom, post.ambient_occlusion, post.color_grading);
+    let (bloom, ao, grading) = (post.bloom, post.ambient_occlusion, &post.color_grading);
     let (vignette, aberration, grain) = (post.vignette, post.chromatic_aberration, post.film_grain);
     let (dof, motion) = (post.depth_of_field, post.motion_blur);
     PostProcess {
@@ -328,6 +349,8 @@ fn render_post_process(post: &PostProcessSettings) -> PostProcess {
             lift: grading.lift,
             gamma: grading.gamma,
             gain: grading.gain,
+            lut,
+            lut_intensity: grading.lut_intensity,
         },
         vignette: engine_render::Vignette {
             enabled: vignette.enabled,
@@ -501,6 +524,9 @@ struct Sandbox {
     camera_settings: CameraSettings,
     /// Постобработка камеры, разрешённая из `--post-process` или устаревшего `[color]`.
     post_process: PostProcessSettings,
+    /// LUT цветокоррекции, прочитанная при запуске; загружается в renderer в `init`.
+    color_lut_source: Option<CubeLut>,
+    color_lut: Option<ColorLutId>,
     present_mode: Option<BootstrapPresentMode>,
     reflex: Option<BootstrapReflexMode>,
     /// Reflex-handle renderer; `None`, если Reflex выключен или не поддержан.
@@ -581,6 +607,8 @@ impl Sandbox {
             environment: None,
             camera_settings,
             post_process: PostProcessSettings::default(),
+            color_lut_source: None,
+            color_lut: None,
             present_mode,
             reflex: None,
             latency: None,
@@ -853,6 +881,15 @@ impl WindowHandler for Sandbox {
                         }
                     }
                 }
+                if let Some(lut) = &self.color_lut_source {
+                    match renderer.create_color_lut(lut.size(), lut.texels()) {
+                        Ok(id) => self.color_lut = Some(id),
+                        Err(error) => {
+                            self.failure = Some(format!("ошибка создания LUT: {error}"));
+                            return false;
+                        }
+                    }
+                }
                 if self.options.debug_overlay {
                     self.debug_overlay = Some(DebugOverlay::new(
                         &renderer.capabilities().device_name,
@@ -1003,7 +1040,7 @@ impl WindowHandler for Sandbox {
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
-                post: render_post_process(&self.post_process),
+                post: render_post_process(&self.post_process, self.color_lut),
                 screen_shaders: engine_render::ScreenShaders::default(),
                 anti_aliasing: match self.camera_settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
@@ -1185,6 +1222,13 @@ fn main_after_vulkan_environment() -> ExitCode {
         }
     };
     let post_process = resolve_post_process(&camera_settings, post_file.as_ref());
+    let color_lut_source = match load_color_lut(&post_process, &resources.handle()) {
+        Ok(lut) => lut,
+        Err(error) => {
+            eprintln!("Ошибка LUT: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let mut app = Sandbox::new(
         options,
         content,
@@ -1195,6 +1239,7 @@ fn main_after_vulkan_environment() -> ExitCode {
         pipeline_cache,
     );
     app.post_process = post_process;
+    app.color_lut_source = color_lut_source;
     app.reflex = reflex;
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
@@ -1302,6 +1347,38 @@ mod tests {
         let content = super::load_content(&options, &assets).unwrap();
         assert!(!content.meshes.is_empty());
         resources.shutdown().unwrap();
+    }
+
+    #[test]
+    fn color_lut_is_read_from_the_postprocess_reference_and_errors_name_the_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("rve-sandbox-lut-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(root.join("luts")).unwrap();
+        let identity = "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        std::fs::write(root.join("luts/id.cube"), identity).unwrap();
+        std::fs::write(root.join("luts/bad.cube"), "LUT_1D_SIZE 2\n").unwrap();
+        let mut resources = ResourceSystem::start(ResourceConfig {
+            root: root.clone(),
+            ..ResourceConfig::default()
+        })
+        .unwrap();
+        let handle = resources.handle();
+        let mut post = engine_scene::PostProcessSettings::default();
+        assert_eq!(super::load_color_lut(&post, &handle).unwrap(), None);
+        post.color_grading.lut = Some("/luts/id.cube".to_owned());
+        let lut = super::load_color_lut(&post, &handle).unwrap().unwrap();
+        assert_eq!(lut.size(), 2);
+        post.color_grading.lut = Some("/luts/bad.cube".to_owned());
+        let error = super::load_color_lut(&post, &handle).unwrap_err();
+        assert!(error.contains("/luts/bad.cube"), "{error}");
+        post.color_grading.lut = Some("/luts/missing.cube".to_owned());
+        assert!(super::load_color_lut(&post, &handle).is_err());
+        resources.shutdown().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

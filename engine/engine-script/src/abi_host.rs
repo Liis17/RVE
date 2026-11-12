@@ -5353,6 +5353,61 @@ mod tests {
     }
 
     #[test]
+    fn abi_post_process_write_keeps_the_camera_lut_that_the_abi_does_not_carry() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let camera = world.active_camera();
+        let mut file_post = PostProcessSettings::default();
+        file_post.color_grading.lut = Some("/luts/film.cube".to_owned());
+        file_post.color_grading.lut_intensity = 0.4;
+        world.set_post_process(camera, file_post).unwrap();
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: Some(camera),
+            source: "scene/camera/Probe",
+            writable: true,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            queued_audio: 0,
+            queued_animation: 0,
+            queued_rumble: 0,
+            net: Default::default(),
+            queued_net: 0,
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+            lifecycle: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::lifecycle::Lifecycle::default(),
+            )),
+            lifecycle_writes: true,
+            instance_serial: 0,
+            instance_enabled: true,
+            cursor: ScriptCursor::default(),
+        });
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+        let host = context.host(ScriptTime::default());
+        let set_post = host.set_post_process.unwrap();
+        let mut updated = post_process_to_abi(PostProcessSettings::default());
+        updated.bloom_enabled = 1;
+        // SAFETY: the post process pointer remains live through the call.
+        unsafe { assert!(set_post(host.ctx, 1, &updated)) };
+        drop(context);
+        let queued = transaction.post_process(camera).unwrap();
+        assert!(queued.bloom.enabled);
+        assert_eq!(queued.color_grading.lut.as_deref(), Some("/luts/film.cube"));
+        assert_eq!(queued.color_grading.lut_intensity, 0.4);
+    }
+
+    #[test]
     fn legacy_color_proxies_read_and_write_the_effective_post_process_in_call_order() {
         let document = SceneDocument::parse(
             "scene.rvescene",

@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -3139,7 +3139,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "engine-assets",
  "engine-files",
