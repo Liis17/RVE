@@ -145,6 +145,19 @@ impl ProjectPrefabs {
     }
 }
 
+/// Список тяжёлых префабов для Play: открытый в редакторе список того же проекта, включая
+/// несохранённые правки, иначе файл `prefabs.rveprefabs`. Правки уже прошли тот же разбор, что и
+/// файл, поэтому Play видит ровно то, что показывает подокно Project Prefabs.
+pub fn play_catalog(
+    root: &Path,
+    edited: Option<&ProjectPrefabs>,
+) -> Result<PrefabCatalogFile, String> {
+    match edited {
+        Some(list) if list.loaded && list.root == root => Ok(list.file.clone()),
+        _ => PrefabCatalogFile::load(root.join(PREFAB_CATALOG_FILE_NAME)),
+    }
+}
+
 fn entry_index(file: &PrefabCatalogFile, index: usize) -> Result<usize, String> {
     if index < file.prefabs.len() {
         Ok(index)
@@ -274,5 +287,38 @@ mod tests {
         assert!(prefabs.save().is_err());
         assert!(!prefabs.is_dirty());
         assert_eq!(project.read(), broken);
+    }
+
+    #[test]
+    fn play_uses_unsaved_edits_of_the_same_project_and_the_file_otherwise() {
+        let temp = TempProject::new();
+        temp.write("[[prefabs]]\npath = \"/prefabs/a.rveprefab\"\n");
+        let mut prefabs = ProjectPrefabs::open(&temp.0);
+        prefabs.add("prefabs/b.rveprefab").unwrap();
+        assert!(prefabs.is_dirty());
+        let catalog = play_catalog(&temp.0, Some(&prefabs)).unwrap();
+        let paths = catalog
+            .prefabs
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["/prefabs/a.rveprefab", "/prefabs/b.rveprefab"]);
+        assert!(prefabs.is_dirty(), "Play не сохраняет список");
+
+        // Без открытого списка или для другого проекта читается файл.
+        assert_eq!(play_catalog(&temp.0, None).unwrap().prefabs.len(), 1);
+        let other = TempProject::new();
+        assert_eq!(
+            play_catalog(&other.0, Some(&prefabs))
+                .unwrap()
+                .prefabs
+                .len(),
+            0
+        );
+
+        // Повреждённый файл без загруженного списка остаётся ошибкой Play.
+        temp.write("[[prefabs]");
+        let broken = ProjectPrefabs::open(&temp.0);
+        assert!(play_catalog(&temp.0, Some(&broken)).is_err());
     }
 }

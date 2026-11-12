@@ -8,6 +8,7 @@ use crate::mcp::{McpHost, capture};
 use crate::play::{PlayPrefabs, PlayScene, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
 use crate::project::OpenProject;
+use crate::project_prefabs::{ProjectPrefabs, play_catalog};
 use crate::scene_edit::EditorScene;
 use crate::settings::{SettingsStore, UserSettings};
 use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt, ViewCommand};
@@ -22,7 +23,7 @@ use engine_console::{
     CommandCatalog, ConsoleBuffer, ConsoleLevel, ConsoleLine, install_logger, parse_command_line,
 };
 use engine_files::VirtualPath;
-use engine_project::{BootstrapReflexMode, PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
+use engine_project::BootstrapReflexMode;
 use engine_render::{
     DebugView, DirectionalLight, Frame, FrameCamera, FrameStatus, LatencyHandle, LatencyMarker,
     LowLatencyMode, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewSettings,
@@ -84,12 +85,13 @@ fn enabled_scene_paths(project: &OpenProject) -> Vec<String> {
 /// цель записи: сцена собирается отдельно и попадает только в сессию Play.
 fn prepare_play_scene(
     project: &OpenProject,
+    edited_prefabs: Option<&ProjectPrefabs>,
     path: &str,
 ) -> Result<(PlayScene, Vec<String>), String> {
     let text = project.read_text(path)?;
     let virtual_path = VirtualPath::parse(path).map_err(|error| error.to_string())?;
     let scene = EditorScene::parse(virtual_path, &text, project.prefab_loader())?;
-    let heavy = PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME))?;
+    let heavy = play_catalog(&project.root, edited_prefabs)?;
     let (prefabs, warnings) = PlayPrefabs::load(
         scene.view(),
         &mut |label| project.read_text(label),
@@ -172,12 +174,13 @@ fn apply_play_scene_request(state: &mut EditorState) {
         return;
     };
     let result = match state.project.as_ref() {
-        Some(project) => prepare_play_scene(project, &path).and_then(|(scene, warnings)| {
-            for warning in warnings {
-                state.log.push(LogLevel::Warn, warning);
-            }
-            play.replace_scene(scene)
-        }),
+        Some(project) => prepare_play_scene(project, state.project_prefabs.as_ref(), &path)
+            .and_then(|(scene, warnings)| {
+                for warning in warnings {
+                    state.log.push(LogLevel::Warn, warning);
+                }
+                play.replace_scene(scene)
+            }),
         None => Err("проект не открыт".to_owned()),
     };
     if let Err(error) = result {
@@ -1535,7 +1538,7 @@ impl EditorApp {
                 return;
             }
         };
-        let heavy = match PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME)) {
+        let heavy = match play_catalog(&project.root, self.state.project_prefabs.as_ref()) {
             Ok(heavy) => heavy,
             Err(error) => {
                 self.state.log.error(error);
