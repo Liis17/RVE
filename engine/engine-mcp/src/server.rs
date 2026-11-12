@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -16,11 +16,14 @@ use tiny_http::Server;
 
 pub(crate) const WORKER_COUNT: usize = 4;
 pub(crate) const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Как часто воркер проверяет соединение клиента, пока вызов ждёт главный поток.
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Configuration for the editor's local MCP endpoint.
 pub struct McpConfig {
     pub port: u16,
-    pub token: String,
+    /// [`crate::token_hash`] токена доступа; сам токен серверу не нужен.
+    pub token_hash: String,
     pub permissions: Permissions,
     pub tools: Vec<ToolSpec>,
 }
@@ -34,6 +37,8 @@ pub struct ToolCall {
     /// Editor-state generation captured when the HTTP worker queued this call.
     pub(crate) generation: u64,
     pub(crate) responder: flume::Sender<ToolResult>,
+    /// Клиент отменил вызов (`notifications/cancelled`) или отключился.
+    pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 impl ToolCall {
@@ -42,9 +47,12 @@ impl ToolCall {
         self.responder.send(result).is_ok()
     }
 
-    /// Reports whether the HTTP worker timed out, shut down, or dropped its response receiver.
+    /// Reports whether the HTTP worker timed out, shut down, or dropped its response receiver,
+    /// or the client cancelled the call or disconnected.
     pub fn is_abandoned(&self) -> bool {
-        Instant::now() >= self.deadline || self.responder.is_disconnected()
+        Instant::now() >= self.deadline
+            || self.responder.is_disconnected()
+            || self.cancelled.load(Ordering::Acquire)
     }
 
     /// Returns the editor-state generation captured when the call was queued.
@@ -64,7 +72,7 @@ pub struct McpServer {
 
 pub(crate) struct Shared {
     pub port: u16,
-    pub token: String,
+    pub token_hash: String,
     pub tools: Vec<ToolSpec>,
     pub sessions: Mutex<HashMap<String, Session>>,
     /// Счётчик обращений к сессиям для вытеснения самой давно использованной.
@@ -73,6 +81,22 @@ pub(crate) struct Shared {
     pub generation: Arc<AtomicU64>,
     pub calls: flume::Sender<ToolCall>,
     pub wake: Arc<dyn Fn() + Send + Sync>,
+    /// Ожидающие вызовы по ключу сессии и JSON-RPC id: по ним `notifications/cancelled`
+    /// находит вызов.
+    pub inflight: Mutex<HashMap<String, InFlight>>,
+}
+
+/// Ожидающий вызов, который можно отменить.
+pub(crate) struct InFlight {
+    pub cancelled: Arc<AtomicBool>,
+    pub signal: flume::Sender<()>,
+}
+
+impl InFlight {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.signal.try_send(());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +105,10 @@ pub(crate) enum WaitResult {
     Shutdown,
     Deadline,
     Disconnected,
+    /// Клиент отменил вызов.
+    Cancelled,
+    /// Прошёл интервал проверки соединения, а результата ещё нет.
+    Tick,
 }
 
 impl McpServer {
@@ -109,7 +137,7 @@ impl McpServer {
         let generation = Arc::new(AtomicU64::new(generation));
         let shared = Arc::new(Shared {
             port: config.port,
-            token: config.token,
+            token_hash: config.token_hash,
             tools: config.tools,
             sessions: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(0),
@@ -117,6 +145,7 @@ impl McpServer {
             generation: Arc::clone(&generation),
             calls: calls_tx,
             wake,
+            inflight: Mutex::new(HashMap::new()),
         });
 
         for index in 0..WORKER_COUNT {
@@ -175,10 +204,13 @@ impl Drop for McpServer {
     }
 }
 
+/// Ждёт результат, остановку сервера, отмену или deadline не дольше `tick`.
 pub(crate) fn wait_for_result(
     response: &flume::Receiver<ToolResult>,
     shutdown: &flume::Receiver<()>,
+    cancel: &flume::Receiver<()>,
     deadline: Instant,
+    tick: Duration,
 ) -> WaitResult {
     use flume::{Selector, select::SelectError};
 
@@ -186,9 +218,12 @@ pub(crate) fn wait_for_result(
     let selected = Selector::new()
         .recv(response, WaitResult::from_response)
         .recv(shutdown, |_| WaitResult::Shutdown)
-        .wait_timeout(remaining);
+        // Ожидающий держит свой отправитель отмены, поэтому канал не разрывается.
+        .recv(cancel, |_| WaitResult::Cancelled)
+        .wait_timeout(remaining.min(tick));
     let result = match selected {
         Ok(result) => result,
+        Err(SelectError::Timeout) if Instant::now() < deadline => return WaitResult::Tick,
         Err(SelectError::Timeout) => return WaitResult::Deadline,
     };
     if Instant::now() >= deadline {
@@ -217,6 +252,47 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    /// Канал отмены, который не срабатывает: отправитель живёт, пока жив процесс теста.
+    fn never_cancelled() -> flume::Receiver<()> {
+        let (sender, receiver) = flume::bounded(1);
+        std::mem::forget(sender);
+        receiver
+    }
+
+    #[test]
+    fn a_tick_without_a_result_is_reported_before_the_deadline() {
+        let (_response_tx, response_rx) = flume::bounded(1);
+        let (_shutdown_tx, shutdown_rx) = flume::unbounded();
+        assert_eq!(
+            wait_for_result(
+                &response_rx,
+                &shutdown_rx,
+                &never_cancelled(),
+                Instant::now() + Duration::from_secs(120),
+                Duration::from_millis(1),
+            ),
+            WaitResult::Tick
+        );
+    }
+
+    #[test]
+    fn a_cancelled_flag_abandons_the_call() {
+        let (responder, _receiver) = flume::bounded(1);
+        let call = ToolCall {
+            name: "probe".to_owned(),
+            arguments: json!({}),
+            deadline: Instant::now() + Duration::from_secs(5),
+            required_permission: Permission::Read,
+            generation: 0,
+            responder,
+            cancelled: Default::default(),
+        };
+        assert!(!call.is_abandoned());
+        call.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(call.is_abandoned());
+    }
+
     #[test]
     fn shutdown_wakes_an_waiting_call_without_a_join_or_timeout() {
         let (_response_tx, response_rx) = flume::bounded(1);
@@ -226,7 +302,9 @@ mod tests {
             wait_for_result(
                 &response_rx,
                 &shutdown_rx,
+                &never_cancelled(),
                 Instant::now() + Duration::from_secs(120),
+                Duration::from_secs(120),
             ),
             WaitResult::Shutdown
         );
@@ -237,7 +315,13 @@ mod tests {
         let (_response_tx, response_rx) = flume::bounded(1);
         let (_shutdown_tx, shutdown_rx) = flume::unbounded();
         assert_eq!(
-            wait_for_result(&response_rx, &shutdown_rx, Instant::now()),
+            wait_for_result(
+                &response_rx,
+                &shutdown_rx,
+                &never_cancelled(),
+                Instant::now(),
+                Duration::from_secs(1),
+            ),
             WaitResult::Deadline
         );
     }
@@ -254,7 +338,9 @@ mod tests {
             wait_for_result(
                 &first_rx,
                 &shutdown_for_first,
+                &never_cancelled(),
                 Instant::now() + Duration::from_secs(5),
+                Duration::from_secs(5),
             )
         });
         started_rx.recv().unwrap();
@@ -264,7 +350,9 @@ mod tests {
             wait_for_result(
                 &second_rx,
                 &shutdown_rx,
-                Instant::now() + Duration::from_secs(5)
+                &never_cancelled(),
+                Instant::now() + Duration::from_secs(5),
+                Duration::from_secs(5),
             ),
             WaitResult::Response(ToolResult { .. })
         ));
@@ -282,6 +370,7 @@ mod tests {
             required_permission: Permission::Read,
             generation: 0,
             responder,
+            cancelled: Default::default(),
         };
         assert!(!call.is_abandoned());
         drop(receiver);
@@ -295,6 +384,7 @@ mod tests {
             required_permission: Permission::Read,
             generation: 0,
             responder,
+            cancelled: Default::default(),
         };
         assert!(expired.is_abandoned());
     }

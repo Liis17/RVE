@@ -2324,3 +2324,128 @@ fn create_menu_opens_material_and_shader_items_without_a_second_create_level() {
     assert_eq!(count("Material"), 1, "{labels:?}");
     assert_eq!(count("Shader"), 1, "{labels:?}");
 }
+
+#[test]
+fn renaming_a_folder_in_project_updates_references_in_files_and_the_open_scene() {
+    let fixture =
+        ProjectFixture::new("# каталог\n[[prefabs]]\npath = \"/prefabs/crate.rveprefab\"\n");
+    fixture.write_asset("prefabs/crate.rveprefab", "[[objects]]\nid = \"root\"\n");
+    let scene_text = "# Главная сцена\n[[assets]]\npath = \"/prefabs/crate.rveprefab\"\n\n\
+                      [[instances]]\nid = \"crate\" # ящик\nprefab = \"/prefabs/crate.rveprefab\"\n\n\
+                      [[objects]]\nid = \"cam\"\n[objects.camera]\n";
+    fixture.write_asset("scenes/main.rvescene", scene_text);
+    let mut harness = Harness::new();
+    let project = OpenProject::open(&fixture.0).unwrap();
+    let loader = project.prefab_loader();
+    harness.state.project = Some(project);
+    harness.state.scene = Some(
+        EditorScene::parse(
+            VirtualPath::parse("scenes/main.rvescene").unwrap(),
+            scene_text,
+            loader,
+        )
+        .unwrap(),
+    );
+
+    let references = project_panel::find_references(&mut harness.state, "prefabs");
+    let mut files = references
+        .files
+        .iter()
+        .map(|reference| (reference.source.to_string(), reference.count))
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            ("Assets/scenes/main.rvescene".to_owned(), 2),
+            ("prefabs.rveprefabs".to_owned(), 1),
+        ]
+    );
+    assert!(references.unsaved.is_empty());
+    harness.state.project_dialog = Some(project_panel::ProjectDialog::Rename {
+        path: "prefabs".to_owned(),
+        name: "heavy".to_owned(),
+        references,
+        update_references: true,
+    });
+    let input = harness.input(vec![key(egui::Key::Enter)]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        project_panel::show_dialog(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+
+    let read = |path: &str| std::fs::read_to_string(fixture.0.join(path)).unwrap();
+    assert_eq!(
+        read("Assets/scenes/main.rvescene"),
+        scene_text.replace("/prefabs/", "/heavy/"),
+        "комментарии и форматирование сохраняются"
+    );
+    assert_eq!(
+        read("prefabs.rveprefabs"),
+        "# каталог\n[[prefabs]]\npath = \"/heavy/crate.rveprefab\"\n"
+    );
+    let scene = harness.scene();
+    assert!(!scene.is_dirty(), "сохранённая сцена переписана и на диске");
+    assert_eq!(
+        scene.document().instances[0].prefab.as_str(),
+        "heavy/crate.rveprefab"
+    );
+    assert!(
+        scene
+            .view()
+            .objects
+            .iter()
+            .any(|object| object.id == "crate")
+    );
+    assert!(harness.scene_mut().undo(), "обновление ссылок — шаг undo");
+}
+
+const CAMERA_SCENE: &str = "[[objects]]\nid = \"cam\"\n[objects.camera]\n";
+
+#[test]
+fn deleting_a_referenced_file_lists_unsaved_references_and_rename_without_update_moves_the_scene() {
+    let fixture = ProjectFixture::new("");
+    fixture.write_asset("models/a.fbx", "fbx");
+    fixture.write_asset("scenes/main.rvescene", CAMERA_SCENE);
+    let mut harness = Harness::new();
+    let project = OpenProject::open(&fixture.0).unwrap();
+    let loader = project.prefab_loader();
+    harness.state.project = Some(project);
+    let mut scene = EditorScene::parse(
+        VirtualPath::parse("scenes/main.rvescene").unwrap(),
+        CAMERA_SCENE,
+        loader,
+    )
+    .unwrap();
+    scene
+        .create_object(
+            &NewObject::Mesh(VirtualPath::parse("/models/a.fbx").unwrap(), [0.0; 3]),
+            None,
+        )
+        .unwrap();
+    harness.state.scene = Some(scene);
+
+    let references = project_panel::find_references(&mut harness.state, "models/a.fbx");
+    assert!(references.files.is_empty());
+    assert_eq!(references.unsaved, ["Assets/scenes/main.rvescene"]);
+
+    // Переименование папки со сценой без обновления ссылок всё равно переносит путь сцены.
+    harness.state.project_dialog = Some(project_panel::ProjectDialog::Rename {
+        path: "scenes".to_owned(),
+        name: "levels".to_owned(),
+        references: project_panel::AssetReferences::default(),
+        update_references: false,
+    });
+    let input = harness.input(vec![key(egui::Key::Enter)]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        project_panel::show_dialog(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert_eq!(
+        harness.scene().path().map(VirtualPath::as_str),
+        Some("levels/main.rvescene")
+    );
+    assert!(harness.scene().is_dirty());
+}
