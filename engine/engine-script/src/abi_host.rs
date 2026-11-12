@@ -87,6 +87,7 @@ use rve_sdk::abi::{
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) struct AbiCallContext<'a> {
     self_object: u64,
@@ -118,6 +119,8 @@ pub(crate) struct AbiScriptCall<'a> {
     pub(crate) commands_generation: &'a CommandGeneration,
     pub(crate) command_owner: usize,
     pub(crate) commands_allowed: bool,
+    /// Флаг прерывания Rust-скриптов, см. [`crate::ScriptInterruptHandle::interrupt`].
+    pub(crate) interrupt: &'a AtomicBool,
 }
 
 pub(crate) struct AbiCommandAccess<'a> {
@@ -426,6 +429,7 @@ impl<'a> AbiCallContext<'a> {
             window_screenshot: Some(host_window_screenshot),
             file_dialog_open: Some(host_file_dialog_open),
             file_dialog_poll: Some(host_file_dialog_poll),
+            interrupt: std::ptr::null(),
         }
     }
 
@@ -495,7 +499,7 @@ impl AbiScriptInstance {
             AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
         let mut instance = std::ptr::null_mut();
         let status = {
-            let host = context.host(ScriptTime::default());
+            let host = with_interrupt(context.host(ScriptTime::default()), call.interrupt);
             // SAFETY: callback context and borrowed parameters remain live through create.
             unsafe { (descriptor.create)(&host, &params.abi, &mut instance) }
         };
@@ -553,7 +557,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: this instance came from its matching descriptor's successful create call.
             unsafe {
                 match phase {
@@ -613,7 +617,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: the value, name, instance, and host remain live throughout the callback.
             unsafe { set_property(self.instance, &host, name, &value.value, phase) }
         };
@@ -646,7 +650,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: message data, instance, and host remain live throughout the callback.
             unsafe { (self.descriptor.message)(self.instance, &host, sender, name, &value.value) }
         };
@@ -710,7 +714,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             let value = value
                 .as_ref()
                 .map_or(std::ptr::null(), |value| &value.value as *const RveValue);
@@ -757,7 +761,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             let ui_event = RveUiEvent {
                 kind: ui_event_code(event.kind),
                 canvas: canvas_to_abi(event.canvas),
@@ -795,7 +799,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: the tag, instance, and host remain live throughout the callback.
             unsafe { callback(self.instance, &host, RveStr::from_str_ref(tag)) }
         };
@@ -834,7 +838,7 @@ impl AbiScriptInstance {
             normal,
         };
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: the event, instance, and host remain live throughout the callback.
             unsafe { callback(self.instance, &host, event) }
         };
@@ -866,7 +870,7 @@ impl AbiScriptInstance {
             command_access,
         );
         let status = {
-            let host = context.host(time);
+            let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: name and arguments are borrowed for the duration of the synchronous callback.
             unsafe {
                 callback(
@@ -913,6 +917,15 @@ pub(crate) enum AbiPhase {
     FixedUpdate(f32),
     LateUpdate(f32),
     Destroy,
+}
+
+/// Сбрасывает прошлую просьбу прервать Rust-скрипт и передаёт гостю флаг текущего вызова (ABI
+/// v25). Просьба, пришедшая до этого вызова, относилась к уже завершившемуся коду: например,
+/// к зависшему Lua.
+fn with_interrupt(mut host: RveHost, interrupt: &AtomicBool) -> RveHost {
+    interrupt.store(false, Ordering::Release);
+    host.interrupt = interrupt;
+    host
 }
 
 fn guarded<T: Copy>(

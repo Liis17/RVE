@@ -500,7 +500,7 @@ impl Save<'_> {
         let callback = self.host.save_get.ok_or(SaveError::Unavailable)?;
         let mut value = RveValue::integer(0);
         // SAFETY: the callback only borrows `key` and writes a value backed by its call context.
-        if !unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &mut value) } {
+        if !unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(key), &mut value) } {
             return Ok(None);
         }
         // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
@@ -514,7 +514,13 @@ impl Save<'_> {
         let callback = self.host.save_set.ok_or(SaveError::Unavailable)?;
         let value = BorrowedAbiValue::new(value);
         // SAFETY: the key and recursive value buffers live through the synchronous callback.
-        if unsafe { callback(self.host.ctx, RveStr::from_str_ref(key), &value.value) } {
+        if unsafe {
+            callback(
+                self.host.call_ctx(),
+                RveStr::from_str_ref(key),
+                &value.value,
+            )
+        } {
             Ok(())
         } else {
             Err(SaveError::Rejected)
@@ -525,14 +531,14 @@ impl Save<'_> {
     pub fn delete(&self, key: &str) -> Result<bool, SaveError> {
         let callback = self.host.save_delete.ok_or(SaveError::Unavailable)?;
         // SAFETY: the key bytes live through this synchronous callback.
-        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+        Ok(unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(key)) })
     }
 
     /// Checks whether a key is present.
     pub fn has(&self, key: &str) -> Result<bool, SaveError> {
         let callback = self.host.save_has.ok_or(SaveError::Unavailable)?;
         // SAFETY: the key bytes live through this synchronous callback.
-        Ok(unsafe { callback(self.host.ctx, RveStr::from_str_ref(key)) })
+        Ok(unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(key)) })
     }
 
     /// Returns save keys in sorted order.
@@ -540,12 +546,19 @@ impl Save<'_> {
         let callback = self.host.save_keys.ok_or(SaveError::Unavailable)?;
         let mut count = 0;
         // SAFETY: the zero-capacity query only writes `count`.
-        if !unsafe { callback(self.host.ctx, std::ptr::null_mut(), 0, &mut count) } {
+        if !unsafe { callback(self.host.call_ctx(), std::ptr::null_mut(), 0, &mut count) } {
             return Err(SaveError::Rejected);
         }
         let mut keys = vec![RveStr::empty(); count];
         // SAFETY: the host writes at most `count` borrowed strings into this buffer.
-        if !unsafe { callback(self.host.ctx, keys.as_mut_ptr(), keys.len(), &mut count) } {
+        if !unsafe {
+            callback(
+                self.host.call_ctx(),
+                keys.as_mut_ptr(),
+                keys.len(),
+                &mut count,
+            )
+        } {
             return Err(SaveError::Rejected);
         }
         keys.into_iter()
@@ -563,7 +576,7 @@ impl Save<'_> {
     pub fn flush(&self) -> Result<(), SaveError> {
         let callback = self.host.save_flush.ok_or(SaveError::Unavailable)?;
         // SAFETY: the host callback stages a write request in the active transaction.
-        if unsafe { callback(self.host.ctx) } {
+        if unsafe { callback(self.host.call_ctx()) } {
             Ok(())
         } else {
             Err(SaveError::Rejected)
@@ -993,14 +1006,14 @@ impl Object {
     pub fn play_sound(&self, ctx: &mut Context<'_>) -> Result<(), AudioError> {
         let callback = ctx.host.audio_play_source.ok_or(AudioError::Unavailable)?;
         // SAFETY: host callback is valid during this guest callback.
-        audio_status(unsafe { callback(ctx.host.ctx, self.handle) })
+        audio_status(unsafe { callback(ctx.host.call_ctx(), self.handle) })
     }
 
     /// Stops this object's current `audio_source` voice.
     pub fn stop_sound(&self, ctx: &mut Context<'_>) -> Result<(), AudioError> {
         let callback = ctx.host.audio_stop_source.ok_or(AudioError::Unavailable)?;
         // SAFETY: host callback is valid during this guest callback.
-        audio_status(unsafe { callback(ctx.host.ctx, self.handle) })
+        audio_status(unsafe { callback(ctx.host.call_ctx(), self.handle) })
     }
 
     /// Sets the volume of this object's current voice and of its next starts.
@@ -1011,7 +1024,7 @@ impl Object {
             .audio_set_source_volume
             .ok_or(AudioError::Unavailable)?;
         // SAFETY: host callback is valid during this guest callback.
-        audio_status(unsafe { callback(ctx.host.ctx, self.handle, volume) })
+        audio_status(unsafe { callback(ctx.host.call_ctx(), self.handle, volume) })
     }
 }
 
@@ -1037,7 +1050,7 @@ impl Context<'_> {
         // SAFETY: path, params and output storage remain valid during this script call.
         audio_status(unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 abi::RveStr::from_str_ref(path),
                 &params,
                 &mut voice,
@@ -1050,7 +1063,7 @@ impl Context<'_> {
     pub fn stop_voice(&mut self, voice: u64) -> Result<(), AudioError> {
         let callback = self.host.audio_stop_voice.ok_or(AudioError::Unavailable)?;
         // SAFETY: host callback is valid during this script call.
-        audio_status(unsafe { callback(self.host.ctx, voice) })
+        audio_status(unsafe { callback(self.host.call_ctx(), voice) })
     }
 
     /// Sets one mixer group's volume; `Master` multiplies every group.
@@ -1061,7 +1074,7 @@ impl Context<'_> {
             .audio_set_group_volume
             .ok_or(AudioError::Unavailable)?;
         // SAFETY: host callback is valid during this script call.
-        audio_status(unsafe { callback(self.host.ctx, group.code(), volume) })
+        audio_status(unsafe { callback(self.host.call_ctx(), group.code(), volume) })
     }
 }
 
@@ -1230,7 +1243,7 @@ impl Prefabs<'_> {
             return PrefabState::Unavailable;
         };
         // SAFETY: the host callback and borrowed path are valid during this guest call.
-        let code = unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(path)) };
+        let code = unsafe { callback(self.host.call_ctx(), abi::RveStr::from_str_ref(path)) };
         PrefabState::from_abi(code)
     }
 
@@ -1239,7 +1252,7 @@ impl Prefabs<'_> {
             return false;
         };
         // SAFETY: the host callback and borrowed path are valid during this guest call.
-        unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(path)) }
+        unsafe { callback(self.host.call_ctx(), abi::RveStr::from_str_ref(path)) }
     }
 }
 
@@ -1266,8 +1279,13 @@ impl Context<'_> {
         }
         let options = options.to_abi();
         // SAFETY: the prefab path and the options, with their borrowed strings, outlive this call.
-        let handle =
-            unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(prefab), &options) };
+        let handle = unsafe {
+            callback(
+                self.host.call_ctx(),
+                abi::RveStr::from_str_ref(prefab),
+                &options,
+            )
+        };
         (handle != 0).then_some(Object { handle })
     }
 
@@ -1357,7 +1375,7 @@ impl Object {
         // SAFETY: the host callback, the motion string and the params stay valid during this callback.
         animation_status(unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 abi::RveStr::from_str_ref(motion),
                 &params,
@@ -1382,7 +1400,7 @@ impl Object {
         // SAFETY: the host callback and the motion string stay valid during this callback.
         animation_status(unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 abi::RveStr::from_str_ref(motion),
                 weight,
@@ -1406,7 +1424,7 @@ impl Object {
         // SAFETY: the host callback and the parameter name stay valid during this callback.
         animation_status(unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 abi::RveStr::from_str_ref(name),
                 value,
@@ -1426,14 +1444,14 @@ impl Object {
             .animation_set_speed
             .ok_or(AnimationError::Unavailable)?;
         // SAFETY: the host callback stays valid during this callback.
-        animation_status(unsafe { callback(ctx.host.ctx, self.handle, speed) })
+        animation_status(unsafe { callback(ctx.host.call_ctx(), self.handle, speed) })
     }
 
     /// Stops every motion of this object's animator at once.
     pub fn stop_animation(&self, ctx: &mut Context<'_>) -> Result<(), AnimationError> {
         let callback = ctx.host.animation_stop.ok_or(AnimationError::Unavailable)?;
         // SAFETY: the host callback stays valid during this callback.
-        animation_status(unsafe { callback(ctx.host.ctx, self.handle) })
+        animation_status(unsafe { callback(ctx.host.call_ctx(), self.handle) })
     }
 }
 
@@ -1462,7 +1480,7 @@ impl ScriptRef {
         // SAFETY: the host keeps the value's nested buffers alive until this guest callback ends.
         if !unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 RveStr::from_str_ref(name),
                 &mut value,
@@ -1484,7 +1502,7 @@ impl ScriptRef {
         // SAFETY: the name and recursive value buffers live through the synchronous callback.
         unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 RveStr::from_str_ref(name),
                 &value.value,
@@ -1501,7 +1519,7 @@ impl ScriptRef {
         // SAFETY: the name and recursive value buffers live through the synchronous callback.
         unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 RveStr::from_str_ref(name),
                 &value.value,
@@ -1514,7 +1532,7 @@ impl ScriptRef {
         let callback = ctx.host.script_ref_enabled?;
         let mut enabled = false;
         // SAFETY: the output slot lives through this synchronous host call.
-        unsafe { callback(ctx.host.ctx, self.handle, &mut enabled) }.then_some(enabled)
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut enabled) }.then_some(enabled)
     }
 
     /// Stages the enabled flag; it takes effect at the end of the current phase.
@@ -1523,7 +1541,7 @@ impl ScriptRef {
             return false;
         };
         // SAFETY: the host pointer remains valid during this guest callback.
-        unsafe { callback(ctx.host.ctx, self.handle, enabled) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, enabled) }
     }
 }
 
@@ -1542,7 +1560,7 @@ impl Object {
             return false;
         };
         // SAFETY: the host callback is valid during this guest call.
-        unsafe { callback(ctx.host.ctx, self.handle, delay) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, delay) }
     }
 
     /// Returns `true` while the object is in the world.
@@ -1559,7 +1577,7 @@ impl Object {
     fn state_code(&self, ctx: &Context<'_>) -> Option<u32> {
         let callback = ctx.host.object_state?;
         // SAFETY: the host callback is valid during this guest call.
-        Some(unsafe { callback(ctx.host.ctx, self.handle) })
+        Some(unsafe { callback(ctx.host.call_ctx(), self.handle) })
     }
 }
 
@@ -1629,7 +1647,7 @@ impl<'a> Context<'a> {
                 // SAFETY: the name and recursive value buffers live through the synchronous callback.
                 if !unsafe {
                     callback(
-                        self.host.ctx,
+                        self.host.call_ctx(),
                         0,
                         RveStr::from_str_ref(name),
                         &borrowed.value,
@@ -1641,7 +1659,12 @@ impl<'a> Context<'a> {
                     let mut output = RveValue::integer(0);
                     // SAFETY: the host returns a value owned by the active ABI call context.
                     if !unsafe {
-                        callback(self.host.ctx, 0, RveStr::from_str_ref(name), &mut output)
+                        callback(
+                            self.host.call_ctx(),
+                            0,
+                            RveStr::from_str_ref(name),
+                            &mut output,
+                        )
                     } {
                         return Err(format!("script property {name:?} could not be read back"));
                     }
@@ -1668,6 +1691,8 @@ impl<'a> Context<'a> {
                 return Err("script produced a non-finite transform".to_owned());
             }
             let transform: RveTransform = self.transform.into();
+            // A script that noticed `is_interrupted` and returned still commits its work, so this
+            // write does not panic on an interrupt.
             // SAFETY: the host pointer and transform are valid for the duration of this callback.
             let ok =
                 unsafe { (self.host.set_local)(self.host.ctx, self.host.self_object, &transform) };
@@ -1679,6 +1704,13 @@ impl<'a> Context<'a> {
             self.properties.insert(name, value);
         }
         Ok(())
+    }
+
+    /// Whether the host asked this callback to stop, for example after the editor watchdog fired.
+    /// Every engine call made afterwards panics and the instance is disabled; a long computation
+    /// that does not call the engine should check this and return.
+    pub fn is_interrupted(&self) -> bool {
+        self.host.is_interrupted()
     }
 
     /// Returns the host's time snapshot for this lifecycle call.
@@ -1701,7 +1733,7 @@ impl<'a> Context<'a> {
             .set_time_scale
             .ok_or_else(|| "time scale is unavailable on this host".to_owned())?;
         // SAFETY: the callback and host context are valid during this guest call.
-        if unsafe { callback(self.host.ctx, scale) } {
+        if unsafe { callback(self.host.call_ctx(), scale) } {
             Ok(())
         } else {
             Err("could not stage time scale".to_owned())
@@ -1730,7 +1762,7 @@ impl<'a> Context<'a> {
         // SAFETY: the tag and output slot remain valid for this synchronous callback.
         let status = unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 delay,
                 repeat,
                 RveStr::from_str_ref(tag.as_ref()),
@@ -1752,7 +1784,7 @@ impl<'a> Context<'a> {
             .ok_or_else(|| "timers are unavailable on this host".to_owned())?;
         let mut canceled = false;
         // SAFETY: the output slot and host context remain valid during this callback.
-        let status = unsafe { callback(self.host.ctx, id.0, &mut canceled) };
+        let status = unsafe { callback(self.host.call_ctx(), id.0, &mut canceled) };
         if status == 0 {
             Ok(canceled)
         } else {
@@ -1793,7 +1825,8 @@ impl<'a> Context<'a> {
     /// Finds a scene object by its stable scene id.
     pub fn find(&self, id: &str) -> Option<Object> {
         // SAFETY: the host pointer and borrowed id are valid for this callback.
-        let handle = unsafe { (self.host.find_object)(self.host.ctx, RveStr::from_str_ref(id)) };
+        let handle =
+            unsafe { (self.host.find_object)(self.host.call_ctx(), RveStr::from_str_ref(id)) };
         (handle != 0).then_some(Object { handle })
     }
 
@@ -1802,7 +1835,7 @@ impl<'a> Context<'a> {
     pub fn active_camera(&self) -> Option<Object> {
         let callback = self.host.active_camera?;
         // SAFETY: host callback pointers and context are valid during this guest callback.
-        let handle = unsafe { callback(self.host.ctx) };
+        let handle = unsafe { callback(self.host.call_ctx()) };
         (handle != 0).then_some(Object { handle })
     }
 
@@ -1813,7 +1846,7 @@ impl<'a> Context<'a> {
         // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
         unsafe {
             (self.host.send)(
-                self.host.ctx,
+                self.host.call_ctx(),
                 RveStr::from_str_ref(target_id),
                 RveStr::from_str_ref(name),
                 &value.value,
@@ -1830,7 +1863,7 @@ impl<'a> Context<'a> {
             return false;
         };
         // SAFETY: the path bytes live through this synchronous host call.
-        unsafe { callback(self.host.ctx, RveStr::from_str_ref(path)) }
+        unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(path)) }
     }
 
     /// Requests graceful application shutdown after the current successful callback.
@@ -1840,7 +1873,7 @@ impl<'a> Context<'a> {
             return false;
         };
         // SAFETY: the host context is valid for the duration of this guest callback.
-        unsafe { callback(self.host.ctx) }
+        unsafe { callback(self.host.call_ctx()) }
     }
 
     /// Returns the name of the current scene, or `None` if the host does not report one.
@@ -1848,7 +1881,7 @@ impl<'a> Context<'a> {
         let callback = self.host.scene_current?;
         let mut value = RveValue::integer(0);
         // SAFETY: the host keeps the string alive until this guest callback ends.
-        if !unsafe { callback(self.host.ctx, &mut value) } {
+        if !unsafe { callback(self.host.call_ctx(), &mut value) } {
             return None;
         }
         // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
@@ -1862,7 +1895,13 @@ impl<'a> Context<'a> {
     pub fn broadcast(&mut self, name: &str, value: &Value) -> bool {
         let value = BorrowedAbiValue::new(value);
         // SAFETY: the name and recursive ABI value remain alive for the duration of this call.
-        unsafe { (self.host.broadcast)(self.host.ctx, RveStr::from_str_ref(name), &value.value) }
+        unsafe {
+            (self.host.broadcast)(
+                self.host.call_ctx(),
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
     }
 
     /// Appends an informational event to the host's script event queue.
@@ -1870,7 +1909,7 @@ impl<'a> Context<'a> {
         // SAFETY: the string is borrowed only for the host call.
         unsafe {
             (self.host.log)(
-                self.host.ctx,
+                self.host.call_ctx(),
                 abi::RVE_LOG_INFO,
                 RveStr::from_str_ref(message.as_ref()),
             )
@@ -1882,7 +1921,7 @@ impl<'a> Context<'a> {
         // SAFETY: the string is borrowed only for the host call.
         unsafe {
             (self.host.log)(
-                self.host.ctx,
+                self.host.call_ctx(),
                 abi::RVE_LOG_WARN,
                 RveStr::from_str_ref(message.as_ref()),
             )
@@ -1894,7 +1933,7 @@ impl<'a> Context<'a> {
         // SAFETY: the string is borrowed only for the host call.
         unsafe {
             (self.host.log)(
-                self.host.ctx,
+                self.host.call_ctx(),
                 abi::RVE_LOG_ERROR,
                 RveStr::from_str_ref(message.as_ref()),
             )
@@ -1907,21 +1946,21 @@ impl<'a> Context<'a> {
             return false;
         };
         // SAFETY: the context name is borrowed for the duration of the callback.
-        unsafe { callback(self.host.ctx, RveStr::from_str_ref(name)) }
+        unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(name)) }
     }
 
     /// Stages cursor visibility for this callback. Returns false when the host lacks ABI v8 support.
     pub fn set_cursor_visible(&mut self, visible: bool) -> bool {
         self.host
             .set_cursor_visible
-            .is_some_and(|callback| unsafe { callback(self.host.ctx, visible) })
+            .is_some_and(|callback| unsafe { callback(self.host.call_ctx(), visible) })
     }
 
     /// Stages cursor locking for this callback. Returns false when the host lacks ABI v8 support.
     pub fn set_cursor_locked(&mut self, locked: bool) -> bool {
         self.host
             .set_cursor_locked
-            .is_some_and(|callback| unsafe { callback(self.host.ctx, locked) })
+            .is_some_and(|callback| unsafe { callback(self.host.call_ctx(), locked) })
     }
 
     /// Replaces one action binding slot. Returns false when unavailable or invalid.
@@ -1943,7 +1982,7 @@ impl<'a> Context<'a> {
         // SAFETY: all strings and the array remain alive for the callback.
         unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 RveStr::from_str_ref(context),
                 RveStr::from_str_ref(action),
                 RveStr::from_str_ref(slot),
@@ -1957,13 +1996,13 @@ impl<'a> Context<'a> {
     pub fn reset_bindings(&mut self) -> bool {
         self.host
             .reset_bindings
-            .is_some_and(|callback| unsafe { callback(self.host.ctx) })
+            .is_some_and(|callback| unsafe { callback(self.host.call_ctx()) })
     }
 
     fn object_string(&self, callback: abi::RveObjectStringFn) -> Option<String> {
         let mut value = RveStr::empty();
         // SAFETY: the host pointer and output slot are valid during this callback.
-        if !unsafe { callback(self.host.ctx, self.host.self_object, &mut value) } {
+        if !unsafe { callback(self.host.call_ctx(), self.host.self_object, &mut value) } {
             return None;
         }
         // SAFETY: the host keeps returned strings alive through the current guest callback.
@@ -1983,7 +2022,13 @@ impl Console<'_> {
             ConsoleLevel::Error => abi::RVE_LOG_ERROR,
         };
         // SAFETY: the string is borrowed only for the host call.
-        unsafe { (self.host.log)(self.host.ctx, level, RveStr::from_str_ref(message.as_ref())) }
+        unsafe {
+            (self.host.log)(
+                self.host.call_ctx(),
+                level,
+                RveStr::from_str_ref(message.as_ref()),
+            )
+        }
     }
 
     pub fn register(&self, name: &str, description: Option<&str>) -> Result<(), String> {
@@ -1994,7 +2039,7 @@ impl Console<'_> {
         // SAFETY: both strings are borrowed only during the host callback.
         let status = unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 RveStr::from_str_ref(name),
                 description.map_or_else(RveStr::empty, RveStr::from_str_ref),
             )
@@ -2012,7 +2057,7 @@ impl Console<'_> {
             .unregister_command
             .ok_or_else(|| "console commands are unavailable in this script ABI".to_owned())?;
         // SAFETY: the name is borrowed only during the host callback.
-        let status = unsafe { callback(self.host.ctx, RveStr::from_str_ref(name)) };
+        let status = unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(name)) };
         if status == abi::RveStatus::Ok as u32 {
             Ok(())
         } else {
@@ -2055,7 +2100,7 @@ impl Input<'_> {
         let callback = self.host.input_context?;
         let mut value = RveStr::empty();
         // SAFETY: output storage is local and returned strings are callback-scoped.
-        if !unsafe { callback(self.host.ctx, &mut value) } {
+        if !unsafe { callback(self.host.call_ctx(), &mut value) } {
             return None;
         }
         // SAFETY: ABI v5 host keeps this borrowed string alive through the callback.
@@ -2071,7 +2116,7 @@ impl Input<'_> {
             // SAFETY: names and output storage are valid during the host callback.
             if !unsafe {
                 callback(
-                    self.host.ctx,
+                    self.host.call_ctx(),
                     RveStr::from_str_ref(context),
                     RveStr::from_str_ref(action),
                     RveStr::from_str_ref(slot),
@@ -2132,7 +2177,7 @@ impl Input<'_> {
         };
         let mut state = abi::RveGamepadState::default();
         // SAFETY: the host pointer and output slot remain valid during this script callback.
-        if unsafe { callback(self.host.ctx, u32::from(pad), &mut state) } {
+        if unsafe { callback(self.host.call_ctx(), u32::from(pad), &mut state) } {
             GamepadState { state }
         } else {
             GamepadState::default()
@@ -2148,7 +2193,7 @@ impl Input<'_> {
             return false;
         };
         // SAFETY: the host pointer remains valid during this script callback.
-        unsafe { callback(self.host.ctx, u32::from(pad), strong, weak, seconds) }
+        unsafe { callback(self.host.call_ctx(), u32::from(pad), strong, weak, seconds) }
     }
 
     /// Returns whether a key is currently held.
@@ -2198,7 +2243,7 @@ impl Input<'_> {
             locked: false,
         };
         // SAFETY: the host pointer and output slot remain valid during this script callback.
-        unsafe { callback(self.host.ctx, &mut state) }.then_some(state)
+        unsafe { callback(self.host.call_ctx(), &mut state) }.then_some(state)
     }
 
     /// Returns the cursor position in physical window pixels.
@@ -2218,7 +2263,7 @@ impl Input<'_> {
 
     fn key_state(&self, key: Key) -> u32 {
         // SAFETY: the host pointer remains valid during this script callback.
-        unsafe { (self.host.key_state)(self.host.ctx, key as u32) }
+        unsafe { (self.host.key_state)(self.host.call_ctx(), key as u32) }
     }
 
     fn action_state(&self, name: &str) -> u32 {
@@ -2228,7 +2273,7 @@ impl Input<'_> {
         // SAFETY: the name is borrowed only for the host callback.
         unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 RveStr::from_str_ref(name),
                 abi::RVE_ACTION_BUTTON,
             )
@@ -2240,19 +2285,25 @@ impl Input<'_> {
         let mut value = [0.0; 2];
         // SAFETY: name and output storage remain valid for the host callback.
         unsafe {
-            callback(self.host.ctx, RveStr::from_str_ref(name), kind, &mut value).then_some(value)
+            callback(
+                self.host.call_ctx(),
+                RveStr::from_str_ref(name),
+                kind,
+                &mut value,
+            )
+            .then_some(value)
         }
     }
 
     fn mouse_button_state(&self, button: MouseButton) -> u32 {
         // SAFETY: the host pointer remains valid during this script callback.
-        unsafe { (self.host.mouse_button_state)(self.host.ctx, button as u32) }
+        unsafe { (self.host.mouse_button_state)(self.host.call_ctx(), button as u32) }
     }
 
     fn input_vector(&self, callback: abi::RveInputVectorFn) -> [f32; 2] {
         let mut value = [0.0; 2];
         // SAFETY: the host pointer and output slot remain valid during this script callback.
-        let _ = unsafe { callback(self.host.ctx, &mut value) };
+        let _ = unsafe { callback(self.host.call_ctx(), &mut value) };
         value
     }
 }
@@ -2262,7 +2313,7 @@ impl Object {
     pub fn transform(&self, ctx: &mut Context<'_>) -> Option<Transform> {
         let mut transform = RveTransform::default();
         // SAFETY: the host pointer and output slot are valid during this guest callback.
-        if !unsafe { (ctx.host.get_local)(ctx.host.ctx, self.handle, &mut transform) } {
+        if !unsafe { (ctx.host.get_local)(ctx.host.call_ctx(), self.handle, &mut transform) } {
             return None;
         }
         Some(transform.into())
@@ -2272,7 +2323,7 @@ impl Object {
     pub fn set_transform(&self, ctx: &mut Context<'_>, transform: Transform) -> bool {
         let transform: RveTransform = transform.into();
         // SAFETY: the host pointer and transform are valid during this guest callback.
-        unsafe { (ctx.host.set_local)(ctx.host.ctx, self.handle, &transform) }
+        unsafe { (ctx.host.set_local)(ctx.host.call_ctx(), self.handle, &transform) }
     }
 
     /// Returns this object's camera settings, or `None` if it is not a camera or the host does
@@ -2281,7 +2332,7 @@ impl Object {
         let callback = ctx.host.get_camera_settings?;
         let mut settings = RveCameraSettings::default();
         // SAFETY: host callback and output storage are valid during this guest callback.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &mut settings) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &mut settings) } {
             return None;
         }
         settings.try_into().ok()
@@ -2295,7 +2346,7 @@ impl Object {
         };
         let settings: RveCameraSettings = settings.into();
         // SAFETY: host callback and settings are valid during this guest callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &settings) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &settings) }
     }
 
     /// Returns this camera's post-process settings in the flat ABI v12 layout. `None` when the
@@ -2304,7 +2355,7 @@ impl Object {
         let callback = ctx.host.get_post_process?;
         let mut settings = RvePostProcessSettings::default();
         // SAFETY: host callback and output storage are valid during this guest callback.
-        if unsafe { callback(ctx.host.ctx, self.handle, &mut settings) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &mut settings) } {
             Some(settings)
         } else {
             None
@@ -2322,7 +2373,7 @@ impl Object {
             return false;
         };
         // SAFETY: host callback and settings are valid during this guest callback.
-        unsafe { callback(ctx.host.ctx, self.handle, settings) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, settings) }
     }
 
     /// Number of screen shader slots of this camera; `None` when the object is not a camera or the
@@ -2331,7 +2382,7 @@ impl Object {
         let callback = ctx.host.screen_shader_count?;
         let mut count = 0;
         // SAFETY: host callback and output storage are valid during this guest callback.
-        if unsafe { callback(ctx.host.ctx, self.handle, &mut count) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &mut count) } {
             Some(count)
         } else {
             None
@@ -2343,7 +2394,7 @@ impl Object {
         let callback = ctx.host.get_screen_shader?;
         let mut state = RveScreenShaderState::default();
         // SAFETY: host callback and output storage are valid during this guest callback.
-        if unsafe { callback(ctx.host.ctx, self.handle, slot, &mut state) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, slot, &mut state) } {
             Some(state)
         } else {
             None
@@ -2362,7 +2413,7 @@ impl Object {
             return false;
         };
         // SAFETY: host callback and state are valid during this guest callback.
-        unsafe { callback(ctx.host.ctx, self.handle, slot, state) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, slot, state) }
     }
 
     /// Stages this object as the active scene camera.
@@ -2371,14 +2422,14 @@ impl Object {
             return false;
         };
         // SAFETY: host callback is valid during this guest callback.
-        unsafe { callback(ctx.host.ctx, self.handle) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle) }
     }
 
     /// Returns this object's column-major world matrix snapshot.
     pub fn world_matrix(&self, ctx: &mut Context<'_>) -> Option<[f32; 16]> {
         let mut matrix = [0.0; 16];
         // SAFETY: the host pointer and output slot are valid during this guest callback.
-        if !unsafe { (ctx.host.world_matrix)(ctx.host.ctx, self.handle, &mut matrix) } {
+        if !unsafe { (ctx.host.world_matrix)(ctx.host.call_ctx(), self.handle, &mut matrix) } {
             return None;
         }
         Some(matrix)
@@ -2389,7 +2440,7 @@ impl Object {
         let callback = ctx.host.get_velocity.ok_or(PhysicsError::Unavailable)?;
         let mut value = [0.0; 3];
         // SAFETY: callback and output storage remain valid during this script call.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &mut value) } {
             return Err(PhysicsError::Rejected);
         }
         finite_vector(value)
@@ -2434,7 +2485,7 @@ impl Object {
         }
         let callback = callback.ok_or(PhysicsError::Unavailable)?;
         // SAFETY: callback and vector storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &value) } {
             Ok(())
         } else {
             Err(PhysicsError::Rejected)
@@ -2453,7 +2504,7 @@ impl Object {
         let callback = ctx.host.move_character.ok_or(PhysicsError::Unavailable)?;
         let mut result = RveCharacterMoveResult::default();
         // SAFETY: callback and input/output storage remain valid during this script call.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &displacement, &mut result) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &displacement, &mut result) } {
             return Err(PhysicsError::Rejected);
         }
         if !finite_vector(result.translation) {
@@ -2467,7 +2518,7 @@ impl Object {
         let callback = ctx.host.is_grounded.ok_or(PhysicsError::Unavailable)?;
         let mut grounded = false;
         // SAFETY: callback and output storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &mut grounded) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &mut grounded) } {
             Ok(grounded)
         } else {
             Err(PhysicsError::Rejected)
@@ -2485,7 +2536,7 @@ impl Object {
             .set_collider_enabled
             .ok_or(PhysicsError::Unavailable)?;
         // SAFETY: callback is valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, enabled) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, enabled) } {
             Ok(())
         } else {
             Err(PhysicsError::Rejected)
@@ -2500,7 +2551,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let mut enabled = false;
         // SAFETY: callback and output storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &mut enabled) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &mut enabled) } {
             Ok(enabled)
         } else {
             Err(PhysicsError::Rejected)
@@ -2524,7 +2575,7 @@ impl Object {
     ) -> Option<String> {
         let mut value = RveStr::empty();
         // SAFETY: the host pointer and output slot are valid during this guest callback.
-        if !unsafe { callback(ctx.host.ctx, handle, &mut value) } {
+        if !unsafe { callback(ctx.host.call_ctx(), handle, &mut value) } {
             return None;
         }
         // SAFETY: the host keeps returned strings alive through the current guest callback.
@@ -2565,7 +2616,7 @@ impl Physics<'_> {
         // SAFETY: callback and all vector/output storage remain valid through this script call.
         if !unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 &origin,
                 &direction,
                 max_distance,
@@ -2605,7 +2656,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let mut value = RveColliderValue::default();
         // SAFETY: callback and output storage remain valid during this script call.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &mut value) } {
             return Err(PhysicsError::Rejected);
         }
         collider_from_abi(value)
@@ -2628,7 +2679,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let value = collider_to_abi(collider);
         // SAFETY: callback and input storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &value) } {
             Ok(())
         } else {
             Err(PhysicsError::Rejected)
@@ -2643,7 +2694,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let mut value = RveRigidBodyValue::default();
         // SAFETY: callback and output storage remain valid during this script call.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &mut value) } {
             return Err(PhysicsError::Rejected);
         }
         rigid_body_from_abi(value)
@@ -2666,7 +2717,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let value = rigid_body_to_abi(body);
         // SAFETY: callback and input storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &value) } {
             Ok(())
         } else {
             Err(PhysicsError::Rejected)
@@ -2681,7 +2732,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let mut value = RveControllerValue::default();
         // SAFETY: callback and output storage remain valid during this script call.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &mut value) } {
             return Err(PhysicsError::Rejected);
         }
         Ok(controller_from_abi(value))
@@ -2704,7 +2755,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let value = controller_to_abi(controller);
         // SAFETY: callback and input storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &value) } {
             Ok(())
         } else {
             Err(PhysicsError::Rejected)
@@ -2727,7 +2778,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let mut result = RveCharacterMoveResult::default();
         // SAFETY: callback and input/output storage remain valid during this script call.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &velocity, &mut result) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &velocity, &mut result) } {
             return Err(PhysicsError::Rejected);
         }
         Ok(result.into())
@@ -2738,7 +2789,7 @@ impl Object {
         let callback = ctx.host.physics_jump.ok_or(PhysicsError::Unavailable)?;
         let mut jumped = false;
         // SAFETY: callback and output storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &mut jumped) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &mut jumped) } {
             Ok(jumped)
         } else {
             Err(PhysicsError::Rejected)
@@ -2753,7 +2804,7 @@ impl Object {
             .ok_or(PhysicsError::Unavailable)?;
         let mut velocity = 0.0f32;
         // SAFETY: callback and output storage remain valid during this script call.
-        if unsafe { callback(ctx.host.ctx, self.handle, &mut velocity) } {
+        if unsafe { callback(ctx.host.call_ctx(), self.handle, &mut velocity) } {
             Ok(velocity)
         } else {
             Err(PhysicsError::Rejected)
@@ -2765,7 +2816,7 @@ impl Object {
         let callback = ctx.host.physics_overlaps.ok_or(PhysicsError::Unavailable)?;
         // SAFETY: the host writes at most `capacity` handles into the buffer for this call.
         Ok(host_handles(|out, capacity, count| unsafe {
-            callback(ctx.host.ctx, self.handle, out, capacity, count)
+            callback(ctx.host.call_ctx(), self.handle, out, capacity, count)
         }))
     }
 
@@ -2796,7 +2847,15 @@ impl Physics<'_> {
         let query = query_options_to_abi(options, &ignore);
         // SAFETY: shape, center, options and the ignore buffer remain valid through this call.
         Ok(host_handles(|out, capacity, count| unsafe {
-            callback(self.host.ctx, &shape, &center, &query, out, capacity, count)
+            callback(
+                self.host.call_ctx(),
+                &shape,
+                &center,
+                &query,
+                out,
+                capacity,
+                count,
+            )
         }))
     }
 
@@ -2861,7 +2920,7 @@ impl Physics<'_> {
         // SAFETY: a null buffer with zero capacity asks only for the hit count.
         if !unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 &origin,
                 &direction,
                 max_distance,
@@ -2878,7 +2937,7 @@ impl Physics<'_> {
         // SAFETY: `hits` has `count` writable entries; the host writes at most that many.
         if !unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 &origin,
                 &direction,
                 max_distance,
@@ -2925,7 +2984,7 @@ impl Physics<'_> {
         // SAFETY: shape, vectors, options and the ignore buffer remain valid through this call.
         if !unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 &shape,
                 &center,
                 &displacement,
@@ -3181,7 +3240,7 @@ impl Net<'_> {
     pub fn mode(&self) -> Result<NetMode, NetError> {
         let callback = self.host.net_mode.ok_or(NetError::Unavailable)?;
         // SAFETY: the host context is valid for this callback.
-        Ok(match unsafe { callback(self.host.ctx) } {
+        Ok(match unsafe { callback(self.host.call_ctx()) } {
             RVE_NET_MODE_HOST => NetMode::Host,
             RVE_NET_MODE_SERVER => NetMode::Server,
             RVE_NET_MODE_CLIENT => NetMode::Client,
@@ -3206,7 +3265,7 @@ impl Net<'_> {
     pub fn local_peer(&self) -> Result<u32, NetError> {
         let callback = self.host.net_local_peer.ok_or(NetError::Unavailable)?;
         // SAFETY: the host context is valid for this callback.
-        Ok(unsafe { callback(self.host.ctx) })
+        Ok(unsafe { callback(self.host.call_ctx()) })
     }
 
     /// Returns the remote peers, without the local one.
@@ -3214,13 +3273,20 @@ impl Net<'_> {
         let callback = self.host.net_peers.ok_or(NetError::Unavailable)?;
         let mut count = 0_usize;
         // SAFETY: a zero-capacity call writes only the total count.
-        if !unsafe { callback(self.host.ctx, std::ptr::null_mut(), 0, &mut count) } {
+        if !unsafe { callback(self.host.call_ctx(), std::ptr::null_mut(), 0, &mut count) } {
             return Err(NetError::Rejected);
         }
         let mut peers = vec![0_u32; count];
         let mut total = 0_usize;
         // SAFETY: the buffer holds `count` entries; the host writes at most that many.
-        if !unsafe { callback(self.host.ctx, peers.as_mut_ptr(), peers.len(), &mut total) } {
+        if !unsafe {
+            callback(
+                self.host.call_ctx(),
+                peers.as_mut_ptr(),
+                peers.len(),
+                &mut total,
+            )
+        } {
             return Err(NetError::Rejected);
         }
         peers.truncate(total.min(count));
@@ -3241,7 +3307,7 @@ impl Net<'_> {
         // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
         let status = unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 kind,
                 peer,
                 RveStr::from_str_ref(name),
@@ -3259,7 +3325,7 @@ impl Object {
         let callback = ctx.host.net_object_id.ok_or(NetError::Unavailable)?;
         let mut id = 0_u32;
         // SAFETY: the host owns the output slot for this call.
-        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut id) }.then_some(id))
+        Ok(unsafe { callback(ctx.host.call_ctx(), self.handle, &mut id) }.then_some(id))
     }
 
     /// Owner peer of this object, or `None` when no owner is assigned.
@@ -3267,7 +3333,7 @@ impl Object {
         let callback = ctx.host.net_object_owner.ok_or(NetError::Unavailable)?;
         let mut owner = 0_u32;
         // SAFETY: the host owns the output slot for this call.
-        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut owner) }.then_some(owner))
+        Ok(unsafe { callback(ctx.host.call_ctx(), self.handle, &mut owner) }.then_some(owner))
     }
 
     /// True when the local peer owns this object.
@@ -3275,7 +3341,7 @@ impl Object {
         let callback = ctx.host.net_object_is_owner.ok_or(NetError::Unavailable)?;
         let mut owner = false;
         // SAFETY: the host owns the output slot for this call.
-        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut owner) } && owner)
+        Ok(unsafe { callback(ctx.host.call_ctx(), self.handle, &mut owner) } && owner)
     }
 
     /// True when this process may change the state of this object.
@@ -3286,14 +3352,14 @@ impl Object {
             .ok_or(NetError::Unavailable)?;
         let mut authority = false;
         // SAFETY: the host owns the output slot for this call.
-        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut authority) } && authority)
+        Ok(unsafe { callback(ctx.host.call_ctx(), self.handle, &mut authority) } && authority)
     }
 
     /// Assigns the owner peer; only the server, a listen server or offline mode may do it.
     pub fn set_net_owner(&self, ctx: &mut Context<'_>, peer: u32) -> Result<(), NetError> {
         let callback = ctx.host.net_object_set_owner.ok_or(NetError::Unavailable)?;
         // SAFETY: the host context is valid for this callback.
-        net_status(unsafe { callback(ctx.host.ctx, self.handle, peer) })
+        net_status(unsafe { callback(ctx.host.call_ctx(), self.handle, peer) })
     }
 
     /// Stages a message for the same object on `target`'s side.
@@ -3311,7 +3377,7 @@ impl Object {
         // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
         let status = unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 kind,
                 peer,
@@ -3350,7 +3416,7 @@ impl Object {
         let callback = ctx.host.object_parent?;
         let mut parent = 0u64;
         // SAFETY: the host context and the output slot are valid for this callback.
-        let ok = unsafe { callback(ctx.host.ctx, self.handle, &mut parent) };
+        let ok = unsafe { callback(ctx.host.call_ctx(), self.handle, &mut parent) };
         (ok && parent != 0).then_some(Object { handle: parent })
     }
 
@@ -3359,7 +3425,7 @@ impl Object {
         let Some(callback) = ctx.host.object_children else {
             return Vec::new();
         };
-        let (host, handle) = (ctx.host.ctx, self.handle);
+        let (host, handle) = (ctx.host.call_ctx(), self.handle);
         // SAFETY: the host context and output buffers are valid for each call.
         host_handles(|out, capacity, count| unsafe { callback(host, handle, out, capacity, count) })
     }
@@ -3376,7 +3442,7 @@ impl Object {
         };
         let parent = parent.map_or(0, |parent| parent.handle);
         // SAFETY: the host context is valid for this callback.
-        unsafe { callback(ctx.host.ctx, self.handle, parent, keep_world) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, parent, keep_world) }
     }
 
     /// Returns this object's own active flag; `None` if the object is unavailable.
@@ -3395,7 +3461,7 @@ impl Object {
             return false;
         };
         // SAFETY: the host context is valid for this callback.
-        unsafe { callback(ctx.host.ctx, self.handle, active) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, active) }
     }
 
     /// Returns whether this root object persists when a scene is loaded.
@@ -3403,7 +3469,7 @@ impl Object {
         let callback = ctx.host.object_keep_on_load?;
         let mut keep = false;
         // SAFETY: the host callback and output slot are valid during this guest call.
-        unsafe { callback(ctx.host.ctx, self.handle, &mut keep) }.then_some(keep)
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &mut keep) }.then_some(keep)
     }
 
     /// Stages whether this root object persists when a scene is loaded.
@@ -3412,7 +3478,7 @@ impl Object {
             return false;
         };
         // SAFETY: the host pointer remains valid during this guest callback.
-        unsafe { callback(ctx.host.ctx, self.handle, keep) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, keep) }
     }
 
     /// Finds another script instance on this object: a lite script is found by its virtual path
@@ -3423,7 +3489,7 @@ impl Object {
         // SAFETY: the key and output slot live through this synchronous host call.
         unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 RveStr::from_str_ref(key),
                 &mut handle,
@@ -3443,7 +3509,7 @@ impl Object {
             return false;
         };
         // SAFETY: the host context and the vector are valid for this callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &position) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &position) }
     }
 
     /// Returns the world rotation as Euler angles in degrees.
@@ -3457,7 +3523,7 @@ impl Object {
             return false;
         };
         // SAFETY: the host context and the vector are valid for this callback.
-        unsafe { callback(ctx.host.ctx, self.handle, &rotation_deg) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, &rotation_deg) }
     }
 
     /// Returns the tag; an empty string means no tag.
@@ -3465,7 +3531,7 @@ impl Object {
         let callback = ctx.host.object_tag?;
         let mut value = RveStr::from_static("");
         // SAFETY: the host context and the output slot are valid for this callback.
-        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+        if !unsafe { callback(ctx.host.call_ctx(), self.handle, &mut value) } {
             return None;
         }
         // SAFETY: the host keeps the string valid for the duration of this callback.
@@ -3478,7 +3544,7 @@ impl Object {
             return false;
         };
         // SAFETY: the borrowed string is valid for this call.
-        unsafe { callback(ctx.host.ctx, self.handle, RveStr::from_str_ref(tag)) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, RveStr::from_str_ref(tag)) }
     }
 
     /// Returns the layer index `0..32`.
@@ -3486,7 +3552,7 @@ impl Object {
         let callback = ctx.host.object_layer?;
         let mut layer = 0u32;
         // SAFETY: the host context and the output slot are valid for this callback.
-        (unsafe { callback(ctx.host.ctx, self.handle, &mut layer) }).then_some(layer)
+        (unsafe { callback(ctx.host.call_ctx(), self.handle, &mut layer) }).then_some(layer)
     }
 
     /// Sets the layer index `0..32`.
@@ -3495,7 +3561,7 @@ impl Object {
             return false;
         };
         // SAFETY: the host context is valid for this callback.
-        unsafe { callback(ctx.host.ctx, self.handle, layer) }
+        unsafe { callback(ctx.host.call_ctx(), self.handle, layer) }
     }
 
     /// Returns whether the object has the named component (see [`crate::abi::RVE_COMPONENT_NAMES`]),
@@ -3508,7 +3574,7 @@ impl Object {
         // SAFETY: the borrowed name and the output slot are valid for this callback.
         let ok = unsafe {
             callback(
-                ctx.host.ctx,
+                ctx.host.call_ctx(),
                 self.handle,
                 RveStr::from_str_ref(name),
                 &mut present,
@@ -3534,7 +3600,7 @@ fn bool_query(
     let callback = callback?;
     let mut value = false;
     // SAFETY: the host context and the output slot are valid for this callback.
-    (unsafe { callback(ctx.host.ctx, handle, &mut value) }).then_some(value)
+    (unsafe { callback(ctx.host.call_ctx(), handle, &mut value) }).then_some(value)
 }
 
 fn vec3_query(
@@ -3545,7 +3611,7 @@ fn vec3_query(
     let callback = callback?;
     let mut value = [0.0; 3];
     // SAFETY: the host context and the output slot are valid for this callback.
-    (unsafe { callback(ctx.host.ctx, handle, &mut value) }).then_some(value)
+    (unsafe { callback(ctx.host.call_ctx(), handle, &mut value) }).then_some(value)
 }
 
 impl Context<'_> {
@@ -3579,7 +3645,7 @@ impl Context<'_> {
             return false;
         };
         // SAFETY: the host context is valid for this callback.
-        unsafe { callback(self.host.ctx, enabled) }
+        unsafe { callback(self.host.call_ctx(), enabled) }
     }
 
     /// Returns this script instance's enabled flag; `false` if the host lacks the callback.
@@ -3589,14 +3655,14 @@ impl Context<'_> {
         };
         let mut enabled = false;
         // SAFETY: the host context and the output slot are valid for this callback.
-        unsafe { callback(self.host.ctx, &mut enabled) && enabled }
+        unsafe { callback(self.host.call_ctx(), &mut enabled) && enabled }
     }
 
     fn find_list(&self, callback: Option<abi::RveFindObjectsFn>, value: &str) -> Vec<Object> {
         let Some(callback) = callback else {
             return Vec::new();
         };
-        let host = self.host.ctx;
+        let host = self.host.call_ctx();
         // SAFETY: the host context and the borrowed string are valid for each call.
         host_handles(|out, capacity, count| unsafe {
             callback(host, RveStr::from_str_ref(value), out, capacity, count)
@@ -3812,7 +3878,8 @@ impl Ui<'_> {
         let callback = self.host.ui_open.ok_or(UiError::Unavailable)?;
         let mut raw = 0_u64;
         // SAFETY: the host and the output slot are valid for this callback.
-        let status = unsafe { callback(self.host.ctx, RveStr::from_str_ref(path), &mut raw) };
+        let status =
+            unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(path), &mut raw) };
         ui_status(status)?;
         Ok(Canvas { raw })
     }
@@ -3821,7 +3888,7 @@ impl Ui<'_> {
     pub fn close(&self, canvas: Canvas) -> Result<(), UiError> {
         let callback = self.host.ui_close.ok_or(UiError::Unavailable)?;
         // SAFETY: the host is valid for this callback and checks the handle itself.
-        ui_status(unsafe { callback(self.host.ctx, canvas.raw) })
+        ui_status(unsafe { callback(self.host.call_ctx(), canvas.raw) })
     }
 
     /// The canvas of an object's `ui_canvas` component, if it is open.
@@ -3829,7 +3896,7 @@ impl Ui<'_> {
         let callback = self.host.ui_object_canvas?;
         let mut raw = 0_u64;
         // SAFETY: the host and the output slot are valid for this callback.
-        unsafe { callback(self.host.ctx, object.handle, &mut raw) }.then_some(Canvas { raw })
+        unsafe { callback(self.host.call_ctx(), object.handle, &mut raw) }.then_some(Canvas { raw })
     }
 
     /// The element that has focus, if any.
@@ -3838,7 +3905,7 @@ impl Ui<'_> {
         let mut canvas = 0_u64;
         let mut index = 0_u32;
         // SAFETY: the host and both output slots are valid for this callback.
-        unsafe { callback(self.host.ctx, &mut canvas, &mut index) }.then_some(Element {
+        unsafe { callback(self.host.call_ctx(), &mut canvas, &mut index) }.then_some(Element {
             canvas: Canvas { raw: canvas },
             index,
         })
@@ -3849,7 +3916,7 @@ impl Ui<'_> {
         self.host
             .ui_pointer_over
             // SAFETY: the host is valid for this callback.
-            .is_some_and(|callback| unsafe { callback(self.host.ctx) })
+            .is_some_and(|callback| unsafe { callback(self.host.call_ctx()) })
     }
 
     /// The element with this identifier, or `None` when the canvas has no such element.
@@ -3859,7 +3926,7 @@ impl Ui<'_> {
         // SAFETY: the host and the output slot are valid for this callback.
         let found = unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 canvas.raw,
                 RveStr::from_str_ref(id),
                 &mut index,
@@ -3872,7 +3939,7 @@ impl Ui<'_> {
         let callback = self.host.ui_get.ok_or(UiError::Unavailable)?;
         let mut out = empty_ui_value();
         // SAFETY: the host and the output slot are valid for this callback.
-        ui_status(unsafe { callback(self.host.ctx, canvas, element, property, &mut out) })?;
+        ui_status(unsafe { callback(self.host.call_ctx(), canvas, element, property, &mut out) })?;
         Ok(out)
     }
 
@@ -3886,7 +3953,7 @@ impl Ui<'_> {
         let callback = self.host.ui_set.ok_or(UiError::Unavailable)?;
         let value = ui_value_to_abi(value)?;
         // SAFETY: the host reads the borrowed value only during this callback; `value` lives on.
-        ui_status(unsafe { callback(self.host.ctx, canvas, element, property, &value) })
+        ui_status(unsafe { callback(self.host.call_ctx(), canvas, element, property, &value) })
     }
 
     fn get_bool(&self, canvas: u64, element: u32, property: u32) -> Result<bool, UiError> {
@@ -3936,7 +4003,7 @@ impl Ui<'_> {
         // SAFETY: the host reads the value only during this callback.
         ui_status(unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 canvas.raw,
                 0,
                 RVE_UI_PROP_CANVAS_LAYER,
@@ -4031,7 +4098,7 @@ impl Ui<'_> {
         // SAFETY: the host copies the borrowed path during this callback.
         ui_status(unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 element.canvas.raw,
                 element.index,
                 RveStr::from_str_ref(path),
@@ -4049,7 +4116,14 @@ impl Ui<'_> {
             offset_max: [0.0; 2],
         };
         // SAFETY: the host and the output slot are valid for this callback.
-        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index, &mut out) })?;
+        ui_status(unsafe {
+            callback(
+                self.host.call_ctx(),
+                element.canvas.raw,
+                element.index,
+                &mut out,
+            )
+        })?;
         Ok(out.into())
     }
 
@@ -4057,7 +4131,14 @@ impl Ui<'_> {
         let callback = self.host.ui_set_rect.ok_or(UiError::Unavailable)?;
         let rect = RveUiRect::from(rect);
         // SAFETY: the host reads the rectangle only during this callback.
-        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index, &rect) })
+        ui_status(unsafe {
+            callback(
+                self.host.call_ctx(),
+                element.canvas.raw,
+                element.index,
+                &rect,
+            )
+        })
     }
 
     /// Replaces the options of a dropdown; the selection is kept only while its index remains.
@@ -4070,7 +4151,7 @@ impl Ui<'_> {
         // SAFETY: `borrowed` and the strings it points to outlive this callback.
         ui_status(unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 element.canvas.raw,
                 element.index,
                 borrowed.as_ptr(),
@@ -4083,7 +4164,7 @@ impl Ui<'_> {
     pub fn focus(&self, element: Element) -> Result<(), UiError> {
         let callback = self.host.ui_focus.ok_or(UiError::Unavailable)?;
         // SAFETY: the host is valid for this callback and checks the handle itself.
-        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index) })
+        ui_status(unsafe { callback(self.host.call_ctx(), element.canvas.raw, element.index) })
     }
 }
 

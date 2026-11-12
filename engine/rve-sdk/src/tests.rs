@@ -26,6 +26,29 @@ struct Probe {
 
 struct QuitProbe;
 
+/// Hangs in a loop that keeps calling the engine, until the host interrupts it.
+struct HangingLoop;
+
+impl Script for HangingLoop {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        loop {
+            ctx.log_info("tick");
+        }
+    }
+}
+
+/// Spins without engine calls but polls `is_interrupted` and returns cooperatively.
+struct PollingLoop;
+
+impl Script for PollingLoop {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        ctx.log_info("started");
+        while !ctx.is_interrupted() {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 impl Script for QuitProbe {
     fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
         let accepted = ctx.quit();
@@ -157,6 +180,21 @@ fn scripts() -> &'static RveModule {
     }
 }
 
+fn hanging_loop_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(HangingLoop))
+}
+
+fn polling_loop_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PollingLoop))
+}
+
+fn loop_scripts() -> &'static RveModule {
+    crate::script_module! {
+        "HangingLoop" => hanging_loop_factory,
+        "PollingLoop" => polling_loop_factory,
+    }
+}
+
 fn quit_scripts() -> &'static RveModule {
     crate::script_module! {
         "QuitProbe" => quit_probe_factory,
@@ -211,6 +249,9 @@ mod exported {
 #[derive(Default)]
 struct HostState {
     error: Option<String>,
+    /// Raises `interrupt` once this many messages were logged, like a watchdog would.
+    interrupt_after_logs: Option<usize>,
+    interrupt: std::sync::atomic::AtomicBool,
     /// UI calls in guest order, with their arguments spelled out.
     ui_calls: Vec<String>,
     /// Status returned by every UI callback; zero is `RVE_UI_OK`.
@@ -298,6 +339,14 @@ unsafe extern "C" fn log(ctx: *mut c_void, level: u32, message: RveStr) {
         .logs
         .push(unsafe { message.to_str() }.unwrap().to_owned());
     state.log_levels.push(level);
+    if state
+        .interrupt_after_logs
+        .is_some_and(|limit| state.logs.len() >= limit)
+    {
+        state
+            .interrupt
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 unsafe extern "C" fn register_command(ctx: *mut c_void, name: RveStr, description: RveStr) -> u32 {
@@ -828,6 +877,7 @@ fn host(state: &mut HostState) -> RveHost {
         window_screenshot: None,
         file_dialog_open: None,
         file_dialog_poll: None,
+        interrupt: std::ptr::null(),
         app_quit: None,
     }
 }
@@ -1084,6 +1134,69 @@ fn script_module_macro_builds_abi_table_and_guest_callbacks() {
         },
         RveStatus::Ok
     );
+    // SAFETY: drop is called exactly once for this successful create.
+    assert_eq!(unsafe { (script.drop)(instance) }, RveStatus::Ok);
+}
+
+#[test]
+fn host_interrupt_unwinds_a_script_looping_over_engine_calls() {
+    let mut state = HostState {
+        interrupt_after_logs: Some(3),
+        ..HostState::default()
+    };
+    let mut abi_host = host(&mut state);
+    abi_host.interrupt = std::ptr::addr_of!(state.interrupt);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let script = descriptor(loop_scripts(), "HangingLoop");
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor, host and its interrupt flag stay live through each guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&abi_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+        assert_eq!(
+            (script.update)(instance, &abi_host, 0.1),
+            RveStatus::Panicked
+        );
+        assert_eq!((script.drop)(instance), RveStatus::Ok);
+    }
+    assert_eq!(state.logs, ["tick", "tick", "tick"]);
+    assert_eq!(
+        state.error.as_deref(),
+        Some(crate::abi::RVE_INTERRUPTED_MESSAGE)
+    );
+}
+
+#[test]
+fn script_can_poll_the_host_interrupt_and_return_normally() {
+    let mut state = HostState {
+        interrupt_after_logs: Some(1),
+        ..HostState::default()
+    };
+    let mut abi_host = host(&mut state);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let script = descriptor(loop_scripts(), "PollingLoop");
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: descriptor and host stay live through each synchronous guest callback.
+    unsafe {
+        assert_eq!(
+            (script.create)(&abi_host, &params, &mut instance),
+            RveStatus::Ok
+        );
+    }
+    abi_host.interrupt = std::ptr::addr_of!(state.interrupt);
+    // SAFETY: as above; the flag is raised by the first log and read through `is_interrupted`.
+    unsafe {
+        assert_eq!((script.update)(instance, &abi_host, 0.1), RveStatus::Ok);
+    }
+    assert_eq!(state.logs, ["started"]);
     // SAFETY: drop is called exactly once for this successful create.
     assert_eq!(unsafe { (script.drop)(instance) }, RveStatus::Ok);
 }
@@ -2578,7 +2691,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2853,7 +2966,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
 }
 
 #[test]
@@ -2875,7 +2988,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
 }
 
 #[test]
@@ -2899,7 +3012,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
 }
 
 #[test]
@@ -2935,7 +3048,7 @@ fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
         offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
 }
 
 #[test]
@@ -2981,7 +3094,7 @@ fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
 fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
     assert_eq!(RVE_TRIGGER_STAY, 4);
     assert_eq!(
         offset_of!(RveHost, physics_get_collider),
@@ -2998,7 +3111,7 @@ fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
 fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
     assert_eq!(
         offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
@@ -3034,7 +3147,7 @@ fn runtime_physics_value_types_are_c_layout_in_v18() {
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);

@@ -67,8 +67,8 @@ dock UI. Существующая dock-панель Console остаётся ж�
 
 UI и command parsing имеют headless-проверки без окна и GPU. Runtime overlay и Vulkan
 ресурсный цикл требуют ручной проверки на целевой Windows/macOS с подходящим Vulkan
-драйвером и не покрываются этими тестами. Lua можно прервать watchdog-ом, но синхронный
-Rust callback нельзя принудительно остановить; см. [[Engine/EngineScript]] и
+драйвером и не покрываются этими тестами. Lua можно прервать watchdog-ом; синхронный
+Rust callback останавливается только на вызове API движка или проверке `is_interrupted`; см. [[Engine/EngineScript]] и
 [[Engine/RveSdk]].
 
 ## Источники
