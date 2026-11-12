@@ -341,14 +341,19 @@ pub(crate) fn record_exposure(
     } = record;
     write_exposure_bindings(device, set, source.view, buffer);
     let set = [set];
-    // Предыдущий кадр вида мог писать буфер в compute и читать его в fragment-стадиях; барьер
-    // упорядочивает заполнение гистограммы после них (см. описание модуля).
+    // Предыдущий кадр вида мог писать буфер в compute, читать его в fragment-стадиях и копировать
+    // множитель в изображение экспозиции FSR/DLSS (transfer); барьер упорядочивает заполнение
+    // гистограммы и через цепочку барьеров запись усреднения после них (см. описание модуля).
     buffer_barrier(
         device,
         command_buffer,
         buffer,
-        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        vk::PipelineStageFlags2::COMPUTE_SHADER
+            | vk::PipelineStageFlags2::FRAGMENT_SHADER
+            | vk::PipelineStageFlags2::ALL_TRANSFER,
+        vk::AccessFlags2::SHADER_STORAGE_READ
+            | vk::AccessFlags2::SHADER_STORAGE_WRITE
+            | vk::AccessFlags2::TRANSFER_READ,
         vk::PipelineStageFlags2::ALL_TRANSFER,
         vk::AccessFlags2::TRANSFER_WRITE,
     );
