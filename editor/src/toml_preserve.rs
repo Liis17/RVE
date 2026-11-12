@@ -34,9 +34,15 @@ pub fn preserve_formatting(
     let mut renumbered = merged.clone();
     let mut position = 0;
     renumber(renumbered.as_table_mut(), &mut position);
-    [merged, renumbered]
+    let text = [merged, renumbered]
         .into_iter()
-        .find_map(|candidate| without_redundant_keys(candidate, &added, &same))
+        .find_map(|candidate| without_redundant_keys(candidate, &added, &same))?;
+    // toml_edit пишет `\n`; файл с окончаниями `\r\n` (checkout Windows) их сохраняет.
+    if previous.contains("\r\n") {
+        Some(text.replace("\r\n", "\n").replace('\n', "\r\n"))
+    } else {
+        Some(text)
+    }
 }
 
 /// Предел поштучных проверок добавленных ключей: каждая разбирает весь документ, а оставшиеся
@@ -526,6 +532,17 @@ id = \"b\" # второй
 id = \"a\" # первый
 transform = { position = [2.0, 0.0, 0.0] }
 "
+        );
+    }
+
+    #[test]
+    fn windows_line_endings_are_kept() {
+        let previous = PREVIOUS.replace('\n', "\r\n");
+        let generated = "[[assets]]\npath = \"/models/a.fbx\"\n";
+        let merged = preserve_formatting(&previous, generated, same_as(generated)).unwrap();
+        assert_eq!(
+            merged,
+            "# Главная сцена демо.\r\n[[assets]]\r\npath = \"/models/a.fbx\" # общий куб\r\n"
         );
     }
 
