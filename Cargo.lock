@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "engine-platform"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-platform-macos",
  "engine-platform-windows",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "engine-platform-macos"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ash",
  "ash-window",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "engine-platform-windows"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ash",
  "ash-window",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3210,11 +3210,11 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.21.0"
+version = "0.22.0"
 
 [[package]]
 name = "rve-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-runtime",
 ]
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "engine-assets",
  "engine-core",

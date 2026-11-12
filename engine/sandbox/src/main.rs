@@ -1092,6 +1092,10 @@ fn upload_content_texture(
 }
 
 fn main() -> ExitCode {
+    // Ctrl+C в терминале не закрывает движок; выход — закрытием окна или по --frames.
+    if let Err(error) = engine_platform::ignore_console_interrupt() {
+        eprintln!("Не удалось отключить Ctrl+C: {error}");
+    }
     with_executable_directory(std::env::current_exe(), |exe_dir| {
         // SAFETY: called before parsing, resource startup, or any other thread creation.
         unsafe { engine_platform::prepare_vulkan_environment(exe_dir) };

@@ -126,7 +126,7 @@ impl Context<'_> {
         };
         let mut fullscreen = false;
         // SAFETY: the callback writes one bool into this local.
-        unsafe { callback(self.host.ctx, &mut fullscreen) && fullscreen }
+        unsafe { callback(self.host.call_ctx(), &mut fullscreen) && fullscreen }
     }
 
     /// Stages a borderless fullscreen change applied after this frame.
@@ -135,7 +135,7 @@ impl Context<'_> {
             return false;
         };
         // SAFETY: the host stages a request in the active transaction.
-        unsafe { callback(self.host.ctx, fullscreen) }
+        unsafe { callback(self.host.call_ctx(), fullscreen) }
     }
 
     /// Stages a PNG screenshot of the window. `None` saves into the project's screenshot folder.
@@ -145,7 +145,7 @@ impl Context<'_> {
         };
         let path = path.map_or(RveStr::empty(), RveStr::from_str_ref);
         // SAFETY: the path bytes live through this synchronous host call.
-        unsafe { callback(self.host.ctx, path) }
+        unsafe { callback(self.host.call_ctx(), path) }
     }
 
     /// Stages a system file dialog that opens after this frame; read the result with
@@ -183,7 +183,8 @@ impl Context<'_> {
         };
         let mut id = 0;
         // SAFETY: every borrowed string and array outlives this synchronous host call.
-        (unsafe { callback(self.host.ctx, &raw, &mut id) } && id != 0).then_some(FileDialogId(id))
+        (unsafe { callback(self.host.call_ctx(), &raw, &mut id) } && id != 0)
+            .then_some(FileDialogId(id))
     }
 
     /// Reads a dialog result. A `Done` result is consumed when this callback succeeds, so the
@@ -195,7 +196,7 @@ impl Context<'_> {
         // SAFETY: the zero-capacity query only writes `count` and `done`.
         if !unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 id.0,
                 std::ptr::null_mut(),
                 0,
@@ -212,7 +213,7 @@ impl Context<'_> {
         // SAFETY: the host writes at most `paths.len()` borrowed strings into this buffer.
         if !unsafe {
             callback(
-                self.host.ctx,
+                self.host.call_ctx(),
                 id.0,
                 paths.as_mut_ptr(),
                 paths.len(),

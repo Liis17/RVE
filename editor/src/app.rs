@@ -962,15 +962,30 @@ impl EditorApp {
             return;
         };
         let revision = scene.revision();
-        // Пока решение о копии прошлого сеанса не принято, её нельзя перезаписать.
         if self.state.is_playing()
-            || self.state.recovery_prompt.is_some()
             || !autosave_due(
                 scene.is_dirty(),
                 revision,
                 self.autosaved_revision,
                 self.last_autosave.elapsed(),
             )
+        {
+            return;
+        }
+        self.write_autosave();
+    }
+
+    /// Сразу записывает копию изменённой сцены, если последняя копия устарела. Вызывается и перед
+    /// Play: зависший Rust-скрипт останавливает главный поток, и правки иначе потерялись бы.
+    fn write_autosave(&mut self) {
+        let Some(scene) = &self.state.scene else {
+            return;
+        };
+        let revision = scene.revision();
+        // Пока решение о копии прошлого сеанса не принято, её нельзя перезаписать.
+        if self.state.recovery_prompt.is_some()
+            || !scene.is_dirty()
+            || self.autosaved_revision == Some(revision)
         {
             return;
         }
@@ -1504,6 +1519,10 @@ impl EditorApp {
     }
 
     fn start_play_now(&mut self) {
+        if self.state.project.is_none() {
+            return;
+        }
+        self.write_autosave();
         let Some(project) = &self.state.project else {
             return;
         };
@@ -3203,6 +3222,50 @@ mod tests {
             app.state.scene.as_ref().unwrap().view().objects[0].id,
             "edit-root"
         );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn play_start_writes_the_autosave_before_scripts_run() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rve-editor-play-autosave-{id}"));
+        std::fs::create_dir_all(root.join("Assets/scenes")).unwrap();
+        std::fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/scenes/start.rvescene\"\n",
+        )
+        .unwrap();
+        // Стартовой сцены на диске нет: Play остановится на её загрузке, уже после записи копии,
+        // и тест не запускает звук и физику.
+        let scene_path = VirtualPath::parse("scenes/start.rvescene").unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.scene = Some(
+            EditorScene::parse(
+                scene_path.clone(),
+                "[[objects]]\nid = \"project-camera\"\n[objects.camera]\n",
+                crate::scene_edit::no_prefabs(),
+            )
+            .unwrap(),
+        );
+        app.state
+            .create_object(&crate::scene_edit::NewObject::Empty, None);
+        // Интервал автосохранения ещё не истёк: обычный тик копию не пишет.
+        app.autosave_tick();
+        let store = AutosaveStore::for_project(&root);
+        assert_eq!(store.read(Some(&scene_path)), None);
+
+        app.start_play_now();
+
+        assert!(!app.state.is_playing());
+        let copy = store.read(Some(&scene_path)).expect("autosave written");
+        let objects = app.state.scene.as_ref().unwrap().view().objects.len();
+        assert_eq!(copy.matches("[[objects]]").count(), objects);
+        assert_eq!(objects, 2);
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }

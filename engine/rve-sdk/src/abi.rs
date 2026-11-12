@@ -1,6 +1,7 @@
 //! C-compatible types shared by an RVE host and a game script library.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
@@ -27,7 +28,8 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// nullable `set_property` callback after the v20 descriptor tail.
 /// Version 23 appends the nullable application-quit callback after the v22 host tail.
 /// Version 24 appends window and file dialog callbacks after the v23 quit callback.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 24;
+/// Version 25 appends the nullable `interrupt` flag after the v24 file dialog callbacks.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 25;
 
 /// Validate an external property write before any `Script::set_property` hook runs.
 pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
@@ -1966,7 +1968,30 @@ pub struct RveHost {
     pub file_dialog_open: Option<RveFileDialogOpenFn>,
     /// Reads a file dialog result by id. Appended in ABI v24.
     pub file_dialog_poll: Option<RveFileDialogPollFn>,
+    /// Host request to abandon the running callback, read atomically by the guest: one byte, zero
+    /// while the callback may continue. Null when the host never interrupts. Appended in ABI v25.
+    pub interrupt: *const AtomicBool,
 }
+
+impl RveHost {
+    /// Whether the host asked the running callback to stop (ABI v25).
+    pub fn is_interrupted(&self) -> bool {
+        // SAFETY: a non-null flag stays valid for the whole callback per the ABI contract.
+        !self.interrupt.is_null() && unsafe { (*self.interrupt).load(Ordering::Acquire) }
+    }
+
+    /// Context pointer for a host callback. Panics once the host interrupted the callback, so a
+    /// script stuck in a loop that calls the engine unwinds to its guarded entry point.
+    pub(crate) fn call_ctx(&self) -> *mut c_void {
+        if self.is_interrupted() {
+            panic!("{RVE_INTERRUPTED_MESSAGE}");
+        }
+        self.ctx
+    }
+}
+
+/// Panic message of a guest callback abandoned through [`RveHost::interrupt`].
+pub const RVE_INTERRUPTED_MESSAGE: &str = "script interrupted by the host";
 
 /// One extension filter of [`RveFileDialog`]; extensions are given without a dot. Appended in
 /// ABI v24.
@@ -2846,7 +2871,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -2900,7 +2925,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -2927,7 +2952,7 @@ mod tests {
     fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
         use std::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(size_of::<super::RveScriptTime>(), 40);
         assert_eq!(align_of::<super::RveScriptTime>(), 8);
@@ -2996,7 +3021,7 @@ mod tests {
     fn abi21_callbacks_append_after_the_abi20_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
         assert_eq!(
             offset_of!(super::RveHost, save_set),
             offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()
@@ -3067,7 +3092,7 @@ mod tests {
     fn abi23_app_quit_callback_appends_after_the_scene_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(
             offset_of!(super::RveHost, app_quit),
@@ -3084,7 +3109,7 @@ mod tests {
     fn abi24_window_and_dialog_callbacks_append_after_the_abi23_quit_callback() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 24);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
         let pointer = size_of::<usize>();
         assert_eq!(size_of::<Option<super::RveWindowFullscreenFn>>(), pointer);
         assert_eq!(
@@ -3103,13 +3128,25 @@ mod tests {
             offset_of!(super::RveHost, file_dialog_poll),
             offset_of!(super::RveHost, file_dialog_open) + pointer
         );
-        assert_eq!(
-            size_of::<super::RveHost>(),
-            offset_of!(super::RveHost, file_dialog_poll) + pointer
-        );
         assert_eq!(offset_of!(super::RveFileDialog, title), pointer);
         assert_eq!(size_of::<super::RveFileDialog>(), pointer * 9);
         assert_eq!(size_of::<super::RveFileDialogFilter>(), pointer * 4);
         assert_eq!(super::RVE_FILE_DIALOG_PICK_FOLDER, 3);
+    }
+
+    #[test]
+    fn abi25_interrupt_flag_appends_after_the_abi24_dialog_callbacks() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 25);
+        let pointer = size_of::<usize>();
+        assert_eq!(
+            offset_of!(super::RveHost, interrupt),
+            offset_of!(super::RveHost, file_dialog_poll) + pointer
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, interrupt) + pointer
+        );
     }
 }
