@@ -25,7 +25,7 @@ use crate::scene::{
 use crate::scene_switch::{
     SceneCommit, SceneGpuIds, SceneLoader, SceneSwitch, SceneUpload, SceneUploadReply,
 };
-use engine_animation::{AnimationBridge, AnimationEvent};
+use engine_animation::{AnimationBridge, AnimationEvent, PaletteRemap};
 use engine_assets::{Model, ModelAnimation, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
@@ -56,7 +56,7 @@ use engine_scene::light::{
 use engine_scene::world::ParticleCommand;
 use engine_scene::{
     AntiAliasing, AudioRequest, CameraSettings, EnvironmentState, LightState, LocalLightState,
-    ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
+    LodSelector, ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
     activity_audio_requests,
 };
 #[cfg(feature = "dev-console")]
@@ -161,6 +161,15 @@ pub(crate) struct ParticleSnapshot {
 /// Уровни LOD объекта: каждый уровень — список пар «меш и материал».
 type GpuLevels = Vec<Vec<(MeshId, MaterialId)>>;
 
+/// Skinning одного уровня LOD: экземпляр на каждую часть меша и перевод палитры уровня 0 на
+/// скелет уровня. Пустой список — уровень рисуется без скиннинга.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SkinLevel {
+    pub instances: Vec<SkinId>,
+    /// `None` у уровня 0: его палитра — палитра моста.
+    pub remap: Option<Arc<PaletteRemap>>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, GpuLevels>,
@@ -189,8 +198,8 @@ pub(crate) struct GpuSceneTable {
     pub animation_models: HashMap<String, Arc<Model>>,
     /// Клипы `animator.clips` по виртуальному пути файла.
     pub animation_clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
-    /// Экземпляры skinning по объекту: по одному на часть меша уровня 0.
-    pub skin_instances: HashMap<ObjectHandle, Vec<SkinId>>,
+    /// Экземпляры skinning по объекту: элемент `i` относится к уровню LOD `i`.
+    pub skin_instances: HashMap<ObjectHandle, Vec<SkinLevel>>,
     /// Число костей модели объекта с экземплярами skinning; палитра моста должна иметь ту же длину.
     pub joint_counts: HashMap<ObjectHandle, u32>,
     /// UI-текстуры картинок сцены по пути; создаются при загрузке GPU-ресурсов.
@@ -206,7 +215,11 @@ pub(crate) struct GpuSceneTable {
 impl GpuSceneTable {
     /// Все экземпляры skinning сцены; рендер освобождает их при завершении.
     pub(crate) fn skin_instance_ids(&self) -> Vec<SkinId> {
-        self.skin_instances.values().flatten().copied().collect()
+        self.skin_instances
+            .values()
+            .flatten()
+            .flat_map(|level| level.instances.iter().copied())
+            .collect()
     }
 
     /// Экранные шейдеры сцены; рендер освобождает их при выгрузке.
@@ -1585,6 +1598,8 @@ fn scripts_thread(
         audio.apply(scripts.drain_audio_requests(), &world);
     }
     let mut animation = build_animation(&world, &gpu_scene);
+    // История выбора LOD активной камеры для гистерезиса между кадрами.
+    let mut lod_selector = LodSelector::default();
     drop_mismatched_skins(&world, &mut gpu_scene, &animation);
     animation.apply(scripts.drain_animation_requests());
     let mut spawned_roots = apply_world_changes(
@@ -2009,14 +2024,21 @@ fn scripts_thread(
         let ui_paint = scripts.ui_mut().paint();
         timings.record(script_phase::LOOP, script_phase::UI, ui_started.elapsed());
         let snapshot_started = Instant::now();
-        let made =
-            make_snapshot(scene_frame, &world, &gpu_scene, &animation).map(|mut snapshot| {
-                snapshot.sim_time = sim_time;
-                snapshot.particle_commands = std::mem::take(&mut particle_commands);
-                snapshot.ui = ui_paint;
-                snapshot.screen_shaders.time = screen_shader_time(sim_time);
-                snapshot
-            });
+        let made = make_snapshot(
+            scene_frame,
+            &world,
+            &gpu_scene,
+            &animation,
+            &mut lod_selector,
+        )
+        .map(|mut snapshot| {
+            snapshot.sim_time = sim_time;
+            snapshot.particle_commands = std::mem::take(&mut particle_commands);
+            snapshot.ui = ui_paint;
+            snapshot.screen_shaders.time = screen_shader_time(sim_time);
+            snapshot
+        });
+        lod_selector.finish_frame();
         timings.record(
             script_phase::LOOP,
             script_phase::MAKE_SNAPSHOT,
@@ -2926,31 +2948,41 @@ fn make_snapshot(
     world: &World,
     gpu_scene: &GpuSceneTable,
     animation: &AnimationBridge,
+    lod: &mut LodSelector,
 ) -> Result<FrameSnapshot, String> {
     let mut draws = Vec::new();
     let mut joint_palettes = Vec::new();
     let camera_position = scene.camera.position;
+    let fov_narrow = scene.camera.fov_narrow;
     let mut object_motion = HashMap::new();
     for instance in scene.meshes {
         let Some(levels) = gpu_scene.by_object.get(&instance.object) else {
             continue;
         };
-        let Some((lod_level, meshes)) =
-            selected_level(world, instance.object, camera_position, levels)
-        else {
+        let Some((lod_level, meshes)) = selected_level(
+            lod,
+            world,
+            instance.object,
+            camera_position,
+            fov_narrow,
+            levels,
+        ) else {
             continue;
         };
         let model = instance.model.to_cols_array_2d();
         let draw_start = draws.len();
-        // Анимируемый объект рисуется экземплярами skinning, пока у моста есть палитра;
-        // иначе — bind-pose мешем без скиннинга.
+        // Анимируемый объект рисуется экземплярами skinning выбранного уровня, пока у моста есть
+        // палитра; иначе — bind-pose мешем без скиннинга.
         let palette = gpu_scene
             .skin_instances
             .get(&instance.object)
+            .and_then(|skins| skins.get(usize::from(lod_level)))
+            .filter(|skin| !skin.instances.is_empty())
             .zip(animation.palette(instance.object))
-            .map(|(instances, palette)| {
-                joint_palettes.push(palette.to_vec());
-                (instances, (joint_palettes.len() - 1) as u32)
+            .and_then(|(skin, palette)| {
+                let palette = level_palette(skin.remap.as_deref(), palette)?;
+                joint_palettes.push(palette);
+                Some((&skin.instances, (joint_palettes.len() - 1) as u32))
             });
         for (index, (mesh, material)) in meshes.iter().enumerate() {
             let skin = palette.and_then(|(instances, palette)| {
@@ -3366,13 +3398,28 @@ fn procedural_environment_key(sky: ProceduralSky) -> EnvironmentCacheKey {
 }
 
 fn selected_level<'a, T>(
+    lod: &mut LodSelector,
     world: &World,
     object: ObjectHandle,
     eye: Vec3,
+    fov_narrow: f32,
     levels: &'a [T],
 ) -> Option<(u8, &'a T)> {
-    let level = world.lod_level(object, eye)?;
+    let level = lod.select(world, object, eye, fov_narrow)?;
     Some((level.try_into().ok()?, levels.get(level)?))
+}
+
+/// Палитра уровня LOD из палитры моста: уровень 0 берёт её как есть, остальные — через перевод
+/// на свой скелет. `None` — длина палитры не совпала со скелетом перевода.
+fn level_palette(
+    remap: Option<&PaletteRemap>,
+    palette: &[[[f32; 4]; 4]],
+) -> Option<Vec<[[f32; 4]; 4]>> {
+    let Some(remap) = remap else {
+        return Some(palette.to_vec());
+    };
+    let mut out = Vec::with_capacity(remap.joint_count());
+    remap.apply(palette, &mut out).then_some(out)
 }
 
 /// Задаёт курсор скриптов из флагов активной камеры и публикует его до запуска скриптов.
@@ -4167,9 +4214,10 @@ mod tests {
         GpuSceneTable, MotionHistory, PendingRelease, PhysicsWait, ReleaseTarget, RenderBackend,
         RenderControl, RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl,
         ScriptStartupError, ScriptThreadConfig, apply_physics_step, drop_mismatched_skins,
-        finish_releases, log_script_events_with, make_snapshot, procedural_environment_key,
-        receive_physics_interruptibly, render_local_lights, render_loop, render_snapshot,
-        render_thread, selected_level, send_snapshot, sync_input_background, wait_background_tick,
+        finish_releases, level_palette, log_script_events_with, make_snapshot,
+        procedural_environment_key, receive_physics_interruptibly, render_local_lights,
+        render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
+        sync_input_background, wait_background_tick,
     };
     use super::{FrameLatency, publish_script_cursor, set_initial_cursor};
     use super::{MaterialSync, ScriptReply};
@@ -4517,18 +4565,23 @@ distance=2.0
         let object = world.handle("mesh").unwrap();
         let level_meshes = [vec![FakeMeshId(1)], vec![FakeMeshId(2)]];
 
+        let select = |eye: Vec3| {
+            let mut lod = engine_scene::LodSelector::default();
+            selected_level(
+                &mut lod,
+                &world,
+                object,
+                eye,
+                engine_scene::LOD_REFERENCE_FOV,
+                &level_meshes,
+            )
+        };
+        assert_eq!(select(Vec3::ZERO), Some((1, &level_meshes[1])));
         assert_eq!(
-            selected_level(&world, object, Vec3::ZERO, &level_meshes),
-            Some((1, &level_meshes[1]))
-        );
-        assert_eq!(
-            selected_level(&world, object, Vec3::new(0.0, 0.0, -4.5), &level_meshes),
+            select(Vec3::new(0.0, 0.0, -4.5)),
             Some((0, &level_meshes[0]))
         );
-        assert_eq!(
-            selected_level(&world, object, Vec3::new(0.0, 0.0, 3.0), &level_meshes),
-            None
-        );
+        assert_eq!(select(Vec3::new(0.0, 0.0, 3.0)), None);
     }
 
     #[derive(Default)]
@@ -5045,6 +5098,7 @@ range = 10
             &world,
             &GpuSceneTable::default(),
             &AnimationBridge::default(),
+            &mut engine_scene::LodSelector::default(),
         )
         .unwrap();
         assert_eq!(snapshot.view, settings);
@@ -5065,7 +5119,8 @@ range = 10
                 frame.clone(),
                 &world,
                 &GpuSceneTable::default(),
-                &AnimationBridge::default()
+                &AnimationBridge::default(),
+                &mut engine_scene::LodSelector::default(),
             )
             .is_err()
         );
@@ -5079,7 +5134,14 @@ range = 10
             environments: HashMap::from([("environment/sky.hdr".to_owned(), source)]),
             ..GpuSceneTable::default()
         };
-        let snapshot = make_snapshot(frame, &world, &scene, &AnimationBridge::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            &world,
+            &scene,
+            &AnimationBridge::default(),
+            &mut engine_scene::LodSelector::default(),
+        )
+        .unwrap();
         let environment = snapshot.environment.unwrap();
         assert_eq!(
             environment.key,
@@ -5157,6 +5219,7 @@ return Script
             &world,
             &GpuSceneTable::default(),
             &AnimationBridge::default(),
+            &mut engine_scene::LodSelector::default(),
         )
         .unwrap();
         assert_eq!(snapshot.view.color.unwrap_or_default().exposure_ev, 2.5);
@@ -5689,7 +5752,14 @@ return Script
     ) -> Vec<MaterialId> {
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty(), "{warnings:?}");
-        let snapshot = make_snapshot(frame, world, gpu_scene, &AnimationBridge::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            world,
+            gpu_scene,
+            &AnimationBridge::default(),
+            &mut engine_scene::LodSelector::default(),
+        )
+        .unwrap();
         let range = snapshot
             .object_motion
             .get(&object)
@@ -9225,6 +9295,50 @@ return Gun
         scene.joint_counts.insert(hero, 1);
         assert!(drop_mismatched_skins(&world, &mut scene, &animation).is_empty());
         assert!(scene.skin_instances.contains_key(&hero));
+    }
+
+    #[test]
+    fn lod_level_palette_is_translated_to_the_level_skeleton() {
+        use engine_assets::{
+            ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelTransform,
+        };
+        use glam::Mat4;
+        let node = |name: &str| ModelNode {
+            name: name.to_owned(),
+            parent: None,
+            inherit_mode: ModelInheritMode::Normal,
+            inherit_scale_node: None,
+            rest: ModelTransform {
+                translation: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0; 3],
+            },
+        };
+        let joint = |node: usize, inverse_bind: Mat4| ModelJoint {
+            node,
+            inverse_bind: inverse_bind.to_cols_array_2d(),
+        };
+        let base = ModelSkeleton {
+            nodes: vec![node("hip"), node("head")],
+            joints: vec![joint(0, Mat4::IDENTITY), joint(1, Mat4::IDENTITY)],
+        };
+        let lod = ModelSkeleton {
+            nodes: vec![node("head")],
+            joints: vec![joint(0, Mat4::from_scale(glam::Vec3::splat(2.0)))],
+        };
+        let remap = engine_animation::PaletteRemap::new(&base, &lod).unwrap();
+        let head = Mat4::from_translation(glam::Vec3::new(0.0, 3.0, 0.0));
+        let palette = [Mat4::IDENTITY.to_cols_array_2d(), head.to_cols_array_2d()];
+
+        assert_eq!(level_palette(None, &palette), Some(palette.to_vec()));
+        let level = level_palette(Some(&remap), &palette).unwrap();
+        assert_eq!(level.len(), 1);
+        assert!(
+            Mat4::from_cols_array_2d(&level[0])
+                .abs_diff_eq(head * Mat4::from_scale(glam::Vec3::splat(2.0)), 1e-5)
+        );
+        // Палитра другой длины не переводится: уровень рисуется без скиннинга.
+        assert_eq!(level_palette(Some(&remap), &palette[..1]), None);
     }
 }
 

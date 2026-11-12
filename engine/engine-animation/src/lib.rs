@@ -9,6 +9,7 @@ mod blend;
 mod bridge;
 mod clip;
 mod pose;
+mod remap;
 mod skeleton;
 
 pub use animator::{
@@ -19,6 +20,7 @@ pub use blend::{blend, line_weights};
 pub use bridge::{AnimationBridge, AnimationEvent};
 pub use clip::{Clip, Key, Track};
 pub use pose::{Pose, Transform};
+pub use remap::PaletteRemap;
 pub use skeleton::{Joint, Skeleton, SkeletonNode};
 
 /// Версия крейта (SemVer).

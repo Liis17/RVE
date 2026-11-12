@@ -71,7 +71,7 @@ TOML с таблицами `exposure`, `tonemapping`, `bloom`, `ambient_occlusio
 Проходы записываются в порядке `GpuPass` (`engine/engine-render/src/lib.rs`), для каждого вида отдельно.
 
 1. Clusters, ShadowDirectional, ShadowLocal — как раньше.
-2. DepthPrepass — только при включённом AO; непрозрачные меши рисуются с depth `LESS_OR_EQUAL`.
+2. DepthPrepass — при включённом AO или occlusion culling (см. [[Engine/EngineRender]]); после него непрозрачные меши рисуются с depth `LESS_OR_EQUAL`.
 3. AmbientOcclusion — GTAO compute на depth prepass, затем denoise. Каждый слайс проверяет горизонт в обе стороны от пикселя. Сырой GTAO считается в разрешении `ao_resolution`: половинном (с округлением вверх) для `low` и `medium`, полном для `high`; качество дополнительно меняет число направлений и шагов. Пиксели AO отображаются на глубину по UV. Денойз работает в полном разрешении render-цели: bilateral-фильтр 5×5 по текселям сырого AO сравнивает глубину пикселя выхода с глубиной под каждым текселем, поэтому одновременно делает depth-aware upsample. Результат читается мешами во фрагментном шейдере (binding 8) и умножает indirect diffuse и specular. Маскированные и blend-меши AO не получают (define `NO_SCREEN_AO`). Смена качества с другим разрешением пересоздаёт цель AO кадрового слота после ожидания его fence.
 4. Opaque, Skybox, Transparent, Wireframe, Particles — как раньше.
 5. Exposure — гистограмма log-яркости HDR цели сцены в render-разрешении (WGSL, 256 бинов, диапазон log2 −10..+4), усреднение и адаптация по перцентилям low/high с отдельными скоростями роста и падения. Проход идёт до temporal resolve на всех путях (TAA, FSR, DLSS, FXAA, None). Адаптированный EV и множитель `exp2(ev + adapted_ev)` хранятся в буфере на вид.

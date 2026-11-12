@@ -62,8 +62,8 @@ pub use camera_settings::{
 pub use color_lut::{CubeLut, CubeLutError, MAX_CUBE_LUT_SIZE, MIN_CUBE_LUT_SIZE};
 pub use document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
-    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LAYER_COUNT, LiteScript,
-    LodGroup, LodLevel, MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS,
+    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LAYER_COUNT, LOD_HYSTERESIS,
+    LiteScript, LodGroup, LodLevel, MAX_LOD_LEVELS, MAX_SCREEN_SHADER_PARAMS, MAX_SCREEN_SHADERS,
     MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue, PointLightComponent,
     ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset, SceneDocument,
     SceneError, SceneObject, SceneTransform, ScreenShaderRef, ScreenShaderStage,
@@ -82,7 +82,8 @@ pub use prefab::{
     expand_without_overrides,
 };
 pub use world::{
-    EnvironmentState, LightState, LocalLightState, LocalTransform, MAX_GENERATION,
-    MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle, ParticleEmitterInstance, SceneFrame,
-    SceneReplacement, SceneWarning, SpawnOptions, World, WorldObject,
+    EnvironmentState, LOD_REFERENCE_FOV, LightState, LocalLightState, LocalTransform, LodSelector,
+    MAX_GENERATION, MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle,
+    ParticleEmitterInstance, SceneFrame, SceneReplacement, SceneWarning, SpawnOptions, World,
+    WorldObject,
 };

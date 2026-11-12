@@ -113,8 +113,12 @@ impl SceneGpuIds {
                 }
             }
         }
-        for instances in table.skin_instances.values() {
-            ids.skins.extend(instances.iter().copied());
+        for levels in table.skin_instances.values() {
+            ids.skins.extend(
+                levels
+                    .iter()
+                    .flat_map(|level| level.instances.iter().copied()),
+            );
         }
         ids.screen_shaders
             .extend(table.screen_shaders.values().copied());

@@ -1,5 +1,6 @@
 use crate::game_ui::{PreparedUi, UiImageData, load_ui};
-use crate::pipeline::GpuSceneTable;
+use crate::pipeline::{GpuSceneTable, SkinLevel};
+use engine_animation::PaletteRemap;
 use engine_assets::{
     Assets, Model, ModelAlphaMode, ModelAnimation, ModelMaterial, ModelSkin, TextureData,
 };
@@ -1820,12 +1821,13 @@ pub(crate) fn upload_scene(
     let mut material_dependencies = MaterialDependencyMap::new();
     let mut particle_texture_dependencies = HashSet::new();
     let material_assets = MaterialAssetView::from_scene(assets);
-    // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
+    // Модели уровней объектов с `animator` загружаются со скином; мосту нужны только модели уровня 0.
     let animated = animated_model_paths(assets);
+    let skinned_paths = skinned_model_paths(assets);
 
     let result = (|| -> Result<GpuSceneTable, RenderError> {
         for (path, model) in &assets.models {
-            let skinned = animated.contains(path.as_str()) && model.skeleton.is_some();
+            let skinned = skinned_paths.contains(path.as_str()) && model.skeleton.is_some();
             let joint_count = model
                 .skeleton
                 .as_ref()
@@ -1931,14 +1933,39 @@ pub(crate) fn upload_scene(
                     .get(model_path)
                     .and_then(|model| model.skeleton.as_ref())
             {
-                // Экземпляр skinning на каждую часть уровня 0: выходные вершины живут отдельно.
-                let mut instances = Vec::with_capacity(levels[0].len());
-                for (mesh_id, _) in &levels[0] {
-                    let instance = renderer.create_skin_instance(*mesh_id)?;
-                    created.skins.insert(instance);
-                    instances.push(instance);
+                // Экземпляр skinning на каждую часть каждого уровня: выходные вершины живут
+                // отдельно. Уровень, скелет которого не переводится из палитры уровня 0,
+                // рисуется в bind pose.
+                let mut skins = Vec::with_capacity(levels.len());
+                for (level, ((level_path, _), meshes)) in
+                    object.levels.iter().zip(&levels).enumerate()
+                {
+                    let remap = if level == 0 {
+                        None
+                    } else {
+                        let remap = assets
+                            .models
+                            .get(level_path)
+                            .and_then(|model| model.skeleton.as_ref())
+                            .and_then(|lod| PaletteRemap::new(skeleton, lod));
+                        if remap.is_none() {
+                            log::warn!(
+                                "[animation] {level_path}: кости уровня LOD {level} не найдены в {model_path}; уровень рисуется без скиннинга"
+                            );
+                            skins.push(SkinLevel::default());
+                            continue;
+                        }
+                        remap.map(Arc::new)
+                    };
+                    let mut instances = Vec::with_capacity(meshes.len());
+                    for (mesh_id, _) in meshes {
+                        let instance = renderer.create_skin_instance(*mesh_id)?;
+                        created.skins.insert(instance);
+                        instances.push(instance);
+                    }
+                    skins.push(SkinLevel { instances, remap });
                 }
-                table.skin_instances.insert(*handle, instances);
+                table.skin_instances.insert(*handle, skins);
                 table
                     .joint_counts
                     .insert(*handle, skeleton.joints.len() as u32);
@@ -2037,6 +2064,18 @@ pub(crate) fn upload_scene(
             Err(error)
         }
     }
+}
+
+/// Пути моделей всех уровней LOD у объектов сцены с `animator`.
+fn skinned_model_paths(assets: &PreparedRenderAssets) -> HashSet<&str> {
+    assets
+        .objects
+        .iter()
+        .map(|(_, object)| object)
+        .filter(|object| object.animated)
+        .flat_map(|object| object.levels.iter())
+        .map(|(path, _)| path.as_str())
+        .collect()
 }
 
 /// Пути моделей уровня 0 у объектов сцены с `animator`.
