@@ -1,0 +1,146 @@
+#version 450
+
+// Occlusion culling вида. Для каждого draw пишет VkDrawIndexedIndirectCommand (5 uint):
+// instanceCount 0 или 1 и firstInstance — слот экземпляра draw'а, поэтому instanced-батч
+// рисуется одним multi-draw indirect вызовом.
+//
+// Режим 0 (early) готовит в `visible` аргументы первой фазы depth prepass: draw рисуется, если
+// был виден в прошлом кадре этой цели (`history`). Режим 1 (cull) проверяет мировую AABB по Hi-Z,
+// построенной после первой фазы: `late` получает draw'ы, видимые сейчас, но пропущенные первой
+// фазой, `history` — видимость для следующего кадра, а `visible` — аргументы основного и
+// прозрачного проходов. В `visible` остаются и draw'ы первой фазы: их глубина уже записана,
+// и без цвета на её месте осталась бы дыра, даже если тест из-за погрешности счёл их скрытыми.
+
+layout(local_size_x = 64) in;
+
+const uint FLAG_TEST = 1u;
+
+struct DrawInput {
+    mat4 model;
+    vec4 bounds_min;
+    vec4 bounds_max;
+    // x — index count; y — флаги.
+    uvec4 meta;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer DrawInputs {
+    DrawInput draws[];
+} inputs;
+
+layout(set = 0, binding = 1, std430) buffer VisibleArgs {
+    uint args[];
+} visible;
+
+layout(set = 0, binding = 2, std430) buffer LateArgs {
+    uint args[];
+} late;
+
+layout(set = 0, binding = 3) uniform texture2D hiz_image;
+
+layout(set = 0, binding = 4, std430) buffer History {
+    uint values[];
+} history;
+
+layout(push_constant) uniform PushConstants {
+    mat4 view_projection;
+    // x, y — размер depth в пикселях; z, w — размер нулевого уровня Hi-Z.
+    vec4 sizes;
+    // x — число draw'ов; y — режим; z — число уровней Hi-Z; w — слот экземпляра draw'а 0.
+    uvec4 params;
+} push_constants;
+
+void write_command(uint index, uint index_count, uint instance_count, bool late_target) {
+    uint base = index * 5u;
+    uint first_instance = push_constants.params.w + index;
+    if (late_target) {
+        late.args[base] = index_count;
+        late.args[base + 1u] = instance_count;
+        late.args[base + 2u] = 0u;
+        late.args[base + 3u] = 0u;
+        late.args[base + 4u] = first_instance;
+    } else {
+        visible.args[base] = index_count;
+        visible.args[base + 1u] = instance_count;
+        visible.args[base + 2u] = 0u;
+        visible.args[base + 3u] = 0u;
+        visible.args[base + 4u] = first_instance;
+    }
+}
+
+bool is_visible(DrawInput draw) {
+    mat4 model_view_projection = push_constants.view_projection * draw.model;
+    vec3 ndc_min = vec3(3.0e38);
+    vec3 ndc_max = vec3(-3.0e38);
+    for (int corner = 0; corner < 8; corner++) {
+        vec3 position = vec3(
+            (corner & 1) != 0 ? draw.bounds_max.x : draw.bounds_min.x,
+            (corner & 2) != 0 ? draw.bounds_max.y : draw.bounds_min.y,
+            (corner & 4) != 0 ? draw.bounds_max.z : draw.bounds_min.z
+        );
+        vec4 clip = model_view_projection * vec4(position, 1.0);
+        // AABB пересекает плоскость камеры: проекция неопределена, draw считается видимым.
+        if (!(clip.w > 1.0e-5)) {
+            return true;
+        }
+        vec3 ndc = clip.xyz / clip.w;
+        ndc_min = min(ndc_min, ndc);
+        ndc_max = max(ndc_max, ndc);
+    }
+    vec2 size = push_constants.sizes.xy;
+    // Пиксель запаса: jitter TAA сдвигает растеризацию на долю пикселя за край кадра.
+    vec2 margin = 2.0 / size;
+    if (ndc_max.x < -1.0 - margin.x || ndc_min.x > 1.0 + margin.x
+        || ndc_max.y < -1.0 - margin.y || ndc_min.y > 1.0 + margin.y
+        || ndc_min.z > 1.0 || ndc_max.z < 0.0) {
+        return false;
+    }
+
+    ivec2 last = ivec2(size) - ivec2(1);
+    // Запас в пиксель покрывает субпиксельный jitter TAA и округление растеризации.
+    ivec2 low = clamp(ivec2(floor((ndc_min.xy * 0.5 + 0.5) * size)) - ivec2(1), ivec2(0), last);
+    ivec2 high = clamp(ivec2(floor((ndc_max.xy * 0.5 + 0.5) * size)) + ivec2(1), ivec2(0), last);
+
+    // Texel уровня L покрывает 2^(L+1) пикселей depth: выбирается уровень, где прямоугольник
+    // занимает не больше 2x2 texel'ей.
+    int levels = int(push_constants.params.z);
+    int level = 0;
+    for (; level + 1 < levels; level++) {
+        int shift = level + 1;
+        if ((high.x >> shift) - (low.x >> shift) <= 1 && (high.y >> shift) - (low.y >> shift) <= 1) {
+            break;
+        }
+    }
+    int shift = level + 1;
+    ivec2 hiz_size = ivec2(push_constants.sizes.zw);
+    ivec2 level_last = ivec2(((hiz_size.x - 1) >> level), ((hiz_size.y - 1) >> level));
+    ivec2 first = min(ivec2(low.x >> shift, low.y >> shift), level_last);
+    ivec2 second = min(ivec2(high.x >> shift, high.y >> shift), level_last);
+    float farthest = 0.0;
+    for (int y = first.y; y <= second.y; y++) {
+        for (int x = first.x; x <= second.x; x++) {
+            farthest = max(farthest, texelFetch(hiz_image, ivec2(x, y), level).r);
+        }
+    }
+    return max(ndc_min.z, 0.0) <= farthest;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push_constants.params.x) {
+        return;
+    }
+    DrawInput draw = inputs.draws[index];
+    bool tested = (draw.meta.y & FLAG_TEST) != 0u;
+    if (push_constants.params.y == 0u) {
+        // История могла остаться от другого набора draw'ов или быть неинициализированной:
+        // это меняет только число окклюдеров первой фазы.
+        uint early = tested ? min(history.values[index], 1u) : 1u;
+        write_command(index, draw.meta.x, early, false);
+        return;
+    }
+    uint early = visible.args[index * 5u + 1u];
+    bool now_visible = !tested || is_visible(draw);
+    history.values[index] = now_visible ? 1u : 0u;
+    write_command(index, draw.meta.x, (now_visible || early != 0u) ? 1u : 0u, false);
+    write_command(index, draw.meta.x, (now_visible && early == 0u) ? 1u : 0u, true);
+}
