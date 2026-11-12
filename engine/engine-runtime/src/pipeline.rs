@@ -45,7 +45,7 @@ use engine_render::{
     ParticleEmitterId, PostProcess, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION,
     TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
-use engine_render::{SkinBinding, SkinId};
+use engine_render::{ColorLutId, SkinBinding, SkinId};
 #[cfg(feature = "dev-console")]
 use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
 use engine_resources::ResourceHandle;
@@ -97,6 +97,8 @@ pub(crate) struct FrameSnapshot {
     pub view: CameraSettings,
     /// Постобработка активной камеры, уже разрешённая из `.postprocess` или `[color]`.
     pub post_process: PostProcessSettings,
+    /// LUT цветокоррекции активной камеры; `None` без LUT или если LUT не загрузилась.
+    pub color_lut: Option<ColorLutId>,
     pub reset_history: bool,
     pub light: LightState,
     pub local_lights: Vec<LocalLight>,
@@ -206,6 +208,8 @@ pub(crate) struct GpuSceneTable {
     pub ui_scene_owners: HashSet<u64>,
     /// Экранные шейдеры камер по пути `.glsl`; создаются при загрузке сцены и освобождаются с ней.
     pub screen_shaders: HashMap<String, engine_render::ScreenShaderId>,
+    /// LUT цветокоррекции камер по каноническому пути `.cube`; живут как экранные шейдеры.
+    pub color_luts: HashMap<String, ColorLutId>,
 }
 
 impl GpuSceneTable {
@@ -221,6 +225,11 @@ impl GpuSceneTable {
     /// Экранные шейдеры сцены; рендер освобождает их при выгрузке.
     pub(crate) fn screen_shader_ids(&self) -> Vec<engine_render::ScreenShaderId> {
         self.screen_shaders.values().copied().collect()
+    }
+
+    /// LUT цветокоррекции сцены; рендер освобождает их при выгрузке.
+    pub(crate) fn color_lut_ids(&self) -> Vec<ColorLutId> {
+        self.color_luts.values().copied().collect()
     }
 }
 
@@ -563,6 +572,8 @@ pub(crate) struct VulkanBackend {
     /// GPU-ресурсы игрового UI: атлас, картинки по пути и буфер вершин.
     game_ui: GameUi,
     scene_screen_shaders: Vec<engine_render::ScreenShaderId>,
+    /// LUT цветокоррекции стартовой сцены; освобождаются в `release_scene`, если их не освободила замена.
+    scene_color_luts: Vec<ColorLutId>,
     /// Подготовленные ресурсы сцены для замены материалов объектов; нет у тестовых сцен без GPU.
     material_assets: Option<Arc<PreparedRenderAssets>>,
     /// CPU material sources for heavy prefabs, retained until that token's delayed release.
@@ -604,6 +615,7 @@ impl VulkanBackend {
             scene_skin_instances: Vec::new(),
             game_ui: GameUi::default(),
             scene_screen_shaders: Vec::new(),
+            scene_color_luts: Vec::new(),
             material_assets: None,
             prefab_material_assets: HashMap::new(),
             material_caches: MaterialUploadCaches::default(),
@@ -751,6 +763,11 @@ impl VulkanBackend {
         shaders: Vec<engine_render::ScreenShaderId>,
     ) -> Self {
         self.scene_screen_shaders = shaders;
+        self
+    }
+
+    pub(crate) fn with_scene_color_luts(mut self, luts: Vec<ColorLutId>) -> Self {
+        self.scene_color_luts = luts;
         self
     }
 
@@ -990,6 +1007,13 @@ impl RenderBackend for VulkanBackend {
         // Шейдер, уничтоженный здесь, не должен уйти повторно при выгрузке (`release_scene`).
         self.scene_screen_shaders
             .retain(|shader| !ids.screen_shaders.contains(shader));
+        for lut in &ids.color_luts {
+            if let Err(error) = self.renderer.destroy_color_lut(*lut) {
+                log::error!("LUT сцены не уничтожена: {error}");
+            }
+        }
+        self.scene_color_luts
+            .retain(|lut| !ids.color_luts.contains(lut));
     }
 
     fn release_materials(&mut self, materials: &[MaterialId]) {
@@ -1083,7 +1107,7 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                post: render_post_process(&snapshot.post_process),
+                post: render_post_process(&snapshot.post_process, snapshot.color_lut),
                 screen_shaders: snapshot.screen_shaders,
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
@@ -1119,6 +1143,11 @@ impl RenderBackend for VulkanBackend {
         for shader in self.scene_screen_shaders.drain(..) {
             if let Err(error) = self.renderer.destroy_screen_shader(shader) {
                 eprintln!("failed to release screen shader: {error}");
+            }
+        }
+        for lut in self.scene_color_luts.drain(..) {
+            if let Err(error) = self.renderer.destroy_color_lut(lut) {
+                eprintln!("failed to release color LUT: {error}");
             }
         }
     }
@@ -1215,7 +1244,7 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                post: render_post_process(&snapshot.post_process),
+                post: render_post_process(&snapshot.post_process, snapshot.color_lut),
                 screen_shaders: snapshot.screen_shaders,
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
@@ -2904,6 +2933,16 @@ pub(crate) fn screen_shader_view(
     view
 }
 
+/// LUT активной камеры по пути из её постобработки; ключи таблицы — канонические пути без
+/// ведущего `/`, поэтому поиск не выделяет память.
+fn scene_color_lut(
+    post: &PostProcessSettings,
+    luts: &HashMap<String, ColorLutId>,
+) -> Option<ColorLutId> {
+    let path = post.color_grading.lut.as_deref()?;
+    luts.get(path.strip_prefix('/').unwrap_or(path)).copied()
+}
+
 fn make_snapshot(
     scene: engine_scene::SceneFrame,
     world: &World,
@@ -2987,6 +3026,7 @@ fn make_snapshot(
         camera: scene.camera,
         active_camera: world.active_camera(),
         view: scene.view,
+        color_lut: scene_color_lut(&scene.post_process, &gpu_scene.color_luts),
         post_process: scene.post_process,
         screen_shaders: screen_shader_view(&scene.screen_shaders, &gpu_scene.screen_shaders),
         reset_history: false,
@@ -4055,7 +4095,7 @@ fn render_snapshot(
 /// Выключенная экспозиция становится ручной с EV 0, выключенный tonemapping — `None`. Выключенные
 /// эффекты сохраняют параметры, но renderer их не выполняет, поэтому `enabled = false` совпадает
 /// с тождественным преобразованием.
-pub fn render_post_process(post: &PostProcessSettings) -> PostProcess {
+pub fn render_post_process(post: &PostProcessSettings, lut: Option<ColorLutId>) -> PostProcess {
     let exposure = if post.exposure.enabled {
         Exposure {
             mode: match post.exposure.mode {
@@ -4091,7 +4131,7 @@ pub fn render_post_process(post: &PostProcessSettings) -> PostProcess {
     };
     let bloom = post.bloom;
     let ao = post.ambient_occlusion;
-    let grading = post.color_grading;
+    let grading = &post.color_grading;
     let vignette = post.vignette;
     let aberration = post.chromatic_aberration;
     let grain = post.film_grain;
@@ -4124,6 +4164,8 @@ pub fn render_post_process(post: &PostProcessSettings) -> PostProcess {
             lift: grading.lift,
             gamma: grading.gamma,
             gain: grading.gain,
+            lut,
+            lut_intensity: grading.lut_intensity,
         },
         vignette: engine_render::Vignette {
             enabled: vignette.enabled,
@@ -4824,6 +4866,7 @@ distance=2.0
     fn empty_snapshot() -> FrameSnapshot {
         let active_camera = motion_test_handles().0;
         FrameSnapshot {
+            color_lut: None,
             ui: crate::game_ui::empty_paint(),
             particles: Vec::new(),
             particle_commands: Vec::new(),
@@ -4872,6 +4915,7 @@ distance=2.0
         objects: &[(ObjectHandle, [[f32; 4]; 4])],
     ) -> FrameSnapshot {
         FrameSnapshot {
+            color_lut: None,
             ui: crate::game_ui::empty_paint(),
             particles: Vec::new(),
             particle_commands: Vec::new(),
@@ -9546,7 +9590,7 @@ mod post_process_mapping_tests {
     #[test]
     fn scene_defaults_map_to_renderer_defaults() {
         assert_eq!(
-            render_post_process(&PostProcessSettings::default()),
+            render_post_process(&PostProcessSettings::default(), None),
             PostProcess::default()
         );
     }
@@ -9557,7 +9601,7 @@ mod post_process_mapping_tests {
         post.exposure.enabled = false;
         post.exposure.ev = 2.0;
         post.tonemapping.enabled = false;
-        let mapped = render_post_process(&post);
+        let mapped = render_post_process(&post, None);
         assert_eq!(mapped.exposure, Exposure::default());
         assert_eq!(mapped.tonemapper, RenderTonemapper::None);
     }
@@ -9571,7 +9615,7 @@ mod post_process_mapping_tests {
         post.ambient_occlusion.quality = engine_scene::AmbientOcclusionQuality::High;
         post.exposure.mode = engine_scene::ExposureMode::Auto;
         post.exposure.ev = -0.5;
-        let mapped = render_post_process(&post);
+        let mapped = render_post_process(&post, None);
         assert!(mapped.bloom.enabled);
         assert_eq!(mapped.bloom.intensity, 1.5);
         assert!(mapped.ambient_occlusion.enabled);
@@ -9581,6 +9625,30 @@ mod post_process_mapping_tests {
         );
         assert_eq!(mapped.exposure.mode, engine_render::ExposureMode::Auto);
         assert_eq!(mapped.exposure.ev, -0.5);
+    }
+
+    fn fake_lut(value: usize) -> ColorLutId {
+        // SAFETY: ColorLutId — обёртка над одним usize; любое значение допустимо для теста.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    #[test]
+    fn color_lut_maps_with_intensity_and_is_found_by_canonical_path() {
+        let mut post = PostProcessSettings::default();
+        post.color_grading.enabled = true;
+        post.color_grading.lut_intensity = 0.25;
+        let mapped = render_post_process(&post, Some(fake_lut(7)));
+        assert_eq!(mapped.color_grading.lut, Some(fake_lut(7)));
+        assert_eq!(mapped.color_grading.lut_intensity, 0.25);
+
+        let luts = HashMap::from([("luts/film.cube".to_owned(), fake_lut(7))]);
+        assert_eq!(scene_color_lut(&post, &luts), None, "без LUT в настройках");
+        post.color_grading.lut = Some("/luts/film.cube".to_owned());
+        assert_eq!(scene_color_lut(&post, &luts), Some(fake_lut(7)));
+        post.color_grading.lut = Some("luts/film.cube".to_owned());
+        assert_eq!(scene_color_lut(&post, &luts), Some(fake_lut(7)));
+        post.color_grading.lut = Some("/luts/other.cube".to_owned());
+        assert_eq!(scene_color_lut(&post, &luts), None, "LUT не загрузилась");
     }
 
     #[test]

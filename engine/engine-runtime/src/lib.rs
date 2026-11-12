@@ -409,6 +409,7 @@ fn run_from_args(
     if !headless {
         // Исходники экранных шейдеров читает только игровой клиент; headless их не открывает.
         render_assets.screen_shaders = scene::load_screen_shader_sources(&resource_handle, &world);
+        render_assets.color_luts = scene::load_color_luts(&resource_handle, &world);
     }
     let ui_text_focus = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (script_tx, script_rx) = flume::unbounded();

@@ -2,7 +2,9 @@
 
 // Screen-space ambient occlusion по горизонтам (в духе GTAO): для каждого направления экрана
 // ищется наибольший угол горизонта относительно нормали, восстановленной из глубины.
-// Результат R8: 1 — открыто, 0 — полностью закрыто.
+// Результат R8: 1 — открыто, 0 — полностью закрыто. Цель может быть меньше глубины (половинное
+// разрешение для low/medium): пиксели AO отображаются на глубину по UV, геометрия считается в
+// пикселях цели AO.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -14,7 +16,7 @@ layout(push_constant) uniform PushConstants {
     vec4 projection_near_far;
     // x — радиус в метрах; y — интенсивность; z — доля радиуса, с которой начинается спад; w — направления.
     vec4 radius_intensity_falloff_slices;
-    // x, y — размер цели; z — шаги на направление.
+    // x, y — размер цели AO; z — шаги на направление.
     vec4 size_steps;
 } push_constants;
 
@@ -38,9 +40,13 @@ vec3 view_position(ivec2 pixel, float depth) {
                 -z);
 }
 
+// Глубина под пикселем цели AO: центр пикселя переводится в пиксель глубины по UV.
 float sample_depth(ivec2 pixel) {
     ivec2 limit = ivec2(target_size()) - 1;
-    return texelFetch(depth_image, clamp(pixel, ivec2(0), limit), 0).r;
+    ivec2 ao_pixel = clamp(pixel, ivec2(0), limit);
+    ivec2 depth_size = textureSize(depth_image, 0);
+    ivec2 depth_pixel = ivec2((vec2(ao_pixel) + 0.5) * vec2(depth_size) / target_size());
+    return texelFetch(depth_image, clamp(depth_pixel, ivec2(0), depth_size - 1), 0).r;
 }
 
 // Наибольший косинус угла горизонта с нормалью вдоль одной стороны слайса; 0 — горизонта нет.

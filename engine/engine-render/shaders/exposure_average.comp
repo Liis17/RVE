@@ -4,14 +4,15 @@
 // целевой EV = log2(0.18) - средняя, затем экспоненциальное приближение с разной скоростью
 // вверх и вниз. Одна рабочая группа; суммирование выполняет первый поток. Гистограмма
 // записана атомиками в exposure_histogram.wgsl, здесь её только читают.
-// Компенсация EV добавляется в composite; буфер хранит адаптированное значение.
+// Компенсация EV добавляется в composite; буфер хранит адаптированное значение и множитель
+// exp2(ev + adapted_ev), который копируется в изображение экспозиции FSR/DLSS.
 
 layout(local_size_x = 256) in;
 
 layout(std430, set = 0, binding = 1) buffer ExposureBuffer {
     uint histogram[256];
     float adapted_ev;
-    float pad0;
+    float exposure_scale;
     float pad1;
     float pad2;
 } exposure;
@@ -21,6 +22,8 @@ layout(push_constant) uniform PushConstants {
     vec4 timing;
     // x — min_ev, y — max_ev, z — низкий перцентиль (доля), w — высокий перцентиль (доля).
     vec4 range;
+    // x — ручной EV (компенсация).
+    vec4 compensation;
 } push_constants;
 
 const float MIN_LOG2 = -10.0;
@@ -59,4 +62,5 @@ void main() {
         next = current + (target_ev - current) * alpha;
     }
     exposure.adapted_ev = next;
+    exposure.exposure_scale = exp2(push_constants.compensation.x + next);
 }

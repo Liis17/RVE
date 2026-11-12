@@ -5,6 +5,7 @@ pub mod asset_kind;
 pub mod audio;
 pub mod camera;
 pub mod camera_settings;
+pub mod color_lut;
 pub mod document;
 pub mod light;
 pub mod material_asset;
@@ -59,6 +60,7 @@ pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,
     ProjectionSettings, Tonemapper,
 };
+pub use color_lut::{CubeLut, CubeLutError, MAX_CUBE_LUT_SIZE, MIN_CUBE_LUT_SIZE};
 pub use document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LAYER_COUNT, LOD_HYSTERESIS,

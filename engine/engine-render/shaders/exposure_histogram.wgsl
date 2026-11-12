@@ -7,7 +7,7 @@ const MAX_LOG2: f32 = 4.0;
 struct Exposure {
     histogram: array<atomic<u32>, 256>,
     adapted_ev: f32,
-    pad0: f32,
+    exposure_scale: f32,
     pad1: f32,
     pad2: f32,
 }

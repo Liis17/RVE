@@ -199,6 +199,13 @@ const SHADERS: &[ShaderBuild] = &[
         &[],
         "gtao_denoise.comp.spv",
     ),
+    ("hiz.comp", naga::ShaderStage::Compute, &[], "hiz.comp.spv"),
+    (
+        "occlusion.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "occlusion.comp.spv",
+    ),
     (
         "bloom_upsample.frag",
         naga::ShaderStage::Fragment,
