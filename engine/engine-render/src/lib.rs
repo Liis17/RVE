@@ -2957,16 +2957,16 @@ impl Renderer {
         }
         if post_frame.plan.ambient_occlusion
             && let Some(target) = frame_resources.target.as_mut()
-            && target.scene.ao.is_none()
         {
-            target.scene.ao = Some(AoTarget::new(
+            ensure_ao_target(
                 &instance,
                 &device,
                 self.physical_device,
+                &mut target.scene,
                 target.render_extent,
-                target.scene.depth.view,
+                post_frame.ao.quality,
                 ao_layout,
-            )?);
+            )?;
         }
         let frame_ao_view = frame_resources
             .target
@@ -3916,15 +3916,16 @@ impl Renderer {
                 camera_near_far(frame.camera.projection),
                 &effective_view_settings(frame.view, frame.debug_view).screen_shaders,
             );
-            if post_frame.plan.ambient_occlusion && target.scene.ao.is_none() {
-                target.scene.ao = Some(AoTarget::new(
+            if post_frame.plan.ambient_occlusion {
+                ensure_ao_target(
                     &instance,
                     &device,
                     physical_device,
+                    &mut target.scene,
                     target.render_extent,
-                    target.scene.depth.view,
+                    post_frame.ao.quality,
                     ao_set_layout,
-                )?);
+                )?;
             }
             let frame_ao_view = target
                 .scene
@@ -9281,6 +9282,39 @@ impl Drop for FrameResources {
     }
 }
 
+/// Создаёт цель AO или пересоздаёт её, если качество сменило разрешение сырого GTAO.
+/// Вызывается после ожидания fence кадрового слота: прежняя цель слота больше не используется GPU.
+#[allow(clippy::too_many_arguments)]
+fn ensure_ao_target(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    scene: &mut OffscreenTarget,
+    render_extent: vk::Extent2D,
+    quality: AmbientOcclusionQuality,
+    set_layout: vk::DescriptorSetLayout,
+) -> Result<(), RenderError> {
+    let (width, height) = post::ao_resolution(quality, (render_extent.width, render_extent.height));
+    let raw_extent = vk::Extent2D { width, height };
+    if scene
+        .ao
+        .as_ref()
+        .is_some_and(|ao| ao.raw_extent == raw_extent)
+    {
+        return Ok(());
+    }
+    scene.ao = Some(AoTarget::new(
+        instance,
+        device,
+        physical_device,
+        render_extent,
+        raw_extent,
+        scene.depth.view,
+        set_layout,
+    )?);
+    Ok(())
+}
+
 struct OffscreenTarget {
     color: DeviceImage,
     velocity: DeviceImage,
@@ -11901,7 +11935,7 @@ fn record_scene(
             &scene.post.ao,
             scene.projection_scale,
             scene.post.filters.near_far,
-            (render_extent.width, render_extent.height),
+            (ao.raw_extent.width, ao.raw_extent.height),
         );
         record_ambient_occlusion(
             device,

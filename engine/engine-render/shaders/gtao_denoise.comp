@@ -1,7 +1,9 @@
 #version 450
 
 // Двусторонний фильтр 5x5 для сырого AO: веса по пространственной близости и по разности
-// линейной глубины, чтобы не размывать AO через силуэты.
+// линейной глубины, чтобы не размывать AO через силуэты. Выход имеет разрешение глубины, а сырой
+// AO может быть меньше (половинное разрешение для low/medium): тогда фильтр одновременно делает
+// depth-aware upsample, сравнивая глубину пикселя выхода с глубиной под каждым текселем сырого AO.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -10,7 +12,7 @@ layout(set = 0, binding = 1) uniform texture2D raw_ao_image;
 layout(set = 0, binding = 2, r8) uniform writeonly image2D ao_output;
 
 layout(push_constant) uniform PushConstants {
-    // x — near; y — far; z, w — размер цели.
+    // x — near; y — far; z, w — размер выхода (совпадает с глубиной).
     vec4 near_far_size;
 } push_constants;
 
@@ -31,18 +33,24 @@ void main() {
         imageStore(ao_output, pixel, vec4(1.0));
         return;
     }
+    ivec2 raw_size = textureSize(raw_ao_image, 0);
+    // Отношение размеров выхода и сырого AO: 1 в полном разрешении, около 2 в половинном.
+    vec2 raw_to_depth = vec2(size) / vec2(raw_size);
+    ivec2 raw_center = clamp(ivec2((vec2(pixel) + 0.5) / raw_to_depth), ivec2(0), raw_size - 1);
     float center_z = linear_depth(center_depth);
     float total = 0.0;
     float weight_sum = 0.0;
     for (int y = -2; y <= 2; y++) {
         for (int x = -2; x <= 2; x++) {
-            ivec2 sample_pixel = clamp(pixel + ivec2(x, y), ivec2(0), size - 1);
-            float sample_depth_value = texelFetch(depth_image, sample_pixel, 0).r;
+            ivec2 raw_pixel = clamp(raw_center + ivec2(x, y), ivec2(0), raw_size - 1);
+            // Глубина берётся в той же точке, по которой GTAO считал этот тексель.
+            ivec2 depth_pixel = clamp(ivec2((vec2(raw_pixel) + 0.5) * raw_to_depth), ivec2(0), size - 1);
+            float sample_depth_value = texelFetch(depth_image, depth_pixel, 0).r;
             float sample_z = linear_depth(sample_depth_value);
             float spatial = exp(-float(x * x + y * y) * 0.25);
             float depth_weight = exp(-abs(sample_z - center_z) * 8.0 / max(center_z, 1e-3));
             float weight = spatial * depth_weight;
-            total += texelFetch(raw_ao_image, sample_pixel, 0).r * weight;
+            total += texelFetch(raw_ao_image, raw_pixel, 0).r * weight;
             weight_sum += weight;
         }
     }

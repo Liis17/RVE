@@ -656,6 +656,19 @@ pub fn ao_sampling(quality: AmbientOcclusionQuality) -> (u32, u32) {
     }
 }
 
+/// Разрешение сырого GTAO для качества: `low` и `medium` считаются в половинном разрешении
+/// render-цели (с округлением вверх), `high` — в полном. Денойз возвращает результат в полное
+/// разрешение с учётом глубины, поэтому mesh-шейдер всегда читает AO размера render-цели.
+pub fn ao_resolution(quality: AmbientOcclusionQuality, render_extent: (u32, u32)) -> (u32, u32) {
+    match quality {
+        AmbientOcclusionQuality::Low | AmbientOcclusionQuality::Medium => (
+            render_extent.0.div_ceil(2).max(1),
+            render_extent.1.div_ceil(2).max(1),
+        ),
+        AmbientOcclusionQuality::High => render_extent,
+    }
+}
+
 /// Push constants GTAO: масштабы проекции и плоскости, радиус, интенсивность, спад, направления,
 /// размер цели и шаги. Раскладка совпадает с `gtao.comp`.
 #[repr(C)]
@@ -1186,6 +1199,31 @@ mod tests {
         assert_eq!(ao_sampling(AmbientOcclusionQuality::Low), (4, 3));
         assert_eq!(ao_sampling(AmbientOcclusionQuality::Medium), (6, 4));
         assert_eq!(ao_sampling(AmbientOcclusionQuality::High), (8, 6));
+    }
+
+    #[test]
+    fn ambient_occlusion_low_and_medium_run_at_half_resolution() {
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::Low, (1280, 720)),
+            (640, 360)
+        );
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::Medium, (1280, 720)),
+            (640, 360)
+        );
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::High, (1280, 720)),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn ambient_occlusion_half_resolution_rounds_up_and_never_reaches_zero() {
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::Medium, (1281, 721)),
+            (641, 361)
+        );
+        assert_eq!(ao_resolution(AmbientOcclusionQuality::Low, (1, 1)), (1, 1));
     }
 
     #[test]
