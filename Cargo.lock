@@ -998,9 +998,10 @@ dependencies = [
 
 [[package]]
 name = "engine-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
+ "blake3",
  "flume",
  "getrandom 0.4.3",
  "serde_json",
@@ -3161,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "egui",
  "egui-winit",

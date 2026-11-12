@@ -62,11 +62,11 @@ impl HttpFailure {
 pub(crate) fn validate_headers(
     headers: Headers<'_>,
     port: u16,
-    token: &str,
+    token_hash: &str,
     sessions: &HashMap<String, Session>,
     rpc_method: Option<&str>,
 ) -> Result<(), HttpFailure> {
-    if !valid_bearer(headers.authorization, token) {
+    if !valid_bearer(headers.authorization, token_hash) {
         return Err(HttpFailure::Unauthorized);
     }
 
@@ -159,12 +159,13 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-fn valid_bearer(value: Option<&str>, token: &str) -> bool {
+/// Сверяет хеш предъявленного токена с хранимым; сам токен сервер не хранит.
+fn valid_bearer(value: Option<&str>, token_hash: &str) -> bool {
     value
         .and_then(|value| value.split_once(' '))
         .is_some_and(|(scheme, value)| {
             scheme.eq_ignore_ascii_case("Bearer")
-                && constant_time_eq(value.as_bytes(), token.as_bytes())
+                && constant_time_eq(crate::token_hash(value).as_bytes(), token_hash.as_bytes())
         })
 }
 
@@ -218,7 +219,7 @@ pub(crate) fn worker(listener: Arc<Server>, shared: Arc<Shared>, shutdown: flume
 fn handle_request(request: Request, shared: &Shared, shutdown: &flume::Receiver<()>) {
     let owned_headers = request_headers(&request);
     let headers = owned_headers.view();
-    if let Err(failure) = validate_authority(headers, shared.port, &shared.token) {
+    if let Err(failure) = validate_authority(headers, shared.port, &shared.token_hash) {
         respond_failure(request, failure);
         return;
     }
@@ -231,8 +232,12 @@ fn handle_request(request: Request, shared: &Shared, shutdown: &flume::Receiver<
     }
 }
 
-fn validate_authority(headers: Headers<'_>, port: u16, token: &str) -> Result<(), HttpFailure> {
-    if !valid_bearer(headers.authorization, token) {
+fn validate_authority(
+    headers: Headers<'_>,
+    port: u16,
+    token_hash: &str,
+) -> Result<(), HttpFailure> {
+    if !valid_bearer(headers.authorization, token_hash) {
         return Err(HttpFailure::Unauthorized);
     }
     let expected_host = format!("127.0.0.1:{port}");
@@ -353,7 +358,7 @@ pub(crate) fn post_outcome(body: &[u8], headers: Headers<'_>, shared: &Shared) -
     if let Err(failure) = validate_headers(
         headers,
         shared.port,
-        &shared.token,
+        &shared.token_hash,
         &sessions,
         Some(&rpc.method),
     ) {
@@ -547,7 +552,7 @@ fn handle_delete(request: Request, headers: Headers<'_>, shared: &Shared) {
 /// Ends the session named by `Mcp-Session-Id`; later requests with it get 404.
 fn delete_session(headers: Headers<'_>, shared: &Shared) -> Result<(), HttpFailure> {
     let mut sessions = shared.sessions.lock().unwrap();
-    validate_headers(headers, shared.port, &shared.token, &sessions, None)?;
+    validate_headers(headers, shared.port, &shared.token_hash, &sessions, None)?;
     if let Some(session_id) = headers.session_id {
         sessions.remove(session_id);
     }
@@ -682,6 +687,21 @@ mod tests {
     }
 
     #[test]
+    fn bearer_is_checked_against_the_stored_hash_only() {
+        let stored = crate::token_hash("secret");
+        assert_eq!(stored.len(), 64);
+        assert!(super::valid_bearer(Some("Bearer secret"), &stored));
+        assert!(super::valid_bearer(Some("bearer secret"), &stored));
+        assert!(!super::valid_bearer(Some("Bearer wrong"), &stored));
+        // Предъявленный хеш вместо токена доступа не даёт.
+        assert!(!super::valid_bearer(
+            Some(&format!("Bearer {stored}")),
+            &stored
+        ));
+        assert!(!super::valid_bearer(None, &stored));
+    }
+
+    #[test]
     fn request_header_checks_cover_auth_host_origin_protocol_and_session() {
         let mut sessions = HashMap::new();
         sessions.insert(
@@ -736,7 +756,13 @@ mod tests {
             ),
         ];
         for (label, request, expected) in cases {
-            let result = validate_headers(request, 47615, "secret", &sessions, Some("initialize"));
+            let result = validate_headers(
+                request,
+                47615,
+                &crate::token_hash("secret"),
+                &sessions,
+                Some("initialize"),
+            );
             assert_eq!(result.err(), expected, "{label}");
         }
         assert_eq!(
@@ -747,7 +773,7 @@ mod tests {
                     ..headers()
                 },
                 47615,
-                "secret",
+                &crate::token_hash("secret"),
                 &sessions,
                 Some("initialize")
             ),
@@ -800,7 +826,13 @@ mod tests {
             ),
         ];
         for (label, request, expected) in cases {
-            let result = validate_headers(request, 47615, "secret", &sessions, Some("tools/list"));
+            let result = validate_headers(
+                request,
+                47615,
+                &crate::token_hash("secret"),
+                &sessions,
+                Some("tools/list"),
+            );
             assert_eq!(result.err(), expected, "{label}");
         }
     }
@@ -891,7 +923,7 @@ mod tests {
         let (calls, receiver) = flume::unbounded();
         let shared = Shared {
             port: 47615,
-            token: "secret".to_owned(),
+            token_hash: crate::token_hash("secret"),
             tools,
             sessions: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(1),

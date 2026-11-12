@@ -18,6 +18,12 @@ const FILE_NAME: &str = "settings.json";
 pub struct McpSettings {
     pub enabled: bool,
     pub port: u16,
+    /// [`engine_mcp::token_hash`] токена доступа; в файле хранится только он.
+    pub token_hash: String,
+    /// Токен открытым текстом, известный только в этом сеансе: после генерации или миграции
+    /// старого поля `token`. В файл не записывается; без него клиент подключается токеном,
+    /// выданным раньше, а новый получается через Regenerate.
+    #[serde(skip_serializing)]
     pub token: String,
     pub permissions: McpPermissionSettings,
 }
@@ -27,6 +33,7 @@ impl Default for McpSettings {
         Self {
             enabled: false,
             port: 47615,
+            token_hash: String::new(),
             token: String::new(),
             permissions: McpPermissionSettings::default(),
         }
@@ -52,8 +59,22 @@ impl McpSettings {
             token.push(HEX[usize::from(byte >> 4)] as char);
             token.push(HEX[usize::from(byte & 0x0f)] as char);
         }
+        self.token_hash = engine_mcp::token_hash(&token);
         self.token = token;
         Ok(())
+    }
+
+    /// Хеш для токена, введённого вручную или прочитанного из старого `settings.json`, где он
+    /// хранился открытым текстом. Сам токен остаётся только в памяти сеанса.
+    pub fn hash_known_token(&mut self) {
+        if !self.token.is_empty() {
+            self.token_hash = engine_mcp::token_hash(&self.token);
+        }
+    }
+
+    /// Токен открытым текстом известен в этом сеансе: его можно скопировать.
+    pub fn token_known(&self) -> bool {
+        !self.token.is_empty()
     }
 }
 
@@ -160,7 +181,12 @@ impl SettingsStore {
             scroll_navigation: field(&value, "scroll_navigation", &mut problems)
                 .unwrap_or_default(),
             layout: field(&value, "layout", &mut problems),
-            mcp: field(&value, "mcp", &mut problems).unwrap_or_default(),
+            mcp: field(&value, "mcp", &mut problems)
+                .map(|mut mcp: McpSettings| {
+                    mcp.hash_known_token();
+                    mcp
+                })
+                .unwrap_or_default(),
         };
         let message = (!problems.is_empty()).then(|| {
             format!(
@@ -188,8 +214,9 @@ impl SettingsStore {
     }
 }
 
-/// Атомарная запись `settings.json`; на unix временный файл создаётся сразу с правами 0600,
-/// потому что в нём лежит токен MCP.
+/// Атомарная запись `settings.json`; на unix временный файл создаётся сразу с правами 0600.
+/// Токен MCP хранится только хешем, поэтому файл не даёт доступа к серверу; права
+/// ограничиваются как дополнительная защита настроек пользователя.
 #[cfg(unix)]
 fn write_private(file: &Path, contents: &[u8]) -> Result<(), String> {
     use std::io::Write;
@@ -421,15 +448,21 @@ mod tests {
         assert!(!settings.mcp.enabled);
         assert_eq!(settings.mcp.port, 47615);
         settings.mcp.enabled = true;
-        settings.mcp.token = "token".to_owned();
+        settings.mcp.regenerate_token().unwrap();
         settings.mcp.permissions.edit_scene = true;
 
         store.save(&settings).unwrap();
+        let text = std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap();
+        assert!(
+            !text.contains(&settings.mcp.token),
+            "токен не пишется в файл"
+        );
         let (loaded, message) = store.load();
 
         assert!(loaded.mcp.enabled);
         assert_eq!(loaded.mcp.port, 47615);
-        assert_eq!(loaded.mcp.token, "token");
+        assert_eq!(loaded.mcp.token_hash, settings.mcp.token_hash);
+        assert!(!loaded.mcp.token_known());
         assert!(loaded.mcp.permissions.edit_scene);
         assert_eq!(message, None);
     }
@@ -446,7 +479,7 @@ mod tests {
         std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).unwrap();
         let store = SettingsStore::in_dir(&dir.0);
         let mut settings = UserSettings::default();
-        settings.mcp.token = "token".to_owned();
+        settings.mcp.regenerate_token().unwrap();
         store.save(&settings).unwrap();
         let mode = std::fs::metadata(dir.0.join(FILE_NAME))
             .unwrap()
@@ -456,9 +489,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_plaintext_token_is_migrated_to_a_hash_and_dropped_on_save() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(
+            dir.0.join(FILE_NAME),
+            r#"{"mcp":{"enabled":true,"port":47615,"token":"legacy-token"}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::in_dir(&dir.0);
+        let (loaded, message) = store.load();
+        assert_eq!(message, None);
+        assert_eq!(
+            loaded.mcp.token_hash,
+            engine_mcp::token_hash("legacy-token")
+        );
+        assert!(
+            loaded.mcp.token_known(),
+            "токен можно скопировать до конца сеанса"
+        );
+        store.save(&loaded).unwrap();
+        let text = std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap();
+        assert!(!text.contains("legacy-token"));
+        assert!(text.contains(&engine_mcp::token_hash("legacy-token")));
+    }
+
+    #[test]
     fn regenerated_mcp_token_is_32_bytes_of_lowercase_hex() {
         let mut settings = McpSettings::default();
         settings.regenerate_token().unwrap();
+        assert_eq!(settings.token_hash, engine_mcp::token_hash(&settings.token));
         assert_eq!(settings.token.len(), 64);
         assert!(
             settings

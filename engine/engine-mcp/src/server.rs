@@ -20,7 +20,8 @@ pub(crate) const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Configuration for the editor's local MCP endpoint.
 pub struct McpConfig {
     pub port: u16,
-    pub token: String,
+    /// [`crate::token_hash`] токена доступа; сам токен серверу не нужен.
+    pub token_hash: String,
     pub permissions: Permissions,
     pub tools: Vec<ToolSpec>,
 }
@@ -64,7 +65,7 @@ pub struct McpServer {
 
 pub(crate) struct Shared {
     pub port: u16,
-    pub token: String,
+    pub token_hash: String,
     pub tools: Vec<ToolSpec>,
     pub sessions: Mutex<HashMap<String, Session>>,
     /// Счётчик обращений к сессиям для вытеснения самой давно использованной.
@@ -109,7 +110,7 @@ impl McpServer {
         let generation = Arc::new(AtomicU64::new(generation));
         let shared = Arc::new(Shared {
             port: config.port,
-            token: config.token,
+            token_hash: config.token_hash,
             tools: config.tools,
             sessions: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(0),
