@@ -53,10 +53,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         );
     }
     if response.dragged() {
-        let delta = response.drag_delta();
-        state.material_preview_yaw += delta.x * 0.01;
-        state.material_preview_pitch =
-            (state.material_preview_pitch + delta.y * 0.01).clamp(-1.35, 1.35);
+        (state.material_preview_yaw, state.material_preview_pitch) = orbit_preview(
+            state.material_preview_yaw,
+            state.material_preview_pitch,
+            response.drag_delta(),
+        );
         ui.ctx().request_repaint();
     }
     if response.contains_pointer() {
@@ -66,5 +67,45 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                 (state.material_preview_zoom * (-scroll * 0.002).exp()).clamp(1.5, 12.0);
             ui.ctx().request_repaint();
         }
+    }
+}
+
+/// Перетаскивание вправо поворачивает модель вправо, как в Scene: камера орбиты уходит на -yaw.
+fn orbit_preview(yaw: f32, pitch: f32, drag: egui::Vec2) -> (f32, f32) {
+    (
+        yaw - drag.x * 0.01,
+        (pitch + drag.y * 0.01).clamp(-1.35, 1.35),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::viewport::camera::EditorCamera;
+
+    #[test]
+    fn horizontal_drag_orbits_in_the_same_direction_as_scene_camera() {
+        let (yaw, pitch) = orbit_preview(0.5, 0.25, egui::vec2(20.0, 0.0));
+        let scene = EditorCamera {
+            yaw: 0.5,
+            pitch: 0.25,
+            ..EditorCamera::default()
+        };
+        let mut scene_moved = scene;
+        scene_moved.orbit(20.0, 0.0);
+        assert!(scene_moved.yaw < scene.yaw);
+        assert!(
+            yaw < 0.5,
+            "drag right must decrease yaw like the scene camera"
+        );
+        assert_eq!(pitch, 0.25);
+    }
+
+    #[test]
+    fn vertical_drag_keeps_its_direction_and_pitch_is_clamped() {
+        let (_, pitch) = orbit_preview(0.5, 0.25, egui::vec2(0.0, 20.0));
+        assert!(pitch > 0.25);
+        let (_, pitch) = orbit_preview(0.5, 1.34, egui::vec2(0.0, 1_000.0));
+        assert_eq!(pitch, 1.35);
     }
 }
