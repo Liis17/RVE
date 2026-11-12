@@ -41,6 +41,7 @@ use ui::{
 mod ambient_occlusion;
 mod bloom;
 mod clusters;
+mod color_lut;
 mod culling;
 mod exposure;
 mod filters;
@@ -54,8 +55,15 @@ use ambient_occlusion::{AoPipelines, AoRecord, AoTarget, record_ambient_occlusio
 use bloom::{
     BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
 };
+use color_lut::{
+    COLOR_LUT_FORMAT, IDENTITY_LUT_SIZE, color_lut_bytes, identity_color_lut, validate_color_lut,
+    write_composite_lut,
+};
+pub use color_lut::{MAX_COLOR_LUT_SIZE, MIN_COLOR_LUT_SIZE};
+#[cfg(windows)]
+use exposure::{EXPOSURE_SCALE_OFFSET, buffer_barrier as exposure_buffer_barrier};
 use exposure::{
-    ExposureHistory, ExposurePipelines, ExposureRecord, ExposureResources, ExposureTarget,
+    ExposureFrame, ExposureHistory, ExposurePipelines, ExposureResources, ExposureTarget,
     ViewExposure, exposure_record, prepare_view_exposure, record_exposure,
     write_composite_exposure,
 };
@@ -71,7 +79,7 @@ pub use particles::{
 };
 pub use post::{
     AmbientOcclusion, AmbientOcclusionQuality, Bloom, ChromaticAberration, ColorGrading,
-    DepthOfField, Exposure, ExposureMode, FilmGrain, MotionBlur, PostProcess, Vignette,
+    ColorLutId, DepthOfField, Exposure, ExposureMode, FilmGrain, MotionBlur, PostProcess, Vignette,
 };
 use post::{COMPOSITE_PUSH_CONSTANTS_SIZE, OUTPUT_PUSH_CONSTANTS_SIZE, PostFrame};
 #[cfg(any(test, all(windows, feature = "dlss")))]
@@ -1193,14 +1201,15 @@ pub enum GpuPass {
     Wireframe,
     /// Частицы: spawn, симуляция и аддитивные billboards.
     Particles,
+    /// Адаптация экспозиции по гистограмме HDR цели сцены до temporal resolve; отсутствует при
+    /// ручной экспозиции.
+    Exposure,
     /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
     TemporalResolve,
     /// Экранные шейдеры до motion blur и DoF; отсутствуют без пользовательских шейдеров.
     ScreenShaderBefore,
     /// Motion blur и depth of field; отсутствуют, если эффекты выключены.
     Filters,
-    /// Адаптация экспозиции по гистограмме; отсутствует при ручной экспозиции.
-    Exposure,
     /// Bloom: prefilter, downsample и upsample; отсутствует, если эффект выключен.
     Bloom,
     /// Composite: tonemap до вывода на swapchain.
@@ -1224,10 +1233,10 @@ impl GpuPass {
         Self::Transparent,
         Self::Wireframe,
         Self::Particles,
+        Self::Exposure,
         Self::TemporalResolve,
         Self::ScreenShaderBefore,
         Self::Filters,
-        Self::Exposure,
         Self::Bloom,
         Self::Tonemap,
         Self::ScreenShaderAfter,
@@ -1518,6 +1527,8 @@ pub struct Renderer {
     viewport_output_pipeline: Option<vk::Pipeline>,
     /// Пайплайны экранных шейдеров по `ScreenShaderId`; `None` — шейдер уничтожен.
     screen_shaders: Vec<Option<ScreenShaderPipelines>>,
+    /// 3D LUT цветокоррекции по `ColorLutId`; индекс 0 — встроенная identity LUT, `None` — уничтожена.
+    color_luts: Vec<Option<DeviceImage>>,
     /// Layout экранных проходов; создаётся вместе с первым шейдером.
     screen_shader_layout: Option<ScreenShaderLayout>,
     overlay_pipeline_layout: Option<vk::PipelineLayout>,
@@ -1721,6 +1732,7 @@ impl Renderer {
             max_texture_size: 0,
             meshes: Vec::new(),
             textures: Vec::new(),
+            color_luts: Vec::new(),
             materials: Vec::new(),
             surface_shaders: Vec::new(),
             ui_textures: Vec::new(),
@@ -2528,6 +2540,39 @@ impl Renderer {
         Ok(())
     }
 
+    /// Создаёт 3D LUT цветокоррекции стороны `size` из `size³` узлов RGB; красный меняется быстрее
+    /// всего, затем зелёный и синий (порядок `.cube`). Вход LUT — sRGB-кодированный цвет в `[0, 1]`.
+    /// Загрузка синхронная; ошибка проверки не меняет состояние renderer.
+    pub fn create_color_lut(
+        &mut self,
+        size: u32,
+        texels: &[[f32; 3]],
+    ) -> Result<ColorLutId, RenderError> {
+        validate_color_lut(size, texels)?;
+        let lut = self.upload_color_lut(size, &color_lut_bytes(texels))?;
+        self.color_luts.push(Some(lut));
+        Ok(ColorLutId(self.color_luts.len() - 1))
+    }
+
+    /// Удаляет LUT; изображение освобождается после кадров, которые могли его читать.
+    /// Ссылка на удалённую LUT в `PostProcess` даёт `InvalidConfig`.
+    pub fn destroy_color_lut(&mut self, lut: ColorLutId) -> Result<(), RenderError> {
+        let unknown =
+            || RenderError::InvalidTexture("ColorLutId не принадлежит renderer".to_owned());
+        // Встроенная identity LUT не выдаётся наружу.
+        if lut.0 == 0 {
+            return Err(unknown());
+        }
+        let image = self
+            .color_luts
+            .get_mut(lut.0)
+            .and_then(Option::take)
+            .ok_or_else(unknown)?;
+        self.retired
+            .retire(RetiredResource::Image(Box::new(image)), 0);
+        Ok(())
+    }
+
     /// Проверяет параметры экранных шейдеров вида и то, что каждый проход ссылается на живой шейдер.
     fn validate_screen_shaders(&self, shaders: &ScreenShaders) -> Result<(), RenderError> {
         shaders.validate().map_err(RenderError::InvalidConfig)?;
@@ -2572,6 +2617,7 @@ impl Renderer {
         validate_overlay(frame.overlay)?;
         validate_frame_ui(frame.ui)?;
         self.validate_screen_shaders(&frame.view.screen_shaders)?;
+        self.validate_color_lut(&frame.view.post)?;
         let view = effective_view_settings(frame.view, frame.debug_view);
         self.miss_unlisted_viewports(&[]);
         let output_extent = self
@@ -2796,6 +2842,8 @@ impl Renderer {
             &mut self.screen_temporal.exposure_resources,
             post_frame.plan.auto_exposure,
             frame.reset_history,
+            render_extent,
+            exposure_dt_ms,
         )?;
         let frame_resources = self
             .frames
@@ -2987,16 +3035,16 @@ impl Renderer {
         }
         if post_frame.plan.ambient_occlusion
             && let Some(target) = frame_resources.target.as_mut()
-            && target.scene.ao.is_none()
         {
-            target.scene.ao = Some(AoTarget::new(
+            ensure_ao_target(
                 &instance,
                 &device,
                 self.physical_device,
+                &mut target.scene,
                 target.render_extent,
-                target.scene.depth.view,
+                post_frame.ao.quality,
                 ao_layout,
-            )?);
+            )?;
         }
         let occlusion_pipelines = self.occlusion_pipelines.filter(|_| {
             prepass_pipeline.is_some() && occlusion_culling_enabled(frame.debug_view, frame.draws)
@@ -3222,6 +3270,11 @@ impl Renderer {
                 bloom_pipelines,
                 exposure_pipelines,
                 exposure_dt_ms,
+                color_lut: color_lut_view(
+                    &self.color_luts,
+                    post::planned_color_lut(&view.post, &post_frame.plan),
+                )
+                .ok_or(RenderError::InvalidState("LUT цветокоррекции отсутствует"))?,
                 reset_history: frame.reset_history,
                 filter_pipelines,
                 ao_pipelines,
@@ -3293,7 +3346,10 @@ impl Renderer {
                     #[cfg(windows)]
                     fsr,
                     #[cfg(windows)]
-                    exposure_ev: view.post.exposure.ev,
+                    exposure: UpscalerExposure::new(
+                        view.post.exposure.ev,
+                        view_exposure.adaptation.map(|_| view_exposure.buffer),
+                    ),
                     #[cfg(windows)]
                     frame_time_delta_ms,
                     #[cfg(windows)]
@@ -3381,7 +3437,7 @@ impl Renderer {
         let temporal_submissions = [TemporalSubmission {
             view: TemporalViewId::Screen,
             plan: temporal_plan,
-            exposure: view_exposure.adaptation.is_some(),
+            exposure: view_exposure.adaptation,
             layouts: view
                 .anti_aliasing
                 .is_temporal()
@@ -3487,6 +3543,7 @@ impl Renderer {
             validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
             validate_draws(frame.draws, &self.meshes, &self.materials)?;
             self.validate_screen_shaders(&frame.view.screen_shaders)?;
+            self.validate_color_lut(&frame.view.post)?;
             self.validate_skin_draws(frame)?;
             self.viewports
                 .get(viewport.0)
@@ -3967,15 +4024,16 @@ impl Renderer {
                 camera_near_far(frame.camera.projection),
                 &effective_view_settings(frame.view, frame.debug_view).screen_shaders,
             );
-            if post_frame.plan.ambient_occlusion && target.scene.ao.is_none() {
-                target.scene.ao = Some(AoTarget::new(
+            if post_frame.plan.ambient_occlusion {
+                ensure_ao_target(
                     &instance,
                     &device,
                     physical_device,
+                    &mut target.scene,
                     target.render_extent,
-                    target.scene.depth.view,
+                    post_frame.ao.quality,
                     ao_set_layout,
-                )?);
+                )?;
             }
             if let Some(pipelines) = self.occlusion_pipelines.filter(|_| {
                 self.prepass_pipeline.is_some()
@@ -4197,6 +4255,7 @@ impl Renderer {
                 (!tickets.is_empty()).then_some((entry.0, tickets))
             })
             .collect::<Vec<_>>();
+        let color_luts = &self.color_luts;
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -4286,6 +4345,15 @@ impl Renderer {
                             bloom_pipelines,
                             exposure_pipelines,
                             exposure_dt_ms: *frame_delta_ms,
+                            // Ссылка проверена до acquire; identity LUT существует всегда.
+                            color_lut: color_lut_view(
+                                color_luts,
+                                post::planned_color_lut(
+                                    &effective_view_settings(frame.view, frame.debug_view).post,
+                                    &post_frame.plan,
+                                ),
+                            )
+                            .unwrap_or_default(),
                             reset_history: frame.reset_history,
                             filter_pipelines,
                             ao_pipelines,
@@ -4396,6 +4464,8 @@ impl Renderer {
                     &mut entry.temporal.exposure_resources,
                     pass.post.plan.auto_exposure,
                     pass.reset_history,
+                    target.render_extent,
+                    pass.exposure_dt_ms,
                 )?;
                 record_scene(
                     &device,
@@ -4428,16 +4498,31 @@ impl Renderer {
                     }
                     _ => None,
                 };
+                // Экспозиция замеряется по HDR цели сцены до temporal resolve: FSR/DLSS и composite
+                // получают EV этого кадра.
+                let adapted_exposure = exposure_record(
+                    &target.exposure,
+                    pass.exposure_pipelines,
+                    view_exposure,
+                    &pass.view.post,
+                )
+                .map(|record| {
+                    record_exposure(
+                        &device,
+                        command_buffer,
+                        &target.scene.color,
+                        &mut target.scene.layout,
+                        target.render_extent,
+                        record,
+                        pass.timestamps,
+                    );
+                    exposure_buffer
+                });
+                #[cfg(not(windows))]
+                let _ = adapted_exposure;
                 let passes = PostPasses {
                     filters,
                     sampler: target_resources.post_sampler,
-                    exposure: exposure_record(
-                        &target.exposure,
-                        pass.exposure_pipelines,
-                        view_exposure,
-                        &pass.view.post,
-                        pass.exposure_dt_ms,
-                    ),
                     bloom: bloom_record(
                         target.bloom.as_mut(),
                         pass.bloom_pipelines,
@@ -4447,6 +4532,7 @@ impl Renderer {
                         view_exposure,
                     ),
                     exposure_buffer,
+                    lut: pass.color_lut,
                     screen_before: chain_record(
                         target.screen_before.as_mut(),
                         &pass.post.screen_before,
@@ -4510,7 +4596,10 @@ impl Renderer {
                             #[cfg(windows)]
                             fsr,
                             #[cfg(windows)]
-                            exposure_ev: pass.view.post.exposure.ev,
+                            exposure: UpscalerExposure::new(
+                                pass.view.post.exposure.ev,
+                                adapted_exposure,
+                            ),
                             #[cfg(windows)]
                             frame_time_delta_ms: *_frame_delta_ms,
                             #[cfg(windows)]
@@ -4625,7 +4714,7 @@ impl Renderer {
                 temporal_submissions.push(TemporalSubmission {
                     view: TemporalViewId::Viewport(*viewport),
                     plan: pass.temporal_plan,
-                    exposure: view_exposure.adaptation.is_some(),
+                    exposure: view_exposure.adaptation,
                     layouts: temporal_outcome
                         .as_ref()
                         .is_some_and(|outcome| outcome.used_taa)
@@ -5538,6 +5627,7 @@ impl Renderer {
         self.create_particle_pipelines()?;
         self.create_environment_resources()?;
         self.create_default_environment()?;
+        self.create_identity_color_lut()?;
         self.create_mesh_pipeline()?;
         self.create_skybox_pipeline()?;
         self.create_shadow_pipeline()?;
@@ -5810,10 +5900,16 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let post_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&post_bindings);
-        // SAFETY: composite, output and fullscreen post shaders read bindings 0, 1 and (composite) 2.
+        // SAFETY: composite, output and fullscreen post shaders read bindings 0, 1 and
+        // (composite) 2-4: bloom, exposure buffer and 3D LUT.
         self.post_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&post_layout_info, None) }?);
 
@@ -5976,7 +6072,7 @@ impl Renderer {
         let post_pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(post_set_count * 2),
+                .descriptor_count(post_set_count * 3),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(post_set_count),
@@ -6161,6 +6257,97 @@ impl Renderer {
         self.brdf_image =
             Some(self.upload_16bit_image(64, 64, vk::Format::R16G16_SFLOAT, 4, &lut_bytes)?);
         Ok(())
+    }
+
+    /// Встроенная identity LUT (`ColorLutId` 0): composite всегда читает binding 4.
+    fn create_identity_color_lut(&mut self) -> Result<(), RenderError> {
+        let lut = self.upload_color_lut(
+            IDENTITY_LUT_SIZE,
+            &color_lut_bytes(&identity_color_lut(IDENTITY_LUT_SIZE)),
+        )?;
+        self.color_luts.push(Some(lut));
+        Ok(())
+    }
+
+    /// Загружает 3D LUT RGBA16F стороны `size` одной синхронной отправкой.
+    fn upload_color_lut(&self, size: u32, bytes: &[u8]) -> Result<DeviceImage, RenderError> {
+        let device = self.device()?;
+        let image = DeviceImage::new_3d(
+            self.instance()?,
+            device,
+            self.physical_device,
+            size,
+            COLOR_LUT_FORMAT,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        )?;
+        let staging = HostBuffer::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            bytes,
+        )?;
+        self.submit_once(|command_buffer| {
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::NONE,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    color_subresource_range(),
+                ),
+            );
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(color_subresource_layers())
+                .image_extent(vk::Extent3D {
+                    width: size,
+                    height: size,
+                    depth: size,
+                })];
+            // SAFETY: staging holds size³ RGBA16F texels and the image is transfer-dst.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging.buffer,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                )
+            };
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    color_subresource_range(),
+                ),
+            );
+        })?;
+        Ok(image)
+    }
+
+    /// Проверяет, что LUT цветокоррекции вида создана и не уничтожена.
+    fn validate_color_lut(&self, post: &PostProcess) -> Result<(), RenderError> {
+        match post.color_grading.lut {
+            Some(lut) if lut.0 == 0 || color_lut_view(&self.color_luts, Some(lut)).is_none() => {
+                Err(RenderError::InvalidConfig(
+                    "LUT цветокоррекции не создана или уничтожена",
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn create_default_environment(&mut self) -> Result<(), RenderError> {
@@ -8329,6 +8516,7 @@ impl Drop for Renderer {
         self.builtin_user_uniform.take();
         self.surface_shaders.clear();
         self.textures.clear();
+        self.color_luts.clear();
         if let Some(device) = self.device.as_ref() {
             if let Some(pool) = self.frame_descriptor_pool.take() {
                 // SAFETY: the device is idle; destroying the pool frees its frame sets.
@@ -9438,6 +9626,39 @@ impl Drop for FrameResources {
     }
 }
 
+/// Создаёт цель AO или пересоздаёт её, если качество сменило разрешение сырого GTAO.
+/// Вызывается после ожидания fence кадрового слота: прежняя цель слота больше не используется GPU.
+#[allow(clippy::too_many_arguments)]
+fn ensure_ao_target(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    scene: &mut OffscreenTarget,
+    render_extent: vk::Extent2D,
+    quality: AmbientOcclusionQuality,
+    set_layout: vk::DescriptorSetLayout,
+) -> Result<(), RenderError> {
+    let (width, height) = post::ao_resolution(quality, (render_extent.width, render_extent.height));
+    let raw_extent = vk::Extent2D { width, height };
+    if scene
+        .ao
+        .as_ref()
+        .is_some_and(|ao| ao.raw_extent == raw_extent)
+    {
+        return Ok(());
+    }
+    scene.ao = Some(AoTarget::new(
+        instance,
+        device,
+        physical_device,
+        render_extent,
+        raw_extent,
+        scene.depth.view,
+        set_layout,
+    )?);
+    Ok(())
+}
+
 struct OffscreenTarget {
     color: DeviceImage,
     velocity: DeviceImage,
@@ -10238,8 +10459,9 @@ enum TemporalViewId {
 struct TemporalSubmission {
     view: TemporalViewId,
     plan: TemporalPlan,
-    /// Кадр вида адаптирует экспозицию; состояние адаптации фиксируется после успешного submit.
-    exposure: bool,
+    /// Решение адаптации экспозиции кадра вида (`None` — ручной кадр); фиксируется после
+    /// успешного submit.
+    exposure: Option<ExposureFrame>,
     layouts: Option<[vk::ImageLayout; 2]>,
     #[cfg(windows)]
     fsr_used: bool,
@@ -10616,7 +10838,7 @@ fn allocate_post_image_sets(
     let pool_sizes = [
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(4),
+            .descriptor_count(6),
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER)
             .descriptor_count(2),
@@ -10627,7 +10849,7 @@ fn allocate_post_image_sets(
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(2)
         .pool_sizes(&pool_sizes);
-    // SAFETY: the pool holds one tonemap and one output descriptor set (two sampled images each).
+    // SAFETY: the pool holds one tonemap and one output descriptor set (three sampled images each).
     let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
     let layouts = [layout; 2];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
@@ -10783,6 +11005,24 @@ fn acquire_image(
     Ok(Some((image_index, suboptimal)))
 }
 
+/// View LUT для composite: `None` — встроенная identity LUT (индекс 0).
+fn color_lut_view(luts: &[Option<DeviceImage>], lut: Option<ColorLutId>) -> Option<vk::ImageView> {
+    luts.get(lut.map_or(0, |lut| lut.0))
+        .and_then(Option::as_ref)
+        .map(|image| image.view)
+}
+
+/// Форма изображения `DeviceImage`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageShape {
+    /// 2D-изображение или 2D-массив.
+    Flat,
+    /// Cube-совместимое изображение из шести слоёв.
+    Cube,
+    /// 3D-изображение заданной глубины.
+    Volume(u32),
+}
+
 struct DeviceImage {
     device: ash::Device,
     image: vk::Image,
@@ -10862,7 +11102,32 @@ impl DeviceImage {
             usage,
             subresource_range,
             array_layers,
-            false,
+            ImageShape::Flat,
+        )
+    }
+
+    /// 3D-изображение `size³` с одним mip-уровнем (LUT цветокоррекции).
+    fn new_3d(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        size: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Self, RenderError> {
+        Self::new_with_layers_kind(
+            instance,
+            device,
+            physical_device,
+            vk::Extent2D {
+                width: size,
+                height: size,
+            },
+            format,
+            usage,
+            color_mip_subresource_range(0, 1),
+            1,
+            ImageShape::Volume(size),
         )
     }
 
@@ -10888,7 +11153,7 @@ impl DeviceImage {
             usage,
             color_mip_subresource_range(0, mip_levels),
             6,
-            true,
+            ImageShape::Cube,
         )
     }
 
@@ -10902,8 +11167,13 @@ impl DeviceImage {
         usage: vk::ImageUsageFlags,
         subresource_range: vk::ImageSubresourceRange,
         array_layers: u32,
-        cube_compatible: bool,
+        shape: ImageShape,
     ) -> Result<Self, RenderError> {
+        let cube_compatible = shape == ImageShape::Cube;
+        let depth = match shape {
+            ImageShape::Volume(depth) => depth,
+            ImageShape::Flat | ImageShape::Cube => 1,
+        };
         if array_layers == 0 {
             return Err(RenderError::InvalidConfig(
                 "image должен иметь хотя бы один слой",
@@ -10917,12 +11187,16 @@ impl DeviceImage {
             } else {
                 vk::ImageCreateFlags::empty()
             })
-            .image_type(vk::ImageType::TYPE_2D)
+            .image_type(if depth > 1 {
+                vk::ImageType::TYPE_3D
+            } else {
+                vk::ImageType::TYPE_2D
+            })
             .format(format)
             .extent(vk::Extent3D {
                 width: extent.width,
                 height: extent.height,
-                depth: 1,
+                depth,
             })
             .mip_levels(subresource_range.level_count)
             .array_layers(array_layers)
@@ -10967,6 +11241,8 @@ impl DeviceImage {
             .image(target.image)
             .view_type(if cube_compatible {
                 vk::ImageViewType::CUBE
+            } else if depth > 1 {
+                vk::ImageViewType::TYPE_3D
             } else if array_layers == 1 {
                 vk::ImageViewType::TYPE_2D
             } else {
@@ -11046,7 +11322,7 @@ struct TemporalResolveRecord<'a> {
     #[cfg(windows)]
     fsr: Option<&'a mut FsrView>,
     #[cfg(windows)]
-    exposure_ev: f32,
+    exposure: UpscalerExposure,
     #[cfg(windows)]
     frame_time_delta_ms: f32,
     #[cfg(windows)]
@@ -11120,7 +11396,7 @@ fn record_temporal_resolve_and_tonemap(
             scene,
             fsr,
             resolve.plan,
-            resolve.exposure_ev,
+            resolve.exposure,
             resolve.frame_time_delta_ms,
             resolve.camera,
         ) {
@@ -11146,7 +11422,7 @@ fn record_temporal_resolve_and_tonemap(
             dlss,
             api,
             resolve.plan,
-            resolve.exposure_ev,
+            resolve.exposure,
             resolve.frame_time_delta_ms,
         ) {
             Ok(()) => {
@@ -11225,6 +11501,123 @@ fn record_temporal_resolve_and_tonemap(
     })
 }
 
+/// Экспозиция, которую получает FSR/DLSS.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum UpscalerExposure {
+    /// Ручная экспозиция: множитель `exp2(ev)` записывается очисткой изображения.
+    Manual(f32),
+    /// Auto exposure: множитель `exp2(ev + adapted_ev)` текущего кадра копируется из буфера вида.
+    /// Адаптация этого кадра уже записана: экспозиция замеряется до temporal resolve.
+    Adapted(vk::Buffer),
+}
+
+#[cfg(windows)]
+impl UpscalerExposure {
+    /// Выбирает источник: адаптированный буфер, только если кадр вида записывает адаптацию.
+    fn new(ev: f32, adapted: Option<vk::Buffer>) -> Self {
+        adapted.map_or(Self::Manual(ev), Self::Adapted)
+    }
+}
+
+/// Записывает 1×1 изображение экспозиции апскейлера и переводит его в чтение стадией `consumer_stage`.
+#[cfg(windows)]
+fn write_upscaler_exposure(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    layout: &mut vk::ImageLayout,
+    exposure: UpscalerExposure,
+    consumer_stage: vk::PipelineStageFlags2,
+) {
+    let (source_stage, source_access) = if *layout == vk::ImageLayout::UNDEFINED {
+        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+    } else {
+        (consumer_stage, vk::AccessFlags2::SHADER_SAMPLED_READ)
+    };
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            image,
+            *layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            source_stage,
+            source_access,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            color_subresource_range(),
+        ),
+    );
+    match exposure {
+        UpscalerExposure::Manual(ev) => {
+            let value = [fsr::exposure_value(ev), 0.0, 0.0, 0.0];
+            // SAFETY: the 1x1 exposure image is in TRANSFER_DST_OPTIMAL and the range covers its only subresource.
+            unsafe {
+                device.cmd_clear_color_image(
+                    command_buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { float32: value },
+                    &[color_subresource_range()],
+                )
+            };
+        }
+        UpscalerExposure::Adapted(buffer) => {
+            // Усреднение экспозиции этого кадра записало множитель в compute-стадии.
+            exposure_buffer_barrier(
+                device,
+                command_buffer,
+                buffer,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            );
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(EXPOSURE_SCALE_OFFSET)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                })];
+            // SAFETY: the buffer holds the R32 scale at a texel-aligned offset and the 1x1 image
+            // is in TRANSFER_DST_OPTIMAL.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                )
+            };
+        }
+    }
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            consumer_stage,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        ),
+    );
+    *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn record_fsr_pass(
@@ -11233,7 +11626,7 @@ fn record_fsr_pass(
     scene: &mut OffscreenTarget,
     fsr: &mut FsrView,
     plan: TemporalPlan,
-    exposure_ev: f32,
+    exposure: UpscalerExposure,
     frame_time_delta_ms: f32,
     camera: [f32; 3],
 ) -> Result<(), String> {
@@ -11255,54 +11648,14 @@ fn record_fsr_pass(
         );
         scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
-    let exposure_src = if fsr.exposure_layout == vk::ImageLayout::UNDEFINED {
-        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
-    } else {
-        (
-            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        )
-    };
-    pipeline_barrier(
+    write_upscaler_exposure(
         device,
         command_buffer,
-        image_layout_barrier(
-            fsr.exposure.image,
-            fsr.exposure_layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            exposure_src.0,
-            exposure_src.1,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            color_subresource_range(),
-        ),
+        fsr.exposure.image,
+        &mut fsr.exposure_layout,
+        exposure,
+        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
     );
-    let exposure = [fsr::exposure_value(exposure_ev), 0.0, 0.0, 0.0];
-    // SAFETY: the 1x1 exposure image is in TRANSFER_DST_OPTIMAL and the range covers its only subresource.
-    unsafe {
-        device.cmd_clear_color_image(
-            command_buffer,
-            fsr.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &vk::ClearColorValue { float32: exposure },
-            &[color_subresource_range()],
-        )
-    };
-    pipeline_barrier(
-        device,
-        command_buffer,
-        image_layout_barrier(
-            fsr.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-            color_subresource_range(),
-        ),
-    );
-    fsr.exposure_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
     if fsr.output_layout == vk::ImageLayout::UNDEFINED {
         pipeline_barrier(
@@ -11388,7 +11741,7 @@ fn record_dlss_pass(
     dlss_view: &mut DlssView,
     api: &dlss::NgxApi,
     plan: TemporalPlan,
-    exposure_ev: f32,
+    exposure: UpscalerExposure,
     frame_time_delta_ms: f32,
 ) -> Result<(), String> {
     for (image, layout, range) in [
@@ -11424,54 +11777,14 @@ fn record_dlss_pass(
         }
     }
 
-    let exposure_source = if dlss_view.exposure_layout == vk::ImageLayout::UNDEFINED {
-        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
-    } else {
-        (
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        )
-    };
-    pipeline_barrier(
+    write_upscaler_exposure(
         device,
         command_buffer,
-        image_layout_barrier(
-            dlss_view.exposure.image,
-            dlss_view.exposure_layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            exposure_source.0,
-            exposure_source.1,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            color_subresource_range(),
-        ),
+        dlss_view.exposure.image,
+        &mut dlss_view.exposure_layout,
+        exposure,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
     );
-    let exposure = [fsr::exposure_value(exposure_ev), 0.0, 0.0, 0.0];
-    // SAFETY: the 1x1 exposure image is in TRANSFER_DST_OPTIMAL and the range covers its only subresource.
-    unsafe {
-        device.cmd_clear_color_image(
-            command_buffer,
-            dlss_view.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &vk::ClearColorValue { float32: exposure },
-            &[color_subresource_range()],
-        )
-    };
-    pipeline_barrier(
-        device,
-        command_buffer,
-        image_layout_barrier(
-            dlss_view.exposure.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-            color_subresource_range(),
-        ),
-    );
-    dlss_view.exposure_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
     let (output_stage, output_access) = offscreen_previous_use(dlss_view.output_layout);
     pipeline_barrier(
@@ -11626,16 +11939,27 @@ fn record_frame(
         }
         _ => None,
     };
+    // Экспозиция замеряется по HDR цели сцены до temporal resolve: FSR/DLSS и composite
+    // получают EV этого кадра.
+    if let Some(record) = exposure_record(
+        &target.exposure,
+        scene.exposure_pipelines,
+        exposure,
+        &view.post,
+    ) {
+        record_exposure(
+            device,
+            command_buffer,
+            &target.scene.color,
+            &mut target.scene.layout,
+            target.render_extent,
+            record,
+            scene.timestamps,
+        );
+    }
     let passes = PostPasses {
         filters,
         sampler: post_sampler,
-        exposure: exposure_record(
-            &target.exposure,
-            scene.exposure_pipelines,
-            exposure,
-            &view.post,
-            scene.exposure_dt_ms,
-        ),
         bloom: bloom_record(
             target.bloom.as_mut(),
             scene.bloom_pipelines,
@@ -11645,6 +11969,7 @@ fn record_frame(
             exposure,
         ),
         exposure_buffer,
+        lut: scene.color_lut,
         screen_before: chain_record(
             target.screen_before.as_mut(),
             &scene.post.screen_before,
@@ -12139,7 +12464,7 @@ fn record_scene(
             &scene.post.ao,
             scene.projection_scale,
             scene.post.filters.near_far,
-            (render_extent.width, render_extent.height),
+            (ao.raw_extent.width, ao.raw_extent.height),
         );
         record_ambient_occlusion(
             device,
@@ -12675,6 +13000,8 @@ struct ScenePass<'a> {
     exposure_pipelines: Option<ExposurePipelines>,
     /// Время кадра вида для адаптации экспозиции.
     exposure_dt_ms: f32,
+    /// 3D LUT composite вида: LUT цветокоррекции или встроенная identity LUT.
+    color_lut: vk::ImageView,
     reset_history: bool,
     filter_pipelines: Option<FilterPipelines>,
     ao_pipelines: Option<AoPipelines>,
@@ -13351,9 +13678,10 @@ fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
 /// Проходы постобработки вида, которые записываются перед composite.
 struct PostPasses<'a> {
     filters: Option<FilterRecord<'a>>,
-    exposure: Option<ExposureRecord>,
     bloom: Option<BloomRecord<'a>>,
     exposure_buffer: vk::Buffer,
+    /// 3D LUT composite: LUT вида или встроенная identity LUT.
+    lut: vk::ImageView,
     sampler: vk::Sampler,
     /// Экранные шейдеры до фильтров; `None`, если вид их не использует.
     screen_before: Option<ScreenChainRecord<'a>>,
@@ -13379,9 +13707,9 @@ fn record_tonemap_pass(
 ) -> vk::ImageView {
     let PostPasses {
         mut filters,
-        exposure,
         bloom,
         exposure_buffer,
+        lut,
         sampler,
         mut screen_before,
         mut screen_after,
@@ -13428,17 +13756,6 @@ fn record_tonemap_pass(
         _ => (source, source_layout),
     };
     write_image_set(device, set, final_image.view, sampler);
-    if let Some(record) = exposure {
-        record_exposure(
-            device,
-            command_buffer,
-            final_image,
-            &mut final_layout,
-            extent,
-            record,
-            timestamps,
-        );
-    }
     let bloom_view = bloom.map(|record| {
         record_bloom(
             device,
@@ -13451,6 +13768,7 @@ fn record_tonemap_pass(
     });
     write_composite_bloom(device, set, bloom_view.unwrap_or(final_image.view));
     write_composite_exposure(device, set, exposure_buffer);
+    write_composite_lut(device, set, lut);
     if final_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
         let (source_stage, source_access) = match final_layout {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (

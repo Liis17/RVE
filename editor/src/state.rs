@@ -548,7 +548,7 @@ impl EditorState {
             .unwrap_or_default();
         if let Some(world) = self.world_mut() {
             for handle in handles {
-                let _ = world.set_post_process(handle, settings);
+                let _ = world.set_post_process(handle, settings.clone());
             }
         }
         self.log.info(format!("Сохранена постобработка {path}"));

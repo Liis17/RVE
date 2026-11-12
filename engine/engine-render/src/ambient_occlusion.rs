@@ -2,8 +2,10 @@
 //!
 //! Вход — depth цели сцены после prepass непрозрачных мешей; результат — R8-изображение,
 //! которое mesh-шейдер читает через binding 8 набора кадра и применяет к непрямому свету.
-//! Сырой и отфильтрованный буферы живут в цели сцены (per slot), создаются лениво и
-//! пересоздаются вместе с ней.
+//! Сырой AO считается в разрешении `post::ao_resolution` (половинном для `low`/`medium`);
+//! денойз читает его вместе с глубиной полного разрешения и пишет отфильтрованный буфер размера
+//! render-цели, поэтому денойз одновременно выполняет depth-aware upsample. Буферы живут в цели
+//! сцены (per slot), создаются лениво и пересоздаются вместе с ней или при смене разрешения AO.
 
 use super::post::AoParams;
 use super::{
@@ -118,6 +120,8 @@ fn sampled_binding(binding: u32) -> vk::DescriptorSetLayoutBinding<'static> {
 
 /// Цель AO одной цели сцены: сырой и отфильтрованный буферы с наборами дескрипторов.
 pub(crate) struct AoTarget {
+    /// Разрешение сырого GTAO; отфильтрованный буфер совпадает с render-целью.
+    pub(crate) raw_extent: vk::Extent2D,
     pub(crate) raw: DeviceImage,
     pub(crate) filtered: DeviceImage,
     raw_layout: vk::ImageLayout,
@@ -133,6 +137,7 @@ impl AoTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
+        raw_extent: vk::Extent2D,
         depth_view: vk::ImageView,
         set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
@@ -141,7 +146,7 @@ impl AoTarget {
             instance,
             device,
             physical_device,
-            extent,
+            raw_extent,
             AO_FORMAT,
             usage,
             color_subresource_range(),
@@ -178,6 +183,7 @@ impl AoTarget {
         write_ao_set(device, sets[0], depth_view, None, raw.view);
         write_ao_set(device, sets[1], depth_view, Some(raw.view), filtered.view);
         Ok(Self {
+            raw_extent,
             raw,
             filtered,
             raw_layout: vk::ImageLayout::UNDEFINED,
@@ -240,7 +246,8 @@ pub(crate) struct AoRecord<'a> {
     pub(crate) near_far: [f32; 2],
 }
 
-/// Записывает GTAO и денойз. Глубина должна быть в `SHADER_READ_ONLY_OPTIMAL`.
+/// Записывает GTAO в разрешении сырого буфера и денойз с upsample в `extent` render-цели.
+/// Глубина должна быть в `SHADER_READ_ONLY_OPTIMAL`.
 pub(crate) fn record_ambient_occlusion(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -254,6 +261,10 @@ pub(crate) fn record_ambient_occlusion(
         gtao,
         near_far,
     } = record;
+    let raw_groups = (
+        target.raw_extent.width.div_ceil(GROUP_SIZE),
+        target.raw_extent.height.div_ceil(GROUP_SIZE),
+    );
     let groups = (
         extent.width.div_ceil(GROUP_SIZE),
         extent.height.div_ceil(GROUP_SIZE),
@@ -279,7 +290,7 @@ pub(crate) fn record_ambient_occlusion(
         pipelines.layout,
         target.gtao_set,
         &gtao_push,
-        groups,
+        raw_groups,
     );
     transition_image(
         device,

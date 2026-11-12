@@ -8,7 +8,7 @@ use crate::screen_shader::{ScreenChain, ScreenShaderStage, ScreenShaders};
 use crate::{DebugView, Tonemapper};
 
 /// Число `vec4` в push constants composite-прохода (tonemap.frag).
-pub const COMPOSITE_PUSH_VECTORS: usize = 6;
+pub const COMPOSITE_PUSH_VECTORS: usize = 7;
 /// Размер push constants composite-прохода в байтах.
 pub const COMPOSITE_PUSH_CONSTANTS_SIZE: usize = COMPOSITE_PUSH_VECTORS * 16;
 /// Число `vec4` в push constants output-прохода (output.frag).
@@ -116,6 +116,9 @@ impl PostProcess {
                 .all(|value| in_range(value, 0.0, 4.0))
         {
             return Err("color grading lift, gamma и gain вне допустимых диапазонов");
+        }
+        if !in_range(grading.lut_intensity, 0.0, 1.0) {
+            return Err("color grading lut_intensity должен находиться в [0, 1]");
         }
         let vignette = self.vignette;
         if !(in_range(vignette.intensity, 0.0, 1.0)
@@ -263,7 +266,11 @@ impl Default for AmbientOcclusion {
     }
 }
 
-/// Цветокоррекция в linear HDR до tonemapping и lift/gamma/gain после него.
+/// Идентификатор 3D LUT цветокоррекции, созданной [`crate::Renderer::create_color_lut`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColorLutId(pub(crate) usize);
+
+/// Цветокоррекция в linear HDR до tonemapping, lift/gamma/gain после него и 3D LUT в конце.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorGrading {
     pub enabled: bool,
@@ -274,6 +281,10 @@ pub struct ColorGrading {
     pub lift: [f32; 3],
     pub gamma: [f32; 3],
     pub gain: [f32; 3],
+    /// 3D LUT, применяемая к sRGB-кодированному цвету после lift/gamma/gain; `None` — без LUT.
+    pub lut: Option<ColorLutId>,
+    /// Доля LUT в `[0, 1]`: 0 — исходный цвет, 1 — полностью цвет LUT.
+    pub lut_intensity: f32,
 }
 
 impl Default for ColorGrading {
@@ -287,6 +298,8 @@ impl Default for ColorGrading {
             lift: [0.0; 3],
             gamma: [1.0; 3],
             gain: [1.0; 3],
+            lut: None,
+            lut_intensity: 1.0,
         }
     }
 }
@@ -547,6 +560,11 @@ pub fn composite_params(
         } else {
             (0.0, 0.0, 1.0, [0.0; 3])
         };
+    // LUT применяется только при включённой цветокоррекции; 0 выключает выборку в шейдере.
+    let lut_intensity = match grading.lut {
+        Some(_) if plan.color_grading => grading.lut_intensity,
+        _ => 0.0,
+    };
     // Флаги композита: бит 0 — bloom, бит 1 — экспозиция по гистограмме (читается из буфера).
     let flags =
         f32::from(u8::from(plan.bloom_mips > 0)) + 2.0 * f32::from(u8::from(plan.auto_exposure));
@@ -573,26 +591,40 @@ pub fn composite_params(
                 vignette_color[2],
                 vignette_roundness,
             ],
+            [lut_intensity, 0.0, 0.0, 0.0],
         ],
     }
+}
+
+/// LUT, которую composite вида должен привязать: `None` — встроенная identity LUT.
+pub fn planned_color_lut(post: &PostProcess, plan: &PostPlan) -> Option<ColorLutId> {
+    post.color_grading.lut.filter(|_| plan.color_grading)
 }
 
 /// Число бинов гистограммы экспозиции (совпадает с exposure_histogram.wgsl).
 pub const EXPOSURE_BINS: usize = 256;
 /// Push constants усредняющего прохода экспозиции: тайминг и диапазон адаптации.
-/// Раскладка: timing = (dt, скорость роста, скорость падения, snap); range = (min, max, low, high).
+/// Раскладка: timing = (dt, скорость роста, скорость падения, snap); range = (min, max, low, high);
+/// compensation = (ручной EV, резерв) — для множителя экспозиции FSR/DLSS.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExposureAverageParams {
     pub timing: [f32; 4],
     pub range: [f32; 4],
+    pub compensation: [f32; 4],
 }
 
 impl ExposureAverageParams {
     /// Байты push constants в порядке записи.
-    pub fn to_bytes(self) -> [u8; 32] {
-        let mut bytes = [0; 32];
-        for (index, value) in self.timing.iter().chain(&self.range).enumerate() {
+    pub fn to_bytes(self) -> [u8; 48] {
+        let mut bytes = [0; 48];
+        for (index, value) in self
+            .timing
+            .iter()
+            .chain(&self.range)
+            .chain(&self.compensation)
+            .enumerate()
+        {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
         bytes
@@ -619,6 +651,7 @@ pub fn exposure_average_params(
             exposure.low_percent / 100.0,
             exposure.high_percent / 100.0,
         ],
+        compensation: [exposure.ev, 0.0, 0.0, 0.0],
     }
 }
 
@@ -653,6 +686,19 @@ pub fn ao_sampling(quality: AmbientOcclusionQuality) -> (u32, u32) {
         AmbientOcclusionQuality::Low => (4, 3),
         AmbientOcclusionQuality::Medium => (6, 4),
         AmbientOcclusionQuality::High => (8, 6),
+    }
+}
+
+/// Разрешение сырого GTAO для качества: `low` и `medium` считаются в половинном разрешении
+/// render-цели (с округлением вверх), `high` — в полном. Денойз возвращает результат в полное
+/// разрешение с учётом глубины, поэтому mesh-шейдер всегда читает AO размера render-цели.
+pub fn ao_resolution(quality: AmbientOcclusionQuality, render_extent: (u32, u32)) -> (u32, u32) {
+    match quality {
+        AmbientOcclusionQuality::Low | AmbientOcclusionQuality::Medium => (
+            render_extent.0.div_ceil(2).max(1),
+            render_extent.1.div_ceil(2).max(1),
+        ),
+        AmbientOcclusionQuality::High => render_extent,
     }
 }
 
@@ -919,6 +965,7 @@ mod tests {
                 [1.0, 1.0, 1.0, 0.0],
                 [1.0, 1.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
             ]
         );
     }
@@ -965,6 +1012,52 @@ mod tests {
     }
 
     #[test]
+    fn color_lut_applies_only_with_enabled_grading_in_lit_view() {
+        let mut post = PostProcess::default();
+        post.color_grading.lut = Some(ColorLutId(4));
+        post.color_grading.lut_intensity = 0.6;
+        let disabled = build_plan(&post, DebugView::Lit, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &disabled, DebugView::Lit).vectors[6][0],
+            0.0
+        );
+        assert_eq!(planned_color_lut(&post, &disabled), None);
+
+        post.color_grading.enabled = true;
+        let lit = build_plan(&post, DebugView::Lit, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &lit, DebugView::Lit).vectors[6][0],
+            0.6
+        );
+        assert_eq!(planned_color_lut(&post, &lit), Some(ColorLutId(4)));
+        let bytes = composite_params(&post, &lit, DebugView::Lit).to_bytes();
+        assert_eq!(f32::from_ne_bytes(bytes[96..100].try_into().unwrap()), 0.6);
+
+        let wireframe = build_plan(&post, DebugView::Wireframe, (64, 64), (64, 64));
+        assert_eq!(planned_color_lut(&post, &wireframe), None);
+    }
+
+    #[test]
+    fn enabled_grading_without_lut_keeps_lut_intensity_zero() {
+        let mut post = PostProcess::default();
+        post.color_grading.enabled = true;
+        let lit = build_plan(&post, DebugView::Lit, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &lit, DebugView::Lit).vectors[6][0],
+            0.0
+        );
+    }
+
+    #[test]
+    fn lut_intensity_outside_unit_range_is_rejected() {
+        for intensity in [-0.01, 1.01, f32::NAN] {
+            let mut post = PostProcess::default();
+            post.color_grading.lut_intensity = intensity;
+            assert!(post.validate().is_err(), "{intensity}");
+        }
+    }
+
+    #[test]
     fn grain_parameters_are_zero_unless_planned_and_wrap_the_seed() {
         let mut post = PostProcess::default();
         post.film_grain.enabled = true;
@@ -995,6 +1088,19 @@ mod tests {
             exposure_average_params(&exposure, -5.0, false).timing[0],
             0.0
         );
+    }
+
+    #[test]
+    fn average_params_carry_manual_ev_for_the_upscaler_exposure_scale() {
+        let exposure = Exposure {
+            ev: 1.5,
+            ..Exposure::default()
+        };
+        let params = exposure_average_params(&exposure, 16.0, false);
+        assert_eq!(params.compensation, [1.5, 0.0, 0.0, 0.0]);
+        let bytes = params.to_bytes();
+        assert_eq!(bytes.len(), size_of::<ExposureAverageParams>());
+        assert_eq!(f32::from_ne_bytes(bytes[32..36].try_into().unwrap()), 1.5);
     }
 
     #[test]
@@ -1189,6 +1295,31 @@ mod tests {
     }
 
     #[test]
+    fn ambient_occlusion_low_and_medium_run_at_half_resolution() {
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::Low, (1280, 720)),
+            (640, 360)
+        );
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::Medium, (1280, 720)),
+            (640, 360)
+        );
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::High, (1280, 720)),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn ambient_occlusion_half_resolution_rounds_up_and_never_reaches_zero() {
+        assert_eq!(
+            ao_resolution(AmbientOcclusionQuality::Medium, (1281, 721)),
+            (641, 361)
+        );
+        assert_eq!(ao_resolution(AmbientOcclusionQuality::Low, (1, 1)), (1, 1));
+    }
+
+    #[test]
     fn ambient_occlusion_parameters_carry_camera_planes_and_radius_in_meters() {
         let ao = AmbientOcclusion {
             enabled: true,
@@ -1214,7 +1345,7 @@ mod tests {
 
     #[test]
     fn push_constant_sizes_fit_the_shared_layout() {
-        assert_eq!(COMPOSITE_PUSH_CONSTANTS_SIZE, 96);
+        assert_eq!(COMPOSITE_PUSH_CONSTANTS_SIZE, 112);
         assert_eq!(OUTPUT_PUSH_CONSTANTS_SIZE, 32);
     }
 

@@ -1497,7 +1497,7 @@ impl World {
 
         let post_process = self
             .object(self.active_camera)
-            .and_then(|object| object.post_process)
+            .and_then(|object| object.post_process.clone())
             .unwrap_or_default();
         let screen_shaders = self
             .object(self.active_camera)
@@ -2657,7 +2657,7 @@ id="mesh"
         let mut graded = crate::PostProcessSettings::default();
         graded.bloom.enabled = true;
         graded.bloom.intensity = 2.0;
-        world.set_post_process(main, graded).unwrap();
+        world.set_post_process(main, graded.clone()).unwrap();
         assert_eq!(world.post_process(main), Some(&graded));
         assert_eq!(
             world.post_process(second),
