@@ -260,6 +260,9 @@ pub struct EditorScene {
     coalesce: Option<String>,
     /// Растёт при каждом изменении документа; потребители по нему обновляют производные данные.
     revision: u64,
+    /// Текст файла на диске на момент открытия, сохранения или последнего перечитывания;
+    /// `None` — неизвестен (новая сцена или восстановление из автосохранения).
+    disk_text: Option<String>,
 }
 
 impl EditorScene {
@@ -272,7 +275,9 @@ impl EditorScene {
     /// Разбирает сцену или, для пути `.rveprefab`, префаб.
     pub fn parse(path: VirtualPath, contents: &str, loader: PrefabLoader) -> Result<Self, String> {
         let document = parse_document(&path, contents).map_err(|error| error.to_string())?;
-        Self::from_document(document, Some(path), loader)
+        let mut scene = Self::from_document(document, Some(path), loader)?;
+        scene.disk_text = Some(contents.to_owned());
+        Ok(scene)
     }
 
     /// Сцена из автосохранения: путь прежний, а изменения считаются несохранёнными.
@@ -316,6 +321,7 @@ impl EditorScene {
             redo: Vec::new(),
             coalesce: None,
             revision: 0,
+            disk_text: None,
         })
     }
 
@@ -1768,6 +1774,45 @@ impl EditorScene {
         self.document = reparsed;
         self.path = Some(path);
         self.dirty = false;
+        self.disk_text = Some(contents);
+        Ok(())
+    }
+
+    /// Текст файла отличается от последнего известного редактору: файл изменили вне редактора.
+    pub fn differs_from_disk(&self, text: &str) -> bool {
+        self.disk_text.as_deref() != Some(text)
+    }
+
+    /// Запоминает текст файла без перечитывания: пользователь оставил свои правки, и следующее
+    /// событие с тем же содержимым больше не считается внешним изменением.
+    pub fn acknowledge_disk_text(&mut self, text: &str) {
+        self.disk_text = Some(text.to_owned());
+    }
+
+    /// Заменяет документ содержимым файла отдельным шагом undo и помечает сцену сохранённой.
+    /// Выделение сохраняется для объектов, оставшихся в сцене.
+    pub fn reload_from_disk(&mut self, text: &str) -> Result<(), String> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| "сцена ещё не сохранялась".to_owned())?;
+        let next = parse_document(&path, text).map_err(|error| error.to_string())?;
+        self.end_continuous_edit();
+        self.edit(None, |document| {
+            *document = next;
+            Ok(())
+        })?;
+        self.end_continuous_edit();
+        self.dirty = false;
+        self.disk_text = Some(text.to_owned());
+        let visible = self
+            .expansion
+            .document
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        self.selection.retain(|id| visible.contains(id.as_str()));
         Ok(())
     }
 

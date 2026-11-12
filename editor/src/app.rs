@@ -807,6 +807,15 @@ impl EditorApp {
     }
 
     fn apply_asset_changes(&mut self, changes: AssetChanges) {
+        let scene_file_changed = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(EditorScene::path)
+            .is_some_and(|path| changes.rescan || changes.contains_path_or_parent(path));
+        if scene_file_changed {
+            self.state.check_scene_file();
+        }
         if let (Some(editor), Some(project)) = (&mut self.state.ui_document, &self.state.project) {
             editor.refresh_external(project, &changes);
         }
@@ -2124,6 +2133,7 @@ pub(crate) fn console_modal_open(state: &EditorState) -> bool {
         || state.project_dialog.is_some()
         || state.new_project_dialog.is_some()
         || state.recovery_prompt.is_some()
+        || state.external_scene_prompt.is_some()
         || state.apply_prompt.is_some()
 }
 
@@ -2922,6 +2932,10 @@ impl WindowHandler for EditorApp {
         }
         if let Some(changes) = self.asset_changes.take_ready(now) {
             self.apply_asset_changes(changes);
+            window.request_redraw();
+        }
+        if self.state.scene_file_check_pending && !self.state.is_playing() {
+            self.state.check_scene_file();
             window.request_redraw();
         }
         // Вне Play очередь геймпадов дренируется без доставки в скрипты; в Play опрос идёт в кадре.
