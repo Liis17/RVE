@@ -20,8 +20,8 @@ use engine_render::{
     ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleEmitterFrame,
     ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey, PostProcess,
     ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, ShaderId, SkinBinding, SkinId,
-    SkinVertex, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings,
-    ViewportId,
+    SkinVertex, SurfaceLighting, SurfaceShaderSource, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_render::{
     SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage, ScreenShaders,
@@ -132,6 +132,7 @@ pub struct SceneRenderer {
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     grid: Option<MeshId>,
     grid_material: Option<MaterialId>,
+    grid_shader: Option<ShaderId>,
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
     /// Viewport захвата с отдельной камерой; создаётся только на время `capture_view`.
@@ -360,6 +361,7 @@ impl SceneRenderer {
             object_materials: HashMap::new(),
             grid: None,
             grid_material: None,
+            grid_shader: None,
             scene_draws: Vec::new(),
             game_draws: Vec::new(),
             capture_viewport: None,
@@ -1555,7 +1557,10 @@ impl SceneRenderer {
             let grid_material = match self.grid_material {
                 Some(material) => material,
                 None => {
+                    let shader = renderer.create_surface_shader(&grid_surface_source())?;
+                    self.grid_shader = Some(shader);
                     let material = renderer.create_material(&Material {
+                        shader: Some(shader),
                         double_sided: true,
                         ..Material::default()
                     })?;
@@ -3102,6 +3107,15 @@ fn grid_scale(camera_distance: f32) -> f32 {
     10_f32.powf(camera_distance.max(1e-3).log10().floor())
 }
 
+/// Unlit-поверхность для сетки: без освещения сетка не получает тени от объектов и AO.
+fn grid_surface_source() -> SurfaceShaderSource {
+    SurfaceShaderSource {
+        lighting: SurfaceLighting::Unlit,
+        properties: Vec::new(),
+        code: "void surface(inout Surface s) {}".to_owned(),
+    }
+}
+
 /// Сетка пола из тонких квадратов: renderer рисует только треугольники.
 fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
@@ -3684,6 +3698,16 @@ distance=10.0
             let normal = Vec3::from_array(vertices[triangle[0] as usize].normal);
             assert!((b - a).cross(c - a).dot(normal) > 0.0);
         }
+    }
+
+    #[test]
+    fn grid_surface_is_unlit_and_compiles() {
+        let source = grid_surface_source();
+        assert_eq!(source.lighting, SurfaceLighting::Unlit);
+        assert!(source.properties.is_empty());
+        let variants = engine_render::compile_surface_shader(&source)
+            .expect("unlit grid surface must compile");
+        assert!(!variants.opaque.is_empty());
     }
 
     #[test]
