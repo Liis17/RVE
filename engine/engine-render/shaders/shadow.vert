@@ -2,6 +2,11 @@
 
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec2 in_uv;
+// Столбцы model экземпляра: binding 1 с шагом на instance.
+layout(location = 2) in vec4 in_model_0;
+layout(location = 3) in vec4 in_model_1;
+layout(location = 4) in vec4 in_model_2;
+layout(location = 5) in vec4 in_model_3;
 layout(location = 0) out vec2 out_uv;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
@@ -28,20 +33,18 @@ layout(set = 0, binding = 6, std430) readonly buffer LocalShadowMatrixBuffer {
 } local_shadow_matrix_buffer;
 #endif
 
+// params.y — каскад directional shadow или слой local shadow.
 layout(push_constant) uniform PushConstants {
-    mat4 model;
-    mat4 normal_from_model;
-    mat4 previous_model;
     uvec4 params;
 } push_constants;
 
 void main() {
     out_uv = in_uv;
+    vec4 world_position = mat4(in_model_0, in_model_1, in_model_2, in_model_3)
+        * vec4(in_position, 1.0);
 #ifdef LOCAL_SHADOW
-    gl_Position = local_shadow_matrix_buffer.matrices[gl_InstanceIndex]
-        * push_constants.model * vec4(in_position, 1.0);
+    gl_Position = local_shadow_matrix_buffer.matrices[push_constants.params.y] * world_position;
 #else
-    gl_Position = frame.shadow_view_projections[gl_InstanceIndex]
-        * push_constants.model * vec4(in_position, 1.0);
+    gl_Position = frame.shadow_view_projections[push_constants.params.y] * world_position;
 #endif
 }
