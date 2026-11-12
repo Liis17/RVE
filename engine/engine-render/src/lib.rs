@@ -44,6 +44,7 @@ mod clusters;
 mod culling;
 mod exposure;
 mod filters;
+mod occlusion;
 mod particle_gpu;
 mod particles;
 mod post;
@@ -59,6 +60,7 @@ use exposure::{
     write_composite_exposure,
 };
 use filters::{FilterPipelines, FilterRecord, FilterScratch, record_filters};
+use occlusion::{OcclusionPipelines, OcclusionTarget};
 use particle_gpu::{
     ParticleEmitter, ParticlePass, ParticleSystem, particle_depth_source_masks, record_particles,
 };
@@ -1166,7 +1168,8 @@ pub enum GpuPass {
     ShadowDirectional,
     /// Локальные теневые слои.
     ShadowLocal,
-    /// Depth prepass непрозрачных мешей; отсутствует, если AO выключен.
+    /// Depth prepass непрозрачных мешей вместе с Hi-Z и тестом occlusion culling;
+    /// отсутствует, если выключены и AO, и occlusion culling.
     DepthPrepass,
     /// GTAO и denoise; отсутствует, если AO выключен.
     AmbientOcclusion,
@@ -1491,6 +1494,8 @@ pub struct Renderer {
     exposure_pipelines: Option<ExposurePipelines>,
     filter_pipelines: Option<FilterPipelines>,
     ao_pipelines: Option<AoPipelines>,
+    /// Hi-Z и тест видимости для occlusion culling видов.
+    occlusion_pipelines: Option<OcclusionPipelines>,
     /// Вариант непрозрачного пайплайна с LESS_OR_EQUAL для прохода после prepass.
     opaque_equal_pipeline: Option<vk::Pipeline>,
     /// Depth-only пайплайн непрозрачных мешей для prepass.
@@ -1651,6 +1656,7 @@ impl Renderer {
             exposure_pipelines: None,
             filter_pipelines: None,
             ao_pipelines: None,
+            occlusion_pipelines: None,
             opaque_equal_pipeline: None,
             prepass_pipeline: None,
             taa_set_layout: None,
@@ -2968,6 +2974,23 @@ impl Renderer {
                 ao_layout,
             )?);
         }
+        let occlusion_pipelines = self.occlusion_pipelines.filter(|_| {
+            prepass_pipeline.is_some() && occlusion_culling_enabled(frame.debug_view, frame.draws)
+        });
+        if let (Some(pipelines), Some(target)) =
+            (occlusion_pipelines, frame_resources.target.as_mut())
+        {
+            prepare_occlusion(
+                &instance,
+                &device,
+                self.physical_device,
+                &mut target.scene,
+                target.render_extent,
+                pipelines,
+                frame.draws,
+                &self.meshes,
+            )?;
+        }
         let frame_ao_view = frame_resources
             .target
             .as_ref()
@@ -3178,7 +3201,9 @@ impl Renderer {
                 ao_pipelines,
                 opaque_equal_pipeline,
                 prepass_pipeline,
-                depth_prepass: post_frame.plan.depth_prepass && prepass_pipeline.is_some(),
+                depth_prepass: (post_frame.plan.depth_prepass || occlusion_pipelines.is_some())
+                    && prepass_pipeline.is_some(),
+                occlusion: occlusion_pipelines,
                 projection_scale: [frame.camera.projection[0][0], frame.camera.projection[1][1]],
                 particles: particle_pass,
                 stats: &draw_stats,
@@ -3926,6 +3951,21 @@ impl Renderer {
                     ao_set_layout,
                 )?);
             }
+            if let Some(pipelines) = self.occlusion_pipelines.filter(|_| {
+                self.prepass_pipeline.is_some()
+                    && occlusion_culling_enabled(frame.debug_view, frame.draws)
+            }) {
+                prepare_occlusion(
+                    &instance,
+                    &device,
+                    physical_device,
+                    &mut target.scene,
+                    target.render_extent,
+                    pipelines,
+                    frame.draws,
+                    &self.meshes,
+                )?;
+            }
             let frame_ao_view = target
                 .scene
                 .ao
@@ -4115,6 +4155,7 @@ impl Renderer {
         let ao_pipelines = self.ao_pipelines;
         let opaque_equal_pipeline = self.opaque_equal_pipeline;
         let prepass_pipeline = self.prepass_pipeline;
+        let occlusion_pipelines = self.occlusion_pipelines;
         // Только viewport с запросами: без захвата внешний список остаётся пустым и не выделяет память.
         let capture_tickets_by_viewport = rendered
             .iter()
@@ -4145,6 +4186,11 @@ impl Renderer {
                         post_frame,
                     ),
                 )| {
+                    // Условие совпадает с подготовкой цели вида в prepare_occlusion.
+                    let occlusion_pipelines = occlusion_pipelines.filter(|_| {
+                        prepass_pipeline.is_some()
+                            && occlusion_culling_enabled(frame.debug_view, frame.draws)
+                    });
                     (
                         *viewport,
                         ShadowPass {
@@ -4204,8 +4250,10 @@ impl Renderer {
                             ao_pipelines,
                             opaque_equal_pipeline,
                             prepass_pipeline,
-                            depth_prepass: post_frame.plan.depth_prepass
+                            depth_prepass: (post_frame.plan.depth_prepass
+                                || occlusion_pipelines.is_some())
                                 && prepass_pipeline.is_some(),
+                            occlusion: occlusion_pipelines,
                             projection_scale: [
                                 frame.camera.projection[0][0],
                                 frame.camera.projection[1][1],
@@ -7767,6 +7815,7 @@ impl Renderer {
         self.exposure_pipelines = Some(ExposurePipelines::new(&device, cache)?);
         self.filter_pipelines = Some(FilterPipelines::new(&device, cache)?);
         self.ao_pipelines = Some(AoPipelines::new(&device, cache)?);
+        self.occlusion_pipelines = Some(OcclusionPipelines::new(&device, cache)?);
         Ok(())
     }
 
@@ -8329,6 +8378,9 @@ impl Drop for Renderer {
                 pipelines.destroy(device);
             }
             if let Some(pipelines) = self.ao_pipelines.take() {
+                pipelines.destroy(device);
+            }
+            if let Some(pipelines) = self.occlusion_pipelines.take() {
                 pipelines.destroy(device);
             }
             for pipeline in [
@@ -9293,6 +9345,8 @@ struct OffscreenTarget {
     depth_set: vk::DescriptorSet,
     /// Экранный AO цели; создаётся, когда эффект запланирован, и живёт вместе с целью.
     ao: Option<AoTarget>,
+    /// Hi-Z и indirect-аргументы occlusion culling; создаются для первого вида с тестом.
+    occlusion: Option<OcclusionTarget>,
 }
 
 impl OffscreenTarget {
@@ -9339,6 +9393,7 @@ impl OffscreenTarget {
             _depth_pool: depth_pool,
             depth_set,
             ao: None,
+            occlusion: None,
         })
     }
 }
@@ -11594,18 +11649,21 @@ fn begin_command_buffer(
 
 /// Записывает cluster, shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
 #[allow(clippy::too_many_arguments)]
-/// Записывает depth prepass непрозрачных мешей. Глубина очищается здесь, основной проход её загружает.
+/// Записывает фазу depth prepass непрозрачных мешей. Первая фаза очищает глубину, вторая
+/// (после теста occlusion culling) загружает её; основной проход глубину загружает.
 fn record_depth_prepass(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    target: &OffscreenTarget,
+    depth_view: vk::ImageView,
     render_extent: vk::Extent2D,
     scene: &ScenePass<'_>,
+    load_op: vk::AttachmentLoadOp,
+    indirect: Option<vk::Buffer>,
 ) {
     let depth_attachment = vk::RenderingAttachmentInfo::default()
-        .image_view(target.depth.view)
+        .image_view(depth_view)
         .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(load_op)
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
@@ -11628,15 +11686,10 @@ fn record_depth_prepass(
         render_extent,
         scene,
         DrawPass::Prepass,
+        indirect,
     );
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
-    mark_pass(
-        device,
-        command_buffer,
-        scene.timestamps,
-        GpuPass::DepthPrepass,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11876,8 +11929,81 @@ fn record_scene(
                 color: vk::ClearColorValue { float32: [0.0; 4] },
             }),
     ];
+    let occlusion_pipelines = scene
+        .occlusion
+        .filter(|_| scene.depth_prepass && target.occlusion.is_some());
+    let visible_args = occlusion_pipelines
+        .and(target.occlusion.as_ref())
+        .and_then(OcclusionTarget::visible_buffer);
     if scene.depth_prepass {
-        record_depth_prepass(device, command_buffer, target, render_extent, scene);
+        if let (Some(pipelines), Some(occlusion)) = (occlusion_pipelines, target.occlusion.as_ref())
+        {
+            occlusion::record_early(device, command_buffer, pipelines, occlusion);
+        }
+        record_depth_prepass(
+            device,
+            command_buffer,
+            target.depth.view,
+            render_extent,
+            scene,
+            vk::AttachmentLoadOp::CLEAR,
+            visible_args,
+        );
+        if let (Some(pipelines), Some(occlusion)) = (occlusion_pipelines, target.occlusion.as_mut())
+        {
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    target.depth.image,
+                    vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    depth_subresource_range(),
+                ),
+            );
+            occlusion::record_cull(
+                device,
+                command_buffer,
+                pipelines,
+                occlusion,
+                scene.view_projection,
+            );
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    target.depth.image,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    depth_subresource_range(),
+                ),
+            );
+            record_depth_prepass(
+                device,
+                command_buffer,
+                target.depth.view,
+                render_extent,
+                scene,
+                vk::AttachmentLoadOp::LOAD,
+                occlusion.late_buffer(),
+            );
+        }
+        mark_pass(
+            device,
+            command_buffer,
+            scene.timestamps,
+            GpuPass::DepthPrepass,
+        );
     }
     if scene.depth_prepass
         && scene.post.plan.ambient_occlusion
@@ -11967,6 +12093,7 @@ fn record_scene(
         } else {
             DrawPass::OpaqueAndMask
         },
+        visible_args,
     );
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
@@ -12127,6 +12254,7 @@ fn record_scene(
             render_extent,
             scene,
             DrawPass::Blend,
+            visible_args,
         );
         // SAFETY: this matches the preceding transparent cmd_begin_rendering call.
         unsafe { device.cmd_end_rendering(command_buffer) };
@@ -12257,6 +12385,7 @@ fn record_wireframe(
         render_extent,
         scene,
         DrawPass::Wireframe,
+        None,
     );
     // SAFETY: this matches the preceding dynamic-rendering begin call.
     unsafe { device.cmd_end_rendering(command_buffer) };
@@ -12440,6 +12569,9 @@ struct ScenePass<'a> {
     prepass_pipeline: Option<vk::Pipeline>,
     /// Prepass записан: основной непрозрачный проход использует LESS_OR_EQUAL и загружает глубину.
     depth_prepass: bool,
+    /// Пайплайны occlusion culling, если тест включён для вида; требует `depth_prepass`
+    /// и подготовленный `OffscreenTarget::occlusion`.
+    occlusion: Option<OcclusionPipelines>,
     /// (proj[0][0], proj[1][1]) камеры для восстановления позиции по глубине в AO.
     projection_scale: [f32; 2],
     particles: Option<ParticlePass<'a>>,
@@ -12513,12 +12645,57 @@ struct OverlayPass {
     vertex_count: u32,
 }
 
+/// Occlusion culling включается для вида с draw'ами; режим Overdraw показывает всю
+/// растеризуемую геометрию и проверку не использует.
+fn occlusion_culling_enabled(debug_view: DebugView, draws: &[DrawCommand]) -> bool {
+    !draws.is_empty() && debug_view != DebugView::Overdraw
+}
+
+/// Создаёт ресурсы occlusion culling цели при первом использовании и пишет входы кадра.
+/// Вызывается после ожидания fence слота цели.
+#[allow(clippy::too_many_arguments)]
+fn prepare_occlusion(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    scene: &mut OffscreenTarget,
+    render_extent: vk::Extent2D,
+    pipelines: OcclusionPipelines,
+    draws: &[DrawCommand],
+    meshes: &[Option<MeshBuffers>],
+) -> Result<(), RenderError> {
+    if scene.occlusion.is_none() {
+        scene.occlusion = Some(OcclusionTarget::new(
+            instance,
+            device,
+            physical_device,
+            render_extent,
+            scene.depth.view,
+            pipelines,
+        )?);
+    }
+    let Some(occlusion) = scene.occlusion.as_mut() else {
+        return Err(RenderError::InvalidState(
+            "ресурсы occlusion culling отсутствуют",
+        ));
+    };
+    occlusion.prepare(instance, physical_device, draws, |draw| {
+        meshes
+            .get(draw.mesh.0)?
+            .as_ref()
+            .map(|mesh| (mesh.index_count, mesh.bounds))
+    })
+}
+
+/// Записывает draw'ы прохода. С `indirect` каждый draw читает `VkDrawIndexedIndirectCommand`
+/// по своему индексу из буфера occlusion culling, и GPU пропускает невидимые.
 fn record_draws(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     render_extent: vk::Extent2D,
     scene: &ScenePass<'_>,
     pass: DrawPass,
+    indirect: Option<vk::Buffer>,
 ) {
     if scene.draws.is_empty() {
         return;
@@ -12662,7 +12839,17 @@ fn record_draws(
                 0,
                 &push_constants,
             );
-            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+            if let Some(buffer) = indirect {
+                device.cmd_draw_indexed_indirect(
+                    command_buffer,
+                    buffer,
+                    vk::DeviceSize::from(occlusion::INDIRECT_COMMAND_SIZE) * index as u64,
+                    1,
+                    occlusion::INDIRECT_COMMAND_SIZE,
+                );
+            } else {
+                device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+            }
         }
         update_stats(scene.stats, |stats| stats.scene_draw_calls += 1);
     }
@@ -18797,6 +18984,24 @@ mod tests {
             validate_shader_destroyable(1),
             Err(RenderError::InvalidShader(_))
         ));
+    }
+
+    #[test]
+    fn occlusion_culling_skips_empty_frames_and_overdraw_view() {
+        use super::occlusion_culling_enabled;
+        let draw = DrawCommand {
+            mesh: MeshId(0),
+            material: None,
+            model: IDENTITY,
+            previous_model: None,
+            lod_level: 0,
+            casts_shadow: false,
+            skin: None,
+        };
+        assert!(occlusion_culling_enabled(DebugView::Lit, &[draw]));
+        assert!(occlusion_culling_enabled(DebugView::Wireframe, &[draw]));
+        assert!(!occlusion_culling_enabled(DebugView::Overdraw, &[draw]));
+        assert!(!occlusion_culling_enabled(DebugView::Lit, &[]));
     }
 
     #[test]

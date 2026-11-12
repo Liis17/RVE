@@ -64,7 +64,7 @@ TOML с таблицами `exposure`, `tonemapping`, `bloom`, `ambient_occlusio
 Проходы записываются в порядке `GpuPass` (`engine/engine-render/src/lib.rs`), для каждого вида отдельно.
 
 1. Clusters, ShadowDirectional, ShadowLocal — как раньше.
-2. DepthPrepass — только при включённом AO; непрозрачные меши рисуются с depth `LESS_OR_EQUAL`.
+2. DepthPrepass — при включённом AO или occlusion culling (см. [[Engine/EngineRender]]); после него непрозрачные меши рисуются с depth `LESS_OR_EQUAL`.
 3. AmbientOcclusion — GTAO compute на depth prepass, затем denoise. Каждый слайс проверяет горизонт в обе стороны от пикселя. Результат читается мешами во фрагментном шейдере (binding 8) и умножает indirect diffuse и specular. Маскированные и blend-меши AO не получают (define `NO_SCREEN_AO`). AO считается в полном разрешении render-цели при любом качестве: качество меняет число направлений и шагов.
 4. Opaque, Skybox, Transparent, Wireframe, Particles — как раньше.
 5. TemporalResolve — TAA, FSR или DLSS, если включены.
