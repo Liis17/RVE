@@ -1097,10 +1097,7 @@ impl WindowHandler for Sandbox {
 
     fn update(&mut self, window: &Window) -> bool {
         self.advance_resize_test(window);
-        if self.failure.is_some() {
-            return false;
-        }
-        true
+        self.failure.is_none()
     }
 
     fn exiting(&mut self) {
