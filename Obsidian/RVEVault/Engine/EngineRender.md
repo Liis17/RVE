@@ -10,7 +10,7 @@ Parent: [[Index]]
 
 | Файл | Значимый символ | Роль |
 |---|---|---|
-| `engine/engine-render/src/lib.rs`, `engine/engine-render/src/environment.rs` | `RendererConfig`, `Capabilities`, `DeviceReport`, `probe_devices`, `RenderError`, `FrameStatus`, `FrameOutcome`, `Renderer`, `EnvironmentSource`, `ProceduralSky`, `EnvironmentId`, `LocalLight`, `LocalLightShadow`, `LocalLightShadowMatrices`, `FrameCamera`, `FrameEnvironment`, `Frame`, ресурсы и UI-типы | Публичный контракт renderer, headless-проверка Vulkan-устройств, IBL и реализация Vulkan-пути |
+| `engine/engine-render/src/lib.rs` и модули из раздела «Структура модулей», `engine/engine-render/src/environment.rs` | `RendererConfig`, `Capabilities`, `DeviceReport`, `probe_devices`, `RenderError`, `FrameStatus`, `FrameOutcome`, `Renderer`, `EnvironmentSource`, `ProceduralSky`, `EnvironmentId`, `LocalLight`, `LocalLightShadow`, `LocalLightShadowMatrices`, `FrameCamera`, `FrameEnvironment`, `Frame`, ресурсы и UI-типы | Публичный контракт renderer, headless-проверка Vulkan-устройств, IBL и реализация Vulkan-пути |
 | engine/engine-render/src/surface_shader.rs | SurfaceShaderSource, compile_surface_shader | Runtime compile пользовательского surface GLSL в SPIR-V с naga и диагностикой строки исходника |
 | `engine/engine-render/src/culling.rs` | `LocalBounds`, `Frustum`, `back_to_front_order` | Pure math для frustum culling и стабильной сортировки blend draws по центру мирового AABB, без glam и GPU |
 | `engine/engine-render/src/occlusion.rs`, `engine/engine-render/shaders/hiz.comp`, `engine/engine-render/shaders/occlusion.comp` | `OcclusionPipelines`, `OcclusionTarget`, `hiz_mip_extents`, `pack_draw_inputs` | GPU two-phase occlusion culling вида: Hi-Z пирамида глубины, тест мировых AABB и indirect-аргументы draw'ов |
@@ -30,6 +30,23 @@ Parent: [[Index]]
 | `engine/engine-render/src/screen_shader.rs` | `compile_screen_shader`, `ScreenShaderStage`, `ScreenShaders`, `ScreenShaderPipelines`, `ScreenShaderScratch`, `record_screen_chain` | Пользовательские экранные шейдеры камеры: prelude, компиляция naga без GPU, проверка IR, push constants и проходы; см. [[Engine/EngineScreenShaders]] |
 | `engine/engine-render/Cargo.toml`, `engine/engine-render/build.rs` | feature `dlss`, `RVE_DLSS_SDK` | Windows x64 MSVC DLSS feature связывается с `nvsdk_ngx_s.lib`; runtime SDK DLL не хранится в репозитории |
 | `engine/engine-render/Cargo.toml` | `ash`, `libloading`, `engine-platform`, `raw-window-handle`, зависимость `naga` (шейдеры renderer при сборке, Surface GLSL и пользовательские экранные шейдеры во время работы) | Vulkan bindings, динамический FSR loader, платформенная интеграция, оконные handles без зависимости от winit и сборка шейдеров |
+
+## Структура модулей
+
+`lib.rs` содержит только объявления модулей, реэкспорт публичного API, константы, struct `Renderer` и его мелкие геттеры. Реализация `Renderer` разнесена по нескольким блокам `impl Renderer` в дочерних модулях; они видят приватные поля `Renderer`, потому что struct объявлен в корне крейта. Модули импортируют корень через `use crate::*;`, а корень подключает их glob-импортом: публичные типы — через `pub use`, внутренние — с видимостью `pub(crate)`.
+
+| Модуль | Содержимое |
+|---|---|
+| `types.rs`, `config.rs`, `error.rs`, `profile.rs` | Публичные типы кадра и сцены, `RendererConfig`/`Capabilities`/`DeviceReport`, `RenderError`, `GpuPass` и тайминги кадра |
+| `init.rs`, `teardown.rs` | `Renderer::new`, инициализация устройства и начальных ресурсов; `Drop` с порядком уничтожения Vulkan-объектов |
+| `physical_device.rs`, `swapchain.rs` | `probe_devices`, оценка и выбор устройства, расширения; формат поверхности, present mode, acquire и пересоздание swapchain |
+| `frame/` | Подготовка кадра, submit и present (`mod.rs`), кадр окна (`window.rs`), кадр viewport-сцен с UI (`viewports.rs`) |
+| `passes/` | Запись команд: общий `record_frame` и барьеры, проходы сцены и теней, draw batching, постобработка, temporal resolve и FSR/DLSS, overlay и UI |
+| `pipelines/` | Shader modules, pipeline cache и создание конвейеров сцены и экранных проходов |
+| `resources/` | Публичное API ресурсов (`api.rs`), буферы, изображения, staging-загрузка, дескрипторы, материалы, GPU-окружение, цели кадра и viewport |
+| `capture.rs`, `lights.rs`, `temporal_views.rs`, `validation.rs`, `math.rs` | Захват изображений, отбор локального света, история TAA/FSR/DLSS по видам, проверка входных данных и матричная арифметика |
+
+Тесты корня лежат в `tests.rs`, `fxaa_reference_tests.rs` и `capture/tests.rs`.
 
 ## Публичные контракты
 

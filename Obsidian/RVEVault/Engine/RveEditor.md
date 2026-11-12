@@ -24,6 +24,7 @@ Parent: [[Index]]
 | `editor/src/ui/preferences.rs` | `Preferences`, `show` | Окно Edit → Preferences… с настройками MCP-сервера |
 | `editor/src/autosave.rs` | `AutosaveStore` | Копии несохранённых сцен и их восстановление |
 | `editor/src/assets_fs.rs` | `AssetsDir` | Файловые операции в `Assets/` с проверкой путей |
+| `editor/src/asset_refs.rs` | `PathRemap`, `scan`, `rewrite_files` | Поиск и переписывание ссылок сцен, префабов и `prefabs.rveprefabs` при переименовании в Project |
 | `editor/src/asset_watch.rs` | `AssetWatcher`, `AssetChanges`, `ChangeBatch` | Watcher `Assets/`, классификация путей, debounce и выборочная обработка изменений |
 | `editor/src/play_network.rs` | `PlayNetwork`, `PlayNetworkForm`, `PlayNetworkPlan`, `PlayNetworkMode` | Сетевой Play: выбор Offline/Host/Client, проверка полей и мост к миру сессии |
 | `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` |
@@ -38,7 +39,7 @@ Parent: [[Index]]
 | `editor/src/play.rs` | `PlaySession`, `PlayPhysics`, `PlayAudio`, `HeavyLoads`, `Watchdog` | Копия мира, скрипты, per-Play physics thread, звуковой поток, фоновая загрузка тяжёлых префабов, прерывание зависшего Lua и мост анимации Play |
 | `editor/src/viewport/animation.rs` | `EditorAnimation`, `AnimationPreview`, `PreviewStatus`, `project_bridge`, `project_preview_bridge` | Мост превью выбранного аниматора, его настройки и сведения для инспектора; Play-мост строится через `project_bridge` |
 | `editor/src/play_cursor.rs` | `PlayCursor`, `play_cursor_captured`, `sync`, `focus_game_tab` | Захват курсора панелью Game во время Play и состояние, отправляемое в окно |
-| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
+| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `ImageLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
 | `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `scene_assets`, `project_prefabs`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
 | `editor/src/project_prefabs.rs` | `ProjectPrefabs` | Редактируемый список `prefabs.rveprefabs` подокна Project Prefabs: проверка правок, явное сохранение |
 
@@ -65,6 +66,10 @@ Parent: [[Index]]
 Окно работает в `RedrawMode::OnDemand`: кадр запрашивают события egui-winit, отложенный repaint egui через `WindowHandler::next_wakeup`, незавершённые превью и модели и пропущенный кадр. В Play вне паузы кадр запрашивается постоянно. Срок автосохранения тоже входит в `next_wakeup`, а копия пишется в `WindowHandler::update`, поэтому последняя правка перед простоем записывается без перерисовки. Вызовы MCP будят окно через `WindowProxy::wake`; пока `capture_view` активен, `next_wakeup` возвращает опрос каждые 16 мс (см. «MCP-сервер» ниже и [[Engine/EngineMcp]]).
 
 Модели FBX разбирает `ModelLoader` в потоке `rve-editor-models`, а загрузку готовой модели в GPU выполняет `SceneRenderer::sync_assets` на главном потоке; до готовности объект не рисуется и не выбирается, ошибка пишется в Console. Смена проекта перезапускает очередь с новым поколением, и результаты, начатые раньше, отбрасываются. Наведение камеры на новую модель (`pending_frame`) ждёт окончания её загрузки.
+
+Каждый запрос модели получает флаг отмены (`Assets::load_model_cancellable`, [[Engine/EngineAssets]]): перезагрузка модели во время разбора, изменение PNG или каталога (`stale_pending`) и смена проекта прерывают текущий разбор, и устаревшая модель запрашивается заново, а не доразбирается.
+
+PNG-текстуры сцены и материалов и HDR environments декодирует `ImageLoader` (`editor/src/viewport/image_loader.rs`) в потоке `rve-editor-images`; `SceneRenderer` владеет им и перезапускает при смене корня проекта. Главный поток только создаёт GPU-ресурс в `accept_images` (в начале `sync_assets` и при запросе текстуры). Пока PNG декодируется, материал рисуется без неё; готовая текстура повышает ревизию и пересобирает материалы. Пока декодируется HDR, остаётся прежнее окружение или окружение по умолчанию, ошибка «источник недоступен» не пишется. Первая загрузка и перезагрузка после изменения файла идут одним путём: ошибка сохраняет прежний ресурс. Ожидающие изображения будят окно так же, как модели.
 
 ## Автообновление ресурсов
 
@@ -275,6 +280,16 @@ Play передаёт хосту включённые сцены проекта 
 
 **Undo и файлы.** Create Prefab и Apply to Prefab пишут файлы вне истории сцены: undo возвращает сцену, но файл префаба остаётся.
 
+## Ссылки при переименовании и удалении
+
+Rename и Delete в Project (`ui/project_panel.rs`) при открытии диалога ищут ссылки на файл или папку (`asset_refs::scan`): во всех `.rvescene` и `.rveprefab` из `Assets/`, в `prefabs.rveprefabs` и в несохранённых правках открытой сцены и списка Project Prefabs. Ссылка — любое строковое значение TOML, равное virtual path файла или начинающееся с пути папки и `/`. Нечитаемые файлы пропускаются с предупреждением в Console.
+
+- Rename показывает список и флажок «Обновить ссылки» (включён, если ссылки есть). После переименования файлы переписываются через `toml_edit`: меняются только строки путей, комментарии и форматирование сохраняются. Результат проходит разбор документа; файл, не прошедший проверку (например, модель переименована в `.png`), не меняется, ошибка пишется в Console. Записи атомарные; файлы вне истории undo.
+- Открытая сцена получает те же замены отдельным шагом undo (`EditorScene::remap_asset_paths`). Если её файл на диске тоже переписан, сцена без несохранённых правок остаётся сохранённой. Список Project Prefabs обновляется в памяти так же.
+- Путь открытой сцены переносится при переименовании её файла или папки независимо от флажка (`EditorScene::follow_rename`).
+- Delete показывает тот же список с предупреждением: ссылки после удаления остаются битыми.
+- MCP-инструменты `rename_asset` и `delete_asset` ссылки не обновляют. Ссылки в `.rvemat`, `.rveui` и других форматах не ищутся.
+
 ## New Project
 
 File → New Project… принимает имя проекта и родительскую папку, выбранную через системный picker. Папка сохраняет введённое имя; отдельный `ProjectSettings.id` нормализуется. Существующая папка не перезаписывается, итоговый путь показан в диалоге. Генератор записывает встроенные UTF-8 шаблоны и модель cube из sibling staging-каталога, затем публикует папку атомарным no-replace rename. После генерации `OpenProjectAt` идёт через обычную проверку несохранённых изменений. `project.rveproject` задаёт `heavy_scripts = "Scripts"` и включённую `/scenes/main.rvescene`; шаблон содержит камеру, directional light, FBX cube, Lua Jump с Inspector-параметрами height/duration и Rust Orbit cdylib со схемой radius/height/speed. `.rve/` исключена в шаблонном `.gitignore`.
@@ -322,7 +337,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 
 Редактор запускает локальный MCP-сервер ([[Engine/EngineMcp]]) для агентов: он читает ассеты, файлы, сцену и лог, правит сцену и ассеты, управляет Play и сборкой и делает скриншоты. Сервер живёт вместе с редактором и не зависит от открытого проекта.
 
-**Настройки.** Edit → Preferences… → «MCP Server» (`editor/src/ui/preferences.rs`): вкл/выкл, порт (1024–65535, по умолчанию 47615), статус, токен (скрыт; кнопки Copy и Regenerate), флажки прав «Edit scene», «Write assets», «Control Play», «Build» и кнопка «Copy connection command» (`claude mcp add --transport http rve-editor http://127.0.0.1:<порт>/mcp --header "Authorization: Bearer <токен>"`). Изменения применяются по Apply и сохраняются в поле `mcp` файла `settings.json` пользователя (`McpSettings` в `editor/src/settings.rs`). Токен создаётся при первом включении. Regenerate заменяет токен в черновике; новый токен действует после Apply, и клиенты со старым получают 401. Право Read всегда доступно; остальные выключены по умолчанию.
+**Настройки.** Edit → Preferences… → «MCP Server» (`editor/src/ui/preferences.rs`): вкл/выкл, порт (1024–65535, по умолчанию 47615), статус, токен (скрыт; кнопки Copy и Regenerate), флажки прав «Edit scene», «Write assets», «Control Play», «Build» и кнопка «Copy connection command» (`claude mcp add --transport http rve-editor http://127.0.0.1:<порт>/mcp --header "Authorization: Bearer <токен>"`). Изменения применяются по Apply и сохраняются в поле `mcp` файла `settings.json` пользователя (`McpSettings` в `editor/src/settings.rs`). Токен создаётся при первом включении. В файл пишется только `token_hash`; открытый токен живёт в памяти до конца сеанса, только пока его можно скопировать (Copy и «Copy connection command»). После перезапуска подключённые клиенты продолжают работать со своим токеном, а для нового клиента нужен Regenerate. Токен можно ввести вручную: по Apply сохраняется его хеш. Старый `settings.json` с открытым полем `token` при чтении переводится в хеш, и следующая запись поле удаляет. Regenerate заменяет токен в черновике; новый токен действует после Apply, и клиенты со старым получают 401. Право Read всегда доступно; остальные выключены по умолчанию.
 
 **Флаг `--mcp`.** Включает сервер на этот запуск. В памяти `mcp.enabled` становится `true`, но при записи `settings.json` записывается сохранённое значение. Apply в Preferences сохраняет выбранное пользователем значение `enabled`, даже при `--mcp`.
 
@@ -363,7 +378,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - Иначе используется offscreen-режим. Создаётся один offscreen viewport с камерой редактора (`scene`), игровой камерой (`game`) или камерой объекта. Размер по умолчанию — последний размер панели, а при его отсутствии 1280×720. Кадр рисуется `warmup_frames` раз (первый с `reset_history`), затем запрашивается readback. Такой кадр строится, даже если обе панели скрыты.
 - `SceneRenderer` (`editor/src/viewport/render.rs`) строит для capture-камеры отдельный третий список отрисовки: отсечение и LOD считаются по её позиции. Материалы берутся из тех же ресурсов кадра (`.rvemat`/`.rveshader` и материалы объектов), что и панели. Для вида `scene` применяются постобработка и DebugView панели Scene, сетка не добавляется. Экранные шейдеры берутся так же, как у панелей: объект-камера — свои, Game — шейдеры Game-камеры, Scene их не применяет.
 - Задача живёт в `EditorState` до готового кадра. Пока она активна, `update` запрашивает redraw, а `next_wakeup` возвращает опрос каждые 16 мс. Ответ — PNG, кодируемый на главном потоке, и JSON с полями `view`, `source` (`panel` или `offscreen`), `camera`, `width`, `height` и `warmup_frames` (для offscreen).
-- Срок ожидания — 10 с. Задача также отменяется при смене поколения, остановке сервера или закрытии редактора, а также когда вызов уже брошен (`is_abandoned`). Отключение клиента этим не определяется (см. [[Engine/EngineMcp]]). Отмена вызывает `cancel_capture` и освобождает offscreen viewport, клиент получает `isError` с причиной.
+- Срок ожидания — 10 с. Задача также отменяется при смене поколения, остановке сервера или закрытии редактора, а также когда вызов уже брошен (`is_abandoned`). Отключение клиента и `notifications/cancelled` тоже делают вызов брошенным (см. [[Engine/EngineMcp]]). Отмена вызывает `cancel_capture` и освобождает offscreen viewport, клиент получает `isError` с причиной.
 
 **Ограничения MCP.**
 
@@ -371,7 +386,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - Readback и кодирование PNG выполняются на главном потоке и могут задерживать UI на большом разрешении.
 - Свёрнутое окно не получает кадров (`FrameStatus::Skipped`), поэтому захват не завершается и заканчивается ошибкой по 10-секундному сроку.
 - Возможный риск: offscreen-кадр может не успеть стабилизировать auto-exposure и TAA за `warmup_frames`. Панельный захват этого не требует.
-- Токен хранится в `settings.json` открытым текстом. Права Assets и Build открывают внешние пути (см. политику путей).
+- Права Assets и Build открывают внешние пути (см. политику путей).
 - `read_text_file` читает UTF-8 текст размером до 1 МиБ.
 
 ## Ограничения
@@ -379,9 +394,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - Захват курсора в Game и raw-дельта на Windows не проверены вручную; на macOS проверка требует запуска редактора с Play и Cmd+Tab.
 - Закрытые панели возвращает меню Window; Reset Layout возвращает раскладку по умолчанию.
 - Несохранённый список Project Prefabs учитывается в окне несохранённых изменений наравне со сценой: Save сохраняет и список, Discard его отбрасывает. Список сбрасывается при открытии другого проекта и при Reload; Play читает `prefabs.rveprefabs` с диска при старте, поэтому несохранённые правки в него не попадают.
-- Переименование и удаление файла в Project не обновляют ссылки в сценах, включая префабы.
 - Edit-world кэшируется по revision сцены. Если `.camerasettings` отсутствует или невалиден, редактор сообщает ошибку один раз за revision сцены и использует последнюю валидную версию, если она есть; иначе остаются defaults. Play и runtime продолжают считать такую ошибку фатальной.
-- Текстуры PNG сцены и HDR environments загружаются синхронно при первом появлении, модели FBX и превью PNG/HDR — в фоне. Начатый разбор FBX нельзя прервать; после изменения файла устаревший результат отбрасывается и модель запрашивается снова.
 - Автосохранение работает в цикле кадра, но во время Play документ не меняется, а перед Play копия записывается, поэтому зависший скрипт не теряет правки.
 - Ctrl+C в терминале не закрывает редактор (`engine_platform::ignore_console_interrupt`).
 - Egui смешивает цвета в гамма-пространстве; при sRGB swapchain смешивание идёт в линейном, поэтому полупрозрачные элементы выглядят немного иначе, чем в типичных приложениях egui.

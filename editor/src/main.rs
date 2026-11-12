@@ -3,6 +3,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod asset_refs;
 mod asset_watch;
 mod assets_fs;
 mod autosave;

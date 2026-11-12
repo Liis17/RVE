@@ -1,5 +1,6 @@
 //! Панель Project: файловый менеджер каталога `Assets/`.
 
+use crate::asset_refs::{self, PathRemap, Reference, ReferenceSource};
 use crate::assets_fs::{AssetEntry, AssetKind};
 use crate::icons::{file_icon, folder_icon};
 use crate::state::{Action, AssetDrag, EditorState};
@@ -11,13 +12,34 @@ const TILE_SIZE: f32 = 88.0;
 /// Открытый диалог файловой операции.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectDialog {
-    NewFolder { name: String },
-    NewUi { name: String },
-    Rename { path: String, name: String },
-    Delete { path: String, is_dir: bool },
-    NewPhysicsMaterial { name: String },
-    NewMaterial { folder: String, name: String },
-    NewShader { folder: String, name: String },
+    NewFolder {
+        name: String,
+    },
+    NewUi {
+        name: String,
+    },
+    Rename {
+        path: String,
+        name: String,
+        references: AssetReferences,
+        update_references: bool,
+    },
+    Delete {
+        path: String,
+        is_dir: bool,
+        references: AssetReferences,
+    },
+    NewPhysicsMaterial {
+        name: String,
+    },
+    NewMaterial {
+        folder: String,
+        name: String,
+    },
+    NewShader {
+        folder: String,
+        name: String,
+    },
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -337,15 +359,20 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
         create_menu(ui, state, create_target(Some(entry), &state.current_folder));
         ui.separator();
         if ui.button("Rename").clicked() {
+            let references = find_references(state, &entry.path);
             state.project_dialog = Some(ProjectDialog::Rename {
                 path: entry.path.clone(),
                 name: entry.name.clone(),
+                update_references: !references.is_empty(),
+                references,
             });
         }
         if ui.button("Delete").clicked() {
+            let references = find_references(state, &entry.path);
             state.project_dialog = Some(ProjectDialog::Delete {
                 path: entry.path.clone(),
                 is_dir: entry.is_dir,
+                references,
             });
         }
     });
@@ -414,12 +441,31 @@ pub fn show_dialog(ctx: &egui::Context, state: &mut EditorState) {
                 ui.heading("New Shader");
                 ui.text_edit_singleline(name).request_focus();
             }
-            ProjectDialog::Rename { name, .. } => {
+            ProjectDialog::Rename {
+                name,
+                references,
+                update_references,
+                ..
+            } => {
                 ui.heading("Rename");
                 ui.text_edit_singleline(name).request_focus();
-                ui.label("Ссылки в сценах на старый путь не обновляются.");
+                if !references.is_empty() {
+                    ui.add_space(4.0);
+                    ui.checkbox(update_references, "Обновить ссылки в файлах:");
+                    show_references(ui, references);
+                    if !*update_references {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "Ссылки останутся на старый путь и перестанут загружаться.",
+                        );
+                    }
+                }
             }
-            ProjectDialog::Delete { path, is_dir } => {
+            ProjectDialog::Delete {
+                path,
+                is_dir,
+                references,
+            } => {
                 ui.heading("Delete");
                 let what = if *is_dir {
                     "папку с содержимым"
@@ -427,6 +473,14 @@ pub fn show_dialog(ctx: &egui::Context, state: &mut EditorState) {
                     "файл"
                 };
                 ui.label(format!("Удалить {what} {path}? Это действие необратимо."));
+                if !references.is_empty() {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "На него ссылаются файлы; после удаления ссылки останутся битыми:",
+                    );
+                    show_references(ui, references);
+                }
             }
         }
         ui.add_space(8.0);
@@ -504,14 +558,25 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
         }
         return;
     }
-    let assets = &project.assets_dir;
+    let assets = project.assets_dir.clone();
     let result = match dialog {
         ProjectDialog::NewFolder { name } => assets
             .create_folder(&state.current_folder, name)
             .map(|path| format!("Создана папка {path}")),
-        ProjectDialog::Rename { path, name } => assets
-            .rename(path, name)
-            .map(|target| format!("{path} переименован в {target}")),
+        ProjectDialog::Rename {
+            path,
+            name,
+            references,
+            update_references,
+        } => match assets.rename(path, name) {
+            Ok(target) => {
+                let message = format!("{path} переименован в {target}");
+                let remap = PathRemap::new(path, &target);
+                follow_rename(state, &remap, references, *update_references);
+                Ok(message)
+            }
+            Err(error) => Err(error),
+        },
         ProjectDialog::NewPhysicsMaterial { .. } | ProjectDialog::NewUi { .. } => return,
         ProjectDialog::NewMaterial { .. } | ProjectDialog::NewShader { .. } => return,
         ProjectDialog::Delete { path, .. } => {
@@ -524,6 +589,117 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
             state.action(Action::RefreshTree);
         }
         Err(error) => state.log.error(error.to_string()),
+    }
+}
+
+/// Файлы, ссылающиеся на ресурс, который переименовывают или удаляют.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AssetReferences {
+    /// Сцены, префабы и `prefabs.rveprefabs` на диске.
+    pub files: Vec<Reference>,
+    /// Открытые документы, у которых ссылки есть только в несохранённых правках.
+    pub unsaved: Vec<String>,
+}
+
+impl AssetReferences {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.unsaved.is_empty()
+    }
+}
+
+/// Ищет ссылки на `path` в файлах проекта и в несохранённых открытых документах.
+pub fn find_references(state: &mut EditorState, path: &str) -> AssetReferences {
+    let Some(project) = state.project.as_ref() else {
+        return AssetReferences::default();
+    };
+    let remap = PathRemap::new(path, path);
+    let scan = asset_refs::scan(&project.root, &project.assets_dir, &remap);
+    for error in scan.errors {
+        state
+            .log
+            .warn(format!("Поиск ссылок на {path}: не прочитан {error}"));
+    }
+    let on_disk = |source: &ReferenceSource| scan.references.iter().any(|r| &r.source == source);
+    let mut unsaved = Vec::new();
+    if let Some(scene) = state.scene.as_ref().filter(|scene| scene.is_dirty())
+        && scene.count_asset_references(&remap) > 0
+    {
+        let source = scene
+            .path()
+            .map(|path| ReferenceSource::Asset(path.as_str().to_owned()));
+        if !source.as_ref().is_some_and(on_disk) {
+            unsaved.push(source.map_or("Untitled".to_owned(), |source| source.to_string()));
+        }
+    }
+    if let Some(prefabs) = state
+        .project_prefabs
+        .as_ref()
+        .filter(|list| list.is_dirty())
+        && prefabs.count_references(&remap) > 0
+        && !on_disk(&ReferenceSource::ProjectPrefabs)
+    {
+        unsaved.push(ReferenceSource::ProjectPrefabs.to_string());
+    }
+    AssetReferences {
+        files: scan.references,
+        unsaved,
+    }
+}
+
+fn show_references(ui: &mut egui::Ui, references: &AssetReferences) {
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for reference in &references.files {
+                ui.label(format!("{} — {}", reference.source, reference.count));
+            }
+            for label in &references.unsaved {
+                ui.label(format!("{label} — несохранённые правки"));
+            }
+        });
+}
+
+/// После переименования переписывает ссылки в файлах и открытых документах и переносит путь
+/// открытой сцены, если переименован её файл или папка.
+fn follow_rename(
+    state: &mut EditorState,
+    remap: &PathRemap,
+    references: &AssetReferences,
+    update_references: bool,
+) {
+    let mut written = Vec::new();
+    if update_references && let Some(project) = state.project.as_ref() {
+        let (files, errors) =
+            asset_refs::rewrite_files(&project.root, &project.assets_dir, &references.files, remap);
+        for error in errors {
+            state.log.error(format!("Ссылки не обновлены: {error}"));
+        }
+        if !files.is_empty() {
+            let list = files
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            state.log.info(format!("Обновлены ссылки: {list}"));
+        }
+        written = files;
+    }
+    if let Some(scene) = state.scene.as_mut() {
+        scene.follow_rename(remap);
+        if update_references {
+            let on_disk = scene.path().is_some_and(|path| {
+                written.contains(&ReferenceSource::Asset(path.as_str().to_owned()))
+            });
+            if let Err(error) = scene.remap_asset_paths(remap, on_disk) {
+                state
+                    .log
+                    .error(format!("Ссылки открытой сцены не обновлены: {error}"));
+            }
+        }
+    }
+    if update_references && let Some(prefabs) = state.project_prefabs.as_mut() {
+        prefabs.remap_paths(remap, written.contains(&ReferenceSource::ProjectPrefabs));
     }
 }
 

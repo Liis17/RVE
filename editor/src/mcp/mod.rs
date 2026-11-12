@@ -50,12 +50,12 @@ pub struct McpHost {
 struct ListenerKey {
     enabled: bool,
     port: u16,
-    token: String,
+    token_hash: String,
 }
 
 struct PendingBind {
     port: u16,
-    token: String,
+    token_hash: String,
     permissions: Permissions,
     generation: u64,
     expires_at: Instant,
@@ -88,7 +88,7 @@ impl McpHost {
         let key = ListenerKey {
             enabled: settings.enabled,
             port: settings.port,
-            token: settings.token.clone(),
+            token_hash: settings.token_hash.clone(),
         };
         let permissions = settings.engine_permissions();
         if self.last_listener.as_ref() != Some(&key) {
@@ -104,7 +104,7 @@ impl McpHost {
                 self.fail("MCP port must be between 1024 and 65535".to_owned(), log);
                 return;
             }
-            if settings.token.is_empty() {
+            if settings.token_hash.is_empty() {
                 self.fail("MCP token is empty".to_owned(), log);
                 return;
             }
@@ -112,7 +112,7 @@ impl McpHost {
             self.try_start(
                 PendingBind {
                     port: settings.port,
-                    token: settings.token.clone(),
+                    token_hash: settings.token_hash.clone(),
                     permissions,
                     generation,
                     expires_at: now + REBIND_RETRY_WINDOW,
@@ -224,7 +224,7 @@ impl McpHost {
         };
         let config = McpConfig {
             port: pending.port,
-            token: pending.token.clone(),
+            token_hash: pending.token_hash.clone(),
             permissions: pending.permissions,
             tools: tool_specs(),
         };
@@ -776,7 +776,7 @@ mod tests {
         crate::settings::McpSettings {
             enabled: true,
             port,
-            token: token.to_owned(),
+            token_hash: engine_mcp::token_hash(token),
             ..Default::default()
         }
     }
@@ -811,7 +811,7 @@ mod tests {
 
         settings.port = 47616;
         assert_eq!(apply_and_count_starts(&mut host, &settings), 1);
-        settings.token = "other".to_owned();
+        settings.token_hash = engine_mcp::token_hash("other");
         assert_eq!(apply_and_count_starts(&mut host, &settings), 1);
 
         settings.enabled = false;

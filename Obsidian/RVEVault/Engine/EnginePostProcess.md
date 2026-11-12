@@ -17,9 +17,9 @@ Parent: [[Index]]
 | `engine/engine-scene/src/world.rs` | `World::post_process`, `World::set_post_process` | Постобработка на каждой камере мира, `SceneFrame` берёт её у активной |
 | `engine/engine-render/src/post.rs` | `PostProcess`, `ColorLutId`, `PostPlan`, `plan`, `PostFrame`, `CompositeParams`, `ao_resolution`, `planned_color_lut` | Публичный renderer-native контракт, план проходов и параметры composite |
 | `engine/engine-render/src/bloom.rs`, `exposure.rs`, `filters.rs`, `ambient_occlusion.rs`, `color_lut.rs` | `BloomChain`, `ExposureResources`, `ExposureHistory`, `ExposureTarget`, `FilterScratch`, `AoTarget`, `validate_color_lut` | Vulkan-ресурсы и запись проходов; состояние экспозиции вида — в `exposure.rs` |
-| `engine/engine-render/src/lib.rs` | `ViewSettings::post`, `Renderer::create_color_lut`, `Renderer::destroy_color_lut`, `GpuPass`, `record_tonemap_pass`, `write_upscaler_exposure` | Вызов проходов в кадре вида, LUT и экспозиция FSR/DLSS |
+| `engine/engine-render/src/types.rs`, `engine/engine-render/src/resources/api.rs`, `engine/engine-render/src/profile.rs`, `engine/engine-render/src/passes/postprocess.rs`, `engine/engine-render/src/passes/upscale.rs` | `ViewSettings::post`, `Renderer::create_color_lut`, `Renderer::destroy_color_lut`, `GpuPass`, `record_tonemap_pass`, `write_upscaler_exposure` | Вызов проходов в кадре вида, LUT и экспозиция FSR/DLSS |
 | `engine/engine-render/shaders/` | `tonemap.frag`, `output.frag`, `bloom_*.frag`, `motion_blur.frag`, `dof.frag`, `gtao.comp`, `gtao_denoise.comp`, `exposure_histogram.wgsl`, `exposure_average.comp` | Шейдеры; `build.rs` компилирует GLSL и WGSL через naga |
-| `engine/engine-runtime/src/scene.rs`, `engine/engine-runtime/src/pipeline.rs`, `engine/engine-runtime/src/scene_switch.rs` | `resolve_post_process`, `render_post_process`, `load_color_luts`, `upload_color_luts`, `GpuSceneTable::color_luts` | Загрузка `.postprocess` на камеру с кэшем, LUT сцены и маппинг в `PostProcess` |
+| `engine/engine-runtime/src/scene.rs`, `engine/engine-runtime/src/pipeline/snapshot.rs`, `engine/engine-runtime/src/scene_switch.rs` | `resolve_post_process`, `render_post_process`, `load_color_luts`, `upload_color_luts`, `GpuSceneTable::color_luts` | Загрузка `.postprocess` на камеру с кэшем, LUT сцены и маппинг в `PostProcess` |
 | `engine/rve-sdk/src/abi.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/transaction.rs` | `RvePostProcessSettings`, `host_get_post_process`, `host_set_post_process` | Script ABI 12 и Lua API |
 | `tools/rve-build/src/project.rs` | ветки `postprocess` и `cube` | Проверка файла и его LUT при сборке релиза |
 | `editor/src/viewport/render.rs`, `editor/src/ui/inspector.rs`, `editor/src/project.rs` | `render_post_process`, `SceneRenderer::sync_color_lut`, `show_post_process_editor` | Маппинг в редакторе, LUT, панель камеры и предпросмотр файла |
@@ -68,7 +68,7 @@ TOML с таблицами `exposure`, `tonemapping`, `bloom`, `ambient_occlusio
 
 ## Порядок проходов
 
-Проходы записываются в порядке `GpuPass` (`engine/engine-render/src/lib.rs`), для каждого вида отдельно.
+Проходы записываются в порядке `GpuPass` (`engine/engine-render/src/profile.rs`), для каждого вида отдельно.
 
 1. Clusters, ShadowDirectional, ShadowLocal — как раньше.
 2. DepthPrepass — при включённом AO или occlusion culling (см. [[Engine/EngineRender]]); после него непрозрачные меши рисуются с depth `LESS_OR_EQUAL`.
@@ -100,7 +100,7 @@ TOML с таблицами `exposure`, `tonemapping`, `bloom`, `ambient_occlusio
 ## Решения и основания
 
 - Renderer не зависит от `engine-scene`: у него свой `PostProcess` в `ViewSettings`, маппинг делают runtime, редактор и sandbox. Это совпадает с тем, как `CameraSettings` уже переводятся в `ViewSettings`.
-- Маппинг `PostProcessSettings → PostProcess` продублирован: `render_post_process` в `engine-runtime` (`pipeline.rs`), функция в `sandbox` и `render_post_process` в редакторе (`viewport/render.rs`). Общей функции нет по границам зависимостей: sandbox и редактор не зависят от `engine-runtime`, а `engine-render` не может зависеть от `engine-scene`. Редактор добавляет оверрайд Scene-вида для DoF и motion blur, поэтому его копия отличается.
+- Маппинг `PostProcessSettings → PostProcess` продублирован: `render_post_process` в `engine-runtime` (`pipeline/snapshot.rs`), функция в `sandbox` и `render_post_process` в редакторе (`viewport/render.rs`). Общей функции нет по границам зависимостей: sandbox и редактор не зависят от `engine-runtime`, а `engine-render` не может зависеть от `engine-scene`. Редактор добавляет оверрайд Scene-вида для DoF и motion blur, поэтому его копия отличается.
 - Адаптация экспозиции хранится на виде, а не на кадровом слоте: при двух кадрах в полёте слоты разделяли бы адаптацию. Порядок между адаптациями кадров одного вида задают барьеры без семафоров: первая область синхронизации `vkCmdPipelineBarrier2` охватывает команды, отправленные раньше на ту же очередь (Khronos registry: `vkCmdPipelineBarrier2`, вне render pass). Условие — все submit renderer идут через одну очередь (`self.queue`, `get_device_queue(family, 0)`). Если появится вторая очередь, этот механизм нужно пересмотреть.
 - Гистограмма экспозиции считается до temporal resolve на всех путях, а не только для FSR/DLSS: FSR и DLSS получают экспозицию текущего кадра, а все пути сглаживания замеряют одно и то же изображение. Цена решения (подтверждено пользователем): экранные шейдеры `before_post` и motion blur/DoF не влияют на замер.
 - После resize и паузы адаптация продолжается с прежним шагом, а не делает snap (решение пользователя): содержимое кадра после resize почти не меняется, а интервал простоя до 1 с иначе превращал первый кадр в скачок экспозиции.
