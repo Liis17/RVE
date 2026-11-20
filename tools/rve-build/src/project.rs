@@ -1,4 +1,5 @@
 use crate::error::BuildError;
+use crate::trace::{ArchiveReason, BuildTrace};
 use engine_assets::{AssetError, Assets};
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
 use engine_gui::document::UiDocument;
@@ -60,7 +61,7 @@ pub(crate) struct ScriptReferenceContext {
 }
 
 /// Владелец ассета: включённая сцена или тяжёлый префаб из `prefabs.rveprefabs`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Owner {
     Scene(usize),
     HeavyPrefab(VirtualPath),
@@ -96,6 +97,22 @@ struct EnabledScene {
 }
 
 pub(crate) fn prepare_project(project_dir: &Path) -> Result<ProjectBuild, BuildError> {
+    prepare_project_with_trace(project_dir, None)
+}
+
+/// Как [`prepare_project`], но дополнительно собирает трассу ссылок и причин архивов для `explain`.
+pub(crate) fn prepare_project_traced(
+    project_dir: &Path,
+) -> Result<(ProjectBuild, BuildTrace), BuildError> {
+    let mut trace = BuildTrace::default();
+    let project = prepare_project_with_trace(project_dir, Some(&mut trace))?;
+    Ok((project, trace))
+}
+
+fn prepare_project_with_trace(
+    project_dir: &Path,
+    trace: Option<&mut BuildTrace>,
+) -> Result<ProjectBuild, BuildError> {
     let project_dir = fs::canonicalize(project_dir).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             BuildError::input(format!(
@@ -138,12 +155,11 @@ pub(crate) fn prepare_project(project_dir: &Path) -> Result<ProjectBuild, BuildE
     .map_err(|error| resource_error("не удалось открыть Assets", error))?;
     let result = prepare_with_resources(
         project_dir,
-        assets_dir,
-        bootstrap_path,
         settings,
         prefabs,
         bootstrap,
         &mut resources,
+        trace,
     );
     let shutdown = resources.shutdown().map_err(|error| {
         BuildError::operational(format!("не удалось остановить ResourceSystem: {error}"))
@@ -157,13 +173,14 @@ pub(crate) fn prepare_project(project_dir: &Path) -> Result<ProjectBuild, BuildE
 
 fn prepare_with_resources(
     project_dir: PathBuf,
-    assets_dir: PathBuf,
-    bootstrap_path: PathBuf,
     settings: ProjectSettings,
     prefabs: PrefabCatalogFile,
     bootstrap: BootstrapConfig,
     resources: &mut ResourceSystem,
+    mut trace: Option<&mut BuildTrace>,
 ) -> Result<ProjectBuild, BuildError> {
+    let assets_dir = project_dir.join("Assets");
+    let bootstrap_path = project_dir.join("bootstrap.rves");
     let handle = resources.handle();
     let assets = Assets::with_resources(handle.clone());
     let sources = AssetSources {
@@ -195,10 +212,22 @@ fn prepare_with_resources(
         })?;
         let document = SceneDocument::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
+        let scene_index = enabled_scenes.len();
+        let owner = Owner::Scene(scene_index);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.add_root(owner.clone(), path.clone());
+            trace.record_document(&owner, &path, &document);
+        }
         // Зависимости, скрипты и параметры берутся из раскрытого документа: префабы
         // приносят свои `[[assets]]` и объекты.
-        let expansion = expand(&document, &mut |prefab| load_prefab(&handle, prefab))
-            .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
+        let expansion = expand(&document, &mut |prefab: &VirtualPath| {
+            let loaded = load_prefab(&handle, prefab)?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.record_document(&owner, prefab, &loaded);
+            }
+            Ok(loaded)
+        })
+        .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
         let document = expansion.document;
         validate_lite_params(
             &document.objects,
@@ -226,30 +255,50 @@ fn prepare_with_resources(
             })
         }));
         let mut scene_assets = document.assets.clone();
+        let unused_prefabs = document
+            .assets
+            .iter()
+            .filter(|asset| extension_is(asset.path.as_str(), "rveprefab"))
+            .filter(|asset| !expansion.prefabs.contains(&asset.path))
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>();
         scene_assets.extend(unused_prefab_assets(
             &path,
-            &document.assets,
-            &expansion.prefabs,
+            &unused_prefabs,
             &handle,
             &mut lite_schemas,
             &mut heavy_scripts,
+            &owner,
+            trace.as_deref_mut(),
         )?);
 
         base_paths.insert(path.clone());
-        let scene_index = enabled_scenes.len();
         enabled_scenes.push(EnabledScene {
             path: path.clone(),
             stem,
         });
-        let owner = Owner::Scene(scene_index);
 
         // Файлы префабов, раскрытых сценой, учитываются как её ресурсы; для них не нужна
         // запись `[[assets]]`.
         for prefab in &expansion.prefabs {
-            record_asset(&mut usages, &sources, prefab, &owner, None)?;
+            record_asset(
+                &mut usages,
+                &sources,
+                prefab,
+                &owner,
+                None,
+                trace.as_deref_mut(),
+            )?;
         }
         for asset in scene_assets {
-            record_asset(&mut usages, &sources, &asset.path, &owner, None)?;
+            record_asset(
+                &mut usages,
+                &sources,
+                &asset.path,
+                &owner,
+                None,
+                trace.as_deref_mut(),
+            )?;
             if let Some(archive) = asset.archive {
                 add_explicit_archive(&mut usages, &asset.path, &owner, archive);
             }
@@ -266,12 +315,17 @@ fn prepare_with_resources(
             ))
         })?;
         let owner = Owner::HeavyPrefab(path.clone());
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.add_root(owner.clone(), path.clone());
+        }
         let template = load_spawn_template(
             &path,
             &format!("префаб /{path}"),
             &handle,
             &mut lite_schemas,
             &mut heavy_scripts,
+            &owner,
+            trace.as_deref_mut(),
         )?;
         template.check_spawnable().map_err(|error| {
             BuildError::input(format!("тяжёлый префаб /{path} нельзя заспавнить: {error}"))
@@ -283,6 +337,7 @@ fn prepare_with_resources(
                 &asset.path,
                 &owner,
                 entry.archive.as_deref(),
+                trace.as_deref_mut(),
             )?;
             if let Some(archive) = &asset.archive {
                 add_explicit_archive(&mut usages, &asset.path, &owner, archive.clone());
@@ -308,6 +363,9 @@ fn prepare_with_resources(
         require_asset_file(&assets_dir, icon_path)?;
         base_paths.insert(icon_path.clone());
     }
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.icon = icon.clone();
+    }
 
     let files = usages
         .keys()
@@ -316,7 +374,11 @@ fn prepare_with_resources(
         .into_iter()
         .map(|path| Ok((path.clone(), require_asset_file(&assets_dir, path)?)))
         .collect::<Result<BTreeMap<_, _>, BuildError>>()?;
-    let assignments = assign_archives(&enabled_scenes, &usages, &base_paths, icon.as_ref())?;
+    let (assignments, reasons) =
+        assign_archives(&enabled_scenes, &usages, &base_paths, icon.as_ref())?;
+    if let Some(trace) = trace {
+        trace.reasons = reasons;
+    }
     let archives = archive_order(&assignments);
 
     validate_heavy_scripts_configured(&settings, &heavy_scripts)?;
@@ -340,26 +402,23 @@ fn prepare_with_resources(
 /// ресурсы шаблона, включая вложенные префабы.
 fn unused_prefab_assets(
     scene: &VirtualPath,
-    assets: &[SceneAsset],
-    instanced: &[VirtualPath],
+    unused: &[VirtualPath],
     handle: &ResourceHandle,
     schemas: &mut BTreeMap<VirtualPath, Option<ParamSchema>>,
     heavy_scripts: &mut Vec<HeavyScriptUse>,
+    owner: &Owner,
+    mut trace: Option<&mut BuildTrace>,
 ) -> Result<Vec<SceneAsset>, BuildError> {
     let mut extra = Vec::new();
-    for asset in assets
-        .iter()
-        .filter(|asset| extension_is(asset.path.as_str(), "rveprefab"))
-    {
-        if instanced.contains(&asset.path) {
-            continue;
-        }
+    for path in unused {
         let template = load_spawn_template(
-            &asset.path,
+            path,
             &format!("сцена /{scene}"),
             handle,
             schemas,
             heavy_scripts,
+            owner,
+            trace.as_deref_mut(),
         )?;
         extra.extend(template.assets().iter().cloned());
     }
@@ -374,11 +433,20 @@ fn load_spawn_template(
     handle: &ResourceHandle,
     schemas: &mut BTreeMap<VirtualPath, Option<ParamSchema>>,
     heavy_scripts: &mut Vec<HeavyScriptUse>,
+    trace_owner: &Owner,
+    mut trace: Option<&mut BuildTrace>,
 ) -> Result<PrefabTemplate, BuildError> {
-    let template = PrefabTemplate::load(path, &mut |child: &VirtualPath| {
-        read_prefab_text(handle, child)
-    })
-    .map_err(|error| BuildError::input(format!("ошибка префаба /{path}: {error}")))?;
+    let template =
+        PrefabTemplate::load(path, &mut |child: &VirtualPath| -> Result<String, String> {
+            let text = read_prefab_text(handle, child)?;
+            if let Some(trace) = trace.as_deref_mut()
+                && let Ok(document) = SceneDocument::parse_prefab(format!("/{child}"), &text)
+            {
+                trace.record_document(trace_owner, child, &document);
+            }
+            Ok(text)
+        })
+        .map_err(|error| BuildError::input(format!("ошибка префаба /{path}: {error}")))?;
     let reference_objects = template
         .objects()
         .iter()
@@ -429,6 +497,7 @@ fn record_asset(
     path: &VirtualPath,
     owner: &Owner,
     list_archive: Option<&str>,
+    trace: Option<&mut BuildTrace>,
 ) -> Result<(), BuildError> {
     record_asset_recursive(
         usages,
@@ -437,7 +506,21 @@ fn record_asset(
         owner,
         list_archive,
         &mut BTreeSet::new(),
+        trace,
     )
+}
+
+/// Пишет зависимость `from → to` в трассу, если трассировка включена.
+fn note_dependency(
+    trace: Option<&mut BuildTrace>,
+    owner: &Owner,
+    from: &VirtualPath,
+    to: &VirtualPath,
+    label: &'static str,
+) {
+    if let Some(trace) = trace {
+        trace.add_dependency(owner, from, to, label);
+    }
 }
 
 fn record_asset_recursive(
@@ -447,10 +530,14 @@ fn record_asset_recursive(
     owner: &Owner,
     list_archive: Option<&str>,
     visited: &mut BTreeSet<VirtualPath>,
+    mut trace: Option<&mut BuildTrace>,
 ) -> Result<(), BuildError> {
     usages.entry(path.clone()).or_default().add_owner(owner);
     if let Some(archive) = list_archive {
         add_explicit_archive(usages, path, owner, archive.to_owned());
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.record_list_archive(path, owner, archive);
+        }
     }
     if !visited.insert(path.clone()) {
         return Ok(());
@@ -490,7 +577,22 @@ fn record_asset_recursive(
             .map_err(|error| BuildError::input(error.to_string()))?;
         // LUT цветокоррекции — зависимость файла постобработки: тот же владелец и архив.
         if let Some(lut) = settings.color_grading.lut_path() {
-            record_asset_recursive(usages, sources, &lut, owner, list_archive, visited)?;
+            note_dependency(
+                trace.as_deref_mut(),
+                owner,
+                path,
+                &lut,
+                "LUT цветокоррекции",
+            );
+            record_asset_recursive(
+                usages,
+                sources,
+                &lut,
+                owner,
+                list_archive,
+                visited,
+                trace.as_deref_mut(),
+            )?;
         }
     }
 
@@ -557,12 +659,18 @@ fn record_asset_recursive(
                 .and_then(|request| request.wait())
                 .map_err(|error| resource_error(&format!("UI-ассет /{dependency}"), error))?;
             require_asset_file(sources.assets_dir, &dependency)?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.add_dependency(owner, path, &dependency, "картинка или шрифт UI");
+            }
             usages
                 .entry(dependency.clone())
                 .or_default()
                 .add_owner(owner);
             if let Some(archive) = list_archive {
                 add_explicit_archive(usages, &dependency, owner, archive.to_owned());
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record_list_archive(&dependency, owner, archive);
+                }
             }
         }
     }
@@ -572,7 +680,22 @@ fn record_asset_recursive(
         let material = MaterialAsset::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(error.to_string()))?;
         for dependency in material.dependencies() {
-            record_asset_recursive(usages, sources, &dependency, owner, list_archive, visited)?;
+            note_dependency(
+                trace.as_deref_mut(),
+                owner,
+                path,
+                &dependency,
+                "shader или текстура материала",
+            );
+            record_asset_recursive(
+                usages,
+                sources,
+                &dependency,
+                owner,
+                list_archive,
+                visited,
+                trace.as_deref_mut(),
+            )?;
         }
     }
 
@@ -582,7 +705,22 @@ fn record_asset_recursive(
             .map_err(|error| BuildError::input(error.to_string()))?;
         for property in shader.properties {
             if let ShaderPropertyDefault::Texture(Some(dependency)) = property.default {
-                record_asset_recursive(usages, sources, &dependency, owner, list_archive, visited)?;
+                note_dependency(
+                    trace.as_deref_mut(),
+                    owner,
+                    path,
+                    &dependency,
+                    "текстура шейдера по умолчанию",
+                );
+                record_asset_recursive(
+                    usages,
+                    sources,
+                    &dependency,
+                    owner,
+                    list_archive,
+                    visited,
+                    trace.as_deref_mut(),
+                )?;
             }
         }
     }
@@ -596,7 +734,22 @@ fn record_asset_recursive(
             let dependency = VirtualPath::parse(&dependency).map_err(|error| {
                 BuildError::input(format!("модель /{path} вернула неверную текстуру: {error}"))
             })?;
-            record_asset_recursive(usages, sources, &dependency, owner, list_archive, visited)?;
+            note_dependency(
+                trace.as_deref_mut(),
+                owner,
+                path,
+                &dependency,
+                "текстура FBX",
+            );
+            record_asset_recursive(
+                usages,
+                sources,
+                &dependency,
+                owner,
+                list_archive,
+                visited,
+                trace.as_deref_mut(),
+            )?;
         }
     }
     Ok(())
@@ -810,13 +963,21 @@ fn validate_heavy_scripts_configured(
     Ok(())
 }
 
+/// Назначение архивов и ветка, которая выбрала архив каждого ресурса.
+type Assignments = (
+    BTreeMap<VirtualPath, String>,
+    BTreeMap<VirtualPath, ArchiveReason>,
+);
+
+/// Назначает архивы и возвращает вместе с ними ветку, которая выбрала каждый архив.
 fn assign_archives(
     scenes: &[EnabledScene],
     usages: &BTreeMap<VirtualPath, AssetUsage>,
     base_paths: &BTreeSet<VirtualPath>,
     icon: Option<&VirtualPath>,
-) -> Result<BTreeMap<VirtualPath, String>, BuildError> {
+) -> Result<Assignments, BuildError> {
     let mut assignments = BTreeMap::new();
+    let mut reasons = BTreeMap::new();
     for path in usages
         .keys()
         .chain(base_paths.iter())
@@ -841,6 +1002,14 @@ fn assign_archives(
                 )));
             }
             assignments.insert((*path).clone(), "base".to_owned());
+            reasons.insert(
+                (*path).clone(),
+                if icon == Some(path) {
+                    ArchiveReason::AppIcon
+                } else {
+                    ArchiveReason::SceneFile
+                },
+            );
             continue;
         }
 
@@ -867,34 +1036,66 @@ fn assign_archives(
                 )));
             }
             assignments.insert((*path).clone(), first.1.clone());
+            reasons.insert(
+                (*path).clone(),
+                ArchiveReason::Explicit {
+                    owner: first.0.clone(),
+                    archive: first.1.clone(),
+                },
+            );
             continue;
         }
         if let Some(first) = usage.explicit_archives.first() {
-            let archive = if usage
+            let (archive, reason) = if usage
                 .explicit_archives
                 .iter()
                 .all(|(_, archive)| archive == &first.1)
             {
-                first.1.clone()
+                (
+                    first.1.clone(),
+                    ArchiveReason::Explicit {
+                        owner: first.0.clone(),
+                        archive: first.1.clone(),
+                    },
+                )
             } else {
-                "shared".to_owned()
+                (
+                    "shared".to_owned(),
+                    ArchiveReason::ConflictingExplicit {
+                        assignments: usage.explicit_archives.clone(),
+                    },
+                )
             };
             assignments.insert((*path).clone(), archive);
+            reasons.insert((*path).clone(), reason);
             continue;
         }
 
-        let archive = if usage.scenes.len() == 1 {
+        let (archive, reason) = if usage.scenes.len() == 1 {
             let scene_index = *usage.scenes.first().unwrap();
             let archive = format!("scene-{}", scenes[scene_index].stem);
             validate_scene_archive_name(&archive, &scenes[scene_index].path)?;
-            archive
+            let scene = scenes[scene_index].path.clone();
+            (archive, ArchiveReason::SingleScene { scene })
         } else {
-            "shared".to_owned()
+            let reason = if usage.scenes.is_empty() {
+                ArchiveReason::NoScene
+            } else {
+                ArchiveReason::SharedScenes {
+                    scenes: usage
+                        .scenes
+                        .iter()
+                        .map(|index| scenes[*index].path.clone())
+                        .collect(),
+                }
+            };
+            ("shared".to_owned(), reason)
         };
         assignments.insert((*path).clone(), archive);
+        reasons.insert((*path).clone(), reason);
     }
     validate_archive_names(assignments.values())?;
-    Ok(assignments)
+    Ok((assignments, reasons))
 }
 
 /// Метка владельца для сообщений об ошибках: «сцена /…» или «тяжёлый префаб /…».
@@ -1142,7 +1343,7 @@ mod tests {
                 explicit_archives: vec![(Owner::Scene(1), "props".to_owned())],
             },
         );
-        let assignments = assign_archives(&scenes(), &usages, &BTreeSet::new(), None).unwrap();
+        let (assignments, _) = assign_archives(&scenes(), &usages, &BTreeSet::new(), None).unwrap();
         assert_eq!(assignments[&path("/models/one.fbx")], "scene-main");
         assert_eq!(assignments[&path("/models/shared.fbx")], "shared");
         assert_eq!(assignments[&path("/models/props.fbx")], "props");

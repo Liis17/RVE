@@ -126,6 +126,28 @@ Dev-player использует библиотеку из проекта. При
 а также Windows-только DLL FSR/DLSS и размер ICO-иконки, наличие player и Vulkan SDK.
 Эти проверки выполняются в `build` и `scripts`.
 
+## Объяснение назначения
+
+`rve-build explain <project-dir> <virtual-path>` выполняет тот же разбор проекта, что и
+`build`, с трассировкой (`prepare_project_traced`) и печатает архив ресурса, причину выбора
+архива и по одной кратчайшей цепочке ссылок от каждого корня, из которого ресурс достижим.
+Корни: включённые сцены, записи `prefabs.rveprefabs` и AppIcon из `bootstrap.rves`. Путь
+разбирается как виртуальный, с ведущим `/` или без; ошибка разбора — код 2 на этапе CLI.
+Ресурс, которого нет в сборке, — ошибка проекта с кодом 2. Команда не пишет файлы.
+
+Ссылки трёх видов: объявлен в `[[assets]]` документа, экземпляр префаба и зависимость
+ресурса (текстура FBX, shader или текстура материала, текстура шейдера по умолчанию, LUT
+цветокоррекции, картинка или шрифт UI). Обход идёт только по рёбрам того контекста
+раскрытия, в котором документ раскрыт. Поэтому файл сцены, объявленный в `[[assets]]`
+другой сцены, и префаб, который тяжёлый префаб объявил, но не раскрыл, остаются листьями
+для этого корня.
+
+Причина повторяет ветку назначения, а не вычисляется отдельно. Файл включённой сцены и
+AppIcon — `base`. Явный архив указывает, где он задан: `[[assets]]` сцены, `[[assets]]`
+префаба (сцена переопределяет префаб) или запись `prefabs.rveprefabs`. Разные явные архивы
+тяжёлых префабов дают `shared` со списком назначений. Ресурс одной сценой — `scene-<stem>`,
+нескольких сцен и ресурс без сцен — `shared`.
+
 ## Материалы и Surface shaders
 
 tools/rve-build/src/project.rs валидирует каждый используемый .rvemat, затем рекурсивно включает его .rveshader и текстуры из properties в ресурсный набор сцены. Эти dependencies получают archive owner по тем же правилам, что и остальные использованные файлы. .rveshader разбирается и проверяется как формат engine-scene; GLSL body не компилируется в builder, потому что rve-build не зависит от engine-render. Ошибки TOML, schema material или отсутствующие dependencies — ошибка проекта с кодом 2. Ошибка GLSL появляется в editor/runtime и использует magenta Lit fallback; формат и ограничение compile-time см. [[Engine/EngineMaterials]].
@@ -289,7 +311,8 @@ MoltenVK (Apache-2.0).
 требует совместимое устройство.
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
-`archives.rs`, `check.rs`, `player.rs`, `sdk.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
+`archives.rs`, `check.rs`, `explain.rs`, `trace.rs`, `player.rs`, `sdk.rs`, `ico.rs`,
+`platform.rs`, `temporary.rs`.
 
 В SDK-режиме на macOS Build Player берёт Vulkan из bundled `Contents/Resources/Engine`;
 явный `--vulkan-sdk` сохраняет приоритет. Windows SDK принимает только toolchain

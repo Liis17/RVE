@@ -1,7 +1,8 @@
+use engine_files::VirtualPath;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build check <project-dir>\n    проверяет проект без сборки архивов, player и скриптов; heavy-скрипты (cdylib), Vulkan и Windows-DLL не проверяются\n  rve-build --help";
+pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build check <project-dir>\n    проверяет проект без сборки архивов, player и скриптов; heavy-скрипты (cdylib), Vulkan и Windows-DLL не проверяются\n  rve-build explain <project-dir> <virtual-path>\n    показывает архив ресурса, причину выбора и кратчайшие цепочки ссылок от корней сборки\n  rve-build --help";
 
 pub(crate) enum CommandLine {
     Help,
@@ -10,6 +11,10 @@ pub(crate) enum CommandLine {
     },
     Check {
         project_dir: PathBuf,
+    },
+    Explain {
+        project_dir: PathBuf,
+        path: VirtualPath,
     },
     Build {
         project_dir: PathBuf,
@@ -31,7 +36,9 @@ pub(crate) enum CommandLine {
 pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandLine, String> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
-        return Err("ожидается команда build, run, sdk, scripts, check или --help".to_owned());
+        return Err(
+            "ожидается команда build, run, sdk, scripts, check, explain или --help".to_owned(),
+        );
     };
     if is_help(&command) {
         return Ok(CommandLine::Help);
@@ -41,6 +48,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandL
         Some("build") => parse_build(args),
         Some("run") => parse_run(args),
         Some("sdk") => parse_sdk(args),
+        Some("explain") => parse_explain(args),
         Some("scripts") => Ok(match parse_project_dir("scripts", args)? {
             Some(project_dir) => CommandLine::Scripts { project_dir },
             None => CommandLine::Help,
@@ -52,6 +60,30 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandL
         Some(value) => Err(format!("неизвестная команда {value:?}")),
         None => Err("имя команды должно быть текстом UTF-8".to_owned()),
     }
+}
+
+fn parse_explain(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
+    const REQUIRED: &str = "для explain требуются <project-dir> и <virtual-path>";
+    let project_dir = args.next().ok_or(REQUIRED)?;
+    if is_help(&project_dir) {
+        return Ok(CommandLine::Help);
+    }
+    let path = args.next().ok_or(REQUIRED)?;
+    if is_help(&path) {
+        return Ok(CommandLine::Help);
+    }
+    if args.next().is_some() {
+        return Err("лишние аргументы explain".to_owned());
+    }
+    let text = path
+        .to_str()
+        .ok_or("виртуальный путь должен быть текстом UTF-8")?;
+    let path = VirtualPath::parse(text)
+        .map_err(|error| format!("некорректный виртуальный путь {text:?}: {error}"))?;
+    Ok(CommandLine::Explain {
+        project_dir: project_dir.into(),
+        path,
+    })
 }
 
 /// Разбирает команду с одним аргументом `<project-dir>`. `None` — запрошена справка.
@@ -207,6 +239,7 @@ fn is_help(value: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{CommandLine, parse};
+    use engine_files::VirtualPath;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -277,6 +310,43 @@ mod tests {
         let error = parse(args(&["check"])).err().unwrap();
         assert!(error.contains("check"), "{error}");
         assert!(parse(args(&["check", "game", "extra"])).is_err());
+    }
+
+    #[test]
+    fn explain_takes_a_project_and_one_virtual_path() {
+        let expected = VirtualPath::parse("textures/wood.png").unwrap();
+        for text in ["/textures/wood.png", "textures/wood.png"] {
+            assert!(matches!(
+                parse(args(&["explain", "my game", text])).unwrap(),
+                CommandLine::Explain { project_dir, path }
+                    if project_dir == Path::new("my game") && path == expected
+            ));
+        }
+        assert!(matches!(
+            parse(args(&["explain", "--help"])).unwrap(),
+            CommandLine::Help
+        ));
+        assert!(matches!(
+            parse(args(&["explain", "game", "-h"])).unwrap(),
+            CommandLine::Help
+        ));
+    }
+
+    #[test]
+    fn explain_rejects_missing_extra_and_invalid_arguments() {
+        for values in [
+            vec!["explain"],
+            vec!["explain", "game"],
+            vec!["explain", "game", "/textures/wood.png", "extra"],
+            vec!["explain", "game", "../secret.png"],
+        ] {
+            let error = parse(args(&values)).err().unwrap();
+            assert!(!error.is_empty(), "{values:?}");
+        }
+        let error = parse(args(&["explain", "game", "../secret.png"]))
+            .err()
+            .unwrap();
+        assert!(error.contains("../secret.png"), "{error}");
     }
 
     #[test]
