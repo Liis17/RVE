@@ -8,7 +8,7 @@ import subprocess
 from affected_packages import affected_packages, changed_paths
 
 
-SDK_PACKAGES = {"rve-editor", "rve-build", "rve-crash-monitor", "rve-player", "rve-sdk"}
+SDK_PACKAGES = {"rve-editor", "rve-build", "rve-player", "rve-sdk"}
 RELEASE_INPUTS = {
     "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml",
     ".github/workflows/ci.yml",

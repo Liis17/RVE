@@ -75,7 +75,7 @@ impl PlayerFlavor {
     }
 }
 
-/// Пакет монитора падений; собирается вместе с игроком и сервером, см. `crash_monitor`.
+/// Пакет монитора падений; собирается вместе с игроком и сервером, см. `build_checkout_player`.
 pub(crate) const CRASH_MONITOR_PACKAGE: &str = "rve-crash-monitor";
 
 pub(crate) fn build_distribution(
@@ -95,17 +95,24 @@ pub(crate) fn build_distribution(
     let _ = vulkan_sdk;
 
     #[cfg(windows)]
-    let executable = locate_player(
+    let player = locate_player(
         PlayerFlavor::Distribution,
         project.settings.runtime.dlss_library.is_some(),
     )?;
     #[cfg(not(windows))]
-    let executable = locate_player(PlayerFlavor::Distribution, false)?;
-    let server_executable = with_server
+    let player = locate_player(PlayerFlavor::Distribution, false)?;
+    let executable = player.executable;
+    let player_monitor = select_crash_monitor(player.crash_monitor, &executable);
+    let (server_executable, server_monitor) = match with_server
         .then(|| locate_player(PlayerFlavor::Server, false))
-        .transpose()?;
-    let player_monitor = crash_monitor(&executable);
-    let server_monitor = server_executable.as_deref().and_then(crash_monitor);
+        .transpose()?
+    {
+        Some(server) => {
+            let monitor = select_crash_monitor(server.crash_monitor, &server.executable);
+            (Some(server.executable), monitor)
+        }
+        None => (None, None),
+    };
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -219,9 +226,10 @@ pub(crate) fn run_project(project_dir: &Path, player_args: &[OsString]) -> Resul
     let executable = locate_player(
         PlayerFlavor::Dev,
         project.settings.runtime.dlss_library.is_some(),
-    )?;
+    )?
+    .executable;
     #[cfg(not(windows))]
-    let executable = locate_player(PlayerFlavor::Dev, false)?;
+    let executable = locate_player(PlayerFlavor::Dev, false)?.executable;
     let project_dir = normalize_build_path(&project.project_dir)?;
     let mut command = Command::new(&executable);
     command.arg("--project").arg(project_dir);
@@ -645,20 +653,33 @@ fn parse_cargo_output(
         .ok_or_else(|| format!("cargo output не содержит target {target_name:?} с kind {kind:?}"))
 }
 
-fn locate_player(flavor: PlayerFlavor, dlss: bool) -> Result<PathBuf, BuildError> {
+/// Игрок или сервер и путь к монитору. У SDK без монитора `crash_monitor` пуст.
+pub(crate) struct LocatedPlayer {
+    pub(crate) executable: PathBuf,
+    pub(crate) crash_monitor: Option<PathBuf>,
+}
+
+fn locate_player(flavor: PlayerFlavor, dlss: bool) -> Result<LocatedPlayer, BuildError> {
     let executable = current_executable_path()?;
     let executable_dir = executable_directory(&executable)?;
     match sdk::locate_player_in_with_dlss(&executable_dir, flavor, dlss, |flavor| {
         build_checkout_player(flavor, dlss)
     })? {
-        PlayerLocation::Checkout(executable) => Ok(executable),
+        PlayerLocation::Checkout(checkout) => Ok(LocatedPlayer {
+            executable: checkout.executable,
+            crash_monitor: Some(checkout.crash_monitor),
+        }),
         PlayerLocation::Sdk {
             executable,
+            crash_monitor,
             manifest,
         } => {
             println!("{}: prebuilt (SDK)", flavor.package());
             println!("rve-sdk engine version: {}", manifest.engine_version);
-            Ok(executable)
+            Ok(LocatedPlayer {
+                executable,
+                crash_monitor,
+            })
         }
     }
 }
@@ -693,7 +714,7 @@ pub(crate) fn executable_directory(executable: &Path) -> Result<PathBuf, BuildEr
 pub(crate) fn build_checkout_player(
     flavor: PlayerFlavor,
     dlss: bool,
-) -> Result<PathBuf, BuildError> {
+) -> Result<sdk::CheckoutPlayer, BuildError> {
     let root = repo_root()?;
     let target_dir = normalize_build_path(&checkout_player_target_dir(&root, flavor))?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
@@ -725,28 +746,55 @@ pub(crate) fn build_checkout_player(
             "rebuilt"
         }
     );
-    // Монитор должен быть в том же cargo-вызове: его путь — рядом с игроком (см. `crash_monitor`).
-    parse_cargo_output(&stdout, CRASH_MONITOR_PACKAGE, "bin", None).map_err(|message| {
+    // Монитор собирается тем же cargo-вызовом; его путь берётся из того же вывода, а не из соседства.
+    let crash_monitor = crash_monitor_from_cargo_output(&stdout).map_err(|message| {
         BuildError::operational(format!("сборка {CRASH_MONITOR_PACKAGE}: {message}"))
     })?;
-    normalize_build_path(&executable)
-        .map_err(|error| BuildError::operational(format!("сборка {package}: {error}")))
+    Ok(sdk::CheckoutPlayer {
+        executable: normalize_build_path(&executable)
+            .map_err(|error| BuildError::operational(format!("сборка {package}: {error}")))?,
+        crash_monitor: normalize_build_path(&crash_monitor).map_err(|error| {
+            BuildError::operational(format!("сборка {CRASH_MONITOR_PACKAGE}: {error}"))
+        })?,
+    })
 }
 
-/// Монитор лежит рядом с исполняемым файлом игрока или сервера: в checkout — в том же каталоге
-/// target, в SDK — рядом с `rve-build`. SDK без монитора не ломает сборку релиза: релиз выходит
-/// без minidump и с предупреждением.
-pub(crate) fn crash_monitor(player: &Path) -> Option<PathBuf> {
-    let monitor = player.with_file_name(sdk::crash_monitor_filename());
-    if monitor.is_file() {
-        return Some(monitor);
+/// Путь монитора из вывода cargo. Отсутствие artifact — ошибка сборки.
+fn crash_monitor_from_cargo_output(stdout: &str) -> Result<PathBuf, String> {
+    let artifact = parse_cargo_output(stdout, CRASH_MONITOR_PACKAGE, "bin", None)?;
+    artifact
+        .executable
+        .ok_or_else(|| format!("cargo не сообщил executable для {CRASH_MONITOR_PACKAGE}"))
+}
+
+/// Сборка игрока и монитора для SDK (`sdk`): обе через `build_sdk_binary`, т.е. из Cargo JSON.
+pub(crate) fn build_sdk_player(
+    distribution: bool,
+    dlss: bool,
+) -> Result<sdk::CheckoutPlayer, BuildError> {
+    let executable = build_sdk_binary("rve-player", distribution, dlss)?;
+    let crash_monitor = build_sdk_binary(CRASH_MONITOR_PACKAGE, false, false)?;
+    Ok(sdk::CheckoutPlayer {
+        executable,
+        crash_monitor,
+    })
+}
+
+/// Монитор нужен релизу, но SDK, собранный до его появления, его не содержит. Тогда релиз собирается
+/// без minidump: предупреждение на stderr, не ошибка.
+pub(crate) fn select_crash_monitor(monitor: Option<PathBuf>, player: &Path) -> Option<PathBuf> {
+    if monitor.is_none() {
+        eprintln!("{}", missing_crash_monitor_warning(player));
     }
-    eprintln!(
-        "предупреждение: рядом с {} нет {}; релиз собирается без minidump (пересоберите SDK)",
+    monitor
+}
+
+fn missing_crash_monitor_warning(player: &Path) -> String {
+    format!(
+        "предупреждение: для {} нет {}: релиз собирается без minidump (пересоберите SDK)",
         player.display(),
-        monitor.display()
-    );
-    None
+        sdk::crash_monitor_filename()
+    )
 }
 
 /// Кладёт монитор в каталог релиза. Если файл уже есть (Windows: игрок и сервер делят каталог),
@@ -1161,8 +1209,9 @@ pub(crate) fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
 mod tests {
     use super::{
         CargoArtifact, CargoFailure, PlayerFlavor, build_distribution, checkout_player_target_dir,
-        copy_dlss_runtime, copy_fsr_runtime, crash_monitor, heavy_scripts_manifest,
-        parse_cargo_output, parse_cdylib_target, player_file_name, sdk_build_command,
+        copy_dlss_runtime, copy_fsr_runtime, crash_monitor_from_cargo_output,
+        heavy_scripts_manifest, missing_crash_monitor_warning, parse_cargo_output,
+        parse_cdylib_target, player_file_name, sdk_build_command, select_crash_monitor,
         select_library_file, stage_crash_monitor, validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
@@ -1420,17 +1469,39 @@ mod tests {
     }
 
     #[test]
-    fn crash_monitor_is_found_next_to_the_player_or_reported_as_missing() {
-        let root = TempDir::create(&std::env::temp_dir(), "rve-build-monitor-locate").unwrap();
-        let player = root
-            .path()
-            .join(sdk::player_filename(PlayerFlavor::Distribution));
-        fs::write(&player, b"player").unwrap();
-        assert_eq!(crash_monitor(&player), None, "старый SDK без монитора");
+    fn missing_crash_monitor_warns_and_the_release_continues_without_it() {
+        let player = Path::new("sdk/rve-player.exe");
+        assert_eq!(select_crash_monitor(None, player), None);
+        let warning = missing_crash_monitor_warning(player);
+        assert!(warning.contains(sdk::crash_monitor_filename()), "{warning}");
+        assert!(warning.contains("без minidump"), "{warning}");
+        let monitor = PathBuf::from("sdk/rve-crash-monitor.exe");
+        assert_eq!(
+            select_crash_monitor(Some(monitor.clone()), player),
+            Some(monitor)
+        );
+    }
 
-        let monitor = root.path().join(sdk::crash_monitor_filename());
-        fs::write(&monitor, b"monitor").unwrap();
-        assert_eq!(crash_monitor(&player), Some(monitor));
+    #[test]
+    fn checkout_build_takes_the_monitor_artifact_from_cargo_output() {
+        fn artifact(name: &str, executable: &str) -> String {
+            format!(
+                r#"{{"reason":"compiler-artifact","target":{{"name":"{name}","kind":["bin"]}},"executable":"{executable}","filenames":[],"fresh":true}}"#
+            )
+        }
+        let player_only = artifact("rve-player", "target/release/rve-player.exe");
+        let error = crash_monitor_from_cargo_output(&player_only).unwrap_err();
+        assert!(error.contains("rve-crash-monitor"), "{error}");
+
+        let both = format!(
+            "{player_only}
+{}",
+            artifact("rve-crash-monitor", "target/release/rve-crash-monitor.exe")
+        );
+        assert_eq!(
+            crash_monitor_from_cargo_output(&both).unwrap(),
+            PathBuf::from("target/release/rve-crash-monitor.exe")
+        );
     }
 
     #[test]

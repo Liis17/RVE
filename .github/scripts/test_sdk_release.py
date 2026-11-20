@@ -15,7 +15,6 @@ class SDKReleaseSelectionTests(unittest.TestCase):
             package("render", ["core"]),
             package("rve-editor", ["render"], directory="editor"),
             package("rve-player", ["core"]),
-            package("rve-crash-monitor", directory="engine/rve-crash-monitor"),
             package("rve-build", directory="tools/rve-build"),
             package("rve-sdk"),
             package("sandbox", ["render"]),
@@ -31,7 +30,6 @@ class SDKReleaseSelectionTests(unittest.TestCase):
             "editor/src/app.rs", "editor/templates/new_project/Assets/models/cube.fbx",
             "engine/core/src/lib.rs", "engine/render/Cargo.toml",
             "engine/rve-player/src/main.rs", "engine/rve-sdk/src/lib.rs",
-            "engine/rve-crash-monitor/src/server.rs",
             "tools/rve-build/src/sdk.rs",
         ]:
             with self.subTest(path=path):

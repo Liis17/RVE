@@ -17,11 +17,20 @@ pub(crate) struct SdkManifest {
     pub(crate) dlss_enabled: bool,
 }
 
+/// Игрок и монитор, собранные cargo в checkout. Оба пути берутся из `compiler-artifact` в выводе cargo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckoutPlayer {
+    pub(crate) executable: PathBuf,
+    pub(crate) crash_monitor: PathBuf,
+}
+
 #[derive(Debug)]
 pub(crate) enum PlayerLocation {
-    Checkout(PathBuf),
+    Checkout(CheckoutPlayer),
     Sdk {
         executable: PathBuf,
+        /// `None` у SDK, собранного до появления монитора падений.
+        crash_monitor: Option<PathBuf>,
         manifest: SdkManifest,
     },
 }
@@ -29,7 +38,7 @@ pub(crate) enum PlayerLocation {
 pub(crate) fn locate_player_in(
     executable_dir: &Path,
     flavor: player::PlayerFlavor,
-    checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<PathBuf, BuildError>,
+    checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<CheckoutPlayer, BuildError>,
 ) -> Result<PlayerLocation, BuildError> {
     locate_player_in_with_dlss(executable_dir, flavor, false, checkout_player)
 }
@@ -38,7 +47,7 @@ pub(crate) fn locate_player_in_with_dlss(
     executable_dir: &Path,
     flavor: player::PlayerFlavor,
     requires_dlss: bool,
-    checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<PathBuf, BuildError>,
+    checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<CheckoutPlayer, BuildError>,
 ) -> Result<PlayerLocation, BuildError> {
     let marker = executable_dir.join(SDK_MARKER);
     let contents = match fs::read_to_string(&marker) {
@@ -79,8 +88,10 @@ pub(crate) fn locate_player_in_with_dlss(
             executable.display()
         )));
     }
+    let crash_monitor = executable_dir.join(crash_monitor_filename());
     Ok(PlayerLocation::Sdk {
         executable,
+        crash_monitor: crash_monitor.is_file().then_some(crash_monitor),
         manifest,
     })
 }
@@ -107,7 +118,6 @@ fn validate_sdk_manifest(manifest: &SdkManifest) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Имя исполняемого файла варианта player или сервера рядом с rve-build и в release-раскладке.
 /// Имя монитора падений рядом с игроком и сервером в SDK и в release.
 pub(crate) fn crash_monitor_filename() -> &'static str {
     if cfg!(windows) {
@@ -117,6 +127,7 @@ pub(crate) fn crash_monitor_filename() -> &'static str {
     }
 }
 
+/// Имя исполняемого файла варианта player или сервера рядом с rve-build и в release-раскладке.
 pub(crate) fn player_filename(flavor: player::PlayerFlavor) -> &'static str {
     match (cfg!(windows), flavor) {
         (true, player::PlayerFlavor::Distribution) => "rve-player.exe",
@@ -166,19 +177,16 @@ pub(crate) fn build_sdk(
         &executable_dir,
         player::PlayerFlavor::Distribution,
         |flavor| {
-            player::build_sdk_binary(
-                "rve-player",
-                flavor == player::PlayerFlavor::Distribution,
-                dlss_enabled,
-            )
+            player::build_sdk_player(flavor == player::PlayerFlavor::Distribution, dlss_enabled)
         },
     )?;
-    let rve_player = checkout_player_for_sdk(location)?;
+    let checkout = checkout_player_for_sdk(location)?;
+    let rve_player = checkout.executable;
+    let rve_crash_monitor = checkout.crash_monitor;
     let rve_player_dev = player::build_sdk_binary("rve-player", false, dlss_enabled)?;
     let rve_server = player::build_sdk_binary("rve-server", true, false)?;
     let rve_editor = player::build_sdk_binary("rve-editor", false, false)?;
     let rve_build = player::build_sdk_binary("rve-build", false, false)?;
-    let rve_crash_monitor = player::build_sdk_binary(player::CRASH_MONITOR_PACKAGE, false, false)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -257,9 +265,9 @@ pub(crate) fn build_sdk(
     }
 }
 
-fn checkout_player_for_sdk(location: PlayerLocation) -> Result<PathBuf, BuildError> {
+fn checkout_player_for_sdk(location: PlayerLocation) -> Result<CheckoutPlayer, BuildError> {
     match location {
-        PlayerLocation::Checkout(executable) => Ok(executable),
+        PlayerLocation::Checkout(checkout) => Ok(checkout),
         PlayerLocation::Sdk { .. } => Err(BuildError::operational(
             "команда `sdk` доступна только в checkout-режиме rve-build",
         )),
@@ -422,15 +430,15 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PlayerLocation, SdkManifest, SdkSources, assemble_sdk_layout, checkout_player_for_sdk,
-        crash_monitor_filename, current_target, locate_player_in, locate_player_in_with_dlss,
-        player_filename,
+        CheckoutPlayer, PlayerLocation, SdkManifest, SdkSources, assemble_sdk_layout,
+        checkout_player_for_sdk, crash_monitor_filename, current_target, locate_player_in,
+        locate_player_in_with_dlss, player_filename,
     };
     use crate::error::BuildError;
     use crate::player::PlayerFlavor;
     use crate::temporary::TempDir;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn sdk_marker(abi_version: u32, target: &str) -> String {
         format!(
@@ -482,16 +490,62 @@ mod tests {
         assert!(!destination.join("src/obsolete.rs").exists());
     }
 
+    /// Checkout-локатор в тестах: монитор лежит рядом с игроком.
+    fn checkout_at(executable: &Path) -> Result<CheckoutPlayer, BuildError> {
+        Ok(CheckoutPlayer {
+            executable: executable.to_owned(),
+            crash_monitor: executable.with_file_name(crash_monitor_filename()),
+        })
+    }
+
+    #[test]
+    fn sdk_without_crash_monitor_is_located_with_none() {
+        let root = temp_dir("rve-sdk-no-monitor");
+        fs::write(
+            root.path().join("rve-sdk.toml"),
+            sdk_marker(rve_sdk::abi::RVE_SCRIPT_ABI_VERSION, &current_target()),
+        )
+        .unwrap();
+        let executable = root.path().join(player_name());
+        fs::write(&executable, b"prebuilt player").unwrap();
+
+        let found = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap();
+        assert!(matches!(
+            found,
+            PlayerLocation::Sdk {
+                crash_monitor: None,
+                ..
+            }
+        ));
+
+        let monitor = root.path().join(crash_monitor_filename());
+        fs::write(&monitor, b"monitor").unwrap();
+        let found = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap();
+        assert!(matches!(
+            found,
+            PlayerLocation::Sdk { crash_monitor: Some(ref path), .. } if *path == monitor
+        ));
+    }
+
     #[test]
     fn marker_absence_selects_checkout_and_calls_injected_locator() {
         let root = temp_dir("rve-sdk-no-marker");
         let checkout_player = PathBuf::from("checkout/rve-player");
         let found = locate_player_in(root.path(), PlayerFlavor::Dev, |flavor| {
             assert_eq!(flavor, PlayerFlavor::Dev);
-            Ok(checkout_player.clone())
+            checkout_at(&checkout_player)
         })
         .unwrap();
-        assert!(matches!(found, PlayerLocation::Checkout(path) if path == checkout_player));
+        assert!(matches!(
+            found,
+            PlayerLocation::Checkout(ref checkout) if checkout.executable == checkout_player
+        ));
     }
 
     #[test]
@@ -524,7 +578,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             found,
-            PlayerLocation::Sdk { executable: path, manifest }
+            PlayerLocation::Sdk { executable: path, manifest, .. }
                 if path == executable && manifest.engine_version == "0.1.0"
         ));
     }
@@ -599,6 +653,7 @@ mod tests {
     fn sdk_command_is_rejected_when_the_current_player_location_is_sdk_mode() {
         let error = checkout_player_for_sdk(PlayerLocation::Sdk {
             executable: PathBuf::from("sdk/rve-player"),
+            crash_monitor: None,
             manifest: SdkManifest {
                 engine_version: "0.1.0".to_owned(),
                 abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
