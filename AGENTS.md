@@ -110,7 +110,7 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
   - engine-mcp (потребитель rve-editor): tiny_http, base64, getrandom, flume, serde_json.
   - engine-pak (потребители engine-resources, rve-build и утилита rvepak): engine-files.
   - rve-player: engine-runtime (feature `crash-dumps` включена по умолчанию).
-  - rve-crash-monitor (потребители: engine-runtime как библиотека с именами и хранением файлов `crash-*`, rve-build как сборка бинарника): зависит от minidumper, windows-sys (Windows) и libc (macOS); minidumper только на Windows x86_64 и macOS.
+  - rve-crash-monitor (потребители: engine-runtime как библиотека без зависимостей с именами и хранением файлов `crash-*`, rve-build как сборка бинарника): бинарник за feature `server`, зависит от minidumper, на Windows — от windows-sys, на macOS — от libc; только на Windows x86_64 и macOS.
   - rve-server: engine-runtime (headless-путь без окна и renderer; feature `crash-dumps` включена по умолчанию).
   - rve-editor: engine-core, engine-platform, engine-animation, engine-assets, engine-files, engine-gui, engine-input, engine-network, engine-physics, engine-project, engine-render, engine-audio, engine-resources, engine-scene, engine-script, engine-window, engine-console, engine-ui, engine-mcp.
 - При изменении engine-platform проверяй общий интерфейс, адаптеры engine-platform-windows и engine-platform-macos и вызовы из renderer.

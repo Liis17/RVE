@@ -225,7 +225,7 @@ developer console из checkout `build/player-dev` или `rve-player-dev[.exe]`
 <library>]`, затем передаёт пользовательские аргументы. Если скриптов нет, `--scripts`
 не добавляется. На Windows player остаётся GUI executable без терминального окна;
 dev-вариант показывает developer console внутри окна. Cargo-команда
-`cargo run -p rve-player` использует default feature и включает её.
+`cargo run -p rve-player` использует default feature и включает её. Монитор падений в этой раскладке не собирается: нужна отдельная `cargo build -p rve-crash-monitor`, иначе игра пишет предупреждение `[crash]` и работает без дампов.
 
 Команда `build` собирает release cdylib и checkout distribution-player без developer
 console либо использует соседний distribution player из SDK, затем копирует
