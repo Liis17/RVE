@@ -3096,7 +3096,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     normal: vertex.normal,
                     uv: vertex.uv,
                     color: [1.0; 3],
-                    tangent: [0.0; 4],
+                    tangent: vertex.tangent,
                 })
                 .collect::<Vec<_>>();
             let mesh_id = match (&model_mesh.skin, model.skeleton.as_ref()) {
