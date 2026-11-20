@@ -124,6 +124,7 @@ impl PlayNetworkForm {
                 mode: NetMode::Host,
                 tick_hz: settings.tick_hz,
                 position_step: settings.position_step,
+                interest_radius: settings.interest_radius,
             },
             summary,
         })
@@ -169,6 +170,7 @@ impl PlayNetworkForm {
                 mode: NetMode::Client,
                 tick_hz: settings.tick_hz,
                 position_step: settings.position_step,
+                interest_radius: settings.interest_radius,
             },
             summary: format!("Сеть: Client к {server_addr}"),
         })

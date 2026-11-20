@@ -285,6 +285,8 @@ pub struct NetworkSettings {
     pub timeout_ms: u32,
     /// Шаг квантования позиции в сети, 1e-5..=1.0. Ошибка позиции не больше половины шага.
     pub position_step: f32,
+    /// Радиус значимости spawn-поддеревьев вокруг owned-объектов участника. 0 выключает фильтр.
+    pub interest_radius: f32,
 }
 
 impl Default for NetworkSettings {
@@ -296,6 +298,7 @@ impl Default for NetworkSettings {
             tick_hz: 30,
             timeout_ms: 10_000,
             position_step: 0.01,
+            interest_radius: 0.0,
         }
     }
 }
@@ -418,6 +421,10 @@ impl ProjectSettings {
         // Вне диапазона попадают и NaN, и бесконечность.
         if !(1e-5..=1.0).contains(&self.network.position_step) {
             return Err("network.position_step должен быть в диапазоне 0.00001..=1.0".to_owned());
+        }
+        // NaN и бесконечность не проходят проверку.
+        if !(self.network.interest_radius.is_finite() && self.network.interest_radius >= 0.0) {
+            return Err("network.interest_radius должен быть конечным и не меньше нуля".to_owned());
         }
         if let Some(path) = &self.runtime.fsr_library
             && (!is_relative_project_path(path)
@@ -1035,6 +1042,29 @@ mod tests {
     }
 
     #[test]
+    fn interest_radius_defaults_to_zero_and_persists_when_set() {
+        let legacy = ProjectSettings::parse(&format!(
+            "{}\n[network]\nenabled = true\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(legacy.network.interest_radius, 0.0);
+
+        let custom = ProjectSettings::parse(&format!(
+            "{}\n[network]\nenabled = true\ninterest_radius = 25.0\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(custom.network.interest_radius, 25.0);
+        let serialized = custom.to_toml().unwrap();
+        assert!(
+            serialized.contains("interest_radius = 25.0"),
+            "{serialized}"
+        );
+        assert_eq!(ProjectSettings::parse(&serialized).unwrap(), custom);
+    }
+
+    #[test]
     fn network_section_round_trips_and_checks_ranges() {
         let settings = ProjectSettings::parse(&format!(
             "{}\n[network]\nenabled = true\nport = 9000\nmax_clients = 64\ntick_hz = 240\ntimeout_ms = 120000\n",
@@ -1050,6 +1080,7 @@ mod tests {
                 tick_hz: 240,
                 timeout_ms: 120_000,
                 position_step: 0.01,
+                interest_radius: 0.0,
             }
         );
         let serialized = settings.to_toml().unwrap();
@@ -1068,6 +1099,9 @@ mod tests {
             ("position_step", "1.5"),
             ("position_step", "nan"),
             ("position_step", "inf"),
+            ("interest_radius", "-1.0"),
+            ("interest_radius", "nan"),
+            ("interest_radius", "inf"),
         ] {
             let contents = format!(
                 "{}\n[network]\n{field} = {value}\n",

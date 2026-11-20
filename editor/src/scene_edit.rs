@@ -4169,6 +4169,7 @@ mod tests {
 
         let identity = engine_scene::NetworkIdentityComponent {
             authority: engine_scene::NetAuthority::Owner,
+            always_relevant: false,
         };
         scene
             .set_component(&id, Component::NetworkIdentity(identity))

@@ -1928,7 +1928,13 @@ fn show_network_identity(
                         })
                         .response;
                     ui.end_row();
+                    ui.label("Always relevant");
+                    let always = ui.checkbox(&mut value.always_relevant, "");
+                    ui.end_row();
                     commit(state, id, "network_identity", &authority, |object| {
+                        object.network_identity = Some(value);
+                    });
+                    commit(state, id, "network_identity", &always, |object| {
                         object.network_identity = Some(value);
                     });
                 });

@@ -132,6 +132,9 @@ impl NetAuthority {
 pub struct NetworkIdentityComponent {
     #[serde(default, skip_serializing_if = "NetAuthority::is_default")]
     pub authority: NetAuthority,
+    /// Объект виден всем участникам независимо от радиуса значимости (`[network].interest_radius`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub always_relevant: bool,
 }
 
 const DEFAULT_SEND_RATE_HZ: u32 = 20;
@@ -335,6 +338,37 @@ mod tests {
         let text = document.to_toml().unwrap();
         assert!(text.contains("[objects.network_identity]"), "{text}");
         assert!(!text.contains("authority"), "{text}");
+    }
+
+    #[test]
+    fn always_relevant_is_off_by_default_and_round_trips_when_set() {
+        let document = parse(&object_with("[objects.network_identity]\n")).unwrap();
+        assert!(
+            !document.objects[1]
+                .network_identity
+                .unwrap()
+                .always_relevant
+        );
+        let text = document.to_toml().unwrap();
+        assert!(!text.contains("always_relevant"), "{text}");
+
+        let document = parse(&object_with(
+            "[objects.network_identity]\nalways_relevant = true\n",
+        ))
+        .unwrap();
+        assert!(
+            document.objects[1]
+                .network_identity
+                .unwrap()
+                .always_relevant
+        );
+        let text = document.to_toml().unwrap();
+        assert!(text.contains("always_relevant = true"), "{text}");
+        let again = parse(&text).unwrap();
+        assert_eq!(
+            again.objects[1].network_identity,
+            document.objects[1].network_identity
+        );
     }
 
     #[test]

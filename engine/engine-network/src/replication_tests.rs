@@ -839,6 +839,11 @@ fn scene_hash_changes_with_network_components() {
     assert_ne!(hash, scene_hash(&scene(&faster)));
     let renamed = base.replace("\"box\"", "\"crate\"");
     assert_ne!(hash, scene_hash(&scene(&renamed)));
+    let relevant = base.replace(
+        "[objects.network_identity]",
+        "[objects.network_identity]\nalways_relevant = true",
+    );
+    assert_ne!(hash, scene_hash(&scene(&relevant)));
     let without_network = format!("{CAMERA}[[objects]]\nid = \"box\"\n");
     assert_ne!(hash, scene_hash(&scene(&without_network)));
 }

@@ -519,6 +519,11 @@ pub fn scene_hash(document: &SceneDocument) -> [u8; 32] {
                         NetAuthority::Owner => 1,
                     });
             item.push(authority);
+            item.push(u8::from(
+                object
+                    .network_identity
+                    .is_some_and(|identity| identity.always_relevant),
+            ));
             match object.network_transform {
                 Some(transform) => {
                     item.push(1);

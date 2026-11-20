@@ -95,6 +95,7 @@ pub(crate) fn prepare(
             mode,
             tick_hz: settings.tick_hz,
             position_step: settings.position_step,
+            interest_radius: settings.interest_radius,
         },
     })
 }
@@ -504,6 +505,7 @@ return Script
                     mode,
                     tick_hz: 30,
                     position_step: 0.01,
+                    interest_radius: 0.0,
                 },
                 &mut world,
                 &mut ScriptNetSink::new(&mut scripts),

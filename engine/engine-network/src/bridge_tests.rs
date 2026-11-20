@@ -30,6 +30,9 @@ const STEP: Duration = Duration::from_millis(10);
 const CRATE: &str = "prefabs/crate.rveprefab";
 const OWNED: &str = "prefabs/owned.rveprefab";
 const HEAVY: &str = "prefabs/heavy.rveprefab";
+const ALWAYS: &str = "prefabs/always.rveprefab";
+const ALWAYS_TEXT: &str = "[[objects]]\nid = \"beacon\"\n[objects.network_identity]\n\
+    always_relevant = true\n[objects.network_transform]\n";
 
 const SCENE: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
     [[objects]]\nid = \"box\"\n[objects.network_identity]\n[objects.network_transform]\n\
@@ -237,6 +240,7 @@ impl TestSink {
             (CRATE, CRATE_TEXT),
             (OWNED, OWNED_TEXT),
             (HEAVY, CRATE_TEXT),
+            (ALWAYS, ALWAYS_TEXT),
         ] {
             templates.insert(path.to_owned(), load_template(path, text));
         }
@@ -394,6 +398,11 @@ fn state_message(object: NetId, x: f32) -> Message {
 
 impl Session {
     fn new() -> Self {
+        Self::with_radius(0.0)
+    }
+
+    /// Сессия с сервером, у которого радиус значимости `radius` (0 — без фильтра).
+    fn with_radius(radius: f32) -> Self {
         let hub = Rc::new(RefCell::new(Hub::default()));
         let now = Instant::now();
         let mut world = scene_world();
@@ -407,6 +416,7 @@ impl Session {
                 mode: NetMode::Server,
                 tick_hz: TICK_HZ,
                 position_step: POSITION_STEP,
+                interest_radius: radius,
             },
             &mut world,
             &mut sink,
@@ -444,6 +454,7 @@ impl Session {
                 mode: NetMode::Client,
                 tick_hz: TICK_HZ,
                 position_step: POSITION_STEP,
+                interest_radius: 0.0,
             },
             &mut world,
             &mut sink,
@@ -1266,4 +1277,500 @@ fn client_local_peer_is_unknown_until_the_server_assigns_it() {
     session.step(STEP);
     let state = session.client(peer).sink.net_state.clone().unwrap();
     assert_eq!(state.1, Some(peer));
+}
+
+// ---- Значимость: фильтр по радиусу вокруг объектов участника ----
+
+/// Радиус значимости во всех тестах этого раздела.
+const RADIUS: f32 = 10.0;
+
+impl Session {
+    /// Ставит корень сервера на ось X на расстояние `x`.
+    fn place(&mut self, root: ObjectHandle, x: f32) {
+        set_position(&mut self.server.world, root, Vec3::new(x, 0.0, 0.0));
+    }
+
+    /// Делает участника `peer` владельцем объекта сервера.
+    fn own(&mut self, root: ObjectHandle, peer: PeerId) {
+        let server = &mut self.server;
+        server.bridge.apply(
+            vec![NetRequest::SetOwner { object: root, peer }],
+            &mut server.world,
+            &mut server.sink,
+        );
+    }
+
+    fn net_of(&self, root: ObjectHandle) -> NetId {
+        self.server.sink.nets[&root].0
+    }
+
+    /// Номер появления корня, который сервер назначил участнику.
+    fn epoch_for(&self, peer: PeerId, net: NetId) -> Option<u32> {
+        self.server.bridge.visible_epoch(peer, net)
+    }
+
+    /// Создаёт корень префаба на сервере в точке `x` на оси X и регистрирует его в мосте.
+    fn spawn_at(&mut self, prefab: &str, x: f32) -> ObjectHandle {
+        let options = SpawnOptions {
+            position: Some(Vec3::new(x, 0.0, 0.0)),
+            ..SpawnOptions::default()
+        };
+        let handle = self
+            .server
+            .sink
+            .spawn(&mut self.server.world, prefab, options)
+            .unwrap();
+        self.server.spawned.push(SpawnedRoot {
+            handle,
+            prefab: prefab.to_owned(),
+        });
+        self.step(STEP);
+        handle
+    }
+}
+
+fn state_message_at(object: NetId, epoch: u32, x: f32) -> Message {
+    Message::States {
+        tick: 0,
+        items: vec![StateItem {
+            object,
+            epoch,
+            mask: MASK_POSITION,
+            pose: Pose {
+                position: Vec3::new(x, 0.0, 0.0),
+                rotation: glam::Quat::IDENTITY,
+                scale: Vec3::ONE,
+            },
+        }],
+    }
+}
+
+#[test]
+fn root_joins_the_zone_at_the_radius_and_leaves_beyond_the_hysteresis() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+
+    session.place(root, 20.0);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_none(),
+        "вне радиуса корня нет"
+    );
+
+    session.place(root, 9.0);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_some(),
+        "в радиусе приходит Spawn"
+    );
+
+    session.place(root, 10.5);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_some(),
+        "между порогами ничего не меняется"
+    );
+
+    session.place(root, 11.5);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_none(),
+        "дальше 1.1R приходит Leave"
+    );
+}
+
+#[test]
+fn owner_keeps_seeing_its_own_object_beyond_the_radius() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    session.connect();
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.place(root, 500.0);
+    session.own(root, 1);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_some(),
+        "владелец видит свой объект"
+    );
+    assert!(
+        mirror(session.client(2), net).is_none(),
+        "чужой участник — нет"
+    );
+}
+
+#[test]
+fn always_relevant_roots_reach_everyone_and_idle_participants_see_only_that() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let beacon = session.spawn_on_server(ALWAYS);
+    session.place(beacon, 1000.0);
+    let far = session.spawn_on_server(CRATE);
+    session.place(far, 1000.0);
+    session.step_n(2, STEP);
+    let beacon_net = session.net_of(beacon);
+    let far_net = session.net_of(far);
+    for peer in [1, 2] {
+        assert!(
+            mirror(session.client(peer), beacon_net).is_some(),
+            "always_relevant виден"
+        );
+        assert!(
+            mirror(session.client(peer), far_net).is_none(),
+            "далёкий корень не виден"
+        );
+    }
+}
+
+#[test]
+fn scene_objects_are_not_filtered_by_the_radius() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let box_server = session.server.world.handle("box").unwrap();
+    set_position(
+        &mut session.server.world,
+        box_server,
+        Vec3::new(1000.0, 0.0, 0.0),
+    );
+    session.step_n(100, STEP);
+    let box_client = session.client(1).world.handle("box").unwrap();
+    assert!(
+        (position_of(&session.client(1).world, box_client).x - 1000.0).abs() < 0.5,
+        "объект сцены приходит, даже далеко от наблюдателя"
+    );
+}
+
+#[test]
+fn each_participant_sees_the_roots_near_its_own_objects() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    session.connect();
+    let first = session.spawn_on_server(OWNED);
+    session.own(first, 1);
+    // Владелец сам шлёт свою позу: объект сразу создаётся в нужной точке, иначе поза сбросится.
+    let second = session.spawn_at(OWNED, 100.0);
+    session.own(second, 2);
+    let near_first = session.spawn_on_server(CRATE);
+    session.place(near_first, 5.0);
+    let near_second = session.spawn_on_server(CRATE);
+    session.place(near_second, 95.0);
+    session.step_n(2, STEP);
+    let a = session.net_of(near_first);
+    let b = session.net_of(near_second);
+    assert!(
+        mirror(session.client(1), a).is_some(),
+        "первый видит свой корень"
+    );
+    assert!(
+        mirror(session.client(1), b).is_none(),
+        "первый не видит чужой корень"
+    );
+    assert!(
+        mirror(session.client(2), b).is_some(),
+        "второй видит корень у своего объекта"
+    );
+    assert!(
+        mirror(session.client(2), a).is_none(),
+        "второй не видит чужой корень"
+    );
+}
+
+#[test]
+fn owner_change_and_object_rpc_in_one_frame_reach_the_new_owner() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 2);
+    let root = session.spawn_on_server(CRATE);
+    session.place(root, 500.0);
+    session.step_n(2, STEP);
+    let net = session.net_of(root);
+    assert!(mirror(session.client(1), net).is_none());
+
+    let server = &mut session.server;
+    server.bridge.apply(
+        vec![
+            NetRequest::SetOwner {
+                object: root,
+                peer: 1,
+            },
+            NetRequest::ObjectSend {
+                object: root,
+                name: "hit".to_owned(),
+                value: ParamValue::Bool(true),
+                target: NetTarget::Peer(1),
+                reliable: true,
+            },
+        ],
+        &mut server.world,
+        &mut server.sink,
+    );
+    session.step_n(2, STEP);
+    let handle = mirror(session.client(1), net).expect("новый владелец получил Spawn");
+    assert!(has_message(
+        &session.client(1).sink.events,
+        0,
+        Some(handle),
+        "hit"
+    ));
+}
+
+#[test]
+fn leave_and_respawn_in_one_receive_recreate_the_object() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.step_n(2, STEP);
+    let before = session.epoch_for(1, net).unwrap();
+
+    let now = session.now;
+    let server = &mut session.server;
+    set_position(&mut server.world, root, Vec3::new(500.0, 0.0, 0.0));
+    server
+        .bridge
+        .tick(&mut server.world, &mut server.sink, &[], now);
+    set_position(&mut server.world, root, Vec3::ZERO);
+    server
+        .bridge
+        .tick(&mut server.world, &mut server.sink, &[], now);
+    session.step(STEP);
+
+    assert!(
+        session.epoch_for(1, net).unwrap() > before,
+        "новое появление — новый номер"
+    );
+    assert!(
+        mirror(session.client(1), net).is_some(),
+        "объект пересоздан"
+    );
+}
+
+#[test]
+fn stale_states_of_a_past_appearance_are_ignored() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.step_n(2, STEP);
+    let old = session.epoch_for(1, net).unwrap();
+
+    session.place(root, 500.0);
+    session.step_n(2, STEP);
+    session.place(root, 0.0);
+    session.step_n(2, STEP);
+    assert_ne!(session.epoch_for(1, net), Some(old));
+    let handle = mirror(session.client(1), net).expect("объект снова виден");
+
+    session.inject_from(
+        Side::Server,
+        NetTarget::Peer(1),
+        &state_message_at(net, old, 7.0),
+        Channel::State,
+    );
+    session.inject_from(
+        Side::Server,
+        NetTarget::Peer(1),
+        &Message::Rpc {
+            object: Some(net),
+            epoch: old,
+            name: "stale".to_owned(),
+            value: ParamValue::Bool(true),
+        },
+        Channel::Rpc,
+    );
+    session.step_n(5, STEP);
+    assert!(
+        position_of(&session.client(1).world, handle).x.abs() < 0.5,
+        "старое состояние отброшено"
+    );
+    assert!(!has_message(
+        &session.client(1).sink.events,
+        0,
+        Some(handle),
+        "stale"
+    ));
+}
+
+#[test]
+fn rpc_ahead_of_spawn_waits_in_the_queue_and_is_delivered() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.place(root, 500.0);
+    session.step_n(2, STEP);
+
+    let upcoming = session.server.bridge.next_epoch();
+    session.inject_from(
+        Side::Server,
+        NetTarget::Peer(1),
+        &Message::Rpc {
+            object: Some(net),
+            epoch: upcoming,
+            name: "early".to_owned(),
+            value: ParamValue::Bool(true),
+        },
+        Channel::Rpc,
+    );
+    session.step_n(2, STEP);
+    assert_eq!(session.client(1).bridge.queued_rpc_len(), 1);
+
+    session.place(root, 0.0);
+    session.step_n(3, STEP);
+    assert_eq!(session.epoch_for(1, net), Some(upcoming));
+    let handle = mirror(session.client(1), net).expect("объект появился");
+    assert!(has_message(
+        &session.client(1).sink.events,
+        0,
+        Some(handle),
+        "early"
+    ));
+    assert_eq!(session.client(1).bridge.queued_rpc_len(), 0);
+}
+
+#[test]
+fn rpc_queue_is_bounded_and_drops_the_oldest_messages() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.place(root, 500.0);
+    session.step_n(2, STEP);
+
+    let upcoming = session.server.bridge.next_epoch();
+    for _ in 0..300 {
+        session.inject_from(
+            Side::Server,
+            NetTarget::Peer(1),
+            &Message::Rpc {
+                object: Some(net),
+                epoch: upcoming,
+                name: "flood".to_owned(),
+                value: ParamValue::Bool(true),
+            },
+            Channel::Rpc,
+        );
+    }
+    session.step_n(2, STEP);
+    assert_eq!(session.client(1).bridge.queued_rpc_len(), 256);
+}
+
+#[test]
+fn late_joiner_gets_a_filtered_snapshot() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.step_n(2, STEP);
+    assert!(mirror(session.client(1), net).is_some());
+
+    session.connect();
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(2), net).is_none(),
+        "без своих объектов корень не виден"
+    );
+
+    let second = session.spawn_on_server(OWNED);
+    session.own(second, 2);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(2), net).is_some(),
+        "свой объект открывает зону"
+    );
+}
+
+#[test]
+fn nested_root_follows_its_parent_out_of_and_into_the_zone() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let root_net = session.net_of(root);
+    session.place(root, 500.0);
+    session.step_n(2, STEP);
+
+    let root_id = session.server.world.object(root).unwrap().id.clone();
+    let lid = session
+        .server
+        .world
+        .handle(&format!("{root_id}.lid"))
+        .unwrap();
+    let options = SpawnOptions {
+        parent: Some(lid),
+        ..SpawnOptions::default()
+    };
+    let nested = session
+        .server
+        .sink
+        .spawn(&mut session.server.world, CRATE, options)
+        .unwrap();
+    session.server.spawned.push(SpawnedRoot {
+        handle: nested,
+        prefab: CRATE.to_owned(),
+    });
+    session.step_n(2, STEP);
+    let nested_net = session.net_of(nested);
+    assert!(
+        mirror(session.client(1), nested_net).is_none(),
+        "родитель вне зоны — вложенного корня нет"
+    );
+
+    session.place(root, 0.0);
+    session.step_n(3, STEP);
+    assert!(
+        mirror(session.client(1), root_net).is_some(),
+        "родитель вошёл в зону"
+    );
+    assert!(
+        mirror(session.client(1), nested_net).is_some(),
+        "вложенный корень появился вместе с ним"
+    );
+}
+
+#[test]
+fn leave_during_heavy_loading_cancels_the_spawn() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect_with(&[HEAVY]);
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(HEAVY);
+    let net = session.net_of(root);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_none(),
+        "префаб ещё загружается"
+    );
+
+    session.place(root, 500.0);
+    session.step_n(2, STEP);
+    let node = session.client_mut(1);
+    node.sink.finish_loading(&mut node.world);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_none(),
+        "снятый до загрузки объект не появляется"
+    );
 }
