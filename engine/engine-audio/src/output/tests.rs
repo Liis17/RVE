@@ -1,5 +1,6 @@
 use super::*;
 use cpal::{SampleFormat, SupportedBufferSize};
+use std::time::{Duration, Instant};
 
 fn range(
     channels: u16,
@@ -173,4 +174,78 @@ fn unsupported_formats_are_listed_in_the_error() {
 fn a_device_without_any_configuration_is_an_error() {
     let error = choose_config(Err("сбой".into()), Ok(Vec::new())).unwrap_err();
     assert!(error.contains("нет конфигураций вывода"), "{error}");
+}
+
+/// Задержки, которые `Reconnect` ставит после каждой подряд идущей неудачи.
+fn waits_after_failures(count: usize) -> Vec<Duration> {
+    let now = Instant::now();
+    let mut reconnect = Reconnect::default();
+    reconnect.schedule(now);
+    (0..count)
+        .map(|_| {
+            reconnect.failed(now);
+            reconnect.wait(now).expect("попытка запланирована")
+        })
+        .collect()
+}
+
+#[test]
+fn the_first_attempt_after_a_loss_is_immediate_then_the_delays_double_up_to_five_seconds() {
+    let ms = Duration::from_millis;
+    assert_eq!(
+        waits_after_failures(8),
+        [
+            ms(250),
+            ms(500),
+            ms(1_000),
+            ms(2_000),
+            ms(4_000),
+            ms(5_000),
+            ms(5_000),
+            ms(5_000),
+        ]
+    );
+    let now = Instant::now();
+    let mut reconnect = Reconnect::default();
+    reconnect.schedule(now);
+    assert_eq!(reconnect.wait(now), Some(Duration::ZERO));
+    assert!(reconnect.due(now));
+}
+
+#[test]
+fn an_attempt_is_due_only_once_its_delay_has_passed() {
+    let now = Instant::now();
+    let mut reconnect = Reconnect::default();
+    reconnect.failed(now);
+    let later = now + Duration::from_millis(249);
+    assert!(!reconnect.due(later));
+    assert!(reconnect.due(now + Duration::from_millis(250)));
+}
+
+#[test]
+fn a_running_stream_resets_the_delays_after_a_loss() {
+    let now = Instant::now();
+    let mut reconnect = Reconnect::default();
+    for _ in 0..3 {
+        reconnect.failed(now);
+    }
+    reconnect.opened();
+    reconnect.alive();
+    reconnect.schedule(now);
+    assert_eq!(reconnect.wait(now), Some(Duration::ZERO));
+}
+
+#[test]
+fn a_stream_that_dies_before_its_first_callback_keeps_the_delays_growing() {
+    let now = Instant::now();
+    let mut reconnect = Reconnect::default();
+    reconnect.schedule(now);
+    reconnect.opened();
+    assert_eq!(
+        reconnect.wait(now),
+        None,
+        "после открытия попытка не запланирована"
+    );
+    reconnect.schedule(now);
+    assert_eq!(reconnect.wait(now), Some(Duration::from_millis(250)));
 }
