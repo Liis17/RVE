@@ -204,9 +204,19 @@ impl AutosaveStore {
     }
 
     /// Удаляет оба слота и прежний файл; отсутствие файла не ошибка. Первая другая ошибка
-    /// возвращается после попытки удалить остальные файлы.
+    /// возвращается после попытки удалить остальные файлы. Каталог и `.lock` не создаются:
+    /// `write` создаёт `.lock` раньше слотов, поэтому без `.lock` слотов нет и блокировка не нужна.
+    /// Ошибка блокировки не мешает удалению, но и не выводится предупреждением: `remove` его не возвращает.
     pub fn remove(&self, scene: Option<&VirtualPath>) -> Result<(), String> {
-        let (_lock, _) = self.lock(scene)?;
+        let path = self.lock_path(scene);
+        let _lock = match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => {
+                let _ = take_lock(&file, &path, File::lock);
+                Some(file)
+            }
+            Err(error) if is_missing(&error) => None,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
         let mut first_error = None;
         for file in [
             self.slot(scene, "a"),
@@ -226,8 +236,9 @@ impl AutosaveStore {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Открывает `.lock` сцены и берёт эксклюзивную блокировку. Файловая система без блокировок
-    /// не мешает записи: тогда возвращается предупреждение. Остальные ошибки прерывают запись.
+    /// Создаёт каталог, открывает `.lock` сцены и берёт эксклюзивную блокировку. Ошибки создания
+    /// каталога и открытия файла прерывают запись. Любая ошибка самой блокировки (например,
+    /// ENOLCK на NFS) означает запись без неё, и причина возвращается предупреждением.
     fn lock(&self, scene: Option<&VirtualPath>) -> Result<(File, Vec<String>), String> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|error| format!("{}: {error}", self.dir.display()))?;
@@ -239,17 +250,8 @@ impl AutosaveStore {
             .truncate(false)
             .open(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        match file.lock() {
-            Ok(()) => Ok((file, Vec::new())),
-            Err(error) if error.kind() == ErrorKind::Unsupported => {
-                let warning = format!(
-                    "{}: блокировка недоступна, запись без неё: {error}",
-                    path.display()
-                );
-                Ok((file, vec![warning]))
-            }
-            Err(error) => Err(format!("{}: {error}", path.display())),
-        }
+        let warnings = take_lock(&file, &path, File::lock).into_iter().collect();
+        Ok((file, warnings))
     }
 
     /// Уникальный временный файл слота: процесс и счётчик.
@@ -344,6 +346,21 @@ fn is_missing(error: &std::io::Error) -> bool {
         error.kind(),
         ErrorKind::NotFound | ErrorKind::InvalidFilename
     )
+}
+
+/// Берёт блокировку через `take` (в рабочем коде — `File::lock`). Любая ошибка означает запись
+/// без блокировки; её причина возвращается предупреждением для Console.
+fn take_lock(
+    file: &File,
+    path: &Path,
+    take: impl FnOnce(&File) -> std::io::Result<()>,
+) -> Option<String> {
+    take(file).err().map(|error| {
+        format!(
+            "{}: блокировка не взята, запись без неё: {error}",
+            path.display()
+        )
+    })
 }
 
 /// Возраст копии для окна восстановления: «только что», «N с/мин/ч/дн назад». Время в будущем —
@@ -681,19 +698,26 @@ mod tests {
     }
 
     #[test]
-    fn failed_publish_keeps_the_newest_generation_and_leaves_no_temporary_file() {
+    fn failed_publish_keeps_both_generations_and_leaves_no_temporary_file() {
         let project = TempDir::new();
         let store = AutosaveStore::for_project(&project.0);
         store.write(None, "first").unwrap();
         store.write(None, "second").unwrap();
 
-        // Следующая запись выберет слот `a` с меньшим `seq`; каталог на его месте не даёт опубликовать копию.
-        let older = store.slot(None, "a");
-        std::fs::remove_file(&older).unwrap();
-        std::fs::create_dir(&older).unwrap();
-        assert!(store.write(None, "third").is_err());
+        // Два исправных поколения: запись выберет слот `a` (`seq` 1). Хук удаляет временный файл
+        // до публикации, поэтому `rename` падает и слот не меняется.
+        let result = store.write_locked(None, "third", || {
+            for entry in std::fs::read_dir(&store.dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+        });
 
-        assert_eq!(texts(&store, None), ["second"]);
+        let error = result.unwrap_err();
+        assert!(error.starts_with(&store.slot(None, "a").display().to_string()));
+        assert_eq!(texts(&store, None), ["second", "first"]);
         let leftovers = std::fs::read_dir(&store.dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -701,9 +725,43 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
 
-        std::fs::remove_dir(&older).unwrap();
         store.write(None, "third").unwrap();
         assert_eq!(texts(&store, None), ["third", "second"]);
+    }
+
+    #[test]
+    fn remove_without_a_lock_file_creates_nothing_and_removes_the_legacy_file() {
+        let project = TempDir::new();
+        let store = AutosaveStore::for_project(&project.0);
+        let scene = path("/scenes/a.rvescene");
+        // Прежний файл есть, каталога `v2` и `.lock` нет: `remove` не должен их создавать.
+        std::fs::create_dir_all(&store.legacy_dir).unwrap();
+        std::fs::write(store.legacy_file(Some(&scene)), "legacy").unwrap();
+
+        store.remove(Some(&scene)).unwrap();
+
+        assert!(!store.legacy_file(Some(&scene)).exists());
+        assert!(!store.dir.exists());
+        assert!(!store.lock_path(Some(&scene)).exists());
+    }
+
+    #[test]
+    fn any_lock_error_is_a_warning_and_not_a_failure() {
+        let project = TempDir::new();
+        let store = AutosaveStore::for_project(&project.0);
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let lock = store.lock_path(None);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock)
+            .unwrap();
+
+        let warning = take_lock(&file, &lock, |_| Err(std::io::Error::other("ENOLCK"))).unwrap();
+        assert!(warning.starts_with(&lock.display().to_string()));
+        assert!(warning.contains("ENOLCK"));
+        assert_eq!(take_lock(&file, &lock, |_| Ok(())), None);
     }
 
     #[test]

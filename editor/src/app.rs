@@ -967,6 +967,29 @@ impl EditorApp {
         }
     }
 
+    /// Удаляет копии сцены из окна восстановления. При неудаче окно остаётся открытым, а путь и
+    /// причина попадают в список ошибок окна и в Console.
+    fn discard_autosave(&mut self) {
+        let Some(prompt) = &self.state.recovery_prompt else {
+            return;
+        };
+        let scene = prompt.scene.clone();
+        let removed = self
+            .autosave_store()
+            .map_or(Ok(()), |store| store.remove(scene.as_ref()));
+        match removed {
+            Ok(()) => self.state.recovery_prompt = None,
+            Err(error) => {
+                self.state.log.push(LogLevel::Error, error.clone());
+                if let Some(prompt) = &mut self.state.recovery_prompt
+                    && !prompt.errors.contains(&error)
+                {
+                    prompt.errors.push(error);
+                }
+            }
+        }
+    }
+
     /// Копия изменённой сцены, которую `discard_changes` велит отбросить. Берётся до смены сцены или проекта,
     /// потому что после смены проекта каталог копий уже другой; удаляется только после успешной смены.
     fn discarded_scene_autosave(
@@ -1847,11 +1870,7 @@ impl EditorApp {
                     self.run_confirmed(*then);
                 }
                 Action::RestoreAutosave(index) => self.restore_autosave(index),
-                Action::DiscardAutosave => {
-                    if let Some(prompt) = self.state.recovery_prompt.take() {
-                        self.remove_autosave(prompt.scene.as_ref());
-                    }
-                }
+                Action::DiscardAutosave => self.discard_autosave(),
                 Action::KeepAutosave => self.state.recovery_prompt = None,
                 Action::SaveThen(then) => {
                     if self.save(false) {
@@ -3456,6 +3475,64 @@ mod tests {
             app.state.scene.as_ref().unwrap().document().objects.len(),
             2
         );
+    }
+
+    #[test]
+    fn failed_discard_keeps_the_recovery_window_open_with_the_path() {
+        let root = temp_project("failed-discard");
+        // Непустой каталог на месте прежнего файла: `remove_file` его не удалит.
+        let legacy = root.join(".rve/editor/autosave/~untitled.autosave");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("inner"), "x").unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.recovery_prompt = Some(RecoveryPrompt {
+            scene: None,
+            copies: Vec::new(),
+            errors: Vec::new(),
+        });
+
+        app.state.action(Action::DiscardAutosave);
+        app.run_actions();
+        // Повторный Discard не дублирует ошибку в окне.
+        app.state.action(Action::DiscardAutosave);
+        app.run_actions();
+
+        let prompt = app
+            .state
+            .recovery_prompt
+            .as_ref()
+            .expect("window stays open");
+        assert_eq!(prompt.errors.len(), 1);
+        assert!(prompt.errors[0].starts_with(&legacy.display().to_string()));
+        assert_eq!(
+            app.state.log.entries().next_back().map(|entry| entry.level),
+            Some(LogLevel::Error)
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discard_removes_the_copies_and_closes_the_window() {
+        let root = temp_project("discard");
+        let store = AutosaveStore::for_project(&root);
+        store.write(None, "untitled copy").unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.recovery_prompt = Some(RecoveryPrompt {
+            scene: None,
+            copies: Vec::new(),
+            errors: Vec::new(),
+        });
+
+        app.state.action(Action::DiscardAutosave);
+        app.run_actions();
+
+        assert!(app.state.recovery_prompt.is_none());
+        assert!(store.read(None).copies.is_empty());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
