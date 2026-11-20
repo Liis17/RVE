@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [features]
 dev-console = ["dep:egui", "dep:egui-winit", "dep:winit", "engine-ui/egui"]
 dlss = ["engine-render/dlss"]
+crash-dumps = ["dep:crash-handler", "dep:minidumper"]
 
 [dependencies]
 engine-core = { path = "../engine-core" }
@@ -40,8 +41,13 @@ glam.workspace = true
 log.workspace = true
 png.workspace = true
 rfd.workspace = true
+getrandom.workspace = true
 sysinfo.workspace = true
 winit = { workspace = true, optional = true }
 
 [dev-dependencies]
 rve-sdk = { path = "../rve-sdk" }
+
+[target.'cfg(any(all(windows, target_arch = "x86_64"), target_os = "macos"))'.dependencies]
+crash-handler = { workspace = true, optional = true }
+minidumper = { workspace = true, optional = true }

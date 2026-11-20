@@ -1,7 +1,8 @@
 //! Имена и хранение файлов отчётов о падении (`crash-*.txt` и `crash-*.dmp`).
 //! Общие для игры (текстовые отчёты) и монитора (minidump).
 
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -131,6 +132,64 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// Аргументы `rve-crash-monitor`: сокет для клиента, каталог отчётов и pid процесса игры.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MonitorArgs {
+    pub socket: PathBuf,
+    pub dir: PathBuf,
+    pub parent: u32,
+}
+
+/// Разбирает `--socket <path> --dir <path> --parent <pid>` в любом порядке.
+pub fn parse_args<I>(args: I) -> Result<MonitorArgs, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut socket = None;
+    let mut dir = None;
+    let mut parent = None;
+    let mut args = args.into_iter();
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("после {} нужно значение", flag.to_string_lossy()))?;
+        match flag.to_str() {
+            Some("--socket") => socket = Some(PathBuf::from(value)),
+            Some("--dir") => dir = Some(PathBuf::from(value)),
+            Some("--parent") => {
+                let pid = value
+                    .to_str()
+                    .and_then(|text| text.parse::<u32>().ok())
+                    .filter(|pid| *pid != 0)
+                    .ok_or_else(|| "--parent должен быть pid больше нуля".to_owned())?;
+                parent = Some(pid);
+            }
+            _ => return Err(format!("неизвестный аргумент {}", flag.to_string_lossy())),
+        }
+    }
+    Ok(MonitorArgs {
+        socket: socket.ok_or("нужен --socket")?,
+        dir: dir.ok_or("нужен --dir")?,
+        parent: parent.ok_or("нужен --parent")?,
+    })
+}
+
+/// Имя дампа: `crash-<время UTC>-<pid процесса игры>.dmp`.
+pub fn dump_file_name(time: SystemTime, parent: u32) -> String {
+    format!("crash-{}-{parent}.dmp", utc_stamp(time))
+}
+
+/// Создаёт новый файл дампа в `dir`; существующий файл не перезаписывается.
+pub fn create_dump_file(dir: &Path, parent: u32, time: SystemTime) -> io::Result<(File, PathBuf)> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(dump_file_name(time, parent));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok((file, path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +313,72 @@ mod tests {
         assert!(own.exists(), "собственный файл не удаляется");
         assert!(unrelated.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod args_and_dumps_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::io::Write;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_all_flags_in_any_order() {
+        let parsed = parse_args(args(&[
+            "--parent", "4242", "--dir", "Logs", "--socket", "s",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            MonitorArgs {
+                socket: PathBuf::from("s"),
+                dir: PathBuf::from("Logs"),
+                parent: 4242,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_values_unknown_flags_and_bad_parents() {
+        assert!(parse_args(args(&["--socket"])).is_err());
+        assert!(parse_args(args(&["--socket", "s", "--dir", "d"])).is_err());
+        assert!(parse_args(args(&["--socket", "s", "--dir", "d", "--parent", "0"])).is_err());
+        assert!(parse_args(args(&["--socket", "s", "--dir", "d", "--parent", "x"])).is_err());
+        assert!(
+            parse_args(args(&[
+                "--socket", "s", "--dir", "d", "--parent", "1", "--extra", "y"
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dump_name_carries_the_utc_time_and_game_pid() {
+        let time = UNIX_EPOCH + Duration::from_secs(1_709_251_199);
+        assert_eq!(dump_file_name(time, 77), "crash-20240229-235959-77.dmp");
+    }
+
+    #[test]
+    fn dump_file_is_created_once_in_a_missing_directory() {
+        let root = std::env::temp_dir().join(format!("rve-dump-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("Logs");
+        let time = UNIX_EPOCH + Duration::from_secs(0);
+
+        let (mut file, path) = create_dump_file(&dir, 9, time).unwrap();
+        file.write_all(b"MDMP").unwrap();
+        drop(file);
+
+        assert_eq!(path, dir.join("crash-19700101-000000-9.dmp"));
+        assert_eq!(fs::read(&path).unwrap(), b"MDMP");
+        assert!(
+            create_dump_file(&dir, 9, time).is_err(),
+            "дамп не перезаписывается"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

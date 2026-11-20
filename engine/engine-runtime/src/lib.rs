@@ -8,6 +8,11 @@ mod cli;
 #[cfg(feature = "dev-console")]
 mod console;
 mod crash;
+#[cfg(all(
+    feature = "crash-dumps",
+    any(all(windows, target_arch = "x86_64"), target_os = "macos")
+))]
+mod crash_dumps;
 mod cursor;
 #[cfg(any(feature = "dev-console", test))]
 mod dev_overlays;
@@ -172,6 +177,19 @@ pub fn run_server() -> ExitCode {
     )
 }
 
+#[cfg(all(
+    feature = "crash-dumps",
+    any(all(windows, target_arch = "x86_64"), target_os = "macos")
+))]
+use crash_dumps::start as start_crash_dumps;
+
+/// Без `crash-dumps` или на платформе без minidump дампы не пишутся.
+#[cfg(not(all(
+    feature = "crash-dumps",
+    any(all(windows, target_arch = "x86_64"), target_os = "macos")
+)))]
+fn start_crash_dumps(_exe_dir: &Path, _logs_dir: Option<&Path>) {}
+
 fn executable_dir() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let executable = normalize_layout_path(&executable).map_err(|error| error.to_string())?;
@@ -253,7 +271,8 @@ fn run_from_args(
         Err(error) => return fail(2, format!("ошибка проекта: {error}")),
     };
     let role = if headless { Role::Server } else { Role::Player };
-    crash::set_target(role, report_dir, &project.name);
+    let report_dir = crash::set_target(role, report_dir, &project.name);
+    start_crash_dumps(&exe_dir, report_dir.as_deref());
     let prefab_list = match load_prefab_catalog(&layout.prefab_catalog, &resource_handle) {
         Ok(list) => list,
         Err(error) => return fail(2, format!("ошибка списка префабов: {error}")),
