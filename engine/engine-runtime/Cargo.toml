@@ -1,6 +1,6 @@
 [package]
 name = "engine-runtime"
-version = "0.33.1"
+version = "0.34.1"
 edition.workspace = true
 license.workspace = true
 
@@ -10,10 +10,12 @@ path = "src/lib.rs"
 [features]
 dev-console = ["dep:egui", "dep:egui-winit", "dep:winit", "engine-ui/egui"]
 dlss = ["engine-render/dlss"]
+crash-dumps = ["dep:crash-handler", "dep:minidumper", "dep:getrandom"]
 
 [dependencies]
 engine-core = { path = "../engine-core" }
 engine-console = { path = "../engine-console" }
+rve-crash-monitor = { path = "../rve-crash-monitor", default-features = false }
 engine-input = { path = "../engine-input" }
 egui = { workspace = true, optional = true }
 egui-winit = { workspace = true, optional = true }
@@ -43,3 +45,8 @@ winit = { workspace = true, optional = true }
 
 [dev-dependencies]
 rve-sdk = { path = "../rve-sdk" }
+
+[target.'cfg(any(all(windows, target_arch = "x86_64"), target_os = "macos"))'.dependencies]
+crash-handler = { workspace = true, optional = true }
+minidumper = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }

@@ -29,3 +29,7 @@ rustc-ice-*.txt
 # LLVM coverage profile data written by instrumented binaries
 default.profraw
 /release/
+
+# Crash reports: release Logs next to the executable, dev Logs in example projects
+/Logs/
+examples/**/Logs/

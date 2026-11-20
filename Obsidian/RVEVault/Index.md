@@ -31,10 +31,10 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineInput]] | Геймпады: `gilrs`-бэкенд, перевод событий, слоты 1–4, фокусный гейт снимка и вибрация |
 | [[Engine/EngineAnimation]] | Скелетная анимация: позы, клипы, blend tree, one-shot с переходом, палитры skinning и мост аниматоров |
 | [[Engine/EngineNetwork]] | Сеть: UDP-протокол с шифрованием и рукопожатием, sans-IO Server/Client, репликация объектов, снимки и мост к миру |
-| [[Engine/EngineConsole]] | Ограниченный буфер лога, команды и общий egui developer console |
+| [[Engine/EngineConsole]] | Ограниченный буфер лога, кольцо последних строк для отчётов о падении, упорядоченный каталог команд с поиском по ссылкам и общий egui developer console |
 | [[Engine/RveSdk]] | C ABI и гостевой API для игровых Rust-скриптов в `cdylib` |
-| [[Engine/EngineRuntime]] | Runtime игры: layout проекта, потоки сцены, скриптов и рендера, быстрые и тяжёлые префабы, сетевой режим и выделенный сервер `rve-server`, завершение и коды выхода |
-| [[Engine/RveBuild]] | Сборка релиза проекта в player и набор RVEPAK |
+| [[Engine/EngineRuntime]] | Runtime игры: layout проекта, потоки сцены, скриптов и рендера, быстрые и тяжёлые префабы, сетевой режим и выделенный сервер `rve-server`, отчёты о падении (текстовые и minidump через `rve-crash-monitor`), завершение и коды выхода |
+| [[Engine/RveBuild]] | Сборка релиза проекта в player, сервер и монитор падений `rve-crash-monitor` и набор RVEPAK |
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 | [[Engine/RveEditor]] | Графический редактор сцен на egui: панели, правки с undo, вьюпорт и Play |
 | [[Engine/EngineMcp]] | Локальный MCP-сервер редактора: Streamable HTTP на `127.0.0.1`, сессии, права и очередь вызовов |

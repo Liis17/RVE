@@ -11,7 +11,7 @@ import zipfile
 
 def package_sdk(sdk, archive):
     for relative in [
-        "rve-editor.exe", "rve-build.exe", "rve-player.exe", "rve-player-dev.exe",
+        "rve-editor.exe", "rve-build.exe", "rve-player.exe", "rve-player-dev.exe", "rve-crash-monitor.exe",
         "rve-sdk.toml", "rve-sdk/Cargo.toml", "rve-sdk/src/lib.rs",
         "toolchain/bin/cargo.exe", "toolchain/bin/rustc.exe",
     ]:
