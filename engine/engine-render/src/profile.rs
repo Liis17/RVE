@@ -24,8 +24,12 @@ pub enum GpuPass {
     Transparent,
     /// Отладочный wireframe.
     Wireframe,
-    /// Частицы: spawn, симуляция и аддитивные billboards.
-    Particles,
+    /// Частицы: spawn и симуляция владельца; отсутствует, если вид не записал ни clear, ни spawn, ни шаг.
+    ParticleSimulation,
+    /// Сортировка alpha-эмиттеров вида; отсутствует, если alpha-частиц нет.
+    ParticleSort,
+    /// Billboards частиц вида; отсутствует, если видимых частиц нет.
+    ParticleDraw,
     /// Адаптация экспозиции по гистограмме HDR цели сцены до temporal resolve; отсутствует при
     /// ручной экспозиции.
     Exposure,
@@ -45,7 +49,7 @@ pub enum GpuPass {
 
 impl GpuPass {
     /// Число проходов, для которых записываются границы.
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 19;
     /// Все проходы в порядке выполнения.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Clusters,
@@ -57,7 +61,9 @@ impl GpuPass {
         Self::Skybox,
         Self::Transparent,
         Self::Wireframe,
-        Self::Particles,
+        Self::ParticleSimulation,
+        Self::ParticleSort,
+        Self::ParticleDraw,
         Self::Exposure,
         Self::TemporalResolve,
         Self::ScreenShaderBefore,
@@ -79,7 +85,9 @@ impl GpuPass {
             Self::Skybox => "Skybox",
             Self::Transparent => "Transparent",
             Self::Wireframe => "Wireframe",
-            Self::Particles => "Particles",
+            Self::ParticleSimulation => "Particles spawn+sim",
+            Self::ParticleSort => "Particles sort",
+            Self::ParticleDraw => "Particles draw",
             Self::TemporalResolve => "Temporal resolve",
             Self::ScreenShaderBefore => "Screen shaders before post",
             Self::Filters => "Motion blur and DoF",

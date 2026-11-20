@@ -64,7 +64,7 @@ Push constants занимают 112 байт. Вход — линейный цв
 - `Renderer::create_screen_shader(source) -> ScreenShaderId` создаёт два пайплайна: вариант `before_post` в `OFFSCREEN_FORMAT` и `after_post` в `LDR_FORMAT`. Ошибка компиляции возвращает `RenderError::ScreenShader` и не меняет состояние.
 - `Renderer::destroy_screen_shader(id)` отправляет пайплайны в `retired`. Ссылка на уничтоженный id в `ViewSettings` даёт `InvalidConfig`.
 - `ViewSettings::screen_shaders: ScreenShaders` — до четырёх `Option<ScreenShaderPass>` в порядке записи и `time`. `ScreenShaderPass` содержит `shader`, `stage` и `params`.
-- `GpuPass` имеет `ScreenShaderBefore` (перед motion blur и DoF) и `ScreenShaderAfter` (после composite), всего 17 записываемых границ.
+- `GpuPass` имеет `ScreenShaderBefore` (перед motion blur и DoF) и `ScreenShaderAfter` (после composite), всего 19 записываемых границ.
 
 ### Порядок в кадре
 

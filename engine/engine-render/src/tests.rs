@@ -3271,8 +3271,8 @@ fn passes_sum(view: &GpuViewTimings) -> Duration {
 
 #[test]
 fn view_timings_split_ticks_between_recorded_boundaries() {
-    // Начало, затем граница после каждого из семнадцати проходов в порядке выполнения;
-    // экранные шейдеры не записаны и отдают пустую границу.
+    // Начало, затем граница после каждого из девятнадцати проходов в порядке выполнения;
+    // сортировка частиц не записана, экранные шейдеры и temporal resolve отдают пустую границу.
     let marks = [
         Some(100),
         Some(110),
@@ -3285,12 +3285,14 @@ fn view_timings_split_ticks_between_recorded_boundaries() {
         Some(175),
         Some(180),
         Some(185),
-        Some(190),
         None,
         Some(195),
         Some(200),
+        None,
         Some(205),
+        Some(210),
         Some(215),
+        Some(225),
         None,
     ];
     let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
@@ -3309,6 +3311,8 @@ fn view_timings_split_ticks_between_recorded_boundaries() {
             Some(ns(10)),
             Some(ns(5)),
             Some(ns(5)),
+            None,
+            Some(ns(10)),
             Some(ns(5)),
             None,
             Some(ns(5)),
@@ -3318,7 +3322,7 @@ fn view_timings_split_ticks_between_recorded_boundaries() {
             None,
         ]
     );
-    assert_eq!(view.total, ns(115));
+    assert_eq!(view.total, ns(125));
     assert_eq!(passes_sum(&view), view.total);
 }
 
@@ -3480,8 +3484,95 @@ fn layout_keeps_keys_of_the_frame_after_viewport_set_changes() {
 }
 
 #[test]
+fn particle_stages_decode_per_view_from_their_own_marks() {
+    let mut layout = GpuProfileLayout::default();
+    let owner_first = layout
+        .add_view(ProfiledView::Viewport(ViewportId(1)))
+        .unwrap();
+    let other_first = layout
+        .add_view(ProfiledView::Viewport(ViewportId(2)))
+        .unwrap();
+    let mark = |first: u32, pass: GpuPass| first as usize + 1 + pass as usize;
+    let mut queries = [None; TIMESTAMP_QUERY_COUNT as usize];
+    // Владелец симуляции: spawn+sim, sort и draw.
+    queries[owner_first as usize] = Some(0);
+    queries[mark(owner_first, GpuPass::ParticleSimulation)] = Some(100);
+    queries[mark(owner_first, GpuPass::ParticleSort)] = Some(130);
+    queries[mark(owner_first, GpuPass::ParticleDraw)] = Some(180);
+    // Второй вид без симуляции: метки sort и draw, метки spawn+sim нет.
+    queries[other_first as usize] = Some(0);
+    queries[mark(other_first, GpuPass::ParticleSort)] = Some(40);
+    queries[mark(other_first, GpuPass::ParticleDraw)] = Some(90);
+
+    let timings = layout.decode(&queries, 64, 1.0);
+
+    let owner = timings.views[0].expect("владелец записан в кадр");
+    assert_eq!(owner.key, ProfiledView::Viewport(ViewportId(1)));
+    assert_eq!(
+        owner.passes[GpuPass::ParticleSimulation as usize],
+        Some(ns(100))
+    );
+    assert_eq!(owner.passes[GpuPass::ParticleSort as usize], Some(ns(30)));
+    assert_eq!(owner.passes[GpuPass::ParticleDraw as usize], Some(ns(50)));
+    assert_eq!(owner.total, ns(180));
+
+    let other = timings.views[1].expect("второй вид записан в кадр");
+    assert_eq!(other.key, ProfiledView::Viewport(ViewportId(2)));
+    assert_eq!(other.passes[GpuPass::ParticleSimulation as usize], None);
+    assert_eq!(other.passes[GpuPass::ParticleSort as usize], Some(ns(40)));
+    assert_eq!(other.passes[GpuPass::ParticleDraw as usize], Some(ns(50)));
+    assert_eq!(other.total, ns(90));
+
+    for pass in GpuPass::ALL {
+        if !matches!(
+            pass,
+            GpuPass::ParticleSimulation | GpuPass::ParticleSort | GpuPass::ParticleDraw
+        ) {
+            assert_eq!(owner.passes[pass as usize], None, "{pass:?} не записан");
+            assert_eq!(other.passes[pass as usize], None, "{pass:?} не записан");
+        }
+    }
+}
+
+#[test]
+fn skipped_sort_mark_moves_its_time_into_particle_draw() {
+    let mut marks = [None; VIEW_QUERY_COUNT as usize];
+    marks[0] = Some(0);
+    marks[1 + GpuPass::ParticleSimulation as usize] = Some(100);
+    marks[1 + GpuPass::ParticleDraw as usize] = Some(180);
+
+    let timing = decode_view(ProfiledView::Screen, &marks, 64, 1.0).expect("вид записан");
+
+    assert_eq!(timing.passes[GpuPass::ParticleSort as usize], None);
+    assert_eq!(timing.passes[GpuPass::ParticleDraw as usize], Some(ns(80)));
+    assert_eq!(timing.total, ns(180));
+}
+
+#[test]
+fn particle_stages_follow_wireframe_in_profile_order() {
+    let position = |pass: GpuPass| {
+        GpuPass::ALL
+            .iter()
+            .position(|&candidate| candidate == pass)
+            .unwrap()
+    };
+    let wireframe = position(GpuPass::Wireframe);
+    assert_eq!(position(GpuPass::ParticleSimulation), wireframe + 1);
+    assert_eq!(position(GpuPass::ParticleSort), wireframe + 2);
+    assert_eq!(position(GpuPass::ParticleDraw), wireframe + 3);
+    assert_eq!(position(GpuPass::Exposure), wireframe + 4);
+    for (index, pass) in GpuPass::ALL.iter().enumerate() {
+        assert_eq!(*pass as usize, index);
+    }
+    let mut labels: Vec<_> = GpuPass::ALL.iter().map(|pass| pass.label()).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), GpuPass::COUNT);
+}
+
+#[test]
 fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-    assert_eq!(TIMESTAMP_QUERY_COUNT, 74);
+    assert_eq!(TIMESTAMP_QUERY_COUNT, 82);
     let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
     let mut layout = GpuProfileLayout::default();
     for index in 0..MAX_PROFILED_VIEWS {
