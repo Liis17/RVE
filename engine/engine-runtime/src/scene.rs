@@ -10,11 +10,11 @@ use engine_physics::{
 };
 use engine_project::PhysicsSettings;
 use engine_render::{
-    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, ParticleBlend, ParticleBurst,
-    ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook, ParticleShape,
-    ParticleSizeKey, RenderError, Renderer, ShaderId, SkinVertex, SurfaceLighting, SurfaceProperty,
-    SurfacePropertyKind, SurfaceShaderSource, SurfaceTextureFallback, TextureColorSpace, TextureId,
-    TextureRole, Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, NormalMipChain, ParticleBlend,
+    ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook,
+    ParticleShape, ParticleSizeKey, RenderError, Renderer, ShaderId, SkinVertex, SurfaceLighting,
+    SurfaceProperty, SurfacePropertyKind, SurfaceShaderSource, SurfaceTextureFallback,
+    TextureColorSpace, TextureId, TextureRole, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::prefab::PREFAB_EXTENSION;
@@ -69,6 +69,8 @@ pub(crate) struct PreparedRenderAssets {
     /// 3D LUT цветокоррекции камер по каноническому пути `.cube`. Как и экранные шейдеры,
     /// читаются только игровым клиентом.
     pub color_luts: BTreeMap<String, CubeLut>,
+    /// Mip-цепочки normal map, построенные при подготовке (в потоке загрузки).
+    pub normal_chains: NormalChains,
 }
 
 #[derive(Default)]
@@ -77,6 +79,90 @@ pub(crate) struct PreparedMaterialAssets {
     pub textures: HashMap<String, TextureData>,
     pub material_assets: HashMap<String, Result<MaterialAsset, String>>,
     pub shader_assets: HashMap<String, Result<ShaderAsset, String>>,
+    pub normal_chains: NormalChains,
+}
+
+/// Mip-цепочки normal map для текстур, которые могут занять слот `normal_texture` встроенного
+/// Lit. Строятся при подготовке; ключи совпадают с ключами загрузки в `upload_material_texture`
+/// и `TextureSources`: модельные — путь модели и индекс текстуры, сценовые — путь. Текстура без
+/// цепочки (например, назначенная скриптом через `set_material`) строится на render thread.
+#[derive(Default)]
+pub(crate) struct NormalChains {
+    models: HashMap<String, HashMap<usize, NormalMipChain>>,
+    scene: HashMap<String, NormalMipChain>,
+}
+
+impl NormalChains {
+    pub(crate) fn get(
+        &self,
+        model_path: &str,
+        source: &MaterialTextureSource,
+    ) -> Option<&NormalMipChain> {
+        match source {
+            MaterialTextureSource::Model(index) => self.models.get(model_path)?.get(index),
+            MaterialTextureSource::Scene(path) => self.scene.get(path),
+        }
+    }
+
+    /// Строит цепочки для кандидатов: индексы normal-текстур мешей моделей и пути normal-текстур
+    /// материалов сцены (переопределения и `.rvemat` без шейдера). Кандидаты — надмножество
+    /// того, что выберет загрузка: лишняя цепочка стоит памяти, пропущенная даёт только
+    /// построение на render thread. Ошибка построения пропускает текстуру: загрузка повторит
+    /// построение и вернёт её ошибку, как и раньше. `None` — подготовка прервана через `stop`.
+    pub(crate) fn build(
+        models: &HashMap<String, Model>,
+        textures: &HashMap<String, TextureData>,
+        scene_paths: &BTreeSet<String>,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Self> {
+        let mut chains = Self::default();
+        for (model_path, model) in models {
+            let indices = model
+                .meshes
+                .iter()
+                .filter_map(|mesh| mesh.material.normal_texture)
+                .collect::<BTreeSet<_>>();
+            for index in indices {
+                if stop() {
+                    return None;
+                }
+                let Some(texture) = model.textures.get(index) else {
+                    continue;
+                };
+                if let Some(chain) = build_normal_chain(model_path, texture) {
+                    chains
+                        .models
+                        .entry(model_path.clone())
+                        .or_default()
+                        .insert(index, chain);
+                }
+            }
+        }
+        for path in scene_paths {
+            if stop() {
+                return None;
+            }
+            let Some(texture) = textures.get(path) else {
+                continue;
+            };
+            if let Some(chain) = build_normal_chain(path, texture) {
+                chains.scene.insert(path.clone(), chain);
+            }
+        }
+        Some(chains)
+    }
+}
+
+fn build_normal_chain(owner: &str, texture: &TextureData) -> Option<NormalMipChain> {
+    match NormalMipChain::build(texture.width, texture.height, &texture.rgba) {
+        Ok(chain) => Some(chain),
+        Err(error) => {
+            log::warn!(
+                "[material] {owner}: mip-цепочка normal map не построена: {error}; цепочка строится при загрузке"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +171,7 @@ pub(crate) struct MaterialAssetView<'a> {
     pub textures: &'a HashMap<String, TextureData>,
     pub material_assets: &'a HashMap<String, Result<MaterialAsset, String>>,
     pub shader_assets: &'a HashMap<String, Result<ShaderAsset, String>>,
+    normal_chains: &'a NormalChains,
     fallback: Option<&'a PreparedRenderAssets>,
 }
 
@@ -95,6 +182,7 @@ impl<'a> MaterialAssetView<'a> {
             textures: &assets.textures,
             material_assets: &assets.material_assets,
             shader_assets: &assets.shader_assets,
+            normal_chains: &assets.normal_chains,
             fallback: None,
         }
     }
@@ -108,8 +196,20 @@ impl<'a> MaterialAssetView<'a> {
             textures: &assets.textures,
             material_assets: &assets.material_assets,
             shader_assets: &assets.shader_assets,
+            normal_chains: &assets.normal_chains,
             fallback,
         }
+    }
+
+    fn normal_chain(
+        &self,
+        model_path: &str,
+        source: &MaterialTextureSource,
+    ) -> Option<&'a NormalMipChain> {
+        self.normal_chains.get(model_path, source).or_else(|| {
+            self.fallback
+                .and_then(|assets| assets.normal_chains.get(model_path, source))
+        })
     }
 
     fn model(&self, path: &str) -> Option<&'a Model> {
@@ -327,6 +427,8 @@ struct RenderAssetSet {
     environments: HashMap<String, Arc<EnvironmentSource>>,
     clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
     lite_paths: BTreeSet<String>,
+    /// Normal-текстуры переопределений материала объектов (кандидаты для mip-цепочек).
+    normal_scene_paths: BTreeSet<String>,
 }
 
 /// Компоненты объекта, из которых готовятся его ресурсы. Одинаковы для объекта мира и для
@@ -456,6 +558,12 @@ fn prepare_scene_with_model_loader(
         }
     }
     set.load_surface_assets(resources, assets, scene_path);
+    // Без `stop`: подготовка сцены не прерывается, `None` невозможен.
+    let normal_chains =
+        NormalChains::build(&set.models, &set.textures, &set.normal_scene_paths, &|| {
+            false
+        })
+        .unwrap_or_default();
 
     let RenderAssetSet {
         models,
@@ -466,6 +574,7 @@ fn prepare_scene_with_model_loader(
         clips,
         lite_paths,
         material_paths: _,
+        normal_scene_paths: _,
     } = set;
     let mut sources = BTreeMap::new();
     for path in lite_paths {
@@ -492,6 +601,7 @@ fn prepare_scene_with_model_loader(
             particles,
             prefab_particles,
             ui_images: BTreeMap::new(),
+            normal_chains,
         },
         prefabs,
     })
@@ -561,6 +671,12 @@ impl RenderAssetSet {
                 }
             }
             let material = mesh.material.clone();
+            if let Some(path) = material
+                .as_ref()
+                .and_then(|material| material.normal_texture.as_ref())
+            {
+                self.normal_scene_paths.insert(path.as_str().to_owned());
+            }
             for path in mesh.materials.iter().flatten() {
                 self.material_paths.insert(path.as_str().to_owned());
             }
@@ -684,6 +800,12 @@ impl RenderAssetSet {
                 None => engine_scene::ShaderSchema::lit(),
             };
             let resolved = material.resolve(&schema);
+            // Без шейдера normal-слот — встроенный Lit, его текстура может стать Normal.
+            if material.shader.is_none()
+                && let Some(Some((path, _))) = resolved.textures.get(2)
+            {
+                self.normal_scene_paths.insert(path.as_str().to_owned());
+            }
             texture_paths.extend(
                 resolved
                     .textures
@@ -1360,6 +1482,7 @@ pub(crate) struct PreparedTemplate {
     pub sources: BTreeMap<String, String>,
     /// `.rveui` шаблона и их ассеты: регистрируются в скриптах и загружаются в GPU при `PrefabReady`.
     pub ui: PreparedUi,
+    pub normal_chains: NormalChains,
 }
 
 /// Заспавненные объекты пока не получают анимацию: аниматор шаблона не готовится, и предупреждение
@@ -1424,6 +1547,9 @@ pub(crate) fn prepare_template(
         }
     }
     set.load_surface_assets(resources, assets, label);
+    let normal_chains =
+        NormalChains::build(&set.models, &set.textures, &set.normal_scene_paths, stop)
+            .ok_or_else(|| STOPPED.to_owned())?;
     let RenderAssetSet {
         models,
         textures,
@@ -1433,6 +1559,7 @@ pub(crate) fn prepare_template(
         clips: _,
         lite_paths,
         material_paths: _,
+        normal_scene_paths: _,
     } = set;
     let mut sources = BTreeMap::new();
     for path in lite_paths {
@@ -1455,6 +1582,7 @@ pub(crate) fn prepare_template(
         particles,
         sources,
         ui,
+        normal_chains,
     })
 }
 
@@ -2541,6 +2669,9 @@ fn upload_material_texture(
     let Some(source) = source else {
         return Ok(None);
     };
+    let chain = (role == TextureRole::Normal)
+        .then(|| assets.normal_chain(model_path, source))
+        .flatten();
     let texture_id = match source {
         MaterialTextureSource::Model(index) => {
             let key = (model_path.to_owned(), *index, color_space, role);
@@ -2550,13 +2681,7 @@ fn upload_material_texture(
                 ))
             })?;
             get_or_insert_gpu(&mut texture_cache.model, key, || {
-                renderer.create_texture_with_role(
-                    texture.width,
-                    texture.height,
-                    &texture.rgba,
-                    color_space,
-                    role,
-                )
+                create_material_texture(renderer, texture, color_space, role, chain)
             })?
         }
         MaterialTextureSource::Scene(path) => {
@@ -2565,29 +2690,44 @@ fn upload_material_texture(
                 RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
             })?;
             get_or_insert_gpu(&mut texture_cache.scene, key, || {
-                renderer.create_texture_with_role(
-                    texture.width,
-                    texture.height,
-                    &texture.rgba,
-                    color_space,
-                    role,
-                )
+                create_material_texture(renderer, texture, color_space, role, chain)
             })?
         }
     };
     Ok(Some(texture_id))
 }
 
+/// GPU-текстура материала: готовая mip-цепочка normal map загружается без вычислений, иначе
+/// цепочка строится здесь (путь для текстур без подготовленной цепочки).
+fn create_material_texture(
+    renderer: &mut Renderer,
+    texture: &TextureData,
+    color_space: TextureColorSpace,
+    role: TextureRole,
+    chain: Option<&NormalMipChain>,
+) -> Result<TextureId, RenderError> {
+    match chain {
+        Some(chain) => renderer.create_texture_from_mip_chain(chain),
+        None => renderer.create_texture_with_role(
+            texture.width,
+            texture.height,
+            &texture.rgba,
+            color_space,
+            role,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ColorLutGpu, CubeLut, GpuTextureCache, MaterialAssetView, MaterialTextureSource,
-        PreparedMaterialAssets, PreparedPrefabs, ScreenShaderGpu, color_lut_paths,
+        NormalChains, PreparedMaterialAssets, PreparedPrefabs, ScreenShaderGpu, color_lut_paths,
         get_or_insert_gpu, load_color_luts, load_scene, load_screen_shader_sources,
         material_cache_key, normal_texture_role, prepare_scene_with_model_loader, resolve_material,
         resolve_material_asset, screen_shader_paths, upload_color_luts, upload_screen_shaders,
     };
-    use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
+    use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, TextureData};
     use engine_files::VirtualPath;
     use engine_physics::BodyKind;
     use engine_project::PhysicsSettings;
@@ -2605,6 +2745,7 @@ mod tests {
     };
     use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -3536,6 +3677,94 @@ id = "camera"
             prepared.sources.get("scripts/main.lua").unwrap(),
             "return {}\n"
         );
+    }
+
+    fn rgba_texture(width: u32, height: u32) -> TextureData {
+        TextureData {
+            width,
+            height,
+            rgba: vec![128; width as usize * height as usize * 4],
+        }
+    }
+
+    #[test]
+    fn normal_chains_cover_only_the_normal_slot_of_prepared_models() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"models/quad.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"quad\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", &scene_text).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            PreparedPrefabs::default(),
+            [0; 32],
+            |_| {
+                Ok(Model {
+                    meshes: vec![ModelMesh {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                        skin: None,
+                        material: ModelMaterial {
+                            base_color_texture: Some(0),
+                            metallic_roughness_texture: Some(1),
+                            normal_texture: Some(2),
+                            ..ModelMaterial::default()
+                        },
+                    }],
+                    textures: vec![rgba_texture(4, 4), rgba_texture(4, 4), rgba_texture(4, 4)],
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+        let chains = &prepared.render_assets.normal_chains;
+        let model = "models/quad.fbx";
+        assert!(
+            chains
+                .get(model, &MaterialTextureSource::Model(2))
+                .is_some()
+        );
+        assert!(
+            chains
+                .get(model, &MaterialTextureSource::Model(0))
+                .is_none()
+        );
+        assert!(
+            chains
+                .get(model, &MaterialTextureSource::Model(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn normal_chain_build_skips_broken_textures_and_honours_interruption() {
+        let textures = HashMap::from([
+            (
+                "tex/broken.png".to_owned(),
+                TextureData {
+                    width: 2,
+                    height: 2,
+                    rgba: vec![0; 3],
+                },
+            ),
+            ("tex/normal.png".to_owned(), rgba_texture(2, 2)),
+        ]);
+        let paths = std::collections::BTreeSet::from([
+            "tex/broken.png".to_owned(),
+            "tex/normal.png".to_owned(),
+        ]);
+        let chains = NormalChains::build(&HashMap::new(), &textures, &paths, &|| false).unwrap();
+        let scene = |path: &str| MaterialTextureSource::Scene(path.to_owned());
+        assert!(chains.get("", &scene("tex/broken.png")).is_none());
+        assert!(chains.get("", &scene("tex/normal.png")).is_some());
+        assert!(NormalChains::build(&HashMap::new(), &textures, &paths, &|| true).is_none());
     }
 
     #[test]

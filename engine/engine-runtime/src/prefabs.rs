@@ -10,16 +10,16 @@ use crate::game_ui::PreparedUi;
 use crate::module_host::ModuleHost;
 use crate::pipeline::ScriptControl;
 use crate::scene::{
-    MaterialTextureSource, ObjectModel, ParticleSource, PreparedMaterialAssets, ResolvedMaterial,
-    load_prefab_template, model_geometry, normal_texture_role, prepare_template, resolve_material,
-    resolve_material_asset,
+    MaterialTextureSource, NormalChains, ObjectModel, ParticleSource, PreparedMaterialAssets,
+    ResolvedMaterial, load_prefab_template, model_geometry, normal_texture_role, prepare_template,
+    resolve_material, resolve_material_asset,
 };
 use engine_assets::{Assets, Model, ModelMaterial, TextureData};
 use engine_files::VirtualPath;
 use engine_physics::ModelGeometry;
 use engine_render::{
-    MaterialId, MeshId, ParticleEmitterDesc, RenderError, Renderer, ShaderId, SurfaceShaderSource,
-    TextureColorSpace, TextureId, TextureRole, Vertex,
+    MaterialId, MeshId, NormalMipChain, ParticleEmitterDesc, RenderError, Renderer, ShaderId,
+    SurfaceShaderSource, TextureColorSpace, TextureId, TextureRole, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::ObjectHandle;
@@ -193,6 +193,11 @@ pub(crate) trait GpuResources {
         color_space: TextureColorSpace,
         role: TextureRole,
     ) -> Result<Self::Texture, RenderError>;
+    /// Normal map из mip-цепочки, построенной при подготовке префаба.
+    fn create_texture_from_chain(
+        &mut self,
+        chain: &NormalMipChain,
+    ) -> Result<Self::Texture, RenderError>;
     fn create_material(
         &mut self,
         resolved: &ResolvedMaterial,
@@ -234,6 +239,13 @@ impl GpuResources for Renderer {
             color_space,
             role,
         )
+    }
+
+    fn create_texture_from_chain(
+        &mut self,
+        chain: &NormalMipChain,
+    ) -> Result<TextureId, RenderError> {
+        Renderer::create_texture_from_mip_chain(self, chain)
     }
 
     fn create_material(
@@ -560,6 +572,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                     model_path: &model,
                     model: model_cpu,
                     scene: &prefab.material_assets.textures,
+                    chains: &prefab.material_assets.normal_chains,
                 };
                 let mut keys = Vec::new();
                 match self.build_material(gpu, &resolved, &sources, &mut job.token, &mut keys) {
@@ -633,6 +646,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                     model_path,
                     model: model_cpu,
                     scene: &prefab.material_assets.textures,
+                    chains: &prefab.material_assets.normal_chains,
                 };
                 let mut keys = Vec::new();
                 let built = resolved
@@ -871,7 +885,13 @@ impl<G: GpuResources> PrefabGpu<G> {
             keys.push(key);
             return Ok(Some(id));
         }
-        let id = gpu.create_texture(data, color_space, role)?;
+        let chain = (role == TextureRole::Normal)
+            .then(|| sources.chains.get(sources.model_path, source))
+            .flatten();
+        let id = match chain {
+            Some(chain) => gpu.create_texture_from_chain(chain)?,
+            None => gpu.create_texture(data, color_space, role)?,
+        };
         self.textures
             .insert(key.clone(), SharedTexture { id, refs: 1 });
         keys.push(key);
@@ -1039,6 +1059,7 @@ struct TextureSources<'a> {
     model_path: &'a str,
     model: &'a Model,
     scene: &'a HashMap<String, TextureData>,
+    chains: &'a NormalChains,
 }
 
 fn gpu_vertices(mesh: &engine_assets::ModelMesh) -> Vec<Vertex> {
@@ -1120,6 +1141,7 @@ pub(crate) fn load_prefab(
             textures: prepared.textures,
             material_assets: prepared.material_assets,
             shader_assets: prepared.shader_assets,
+            normal_chains: prepared.normal_chains,
         }),
         levels: prepared.levels,
         particles: prepared.particles,
@@ -1278,6 +1300,7 @@ impl PrefabLoads {
 mod tests {
     use super::*;
     use engine_assets::{ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex};
+    use std::collections::BTreeSet;
 
     /// Учёт GPU без Vulkan: id выдаются по порядку, неживые освобождения фиксируются.
     #[derive(Default)]
@@ -1288,6 +1311,7 @@ mod tests {
         fail_material_at: Option<usize>,
         materials_created: usize,
         texture_roles: Vec<TextureRole>,
+        chains_created: usize,
     }
 
     impl FakeGpu {
@@ -1317,6 +1341,12 @@ mod tests {
         ) -> Result<u32, RenderError> {
             self.created += 1;
             self.texture_roles.push(role);
+            Ok(self.id())
+        }
+
+        fn create_texture_from_chain(&mut self, _: &NormalMipChain) -> Result<u32, RenderError> {
+            self.created += 1;
+            self.chains_created += 1;
             Ok(self.id())
         }
 
@@ -1445,21 +1475,28 @@ mod tests {
                 geometry: Vec::new(),
                 material_models: Vec::new(),
             },
-            material_assets: Arc::new(PreparedMaterialAssets {
-                models: models
+            material_assets: Arc::new({
+                let models: HashMap<String, Model> = models
                     .iter()
                     .map(|(path, model)| ((*path).to_owned(), model.clone()))
-                    .collect(),
-                textures: HashMap::from([(
+                    .collect();
+                let textures = HashMap::from([(
                     "tex.png".to_owned(),
                     TextureData {
                         width: 1,
                         height: 1,
                         rgba: vec![255; 4],
                     },
-                )]),
-                material_assets: HashMap::new(),
-                shader_assets: HashMap::new(),
+                )]);
+                let normal_chains =
+                    NormalChains::build(&models, &textures, &BTreeSet::new(), &|| false).unwrap();
+                PreparedMaterialAssets {
+                    models,
+                    textures,
+                    material_assets: HashMap::new(),
+                    shader_assets: HashMap::new(),
+                    normal_chains,
+                }
             }),
             levels,
             particles: Vec::new(),
@@ -1618,8 +1655,36 @@ mod tests {
         run_to_completion(&mut state, &mut gpu);
         assert_eq!(
             gpu.texture_roles,
-            vec![TextureRole::Color, TextureRole::Normal],
-            "одна PNG даёт отдельные GPU-текстуры для роли Color и Normal"
+            vec![TextureRole::Color],
+            "только MR создаётся обычным путём"
+        );
+        assert_eq!(
+            gpu.chains_created, 1,
+            "normal-слот берёт готовую mip-цепочку: одна PNG даёт две GPU-текстуры"
+        );
+    }
+
+    #[test]
+    fn normal_slot_without_prepared_chain_falls_back_to_role_upload() {
+        let mut gpu = FakeGpu::default();
+        let mut state = PrefabGpu::default();
+        let mut model = model(1);
+        model.meshes[0].material.normal_texture = Some(0);
+        let mut loaded = prefab(
+            token("prefabs/no-chain.rveprefab", 1),
+            &[("m.fbx", model)],
+            false,
+        );
+        Arc::get_mut(&mut loaded.material_assets)
+            .unwrap()
+            .normal_chains = NormalChains::default();
+        state.submit(loaded);
+
+        run_to_completion(&mut state, &mut gpu);
+        assert_eq!(gpu.chains_created, 0);
+        assert!(
+            gpu.texture_roles.contains(&TextureRole::Normal),
+            "без цепочки normal map создаётся через create_texture с ролью Normal"
         );
     }
 
