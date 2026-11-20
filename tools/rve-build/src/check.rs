@@ -220,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    fn heavy_reference_without_heavy_scripts_setting_is_a_project_error() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-check-heavy").unwrap();
+        let scene = format!(
+            "{CAMERA}[[objects]]\nid = \"mesh\"\n[[objects.heavy_scripts]]\nname = \"Spin\"\n"
+        );
+        small_project(root.path(), "Game", &scene);
+
+        let error = check_project(root.path()).err().unwrap();
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(error.to_string().contains("heavy_scripts"), "{error}");
+        assert!(error.to_string().contains("Spin"), "{error}");
+    }
+
+    #[test]
     fn project_name_that_cannot_be_an_executable_is_rejected() {
         let root = TempDir::create(&std::env::temp_dir(), "rve-check-name").unwrap();
         small_project(root.path(), "Assets", CAMERA);

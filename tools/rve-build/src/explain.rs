@@ -152,9 +152,27 @@ fn reason_text(trace: &BuildTrace, path: &VirtualPath, reason: &ArchiveReason) -
             }
         }
         ArchiveReason::ConflictingExplicit { assignments } => {
-            let list = assignments
+            // Одна зависимость может быть достижима по нескольким путям: пары повторяются.
+            let mut unique = Vec::new();
+            for pair in assignments {
+                if !unique.contains(&pair) {
+                    unique.push(pair);
+                }
+            }
+            let list = unique
                 .iter()
-                .map(|(owner, archive)| format!("{archive:?} ({})", owner_label(trace, owner)))
+                .map(|(owner, archive)| {
+                    let label = owner_label(trace, owner);
+                    match trace.archive_source(path, owner, archive) {
+                        Some(ArchiveSource::PrefabList(_)) => {
+                            format!("{archive:?} ({label}, запись prefabs.rveprefabs)")
+                        }
+                        Some(ArchiveSource::Document(document)) => {
+                            format!("{archive:?} ({label}, [[assets]] /{document})")
+                        }
+                        None => format!("{archive:?} ({label})"),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("явные архивы расходятся, ресурс уходит в shared: {list}")
@@ -551,28 +569,38 @@ mod tests {
             ),
         );
         scene(root.path(), "main", "");
-        for tower in ["tower1", "tower2"] {
-            asset(
-                root.path(),
-                &format!("prefabs/{tower}.rveprefab"),
-                "[[assets]]\npath = \"/textures/a.png\"\n[[objects]]\nid = \"tower\"\n",
-            );
-        }
-        asset(root.path(), "textures/a.png", "a");
+        // tower1 достигает текстуры дважды: напрямую и через материал. Пара назначения
+        // повторяется в использовании, но в причине должна появиться один раз.
+        asset(
+            root.path(),
+            "prefabs/tower1.rveprefab",
+            "[[assets]]\npath = \"/textures/checker.png\"\n[[assets]]\npath = \"/materials/m.rvemat\"\n[[objects]]\nid = \"tower\"\n",
+        );
+        asset(
+            root.path(),
+            "prefabs/tower2.rveprefab",
+            "[[assets]]\npath = \"/textures/checker.png\"\n[[objects]]\nid = \"tower\"\n",
+        );
+        asset(root.path(), "materials/m.rvemat", MATERIAL);
+        asset(root.path(), "shaders/surface.rveshader", SHADER);
+        asset(root.path(), "textures/checker.png", "a");
+        asset(root.path(), "textures/fallback.png", "b");
 
-        let text = explain(root.path(), "/textures/a.png");
+        let text = explain(root.path(), "/textures/checker.png");
         assert!(
-            text.starts_with("/textures/a.png → архив shared\n"),
+            text.starts_with("/textures/checker.png → архив shared\n"),
             "{text}"
         );
         assert!(
             text.contains(
-                "причина: явные архивы расходятся, ресурс уходит в shared: \"towers\" (тяжёлый префаб /prefabs/tower1.rveprefab), \"decor\" (тяжёлый префаб /prefabs/tower2.rveprefab)\n"
+                "причина: явные архивы расходятся, ресурс уходит в shared: \"towers\" (тяжёлый префаб /prefabs/tower1.rveprefab, запись prefabs.rveprefabs), \"decor\" (тяжёлый префаб /prefabs/tower2.rveprefab, запись prefabs.rveprefabs)\n"
             ),
             "{text}"
         );
         assert!(
-            text.contains("  префаб /prefabs/tower1.rveprefab → /textures/a.png ([[assets]])\n"),
+            text.contains(
+                "  префаб /prefabs/tower1.rveprefab → /textures/checker.png ([[assets]])\n"
+            ),
             "{text}"
         );
     }
