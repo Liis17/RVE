@@ -43,22 +43,42 @@ impl PlayerFlavor {
         }
     }
 
-    fn cargo_arguments(self, dlss: bool) -> Vec<&'static str> {
-        let mut arguments = vec!["build"];
+    /// Аргументы одного вызова cargo: игрок (или сервер) и монитор падений в одном target-каталоге.
+    /// Release собирается с `--no-default-features`, поэтому `crash-dumps` включается явно.
+    /// Имена features квалифицированы пакетом: монитор их не имеет.
+    fn cargo_arguments(self, dlss: bool) -> Vec<String> {
+        let package = self.package();
+        let mut arguments = vec!["build".to_owned()];
         if self != Self::Dev {
-            arguments.push("--release");
+            arguments.push("--release".to_owned());
         }
-        arguments.extend(["--locked", "-p", self.package()]);
+        arguments
+            .extend(["--locked", "-p", package, "-p", CRASH_MONITOR_PACKAGE].map(str::to_owned));
         if self != Self::Dev {
-            arguments.push("--no-default-features");
+            arguments.push("--no-default-features".to_owned());
+        }
+        let mut features = Vec::new();
+        if self != Self::Dev {
+            features.push(format!("{package}/crash-dumps"));
         }
         if dlss {
-            arguments.extend(["--features", "dlss"]);
+            features.push(format!("{package}/dlss"));
         }
-        arguments.push("--message-format=json");
+        if self != Self::Dev {
+            // Monitor собирается с `--no-default-features` тоже, поэтому его feature `server` указываем явно.
+            features.push(format!("{CRASH_MONITOR_PACKAGE}/server"));
+        }
+        if !features.is_empty() {
+            arguments.push("--features".to_owned());
+            arguments.push(features.join(","));
+        }
+        arguments.push("--message-format=json".to_owned());
         arguments
     }
 }
+
+/// Пакет монитора падений; собирается вместе с игроком и сервером, см. `build_checkout_player`.
+pub(crate) const CRASH_MONITOR_PACKAGE: &str = "rve-crash-monitor";
 
 pub(crate) fn build_distribution(
     project_dir: &Path,
@@ -78,15 +98,30 @@ pub(crate) fn build_distribution(
     let _ = vulkan_sdk;
 
     #[cfg(windows)]
-    let executable = locate_player(
+    let player = locate_player(
         PlayerFlavor::Distribution,
         project.settings.runtime.dlss_library.is_some(),
     )?;
     #[cfg(not(windows))]
-    let executable = locate_player(PlayerFlavor::Distribution, false)?;
-    let server_executable = with_server
+    let player = locate_player(PlayerFlavor::Distribution, false)?;
+    let executable = player.executable;
+    let mut monitor_warnings = Vec::new();
+    let player_monitor =
+        select_crash_monitor(player.crash_monitor, &executable, &mut monitor_warnings);
+    let (server_executable, server_monitor) = match with_server
         .then(|| locate_player(PlayerFlavor::Server, false))
-        .transpose()?;
+        .transpose()?
+    {
+        Some(server) => {
+            let monitor = select_crash_monitor(
+                server.crash_monitor,
+                &server.executable,
+                &mut monitor_warnings,
+            );
+            (Some(server.executable), monitor)
+        }
+        None => (None, None),
+    };
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -152,7 +187,9 @@ pub(crate) fn build_distribution(
 
     let output_binary = binary_dir.join(&executable_name);
     copy_file(&executable, &output_binary)?;
+    stage_crash_monitor(player_monitor.as_deref(), &binary_dir)?;
     stage_server(server_executable.as_deref(), staging.path())?;
+    stage_crash_monitor(server_monitor.as_deref(), staging.path())?;
     #[cfg(windows)]
     if let Some(icon_path) = &project.icon {
         let source = project
@@ -198,9 +235,10 @@ pub(crate) fn run_project(project_dir: &Path, player_args: &[OsString]) -> Resul
     let executable = locate_player(
         PlayerFlavor::Dev,
         project.settings.runtime.dlss_library.is_some(),
-    )?;
+    )?
+    .executable;
     #[cfg(not(windows))]
-    let executable = locate_player(PlayerFlavor::Dev, false)?;
+    let executable = locate_player(PlayerFlavor::Dev, false)?.executable;
     let project_dir = normalize_build_path(&project.project_dir)?;
     let mut command = Command::new(&executable);
     command.arg("--project").arg(project_dir);
@@ -624,20 +662,33 @@ fn parse_cargo_output(
         .ok_or_else(|| format!("cargo output не содержит target {target_name:?} с kind {kind:?}"))
 }
 
-fn locate_player(flavor: PlayerFlavor, dlss: bool) -> Result<PathBuf, BuildError> {
+/// Игрок или сервер и путь к монитору. У SDK без монитора `crash_monitor` пуст.
+pub(crate) struct LocatedPlayer {
+    pub(crate) executable: PathBuf,
+    pub(crate) crash_monitor: Option<PathBuf>,
+}
+
+fn locate_player(flavor: PlayerFlavor, dlss: bool) -> Result<LocatedPlayer, BuildError> {
     let executable = current_executable_path()?;
     let executable_dir = executable_directory(&executable)?;
     match sdk::locate_player_in_with_dlss(&executable_dir, flavor, dlss, |flavor| {
         build_checkout_player(flavor, dlss)
     })? {
-        PlayerLocation::Checkout(executable) => Ok(executable),
+        PlayerLocation::Checkout(checkout) => Ok(LocatedPlayer {
+            executable: checkout.executable,
+            crash_monitor: Some(checkout.crash_monitor),
+        }),
         PlayerLocation::Sdk {
             executable,
+            crash_monitor,
             manifest,
         } => {
             println!("{}: prebuilt (SDK)", flavor.package());
             println!("rve-sdk engine version: {}", manifest.engine_version);
-            Ok(executable)
+            Ok(LocatedPlayer {
+                executable,
+                crash_monitor,
+            })
         }
     }
 }
@@ -672,7 +723,7 @@ pub(crate) fn executable_directory(executable: &Path) -> Result<PathBuf, BuildEr
 pub(crate) fn build_checkout_player(
     flavor: PlayerFlavor,
     dlss: bool,
-) -> Result<PathBuf, BuildError> {
+) -> Result<sdk::CheckoutPlayer, BuildError> {
     let root = repo_root()?;
     let target_dir = normalize_build_path(&checkout_player_target_dir(&root, flavor))?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
@@ -704,8 +755,78 @@ pub(crate) fn build_checkout_player(
             "rebuilt"
         }
     );
-    normalize_build_path(&executable)
-        .map_err(|error| BuildError::operational(format!("сборка {package}: {error}")))
+    // Монитор собирается тем же cargo-вызовом; его путь берётся из того же вывода, а не из соседства.
+    let crash_monitor = crash_monitor_from_cargo_output(&stdout).map_err(|message| {
+        BuildError::operational(format!("сборка {CRASH_MONITOR_PACKAGE}: {message}"))
+    })?;
+    Ok(sdk::CheckoutPlayer {
+        executable: normalize_build_path(&executable)
+            .map_err(|error| BuildError::operational(format!("сборка {package}: {error}")))?,
+        crash_monitor: normalize_build_path(&crash_monitor).map_err(|error| {
+            BuildError::operational(format!("сборка {CRASH_MONITOR_PACKAGE}: {error}"))
+        })?,
+    })
+}
+
+/// Путь монитора из вывода cargo. Отсутствие artifact — ошибка сборки.
+fn crash_monitor_from_cargo_output(stdout: &str) -> Result<PathBuf, String> {
+    let artifact = parse_cargo_output(stdout, CRASH_MONITOR_PACKAGE, "bin", None)?;
+    artifact
+        .executable
+        .ok_or_else(|| format!("cargo не сообщил executable для {CRASH_MONITOR_PACKAGE}"))
+}
+
+/// Сборка игрока и монитора для SDK (`sdk`): обе через `build_sdk_binary`, т.е. из Cargo JSON.
+pub(crate) fn build_sdk_player(
+    distribution: bool,
+    dlss: bool,
+) -> Result<sdk::CheckoutPlayer, BuildError> {
+    let executable = build_sdk_binary("rve-player", distribution, dlss)?;
+    let crash_monitor = build_sdk_binary(CRASH_MONITOR_PACKAGE, false, false)?;
+    Ok(sdk::CheckoutPlayer {
+        executable,
+        crash_monitor,
+    })
+}
+
+/// Монитор нужен релизу, но SDK, собранный до его появления, его не содержит. Тогда релиз собирается
+/// без minidump: предупреждение на stderr, не ошибка. Игрок и сервер из одного SDK лежат в одном каталоге,
+/// поэтому предупреждение печатается один раз: `warnings` не даёт повторить текст.
+pub(crate) fn select_crash_monitor(
+    monitor: Option<PathBuf>,
+    player: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
+    if monitor.is_none() {
+        let warning = missing_crash_monitor_warning(player);
+        if !warnings.contains(&warning) {
+            eprintln!("{warning}");
+            warnings.push(warning);
+        }
+    }
+    monitor
+}
+
+fn missing_crash_monitor_warning(player: &Path) -> String {
+    let directory = player.parent().unwrap_or(player);
+    format!(
+        "предупреждение: в {} нет {}: релиз собирается без minidump (пересоберите SDK)",
+        directory.display(),
+        sdk::crash_monitor_filename()
+    )
+}
+
+/// Кладёт монитор в каталог релиза. Если файл уже есть (Windows: игрок и сервер делят каталог),
+/// второй копии не нужно.
+fn stage_crash_monitor(monitor: Option<&Path>, directory: &Path) -> Result<(), BuildError> {
+    let Some(monitor) = monitor else {
+        return Ok(());
+    };
+    let destination = directory.join(sdk::crash_monitor_filename());
+    if destination.exists() {
+        return Ok(());
+    }
+    copy_file(monitor, &destination)
 }
 
 pub(crate) fn build_sdk_binary(
@@ -750,8 +871,15 @@ fn sdk_build_command(
     if distribution_player {
         command.arg("--no-default-features");
     }
+    let mut features = Vec::new();
+    if distribution_player {
+        features.push(format!("{package}/crash-dumps"));
+    }
     if dlss {
-        command.args(["--features", "dlss"]);
+        features.push(format!("{package}/dlss"));
+    }
+    if !features.is_empty() {
+        command.args(["--features", &features.join(",")]);
     }
     if cfg!(windows) {
         // An explicit target keeps crt-static off host proc-macro crates.
@@ -1100,12 +1228,14 @@ pub(crate) fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
 mod tests {
     use super::{
         CargoArtifact, CargoFailure, PlayerFlavor, build_distribution, checkout_player_target_dir,
-        copy_dlss_runtime, copy_fsr_runtime, heavy_scripts_manifest, parse_cargo_output,
-        parse_cdylib_target, player_file_name, sdk_build_command, select_library_file,
-        validate_heavy_scripts, validate_staged_archives,
+        copy_dlss_runtime, copy_fsr_runtime, crash_monitor_from_cargo_output,
+        heavy_scripts_manifest, missing_crash_monitor_warning, parse_cargo_output,
+        parse_cdylib_target, player_file_name, sdk_build_command, select_crash_monitor,
+        select_library_file, stage_crash_monitor, validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
     use crate::project::{HeavyScriptUse, ProjectBuild, ScriptReferenceContext};
+    use crate::sdk;
     use crate::temporary::TempDir;
     use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
     use engine_pak::BuildCompression;
@@ -1254,12 +1384,18 @@ mod tests {
                     .map(|arg| arg.to_str().unwrap())
                     .collect();
                 assert_eq!(arguments.contains(&"--no-default-features"), distribution);
-                assert_eq!(
-                    arguments
-                        .windows(2)
-                        .any(|args| args == ["--features", "dlss"]),
-                    dlss
-                );
+                let mut expected = Vec::new();
+                if distribution {
+                    expected.push("rve-player/crash-dumps");
+                }
+                if dlss {
+                    expected.push("rve-player/dlss");
+                }
+                let features = arguments
+                    .windows(2)
+                    .find(|pair| pair[0] == "--features")
+                    .map(|pair| pair[1].to_owned());
+                assert_eq!(features, (!expected.is_empty()).then(|| expected.join(",")));
                 assert!(arguments.contains(&"--release"));
                 let cache = command
                     .get_envs()
@@ -1291,7 +1427,11 @@ mod tests {
                 "--locked",
                 "-p",
                 "rve-player",
+                "-p",
+                "rve-crash-monitor",
                 "--no-default-features",
+                "--features",
+                "rve-player/crash-dumps,rve-crash-monitor/server",
                 "--message-format=json",
             ]
         );
@@ -1302,20 +1442,21 @@ mod tests {
                 "--locked",
                 "-p",
                 "rve-player",
+                "-p",
+                "rve-crash-monitor",
                 "--message-format=json"
             ]
         );
-        assert!(
-            PlayerFlavor::Distribution
-                .cargo_arguments(true)
-                .windows(2)
-                .any(|args| args == ["--features", "dlss"])
+        assert_eq!(
+            PlayerFlavor::Distribution.cargo_arguments(true)[8..10],
+            [
+                "--features",
+                "rve-player/crash-dumps,rve-player/dlss,rve-crash-monitor/server"
+            ]
         );
-        assert!(
-            PlayerFlavor::Dev
-                .cargo_arguments(true)
-                .windows(2)
-                .any(|args| args == ["--features", "dlss"])
+        assert_eq!(
+            PlayerFlavor::Dev.cargo_arguments(true)[6..8],
+            ["--features", "rve-player/dlss"]
         );
         assert_eq!(
             checkout_player_target_dir(root, PlayerFlavor::Distribution),
@@ -1333,7 +1474,11 @@ mod tests {
                 "--locked",
                 "-p",
                 "rve-server",
+                "-p",
+                "rve-crash-monitor",
                 "--no-default-features",
+                "--features",
+                "rve-server/crash-dumps,rve-crash-monitor/server",
                 "--message-format=json",
             ]
         );
@@ -1341,6 +1486,72 @@ mod tests {
             checkout_player_target_dir(root, PlayerFlavor::Server),
             root.join("build/server")
         );
+    }
+
+    #[test]
+    fn missing_crash_monitor_warns_and_the_release_continues_without_it() {
+        let player = Path::new("sdk/rve-player.exe");
+        let mut warnings = Vec::new();
+        assert_eq!(select_crash_monitor(None, player, &mut warnings), None);
+        let sibling = Path::new("sdk/rve-server.exe");
+        assert_eq!(select_crash_monitor(None, sibling, &mut warnings), None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = missing_crash_monitor_warning(player);
+        assert!(warning.contains(sdk::crash_monitor_filename()), "{warning}");
+        assert!(warning.contains("без minidump"), "{warning}");
+        let monitor = PathBuf::from("sdk/rve-crash-monitor.exe");
+        assert_eq!(
+            select_crash_monitor(Some(monitor.clone()), player, &mut warnings),
+            Some(monitor)
+        );
+    }
+
+    #[test]
+    fn checkout_build_takes_the_monitor_artifact_from_cargo_output() {
+        fn artifact(name: &str, executable: &str) -> String {
+            format!(
+                r#"{{"reason":"compiler-artifact","target":{{"name":"{name}","kind":["bin"]}},"executable":"{executable}","filenames":[],"fresh":true}}"#
+            )
+        }
+        let player_only = artifact("rve-player", "target/release/rve-player.exe");
+        let error = crash_monitor_from_cargo_output(&player_only).unwrap_err();
+        assert!(error.contains("rve-crash-monitor"), "{error}");
+
+        let both = format!(
+            "{player_only}
+{}",
+            artifact("rve-crash-monitor", "target/release/rve-crash-monitor.exe")
+        );
+        assert_eq!(
+            crash_monitor_from_cargo_output(&both).unwrap(),
+            PathBuf::from("target/release/rve-crash-monitor.exe")
+        );
+    }
+
+    #[test]
+    fn staged_monitor_is_copied_once_and_missing_sources_are_skipped() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-monitor-stage").unwrap();
+        let source = root.path().join("source-monitor");
+        fs::write(&source, b"first").unwrap();
+        let release = root.path().join("release");
+        fs::create_dir(&release).unwrap();
+        let staged = release.join(sdk::crash_monitor_filename());
+
+        stage_crash_monitor(Some(&source), &release).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"first");
+
+        fs::write(&source, b"second").unwrap();
+        stage_crash_monitor(Some(&source), &release).unwrap();
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            b"first",
+            "второй игрок не перезаписывает копию"
+        );
+
+        let empty = root.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        stage_crash_monitor(None, &empty).unwrap();
+        assert!(!empty.join(sdk::crash_monitor_filename()).exists());
     }
 
     #[test]

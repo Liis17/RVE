@@ -87,6 +87,9 @@ def main():
         require_contains(first_build, "rve-player:", "first checkout build")
         player = build_dir / "player/release" / f"rve-player{executable_suffix}"
         player_hash = hashlib.sha256(player.read_bytes()).digest()
+        monitor_name = f"rve-crash-monitor{executable_suffix}"
+        if not (build_dir / "player/release" / monitor_name).is_file():
+            raise RuntimeError("checkout build did not place rve-crash-monitor next to the player")
 
         scripts = game_a / "HeavyScripts/src/lib.rs"
         with scripts.open("a", encoding="utf-8", newline="") as file:
@@ -109,6 +112,8 @@ def main():
             sdk_dir = sdk_dir / "RVE Editor.app/Contents/MacOS"
         if not (sdk_dir / f"rve-editor{executable_suffix}").is_file():
             raise RuntimeError("SDK editor is missing")
+        if not (sdk_dir / monitor_name).is_file():
+            raise RuntimeError("SDK crash monitor is missing")
         game_sdk = temp_root / "game-sdk"
         copy_demo_game(root / "examples/demo-game", game_sdk)
         rewrite_sdk_path(game_sdk / "HeavyScripts/Cargo.toml", sdk_dir / "rve-sdk")
@@ -118,6 +123,8 @@ def main():
             build_dir,
         )
         require_contains(sdk_build, "rve-player: prebuilt (SDK)", "SDK build")
+        if not any((temp_root / "out-sdk").rglob(monitor_name)):
+            raise RuntimeError("release built from the SDK has no crash monitor")
         if "rve-player: rebuilt" in sdk_build or "rve-player: up to date" in sdk_build:
             raise RuntimeError("SDK build reported a checkout player build")
 

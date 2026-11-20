@@ -70,7 +70,7 @@ class SDKArchiveTests(unittest.TestCase):
         self.sdk = self.root / "sdk"
         self.archive = self.root / "sdk-verified.zip"
         for relative in [
-            "rve-editor.exe", "rve-build.exe", "rve-player.exe", "rve-player-dev.exe",
+            "rve-editor.exe", "rve-build.exe", "rve-player.exe", "rve-player-dev.exe", "rve-crash-monitor.exe",
             "rve-sdk.toml", "rve-sdk/Cargo.toml", "rve-sdk/src/lib.rs",
             "toolchain/bin/cargo.exe", "toolchain/bin/rustc.exe",
             "toolchain/lib/rustlib/x86_64-pc-windows-gnu/bin/rust-lld.exe",

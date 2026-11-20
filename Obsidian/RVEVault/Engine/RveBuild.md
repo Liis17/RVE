@@ -100,7 +100,10 @@ Object/component refs проверяются на существующую це�
 `Assets/` в `Contents/Resources`, `Contents/Info.plist` генерирует
 `platform::info_plist` (`CFBundleIdentifier` = `rve.game.<id>` с заменой `_` на `-`,
 версия из `ProjectSettings.version`). Бандл нужен, чтобы запуск из Finder не открывал
-Terminal. Бандл не подписывается, `.icns` из AppIcon не создаётся.
+Terminal. Бандл не подписывается, `.icns` из AppIcon не создаётся. Монитор падений
+`rve-crash-monitor` кладётся в `Contents/MacOS` рядом с игроком; на Windows он лежит рядом с
+`rve-player.exe`. Если монитора нет (SDK собран до его появления), релиз собирается без minidump и
+с предупреждением на stderr, не ошибкой. Порядок и причины — [[Engine/EngineRuntime]], раздел «Отчёты о падении».
 
 Если Windows-проект задаёт `runtime.fsr_library`, builder проверяет, что loader DLL и
 соседний `amd_fidelityfx_upscaler_vk.dll` находятся внутри каталога проекта, и
@@ -109,7 +112,7 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 входного проекта с кодом 2.
 
 Если Windows-проект задаёт `runtime.dlss_library`, builder проверяет, что
-`nvngx_dlss.dll` находится внутри проекта, собирает checkout player с feature `dlss`
+`nvngx_dlss.dll` находится внутри проекта, собирает checkout player с feature `rve-player/dlss`
 и копирует runtime DLL в `Engine/`. Для player build требуется `RVE_DLSS_SDK` с
 официальным Windows x64 SDK и `nvsdk_ngx_s.lib`; NGX binaries репозиторий не содержит.
 Dev-player использует библиотеку из проекта. При сборке SDK команда включает DLSS,
@@ -182,16 +185,16 @@ tools/rve-build/src/project.rs валидирует каждый использ�
 `rve-build` не генерирует отдельный player crate. Режим определяется наличием
 `rve-sdk.toml` рядом с исполняемым файлом `rve-build`.
 
-Без маркера используется checkout-режим. Distribution flavor собирает пакет
-`rve-player` командой `cargo build --release --locked -p rve-player
---no-default-features` и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`; dev flavor
-собирает default features в `build/player-dev`. Для Windows-проекта с
-`runtime.dlss_library` добавляется `--features dlss`, а `RVE_DLSS_SDK` должен
+Без маркера используется checkout-режим. Distribution flavor собирает пакеты
+`rve-player` и `rve-crash-monitor` одним вызовом `cargo build --release --locked -p rve-player -p rve-crash-monitor
+--no-default-features --features rve-player/crash-dumps,rve-crash-monitor/server` и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`; dev flavor
+собирает default features (включая `crash-dumps`) вместе с монитором в `build/player-dev`. Для Windows-проекта с
+`runtime.dlss_library` в тот же список features добавляется `rve-player/dlss`, а `RVE_DLSS_SDK` должен
 указывать на SDK root с `nvsdk_ngx_s.lib`. Путь к исполняемому файлу берётся из
 Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to date` по полю `fresh`
 этого артефакта.
 
-Выделенный сервер `rve-server` собирается тем же механизмом командой `cargo build --release --locked -p rve-server --no-default-features` в `build/server`. Сборка без dev-console и DLSS; при сборке SDK он копируется как соседний executable `rve-server` (`rve-server.exe` на Windows).
+Выделенный сервер `rve-server` собирается тем же механизмом командой `cargo build --release --locked -p rve-server -p rve-crash-monitor --no-default-features --features rve-server/crash-dumps,rve-crash-monitor/server` в `build/server`. Сборка без dev-console и DLSS; при сборке SDK он копируется как соседний executable `rve-server` (`rve-server.exe` на Windows), монитор — рядом с ним.
 
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
 `engine_version`, `abi_version`, `target` и `dlss_enabled`. Последнее поле по
@@ -212,11 +215,11 @@ SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходн
 содержать `bin/cargo` и `bin/rustc` (на Windows `.exe`) и целиком копируется в
 `toolchain/`. `--no-rust-toolchain` предназначен для CI и пакетов без autobuild.
 
-Команда пересобирает release editor, builder, оба player и `rve-server`; distribution player без
+Команда пересобирает release editor, builder, оба player, `rve-server` и монитор падений (SDK-сборка монитора идёт отдельным вызовом, `rve-crash-monitor` кладётся рядом с игроком); distribution player без
 console. Пути executable берутся из Cargo JSON. Кэши изолированы в `build/sdk-player`
 и `build/sdk-tools`. На Windows каждому Cargo build передаётся явный target вместе
 с `-C target-feature=+crt-static`, поэтому флаг не затрагивает host proc macros.
-SDK содержит пять executable (builder, editor, `rve-player`, `rve-player-dev` и `rve-server`), marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
+SDK содержит шесть executable (builder, editor, `rve-player`, `rve-player-dev`, `rve-server` и `rve-crash-monitor`), marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
 На macOS они находятся в `RVE Editor.app/Contents/MacOS`, Vulkan loader/MoltenVK
 и ICD — в `Contents/Resources/Engine`. Публикация атомарная без замены output.
 
@@ -267,7 +270,7 @@ developer console из checkout `build/player-dev` или `rve-player-dev[.exe]`
 <library>]`, затем передаёт пользовательские аргументы. Если скриптов нет, `--scripts`
 не добавляется. На Windows player остаётся GUI executable без терминального окна;
 dev-вариант показывает developer console внутри окна. Cargo-команда
-`cargo run -p rve-player` использует default feature и включает её.
+`cargo run -p rve-player` использует default feature и включает её. Монитор падений в этой раскладке не собирается: нужна отдельная `cargo build -p rve-crash-monitor`, иначе игра пишет предупреждение `[crash]` и работает без дампов.
 
 Команда `build` собирает release cdylib и checkout distribution-player без developer
 console либо использует соседний distribution player из SDK, затем копирует
