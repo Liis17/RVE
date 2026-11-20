@@ -1067,7 +1067,9 @@ impl SceneRenderer {
                         ImageKind::NormalTexture => TextureRole::Normal,
                         _ => TextureRole::Color,
                     };
-                    for (color_space, role) in self.take_texture_wants(&path, role) {
+                    for (color_space, role) in
+                        take_wants_for_role(&mut self.texture_wants, &path, role)
+                    {
                         self.apply_texture(
                             renderer,
                             log,
@@ -1088,25 +1090,6 @@ impl SceneRenderer {
             }
         }
         Ok(())
-    }
-
-    /// Забирает ожидающие роли пути, которые читает вид декодирования `role`. Роли другого вида
-    /// остаются в очереди: их результат придёт отдельно.
-    fn take_texture_wants(
-        &mut self,
-        path: &str,
-        role: TextureRole,
-    ) -> Vec<(TextureColorSpace, TextureRole)> {
-        let Some(wants) = self.texture_wants.remove(path) else {
-            return Vec::new();
-        };
-        let (taken, kept): (HashSet<_>, HashSet<_>) = wants
-            .into_iter()
-            .partition(|(_, want_role)| *want_role == role);
-        if !kept.is_empty() {
-            self.texture_wants.insert(path.to_owned(), kept);
-        }
-        taken.into_iter().collect()
     }
 
     /// Декодер изображений работает с ресурсами открытого проекта; смена проекта
@@ -3829,6 +3812,25 @@ fn unused_surface_shaders<T: Copy + Eq + Hash>(
         .collect()
 }
 
+/// Забирает ожидающие роли пути, которые читает вид декодирования `role`. Роли другого вида
+/// остаются в очереди: их результат придёт отдельно. Пустая запись пути удаляется.
+fn take_wants_for_role(
+    texture_wants: &mut HashMap<String, HashSet<(TextureColorSpace, TextureRole)>>,
+    path: &str,
+    role: TextureRole,
+) -> Vec<(TextureColorSpace, TextureRole)> {
+    let Some(wants) = texture_wants.remove(path) else {
+        return Vec::new();
+    };
+    let (taken, kept): (HashSet<_>, HashSet<_>) = wants
+        .into_iter()
+        .partition(|(_, want_role)| *want_role == role);
+    if !kept.is_empty() {
+        texture_wants.insert(path.to_owned(), kept);
+    }
+    taken.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3840,6 +3842,35 @@ mod tests {
     fn fake_lut(value: usize) -> ColorLutId {
         // SAFETY: ColorLutId — обёртка над одним usize; любое значение допустимо для теста.
         unsafe { std::mem::transmute(value) }
+    }
+
+    #[test]
+    fn take_wants_for_role_returns_only_that_role_and_keeps_the_other() {
+        let mut wants = HashMap::from([(
+            "tex.png".to_owned(),
+            HashSet::from([
+                (TextureColorSpace::Linear, TextureRole::Normal),
+                (TextureColorSpace::Srgb, TextureRole::Color),
+            ]),
+        )]);
+        let taken = take_wants_for_role(&mut wants, "tex.png", TextureRole::Normal);
+        assert_eq!(taken, [(TextureColorSpace::Linear, TextureRole::Normal)]);
+        assert_eq!(
+            wants["tex.png"],
+            HashSet::from([(TextureColorSpace::Srgb, TextureRole::Color)])
+        );
+    }
+
+    #[test]
+    fn take_wants_for_role_removes_the_path_once_its_last_role_is_taken() {
+        let mut wants = HashMap::from([(
+            "tex.png".to_owned(),
+            HashSet::from([(TextureColorSpace::Srgb, TextureRole::Color)]),
+        )]);
+        let taken = take_wants_for_role(&mut wants, "tex.png", TextureRole::Color);
+        assert_eq!(taken, [(TextureColorSpace::Srgb, TextureRole::Color)]);
+        assert!(!wants.contains_key("tex.png"));
+        assert!(take_wants_for_role(&mut wants, "tex.png", TextureRole::Color).is_empty());
     }
 
     #[test]
