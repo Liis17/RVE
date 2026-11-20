@@ -48,6 +48,11 @@ use super::{
     INSTANCE_STRIDE, MESH_INSTANCE_BINDING, MESH_INSTANCE_VECTORS, SHADOW_INSTANCE_BINDING,
     batch_draws, instance_attributes, instance_binding, pack_instances,
 };
+use super::{
+    MipUploadPlan, NormalMipChain, TextureRole, color_mip_subresource_range, mip_chain_layout,
+    mip_upload_plan, normal_mip_chain, upload_flush_required, validate_texture_extent,
+    validate_texture_role,
+};
 use ash::vk;
 use std::time::{Duration, Instant};
 use std::{
@@ -1242,6 +1247,425 @@ fn texture_upload_budget_contains_only_base_level_rgba8_source_data() {
     assert!(whole_chain_bytes > base_level_bytes);
     assert_eq!(upload_data_layout(0, base_level_bytes, 16), Some((16, 80)));
     assert_eq!(texture_staging_size(u32::MAX, u32::MAX), None);
+}
+
+fn decode_normal_texel(texel: &[u8]) -> [f64; 3] {
+    [0, 1, 2].map(|channel| f64::from(2 * i16::from(texel[channel]) - 255) / 255.0)
+}
+
+/// Эталон по спецификации: нормализованная сумма декодированных векторов, кодирование 0.5/255.
+fn reference_normal_texel(sum: [f64; 3], alpha: f64) -> [u8; 4] {
+    let length = sum.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let vector = if length > 0.0 {
+        sum.map(|value| value / length)
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let encode = |value: f64| ((value * 0.5 + 0.5) * 255.0).round() as u8;
+    [
+        encode(vector[0]),
+        encode(vector[1]),
+        encode(vector[2]),
+        alpha.round() as u8,
+    ]
+}
+
+fn reference_normal_block(rgba: &[u8], width: usize, block: [usize; 4]) -> [u8; 4] {
+    let [x0, y0, block_width, block_height] = block;
+    let mut sum = [0.0; 3];
+    let mut alpha = 0.0;
+    for y in y0..y0 + block_height {
+        for x in x0..x0 + block_width {
+            let texel = &rgba[(y * width + x) * 4..][..4];
+            for (total, value) in sum.iter_mut().zip(decode_normal_texel(texel)) {
+                *total += value;
+            }
+            alpha += f64::from(texel[3]);
+        }
+    }
+    reference_normal_texel(sum, alpha / (block_width * block_height) as f64)
+}
+
+fn chain_texel(
+    chain: &[u8],
+    layout: &[(u32, usize, vk::Extent2D)],
+    level: usize,
+    x: usize,
+    y: usize,
+) -> [u8; 4] {
+    let (_, offset, extent) = layout[level];
+    let index = offset + (y * extent.width as usize + x) * 4;
+    chain[index..index + 4].try_into().unwrap()
+}
+
+#[test]
+fn mip_chain_layout_packs_levels_densely_from_base() {
+    let layout = mip_chain_layout(4, 4, mip_level_count(4, 4));
+    assert_eq!(
+        layout,
+        vec![
+            (
+                0,
+                0,
+                vk::Extent2D {
+                    width: 4,
+                    height: 4
+                }
+            ),
+            (
+                1,
+                64,
+                vk::Extent2D {
+                    width: 2,
+                    height: 2
+                }
+            ),
+            (
+                2,
+                80,
+                vk::Extent2D {
+                    width: 1,
+                    height: 1
+                }
+            ),
+        ]
+    );
+    let total: usize = layout
+        .iter()
+        .map(|(_, _, extent)| extent.width as usize * extent.height as usize * 4)
+        .sum();
+    assert_eq!(total, 84);
+}
+
+#[test]
+fn normal_mip_chain_keeps_flat_normal_exact_on_every_level() {
+    let rgba = [128, 128, 255, 255].repeat(16);
+    let chain = normal_mip_chain(4, 4, &rgba).unwrap();
+    assert_eq!(chain.len(), 84);
+    assert!(
+        chain
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|texel| *texel == [128, 128, 255, 255])
+    );
+}
+
+#[test]
+fn normal_mip_chain_level_zero_is_copied_unchanged() {
+    let rgba: Vec<u8> = (0..3 * 3 * 4)
+        .map(|index| (index * 7 % 256) as u8)
+        .collect();
+    let chain = normal_mip_chain(3, 3, &rgba).unwrap();
+    assert_eq!(&chain[..rgba.len()], rgba.as_slice());
+    assert_eq!(chain.len(), 36 + 4);
+}
+
+#[test]
+fn normal_mip_levels_decode_to_unit_length_within_quantization() {
+    let mut state = 0x2545_f491_u32;
+    let rgba: Vec<u8> = (0..8 * 8 * 4)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let chain = normal_mip_chain(8, 8, &rgba).unwrap();
+    let layout = mip_chain_layout(8, 8, mip_level_count(8, 8));
+    for (level, (_, offset, extent)) in layout.iter().enumerate().skip(1) {
+        let area = extent.width as usize * extent.height as usize;
+        for texel in chain[*offset..*offset + area * 4].as_chunks::<4>().0 {
+            let length = decode_normal_texel(texel)
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                (length - 1.0).abs() <= 1.0 / 127.0,
+                "длина {length} у уровня {level}"
+            );
+        }
+    }
+}
+
+#[test]
+fn normal_mip_chain_cancels_complementary_normals_to_flat_fallback() {
+    // Пары 127/128 и 0/255 по каждому каналу дают нулевую сумму: результат (0, 0, 1).
+    let rgba = [
+        127, 128, 0, 255, 128, 127, 255, 255, 127, 128, 0, 255, 128, 127, 255, 255,
+    ];
+    let chain = normal_mip_chain(2, 2, &rgba).unwrap();
+    assert_eq!(&chain[16..20], &[128, 128, 255, 255]);
+
+    let extremes = [0, 0, 0, 255, 255, 255, 255, 255];
+    let chain = normal_mip_chain(2, 1, &extremes).unwrap();
+    assert_eq!(&chain[8..12], &[128, 128, 255, 255]);
+}
+
+#[test]
+fn normal_mip_chain_averages_known_two_by_two_input() {
+    // Суммы декодированных векторов: (512, 512, 4); нормаль (0.7071, 0.7071, 0.0055).
+    let rgba = [
+        255, 128, 128, 255, 128, 255, 128, 255, 255, 128, 128, 255, 128, 255, 128, 255,
+    ];
+    let chain = normal_mip_chain(2, 2, &rgba).unwrap();
+    assert_eq!(&chain[16..20], &[218, 218, 128, 255]);
+}
+
+#[test]
+fn normal_mip_chain_three_by_three_uses_corner_texel_in_rgb_and_alpha() {
+    let mut rgba = [128, 128, 255, 0].repeat(9);
+    rgba[32..36].copy_from_slice(&[255, 128, 128, 255]);
+    let chain = normal_mip_chain(3, 3, &rgba).unwrap();
+    assert_eq!(
+        chain_texel(&chain, &mip_chain_layout(3, 3, 2), 1, 0, 0),
+        [144, 128, 254, 28]
+    );
+}
+
+#[test]
+fn normal_mip_chain_five_by_one_gives_edge_texel_fractional_weight() {
+    let mut rgba = [128, 128, 255, 0].repeat(5);
+    rgba[16..20].copy_from_slice(&[255, 128, 128, 255]);
+    let chain = normal_mip_chain(5, 1, &rgba).unwrap();
+    let layout = mip_chain_layout(5, 1, mip_level_count(5, 1));
+    // Второй texel уровня 1 покрывает [2.5, 5): texel 2 вносит половину веса, texel 4 — полный.
+    assert_eq!(chain_texel(&chain, &layout, 1, 1, 0), [198, 128, 233, 102]);
+    assert_eq!(chain_texel(&chain, &layout, 1, 0, 0), [128, 128, 255, 0]);
+}
+
+#[test]
+fn normal_mip_levels_match_normalized_mean_of_level_zero_region() {
+    let mut state = 0x9e37_79b9_u32;
+    let rgba: Vec<u8> = (0..8 * 4 * 4)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let chain = normal_mip_chain(8, 4, &rgba).unwrap();
+    let layout = mip_chain_layout(8, 4, mip_level_count(8, 4));
+    for (level, _, extent) in layout.iter().skip(1) {
+        let block_width = 8 / extent.width as usize;
+        let block_height = 4 / extent.height as usize;
+        for y in 0..extent.height as usize {
+            for x in 0..extent.width as usize {
+                let block = [x * block_width, y * block_height, block_width, block_height];
+                assert_eq!(
+                    chain_texel(&chain, &layout, *level as usize, x, y),
+                    reference_normal_block(&rgba, 8, block),
+                    "уровень {level}, texel ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn normal_mip_chain_last_level_is_mean_of_odd_source_row() {
+    let mut state = 0x1234_5678_u32;
+    let rgba: Vec<u8> = (0..13 * 4)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let chain = normal_mip_chain(13, 1, &rgba).unwrap();
+    let layout = mip_chain_layout(13, 1, mip_level_count(13, 1));
+    let last = layout.len() - 1;
+    assert_eq!(
+        chain_texel(&chain, &layout, last, 0, 0),
+        reference_normal_block(&rgba, 13, [0, 0, 13, 1])
+    );
+}
+
+#[test]
+fn normal_mip_chain_one_by_one_is_input_unchanged() {
+    let rgba = [10, 200, 30, 40];
+    assert_eq!(normal_mip_chain(1, 1, &rgba).unwrap(), rgba);
+}
+
+#[test]
+fn normal_mip_chain_inexact_weights_still_cancel_to_flat_fallback() {
+    // 7×2 → 3×1: веса частичных ячеек 1/3 и 2/3 неточны в f32. Строки противоположны по всем
+    // каналам, поэтому сумма каждого texel-а нулевая, а не только округлённо близкая к нулю.
+    let rgba: Vec<u8> = (0..7 * 2)
+        .flat_map(|index| {
+            let value = if index < 7 { 127 } else { 128 };
+            [value, value, value, 255]
+        })
+        .collect();
+    let chain = normal_mip_chain(7, 2, &rgba).unwrap();
+    let layout = mip_chain_layout(7, 2, mip_level_count(7, 2));
+    for x in 0..3 {
+        assert_eq!(
+            chain_texel(&chain, &layout, 1, x, 0),
+            [128, 128, 255, 255],
+            "texel {x} уровня 1"
+        );
+    }
+}
+
+#[test]
+fn normal_role_requires_linear_color_space() {
+    assert!(matches!(
+        validate_texture_role(TextureRole::Normal, TextureColorSpace::Srgb),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(validate_texture_role(TextureRole::Normal, TextureColorSpace::Linear).is_ok());
+    assert!(validate_texture_role(TextureRole::Color, TextureColorSpace::Srgb).is_ok());
+}
+
+#[test]
+fn mip_upload_plan_copies_normal_levels_at_absolute_offsets() {
+    assert_eq!(
+        mip_upload_plan(TextureRole::Color, 256, 4, 4, 3),
+        MipUploadPlan::Blit
+    );
+    let MipUploadPlan::Copies(copies) = mip_upload_plan(TextureRole::Normal, 256, 4, 4, 3) else {
+        panic!("normal map должна копировать уровни");
+    };
+    let offsets: Vec<(u32, usize)> = copies
+        .iter()
+        .map(|(level, offset, _)| (*level, *offset))
+        .collect();
+    assert_eq!(offsets, vec![(0, 256), (1, 256 + 64), (2, 256 + 80)]);
+    for (_, offset, extent) in &copies {
+        let size = extent.width as usize * extent.height as usize * 4;
+        assert_eq!(offset % 4, 0);
+        assert!(*offset + size <= 256 + 84, "регион выходит за staging");
+    }
+}
+
+#[test]
+fn mip_upload_plan_normal_single_level_copies_only_base() {
+    let MipUploadPlan::Copies(copies) = mip_upload_plan(TextureRole::Normal, 64, 1, 1, 1) else {
+        panic!("normal map должна копировать уровни");
+    };
+    assert_eq!(
+        copies,
+        vec![(
+            0,
+            64,
+            vk::Extent2D {
+                width: 1,
+                height: 1
+            }
+        )]
+    );
+}
+
+#[test]
+fn normal_mip_chain_reports_impossible_allocation_as_invalid_texture() {
+    // Цепочка около 4/3 · 2^63 байт больше `isize::MAX`: `try_reserve_exact` отказывает до
+    // аллокации, поэтому тест детерминирован и не расходует память.
+    let result = normal_mip_chain(1 << 31, 1 << 30, &[]);
+    assert!(matches!(result, Err(RenderError::InvalidTexture(_))));
+}
+
+#[test]
+fn normal_mip_chain_build_rejects_bad_dimensions_and_lengths() {
+    assert!(matches!(
+        NormalMipChain::build(0, 4, &[]),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(matches!(
+        NormalMipChain::build(2, 2, &[0; 15]),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(matches!(
+        NormalMipChain::build(2, 2, &[0; 17]),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(NormalMipChain::build(2, 2, &[0; 16]).is_ok());
+}
+
+#[test]
+fn normal_mip_chain_build_matches_chain_function_and_layout() {
+    let rgba: Vec<u8> = (0..3 * 3 * 4).map(|byte| (byte * 7 % 251) as u8).collect();
+    let chain = NormalMipChain::build(3, 3, &rgba).unwrap();
+    assert_eq!(
+        (chain.width(), chain.height(), chain.mip_levels()),
+        (3, 3, 2)
+    );
+    assert_eq!(chain.data(), normal_mip_chain(3, 3, &rgba).unwrap());
+    let layout = mip_chain_layout(3, 3, 2);
+    let (_, last_offset, last_extent) = layout[1];
+    assert_eq!(
+        chain.data().len(),
+        last_offset + last_extent.width as usize * last_extent.height as usize * 4
+    );
+}
+
+#[test]
+fn normal_mip_chain_is_send_and_sync_with_compact_debug() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<NormalMipChain>();
+    let chain = NormalMipChain::build(64, 64, &[128; 64 * 64 * 4]).unwrap();
+    let debug = format!("{chain:?}");
+    assert!(debug.contains("mip_levels: 7"), "{debug}");
+    assert!(
+        debug.len() < 200,
+        "Debug не должен печатать пиксели: {debug}"
+    );
+}
+
+#[test]
+fn normal_mip_chain_upload_copies_end_exactly_at_chain_length() {
+    // Загрузка готовой цепочки выбирает Copies: последний регион заканчивается на границе данных.
+    let chain = NormalMipChain::build(5, 3, &[128; 5 * 3 * 4]).unwrap();
+    let MipUploadPlan::Copies(copies) = mip_upload_plan(
+        TextureRole::Normal,
+        0,
+        chain.width(),
+        chain.height(),
+        chain.mip_levels(),
+    ) else {
+        panic!("normal map должна копироваться по уровням");
+    };
+    let end = copies
+        .iter()
+        .map(|(_, offset, extent)| offset + extent.width as usize * extent.height as usize * 4)
+        .max();
+    assert_eq!(end, Some(chain.data().len()));
+}
+
+#[test]
+fn texture_extent_rejects_zero_and_sizes_above_gpu_limit() {
+    assert!(matches!(
+        validate_texture_extent(0, 1, 4096),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(matches!(
+        validate_texture_extent(4097, 1, 4096),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(validate_texture_extent(4096, 4096, 4096).is_ok());
+}
+
+#[test]
+fn upload_flush_is_required_when_only_base_level_fits() {
+    // Пачка с capacity 80 вмещает базовый уровень (64 байта с выравниванием 16), но не всю цепочку.
+    assert!(!upload_flush_required(false, 0, 80, 64, 16));
+    assert!(upload_flush_required(false, 0, 80, 84, 16));
+    assert!(upload_flush_required(true, 0, 1000, 4, 16));
+}
+
+#[test]
+fn texture_upload_barriers_cover_every_level() {
+    let upload = texture_upload_barrier(vk::Image::null(), 3);
+    assert_eq!(upload.old_layout, vk::ImageLayout::UNDEFINED);
+    assert_eq!(upload.new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    assert_eq!(upload.subresource_range.base_mip_level, 0);
+    assert_eq!(upload.subresource_range.level_count, 3);
+
+    let ready = texture_mip_destination_shader_barrier(
+        vk::Image::null(),
+        color_mip_subresource_range(0, 3),
+    );
+    assert_eq!(ready.src_access_mask, vk::AccessFlags2::TRANSFER_WRITE);
+    assert_eq!(ready.dst_access_mask, vk::AccessFlags2::SHADER_SAMPLED_READ);
+    assert_eq!(ready.subresource_range.level_count, 3);
 }
 
 const IDENTITY: [[f32; 4]; 4] = [
@@ -3271,8 +3695,8 @@ fn passes_sum(view: &GpuViewTimings) -> Duration {
 
 #[test]
 fn view_timings_split_ticks_between_recorded_boundaries() {
-    // Начало, затем граница после каждого из семнадцати проходов в порядке выполнения;
-    // экранные шейдеры не записаны и отдают пустую границу.
+    // Начало, затем граница после каждого из девятнадцати проходов в порядке выполнения;
+    // сортировка частиц не записана, экранные шейдеры и temporal resolve отдают пустую границу.
     let marks = [
         Some(100),
         Some(110),
@@ -3285,12 +3709,14 @@ fn view_timings_split_ticks_between_recorded_boundaries() {
         Some(175),
         Some(180),
         Some(185),
-        Some(190),
         None,
         Some(195),
         Some(200),
+        None,
         Some(205),
+        Some(210),
         Some(215),
+        Some(225),
         None,
     ];
     let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
@@ -3309,6 +3735,8 @@ fn view_timings_split_ticks_between_recorded_boundaries() {
             Some(ns(10)),
             Some(ns(5)),
             Some(ns(5)),
+            None,
+            Some(ns(10)),
             Some(ns(5)),
             None,
             Some(ns(5)),
@@ -3318,7 +3746,7 @@ fn view_timings_split_ticks_between_recorded_boundaries() {
             None,
         ]
     );
-    assert_eq!(view.total, ns(115));
+    assert_eq!(view.total, ns(125));
     assert_eq!(passes_sum(&view), view.total);
 }
 
@@ -3480,8 +3908,95 @@ fn layout_keeps_keys_of_the_frame_after_viewport_set_changes() {
 }
 
 #[test]
+fn particle_stages_decode_per_view_from_their_own_marks() {
+    let mut layout = GpuProfileLayout::default();
+    let owner_first = layout
+        .add_view(ProfiledView::Viewport(ViewportId(1)))
+        .unwrap();
+    let other_first = layout
+        .add_view(ProfiledView::Viewport(ViewportId(2)))
+        .unwrap();
+    let mark = |first: u32, pass: GpuPass| first as usize + 1 + pass as usize;
+    let mut queries = [None; TIMESTAMP_QUERY_COUNT as usize];
+    // Владелец симуляции: spawn+sim, sort и draw.
+    queries[owner_first as usize] = Some(0);
+    queries[mark(owner_first, GpuPass::ParticleSimulation)] = Some(100);
+    queries[mark(owner_first, GpuPass::ParticleSort)] = Some(130);
+    queries[mark(owner_first, GpuPass::ParticleDraw)] = Some(180);
+    // Второй вид без симуляции: метки sort и draw, метки spawn+sim нет.
+    queries[other_first as usize] = Some(0);
+    queries[mark(other_first, GpuPass::ParticleSort)] = Some(40);
+    queries[mark(other_first, GpuPass::ParticleDraw)] = Some(90);
+
+    let timings = layout.decode(&queries, 64, 1.0);
+
+    let owner = timings.views[0].expect("владелец записан в кадр");
+    assert_eq!(owner.key, ProfiledView::Viewport(ViewportId(1)));
+    assert_eq!(
+        owner.passes[GpuPass::ParticleSimulation as usize],
+        Some(ns(100))
+    );
+    assert_eq!(owner.passes[GpuPass::ParticleSort as usize], Some(ns(30)));
+    assert_eq!(owner.passes[GpuPass::ParticleDraw as usize], Some(ns(50)));
+    assert_eq!(owner.total, ns(180));
+
+    let other = timings.views[1].expect("второй вид записан в кадр");
+    assert_eq!(other.key, ProfiledView::Viewport(ViewportId(2)));
+    assert_eq!(other.passes[GpuPass::ParticleSimulation as usize], None);
+    assert_eq!(other.passes[GpuPass::ParticleSort as usize], Some(ns(40)));
+    assert_eq!(other.passes[GpuPass::ParticleDraw as usize], Some(ns(50)));
+    assert_eq!(other.total, ns(90));
+
+    for pass in GpuPass::ALL {
+        if !matches!(
+            pass,
+            GpuPass::ParticleSimulation | GpuPass::ParticleSort | GpuPass::ParticleDraw
+        ) {
+            assert_eq!(owner.passes[pass as usize], None, "{pass:?} не записан");
+            assert_eq!(other.passes[pass as usize], None, "{pass:?} не записан");
+        }
+    }
+}
+
+#[test]
+fn skipped_sort_mark_moves_its_time_into_particle_draw() {
+    let mut marks = [None; VIEW_QUERY_COUNT as usize];
+    marks[0] = Some(0);
+    marks[1 + GpuPass::ParticleSimulation as usize] = Some(100);
+    marks[1 + GpuPass::ParticleDraw as usize] = Some(180);
+
+    let timing = decode_view(ProfiledView::Screen, &marks, 64, 1.0).expect("вид записан");
+
+    assert_eq!(timing.passes[GpuPass::ParticleSort as usize], None);
+    assert_eq!(timing.passes[GpuPass::ParticleDraw as usize], Some(ns(80)));
+    assert_eq!(timing.total, ns(180));
+}
+
+#[test]
+fn particle_stages_follow_wireframe_in_profile_order() {
+    let position = |pass: GpuPass| {
+        GpuPass::ALL
+            .iter()
+            .position(|&candidate| candidate == pass)
+            .unwrap()
+    };
+    let wireframe = position(GpuPass::Wireframe);
+    assert_eq!(position(GpuPass::ParticleSimulation), wireframe + 1);
+    assert_eq!(position(GpuPass::ParticleSort), wireframe + 2);
+    assert_eq!(position(GpuPass::ParticleDraw), wireframe + 3);
+    assert_eq!(position(GpuPass::Exposure), wireframe + 4);
+    for (index, pass) in GpuPass::ALL.iter().enumerate() {
+        assert_eq!(*pass as usize, index);
+    }
+    let mut labels: Vec<_> = GpuPass::ALL.iter().map(|pass| pass.label()).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), GpuPass::COUNT);
+}
+
+#[test]
 fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-    assert_eq!(TIMESTAMP_QUERY_COUNT, 74);
+    assert_eq!(TIMESTAMP_QUERY_COUNT, 82);
     let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
     let mut layout = GpuProfileLayout::default();
     for index in 0..MAX_PROFILED_VIEWS {
