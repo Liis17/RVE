@@ -323,12 +323,16 @@ pub(crate) struct Transcript<'a> {
     pub server_public: &'a [u8; 32],
     pub identity_public: &'a [u8; 32],
     pub conn_id: u32,
+    /// Шаг квантования позиции: биты f32. Стороны с разным шагом не согласуют ключи.
+    pub position_step: u32,
 }
 
 pub(crate) fn transcript_hash(transcript: &Transcript<'_>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("RVE net v1 transcript");
+    hasher.update(&crate::packet::WIRE_VERSION.to_be_bytes());
     hasher.update(transcript.protocol_id);
     hasher.update(transcript.scene_hash);
+    hasher.update(&transcript.position_step.to_be_bytes());
     hasher.update(transcript.client_public);
     hasher.update(transcript.nonce);
     hasher.update(transcript.server_public);
@@ -864,5 +868,29 @@ mod tests {
         assert!(same.open(&datagram).is_some());
         let mut other = reject_session(&[1u8; 32], &[3u8; 32]);
         assert!(other.open(&datagram).is_none(), "другой транскрипт");
+    }
+
+    #[test]
+    fn transcript_binds_the_position_step() {
+        let base = Transcript {
+            protocol_id: &[1; 32],
+            scene_hash: &[2; 32],
+            client_public: &[3; 32],
+            nonce: &[4; 16],
+            server_public: &[5; 32],
+            identity_public: &[6; 32],
+            conn_id: 7,
+            position_step: 0.01f32.to_bits(),
+        };
+        let other = Transcript {
+            position_step: 0.5f32.to_bits(),
+            ..base
+        };
+        assert_ne!(
+            transcript_hash(&base),
+            transcript_hash(&other),
+            "шаг меняет транскрипт"
+        );
+        assert_eq!(transcript_hash(&base), transcript_hash(&base));
     }
 }

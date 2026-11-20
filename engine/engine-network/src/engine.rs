@@ -63,6 +63,8 @@ pub struct NetworkConfig {
     pub scene_hash: [u8; 32],
     /// Срок молчания до разрыва соединения.
     pub timeout: Duration,
+    /// Шаг квантования позиции, 1e-5..=1.0. Клиент и сервер одной сессии должны совпасть.
+    pub position_step: f32,
 }
 
 enum Command {
@@ -151,6 +153,7 @@ impl NetworkEngine {
             protocol_id,
             scene_hash,
             timeout,
+            position_step,
         } = config;
         let now = Instant::now();
         let (machine, transport) = match role {
@@ -168,6 +171,7 @@ impl NetworkEngine {
                         max_clients,
                         password,
                         timeout,
+                        position_step,
                     },
                     identity,
                     now,
@@ -189,6 +193,7 @@ impl NetworkEngine {
                         insecure_no_pin,
                         password,
                         timeout,
+                        position_step,
                     },
                     now,
                 )?;
@@ -485,6 +490,7 @@ mod tests {
                 max_clients: 1,
                 password: None,
                 timeout: Duration::from_secs(5),
+                position_step: 0.01,
             },
             ServerIdentity::ephemeral().unwrap(),
             Instant::now(),
@@ -549,6 +555,7 @@ mod tests {
                 insecure_no_pin: false,
                 password: None,
                 timeout: Duration::from_secs(5),
+                position_step: 0.01,
             },
             Instant::now(),
         )
@@ -705,6 +712,7 @@ mod tests {
                     max_clients: 2,
                     password: None,
                     timeout,
+                    position_step: 0.01,
                 },
                 identity,
                 now,
@@ -737,6 +745,7 @@ mod tests {
                     insecure_no_pin: false,
                     password: None,
                     timeout: self.timeout,
+                    position_step: 0.01,
                 },
                 self.now,
             )

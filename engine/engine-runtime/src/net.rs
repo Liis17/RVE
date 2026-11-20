@@ -89,10 +89,12 @@ pub(crate) fn prepare(
             protocol_id: engine_network::protocol_id(&project.id, &project.version),
             scene_hash,
             timeout: Duration::from_millis(u64::from(settings.timeout_ms)),
+            position_step: settings.position_step,
         },
         bridge: BridgeConfig {
             mode,
             tick_hz: settings.tick_hz,
+            position_step: settings.position_step,
         },
     })
 }
@@ -498,7 +500,11 @@ return Script
             // Мост подключается до старта скриптов, как в `pipeline.rs`: `on_start` видит режим сети.
             let bridge = NetworkBridge::attach(
                 link,
-                BridgeConfig { mode, tick_hz: 30 },
+                BridgeConfig {
+                    mode,
+                    tick_hz: 30,
+                    position_step: 0.01,
+                },
                 &mut world,
                 &mut ScriptNetSink::new(&mut scripts),
                 base,

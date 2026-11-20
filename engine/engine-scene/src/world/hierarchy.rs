@@ -288,8 +288,8 @@ impl World {
         let parent_rotation = self
             .parent_index(index)
             .map_or(Quat::IDENTITY, |parent| self.fresh_world_rotation(parent));
-        let local = (parent_rotation.inverse() * quat_from_degrees(rotation_deg)).normalize();
-        let rotation_deg = rotation_to_degrees(local);
+        let local = (parent_rotation.inverse() * quat_from_yxz_degrees(rotation_deg)).normalize();
+        let rotation_deg = yxz_degrees_from_quat(local);
         if !rotation_deg.is_finite() {
             return Err(self.object_error(index, "локальный поворот объекта не конечен"));
         }
@@ -299,7 +299,7 @@ impl World {
     /// Мировой поворот в градусах по текущим локальным трансформациям.
     pub fn world_rotation_deg(&self, handle: ObjectHandle) -> Option<Vec3> {
         let index = self.dense(handle)?;
-        Some(rotation_to_degrees(self.fresh_world_rotation(index)))
+        Some(yxz_degrees_from_quat(self.fresh_world_rotation(index)))
     }
 
     /// Применяет одно изменение; при ошибке мир не меняется.
@@ -439,7 +439,7 @@ impl World {
     }
 
     fn fresh_world_rotation(&self, index: usize) -> Quat {
-        let local = quat_from_degrees(self.objects[index].transform.rotation_deg);
+        let local = quat_from_yxz_degrees(self.objects[index].transform.rotation_deg);
         match self.parent_index(index) {
             Some(parent) => (self.fresh_world_rotation(parent) * local).normalize(),
             None => local,
@@ -488,17 +488,19 @@ fn local_from_matrix(matrix: Mat4) -> LocalTransform {
     let (scale, rotation, position) = matrix.to_scale_rotation_translation();
     LocalTransform {
         position,
-        rotation_deg: rotation_to_degrees(rotation),
+        rotation_deg: yxz_degrees_from_quat(rotation),
         scale,
     }
 }
 
-fn quat_from_degrees(rotation_deg: Vec3) -> Quat {
+/// Углы Эйлера YXZ в градусах (как `LocalTransform::rotation_deg`) → единичный кватернион.
+pub fn quat_from_yxz_degrees(rotation_deg: Vec3) -> Quat {
     let rotation = rotation_deg * (std::f32::consts::PI / 180.0);
     Quat::from_euler(EulerRot::YXZ, rotation.y, rotation.x, rotation.z).normalize()
 }
 
-fn rotation_to_degrees(rotation: Quat) -> Vec3 {
+/// Кватернион → углы Эйлера YXZ в градусах. Углы не сохраняются: 190° может стать −170°.
+pub fn yxz_degrees_from_quat(rotation: Quat) -> Vec3 {
     let (yaw, pitch, roll) = rotation.normalize().to_euler(EulerRot::YXZ);
     Vec3::new(pitch, yaw, roll) * (180.0 / std::f32::consts::PI)
 }

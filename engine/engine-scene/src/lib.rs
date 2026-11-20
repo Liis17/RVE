@@ -86,5 +86,5 @@ pub use world::{
     EnvironmentState, LOD_REFERENCE_FOV, LightState, LocalLightState, LocalTransform, LodSelector,
     MAX_GENERATION, MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle,
     ParticleEmitterInstance, SceneFrame, SceneReplacement, SceneWarning, SpawnOptions, World,
-    WorldObject,
+    WorldObject, quat_from_yxz_degrees, yxz_degrees_from_quat,
 };

@@ -105,6 +105,7 @@ impl World {
                 max_clients,
                 password: password.map(Password::new),
                 timeout: TIMEOUT,
+                position_step: 0.01,
             },
             identity,
             now,
@@ -151,6 +152,7 @@ impl World {
                 fingerprint,
                 password: password.map(Password::new),
                 timeout: TIMEOUT,
+                position_step: 0.01,
             },
             self.now,
         )
@@ -248,6 +250,7 @@ fn server_only(max_clients: usize) -> Server {
             max_clients,
             password: None,
             timeout: TIMEOUT,
+            position_step: 0.01,
         },
         ServerIdentity::ephemeral().unwrap(),
         Instant::now(),
@@ -261,6 +264,7 @@ fn fresh_hello() -> Hello {
         nonce: [7; 16],
         protocol_id: PROTOCOL,
         scene_hash: SCENE,
+        position_step: 0.01f32.to_bits(),
     }
 }
 
@@ -780,6 +784,7 @@ fn repeated_wrong_passwords_from_one_address_are_refused_for_a_while() {
             max_clients: 2,
             password: Some(Password::new("верный")),
             timeout: TIMEOUT,
+            position_step: 0.01,
         },
         identity,
         now,
@@ -796,6 +801,7 @@ fn repeated_wrong_passwords_from_one_address_are_refused_for_a_while() {
                 insecure_no_pin: false,
                 password: Some(Password::new("неверный")),
                 timeout: TIMEOUT,
+                position_step: 0.01,
             },
             at,
         )
@@ -838,6 +844,7 @@ impl HalfSession {
             nonce: [7; 16],
             protocol_id: PROTOCOL,
             scene_hash: SCENE,
+            position_step: 0.01f32.to_bits(),
         };
         let cookie = cookie_from(&server.handle_datagram(from, &hello_datagram(&hello), now));
         let out = server.handle_datagram(from, &confirm_datagram(&cookie, &hello), now);
@@ -852,6 +859,7 @@ impl HalfSession {
             server_public: &server_public,
             identity_public: &identity_public,
             conn_id,
+            position_step: 0.01f32.to_bits(),
         });
         Self {
             ephemeral,
@@ -901,6 +909,7 @@ fn password_server(password: &str) -> Server {
             max_clients: 2,
             password: Some(Password::new(password)),
             timeout: TIMEOUT,
+            position_step: 0.01,
         },
         ServerIdentity::ephemeral().unwrap(),
         Instant::now(),

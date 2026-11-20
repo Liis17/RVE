@@ -19,13 +19,14 @@ use crate::crypto::{
 };
 use crate::handshake::{
     HANDSHAKE_TIMEOUT, Hello, accept_datagram, cookie_datagram, cookie_valid, make_cookie,
-    parse_confirm, reject_datagram,
+    parse_confirm, reject_datagram, reject_datagram_as,
 };
 use crate::link::{
     AUTH_BODY, Link, OP_AUTH, OP_DISCONNECT, OP_FRAMES, disconnect_body, parse_disconnect,
     welcome_body,
 };
-use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM};
+use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM, WIRE_VERSION};
+use crate::replication::PoseCodec;
 use crate::{Channel, NetError, NetworkEvent, Output};
 
 /// Наибольшее число клиентов на сервере.
@@ -59,6 +60,8 @@ pub struct ServerConfig {
     pub password: Option<Password>,
     /// Срок молчания, после которого соединение считается разорванным.
     pub timeout: Duration,
+    /// Шаг квантования позиции; клиент с другим шагом получает отказ.
+    pub position_step: f32,
 }
 
 /// Рукопожатие, которое ещё не получило верного Auth.
@@ -145,6 +148,8 @@ struct AuthRecord {
 pub struct Server {
     protocol_id: [u8; 32],
     scene_hash: [u8; 32],
+    /// Биты шага квантования позиции: сверяются с Hello и входят в транскрипт.
+    position_step: u32,
     max_clients: usize,
     password: Option<Password>,
     timeout: Duration,
@@ -169,9 +174,11 @@ impl Server {
                 "max_clients должен быть в диапазоне 1..={MAX_CLIENTS}"
             )));
         }
+        let position_step = PoseCodec::new(config.position_step)?.step().to_bits();
         Ok(Self {
             protocol_id: config.protocol_id,
             scene_hash: config.scene_hash,
+            position_step,
             max_clients: config.max_clients,
             password: config.password,
             timeout: config.timeout,
@@ -190,6 +197,7 @@ impl Server {
     pub fn handle_datagram(&mut self, from: SocketAddr, bytes: &[u8], now: Instant) -> Output {
         let mut out = Output::default();
         let Some(header) = Header::decode(bytes) else {
+            self.on_foreign_hello(from, bytes, &mut out);
             return out;
         };
         match header.kind {
@@ -319,9 +327,27 @@ impl Server {
             Some("протокол не совпадает")
         } else if hello.scene_hash != self.scene_hash {
             Some("версия сцены не совпадает")
+        } else if hello.position_step != self.position_step {
+            Some("шаг квантования позиции не совпадает")
         } else {
             None
         }
+    }
+
+    /// Hello чужой версии: короткий отказ с заголовком версии запроса, чтобы клиент увидел причину.
+    /// Узкая ветка: только датаграмма ровно `MAX_DATAGRAM` с `conn_id = 0`. Состояние не создаётся.
+    fn on_foreign_hello(&self, from: SocketAddr, bytes: &[u8], out: &mut Output) {
+        let Some((version, header)) = Header::decode_any(bytes) else {
+            return;
+        };
+        if header.kind != Kind::Hello || header.conn_id != 0 || bytes.len() != MAX_DATAGRAM {
+            return;
+        }
+        let reason = format!(
+            "версия сетевого протокола не совпадает: сервер {WIRE_VERSION}, клиент {version}"
+        );
+        out.datagrams
+            .push((from, reject_datagram_as(version, &reason)));
     }
 
     fn on_hello(&self, from: SocketAddr, bytes: &[u8], now: Instant, out: &mut Output) {
@@ -409,6 +435,7 @@ impl Server {
             server_public: &server_public,
             identity_public: &identity_public,
             conn_id,
+            position_step: self.position_step,
         });
         let keys = derive_keys(&shared, &transcript, &password_hash(self.password.as_ref()));
         let reject = reject_session(&shared, &transcript);
@@ -705,11 +732,152 @@ mod tests {
             max_clients,
             password: None,
             timeout: Duration::from_secs(1),
+            position_step: 0.01,
         };
         let identity = || ServerIdentity::ephemeral().unwrap();
         let now = Instant::now();
         assert!(Server::new(config(0), identity(), now).is_err());
         assert!(Server::new(config(MAX_CLIENTS + 1), identity(), now).is_err());
         assert!(Server::new(config(MAX_CLIENTS), identity(), now).is_ok());
+    }
+
+    fn hello() -> Hello {
+        Hello {
+            client_public: [1; 32],
+            nonce: [2; 16],
+            protocol_id: [1; 32],
+            scene_hash: [2; 32],
+            position_step: 0.01f32.to_bits(),
+        }
+    }
+
+    fn server_with_step(position_step: f32) -> Result<Server, NetError> {
+        Server::new(
+            ServerConfig {
+                protocol_id: [1; 32],
+                scene_hash: [2; 32],
+                max_clients: 2,
+                password: None,
+                timeout: Duration::from_secs(1),
+                position_step,
+            },
+            ServerIdentity::ephemeral().unwrap(),
+            Instant::now(),
+        )
+    }
+
+    fn server() -> Server {
+        server_with_step(0.01).unwrap()
+    }
+
+    fn from() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 9000))
+    }
+
+    fn reason_of(out: &Output) -> String {
+        let (_, datagram) = out.datagrams.first().expect("ответ на Hello");
+        crate::handshake::parse_reject(&datagram[HEADER_LEN..])
+    }
+
+    /// Hello версии 2 получает короткий отказ с заголовком версии 2 и текстом о версии. Состояние
+    /// соединения не создаётся.
+    #[test]
+    fn v2_hello_gets_a_version_reject_without_state() {
+        let mut server = server();
+        let v2 = crate::handshake::hello_v2_datagram(&hello());
+        let out = server.handle_datagram(from(), &v2, Instant::now());
+        assert_eq!(out.datagrams.len(), 1);
+        let (version, header) = Header::decode_any(&out.datagrams[0].1).unwrap();
+        assert_eq!(version, 2, "заголовок echo-ит версию запроса");
+        assert_eq!(header.kind, Kind::Reject);
+        assert_eq!(
+            reason_of(&out),
+            "версия сетевого протокола не совпадает: сервер 3, клиент 2"
+        );
+        assert!(server.halves.is_empty(), "полуоткрытая сессия не создана");
+        assert_eq!(server.peer_count(), 0);
+    }
+
+    /// Узкая ветка принимает только датаграмму ровно 1200 байт с `conn_id = 0`.
+    #[test]
+    fn foreign_hello_outside_the_narrow_branch_is_ignored() {
+        let mut server = server();
+        let mut short = crate::handshake::hello_v2_datagram(&hello());
+        short.pop();
+        assert!(
+            server
+                .handle_datagram(from(), &short, Instant::now())
+                .datagrams
+                .is_empty()
+        );
+
+        let mut with_conn = crate::handshake::hello_v2_datagram(&hello());
+        with_conn[7..11].copy_from_slice(&5u32.to_be_bytes());
+        assert!(
+            server
+                .handle_datagram(from(), &with_conn, Instant::now())
+                .datagrams
+                .is_empty()
+        );
+    }
+
+    /// Чужие Confirm и Data строго проверяют версию и ответа не получают.
+    #[test]
+    fn foreign_confirm_and_data_get_no_reply() {
+        let mut server = server();
+        let mut confirm = Vec::new();
+        Header {
+            kind: Kind::Confirm,
+            conn_id: 0,
+        }
+        .encode_as(2, &mut confirm);
+        confirm.resize(MAX_DATAGRAM, 0);
+        assert!(
+            server
+                .handle_datagram(from(), &confirm, Instant::now())
+                .datagrams
+                .is_empty()
+        );
+
+        let mut data = Vec::new();
+        Header {
+            kind: Kind::Data,
+            conn_id: 9,
+        }
+        .encode_as(2, &mut data);
+        data.resize(64, 0);
+        assert!(
+            server
+                .handle_datagram(from(), &data, Instant::now())
+                .datagrams
+                .is_empty()
+        );
+        assert!(server.halves.is_empty());
+    }
+
+    /// Клиент с другим шагом квантования получает явный отказ и не получает cookie.
+    #[test]
+    fn mismatched_position_step_is_rejected_on_hello() {
+        let mut server = server();
+        let mut other = hello();
+        other.position_step = 0.5f32.to_bits();
+        let out = server.handle_datagram(
+            from(),
+            &crate::handshake::hello_datagram(&other),
+            Instant::now(),
+        );
+        assert_eq!(out.datagrams.len(), 1);
+        assert_eq!(reason_of(&out), "шаг квантования позиции не совпадает");
+        assert_eq!(
+            Header::decode(&out.datagrams[0].1).map(|h| h.kind),
+            Some(Kind::Reject)
+        );
+    }
+
+    #[test]
+    fn invalid_position_step_is_refused() {
+        for step in [0.0, 2.0, f32::NAN] {
+            assert!(server_with_step(step).is_err(), "{step}");
+        }
     }
 }

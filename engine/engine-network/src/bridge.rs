@@ -21,8 +21,8 @@ use log::{debug, error, warn};
 
 use crate::interpolation::{Clock, Sample, push_sample, sample_at};
 use crate::replication::{
-    self, MASK_POSITION, MASK_ROTATION, MASK_SCALE, Message, Pose, SnapItem, SpawnBody, StateItem,
-    child_net_id, state_batches, sync_mask,
+    self, ChildBody, MASK_POSITION, MASK_ROTATION, MASK_SCALE, Message, Pose, PoseCodec, SnapItem,
+    SpawnBody, StateItem, child_net_id, state_batches, sync_mask,
 };
 use crate::{Channel, NetError, NetworkEvent, NetworkHandle};
 
@@ -106,6 +106,8 @@ pub struct BridgeConfig {
     pub mode: NetMode,
     /// Частота серверных меток; та же, что у `[network].tick_hz` проекта.
     pub tick_hz: u32,
+    /// Шаг квантования позиции; тот же, что у `[network].position_step` проекта.
+    pub position_step: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +177,7 @@ struct FaultWindow {
 /// Мост сетевого потока и мира. Создаётся один раз на сессию.
 pub struct NetworkBridge<L: NetLink> {
     link: L,
+    codec: PoseCodec,
     mode: NetMode,
     /// Свой номер; у клиента неизвестен до события `LocalPeer`.
     local_peer: Option<PeerId>,
@@ -214,8 +217,10 @@ impl<L: NetLink> NetworkBridge<L> {
         if config.tick_hz == 0 {
             return Err(NetError::Config("tick_hz должен быть больше нуля".into()));
         }
+        let codec = PoseCodec::new(config.position_step)?;
         let mut bridge = Self {
             link,
+            codec,
             mode: config.mode,
             local_peer: (config.mode != NetMode::Client).then_some(SERVER_PEER_ID),
             clock: Clock::new(now, config.tick_hz),
@@ -372,7 +377,7 @@ impl<L: NetLink> NetworkBridge<L> {
                 if self.mode == NetMode::Offline {
                     return;
                 }
-                match replication::decode(&bytes) {
+                match replication::decode(&bytes, self.codec) {
                     Ok(message) => self.on_message(peer, message, world, sink, now, out),
                     Err(err) => {
                         warn!("сообщение репликации участника {peer} отброшено: {err}");
@@ -453,6 +458,7 @@ impl<L: NetLink> NetworkBridge<L> {
                     object,
                     name,
                     value,
+                    ..
                 } => match self.rpc_object(object, world) {
                     Ok(object) => out.push(NetEvent::Message {
                         peer,
@@ -470,6 +476,7 @@ impl<L: NetLink> NetworkBridge<L> {
                 | Message::Despawn(_)
                 | Message::SceneDeleted(_)
                 | Message::SetOwner { .. }
+                | Message::Leave { .. }
                 | Message::Snapshot(_)
                 | Message::SnapshotEnd => {
                     warn!("участник {peer} прислал серверное сообщение репликации");
@@ -489,6 +496,8 @@ impl<L: NetLink> NetworkBridge<L> {
                     }
                 }
                 Message::SetOwner { object, owner } => self.on_set_owner(object, owner, sink),
+                // Временное снятие поддерева появится вместе с очередью RPC и значимостью.
+                Message::Leave { .. } => debug!("Leave от сервера пока не обрабатывается"),
                 Message::States { tick, items } => {
                     self.clock.observe(tick, now);
                     self.clock.last_tick = tick;
@@ -500,6 +509,7 @@ impl<L: NetLink> NetworkBridge<L> {
                     object,
                     name,
                     value,
+                    ..
                 } => match self.rpc_object(object, world) {
                     Ok(object) => out.push(NetEvent::Message {
                         peer: SERVER_PEER_ID,
@@ -662,7 +672,7 @@ impl<L: NetLink> NetworkBridge<L> {
             id: Some(body.id.clone()),
             parent,
             position: Some(body.pose.position),
-            rotation_deg: Some(body.pose.rotation_deg),
+            rotation_deg: Some(body.pose.rotation_yxz_degrees()),
             scale: Some(body.pose.scale),
             name: None,
         };
@@ -817,6 +827,7 @@ impl<L: NetLink> NetworkBridge<L> {
                 owner,
                 mask,
                 pose,
+                ..
             } => {
                 if let Some(seen) = self.snapshot_seen.as_mut() {
                     seen.insert(object);
@@ -908,10 +919,11 @@ impl<L: NetLink> NetworkBridge<L> {
         };
         let message = Message::Rpc {
             object: object.map(|(net, _)| net),
+            epoch: 0,
             name,
             value,
         };
-        let bytes = match replication::encode(&message) {
+        let bytes = match replication::encode(&message, self.codec) {
             Ok(bytes) => bytes,
             Err(err) => {
                 warn!("RPC не отправлен: {err}");
@@ -1051,17 +1063,64 @@ impl<L: NetLink> NetworkBridge<L> {
         };
         Some(SpawnBody {
             root: net,
+            epoch: 0,
             prefab: prefab.clone(),
             id: replication::spawn_id(net, prefab),
             owner: replica.owner,
             parent,
             pose: Pose::from_local(&object.transform),
+            children: self.child_bodies(net, replica.handle, world),
         })
+    }
+
+    /// Живые сетевые дети spawn-корня с владельцами и синхронизируемыми позами. Ребёнок считается
+    /// своим, только если его id выводится из корня (как в `adopt_children`): дети вложенного
+    /// корня сюда не попадают. Лишние сверх лимита сообщения отбрасываются с записью в лог.
+    fn child_bodies(&self, root_net: NetId, root: ObjectHandle, world: &World) -> Vec<ChildBody> {
+        let Some(root_id) = world.object(root).map(|object| object.id.clone()) else {
+            return Vec::new();
+        };
+        let prefix = format!("{root_id}.");
+        let mut children = Vec::new();
+        for child in world.subtree(&[root]) {
+            if child == root {
+                continue;
+            }
+            let Some(relative) = world
+                .object(child)
+                .and_then(|object| object.id.strip_prefix(&prefix).map(str::to_owned))
+            else {
+                continue;
+            };
+            let Some(net) = self.net_of(child) else {
+                continue;
+            };
+            if net != child_net_id(root_net, &relative) {
+                continue;
+            }
+            let Some(replica) = self.replicas.get(&net) else {
+                continue;
+            };
+            let Some(local) = world.local_transform(child) else {
+                continue;
+            };
+            children.push(ChildBody {
+                object: net,
+                owner: replica.owner,
+                mask: replica.sync.map_or(0, |sync| sync_mask(&sync)),
+                pose: Pose::from_local(local),
+            });
+        }
+        if children.len() > replication::MAX_SPAWN_CHILDREN {
+            warn!("у корня больше сетевых детей, чем помещается в spawn: лишние отброшены");
+            children.truncate(replication::MAX_SPAWN_CHILDREN);
+        }
+        children
     }
 
     fn send_snapshot(&mut self, peer: PeerId, world: &World) {
         let items = self.snapshot_items(world);
-        match replication::snapshot_chunks(&items) {
+        match replication::snapshot_chunks(&items, self.codec) {
             Ok(chunks) => {
                 for chunk in chunks {
                     self.send_bytes(NetTarget::Peer(peer), Channel::Reliable, chunk);
@@ -1090,6 +1149,7 @@ impl<L: NetLink> NetworkBridge<L> {
             let mask = replica.sync.map_or(0, |sync| sync_mask(&sync));
             items.push(SnapItem::Object {
                 object: *net,
+                epoch: 0,
                 owner: replica.owner,
                 mask,
                 pose: Pose::from_local(local),
@@ -1151,12 +1211,13 @@ impl<L: NetLink> NetworkBridge<L> {
                     let interval =
                         Duration::from_secs_f64(1.0 / f64::from(sync.send_rate_hz.max(1)));
                     elapsed >= KEYFRAME_INTERVAL
-                        || (elapsed >= interval && pose.differs(&previous, mask))
+                        || (elapsed >= interval && pose.differs(&previous, mask, self.codec))
                 }
             };
             if send {
                 due.push(StateItem {
                     object: *net,
+                    epoch: 0,
                     mask,
                     pose,
                 });
@@ -1170,12 +1231,12 @@ impl<L: NetLink> NetworkBridge<L> {
     fn send_batches(&mut self, target: NetTarget, tick: u32, due: &[StateItem], now: Instant) {
         let mut lost = 0;
         let mut reason = None;
-        for range in state_batches(due) {
+        for range in state_batches(due, self.codec) {
             let message = Message::States {
                 tick,
                 items: due[range.clone()].to_vec(),
             };
-            let bytes = match replication::encode(&message) {
+            let bytes = match replication::encode(&message, self.codec) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     error!("пакет состояний не закодирован: {err}");
@@ -1288,7 +1349,7 @@ impl<L: NetLink> NetworkBridge<L> {
     }
 
     fn transmit(&mut self, target: NetTarget, channel: Channel, message: &Message) {
-        match replication::encode(message) {
+        match replication::encode(message, self.codec) {
             Ok(bytes) => self.send_bytes(target, channel, bytes),
             Err(err) => error!("сообщение репликации не закодировано: {err}"),
         }
@@ -1429,7 +1490,7 @@ fn apply_pose(world: &mut World, handle: ObjectHandle, pose: Pose, mask: u8) {
         next.position = pose.position;
     }
     if mask & MASK_ROTATION != 0 {
-        next.rotation_deg = pose.rotation_deg;
+        next.rotation_deg = pose.rotation_yxz_degrees();
     }
     if mask & MASK_SCALE != 0 {
         next.scale = pose.scale;

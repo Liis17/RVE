@@ -15,10 +15,15 @@ use engine_scene::{
 use glam::Vec3;
 
 use crate::bridge::{BridgeConfig, NetLink, NetworkBridge, RETRY_REASON, SpawnedRoot, WorldSink};
-use crate::replication::{self, MASK_POSITION, Message, Pose, StateItem, child_net_id};
+use crate::replication::{self, MASK_POSITION, Message, Pose, PoseCodec, StateItem, child_net_id};
 use crate::{Channel, NetError, NetworkEvent};
 
 const TICK_HZ: u32 = 30;
+const POSITION_STEP: f32 = 0.01;
+
+fn codec() -> PoseCodec {
+    PoseCodec::new(POSITION_STEP).unwrap()
+}
 /// Столько ошибок подряд отключают участника в пределах окна.
 const FAULT_BURST: usize = 32;
 const STEP: Duration = Duration::from_millis(10);
@@ -54,6 +59,8 @@ struct Hub {
     snapshot_messages: usize,
     /// Доставленные `SnapshotEnd`: по одному на каждый отправленный снимок.
     snapshot_ends: usize,
+    /// Доставленные `Spawn`: корень и сетевые id его детей, как их передал сервер.
+    spawns: Vec<(NetId, Vec<NetId>)>,
     /// Сколько состояний сервер принимает за шаг; `None` — без ограничения.
     state_budget: Option<usize>,
     state_sent: usize,
@@ -86,9 +93,13 @@ impl Hub {
             if channel == Channel::State && self.drop_state {
                 continue;
             }
-            match replication::decode(&bytes) {
+            match replication::decode(&bytes, codec()) {
                 Ok(Message::Snapshot(_)) => self.snapshot_messages += 1,
                 Ok(Message::SnapshotEnd) => self.snapshot_ends += 1,
+                Ok(Message::Spawn(body)) => self.spawns.push((
+                    body.root,
+                    body.children.iter().map(|child| child.object).collect(),
+                )),
                 _ => {}
             }
             match from {
@@ -370,10 +381,11 @@ fn state_message(object: NetId, x: f32) -> Message {
         tick: 0,
         items: vec![StateItem {
             object,
+            epoch: 0,
             mask: MASK_POSITION,
             pose: Pose {
                 position: Vec3::new(x, 0.0, 0.0),
-                rotation_deg: Vec3::ZERO,
+                rotation: glam::Quat::IDENTITY,
                 scale: Vec3::ONE,
             },
         }],
@@ -394,6 +406,7 @@ impl Session {
             BridgeConfig {
                 mode: NetMode::Server,
                 tick_hz: TICK_HZ,
+                position_step: POSITION_STEP,
             },
             &mut world,
             &mut sink,
@@ -430,6 +443,7 @@ impl Session {
             BridgeConfig {
                 mode: NetMode::Client,
                 tick_hz: TICK_HZ,
+                position_step: POSITION_STEP,
             },
             &mut world,
             &mut sink,
@@ -514,7 +528,7 @@ impl Session {
 
     /// Шлёт сообщение в обход моста с произвольным адресатом.
     fn inject_from(&mut self, from: Side, target: NetTarget, message: &Message, channel: Channel) {
-        let bytes = replication::encode(message).unwrap();
+        let bytes = replication::encode(message, codec()).unwrap();
         self.hub
             .borrow_mut()
             .outbox
@@ -696,6 +710,23 @@ fn only_the_owner_moves_an_owned_object() {
     session.step_n(25, STEP);
     let other_mirror = mirror(session.client(2), net).unwrap();
     assert!((position_of(&session.client(2).world, other_mirror).x - 4.0).abs() < 1e-3);
+}
+
+/// `Spawn` сервера несёт живых сетевых детей корня: их id совпадают с выведенными из корня.
+#[test]
+fn spawn_lists_the_live_network_children_of_its_root() {
+    let mut session = Session::new();
+    session.connect();
+    let root = session.spawn_on_server(CRATE);
+    let net = session.server.sink.nets[&root].0;
+    session.step_n(2, STEP);
+
+    let spawns = session.hub.borrow().spawns.clone();
+    let (_, children) = spawns
+        .iter()
+        .find(|(root_net, _)| *root_net == net)
+        .expect("Spawn корня отправлен");
+    assert_eq!(children, &vec![child_net_id(net, "lid")]);
 }
 
 #[test]
@@ -985,6 +1016,7 @@ fn rpc_addressed_to_a_dead_or_unknown_object_reaches_nobody() {
     let unknown = NetId::spawned(900).unwrap();
     for object in [net, unknown] {
         let message = Message::Rpc {
+            epoch: 0,
             object: Some(object),
             name: "ghost".to_owned(),
             value: ParamValue::Bool(true),
@@ -1112,7 +1144,7 @@ fn moving_objects_beyond_one_queue_limit_all_reach_the_replicas() {
     // Очередь команд принимает 256 сообщений за шаг, как настоящая.
     session.hub.borrow_mut().state_budget = Some(256);
     for (index, root) in roots.iter().enumerate() {
-        let x = 0.5 + index as f32 * 0.001;
+        let x = 0.5 + index as f32 * 0.02;
         set_position(&mut session.server.world, *root, Vec3::new(x, 0.0, 0.0));
     }
     session.step_n(40, STEP);
@@ -1121,9 +1153,9 @@ fn moving_objects_beyond_one_queue_limit_all_reach_the_replicas() {
     for (index, root) in roots.iter().enumerate() {
         let net = session.server.sink.nets[root].0;
         let mirror = mirror(client, net).expect("объект реплицирован");
-        let expected = 0.5 + index as f32 * 0.001;
+        let expected = 0.5 + index as f32 * 0.02;
         assert!(
-            (position_of(&client.world, mirror).x - expected).abs() < 1e-3,
+            (position_of(&client.world, mirror).x - expected).abs() <= POSITION_STEP / 2.0 + 1e-4,
             "объект {index} не получил позу"
         );
     }

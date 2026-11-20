@@ -15,12 +15,13 @@ use crate::crypto::{
 };
 use crate::handshake::{
     ACCEPT_BODY, COOKIE_BODY, HANDSHAKE_RESEND, HANDSHAKE_TIMEOUT, Hello, confirm_datagram,
-    hello_datagram, parse_accept, parse_reject,
+    hello_datagram, hello_v2_datagram, parse_accept, parse_reject,
 };
 use crate::link::{
     Link, OP_DISCONNECT, OP_FRAMES, auth_body, disconnect_body, parse_disconnect, parse_welcome,
 };
-use crate::packet::{HEADER_LEN, Header, Kind};
+use crate::packet::{HEADER_LEN, Header, Kind, WIRE_VERSION};
+use crate::replication::PoseCodec;
 use crate::{Channel, NetError, NetworkEvent, Output};
 
 /// Настройки клиента.
@@ -34,6 +35,8 @@ pub struct ClientConfig {
     pub insecure_no_pin: bool,
     pub password: Option<Password>,
     pub timeout: Duration,
+    /// Шаг квантования позиции; должен совпасть с шагом сервера.
+    pub position_step: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,6 +64,9 @@ struct Handshake {
     reject: Option<Session>,
     /// Последний неподписанный отказ на раннем этапе: показывается, если рукопожатие не состоится.
     last_reject: Option<String>,
+    /// Ответ сервера на диагностический Hello версии 2. Только пояснение к таймауту: рукопожатия
+    /// он не продвигает и не сбивает.
+    diagnosis: Option<String>,
     auth: Vec<u8>,
 }
 
@@ -98,12 +104,14 @@ impl Client {
                 config.server
             );
         }
+        let position_step = PoseCodec::new(config.position_step)?.step().to_bits();
         let ephemeral = EphemeralKey::random()?;
         let hello = Hello {
             client_public: ephemeral.public(),
             nonce: random_bytes::<16>()?,
             protocol_id: config.protocol_id,
             scene_hash: config.scene_hash,
+            position_step,
         };
         Ok(Self {
             settings: Settings {
@@ -123,6 +131,7 @@ impl Client {
                 session: None,
                 reject: None,
                 last_reject: None,
+                diagnosis: None,
                 auth: Vec::new(),
             })),
             local_peer: None,
@@ -144,9 +153,13 @@ impl Client {
         if from != self.settings.server {
             return out;
         }
-        let Some(header) = Header::decode(bytes) else {
+        let Some((version, header)) = Header::decode_any(bytes) else {
             return out;
         };
+        if version != WIRE_VERSION {
+            self.on_foreign(version, header, &bytes[HEADER_LEN..]);
+            return out;
+        }
         let state = std::mem::replace(&mut self.state, State::Closed);
         self.state = match state {
             State::Handshake(hs) => self.on_handshake(hs, header, bytes, now, &mut out),
@@ -221,6 +234,7 @@ impl Client {
             let reason = hs
                 .last_reject
                 .take()
+                .or_else(|| hs.diagnosis.take())
                 .unwrap_or_else(|| "таймаут подключения".to_owned());
             disconnected(&reason, out);
             return State::Closed;
@@ -230,7 +244,15 @@ impl Client {
             .is_none_or(|sent| now.saturating_duration_since(sent) >= HANDSHAKE_RESEND);
         if due {
             let datagram = match hs.stage {
-                Stage::Hello => Some(hello_datagram(&hs.hello)),
+                Stage::Hello => {
+                    // Диагностический Hello версии 2 шлётся только после того, как первый Hello
+                    // остался без ответа, и v3-попытку не прерывает.
+                    if hs.sent_at.is_some() {
+                        out.datagrams
+                            .push((self.settings.server, hello_v2_datagram(&hs.hello)));
+                    }
+                    Some(hello_datagram(&hs.hello))
+                }
                 Stage::Confirm => Some(confirm_datagram(&hs.cookie, &hs.hello)),
                 Stage::Auth => hs
                     .session
@@ -280,6 +302,24 @@ impl Client {
                 State::Closed
             }
         }
+    }
+
+    /// Датаграмма чужой версии. Рукопожатие её не продвигает: только Cookie и отказ на раннем
+    /// этапе, и только как пояснение к таймауту. Confirm на неё не отправляется.
+    fn on_foreign(&mut self, version: u16, header: Header, body: &[u8]) {
+        let State::Handshake(hs) = &mut self.state else {
+            return;
+        };
+        if hs.stage != Stage::Hello {
+            return;
+        }
+        hs.diagnosis = match header.kind {
+            Kind::Cookie if body.len() == COOKIE_BODY => Some(format!(
+                "сервер использует версию протокола {version}, клиент {WIRE_VERSION}"
+            )),
+            Kind::Reject => Some(parse_reject(body)),
+            _ => None,
+        };
     }
 
     fn on_welcome(
@@ -373,6 +413,9 @@ fn on_cookie(hs: &mut Handshake, body: &[u8], now: Instant) -> Option<Vec<u8>> {
     hs.cookie.copy_from_slice(body);
     hs.stage = Stage::Confirm;
     hs.sent_at = Some(now);
+    // Настоящий ответ версии 3 снимает диагностику версии 2: причина таймаута должна относиться
+    // к текущему рукопожатию.
+    hs.diagnosis = None;
     Some(confirm_datagram(&hs.cookie, &hs.hello))
 }
 
@@ -398,6 +441,7 @@ fn accept_reply(
         server_public: &server_public,
         identity_public: &identity,
         conn_id,
+        position_step: hs.hello.position_step,
     });
     // Сначала подпись: подделанный или чужой Accept игнорируется и не сбивает рукопожатие.
     if !verify_accept(&identity, &transcript, &signature) {
@@ -445,6 +489,7 @@ mod tests {
             insecure_no_pin,
             password: None,
             timeout: Duration::from_secs(1),
+            position_step: 0.01,
         }
     }
 
@@ -495,6 +540,7 @@ mod tests {
             server_public: &[0; 32],
             identity_public: &identity.public_key(),
             conn_id: 7,
+            position_step: hs.hello.position_step,
         });
         let signature = identity.sign(&transcript);
         let accept = accept_datagram(7, &[0; 32], &identity.public_key(), &signature);
@@ -561,6 +607,176 @@ mod tests {
         let out = client.handle_datagram(server, &reject_datagram("подделка"), now);
         assert!(out.events.is_empty(), "подделанный отказ не применяется");
         assert!(matches!(&client.state, State::Handshake(_)));
+    }
+
+    /// Клиент v2 против v3 и наоборот: сервер версии 2 отвечает Cookie на диагностический Hello.
+    /// Confirm на него не уходит, а причина показывается по таймауту.
+    #[test]
+    fn v2_server_is_named_as_the_timeout_reason_without_confirm() {
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let mut v2_cookie = Vec::new();
+        Header {
+            kind: Kind::Cookie,
+            conn_id: 0,
+        }
+        .encode_as(2, &mut v2_cookie);
+        v2_cookie.extend_from_slice(&[0u8; COOKIE_BODY]);
+
+        let out = client.handle_datagram(server, &v2_cookie, now);
+        assert!(
+            out.datagrams.is_empty(),
+            "Confirm на версию 2 не отправляется"
+        );
+        assert!(out.events.is_empty());
+        assert!(matches!(
+            &client.state,
+            State::Handshake(hs) if hs.stage == Stage::Hello
+        ));
+        let out = client.update(now + HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            out.events,
+            vec![NetworkEvent::Disconnected {
+                peer: SERVER_PEER_ID,
+                reason: "сервер использует версию протокола 2, клиент 3".into()
+            }]
+        );
+    }
+
+    /// Диагностический ответ до валидного v3-ответа не срывает подключение: v3 Cookie всё ещё
+    /// продвигает рукопожатие к Confirm.
+    #[test]
+    fn diagnostic_reply_does_not_break_the_v3_cookie_path() {
+        use crate::handshake::cookie_datagram;
+
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let mut v2_cookie = Vec::new();
+        Header {
+            kind: Kind::Cookie,
+            conn_id: 0,
+        }
+        .encode_as(2, &mut v2_cookie);
+        v2_cookie.extend_from_slice(&[0u8; COOKIE_BODY]);
+        client.handle_datagram(server, &v2_cookie, now);
+
+        let out = client.handle_datagram(server, &cookie_datagram(&[0u8; COOKIE_BODY]), now);
+        assert_eq!(out.datagrams.len(), 1, "Confirm v3 отправлен");
+        assert_eq!(out.datagrams[0].1.len(), crate::packet::MAX_DATAGRAM);
+        assert_eq!(
+            Header::decode(&out.datagrams[0].1).map(|h| h.kind),
+            Some(Kind::Confirm)
+        );
+        assert!(matches!(
+            &client.state,
+            State::Handshake(hs) if hs.stage == Stage::Confirm
+        ));
+    }
+
+    /// Первый Hello уходит только версией 3. Диагностический Hello версии 2 добавляется на повторе,
+    /// когда ответа на первый нет, и версию 3 не заменяет.
+    #[test]
+    fn hello_resends_include_the_v2_diagnostic_probe() {
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let versions_of = |out: &Output| -> Vec<u16> {
+            out.datagrams
+                .iter()
+                .map(|(addr, bytes)| {
+                    assert_eq!(*addr, server);
+                    Header::decode_any(bytes).unwrap().0
+                })
+                .collect()
+        };
+        assert_eq!(versions_of(&client.update(now)), vec![3]);
+        assert_eq!(
+            versions_of(&client.update(now + HANDSHAKE_RESEND)),
+            vec![2, 3],
+            "проба и повтор версии 3"
+        );
+    }
+
+    /// Диагностика версии 2 не переживает настоящий Cookie версии 3: причина таймаута относится
+    /// к текущему рукопожатию.
+    #[test]
+    fn v3_cookie_clears_the_v2_diagnosis() {
+        use crate::handshake::cookie_datagram;
+
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let mut v2_reject = Vec::new();
+        Header {
+            kind: Kind::Reject,
+            conn_id: 0,
+        }
+        .encode_as(2, &mut v2_reject);
+        let text = "версия сетевого протокола не совпадает: сервер 3, клиент 2";
+        v2_reject.push(text.len() as u8);
+        v2_reject.extend_from_slice(text.as_bytes());
+        client.handle_datagram(server, &v2_reject, now);
+
+        client.handle_datagram(server, &cookie_datagram(&[0u8; COOKIE_BODY]), now);
+        let out = client.update(now + HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            out.events,
+            vec![NetworkEvent::Disconnected {
+                peer: SERVER_PEER_ID,
+                reason: "таймаут подключения".into()
+            }]
+        );
+    }
+
+    /// Ответы версии 2 на этапе Confirm и Auth рукопожатие не продвигают.
+    #[test]
+    fn v2_accept_and_data_do_not_advance_the_handshake() {
+        use crate::handshake::accept_datagram;
+
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let State::Handshake(hs) = &mut client.state else {
+            panic!("клиент должен быть в рукопожатии");
+        };
+        hs.stage = Stage::Confirm;
+        let v3_accept = accept_datagram(7, &[9; 32], &[8; 32], &[1; 64]);
+        let mut v2_accept = Vec::new();
+        Header {
+            kind: Kind::Accept,
+            conn_id: 7,
+        }
+        .encode_as(2, &mut v2_accept);
+        v2_accept.extend_from_slice(&v3_accept[HEADER_LEN..]);
+        let out = client.handle_datagram(server, &v2_accept, now);
+        assert!(out.datagrams.is_empty() && out.events.is_empty());
+        assert!(matches!(
+            &client.state,
+            State::Handshake(hs) if hs.stage == Stage::Confirm
+        ));
+
+        let mut v2_data = Vec::new();
+        Header {
+            kind: Kind::Data,
+            conn_id: 7,
+        }
+        .encode_as(2, &mut v2_data);
+        v2_data.extend_from_slice(&[0u8; 64]);
+        let out = client.handle_datagram(server, &v2_data, now);
+        assert!(out.datagrams.is_empty() && out.events.is_empty());
+        assert!(matches!(&client.state, State::Handshake(_)));
+    }
+
+    #[test]
+    fn invalid_position_step_is_refused_before_any_socket_work() {
+        let mut bad = config(Some([3; 32]), false);
+        bad.position_step = 2.0;
+        assert!(matches!(
+            Client::new(bad, Instant::now()),
+            Err(NetError::Config(_))
+        ));
     }
 
     /// Неподписанный отказ на раннем этапе запоминается и показывается, когда рукопожатие истекает.

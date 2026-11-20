@@ -118,10 +118,12 @@ impl PlayNetworkForm {
                 protocol_id,
                 scene_hash,
                 timeout: Duration::from_millis(u64::from(settings.timeout_ms)),
+                position_step: settings.position_step,
             },
             bridge: BridgeConfig {
                 mode: NetMode::Host,
                 tick_hz: settings.tick_hz,
+                position_step: settings.position_step,
             },
             summary,
         })
@@ -161,10 +163,12 @@ impl PlayNetworkForm {
                 protocol_id,
                 scene_hash,
                 timeout: Duration::from_millis(u64::from(settings.timeout_ms)),
+                position_step: settings.position_step,
             },
             bridge: BridgeConfig {
                 mode: NetMode::Client,
                 tick_hz: settings.tick_hz,
+                position_step: settings.position_step,
             },
             summary: format!("Сеть: Client к {server_addr}"),
         })
