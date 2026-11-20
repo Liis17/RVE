@@ -96,7 +96,7 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
 
 Перед завершением задачи определяй компоненты, которые могут зависеть от изменений.
 
-- В engine-core, engine-window и engine-render проверяй публичный API и его использование в engine/sandbox. Sandbox также использует engine-assets, engine-files, engine-platform, engine-project, engine-resources и engine-scene.
+- В engine-core, engine-window и engine-render проверяй публичный API и его использование в engine/sandbox. Sandbox также использует engine-assets, engine-files, engine-physics, engine-platform, engine-project, engine-resources и engine-scene.
 - Изменения engine-window, engine-render, engine-platform, engine-scene, engine-audio, engine-script, engine-resources, engine-project, engine-physics, engine-input, engine-network, engine-animation и engine-neural проверяй также на потребителях engine-runtime/rve-player и rve-build, если они используют изменённый крейт. Прямые workspace-зависимости:
   - engine-runtime: engine-core, engine-animation, engine-assets, engine-files, engine-audio, engine-neural, engine-network, engine-input, engine-gui, engine-physics, engine-platform, engine-project, engine-render, engine-resources, engine-scene, engine-script, engine-window, engine-console, engine-ui, rve-crash-monitor; за feature `crash-dumps` на Windows x86_64 и macOS также crash-handler и minidumper, а getrandom нужен для имени IPC-каталога.
   - rve-build: engine-render, engine-assets, engine-files, engine-pak, engine-project, engine-resources, engine-scene, engine-script, engine-gui, rve-sdk. Собирает и кладёт рядом с игроком и сервером `rve-crash-monitor`.
