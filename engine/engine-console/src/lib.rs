@@ -389,27 +389,48 @@ impl CommandHistory {
     }
 }
 
+/// Кольцо последних строк для отчётов о падении. В отличие от `ConsoleBuffer` не подавляет повторы:
+/// одинаковые строки подряд — это тоже сведения о сбое.
+struct LogRing {
+    lines: VecDeque<ConsoleLine>,
+}
+
+impl LogRing {
+    fn push(&mut self, line: ConsoleLine) {
+        if self.lines.len() == LOG_TAIL_CAPACITY {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    fn snapshot(&self) -> Vec<ConsoleLine> {
+        self.lines.iter().cloned().collect()
+    }
+}
+
 pub struct ConsoleLogger {
     sink: Option<Arc<Mutex<ConsoleBuffer>>>,
-    tail: Mutex<ConsoleBuffer>,
+    tail: Mutex<LogRing>,
 }
 
 impl ConsoleLogger {
     pub fn new(sink: Option<Arc<Mutex<ConsoleBuffer>>>) -> Self {
         Self {
             sink,
-            tail: Mutex::new(ConsoleBuffer::with_capacity(LOG_TAIL_CAPACITY)),
+            tail: Mutex::new(LogRing {
+                lines: VecDeque::with_capacity(LOG_TAIL_CAPACITY),
+            }),
         }
     }
 
     fn tail_snapshot(&self) -> Vec<ConsoleLine> {
-        lock_buffer(&self.tail).snapshot()
+        lock_tail(&self.tail).snapshot()
     }
 
     /// Не ждёт блокировку: `None`, если её держит другой поток.
     fn try_tail_snapshot(&self) -> Option<Vec<ConsoleLine>> {
         match self.tail.try_lock() {
-            Ok(buffer) => Some(buffer.snapshot()),
+            Ok(ring) => Some(ring.snapshot()),
             Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().snapshot()),
             Err(TryLockError::WouldBlock) => None,
         }
@@ -439,7 +460,7 @@ impl ConsoleLogger {
         if let Some(sink) = &self.sink {
             lock_buffer(sink).push(line.clone());
         }
-        lock_buffer(&self.tail).push(line);
+        lock_tail(&self.tail).push(line);
     }
 }
 
@@ -489,6 +510,10 @@ fn lock_buffer(buffer: &Mutex<ConsoleBuffer>) -> std::sync::MutexGuard<'_, Conso
     buffer
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_tail(tail: &Mutex<LogRing>) -> std::sync::MutexGuard<'_, LogRing> {
+    tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -682,6 +707,14 @@ mod tests {
             tail.last().unwrap().text,
             format!("line {}", LOG_TAIL_CAPACITY + 4)
         );
+    }
+
+    #[test]
+    fn log_tail_keeps_repeated_lines_unlike_the_console_buffer() {
+        let logger = ConsoleLogger::new(None);
+        log_record_at(&logger, Level::Error, "same");
+        log_record_at(&logger, Level::Error, "same");
+        assert_eq!(logger.tail_snapshot().len(), 2);
     }
 
     #[test]
