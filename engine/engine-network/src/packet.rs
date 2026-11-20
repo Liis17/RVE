@@ -3,7 +3,7 @@
 /// Сигнатура протокола в начале каждой датаграммы.
 pub const MAGIC: [u8; 4] = *b"RVEN";
 /// Версия проводного формата.
-pub const WIRE_VERSION: u16 = 2;
+pub const WIRE_VERSION: u16 = 3;
 /// Наибольший размер датаграммы целиком, включая заголовок и тег AEAD.
 pub const MAX_DATAGRAM: usize = 1200;
 /// Длина открытого заголовка: сигнатура, версия, тип и идентификатор соединения.
@@ -63,23 +63,33 @@ pub struct Header {
 
 impl Header {
     pub fn encode(self, out: &mut Vec<u8>) {
+        self.encode_as(WIRE_VERSION, out);
+    }
+
+    /// Пишет заголовок с номером версии `version`. Нужно для ответа на Hello чужой версии.
+    pub fn encode_as(self, version: u16, out: &mut Vec<u8>) {
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+        out.extend_from_slice(&version.to_be_bytes());
         out.push(self.kind.to_u8());
         out.extend_from_slice(&self.conn_id.to_be_bytes());
     }
 
-    /// Разбирает заголовок. `None` — датаграмма не относится к протоколу RVE.
+    /// Разбирает заголовок текущей версии. `None` — датаграмма не относится к протоколу RVE
+    /// или написана другой версией.
     pub fn decode(datagram: &[u8]) -> Option<Self> {
+        let (version, header) = Self::decode_any(datagram)?;
+        (version == WIRE_VERSION).then_some(header)
+    }
+
+    /// Разбирает заголовок любой версии и возвращает её номер. `None` — не протокол RVE.
+    pub fn decode_any(datagram: &[u8]) -> Option<(u16, Self)> {
         if datagram.len() < HEADER_LEN || datagram[..4] != MAGIC {
             return None;
         }
-        if u16::from_be_bytes([datagram[4], datagram[5]]) != WIRE_VERSION {
-            return None;
-        }
+        let version = u16::from_be_bytes([datagram[4], datagram[5]]);
         let kind = Kind::from_u8(datagram[6])?;
         let conn_id = u32::from_be_bytes([datagram[7], datagram[8], datagram[9], datagram[10]]);
-        Some(Self { kind, conn_id })
+        Some((version, Self { kind, conn_id }))
     }
 }
 
@@ -121,5 +131,21 @@ mod tests {
         bytes[5] = 1;
         bytes[6] = 0;
         assert_eq!(Header::decode(&bytes), None, "неизвестный тип");
+    }
+
+    #[test]
+    fn foreign_version_is_visible_only_to_decode_any() {
+        let header = Header {
+            kind: Kind::Hello,
+            conn_id: 0,
+        };
+        let mut bytes = Vec::new();
+        header.encode_as(2, &mut bytes);
+        assert_eq!(
+            Header::decode(&bytes),
+            None,
+            "чужая версия строгим разбором не принимается"
+        );
+        assert_eq!(Header::decode_any(&bytes), Some((2, header)));
     }
 }

@@ -1,9 +1,10 @@
 //! Рукопожатие: форматы тел пакетов, cookie и таймеры. Машины состояний — в `server` и `client`.
 //!
 //! Тела пакетов (после открытого заголовка `packet::Header`):
-//! - Hello, 1200 байт: client_public[32] ‖ nonce[16] ‖ protocol_id[32] ‖ scene_hash[32] ‖ нули.
+//! - Hello, 1200 байт: client_public[32] ‖ nonce[16] ‖ protocol_id[32] ‖ scene_hash[32] ‖
+//!   position_step[4, биты f32] ‖ нули.
 //! - Cookie, 40 байт: time_ms[8] ‖ mac[32], где mac — keyed blake3 от (адрес, time_ms, hash(hello)).
-//! - Confirm, 1200 байт: cookie[40] ‖ hello[112] ‖ нули.
+//! - Confirm, 1200 байт: cookie[40] ‖ hello[116] ‖ нули.
 //! - Accept, 128 байт: server_public[32] ‖ identity_public[32] ‖ signature[64].
 //! - Reject: длина[1] ‖ причина в UTF-8. Не подписан: отправляется только до аутентификации.
 
@@ -12,9 +13,11 @@ use std::time::Duration;
 
 use crate::codec::Reader;
 use crate::crypto::ct_eq;
-use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM, pad_to_max};
+use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM, WIRE_VERSION, pad_to_max};
 
-pub(crate) const HELLO_BODY: usize = 112;
+pub(crate) const HELLO_BODY: usize = 116;
+/// Тело Hello версии 2: без шага квантования. Нужно только для диагностики чужого сервера.
+const HELLO_BODY_V2: usize = 112;
 pub(crate) const COOKIE_BODY: usize = 40;
 pub(crate) const ACCEPT_BODY: usize = 128;
 /// Срок жизни cookie: ответ на Confirm позже этого срока не принимается.
@@ -32,6 +35,8 @@ pub(crate) struct Hello {
     pub nonce: [u8; 16],
     pub protocol_id: [u8; 32],
     pub scene_hash: [u8; 32],
+    /// Шаг квантования позиции в каноническом виде: биты f32.
+    pub position_step: u32,
 }
 
 impl Hello {
@@ -41,6 +46,7 @@ impl Hello {
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.protocol_id);
         out.extend_from_slice(&self.scene_hash);
+        out.extend_from_slice(&self.position_step.to_be_bytes());
         out
     }
 
@@ -51,6 +57,7 @@ impl Hello {
             nonce: reader.array()?,
             protocol_id: reader.array()?,
             scene_hash: reader.array()?,
+            position_step: reader.u32()?,
         })
     }
 }
@@ -63,6 +70,20 @@ pub(crate) fn hello_datagram(hello: &Hello) -> Vec<u8> {
     }
     .encode(&mut out);
     out.extend_from_slice(&hello.encode());
+    pad_to_max(&mut out);
+    out
+}
+
+/// Диагностический Hello версии 2: тот же запрос, который понимает старый сервер. Ответ на него
+/// показывает, что сервер говорит на другой версии. Сам по себе он рукопожатия не продвигает.
+pub(crate) fn hello_v2_datagram(hello: &Hello) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MAX_DATAGRAM);
+    Header {
+        kind: Kind::Hello,
+        conn_id: 0,
+    }
+    .encode_as(2, &mut out);
+    out.extend_from_slice(&hello.encode()[..HELLO_BODY_V2]);
     pad_to_max(&mut out);
     out
 }
@@ -125,16 +146,45 @@ pub(crate) fn parse_confirm(body: &[u8]) -> Option<([u8; COOKIE_BODY], Hello)> {
 }
 
 pub(crate) fn reject_datagram(reason: &str) -> Vec<u8> {
+    reject_datagram_as(WIRE_VERSION, reason)
+}
+
+/// Отказ с заголовком версии `version`. Ответ на Hello чужой версии echo-ит версию запроса,
+/// чтобы старый клиент разобрал причину.
+pub(crate) fn reject_datagram_as(version: u16, reason: &str) -> Vec<u8> {
     let bytes = &reason.as_bytes()[..reason.len().min(MAX_REASON)];
     let mut out = Vec::with_capacity(HEADER_LEN + 1 + bytes.len());
     Header {
         kind: Kind::Reject,
         conn_id: 0,
     }
-    .encode(&mut out);
+    .encode_as(version, &mut out);
     out.push(bytes.len() as u8);
     out.extend_from_slice(bytes);
     out
+}
+
+/// Хвост отказа на Hello чужой версии: метка и версия сервера (u16, big-endian) после текста.
+/// Прежний разбор отказа хвост игнорирует, поэтому текст читается как раньше.
+const VERSION_TAIL: u8 = b'V';
+
+/// Отказ на Hello чужой версии: заголовок echo-ит версию запроса, в конце — версия сервера.
+pub(crate) fn foreign_reject_datagram(request_version: u16, reason: &str) -> Vec<u8> {
+    let mut out = reject_datagram_as(request_version, reason);
+    out.push(VERSION_TAIL);
+    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+    out
+}
+
+/// Версия сервера из хвоста отказа на чужую версию. `None` — хвоста нет, это отказ прежнего вида.
+pub(crate) fn reject_server_version(body: &[u8]) -> Option<u16> {
+    let mut reader = Reader::new(body);
+    let len = reader.u8()?;
+    reader.take(usize::from(len))?;
+    match reader.take(3)? {
+        &[VERSION_TAIL, high, low] => Some(u16::from_be_bytes([high, low])),
+        _ => None,
+    }
 }
 
 pub(crate) fn parse_reject(body: &[u8]) -> String {
@@ -205,6 +255,7 @@ mod tests {
             nonce: [2; 16],
             protocol_id: [3; 32],
             scene_hash: [4; 32],
+            position_step: 0.01f32.to_bits(),
         }
     }
 
@@ -285,5 +336,48 @@ mod tests {
     fn accept_body_must_have_exact_length() {
         assert!(parse_accept(&[0u8; ACCEPT_BODY - 1]).is_none());
         assert!(parse_accept(&[0u8; ACCEPT_BODY]).is_some());
+    }
+
+    #[test]
+    fn hello_carries_the_position_step_and_round_trips() {
+        let mut other = hello();
+        other.position_step = 0.5f32.to_bits();
+        let body = other.encode();
+        assert_eq!(body.len(), HELLO_BODY);
+        assert_eq!(Hello::decode(&body), Some(other));
+        assert_ne!(hello().encode(), body, "шаг входит в тело");
+    }
+
+    #[test]
+    fn v2_diagnostic_hello_keeps_the_v2_layout_and_is_padded() {
+        let datagram = hello_v2_datagram(&hello());
+        assert_eq!(datagram.len(), MAX_DATAGRAM);
+        let (version, header) = Header::decode_any(&datagram).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(header.kind, Kind::Hello);
+        assert_eq!(header.conn_id, 0);
+        assert_eq!(
+            &datagram[HEADER_LEN..HEADER_LEN + HELLO_BODY_V2],
+            &hello().encode()[..HELLO_BODY_V2]
+        );
+    }
+
+    #[test]
+    fn reject_can_echo_a_foreign_version_header() {
+        let datagram = reject_datagram_as(
+            2,
+            "версия сетевого протокола не совпадает: сервер 3, клиент 2",
+        );
+        let (version, header) = Header::decode_any(&datagram).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(header.kind, Kind::Reject);
+        assert_eq!(
+            parse_reject(&datagram[HEADER_LEN..]),
+            "версия сетевого протокола не совпадает: сервер 3, клиент 2"
+        );
+        assert!(
+            Header::decode(&datagram).is_none(),
+            "строгий разбор версию 2 не принимает"
+        );
     }
 }

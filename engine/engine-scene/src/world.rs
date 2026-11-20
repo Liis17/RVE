@@ -34,7 +34,7 @@ pub use components::{
     environment_intensity_problem, lod_distances_problem, mesh_material_problem,
     point_light_problem, procedural_sky_problem, spot_light_problem,
 };
-pub use hierarchy::ObjectEdit;
+pub use hierarchy::{ObjectEdit, quat_from_yxz_degrees, yxz_degrees_from_quat};
 pub use lod::{LOD_REFERENCE_FOV, LodSelector};
 
 /// Наибольшее поколение слота. Слот, поколение которого исчерпано, больше не переиспользуется.

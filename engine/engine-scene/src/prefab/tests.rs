@@ -1326,3 +1326,33 @@ fn camera_screen_shader_overrides_are_validated_like_the_camera() {
     let error = SceneDocument::parse("scene.rvescene", &override_camera(undeclared)).unwrap_err();
     assert!(error.message.contains("/fx/missing.glsl"), "{error}");
 }
+
+#[test]
+fn always_relevant_survives_prefab_expansion_with_and_without_override() {
+    let prefab = "[[objects]]\nid = \"beacon\"\n[objects.network_identity]\nauthority = \"owner\"\nalways_relevant = true\n[objects.network_transform]\n";
+    let library = Library::new(&[("prefabs/beacon.rveprefab", prefab)]);
+    let assets = "[[assets]]\npath = \"/prefabs/beacon.rveprefab\"\n";
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/beacon.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert!(
+        object(&kept, "lamp")
+            .network_identity
+            .is_some_and(|identity| identity.always_relevant),
+        "флаг из префаба наследуется"
+    );
+
+    // Override заменяет identity целиком: флаг нужно указать, иначе он сбросится.
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/beacon.rveprefab\"\n[[instances.overrides]]\ntarget = \"beacon\"\nnetwork_identity = {{ authority = \"server\", always_relevant = true }}\n"
+    );
+    let replaced = library.expand(&scene(&overridden)).unwrap().document;
+    assert!(
+        object(&replaced, "lamp")
+            .network_identity
+            .is_some_and(|identity| identity.always_relevant),
+        "флаг, заданный в override, сохраняется"
+    );
+}

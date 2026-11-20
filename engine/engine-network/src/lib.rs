@@ -11,6 +11,7 @@ mod crypto;
 mod engine;
 mod error;
 mod handshake;
+mod interest;
 mod interpolation;
 mod link;
 mod packet;

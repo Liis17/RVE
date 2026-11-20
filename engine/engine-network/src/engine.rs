@@ -63,6 +63,8 @@ pub struct NetworkConfig {
     pub scene_hash: [u8; 32],
     /// Срок молчания до разрыва соединения.
     pub timeout: Duration,
+    /// Шаг квантования позиции, 1e-5..=1.0. Клиент и сервер одной сессии должны совпасть.
+    pub position_step: f32,
 }
 
 enum Command {
@@ -81,6 +83,8 @@ enum Command {
 /// Клонируемый доступ к сетевому потоку из других потоков.
 #[derive(Clone)]
 pub struct NetworkHandle {
+    /// Шаг квантования позиции, с которым поднят поток; `None` — поток создан без настроек сессии.
+    position_step: Option<f32>,
     commands: Sender<Command>,
     events: Receiver<NetworkEvent>,
 }
@@ -114,6 +118,11 @@ impl NetworkHandle {
     /// Забирает накопленные события.
     pub fn poll_events(&self) -> Vec<NetworkEvent> {
         self.events.try_iter().collect()
+    }
+
+    /// Шаг квантования позиции потока; `None` — поток создан без настроек сессии.
+    pub fn position_step(&self) -> Option<f32> {
+        self.position_step
     }
 }
 
@@ -151,6 +160,7 @@ impl NetworkEngine {
             protocol_id,
             scene_hash,
             timeout,
+            position_step,
         } = config;
         let now = Instant::now();
         let (machine, transport) = match role {
@@ -168,6 +178,7 @@ impl NetworkEngine {
                         max_clients,
                         password,
                         timeout,
+                        position_step,
                     },
                     identity,
                     now,
@@ -189,6 +200,7 @@ impl NetworkEngine {
                         insecure_no_pin,
                         password,
                         timeout,
+                        position_step,
                     },
                     now,
                 )?;
@@ -196,7 +208,9 @@ impl NetworkEngine {
                 (Machine::Client(Box::new(client)), UdpTransport::bind(bind)?)
             }
         };
-        Ok(Self::from_parts(machine, Box::new(transport)))
+        let (engine, mut handle) = Self::from_parts(machine, Box::new(transport));
+        handle.position_step = Some(position_step);
+        Ok((engine, handle))
     }
 
     pub(crate) fn from_parts(
@@ -218,6 +232,7 @@ impl NetworkEngine {
             recv_failed: false,
         };
         let handle = NetworkHandle {
+            position_step: None,
             commands: command_tx,
             events: event_rx,
         };
@@ -485,6 +500,7 @@ mod tests {
                 max_clients: 1,
                 password: None,
                 timeout: Duration::from_secs(5),
+                position_step: 0.01,
             },
             ServerIdentity::ephemeral().unwrap(),
             Instant::now(),
@@ -549,6 +565,7 @@ mod tests {
                 insecure_no_pin: false,
                 password: None,
                 timeout: Duration::from_secs(5),
+                position_step: 0.01,
             },
             Instant::now(),
         )
@@ -705,6 +722,7 @@ mod tests {
                     max_clients: 2,
                     password: None,
                     timeout,
+                    position_step: 0.01,
                 },
                 identity,
                 now,
@@ -737,6 +755,7 @@ mod tests {
                     insecure_no_pin: false,
                     password: None,
                     timeout: self.timeout,
+                    position_step: 0.01,
                 },
                 self.now,
             )
