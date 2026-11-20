@@ -280,7 +280,15 @@ impl Read for SourceReader {
                 .map_err(io::Error::other)?;
             self.buffer_start = self.position;
             if self.buffer.is_empty() {
-                return Ok(0);
+                // Файл короче заявленного размера. Ok(0) здесь означал бы конец потока: ogg
+                // тихо завершил бы клип. Пустой буфер не покрывает позицию, поэтому повтор читает снова.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "файл обрезан: позиция {}, ожидалось {} байт",
+                        self.position, self.len
+                    ),
+                ));
             }
         }
         let offset = (self.position - self.buffer_start) as usize;
