@@ -203,6 +203,22 @@ fn assert_startup_resource_error(directory: &Path, expected: &str) {
 }
 
 #[test]
+fn benchmark_output_directory_is_checked_before_opening_a_window() {
+    let directory = temporary_directory("benchmark-missing-dir");
+    let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
+        .args(["--frames", "300", "--benchmark-json", "no_such_dir/b.json"])
+        .current_dir(&directory)
+        .output()
+        .expect("sandbox binary should start");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("Ошибка --benchmark-json:"), "{stderr}");
+    assert!(stderr.contains("no_such_dir"), "{stderr}");
+    assert!(output.stdout.is_empty(), "window startup must not run");
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn triangle_scene_rejects_model_before_loading_assets() {
     let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
         .args(["--scene", "triangle", "--model", "/model/cube.fbx"])

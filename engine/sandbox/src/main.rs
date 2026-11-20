@@ -5,7 +5,7 @@ mod scene;
 
 use benchmark::{
     BenchmarkOptions, BenchmarkRecorder, DEFAULT_WARMUP_FRAMES, MAX_MEASURED_FRAMES, Observation,
-    RunSettings,
+    RunSettings, validate_output_path,
 };
 use content::Content;
 use debug_overlay::DebugOverlay;
@@ -1237,6 +1237,12 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(benchmark) = options.benchmark.as_ref()
+        && let Err(error) = validate_output_path(Path::new(&benchmark.path))
+    {
+        eprintln!("Ошибка --benchmark-json: {error}");
+        return ExitCode::from(2);
+    }
     let bootstrap = match BootstrapConfig::load("bootstrap.rves") {
         Ok(config) => config,
         Err(error) => {

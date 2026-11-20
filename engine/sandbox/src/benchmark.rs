@@ -262,6 +262,23 @@ pub fn finish_and_write(
     write_report(path, &report)
 }
 
+/// Проверяет путь `--benchmark-json` до прогона: у него должно быть имя файла, а каталог-родитель
+/// (пустой — текущий) должен существовать и быть каталогом. Файловая система не меняется.
+pub fn validate_output_path(path: &Path) -> Result<(), String> {
+    if path.file_name().is_none() {
+        return Err(format!("путь {} не содержит имени файла", path.display()));
+    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    match fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} не является каталогом", parent.display())),
+        Err(error) => Err(format!("каталог {} недоступен: {error}", parent.display())),
+    }
+}
+
 /// Пишет отчёт во временный `<path>.tmp` рядом и переименовывает его в `path`.
 /// При ошибке временный файл удаляется, а старый `path` остаётся нетронутым.
 pub fn write_report(path: &Path, report: &BenchmarkReport) -> Result<(), String> {
@@ -434,7 +451,10 @@ struct GpuMsReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkRecorder, Observation, RunSettings, temporary_path, write_report};
+    use super::{
+        BenchmarkRecorder, Observation, RunSettings, temporary_path, validate_output_path,
+        write_report,
+    };
     use crate::scene::Scene;
     use engine_project::BootstrapReflexMode;
     use engine_render::{
@@ -442,6 +462,7 @@ mod tests {
         ProfiledView, RenderCpuTimings,
     };
     use std::fs;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     fn ms(value: u64) -> Duration {
@@ -683,6 +704,28 @@ mod tests {
             serde_json::from_slice(&fs::read(&target).unwrap()).expect("валидный JSON");
         assert_eq!(written["schema"], 1);
         assert!(!temporary_path(&target).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn output_path_is_checked_before_the_run() {
+        let directory = temporary_directory("validate");
+        let file = directory.join("file.txt");
+        fs::write(&file, b"").unwrap();
+
+        assert!(validate_output_path(&directory.join("bench.json")).is_ok());
+        assert!(validate_output_path(Path::new("bench.json")).is_ok());
+
+        let missing = directory.join("missing").join("bench.json");
+        let error = validate_output_path(&missing).expect_err("каталога нет");
+        assert!(error.contains("недоступен"), "{error}");
+
+        let under_file = file.join("bench.json");
+        let error = validate_output_path(&under_file).expect_err("родитель — файл");
+        assert!(error.contains("не является каталогом"), "{error}");
+
+        let error = validate_output_path(Path::new(".")).expect_err("нет имени файла");
+        assert!(error.contains("не содержит имени файла"), "{error}");
         fs::remove_dir_all(directory).unwrap();
     }
 
