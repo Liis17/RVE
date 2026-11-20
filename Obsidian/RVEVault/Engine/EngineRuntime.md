@@ -184,6 +184,24 @@ Scripts thread регистрирует каждый быстрый шаблон
 
 Ошибки с кодами 1 и 2 печатаются только в stderr. Для кода 3 runtime дополнительно показывает `show_error_dialog` с конкретными причинами.
 
+## Отчёты о падении
+
+`rve-player` и `rve-server` пишут два вида отчётов. Коды выхода от этого не меняются: таблица выше остаётся в силе.
+
+**Текстовый отчёт на panic** (`engine/engine-runtime/src/crash.rs`). Хук panic ставится один раз (`Once`) сразу после установки логгера в `run_player`/`run_server` и всегда вызывает прежний хук последним, поэтому stderr и код выхода не меняются. Panic модуля, перехваченная runtime, остаётся кодом 1. Файл `crash-YYYYMMDD-HHMMSS-<pid>-<n>.txt` (UTC) содержит время, `engine_runtime::VERSION`, роль (`player` или `server`), проект, поток, сообщение, location, backtrace и хвост лога из 200 строк [[Engine/EngineConsole]]; если хвост занят другим потоком, пишется `log tail unavailable`.
+
+Каталог отчётов выбирается после загрузки `project.rveproject` (`crash::set_target`): dev (`--project`) — `<project>/Logs`; release — `Logs` рядом с исполняемым файлом. На macOS игрок внутри `<Name>.app/Contents/MacOS` пишет рядом с `.app`, сервер вне бандла — рядом с собой. Если каталог не создаётся, берётся `save_data_path(project)`, родитель `/Logs`; если и он недоступен, отчёт выводится только в stderr. Хук читает снимок каталога через `try_read`; до загрузки проекта действует каталог release.
+
+Лимит — 8 отчётов за процесс; повторная panic внутри хука пропускается (защита по thread-local). После каждой записи удаляются самые старые файлы `crash-*.txt|.dmp` сверх 20 (общее правило с монитором, см. `rve-crash-monitor`). Файлы моложе 10 с и собственный файл не удаляются.
+
+**Minidump при нативном падении** (`engine/engine-runtime/src/crash_dumps.rs`, feature `crash-dumps`; `rve-player` и `rve-server` включают её по умолчанию; cfg `windows` + `x86_64` или `macos`). Игра запускает `<каталог exe>/rve-crash-monitor[.exe] --socket <path> --dir <Logs> --parent <pid>` с null stdio. Сокет лежит в приватном каталоге `temp_dir()/rve-crash-<16 hex>/` (на Unix права 0700); длина пути проверяется против лимита `sockaddr_un`. Подключение и `CrashHandler::attach` выполняются в фоновом потоке `rve-crash-monitor-client` с дедлайном 3 с, старт игры их не ждёт. При ошибке пишется предупреждение `[crash]`, монитор убивается, каталог IPC удаляется, игра работает без дампов.
+
+Обработчик только вызывает `request_dump` и возвращает `Handled(false)`, поэтому дальнейшая обработка ОС (WER, ReportCrash, код исключения) не меняется. Обработчик `crash-handler` срабатывает также на CRT invalid parameter, pure virtual call и `abort()`; для них тоже пишется дамп. Объекты обработчика, клиента и процесса монитора живут в `OnceLock` до конца процесса; при штатном выходе runtime не ждёт монитор — тот получает отключение клиента и выходит сам.
+
+**Монитор** (`engine/rve-crash-monitor`, [[Architecture]]). Один процесс на одну игру; обслуживает первого клиента и пишет `crash-<UTC>-<pid игры>.dmp` в каталог отчётов. Выходит после дампа, после отключения клиента, если клиент не подключился за 10 с, и при смерти процесса игры (Windows — ожидание дескриптора родителя, macOS — `getppid()` раз в секунду). Второе подключение к сокету останавливает монитор: библиотека не позволяет отказать одному клиенту и принять другого. При выходе монитор удаляет сокет и пустой каталог IPC.
+
+Ограничения: библиотека не имеет таймаута на ответ монитора, поэтому если процесс монитора жив, но запись дампа зависла, падающая игра остаётся в `request_dump`. Оверлеи или Streamline, которые переустанавливают UnhandledExceptionFilter после attach, могут перехватить падение без дампа. macOS проверяется только сборкой и тестами CI.
+
 ## Источники
 
 | Файл | Ответственность |
@@ -204,6 +222,10 @@ Scripts thread регистрирует каждый быстрый шаблон
 | `engine/engine-runtime/src/player.rs` | `WindowHandler`, F8 debug-view control, renderer handoff и shutdown окна |
 | `engine/engine-runtime/src/cursor.rs` | `CursorControl`: состояние курсора скриптов и консоли, отправка в окно и отложенная отправка при подключении |
 | `engine/engine-runtime/src/console.rs` | UI snapshots, latest-only slot и интеграция console-команд с scripts thread |
+| `engine/engine-runtime/src/crash.rs` | Хук panic, снимок каталога отчётов, текстовые отчёты и защита от рекурсии |
+| `engine/engine-runtime/src/crash_dumps.rs` | Запуск `rve-crash-monitor`, приватный IPC-каталог, фоновое подключение и обработчик minidump |
+| `engine/rve-crash-monitor/src/lib.rs` | Имена файлов `crash-*`, UTC-метки, хранение 20 файлов, разбор аргументов монитора |
+| `engine/rve-crash-monitor/src/server.rs` | Сервер minidumper, выход по дампу, отключению, родителю и таймауту подключения |
 | `engine/rve-player/src/main.rs` | бинарный entry point |
 
 ## Зависимости и взаимодействия
@@ -217,6 +239,7 @@ Scripts thread регистрирует каждый быстрый шаблон
 - Поток `rve-audio` запускает звуковой движок с ресурсами проекта и устройством вывода; без устройства звук отключается с предупреждением, игра продолжается. Scripts thread связывает звук с кадром: `AudioBridge::start` после пересчёта матриц и `start` скриптов, `apply` запросов после `update`, `sync_positions` после `build_frame`; в background-режиме позиции не обновляются. См. [[Engine/EngineAudio]].
 - `rve-neural` — управляемый поток без доменной работы. `rve-network` существует только при сетевых флагах и описан в [[Engine/EngineNetwork]]. `rve-physics` выполняет шаги физики, см. [[Engine/EnginePhysics]].
 - Использует `engine-network` для сетевого потока и моста; sandbox сеть не использует.
+- Отчёты о падении: `rve-crash-monitor` (библиотека для имён и хранения `crash-*` и бинарник минидампов), `crash-handler` и `minidumper` за feature `crash-dumps`; подробности в разделе «Отчёты о падении».
 
 ## Игровые действия ввода
 
