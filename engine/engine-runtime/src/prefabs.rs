@@ -886,10 +886,10 @@ impl<G: GpuResources> PrefabGpu<G> {
             return Ok(Some(id));
         }
         let chain = (role == TextureRole::Normal)
-            .then(|| sources.chains.get(sources.model_path, source))
+            .then(|| sources.chains.take(sources.model_path, source))
             .flatten();
         let id = match chain {
-            Some(chain) => gpu.create_texture_from_chain(chain)?,
+            Some(chain) => gpu.create_texture_from_chain(&chain)?,
             None => gpu.create_texture(data, color_space, role)?,
         };
         self.textures
