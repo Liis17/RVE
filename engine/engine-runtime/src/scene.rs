@@ -3817,6 +3817,31 @@ id = "camera"
     }
 
     #[test]
+    fn gpu_texture_cache_keeps_normal_and_color_roles_of_one_png_apart() {
+        let mut cache = GpuTextureCache::<u32>::default();
+        let uploads = Cell::new(0_u32);
+        let key = |role| {
+            (
+                "textures/normal.png".to_owned(),
+                TextureColorSpace::Linear,
+                role,
+            )
+        };
+        let color = get_or_insert_gpu(&mut cache.scene, key(TextureRole::Color), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let normal = get_or_insert_gpu(&mut cache.scene, key(TextureRole::Normal), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        assert_ne!(color, normal);
+        assert_eq!(uploads.get(), 2);
+    }
+
+    #[test]
     fn gpu_texture_cache_reuses_uploads_per_source_and_color_space() {
         let mut cache = GpuTextureCache::<u32>::default();
         let uploads = Cell::new(0_u32);

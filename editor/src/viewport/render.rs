@@ -806,11 +806,14 @@ impl SceneRenderer {
         screen_errors: &mut HashMap<String, String>,
     ) -> Result<(), RenderError> {
         let texture_keys = changed_texture_keys(self.textures.keys(), changes);
-        for (path, color_space, role) in texture_keys {
+        for (path, color_space, role) in &texture_keys {
             self.texture_wants
                 .entry(path.clone())
                 .or_default()
-                .insert((color_space, role));
+                .insert((*color_space, *role));
+        }
+        // Файл декодируется один раз на путь; результат применяется ко всем ролям из `texture_wants`.
+        for path in texture_reload_paths(&texture_keys) {
             self.images.reload(ImageKind::Texture, &path);
         }
 
@@ -3055,6 +3058,17 @@ fn changed_texture_keys<'a>(
         .collect()
 }
 
+/// Пути для перезагрузки без повторов: путь с несколькими ролями читается из файла один раз.
+fn texture_reload_paths(keys: &[EditorTextureKey]) -> Vec<String> {
+    let mut paths = keys
+        .iter()
+        .map(|(path, _, _)| path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn key_matches_changes(changes: &AssetChanges, key: &str) -> bool {
     if changes.rescan {
         return true;
@@ -3966,6 +3980,75 @@ mod tests {
             "normal-версия перечитывается с ролью Normal"
         );
         assert!(!changed.contains(&keys[2]));
+    }
+
+    #[test]
+    fn hot_reload_decodes_a_png_once_for_all_its_roles() {
+        let keys = [
+            (
+                "/textures/a.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
+            (
+                "/textures/a.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Normal,
+            ),
+            (
+                "/textures/b.png".to_owned(),
+                TextureColorSpace::Srgb,
+                TextureRole::Color,
+            ),
+        ];
+        assert_eq!(
+            texture_reload_paths(&keys),
+            vec!["/textures/a.png".to_owned(), "/textures/b.png".to_owned()]
+        );
+    }
+
+    fn lit_texture_slot(name: &str) -> usize {
+        engine_scene::ShaderSchema::lit()
+            .properties
+            .iter()
+            .find(|layout| layout.property.name == name)
+            .map(|layout| layout.slot)
+            .expect("встроенный Lit имеет текстурный слот с этим именем")
+    }
+
+    #[test]
+    fn slot_texture_role_is_normal_only_for_builtin_lit_normal_texture() {
+        let lit = engine_scene::ShaderSchema::lit();
+        assert_eq!(
+            slot_texture_role(&lit, lit_texture_slot("normal_texture")),
+            TextureRole::Normal
+        );
+        assert_eq!(
+            slot_texture_role(&lit, lit_texture_slot("metallic_roughness_texture")),
+            TextureRole::Color
+        );
+    }
+
+    #[test]
+    fn slot_texture_role_keeps_custom_shader_normal_slot_as_color() {
+        let custom = engine_scene::ShaderSchema {
+            lighting: engine_scene::ShaderLighting::Lit,
+            builtin_lit: false,
+            properties: vec![engine_scene::ShaderPropertyLayout {
+                property: engine_scene::ShaderProperty {
+                    name: "normal_texture".to_owned(),
+                    label: "normal_texture".to_owned(),
+                    kind: ShaderPropertyKind::Texture,
+                    default: engine_scene::ShaderPropertyDefault::Texture(None),
+                    min: None,
+                    max: None,
+                    color_space: None,
+                    fallback: None,
+                },
+                slot: 0,
+            }],
+        };
+        assert_eq!(slot_texture_role(&custom, 0), TextureRole::Color);
     }
 
     #[test]
