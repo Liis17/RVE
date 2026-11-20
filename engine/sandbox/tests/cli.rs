@@ -47,6 +47,31 @@ fn invalid_arguments_exit_with_code_two_and_usage_before_opening_a_window() {
         vec!["--render-scale", "0.5", "--render-scale", "1"],
         vec!["--resize-test", "--frames", "119"],
         vec!["--debug-overlay", "--debug-overlay"],
+        vec!["--benchmark-json", "bench.json"],
+        vec!["--frames", "300", "--warmup-frames", "5"],
+        vec![
+            "--frames",
+            "10",
+            "--benchmark-json",
+            "bench.json",
+            "--warmup-frames",
+            "10",
+        ],
+        vec![
+            "--frames",
+            "300",
+            "--benchmark-json",
+            "bench.json",
+            "--resize-test",
+        ],
+        vec![
+            "--frames",
+            "300",
+            "--benchmark-json",
+            "bench.json",
+            "--warmup-frames",
+            "x",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
             .args(&arguments)
@@ -60,6 +85,10 @@ fn invalid_arguments_exit_with_code_two_and_usage_before_opening_a_window() {
             stderr.contains(
                 "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings"
             ),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("[--benchmark-json /путь.json] [--warmup-frames N]"),
             "{stderr}"
         );
         assert!(output.stdout.is_empty(), "{arguments:?}");

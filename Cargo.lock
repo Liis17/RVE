@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "engine-assets",
  "engine-core",
@@ -3254,6 +3254,8 @@ dependencies = [
  "engine-window",
  "font8x8",
  "glam",
+ "serde",
+ "serde_json",
  "sysinfo",
 ]
 
