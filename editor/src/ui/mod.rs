@@ -19,6 +19,7 @@ pub mod toolbar;
 #[cfg(test)]
 mod tests;
 
+use crate::autosave::age_text;
 use crate::layout::{EditorTabs, Tab};
 use crate::state::{Action, AssetDrag, EditorState};
 use egui_dock::{DockArea, DockState, Style};
@@ -204,22 +205,53 @@ fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {
         .as_ref()
         .map_or("untitled", |path| path.as_str())
         .to_owned();
+    // Действие выбирается в замыкании и ставится в очередь после него: окно держит ссылку на состояние.
+    let mut action = None;
     egui::Modal::new(egui::Id::new("recover_autosave")).show(ctx, |ui| {
         ui.set_max_width(380.0);
         ui.heading("Autosave found");
-        ui.label(format!(
-            "Найдены несохранённые изменения {name} от прошлого сеанса. Восстановить их?"
-        ));
+        if prompt.copies.is_empty() {
+            ui.label(format!("Копию {name} не удалось прочитать."));
+        } else {
+            ui.label(format!(
+                "Найдены несохранённые изменения {name} от прошлого сеанса. Восстановить их?"
+            ));
+        }
+        ui.add_space(8.0);
+        let now = std::time::SystemTime::now();
+        for (index, copy) in prompt.copies.iter().enumerate() {
+            let title = if index == 0 {
+                "Последняя"
+            } else {
+                "Предыдущая"
+            };
+            ui.horizontal(|ui| {
+                ui.label(title);
+                ui.label(age_text(copy.saved_at, now));
+                if ui.button("Restore").clicked() {
+                    action = Some(Action::RestoreAutosave(index));
+                }
+            });
+            if let Some(error) = &copy.restore_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+        }
+        for error in &prompt.errors {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("Restore").clicked() {
-                state.action(Action::RestoreAutosave);
-            }
             if ui.button("Discard").clicked() {
-                state.action(Action::DiscardAutosave);
+                action = Some(Action::DiscardAutosave);
+            }
+            if ui.button("Keep").clicked() {
+                action = Some(Action::KeepAutosave);
             }
         });
     });
+    if let Some(action) = action {
+        state.action(action);
+    }
 }
 
 fn show_status_bar(ui: &mut egui::Ui, state: &EditorState) {

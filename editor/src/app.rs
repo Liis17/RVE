@@ -11,7 +11,7 @@ use crate::project::OpenProject;
 use crate::project_prefabs::{ProjectPrefabs, play_catalog};
 use crate::scene_edit::EditorScene;
 use crate::settings::{SettingsStore, UserSettings};
-use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt, ViewCommand};
+use crate::state::{Action, EditorState, RecoveryCopy, RecoveryPrompt, UnsavedPrompt, ViewCommand};
 use crate::ui;
 use crate::ui::game_view;
 use crate::ui::preferences::Preferences;
@@ -222,6 +222,8 @@ pub struct EditorApp {
     /// Ревизия сцены в последней копии автосохранения и время записи.
     autosaved_revision: Option<u64>,
     last_autosave: Instant,
+    /// Предупреждения последней записи копии; одинаковые не выводятся в Console повторно.
+    autosave_warnings: Vec<String>,
     exit: bool,
     pub exit_code: u8,
     window_title: String,
@@ -269,6 +271,7 @@ impl EditorApp {
             continuous_redraw: false,
             autosaved_revision: None,
             last_autosave: Instant::now(),
+            autosave_warnings: Vec::new(),
             exit: false,
             exit_code: 0,
             window_title: String::new(),
@@ -333,6 +336,7 @@ impl EditorApp {
             continuous_redraw: false,
             autosaved_revision: None,
             last_autosave: Instant::now(),
+            autosave_warnings: Vec::new(),
             exit: false,
             exit_code: 0,
             window_title: String::new(),
@@ -923,19 +927,36 @@ impl EditorApp {
         ))
     }
 
-    /// Предлагает восстановить автосохранение открытой сцены, если оно осталось.
+    /// Предлагает восстановить автосохранение открытой сцены, если оно осталось или не читается.
     fn offer_recovery(&mut self) {
         let scene = self
             .state
             .scene
             .as_ref()
             .and_then(|scene| scene.path().cloned());
-        if let Some(contents) = self
-            .autosave_store()
-            .and_then(|store| store.read(scene.as_ref()))
-        {
-            self.state.recovery_prompt = Some(RecoveryPrompt { scene, contents });
+        let Some(store) = self.autosave_store() else {
+            return;
+        };
+        let found = store.read(scene.as_ref());
+        for error in &found.errors {
+            self.state.log.error(error.clone());
         }
+        if found.copies.is_empty() && found.errors.is_empty() {
+            return;
+        }
+        self.state.recovery_prompt = Some(RecoveryPrompt {
+            scene,
+            copies: found
+                .copies
+                .into_iter()
+                .map(|copy| RecoveryCopy {
+                    contents: copy.contents,
+                    saved_at: copy.saved_at,
+                    restore_error: None,
+                })
+                .collect(),
+            errors: found.errors,
+        });
     }
 
     fn remove_autosave(&mut self, scene: Option<&VirtualPath>) {
@@ -943,6 +964,29 @@ impl EditorApp {
             && let Err(error) = store.remove(scene)
         {
             self.state.log.push(LogLevel::Warn, error);
+        }
+    }
+
+    /// Удаляет копии сцены из окна восстановления. При неудаче окно остаётся открытым, а путь и
+    /// причина попадают в список ошибок окна и в Console.
+    fn discard_autosave(&mut self) {
+        let Some(prompt) = &self.state.recovery_prompt else {
+            return;
+        };
+        let scene = prompt.scene.clone();
+        let removed = self
+            .autosave_store()
+            .map_or(Ok(()), |store| store.remove(scene.as_ref()));
+        match removed {
+            Ok(()) => self.state.recovery_prompt = None,
+            Err(error) => {
+                self.state.log.push(LogLevel::Error, error.clone());
+                if let Some(prompt) = &mut self.state.recovery_prompt
+                    && !prompt.errors.contains(&error)
+                {
+                    prompt.errors.push(error);
+                }
+            }
         }
     }
 
@@ -1019,7 +1063,17 @@ impl EditorApp {
             .map_err(|error| error.to_string())
             .and_then(|text| store.write(scene.path(), &text));
         match result {
-            Ok(()) => self.autosaved_revision = Some(revision),
+            Ok(warnings) => {
+                self.autosaved_revision = Some(revision);
+                if warnings != self.autosave_warnings {
+                    for warning in &warnings {
+                        self.state
+                            .log
+                            .push(LogLevel::Warn, format!("автосохранение: {warning}"));
+                    }
+                    self.autosave_warnings = warnings;
+                }
+            }
             Err(error) => self
                 .state
                 .log
@@ -1037,26 +1091,39 @@ impl EditorApp {
         waiting.then(|| self.last_autosave + AUTOSAVE_INTERVAL)
     }
 
-    fn restore_autosave(&mut self) {
-        let Some(prompt) = self.state.recovery_prompt.take() else {
+    /// Открывает копию с индексом `index`. При ошибке окно остаётся открытым, чтобы выбрать другую копию.
+    fn restore_autosave(&mut self, index: usize) {
+        let Some(prompt) = &self.state.recovery_prompt else {
             return;
         };
+        let Some(copy) = prompt.copies.get(index) else {
+            return;
+        };
+        let scene = prompt.scene.clone();
+        let contents = copy.contents.clone();
         let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
         let recovered = match loader {
-            Some(loader) => {
-                EditorScene::recover_with_loader(prompt.scene, &prompt.contents, loader)
-            }
-            None => EditorScene::recover(prompt.scene, &prompt.contents),
+            Some(loader) => EditorScene::recover_with_loader(scene, &contents, loader),
+            None => EditorScene::recover(scene, &contents),
         };
         match recovered {
             Ok(scene) => {
                 self.set_scene(scene);
                 self.state.log.info("Восстановлено автосохранение");
             }
-            Err(error) => self
-                .state
-                .log
-                .error(format!("автосохранение не восстановлено: {error}")),
+            Err(error) => {
+                self.state
+                    .log
+                    .error(format!("автосохранение не восстановлено: {error}"));
+                if let Some(copy) = self
+                    .state
+                    .recovery_prompt
+                    .as_mut()
+                    .and_then(|prompt| prompt.copies.get_mut(index))
+                {
+                    copy.restore_error = Some(error);
+                }
+            }
         }
     }
 
@@ -1802,12 +1869,9 @@ impl EditorApp {
                     self.remove_autosave(scene.as_ref());
                     self.run_confirmed(*then);
                 }
-                Action::RestoreAutosave => self.restore_autosave(),
-                Action::DiscardAutosave => {
-                    if let Some(prompt) = self.state.recovery_prompt.take() {
-                        self.remove_autosave(prompt.scene.as_ref());
-                    }
-                }
+                Action::RestoreAutosave(index) => self.restore_autosave(index),
+                Action::DiscardAutosave => self.discard_autosave(),
+                Action::KeepAutosave => self.state.recovery_prompt = None,
                 Action::SaveThen(then) => {
                     if self.save(false) {
                         match self.state.save_project_prefabs() {
@@ -3287,15 +3351,248 @@ mod tests {
         // Интервал автосохранения ещё не истёк: обычный тик копию не пишет.
         app.autosave_tick();
         let store = AutosaveStore::for_project(&root);
-        assert_eq!(store.read(Some(&scene_path)), None);
+        assert!(store.read(Some(&scene_path)).copies.is_empty());
 
         app.start_play_now();
 
         assert!(!app.state.is_playing());
-        let copy = store.read(Some(&scene_path)).expect("autosave written");
+        let copy = store
+            .read(Some(&scene_path))
+            .copies
+            .into_iter()
+            .next()
+            .expect("autosave written")
+            .contents;
         let objects = app.state.scene.as_ref().unwrap().view().objects.len();
         assert_eq!(copy.matches("[[objects]]").count(), objects);
         assert_eq!(objects, 2);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Временный проект без сцен; копии в нём пишутся через `AutosaveStore`.
+    fn temp_project(name: &str) -> std::path::PathBuf {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rve-editor-{name}-{id}"));
+        std::fs::create_dir_all(root.join("Assets")).unwrap();
+        std::fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/scenes/start.rvescene\"\n",
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn unreadable_autosave_opens_the_recovery_window_and_logs_the_error() {
+        let root = temp_project("unreadable-autosave");
+        // Каталог на месте файла копии: прочитать его нельзя.
+        std::fs::create_dir_all(root.join(".rve/editor/autosave/~untitled.autosave")).unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.scene = Some(EditorScene::new_untitled().unwrap());
+
+        app.offer_recovery();
+
+        let prompt = app.state.recovery_prompt.as_ref().expect("window opens");
+        assert!(prompt.copies.is_empty());
+        assert_eq!(prompt.errors.len(), 1);
+        assert!(prompt.errors[0].contains("~untitled.autosave"));
+        assert_eq!(
+            app.state.log.entries().next_back().map(|entry| entry.level),
+            Some(LogLevel::Error)
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_restore_keeps_the_recovery_window_open() {
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.recovery_prompt = Some(RecoveryPrompt {
+            scene: None,
+            copies: vec![RecoveryCopy {
+                contents: "[[objects]\n".to_owned(),
+                saved_at: std::time::SystemTime::UNIX_EPOCH,
+                restore_error: None,
+            }],
+            errors: Vec::new(),
+        });
+
+        app.state.action(Action::RestoreAutosave(0));
+        app.run_actions();
+
+        let prompt = app
+            .state
+            .recovery_prompt
+            .as_ref()
+            .expect("window stays open");
+        assert!(prompt.copies[0].restore_error.is_some());
+    }
+
+    #[test]
+    fn broken_newest_copy_is_skipped_by_restoring_the_previous_one_from_the_same_window() {
+        let previous = EditorScene::new_untitled()
+            .unwrap()
+            .document()
+            .to_toml()
+            .unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.recovery_prompt = Some(RecoveryPrompt {
+            scene: None,
+            copies: vec![
+                RecoveryCopy {
+                    contents: "[[objects]\n".to_owned(),
+                    saved_at: std::time::SystemTime::UNIX_EPOCH,
+                    restore_error: None,
+                },
+                RecoveryCopy {
+                    contents: previous,
+                    saved_at: std::time::SystemTime::UNIX_EPOCH,
+                    restore_error: None,
+                },
+            ],
+            errors: Vec::new(),
+        });
+
+        app.state.action(Action::RestoreAutosave(0));
+        app.run_actions();
+        let prompt = app
+            .state
+            .recovery_prompt
+            .as_ref()
+            .expect("window stays open");
+        assert!(prompt.copies[0].restore_error.is_some());
+        assert!(prompt.copies[1].restore_error.is_none());
+
+        app.state.action(Action::RestoreAutosave(1));
+        app.run_actions();
+        assert!(app.state.recovery_prompt.is_none());
+        assert_eq!(
+            app.state.scene.as_ref().unwrap().document().objects.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_discard_keeps_the_recovery_window_open_with_the_path() {
+        let root = temp_project("failed-discard");
+        // Непустой каталог на месте прежнего файла: `remove_file` его не удалит. Путь собирается
+        // по компонентам, как в `AutosaveStore::for_project`, чтобы `display()` совпал на Windows.
+        let legacy = root
+            .join(".rve")
+            .join("editor")
+            .join("autosave")
+            .join("~untitled.autosave");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("inner"), "x").unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.recovery_prompt = Some(RecoveryPrompt {
+            scene: None,
+            copies: Vec::new(),
+            errors: Vec::new(),
+        });
+
+        app.state.action(Action::DiscardAutosave);
+        app.run_actions();
+        // Повторный Discard не дублирует ошибку в окне.
+        app.state.action(Action::DiscardAutosave);
+        app.run_actions();
+
+        let prompt = app
+            .state
+            .recovery_prompt
+            .as_ref()
+            .expect("window stays open");
+        assert_eq!(prompt.errors.len(), 1);
+        assert!(prompt.errors[0].starts_with(&legacy.display().to_string()));
+        assert_eq!(
+            app.state.log.entries().next_back().map(|entry| entry.level),
+            Some(LogLevel::Error)
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discard_removes_the_copies_and_closes_the_window() {
+        let root = temp_project("discard");
+        let store = AutosaveStore::for_project(&root);
+        store.write(None, "untitled copy").unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.recovery_prompt = Some(RecoveryPrompt {
+            scene: None,
+            copies: Vec::new(),
+            errors: Vec::new(),
+        });
+
+        app.state.action(Action::DiscardAutosave);
+        app.run_actions();
+
+        assert!(app.state.recovery_prompt.is_none());
+        assert!(store.read(None).copies.is_empty());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn autosave_warning_is_logged_once_while_it_stays_the_same() {
+        let root = temp_project("autosave-warning");
+        // Прежний файл `~untitled` — каталог: вторая запись не может его удалить.
+        std::fs::create_dir_all(root.join(".rve/editor/autosave/~untitled.autosave")).unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.scene = Some(EditorScene::new_untitled().unwrap());
+        let warnings = |app: &EditorApp| {
+            app.state
+                .log
+                .entries()
+                .filter(|entry| {
+                    entry.level == LogLevel::Warn && entry.message.contains("~untitled.autosave")
+                })
+                .count()
+        };
+
+        for _ in 0..3 {
+            app.state
+                .create_object(&crate::scene_edit::NewObject::Empty, None);
+            app.write_autosave();
+        }
+
+        // Первая запись заполняет один слот, вторая и третья пытаются удалить прежний файл.
+        assert_eq!(warnings(&app), 1);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keep_closes_the_recovery_window_and_leaves_the_copy_on_disk() {
+        let root = temp_project("keep-autosave");
+        let store = AutosaveStore::for_project(&root);
+        store.write(None, "untitled copy").unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.scene = Some(EditorScene::new_untitled().unwrap());
+        app.offer_recovery();
+        assert!(app.state.recovery_prompt.is_some());
+
+        app.state.action(Action::KeepAutosave);
+        app.run_actions();
+
+        assert!(app.state.recovery_prompt.is_none());
+        assert_eq!(
+            store
+                .read(None)
+                .copies
+                .first()
+                .map(|copy| copy.contents.as_str()),
+            Some("untitled copy")
+        );
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
