@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use glam::Vec3;
@@ -116,6 +117,8 @@ impl From<NarrowphaseError> for QueryError {
 #[derive(Clone)]
 pub struct QuerySnapshot {
     colliders: Vec<QueryCollider>,
+    /// Позиция тела в `colliders`; хендлы уникальны, поэтому поиск тела — O(1).
+    body_index: HashMap<BodyHandle, usize>,
     x_order: Vec<usize>,
     /// Активные пары триггера с хотя бы одним trigger-коллайдером; порядок по хендлам.
     trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
@@ -222,8 +225,14 @@ impl QuerySnapshot {
                 .total_cmp(&colliders[right].bounds.min.x)
                 .then_with(|| colliders[left].body.cmp(&colliders[right].body))
         });
+        let mut body_index = HashMap::with_capacity(colliders.len());
+        for (index, collider) in colliders.iter().enumerate() {
+            let previous = body_index.insert(collider.body, index);
+            debug_assert!(previous.is_none(), "хендлы тел снимка уникальны");
+        }
         Ok(Self {
             colliders,
+            body_index,
             x_order,
             trigger_pairs,
             gravity,
@@ -235,10 +244,9 @@ impl QuerySnapshot {
     /// стороны, как в шаге физики. Тело вне снимка не ограничивает запрос.
     pub(crate) fn collision_layer_mask(&self, body: BodyHandle) -> u32 {
         let Some(layer) = self
-            .colliders
-            .iter()
-            .find(|collider| collider.body == body)
-            .map(|collider| collider.layer)
+            .body_index
+            .get(&body)
+            .map(|&index| self.colliders[index].layer)
         else {
             return u32::MAX;
         };
@@ -477,9 +485,9 @@ impl QuerySnapshot {
     }
 
     pub fn body_state(&self, body: BodyHandle) -> Option<QueryBodyState> {
-        self.colliders
-            .iter()
-            .find(|collider| collider.body == body)
+        self.body_index
+            .get(&body)
+            .map(|&index| &self.colliders[index])
             .map(|collider| QueryBodyState {
                 pose: collider.pose,
                 enabled: collider.enabled,
@@ -651,7 +659,7 @@ fn query_hit_precedes(candidate: QueryHit, current: QueryHit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::QueryFilter;
-    use crate::world::{BodyDesc, PhysicsWorld};
+    use crate::world::{BodyDesc, BodyHandle, PHYSICS_LAYER_COUNT, PhysicsWorld};
     use crate::{DistanceResult, Pose, Ray, Shape, TriMesh};
     use glam::{Quat, Vec3};
     use std::sync::Arc;
@@ -882,5 +890,37 @@ mod tests {
         .expect("cast must converge at skin contact far from origin");
         let (fraction, _) = contact.expect("approaching contact must be reported");
         assert_eq!(fraction, 0.0);
+    }
+
+    #[test]
+    fn body_lookups_find_each_of_several_bodies_and_report_unknown_handles() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        // Слои 0 и 1 сталкиваются между собой, слой 2 — только сам с собой.
+        let mut masks = [u32::MAX; PHYSICS_LAYER_COUNT];
+        masks[0] = 0b011;
+        masks[1] = 0b011;
+        masks[2] = 0b100;
+        world.set_collision_matrix(masks);
+        let mut handles = Vec::new();
+        for (index, layer) in [0u32, 1, 2].into_iter().enumerate() {
+            let pose = Pose::new(Vec3::new(index as f32 * 3.0, 0.0, 0.0), Quat::IDENTITY).unwrap();
+            let mut desc = BodyDesc::dynamic(Shape::sphere(0.5).unwrap(), pose, 1.0 + index as f32);
+            desc.layer = layer;
+            handles.push(world.insert_body(desc).unwrap());
+        }
+        let snapshot = world.query_snapshot().unwrap();
+
+        for (index, &handle) in handles.iter().enumerate() {
+            let state = snapshot.body_state(handle).unwrap();
+            assert_eq!(state.pose.position, Vec3::new(index as f32 * 3.0, 0.0, 0.0));
+            assert!((state.mass - (1.0 + index as f32)).abs() < 1.0e-5);
+        }
+        assert_eq!(snapshot.collision_layer_mask(handles[0]), 0b011);
+        assert_eq!(snapshot.collision_layer_mask(handles[1]), 0b011);
+        assert_eq!(snapshot.collision_layer_mask(handles[2]), 0b100);
+
+        let missing = BodyHandle(u64::MAX);
+        assert!(snapshot.body_state(missing).is_none());
+        assert_eq!(snapshot.collision_layer_mask(missing), u32::MAX);
     }
 }
