@@ -677,6 +677,7 @@ impl EditorApp {
         self.state.previews.clear();
         self.state.clear_lite_schemas();
         self.state.models.clear();
+        self.state.pick_cache.clear();
         self.state.screen_shader_errors.clear();
         self.state.materials = crate::materials::MaterialLibrary::default();
         self.state.inspected_asset = None;
