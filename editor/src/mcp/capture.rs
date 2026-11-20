@@ -1,8 +1,10 @@
 //! Инструмент `capture_view`: PNG панели Scene или Game либо offscreen-вида выбранной камеры.
 //!
-//! Задача живёт в `EditorState` от `drain` до готового кадра, поэтому HTTP-ответ приходит только
-//! после реального захвата. `CapturePlan` отделён от `ToolCall`: автомат и выбор режима тестируются
-//! без сокета и GPU, а GPU-часть вызывает `EditorApp` через `mcp_capture_gpu`.
+//! Задача живёт в `EditorState` от `drain` до ответа, поэтому HTTP-ответ приходит только после
+//! реального захвата. Задача проходит две фазы: `Rendering` — readback на главном потоке, где нужны
+//! GPU-ресурсы; `Encoding` — PNG и base64 на потоке `rve-mcp-png` (`PngEncoder`), без GPU.
+//! `CapturePlan` отделён от `ToolCall`: автомат и выбор режима тестируются без сокета и GPU, а
+//! GPU-часть вызывает `EditorApp` через `mcp_capture_gpu`.
 
 use super::read::{optional_string, optional_u64, required_string};
 use crate::app::EditorApp;
@@ -12,8 +14,11 @@ use engine_mcp::{Permission, ToolCall, ToolResult, ToolSpec};
 use engine_render::{CaptureTicket, CapturedImage, RenderError};
 use engine_scene::camera::Camera;
 use engine_scene::{CameraSettings, PostProcessSettings, ScreenShaderRef, World};
+use flume::{TryRecvError, TrySendError};
 use serde_json::{Value, json};
 use std::ops::RangeInclusive;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Сколько ждать готовый захват; дольше — ошибка, а не зависание клиента.
@@ -23,6 +28,10 @@ const DEFAULT_CAPTURE_SIZE: [u32; 2] = [1280, 720];
 const DEFAULT_WARMUP_FRAMES: u32 = 8;
 const WARMUP_FRAMES: RangeInclusive<u64> = 1..=64;
 const STALE_GENERATION: &str = "project or scene changed while request was queued";
+// Причины отмены задачи в фазах Rendering и Encoding; тексты — внешний контракт `capture_view`.
+const CHANGED_REASON: &str = "project or scene changed while capture was pending";
+const SERVER_STOPPED_REASON: &str = "MCP server stopped while capture was pending";
+const CLIENT_GONE_REASON: &str = "client disconnected before capture finished";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureView {
@@ -94,10 +103,226 @@ impl CapturePlan {
     }
 }
 
-/// Задача, ожидающая ответа: вызов HTTP и состояние захвата.
+/// Задача, ожидающая ответа: вызов HTTP, состояние захвата и фаза.
 pub(crate) struct CaptureJob {
     call: ToolCall,
-    pub(crate) plan: CapturePlan,
+    plan: CapturePlan,
+    phase: Phase,
+}
+
+impl CaptureJob {
+    /// Задача ещё в фазе Rendering: участвует в отрисовке кадра и держит GPU-ресурсы.
+    pub(crate) fn rendering(&self) -> bool {
+        self.phase.rendering()
+    }
+
+    /// Нужен ли кадр offscreen-вида для этой задачи.
+    pub(crate) fn wants_offscreen_frame(&self) -> bool {
+        self.phase.wants_offscreen_frame(&self.plan)
+    }
+
+    /// Параметры offscreen-кадра для render; `None` вне фазы Rendering.
+    pub(crate) fn offscreen_frame(&self) -> Option<OffscreenFrame> {
+        self.phase.offscreen_frame(&self.plan)
+    }
+}
+
+/// Фаза задачи. В `Encoding` GPU-ресурсы уже освобождены, остаются только пиксели и кодирование.
+/// Все решения о гейтинге отрисовки принимаются здесь, а не в `app.rs`.
+enum Phase {
+    Rendering,
+    Encoding(EncodeWait),
+}
+
+impl Phase {
+    fn rendering(&self) -> bool {
+        matches!(self, Self::Rendering)
+    }
+
+    fn wants_offscreen_frame(&self, plan: &CapturePlan) -> bool {
+        self.rendering() && plan.is_offscreen()
+    }
+
+    /// Параметры offscreen-кадра: панельные задачи и фаза Encoding их не требуют.
+    fn offscreen_frame(&self, plan: &CapturePlan) -> Option<OffscreenFrame> {
+        if !self.rendering() {
+            return None;
+        }
+        let Source::Offscreen(offscreen) = plan.source else {
+            return None;
+        };
+        Some(OffscreenFrame {
+            camera: plan.camera.clone(),
+            size: offscreen.size,
+            reset_history: offscreen.reset_pending,
+            request: offscreen.warmup_left == 0 && plan.ticket.is_none(),
+        })
+    }
+}
+
+/// Кадр, переданный на кодирование: пиксели и мета ответа, собранные на главном потоке.
+struct EncodeInput {
+    image: CapturedImage,
+    meta: Value,
+}
+
+/// Ожидание кодирования. Задание либо ждёт слота (`Pending`), либо принято рабочим потоком (`Running`);
+/// третьего состояния нет, поэтому пиксели и канал результата не могут отсутствовать одновременно.
+enum EncodeWait {
+    Pending(Arc<EncodeInput>),
+    Running(InFlight),
+}
+
+impl EncodeWait {
+    /// Передаёт ожидающее задание рабочему потоку. Занятый слот оставляет его `Pending` до следующего
+    /// опроса; принятое задание переходит в `Running`.
+    fn offer(&mut self, encoder: &mut PngEncoder) -> Result<(), String> {
+        let Self::Pending(input) = self else {
+            return Ok(());
+        };
+        if let Submit::Accepted(flight) = encoder.submit(Arc::clone(&*input))? {
+            *self = Self::Running(flight);
+        }
+        Ok(())
+    }
+
+    /// Отменяет принятое задание. `Pending` ничего не делает: задание сбрасывается вместе с задачей.
+    fn cancel(&self) {
+        if let Self::Running(flight) = self {
+            flight.cancel();
+        }
+    }
+}
+
+/// Задание, принятое рабочим потоком: общий флаг отмены и канал результата ёмкостью 1.
+struct InFlight {
+    cancel: Arc<AtomicBool>,
+    done: flume::Receiver<Result<ToolResult, String>>,
+}
+
+impl InFlight {
+    /// Поток не начнёт задание, если оно ещё не стартовало, а готовый результат будет отброшен.
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Результат `PngEncoder::submit`: задание принято или слот занят. Занятое задание остаётся у вызывающего.
+enum Submit {
+    Accepted(InFlight),
+    Full,
+}
+
+/// Функция кодирования на рабочем потоке; подменяется в тестах.
+type EncodeFn = Arc<dyn Fn(&CapturedImage, &Value) -> Result<ToolResult, String> + Send + Sync>;
+
+/// Задание для рабочего потока. Вход разделяется с `EncodeWait::Pending`, пиксели не копируются.
+struct EncodeTask {
+    input: Arc<EncodeInput>,
+    cancel: Arc<AtomicBool>,
+    done: flume::Sender<Result<ToolResult, String>>,
+}
+
+const ENCODER_STOPPED: &str = "capture failed: PNG encoder stopped";
+
+/// Рабочий поток `rve-mcp-png` с входом ёмкостью 1. Поток создаётся при первом задании и
+/// завершается, когда закрыт вход; join не выполняется.
+pub(crate) struct PngEncoder {
+    encode: EncodeFn,
+    tasks: Option<flume::Sender<EncodeTask>>,
+}
+
+impl PngEncoder {
+    pub(crate) fn new() -> Self {
+        Self::with_encode(Arc::new(encode_response))
+    }
+
+    fn with_encode(encode: EncodeFn) -> Self {
+        Self {
+            encode,
+            tasks: None,
+        }
+    }
+
+    /// Передаёт задание рабочему потоку. Занятый слот даёт `Full`, и задание остаётся у вызывающего.
+    fn submit(&mut self, input: Arc<EncodeInput>) -> Result<Submit, String> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done, result) = flume::bounded(1);
+        let task = EncodeTask {
+            input,
+            cancel: Arc::clone(&cancel),
+            done,
+        };
+        if self.send(task)? {
+            Ok(Submit::Accepted(InFlight {
+                cancel,
+                done: result,
+            }))
+        } else {
+            Ok(Submit::Full)
+        }
+    }
+
+    /// Отправляет задание; `false` — слот занят. Закрытый вход значит, что поток умер: он сбрасывается,
+    /// и задание повторяется на новом потоке. Ошибка возвращается, только если и повтор не удался.
+    fn send(&mut self, task: EncodeTask) -> Result<bool, String> {
+        let outcome = match self.sender()?.try_send(task) {
+            Err(TrySendError::Disconnected(task)) => {
+                self.tasks = None;
+                self.sender()?.try_send(task)
+            }
+            outcome => outcome,
+        };
+        match outcome {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => {
+                self.tasks = None;
+                Err(ENCODER_STOPPED.to_owned())
+            }
+        }
+    }
+
+    /// Забирает результат, если он готов. Упавший поток сбрасывается, а вызов получает ошибку.
+    fn fetch(&mut self, flight: &InFlight) -> Option<Result<ToolResult, String>> {
+        match flight.done.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.tasks = None;
+                Some(Err(ENCODER_STOPPED.to_owned()))
+            }
+        }
+    }
+
+    fn sender(&mut self) -> Result<flume::Sender<EncodeTask>, String> {
+        if let Some(tasks) = &self.tasks {
+            return Ok(tasks.clone());
+        }
+        let (tasks, inbox) = flume::bounded(1);
+        let encode = Arc::clone(&self.encode);
+        std::thread::Builder::new()
+            .name("rve-mcp-png".to_owned())
+            .spawn(move || run_worker(inbox, encode))
+            .map_err(|error| format!("capture failed: cannot start PNG encoder: {error}"))?;
+        self.tasks = Some(tasks.clone());
+        Ok(tasks)
+    }
+}
+
+/// Цикл рабочего потока. Отменённое до старта задание не кодируется, а результат отменённого
+/// отбрасывается: его получатель уже ушёл.
+fn run_worker(inbox: flume::Receiver<EncodeTask>, encode: EncodeFn) {
+    while let Ok(task) = inbox.recv() {
+        if task.cancel.load(Ordering::Acquire) {
+            continue;
+        }
+        let result = encode(&task.input.image, &task.input.meta);
+        if !task.cancel.load(Ordering::Acquire) {
+            // Отправка в закрытый канал безвредна: получатель мог уйти по таймауту или отмене.
+            let _ = task.done.try_send(result);
+        }
+    }
 }
 
 /// Параметры offscreen-кадра, которые render берёт из задачи до отрисовки.
@@ -165,19 +390,24 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
 /// Начинает задачу из `drain`: при ошибке отвечает сразу, иначе сохраняет вызов в состоянии.
 pub(crate) fn begin(app: &mut EditorApp, call: ToolCall) {
     match prepare(app, &call.arguments, call.generation()) {
-        Ok(plan) => app.mcp_state_mut().mcp_capture = Some(CaptureJob { call, plan }),
+        Ok(plan) => {
+            app.mcp_state_mut().mcp_capture = Some(CaptureJob {
+                call,
+                plan,
+                phase: Phase::Rendering,
+            })
+        }
         Err(error) => {
             call.respond(ToolResult::error(error));
         }
     }
 }
 
-/// Забирает готовый захват и снимает задачу при отмене; возвращает `true`, если ответ отправлен.
+/// Продвигает задачу на один опрос; возвращает `true`, если ответ отправлен.
 pub(crate) fn poll(app: &mut EditorApp, server_running: bool) -> bool {
-    let Some(job) = app.mcp_state_mut().mcp_capture.take() else {
+    let Some(mut job) = app.mcp_state_mut().mcp_capture.take() else {
         return false;
     };
-    let ready = take_ready(app, job.plan.ticket);
     let env = Environment {
         generation: app.mcp_state_mut().mcp_generation,
         now: Instant::now(),
@@ -185,29 +415,109 @@ pub(crate) fn poll(app: &mut EditorApp, server_running: bool) -> bool {
         client_gone: job.call.is_abandoned(),
         target_ready: check_target(app.mcp_state_mut(), &job.plan.camera).is_ok(),
     };
-    match ready {
-        Some(result) if env.generation == job.plan.generation => {
-            finish(app, job, result);
+    if advance(app, &mut job, &env) {
+        return true;
+    }
+    app.mcp_state_mut().mcp_capture = Some(job);
+    false
+}
+
+/// Отменяет задачу при выходе из редактора; renderer ещё жив, поэтому тикет освобождается,
+/// а задание кодирования, если оно уже принято, получает флаг отмены.
+pub(crate) fn cancel_active(app: &mut EditorApp, reason: &str) {
+    if let Some(mut job) = app.mcp_state_mut().mcp_capture.take() {
+        abort(app, &mut job, reason);
+    }
+}
+
+fn advance(app: &mut EditorApp, job: &mut CaptureJob, env: &Environment) -> bool {
+    if job.rendering() {
+        advance_rendering(app, job, env)
+    } else {
+        advance_encoding(app, job, env)
+    }
+}
+
+/// Фаза Rendering: готовый readback переводится в Encoding, если поколение совпало.
+fn advance_rendering(app: &mut EditorApp, job: &mut CaptureJob, env: &Environment) -> bool {
+    match take_ready(app, job.plan.ticket) {
+        Some(Ok(image)) if env.generation == job.plan.generation => {
+            match begin_encoding(app, job, image) {
+                Ok(()) => false,
+                Err(error) => {
+                    complete(app, job, ToolResult::error(error));
+                    true
+                }
+            }
+        }
+        Some(Err(error)) if env.generation == job.plan.generation => {
+            complete(
+                app,
+                job,
+                ToolResult::error(format!("capture failed: {error}")),
+            );
             true
         }
-        _ => match abort_reason(&job.plan, &env) {
+        _ => match abort_reason(&job.plan, env) {
             Some(reason) => {
                 abort(app, job, &reason);
                 true
             }
-            None => {
-                app.mcp_state_mut().mcp_capture = Some(job);
-                false
+            None => false,
+        },
+    }
+}
+
+/// Фаза Encoding: готовый PNG отправляется даже при брошенном клиенте и истёкшем сроке; отложенное
+/// задание пробует занять слот, если ответа ещё нет.
+fn advance_encoding(app: &mut EditorApp, job: &mut CaptureJob, env: &Environment) -> bool {
+    let ready = take_encoded(app, job);
+    match encode_step(&job.plan, env, ready) {
+        EncodeStep::Respond(result) => {
+            job.call.respond(result);
+            true
+        }
+        EncodeStep::Cancel(reason) => {
+            abort(app, job, &reason);
+            true
+        }
+        EncodeStep::Wait => match offer_pending(app, job) {
+            Ok(()) => false,
+            Err(error) => {
+                complete(app, job, ToolResult::error(error));
+                true
             }
         },
     }
 }
 
-/// Отменяет задачу при выходе из редактора; renderer ещё жив, поэтому тикет освобождается.
-pub(crate) fn cancel_active(app: &mut EditorApp, reason: &str) {
-    if let Some(job) = app.mcp_state_mut().mcp_capture.take() {
-        abort(app, job, reason);
-    }
+/// Переводит задачу в Encoding. GPU-ресурсы освобождаются здесь один раз; meta строится на главном
+/// потоке, пиксели уходят кодировщику.
+fn begin_encoding(
+    app: &mut EditorApp,
+    job: &mut CaptureJob,
+    image: CapturedImage,
+) -> Result<(), String> {
+    release(app, &mut job.plan);
+    let meta = meta_for(&job.plan, &image);
+    job.phase = Phase::Encoding(EncodeWait::Pending(Arc::new(EncodeInput { image, meta })));
+    offer_pending(app, job)
+}
+
+/// Передаёт отложенное задание рабочему потоку. Занятый слот оставляет его до следующего опроса.
+fn offer_pending(app: &mut EditorApp, job: &mut CaptureJob) -> Result<(), String> {
+    let Phase::Encoding(wait) = &mut job.phase else {
+        return Ok(());
+    };
+    wait.offer(&mut app.mcp_state_mut().png_encoder)
+}
+
+/// Результат кодирования, если он уже готов.
+fn take_encoded(app: &mut EditorApp, job: &CaptureJob) -> Option<Result<ToolResult, String>> {
+    let Phase::Encoding(EncodeWait::Running(flight)) = &job.phase else {
+        return None;
+    };
+    app.mcp_state_mut().png_encoder.fetch(flight)
 }
 
 /// Нужен ли кадр, когда ни одна панель не видна: активный offscreen-захват требует отрисовки.
@@ -219,19 +529,6 @@ pub(crate) fn needs_scene_frame(
     scene_drawable || game_drawable || offscreen
 }
 
-/// Параметры offscreen-кадра текущей задачи; панельные задачи кадра не требуют.
-pub(crate) fn offscreen_frame(plan: &CapturePlan) -> Option<OffscreenFrame> {
-    let Source::Offscreen(offscreen) = plan.source else {
-        return None;
-    };
-    Some(OffscreenFrame {
-        camera: plan.camera.clone(),
-        size: offscreen.size,
-        reset_history: offscreen.reset_pending,
-        request: offscreen.warmup_left == 0 && plan.ticket.is_none(),
-    })
-}
-
 /// Записывает результат кадра: тикет, если его запросили, и прогрев по показанным кадрам.
 pub(crate) fn offscreen_rendered(
     job: Option<&mut CaptureJob>,
@@ -241,6 +538,11 @@ pub(crate) fn offscreen_rendered(
     let Some(job) = job else {
         return;
     };
+    // Запрос readback выдаёт только `offscreen_frame` фазы Rendering, поэтому тикет и прогрев
+    // относятся к задаче, которая ещё рисует кадр.
+    if !job.rendering() {
+        return;
+    }
     if requested.is_some() {
         job.plan.ticket = requested;
     }
@@ -442,13 +744,13 @@ fn camera_exists(world: &World, id: &str) -> bool {
 /// Порядок важен: смена сцены и потеря сервера важнее таймаута.
 fn abort_reason(plan: &CapturePlan, env: &Environment) -> Option<String> {
     if env.generation != plan.generation {
-        return Some("project or scene changed while capture was pending".to_owned());
+        return Some(CHANGED_REASON.to_owned());
     }
     if !env.server_running {
-        return Some("MCP server stopped while capture was pending".to_owned());
+        return Some(SERVER_STOPPED_REASON.to_owned());
     }
     if env.client_gone {
-        return Some("client disconnected before capture finished".to_owned());
+        return Some(CLIENT_GONE_REASON.to_owned());
     }
     if !env.target_ready {
         return Some("scene or camera is no longer available".to_owned());
@@ -476,21 +778,29 @@ fn take_ready(
     ready
 }
 
-fn finish(app: &mut EditorApp, mut job: CaptureJob, result: Result<CapturedImage, RenderError>) {
-    let response = match result {
-        Ok(image) => response_for(&image, &job.plan).unwrap_or_else(ToolResult::error),
-        Err(error) => ToolResult::error(format!("capture failed: {error}")),
-    };
-    release(app, &mut job.plan);
-    job.call.respond(response);
-}
-
-fn abort(app: &mut EditorApp, mut job: CaptureJob, reason: &str) {
-    release(app, &mut job.plan);
+/// Отменяет задачу: освобождает то, что держит её фаза, и отвечает ошибкой с причиной.
+fn abort(app: &mut EditorApp, job: &mut CaptureJob, reason: &str) {
+    release_phase(app, job);
     job.call.respond(ToolResult::error(reason));
 }
 
+/// Закрывает задачу ответом; освобождает ресурсы фазы, если они ещё есть.
+fn complete(app: &mut EditorApp, job: &mut CaptureJob, response: ToolResult) {
+    release_phase(app, job);
+    job.call.respond(response);
+}
+
+/// Освобождает ресурсы текущей фазы. В Rendering это GPU-ресурсы; в Encoding ресурсов GPU нет, а
+/// принятое задание получает флаг отмены, ожидающее сбрасывается вместе с задачей.
+fn release_phase(app: &mut EditorApp, job: &mut CaptureJob) {
+    match &job.phase {
+        Phase::Rendering => release(app, &mut job.plan),
+        Phase::Encoding(wait) => wait.cancel(),
+    }
+}
+
 /// Отменяет тикет и освобождает offscreen-viewport; `cancel_capture` безопасен в любом состоянии.
+/// Вызывается один раз: при переходе в Encoding и при отмене в Rendering.
 fn release(app: &mut EditorApp, plan: &mut CapturePlan) {
     let offscreen = plan.is_offscreen();
     let ticket = plan.ticket.take();
@@ -512,8 +822,8 @@ fn release(app: &mut EditorApp, plan: &mut CapturePlan) {
     }
 }
 
-fn response_for(image: &CapturedImage, plan: &CapturePlan) -> Result<ToolResult, String> {
-    let png = encode_png(image)?;
+/// Мета ответа, которую собирает главный поток по готовому readback.
+fn meta_for(plan: &CapturePlan, image: &CapturedImage) -> Value {
     let mut meta = json!({
         "view": plan.view.label(),
         "source": plan.source_label(),
@@ -524,12 +834,55 @@ fn response_for(image: &CapturedImage, plan: &CapturePlan) -> Result<ToolResult,
     if let Source::Offscreen(offscreen) = plan.source {
         meta["warmup_frames"] = json!(offscreen.warmup_frames);
     }
+    meta
+}
+
+/// Кодирует PNG, base64 и ответ; выполняется на рабочем потоке `rve-mcp-png`.
+fn encode_response(image: &CapturedImage, meta: &Value) -> Result<ToolResult, String> {
+    let png = encode_png(image)?;
     let mut result = ToolResult::image_png(&png);
     result
         .content
         .push(json!({"type": "text", "text": meta.to_string()}));
-    result.structured_content = Some(meta);
+    result.structured_content = Some(meta.clone());
     Ok(result)
+}
+
+/// Решение опроса в фазе Encoding. Потеря камеры здесь не отменяет задачу: кадр уже снят.
+#[derive(Debug, PartialEq)]
+enum EncodeStep {
+    /// Ответ готов: кодирование завершилось либо упало.
+    Respond(ToolResult),
+    Cancel(String),
+    Wait,
+}
+
+/// Порядок проверок: смена поколения, затем готовый результат, затем сервер, клиент и срок.
+/// Готовый результат важнее срока и брошенного клиента, как и в фазе Rendering.
+fn encode_step(
+    plan: &CapturePlan,
+    env: &Environment,
+    ready: Option<Result<ToolResult, String>>,
+) -> EncodeStep {
+    if env.generation != plan.generation {
+        return EncodeStep::Cancel(CHANGED_REASON.to_owned());
+    }
+    if let Some(result) = ready {
+        return EncodeStep::Respond(result.unwrap_or_else(ToolResult::error));
+    }
+    if !env.server_running {
+        return EncodeStep::Cancel(SERVER_STOPPED_REASON.to_owned());
+    }
+    if env.client_gone {
+        return EncodeStep::Cancel(CLIENT_GONE_REASON.to_owned());
+    }
+    if env.now >= plan.deadline {
+        return EncodeStep::Cancel(format!(
+            "capture timed out after {} s: PNG encoding did not finish",
+            CAPTURE_DEADLINE.as_secs()
+        ));
+    }
+    EncodeStep::Wait
 }
 
 fn encode_png(image: &CapturedImage) -> Result<Vec<u8>, String> {
@@ -708,17 +1061,17 @@ mod tests {
     #[test]
     fn warmup_gates_the_readback_request_and_reset_applies_once() {
         let mut plan = plan(offscreen(2), CameraChoice::Editor, Instant::now());
-        let first = offscreen_frame(&plan).unwrap();
+        let first = Phase::Rendering.offscreen_frame(&plan).unwrap();
         assert!(first.reset_history);
         assert!(!first.request);
 
         note_presented(&mut plan);
-        let second = offscreen_frame(&plan).unwrap();
+        let second = Phase::Rendering.offscreen_frame(&plan).unwrap();
         assert!(!second.reset_history);
         assert!(!second.request);
 
         note_presented(&mut plan);
-        let ready = offscreen_frame(&plan).unwrap();
+        let ready = Phase::Rendering.offscreen_frame(&plan).unwrap();
         assert!(ready.request);
         assert_eq!(ready.size, [640, 360]);
     }
@@ -726,7 +1079,8 @@ mod tests {
     #[test]
     fn panel_jobs_do_not_produce_offscreen_frames() {
         let plan = plan(Source::Panel, CameraChoice::Editor, Instant::now());
-        assert!(offscreen_frame(&plan).is_none());
+        assert!(Phase::Rendering.offscreen_frame(&plan).is_none());
+        assert!(!Phase::Rendering.wants_offscreen_frame(&plan));
         assert!(!plan.is_offscreen());
     }
 
@@ -860,5 +1214,408 @@ active=false
         let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut pixels).unwrap();
         assert_eq!(pixels, image.rgba8);
+    }
+
+    /// Предел ожидания в тестах: только страховка от зависания, сам тест синхронизируется каналами.
+    const TEST_WAIT: Duration = Duration::from_secs(30);
+
+    fn job_input(seed: u8) -> EncodeInput {
+        EncodeInput {
+            image: CapturedImage {
+                width: 1,
+                height: 1,
+                rgba8: vec![seed, 0, 0, 255],
+            },
+            meta: json!({ "seed": seed }),
+        }
+    }
+
+    fn pending(seed: u8) -> Arc<EncodeInput> {
+        Arc::new(job_input(seed))
+    }
+
+    /// Кодировщик для тестов: сообщает о старте, ждёт токен от теста и кодирует настоящий PNG.
+    /// Токен идёт через `bounded(0)`, поэтому отправка возвращается, только когда поток его принял.
+    fn gated_encoder(started: flume::Sender<()>, gate: flume::Receiver<()>) -> PngEncoder {
+        PngEncoder::with_encode(Arc::new(
+            move |image: &CapturedImage, meta: &Value| -> Result<ToolResult, String> {
+                let _ = started.send(());
+                let _ = gate.recv();
+                encode_response(image, meta)
+            },
+        ))
+    }
+
+    /// Кодировщик, который паникует на задании с `crash`; остальные кодируются настоящим PNG.
+    fn crashing_encoder() -> PngEncoder {
+        PngEncoder::with_encode(Arc::new(
+            |image: &CapturedImage, meta: &Value| -> Result<ToolResult, String> {
+                if meta["crash"] == json!(true) {
+                    panic!("PNG worker crashed in test");
+                }
+                encode_response(image, meta)
+            },
+        ))
+    }
+
+    fn crash_job() -> Arc<EncodeInput> {
+        Arc::new(EncodeInput {
+            image: job_input(0).image,
+            meta: json!({ "crash": true }),
+        })
+    }
+
+    fn accepted(submit: Result<Submit, String>) -> InFlight {
+        match submit.unwrap() {
+            Submit::Accepted(flight) => flight,
+            Submit::Full => panic!("worker slot must be free"),
+        }
+    }
+
+    /// Слот освобождается, когда рабочий поток забирает отменённое задание; ждём это через `yield`.
+    fn accepted_when_free(encoder: &mut PngEncoder, input: Arc<EncodeInput>) -> InFlight {
+        loop {
+            match encoder.submit(Arc::clone(&input)).unwrap() {
+                Submit::Accepted(flight) => return flight,
+                Submit::Full => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn wait_result(flight: &InFlight) -> Result<ToolResult, String> {
+        flight
+            .done
+            .recv_timeout(TEST_WAIT)
+            .expect("encoder must answer")
+    }
+
+    /// Ждёт, пока рабочий поток завершится: его вход закрыт, и отправка получает `Disconnected`.
+    fn wait_until_worker_gone(encoder: &PngEncoder) {
+        let tasks = encoder.tasks.as_ref().expect("worker was started");
+        while !tasks.is_disconnected() {
+            std::thread::yield_now();
+        }
+    }
+
+    fn ready_png() -> Option<Result<ToolResult, String>> {
+        Some(Ok(ToolResult::image_png(b"png")))
+    }
+
+    #[test]
+    fn png_encoder_returns_the_captured_pixels_and_meta() {
+        let (started, _started_rx) = flume::unbounded();
+        let (gate_tx, gate_rx) = flume::bounded::<()>(0);
+        let mut encoder = gated_encoder(started, gate_rx);
+        let image = CapturedImage {
+            width: 2,
+            height: 1,
+            rgba8: vec![255, 0, 0, 255, 0, 0, 255, 128],
+        };
+        let meta = json!({ "view": "scene", "width": 2, "height": 1 });
+        let flight = accepted(encoder.submit(Arc::new(EncodeInput {
+            image: image.clone(),
+            meta: meta.clone(),
+        })));
+        gate_tx.send(()).unwrap();
+        let result = wait_result(&flight).unwrap();
+
+        assert_eq!(result.structured_content, Some(meta.clone()));
+        assert_eq!(
+            result.content[1],
+            json!({"type": "text", "text": meta.to_string()})
+        );
+        let data = result.content[0]["data"].as_str().unwrap();
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(&bytes))
+            .read_info()
+            .unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(pixels, image.rgba8);
+    }
+
+    #[test]
+    fn job_cancelled_while_queued_is_never_encoded() {
+        let (started, started_rx) = flume::unbounded();
+        let (gate_tx, gate_rx) = flume::bounded::<()>(0);
+        let mut encoder = gated_encoder(started, gate_rx);
+        let running = accepted(encoder.submit(pending(1)));
+        started_rx.recv_timeout(TEST_WAIT).unwrap();
+        let queued = accepted(encoder.submit(pending(2)));
+        queued.cancel();
+        gate_tx.send(()).unwrap();
+        wait_result(&running).unwrap();
+
+        let third = accepted_when_free(&mut encoder, pending(3));
+        gate_tx.send(()).unwrap();
+        wait_result(&third).unwrap();
+        assert_eq!(
+            started_rx.drain().count(),
+            1,
+            "the cancelled job must not reach the encoder"
+        );
+    }
+
+    #[test]
+    fn result_of_a_job_cancelled_during_encoding_is_discarded() {
+        let (started, started_rx) = flume::unbounded();
+        let (gate_tx, gate_rx) = flume::bounded::<()>(0);
+        let mut encoder = gated_encoder(started, gate_rx);
+        let running = accepted(encoder.submit(pending(1)));
+        started_rx.recv_timeout(TEST_WAIT).unwrap();
+        running.cancel();
+        gate_tx.send(()).unwrap();
+
+        let next = accepted_when_free(&mut encoder, pending(2));
+        gate_tx.send(()).unwrap();
+        let result = wait_result(&next).unwrap();
+
+        assert_eq!(result.structured_content, Some(json!({ "seed": 2 })));
+        assert!(
+            running.done.try_recv().is_err(),
+            "cancelled job must not deliver its result"
+        );
+        assert_eq!(started_rx.drain().count(), 1);
+    }
+
+    #[test]
+    fn full_slot_defers_the_job_without_starting_it() {
+        let (started, started_rx) = flume::unbounded();
+        let (gate_tx, gate_rx) = flume::bounded::<()>(0);
+        let mut encoder = gated_encoder(started, gate_rx);
+        let running = accepted(encoder.submit(pending(1)));
+        started_rx.recv_timeout(TEST_WAIT).unwrap();
+        let queued = accepted(encoder.submit(pending(2)));
+        assert!(matches!(encoder.submit(pending(3)).unwrap(), Submit::Full));
+
+        gate_tx.send(()).unwrap();
+        wait_result(&running).unwrap();
+        gate_tx.send(()).unwrap();
+        wait_result(&queued).unwrap();
+
+        let next = accepted(encoder.submit(pending(4)));
+        gate_tx.send(()).unwrap();
+        let result = wait_result(&next).unwrap();
+        assert_eq!(result.structured_content, Some(json!({ "seed": 4 })));
+        assert_eq!(
+            started_rx.drain().count(),
+            2,
+            "jobs 2 and 4 start encoding; the deferred job 3 never does"
+        );
+    }
+
+    #[test]
+    fn deferred_job_stays_pending_while_the_slot_is_busy_and_runs_once_it_frees() {
+        let (started, started_rx) = flume::unbounded();
+        let (gate_tx, gate_rx) = flume::bounded::<()>(0);
+        let mut encoder = gated_encoder(started, gate_rx);
+        let running = accepted(encoder.submit(pending(1)));
+        started_rx.recv_timeout(TEST_WAIT).unwrap();
+        let queued = accepted(encoder.submit(pending(2)));
+
+        let mut wait = EncodeWait::Pending(pending(3));
+        wait.offer(&mut encoder).unwrap();
+        assert!(
+            matches!(wait, EncodeWait::Pending(_)),
+            "a busy slot keeps the job pending"
+        );
+
+        gate_tx.send(()).unwrap();
+        wait_result(&running).unwrap();
+        // Рабочий поток забирает задание 2 из слота и сообщает о старте: слот свободен.
+        started_rx.recv_timeout(TEST_WAIT).unwrap();
+        wait.offer(&mut encoder).unwrap();
+        assert!(
+            matches!(wait, EncodeWait::Running(_)),
+            "the next poll moves the job to running"
+        );
+
+        gate_tx.send(()).unwrap();
+        wait_result(&queued).unwrap();
+        gate_tx.send(()).unwrap();
+        let EncodeWait::Running(flight) = &wait else {
+            panic!("job 3 must be running");
+        };
+        let result = wait_result(flight).unwrap();
+        assert_eq!(result.structured_content, Some(json!({ "seed": 3 })));
+    }
+
+    #[test]
+    fn cancelled_pending_job_is_dropped_and_never_reaches_the_encoder() {
+        let (started, started_rx) = flume::unbounded();
+        let (gate_tx, gate_rx) = flume::bounded::<()>(0);
+        let mut encoder = gated_encoder(started, gate_rx);
+        let running = accepted(encoder.submit(pending(1)));
+        started_rx.recv_timeout(TEST_WAIT).unwrap();
+        let queued = accepted(encoder.submit(pending(2)));
+        let mut wait = EncodeWait::Pending(pending(3));
+        wait.offer(&mut encoder).unwrap();
+        assert!(matches!(wait, EncodeWait::Pending(_)));
+
+        // Отмена задачи в фазе Encoding: ожидающее задание сбрасывается вместе с ней.
+        wait.cancel();
+        drop(wait);
+
+        gate_tx.send(()).unwrap();
+        wait_result(&running).unwrap();
+        gate_tx.send(()).unwrap();
+        wait_result(&queued).unwrap();
+        let next = accepted(encoder.submit(pending(4)));
+        gate_tx.send(()).unwrap();
+        wait_result(&next).unwrap();
+        assert_eq!(
+            started_rx.drain().count(),
+            2,
+            "jobs 2 and 4 are encoded; the cancelled pending job 3 is not"
+        );
+    }
+
+    #[test]
+    fn panicked_worker_is_reported_through_fetch_and_the_next_job_starts_a_new_worker() {
+        let mut encoder = crashing_encoder();
+        let crashing = accepted(encoder.submit(crash_job()));
+        assert!(matches!(
+            crashing.done.recv_timeout(TEST_WAIT),
+            Err(flume::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(
+            encoder.fetch(&crashing),
+            Some(Err(ENCODER_STOPPED.to_owned()))
+        );
+
+        let healthy = accepted(encoder.submit(pending(5)));
+        let result = wait_result(&healthy).unwrap();
+        assert_eq!(result.structured_content, Some(json!({ "seed": 5 })));
+    }
+
+    #[test]
+    fn submit_after_a_worker_panic_starts_a_new_worker_instead_of_failing() {
+        let mut encoder = crashing_encoder();
+        let crashing = accepted(encoder.submit(crash_job()));
+        assert!(matches!(
+            crashing.done.recv_timeout(TEST_WAIT),
+            Err(flume::RecvTimeoutError::Disconnected)
+        ));
+        // Результат не забирали: в PngEncoder ещё стоит отправитель мёртвого потока.
+        wait_until_worker_gone(&encoder);
+
+        let healthy = accepted(encoder.submit(pending(6)));
+        let result = wait_result(&healthy).unwrap();
+        assert_eq!(result.structured_content, Some(json!({ "seed": 6 })));
+    }
+
+    #[test]
+    fn encoding_cancels_on_generation_change_even_with_a_ready_result() {
+        let plan = plan(
+            offscreen(8),
+            CameraChoice::Editor,
+            Instant::now() + CAPTURE_DEADLINE,
+        );
+        let env = Environment {
+            generation: plan.generation + 1,
+            ..env(&plan)
+        };
+        assert_eq!(
+            encode_step(&plan, &env, ready_png()),
+            EncodeStep::Cancel(CHANGED_REASON.to_owned())
+        );
+    }
+
+    #[test]
+    fn ready_png_is_sent_to_a_gone_client_after_the_deadline() {
+        let plan = plan(offscreen(8), CameraChoice::Editor, Instant::now());
+        let env = Environment {
+            now: plan.deadline,
+            client_gone: true,
+            ..env(&plan)
+        };
+        assert_eq!(
+            encode_step(&plan, &env, ready_png()),
+            EncodeStep::Respond(ToolResult::image_png(b"png"))
+        );
+    }
+
+    #[test]
+    fn ready_png_is_sent_even_when_the_server_has_stopped() {
+        let plan = plan(
+            offscreen(8),
+            CameraChoice::Editor,
+            Instant::now() + CAPTURE_DEADLINE,
+        );
+        let env = Environment {
+            server_running: false,
+            ..env(&plan)
+        };
+        assert_eq!(
+            encode_step(&plan, &env, ready_png()),
+            EncodeStep::Respond(ToolResult::image_png(b"png"))
+        );
+    }
+
+    #[test]
+    fn dead_encoder_without_a_result_answers_with_the_stopped_error() {
+        let plan = plan(
+            offscreen(8),
+            CameraChoice::Editor,
+            Instant::now() + CAPTURE_DEADLINE,
+        );
+        let env = env(&plan);
+        assert_eq!(
+            encode_step(&plan, &env, Some(Err(ENCODER_STOPPED.to_owned()))),
+            EncodeStep::Respond(ToolResult::error(ENCODER_STOPPED))
+        );
+    }
+
+    #[test]
+    fn encoding_at_the_deadline_without_a_result_reports_png_encoding() {
+        let plan = plan(offscreen(8), CameraChoice::Editor, Instant::now());
+        let env = Environment {
+            now: plan.deadline,
+            ..env(&plan)
+        };
+        let step = encode_step(&plan, &env, None);
+        assert!(
+            matches!(&step, EncodeStep::Cancel(reason) if reason.contains("PNG encoding did not finish")),
+            "{step:?}"
+        );
+    }
+
+    #[test]
+    fn encoding_ignores_a_lost_camera_but_not_a_stopped_server() {
+        let plan = plan(
+            offscreen(8),
+            CameraChoice::Object("drone".to_owned()),
+            Instant::now() + CAPTURE_DEADLINE,
+        );
+        let lost_camera = Environment {
+            target_ready: false,
+            ..env(&plan)
+        };
+        assert_eq!(encode_step(&plan, &lost_camera, None), EncodeStep::Wait);
+
+        let stopped = Environment {
+            server_running: false,
+            ..env(&plan)
+        };
+        assert_eq!(
+            encode_step(&plan, &stopped, None),
+            EncodeStep::Cancel(SERVER_STOPPED_REASON.to_owned())
+        );
+    }
+
+    #[test]
+    fn encoding_phase_never_requests_an_offscreen_readback() {
+        let plan = plan(
+            offscreen(0),
+            CameraChoice::Editor,
+            Instant::now() + CAPTURE_DEADLINE,
+        );
+        assert!(Phase::Rendering.wants_offscreen_frame(&plan));
+        assert!(Phase::Rendering.offscreen_frame(&plan).unwrap().request);
+
+        let encoding = Phase::Encoding(EncodeWait::Pending(pending(1)));
+        assert!(!encoding.wants_offscreen_frame(&plan));
+        assert!(encoding.offscreen_frame(&plan).is_none());
     }
 }

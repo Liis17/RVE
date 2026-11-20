@@ -861,16 +861,6 @@ fn start_modules(
         },
     )?;
 
-    let (neural_tx, neural_rx) = std::sync::mpsc::channel();
-    modules.spawn(
-        "rve-neural",
-        move || {
-            let _ = neural_tx.send(());
-        },
-        move || {
-            engine_neural::NeuralEngine::new().run(neural_rx);
-        },
-    )?;
     if let Some((engine, handle)) = network {
         modules.spawn(
             "rve-network",
@@ -928,16 +918,63 @@ mod tests {
         wait_scripts_ready, wait_scripts_ready_after_timeout,
     };
     use crate::layout::{PrefabCatalogLocation, ProjectSettingsLocation};
-    use crate::pipeline::ScriptStartupError;
+    use crate::module_host::ModuleHost;
+    use crate::pipeline::{RuntimeStatus, ScriptStartupError};
+    use engine_physics::PhysicsSceneDesc;
     use engine_project::PrefabCatalogFile;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
+    use engine_scene::{SceneDocument, World};
     use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
+    use glam::Vec3;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn local_modules_start_without_neural_thread() {
+        let root = std::env::temp_dir().join(format!(
+            "rve-runtime-modules-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut resources = ResourceSystem::start(ResourceConfig {
+            root: root.clone(),
+            source_mode: SourceMode::Loose,
+            ..ResourceConfig::default()
+        })
+        .unwrap();
+        let document = SceneDocument::parse(
+            "empty.rvescene",
+            "[[objects]]\nid='camera'\n[objects.transform]\nposition=[0.0,0.0,-2.0]\n[objects.camera]\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let (driver, _) = PhysicsSceneDesc::from_world(&world, &[], Vec3::ZERO, 60, 8)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut modules = ModuleHost::new();
+        let _started = super::start_modules(
+            &mut modules,
+            driver,
+            Arc::new(RuntimeStatus::default()),
+            resources.handle(),
+            false,
+            false,
+            None,
+        )
+        .expect("local modules start without an output device");
+        assert_eq!(modules.names(), ["rve-audio", "rve-physics"]);
+        assert!(modules.shutdown().is_empty());
+
+        resources.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn reads_release_project_settings_through_resource_handle() {
