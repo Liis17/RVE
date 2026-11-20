@@ -85,7 +85,7 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
     engine-script, engine-window, engine-console, engine-ui.
   - rve-build: engine-render, engine-assets, engine-files, engine-pak, engine-project,
     engine-resources, engine-scene, engine-script, engine-gui, rve-sdk.
-  - engine-script (потребители engine-runtime и rve-editor): engine-console, engine-files, engine-gui, engine-physics, engine-scene, rve-sdk.
+  - engine-script (потребители engine-runtime, rve-editor и rve-build): engine-console, engine-files, engine-platform, engine-project, engine-gui, engine-physics, engine-scene, rve-sdk.
   - engine-gui (потребители engine-script, engine-ui, engine-runtime, rve-editor и rve-build): engine-files, epaint, serde, toml, skrifa.
   - engine-ui (потребители engine-runtime и rve-editor): engine-gui, engine-render, engine-core, engine-console; egui-мост включается feature `egui`.
   - engine-audio (потребители engine-runtime и rve-editor): engine-resources, engine-scene, cpal, lewton, flume, rtrb, log.
@@ -159,7 +159,8 @@ Obsidian/RVEVault/Engine/EngineProject.md.
 - Каждая новая фича или изменение поведения должны сопровождаться автоматическими тестами в том же коммите: основной сценарий, существенные граничные случаи и ошибки. Для исправления бага добавляй регрессионный тест, воспроизводящий проблему до исправления.
 - Это правило действует для всех крейтов workspace. Для крейтов-скелетов тесты появляются вместе с первой реализацией; пустые тесты без проверяемого поведения не добавляй.
 - Проверяй наблюдаемое поведение и публичные контракты. Тесты должны быть воспроизводимыми: без реального GPU, Vulkan loader, окна, сети и ожиданий через sleep. Графический runtime проверяй отдельно командами sandbox.
-- Перед коммитом запускай cargo fmt --all --check, cargo clippy --workspace --all-targets --locked -- -D warnings, cargo build --workspace --locked и cargo test --workspace --locked. Последняя команда включает unit-, integration- и doc-тесты.
+- Для изменений только в Obsidian и правилах агентов сверяй утверждения с исходниками и манифестами, проверяй пути, ссылки, заголовки и diff. Сборка и тесты движка для таких правок не требуются.
+- Для остальных изменений перед коммитом запускай cargo fmt --all --check, cargo clippy --workspace --all-targets --locked -- -D warnings, cargo build --workspace --locked и cargo test --workspace --locked. Последняя команда включает unit-, integration- и doc-тесты.
 - .github/workflows/ci.yml запускается на pull request в son-croissant и mommy, на push в mommy и вручную (push в feature-ветки без PR не запускает CI). Проверка на Windows и macOS изменённые крейты и все транзитивно зависящие от них крейты через -p. Граф берётся из Cargo metadata. Общие настройки, lockfile, CI, неизвестные пути, ручной запуск и push без доступной базы запускают полную проверку. Изменения только документации вне крейтов пропускают проверки Rust; точные правила описаны в Obsidian/RVEVault/Architecture.md.
 - Логику выбора крейтов проверяй командой python3 -B -m unittest discover -s .github/scripts -v из корня; CI запускает эти тесты на Ubuntu перед выбором крейтов.
 - Во время работы проверяй изменённый компонент, затронутые тесты и зависимые контракты; обязательные проверки перед коммитом выполняй полностью.
