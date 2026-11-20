@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1128,7 +1128,6 @@ dependencies = [
  "engine-gui",
  "engine-input",
  "engine-network",
- "engine-neural",
  "engine-physics",
  "engine-platform",
  "engine-project",
