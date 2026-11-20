@@ -24,6 +24,19 @@ pub fn autosave_due(
     dirty && autosaved_revision != Some(revision) && since_last >= AUTOSAVE_INTERVAL
 }
 
+/// Исправная копия сцены.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutosaveCopy {
+    pub contents: String,
+}
+
+/// Найденное для одной сцены: копии и ошибки чтения, которые нельзя молча пропустить.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct AutosaveCopies {
+    pub copies: Vec<AutosaveCopy>,
+    pub errors: Vec<String>,
+}
+
 /// Каталог копий одного проекта.
 pub struct AutosaveStore {
     dir: PathBuf,
@@ -53,9 +66,15 @@ impl AutosaveStore {
         write_atomic(&self.file(scene), contents.as_bytes())
     }
 
-    /// Текст копии, если она есть.
-    pub fn read(&self, scene: Option<&VirtualPath>) -> Option<String> {
-        std::fs::read_to_string(self.file(scene)).ok()
+    /// Копии сцены. Отсутствие копии не ошибка; неудачное чтение попадает в `errors` с путём файла.
+    pub fn read(&self, scene: Option<&VirtualPath>) -> AutosaveCopies {
+        let mut found = AutosaveCopies::default();
+        match read_generation(&self.file(scene)) {
+            Ok(Some(copy)) => found.copies.push(copy),
+            Ok(None) => {}
+            Err(error) => found.errors.push(error),
+        }
+        found
     }
 
     /// Удаляет копию; отсутствие копии не ошибка.
@@ -66,6 +85,15 @@ impl AutosaveStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("{}: {error}", file.display())),
         }
+    }
+}
+
+/// Читает файл копии. Отсутствующий файл — `Ok(None)`; любая другая ошибка — `Err` с путём файла.
+fn read_generation(file: &Path) -> Result<Option<AutosaveCopy>, String> {
+    match std::fs::read_to_string(file) {
+        Ok(contents) => Ok(Some(AutosaveCopy { contents })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", file.display())),
     }
 }
 
@@ -98,6 +126,16 @@ mod tests {
         VirtualPath::parse(value).unwrap()
     }
 
+    /// Текст самой новой исправной копии.
+    fn latest(store: &AutosaveStore, scene: Option<&VirtualPath>) -> Option<String> {
+        store
+            .read(scene)
+            .copies
+            .into_iter()
+            .next()
+            .map(|copy| copy.contents)
+    }
+
     #[test]
     fn copies_are_written_found_and_removed_per_scene() {
         let project = TempDir::new();
@@ -109,9 +147,12 @@ mod tests {
         store.write(Some(&nested), &text).unwrap();
         store.write(None, "untitled").unwrap();
 
-        assert_eq!(store.read(Some(&nested)).as_deref(), Some(text.as_str()));
-        assert_eq!(store.read(None).as_deref(), Some("untitled"));
-        assert_eq!(store.read(Some(&path("/scenes~a.rvescene"))), None);
+        assert_eq!(
+            latest(&store, Some(&nested)).as_deref(),
+            Some(text.as_str())
+        );
+        assert_eq!(latest(&store, None).as_deref(), Some("untitled"));
+        assert_eq!(latest(&store, Some(&path("/scenes~a.rvescene"))), None);
         assert!(project.0.join(".rve/editor/autosave").is_dir());
 
         let restored = EditorScene::recover(Some(nested.clone()), &text).unwrap();
@@ -121,8 +162,39 @@ mod tests {
 
         store.remove(Some(&nested)).unwrap();
         store.remove(Some(&nested)).unwrap();
-        assert_eq!(store.read(Some(&nested)), None);
-        assert_eq!(store.read(None).as_deref(), Some("untitled"));
+        assert_eq!(latest(&store, Some(&nested)), None);
+        assert_eq!(latest(&store, None).as_deref(), Some("untitled"));
+    }
+
+    #[test]
+    fn missing_copy_is_neither_a_copy_nor_an_error() {
+        let project = TempDir::new();
+        let store = AutosaveStore::for_project(&project.0);
+        assert_eq!(store.read(None), AutosaveCopies::default());
+        assert_eq!(
+            read_generation(&project.0.join("missing.autosave")),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn unreadable_copy_is_an_error_with_its_file_path() {
+        let project = TempDir::new();
+        let store = AutosaveStore::for_project(&project.0);
+        let file = store.file(None);
+
+        std::fs::create_dir_all(&file).unwrap();
+        let found = store.read(None);
+        assert!(found.copies.is_empty());
+        assert_eq!(found.errors.len(), 1);
+        assert!(found.errors[0].starts_with(&file.display().to_string()));
+
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, [0xff, 0xfe]).unwrap();
+        let found = store.read(None);
+        assert!(found.copies.is_empty());
+        assert_eq!(found.errors.len(), 1);
+        assert!(found.errors[0].starts_with(&file.display().to_string()));
     }
 
     #[test]
