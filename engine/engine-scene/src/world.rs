@@ -417,6 +417,12 @@ pub struct World {
     topological_order: Vec<usize>,
     world_matrices: Vec<Mat4>,
     world_rotations: Vec<Quat>,
+    /// Метка «локальная трансформация или родитель изменились, кеш не пересчитан» по плотным
+    /// индексам, параллельно `world_matrices`. Объект пересчитывается, если он помечен или его
+    /// родитель пересчитан в этом проходе.
+    dirty: Vec<bool>,
+    /// Есть хотя бы одна метка; при `false` пересчёт выходит сразу.
+    any_dirty: bool,
     active_camera: ObjectHandle,
     last_valid_camera: Option<(Camera, CameraSettings)>,
     last_valid_light: LightState,
@@ -520,6 +526,8 @@ impl World {
             spawned_material_paths: HashMap::new(),
             world_matrices,
             world_rotations,
+            dirty: vec![false; object_count],
+            any_dirty: false,
             active_camera: objects[active_index].handle,
             objects,
             indices_by_id,
@@ -712,6 +720,8 @@ impl World {
                 .push(previous.last_valid_local_lights[source_index]);
             self.world_matrices.push(Mat4::IDENTITY);
             self.world_rotations.push(Quat::IDENTITY);
+            self.dirty.push(true);
+            self.any_dirty = true;
             if let Some(paths) = previous.spawned_material_paths.get(&object.handle) {
                 self.spawned_material_paths
                     .insert(object.handle, Arc::clone(paths));
@@ -862,6 +872,9 @@ impl World {
             self.objects.push(adopted);
             self.world_matrices.push(scene.world_matrices[index]);
             self.world_rotations.push(scene.world_rotations[index]);
+            // Кеш сцены мог содержать отложенные правки, поэтому вставленные объекты помечаются.
+            self.dirty.push(true);
+            self.any_dirty = true;
             self.last_valid_local_lights
                 .push(LastValidLocalLights::default());
         }
@@ -893,6 +906,7 @@ impl World {
         let index = self.live_index_or_error(handle)?;
         self.reject_static(index)?;
         self.objects[index].transform = transform;
+        self.mark_dirty(index);
         Ok(())
     }
 
@@ -959,6 +973,7 @@ impl World {
         object.transform.position = position;
         object.transform.rotation_deg =
             Vec3::new(pitch, yaw, roll) * (180.0 / std::f32::consts::PI);
+        self.mark_dirty(index);
         self.recalculate_world_matrices();
         Ok(())
     }
@@ -1329,8 +1344,37 @@ impl World {
         Ok(())
     }
 
-    /// Пересчитывает мировые матрицы в порядке от родителя к потомкам.
+    /// Пересчитывает мировые матрицы и вращения помеченных объектов и их потомков. После вызова
+    /// кеш [`World::world_matrix`] и [`World::world_rotation`] совпадает с полным пересчётом.
+    /// При чистом мире ничего не делает.
     pub fn recalculate_world_matrices(&mut self) {
+        if !self.any_dirty {
+            return;
+        }
+        for position in 0..self.topological_order.len() {
+            let index = self.topological_order[position];
+            let parent = self.parent_index(index);
+            // Родитель стоит раньше в порядке топологии: его метка уже означает «пересчитан в
+            // этом проходе», потому что метка ставится только при пересчёте.
+            let parent_recomputed = parent.is_some_and(|parent| self.dirty[parent]);
+            if self.dirty[index] || parent_recomputed {
+                self.update_world_transform(index, parent);
+                self.dirty[index] = true;
+            }
+        }
+        self.dirty.fill(false);
+        self.any_dirty = false;
+    }
+
+    /// Помечает объект, у которого изменились локальная трансформация или родитель.
+    fn mark_dirty(&mut self, index: usize) {
+        self.dirty[index] = true;
+        self.any_dirty = true;
+    }
+
+    /// Полный безусловный пересчёт: эталон для проверки инкрементального пересчёта.
+    #[cfg(test)]
+    fn recalculate_all_for_test(&mut self) {
         for position in 0..self.topological_order.len() {
             let index = self.topological_order[position];
             let parent = self.parent_index(index);
@@ -1347,6 +1391,7 @@ impl World {
 
     /// Пересчитывает мировую матрицу и вращение объекта; родитель уже должен быть пересчитан.
     fn update_world_transform(&mut self, index: usize, parent: Option<usize>) {
+        record_transform_update();
         let transform = self.objects[index].transform;
         let local = transform.matrix();
         self.world_matrices[index] = compose_world_matrix(local, parent, &self.world_matrices);
@@ -1764,6 +1809,7 @@ impl World {
             self.objects.push(spawned);
             self.world_matrices.push(Mat4::IDENTITY);
             self.world_rotations.push(Quat::IDENTITY);
+            self.dirty.push(false);
             self.last_valid_local_lights
                 .push(LastValidLocalLights::default());
             self.indices_by_id.insert(ids[local].clone(), handle);
@@ -1882,6 +1928,8 @@ impl World {
         retain_unmarked(&mut self.objects, &removed);
         retain_unmarked(&mut self.world_matrices, &removed);
         retain_unmarked(&mut self.world_rotations, &removed);
+        retain_unmarked(&mut self.dirty, &removed);
+        self.any_dirty = self.dirty.contains(&true);
         retain_unmarked(&mut self.last_valid_local_lights, &removed);
         let order = self
             .topological_order
@@ -1952,6 +2000,26 @@ fn spawned_ids(root_id: &str, template: &PrefabTemplate) -> Vec<String> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRANSFORM_UPDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Считает пересчёты мировой матрицы одного объекта; в обычной сборке ничего не делает.
+#[cfg(test)]
+fn record_transform_update() {
+    TRANSFORM_UPDATES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_transform_update() {}
+
+/// Возвращает число пересчётов с прошлого вызова и обнуляет счётчик текущего потока.
+#[cfg(test)]
+fn take_transform_updates() -> usize {
+    TRANSFORM_UPDATES.with(|count| count.replace(0))
 }
 
 /// Убирает элементы с отмеченными индексами, сохраняя порядок остальных.
@@ -2114,6 +2182,8 @@ mod spawn_tests;
 
 #[cfg(test)]
 mod component_tests;
+#[cfg(test)]
+mod dirty_tests;
 #[cfg(test)]
 mod hierarchy_tests;
 #[cfg(test)]

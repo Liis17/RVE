@@ -3,7 +3,7 @@
 //! Вес каждого проигрывания плавно идёт к цели. Оставшаяся часть суммы веса до 1 берётся
 //! из позы покоя, поэтому затухание из покоя и ручной вес меньше 1 работают предсказуемо.
 
-use crate::blend::{blend, line_weights};
+use crate::blend::{blend_with, line_weights_inline};
 use crate::clip::{Clip, wrap_time};
 use crate::pose::Pose;
 use crate::skeleton::Skeleton;
@@ -94,15 +94,74 @@ struct Playback {
     finished: bool,
 }
 
+/// Данные движения, которые вычисляются один раз в [`Animator::new`]: клипы после создания
+/// не меняются, поэтому длительность и пороги не нужно пересчитывать на каждом кадре.
+#[derive(Debug)]
+struct PreparedMotion {
+    /// Длительность клипа или средняя длительность точек tree.
+    duration: f32,
+    /// Пороги точек tree в их порядке; для клипа пусто.
+    thresholds: Vec<f32>,
+}
+
+impl PreparedMotion {
+    fn new(clips: &[Clip], source: &MotionSource) -> Self {
+        match source {
+            MotionSource::Clip { clip } => Self {
+                duration: clips[*clip].duration(),
+                thresholds: Vec::new(),
+            },
+            MotionSource::Tree { points, .. } => Self {
+                duration: tree_duration(clips, points),
+                thresholds: points.iter().map(|point| point.threshold).collect(),
+            },
+        }
+    }
+}
+
 /// Проигрывание нескольких движений объекта с плавными переходами.
 #[derive(Debug)]
 pub struct Animator {
     clips: Vec<Clip>,
     motions: Vec<Motion>,
+    /// Параллельно `motions`.
+    prepared: Vec<PreparedMotion>,
     playbacks: Vec<Playback>,
     parameters: HashMap<String, f32>,
     speed: f32,
     default_looping: bool,
+}
+
+/// Поза активного движения и её вес в итоговой смеси.
+#[derive(Debug)]
+struct WeightedPose {
+    pose: Pose,
+    weight: f32,
+}
+
+/// Рабочие позы [`Animator::sample_into`]. Мост держит один набор и передаёт его всем аниматорам
+/// по очереди. Каждая поза перед использованием заново приводится к покою текущего скелета,
+/// поэтому результат не зависит от того, чем набор был заполнен раньше.
+#[derive(Debug)]
+pub(crate) struct SampleBuffers {
+    /// Поза покоя текущего скелета; она же добирает недостающий вес.
+    rest: Pose,
+    /// Позы активных движений. Лишние элементы сохраняются, чтобы не выделять память заново.
+    motions: Vec<WeightedPose>,
+    /// Позы детей одномерного дерева на время одного движения.
+    children: Vec<Pose>,
+}
+
+impl Default for SampleBuffers {
+    fn default() -> Self {
+        Self {
+            rest: Pose {
+                transforms: Vec::new(),
+            },
+            motions: Vec::new(),
+            children: Vec::new(),
+        }
+    }
 }
 
 impl Animator {
@@ -143,9 +202,14 @@ impl Animator {
                 }
             }
         }
+        let prepared = motions
+            .iter()
+            .map(|motion| PreparedMotion::new(&clips, &motion.source))
+            .collect();
         Ok(Self {
             clips,
             motions,
+            prepared,
             playbacks: Vec::new(),
             parameters: HashMap::new(),
             speed: 1.0,
@@ -287,7 +351,7 @@ impl Animator {
             return Err(AnimatorError::InvalidValue("время движения"));
         }
         let index = self.motion_index(motion)?;
-        let duration = motion_duration(&self.clips, &self.motions[index].source);
+        let duration = self.prepared[index].duration;
         let Some(playback) = self
             .playbacks
             .iter_mut()
@@ -322,8 +386,8 @@ impl Animator {
         let mut events = Vec::new();
         let mut chained = Vec::new();
         let Self {
-            clips,
             motions,
+            prepared,
             playbacks,
             speed,
             ..
@@ -336,7 +400,7 @@ impl Animator {
             };
             playback.weight = move_toward(playback.weight, playback.target, step);
             playback.time += dt * *speed;
-            let duration = motion_duration(clips, &motions[playback.motion].source);
+            let duration = prepared[playback.motion].duration;
             if playback.looping {
                 playback.time = wrap_time(playback.time, duration, true);
             } else if playback.time >= duration {
@@ -381,69 +445,117 @@ impl Animator {
     /// Длительность движения: клип или среднее по точкам tree.
     pub fn duration(&self, motion: &str) -> Option<f32> {
         let index = self.motion_index(motion).ok()?;
-        Some(motion_duration(&self.clips, &self.motions[index].source))
+        Some(self.prepared[index].duration)
     }
 
     /// Записывает в `out` итоговую позу: смесь активных движений и позы покоя.
+    ///
+    /// Для каждого кадра моста используется [`Animator::sample_into`] с общими буферами;
+    /// этот вызов выделяет временные буферы сам.
     pub fn sample(&self, skeleton: &Skeleton, out: &mut Pose) {
-        let rest = Pose::rest(skeleton);
+        self.sample_into(skeleton, &mut SampleBuffers::default(), out);
+    }
+
+    /// Как [`Animator::sample`], но рабочие позы берутся из `buffers`. После прогрева повторные
+    /// вызовы не выделяют память, пока число активных движений не превышает прежний максимум.
+    pub(crate) fn sample_into(
+        &self,
+        skeleton: &Skeleton,
+        buffers: &mut SampleBuffers,
+        out: &mut Pose,
+    ) {
+        let SampleBuffers {
+            rest,
+            motions,
+            children,
+        } = buffers;
+        rest.reset_to_rest(skeleton);
         let total: f32 = self
             .playbacks
             .iter()
             .map(|playback| playback.weight.max(0.0))
             .sum();
         let scale = if total > 1.0 { 1.0 / total } else { 1.0 };
-        let poses: Vec<(Pose, f32)> = self
+        let mut active = 0;
+        for playback in self
             .playbacks
             .iter()
             .filter(|playback| playback.weight > 0.0)
-            .map(|playback| (self.sample_motion(playback, &rest), playback.weight * scale))
-            .collect();
-        let rest_weight = (1.0 - total * scale).max(0.0);
-        let mut inputs: Vec<(&Pose, f32)> =
-            poses.iter().map(|(pose, weight)| (pose, *weight)).collect();
-        if rest_weight > 0.0 {
-            inputs.push((&rest, rest_weight));
+        {
+            if active == motions.len() {
+                motions.push(WeightedPose {
+                    pose: Pose {
+                        transforms: Vec::new(),
+                    },
+                    weight: 0.0,
+                });
+            }
+            let slot = &mut motions[active];
+            self.sample_motion_into(playback, skeleton, children, &mut slot.pose);
+            slot.weight = playback.weight * scale;
+            active += 1;
         }
-        if inputs.is_empty() {
-            out.transforms.clear();
-            out.transforms.extend_from_slice(&rest.transforms);
+        let rest_weight = (1.0 - total * scale).max(0.0);
+        let count = active + usize::from(rest_weight > 0.0);
+        if count == 0 {
+            out.reset_to_rest(skeleton);
             return;
         }
-        blend(&inputs, out);
+        let motions: &[WeightedPose] = &motions[..active];
+        let rest: &Pose = rest;
+        blend_with(
+            count,
+            |index| match motions.get(index) {
+                Some(entry) => (&entry.pose, entry.weight),
+                None => (rest, rest_weight),
+            },
+            out,
+        );
     }
 
-    fn sample_motion(&self, playback: &Playback, rest: &Pose) -> Pose {
-        let mut pose = rest.clone();
+    /// Записывает позу одного движения в `out`, начиная с позы покоя.
+    fn sample_motion_into(
+        &self,
+        playback: &Playback,
+        skeleton: &Skeleton,
+        children: &mut Vec<Pose>,
+        out: &mut Pose,
+    ) {
+        out.reset_to_rest(skeleton);
         match &self.motions[playback.motion].source {
             MotionSource::Clip { clip } => {
-                self.clips[*clip].sample(playback.time, playback.looping, &mut pose);
+                self.clips[*clip].sample(playback.time, playback.looping, out);
             }
             MotionSource::Tree { parameter, points } => {
+                let prepared = &self.prepared[playback.motion];
                 let value = self.parameter(parameter);
-                let thresholds: Vec<f32> = points.iter().map(|point| point.threshold).collect();
-                let duration = tree_duration(&self.clips, points);
-                let phase = if duration > 0.0 {
-                    (playback.time / duration).clamp(0.0, 1.0)
+                let phase = if prepared.duration > 0.0 {
+                    (playback.time / prepared.duration).clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
-                let mut children = Vec::new();
-                for (index, weight) in line_weights(&thresholds, value) {
+                let weights = line_weights_inline(&prepared.thresholds, value);
+                let weights = weights.as_slice();
+                for (slot, &(index, _)) in weights.iter().enumerate() {
+                    if children.len() == slot {
+                        children.push(Pose {
+                            transforms: Vec::new(),
+                        });
+                    }
+                    let child = &mut children[slot];
                     let clip = &self.clips[points[index].clip];
+                    child.reset_to_rest(skeleton);
                     // Дочерние клипы синхронизированы по нормализованной фазе.
-                    let mut child = rest.clone();
-                    clip.sample(phase * clip.duration(), false, &mut child);
-                    children.push((child, weight));
+                    clip.sample(phase * clip.duration(), false, child);
                 }
-                let inputs: Vec<(&Pose, f32)> = children
-                    .iter()
-                    .map(|(child, weight)| (child, *weight))
-                    .collect();
-                blend(&inputs, &mut pose);
+                let children: &[Pose] = children.as_slice();
+                blend_with(
+                    weights.len(),
+                    |index| (&children[index], weights[index].1),
+                    out,
+                );
             }
         }
-        pose
     }
 
     fn playback(&self, motion: &str) -> Option<&Playback> {
@@ -503,13 +615,6 @@ fn move_toward(current: f32, target: f32, step: f32) -> f32 {
     }
 }
 
-fn motion_duration(clips: &[Clip], source: &MotionSource) -> f32 {
-    match source {
-        MotionSource::Clip { clip } => clips[*clip].duration(),
-        MotionSource::Tree { points, .. } => tree_duration(clips, points),
-    }
-}
-
 fn tree_duration(clips: &[Clip], points: &[TreePoint]) -> f32 {
     if points.is_empty() {
         return 0.0;
@@ -520,6 +625,9 @@ fn tree_duration(clips: &[Clip], points: &[TreePoint]) -> f32 {
         .sum();
     sum / points.len() as f32
 }
+
+#[cfg(test)]
+mod sample_tests;
 
 #[cfg(test)]
 mod tests {
