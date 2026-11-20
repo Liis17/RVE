@@ -14,7 +14,7 @@ use engine_render::{
     ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook, ParticleShape,
     ParticleSizeKey, RenderError, Renderer, ShaderId, SkinVertex, SurfaceLighting, SurfaceProperty,
     SurfacePropertyKind, SurfaceShaderSource, SurfaceTextureFallback, TextureColorSpace, TextureId,
-    Vertex,
+    TextureRole, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::prefab::PREFAB_EXTENSION;
@@ -753,8 +753,8 @@ pub(crate) struct MaterialUploadCaches {
 }
 
 pub(crate) struct GpuTextureCache<T> {
-    model: HashMap<(String, usize, TextureColorSpace), T>,
-    scene: HashMap<(String, TextureColorSpace), T>,
+    model: HashMap<(String, usize, TextureColorSpace, TextureRole), T>,
+    scene: HashMap<(String, TextureColorSpace, TextureRole), T>,
 }
 
 impl<T> Default for GpuTextureCache<T> {
@@ -2115,7 +2115,7 @@ fn particle_desc(
             ))?;
             Some(get_or_insert_gpu(
                 &mut texture_cache.scene,
-                (path.clone(), TextureColorSpace::Srgb),
+                (path.clone(), TextureColorSpace::Srgb, TextureRole::Color),
                 || {
                     renderer.create_texture_with_color_space(
                         data.width,
@@ -2303,6 +2303,7 @@ fn upload_resolved_material(
         renderer,
         resolved.base_color_texture.as_ref(),
         TextureColorSpace::Srgb,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2312,6 +2313,7 @@ fn upload_resolved_material(
         renderer,
         resolved.metallic_roughness_texture.as_ref(),
         TextureColorSpace::Linear,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2321,6 +2323,7 @@ fn upload_resolved_material(
         renderer,
         resolved.normal_texture.as_ref(),
         TextureColorSpace::Linear,
+        normal_texture_role(resolved),
         model_path,
         model,
         assets,
@@ -2330,6 +2333,7 @@ fn upload_resolved_material(
         renderer,
         resolved.emissive_texture.as_ref(),
         TextureColorSpace::Srgb,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2339,6 +2343,7 @@ fn upload_resolved_material(
         renderer,
         resolved.occlusion_texture.as_ref(),
         TextureColorSpace::Linear,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2347,7 +2352,7 @@ fn upload_resolved_material(
     let mut user_textures = [None; 8];
     for (slot, source) in resolved.user_texture_sources.iter().enumerate() {
         let Some(source) = source else { continue };
-        let key = (source.path.clone(), source.color_space);
+        let key = (source.path.clone(), source.color_space, TextureRole::Color);
         let data = assets.texture(&source.path).ok_or_else(|| {
             RenderError::InvalidTexture(format!(
                 "ресурсная текстура /{} отсутствует или не загружена",
@@ -2513,10 +2518,21 @@ fn upload_error_material(
     Ok(material)
 }
 
+/// Роль слота `normal_texture`: `Normal` только у встроенного Lit, пользовательский шейдер — `Color`.
+pub(crate) fn normal_texture_role(resolved: &ResolvedMaterial) -> TextureRole {
+    if resolved.shader_path.is_none() {
+        TextureRole::Normal
+    } else {
+        TextureRole::Color
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn upload_material_texture(
     renderer: &mut Renderer,
     source: Option<&MaterialTextureSource>,
     color_space: TextureColorSpace,
+    role: TextureRole,
     model_path: &str,
     model: &Model,
     assets: MaterialAssetView<'_>,
@@ -2527,32 +2543,34 @@ fn upload_material_texture(
     };
     let texture_id = match source {
         MaterialTextureSource::Model(index) => {
-            let key = (model_path.to_owned(), *index, color_space);
+            let key = (model_path.to_owned(), *index, color_space, role);
             let texture = model.textures.get(*index).ok_or_else(|| {
                 RenderError::InvalidTexture(format!(
                     "модель {model_path:?} ссылается на отсутствующую текстуру {index}"
                 ))
             })?;
             get_or_insert_gpu(&mut texture_cache.model, key, || {
-                renderer.create_texture_with_color_space(
+                renderer.create_texture_with_role(
                     texture.width,
                     texture.height,
                     &texture.rgba,
                     color_space,
+                    role,
                 )
             })?
         }
         MaterialTextureSource::Scene(path) => {
-            let key = (path.clone(), color_space);
+            let key = (path.clone(), color_space, role);
             let texture = assets.texture(path).ok_or({
                 RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
             })?;
             get_or_insert_gpu(&mut texture_cache.scene, key, || {
-                renderer.create_texture_with_color_space(
+                renderer.create_texture_with_role(
                     texture.width,
                     texture.height,
                     &texture.rgba,
                     color_space,
+                    role,
                 )
             })?
         }
@@ -2566,14 +2584,16 @@ mod tests {
         ColorLutGpu, CubeLut, GpuTextureCache, MaterialAssetView, MaterialTextureSource,
         PreparedMaterialAssets, PreparedPrefabs, ScreenShaderGpu, color_lut_paths,
         get_or_insert_gpu, load_color_luts, load_scene, load_screen_shader_sources,
-        material_cache_key, prepare_scene_with_model_loader, resolve_material,
+        material_cache_key, normal_texture_role, prepare_scene_with_model_loader, resolve_material,
         resolve_material_asset, screen_shader_paths, upload_color_luts, upload_screen_shaders,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
     use engine_physics::BodyKind;
     use engine_project::PhysicsSettings;
-    use engine_render::{AlphaMode, EnvironmentSource, RenderError, TextureColorSpace};
+    use engine_render::{
+        AlphaMode, EnvironmentSource, RenderError, TextureColorSpace, TextureRole,
+    };
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{
         MaterialAlphaMode, MaterialAsset, MaterialOverride, PrefabTemplate, SceneDocument,
@@ -3761,6 +3781,20 @@ id = "camera"
     }
 
     #[test]
+    fn normal_slot_role_is_normal_only_for_builtin_lit() {
+        let model = ModelMaterial {
+            normal_texture: Some(0),
+            ..ModelMaterial::default()
+        };
+        let builtin = resolve_material(&model, None, None);
+        assert_eq!(normal_texture_role(&builtin), TextureRole::Normal);
+
+        let mut shaded = builtin.clone();
+        shaded.shader_path = Some("/shaders/water.rveshader".to_owned());
+        assert_eq!(normal_texture_role(&shaded), TextureRole::Color);
+    }
+
+    #[test]
     fn material_cache_key_matches_equal_inputs_and_separates_model_textures_and_shaders() {
         let model = ModelMaterial {
             base_color_texture: Some(0),
@@ -3787,7 +3821,12 @@ id = "camera"
         let mut cache = GpuTextureCache::<u32>::default();
         let uploads = Cell::new(0_u32);
 
-        let model_srgb_key = ("models/a.fbx".to_owned(), 0, TextureColorSpace::Srgb);
+        let model_srgb_key = (
+            "models/a.fbx".to_owned(),
+            0,
+            TextureColorSpace::Srgb,
+            TextureRole::Color,
+        );
         let model_srgb = get_or_insert_gpu(&mut cache.model, model_srgb_key.clone(), || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
@@ -3800,7 +3839,12 @@ id = "camera"
         .unwrap();
         let model_linear = get_or_insert_gpu(
             &mut cache.model,
-            ("models/a.fbx".to_owned(), 0, TextureColorSpace::Linear),
+            (
+                "models/a.fbx".to_owned(),
+                0,
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
             || {
                 uploads.set(uploads.get() + 1);
                 Ok(uploads.get())
@@ -3810,7 +3854,11 @@ id = "camera"
         assert_eq!(model_srgb, model_srgb_reused);
         assert_ne!(model_srgb, model_linear);
 
-        let scene_srgb_key = ("textures/shared.png".to_owned(), TextureColorSpace::Srgb);
+        let scene_srgb_key = (
+            "textures/shared.png".to_owned(),
+            TextureColorSpace::Srgb,
+            TextureRole::Color,
+        );
         let scene_srgb = get_or_insert_gpu(&mut cache.scene, scene_srgb_key.clone(), || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
@@ -3823,7 +3871,11 @@ id = "camera"
         .unwrap();
         let scene_linear = get_or_insert_gpu(
             &mut cache.scene,
-            ("textures/shared.png".to_owned(), TextureColorSpace::Linear),
+            (
+                "textures/shared.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
             || {
                 uploads.set(uploads.get() + 1);
                 Ok(uploads.get())
@@ -4382,7 +4434,7 @@ mod material_resource_ownership_tests {
 mod scene_upload_rollback_tests {
     use super::{
         GpuTextureCache, SceneUploadCleanupGpu, SceneUploadResources, TextureColorSpace,
-        remove_new_cached_textures, restore_shader_cache, rollback_scene_upload,
+        TextureRole, remove_new_cached_textures, restore_shader_cache, rollback_scene_upload,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -4503,9 +4555,15 @@ mod scene_upload_rollback_tests {
             let original_textures = HashSet::from([1]);
             let original_shader_paths = HashSet::from(["old.glsl".to_owned()]);
             let mut texture_cache = GpuTextureCache::<usize>::default();
-            texture_cache
-                .model
-                .insert(("old.png".to_owned(), 0, TextureColorSpace::Srgb), 1);
+            texture_cache.model.insert(
+                (
+                    "old.png".to_owned(),
+                    0,
+                    TextureColorSpace::Srgb,
+                    TextureRole::Color,
+                ),
+                1,
+            );
             let mut shader_cache = HashMap::from([("old.glsl".to_owned(), Ok(1))]);
             let mut material_cache = HashMap::new();
             let original_error_material = Some(1);
@@ -4531,9 +4589,14 @@ mod scene_upload_rollback_tests {
                         error_material = Some(id);
                     }
                     Kind::Texture => {
-                        texture_cache
-                            .scene
-                            .insert(("new.png".to_owned(), TextureColorSpace::Srgb), id);
+                        texture_cache.scene.insert(
+                            (
+                                "new.png".to_owned(),
+                                TextureColorSpace::Srgb,
+                                TextureRole::Color,
+                            ),
+                            id,
+                        );
                     }
                     Kind::SurfaceShader => {
                         shader_cache.insert("new.glsl".to_owned(), Ok(id));
@@ -4595,15 +4658,31 @@ mod scene_upload_rollback_tests {
     #[test]
     fn failed_upload_restores_texture_and_shader_cache_entries() {
         let mut textures = GpuTextureCache::<usize>::default();
-        textures
-            .model
-            .insert(("model.png".to_owned(), 0, TextureColorSpace::Srgb), 1);
-        textures
-            .scene
-            .insert(("scene.png".to_owned(), TextureColorSpace::Linear), 2);
-        textures
-            .scene
-            .insert(("new.png".to_owned(), TextureColorSpace::Srgb), 3);
+        textures.model.insert(
+            (
+                "model.png".to_owned(),
+                0,
+                TextureColorSpace::Srgb,
+                TextureRole::Color,
+            ),
+            1,
+        );
+        textures.scene.insert(
+            (
+                "scene.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
+            2,
+        );
+        textures.scene.insert(
+            (
+                "new.png".to_owned(),
+                TextureColorSpace::Srgb,
+                TextureRole::Color,
+            ),
+            3,
+        );
         assert_eq!(
             remove_new_cached_textures(&mut textures, &HashSet::from([1, 2])),
             HashSet::from([3])

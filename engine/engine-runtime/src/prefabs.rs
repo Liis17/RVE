@@ -11,7 +11,7 @@ use crate::module_host::ModuleHost;
 use crate::pipeline::ScriptControl;
 use crate::scene::{
     MaterialTextureSource, ObjectModel, ParticleSource, PreparedMaterialAssets, ResolvedMaterial,
-    load_prefab_template, model_geometry, prepare_template, resolve_material,
+    load_prefab_template, model_geometry, normal_texture_role, prepare_template, resolve_material,
     resolve_material_asset,
 };
 use engine_assets::{Assets, Model, ModelMaterial, TextureData};
@@ -19,7 +19,7 @@ use engine_files::VirtualPath;
 use engine_physics::ModelGeometry;
 use engine_render::{
     MaterialId, MeshId, ParticleEmitterDesc, RenderError, Renderer, ShaderId, SurfaceShaderSource,
-    TextureColorSpace, TextureId, Vertex,
+    TextureColorSpace, TextureId, TextureRole, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::ObjectHandle;
@@ -191,6 +191,7 @@ pub(crate) trait GpuResources {
         &mut self,
         texture: &TextureData,
         color_space: TextureColorSpace,
+        role: TextureRole,
     ) -> Result<Self::Texture, RenderError>;
     fn create_material(
         &mut self,
@@ -223,13 +224,15 @@ impl GpuResources for Renderer {
         &mut self,
         texture: &TextureData,
         color_space: TextureColorSpace,
+        role: TextureRole,
     ) -> Result<TextureId, RenderError> {
-        Renderer::create_texture_with_color_space(
+        Renderer::create_texture_with_role(
             self,
             texture.width,
             texture.height,
             &texture.rgba,
             color_space,
+            role,
         )
     }
 
@@ -295,10 +298,12 @@ enum TextureKey {
         model: String,
         index: usize,
         space: TextureColorSpace,
+        role: TextureRole,
     },
     Scene {
         path: String,
         space: TextureColorSpace,
+        role: TextureRole,
     },
 }
 
@@ -685,6 +690,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 sources,
                 resolved.base_color_texture.as_ref(),
                 TextureColorSpace::Srgb,
+                TextureRole::Color,
                 keys,
             )?,
             metallic_roughness: self.acquire_slot(
@@ -692,6 +698,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 sources,
                 resolved.metallic_roughness_texture.as_ref(),
                 TextureColorSpace::Linear,
+                TextureRole::Color,
                 keys,
             )?,
             normal: self.acquire_slot(
@@ -699,6 +706,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 sources,
                 resolved.normal_texture.as_ref(),
                 TextureColorSpace::Linear,
+                normal_texture_role(resolved),
                 keys,
             )?,
             emissive: self.acquire_slot(
@@ -706,6 +714,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 sources,
                 resolved.emissive_texture.as_ref(),
                 TextureColorSpace::Srgb,
+                TextureRole::Color,
                 keys,
             )?,
             occlusion: self.acquire_slot(
@@ -713,6 +722,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 sources,
                 resolved.occlusion_texture.as_ref(),
                 TextureColorSpace::Linear,
+                TextureRole::Color,
                 keys,
             )?,
         };
@@ -724,6 +734,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                 sources,
                 Some(&MaterialTextureSource::Scene(source.path.clone())),
                 source.color_space,
+                TextureRole::Color,
                 keys,
             )?;
         }
@@ -816,6 +827,7 @@ impl<G: GpuResources> PrefabGpu<G> {
         sources: &TextureSources<'_>,
         source: Option<&MaterialTextureSource>,
         color_space: TextureColorSpace,
+        role: TextureRole,
         keys: &mut Vec<TextureKey>,
     ) -> Result<Option<G::Texture>, RenderError> {
         let Some(source) = source else {
@@ -834,6 +846,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                         model: sources.model_path.to_owned(),
                         index: *index,
                         space: color_space,
+                        role,
                     },
                     data,
                 )
@@ -846,6 +859,7 @@ impl<G: GpuResources> PrefabGpu<G> {
                     TextureKey::Scene {
                         path: path.clone(),
                         space: color_space,
+                        role,
                     },
                     data,
                 )
@@ -857,7 +871,7 @@ impl<G: GpuResources> PrefabGpu<G> {
             keys.push(key);
             return Ok(Some(id));
         }
-        let id = gpu.create_texture(data, color_space)?;
+        let id = gpu.create_texture(data, color_space, role)?;
         self.textures
             .insert(key.clone(), SharedTexture { id, refs: 1 });
         keys.push(key);
@@ -1273,6 +1287,7 @@ mod tests {
         created: usize,
         fail_material_at: Option<usize>,
         materials_created: usize,
+        texture_roles: Vec<TextureRole>,
     }
 
     impl FakeGpu {
@@ -1298,8 +1313,10 @@ mod tests {
             &mut self,
             _: &TextureData,
             _: TextureColorSpace,
+            role: TextureRole,
         ) -> Result<u32, RenderError> {
             self.created += 1;
+            self.texture_roles.push(role);
             Ok(self.id())
         }
 
@@ -1581,6 +1598,29 @@ mod tests {
         );
         state.release(&mut gpu, &load);
         assert!(gpu.live.is_empty(), "fallback и ресурсы модели освобождены");
+    }
+
+    #[test]
+    fn one_png_in_normal_and_metallic_roughness_slots_makes_two_textures() {
+        let mut gpu = FakeGpu::default();
+        let mut state = PrefabGpu::default();
+        let mut model = model(1);
+        let material = &mut model.meshes[0].material;
+        material.base_color_texture = None;
+        material.metallic_roughness_texture = Some(0);
+        material.normal_texture = Some(0);
+        state.submit(prefab(
+            token("prefabs/png-slots.rveprefab", 1),
+            &[("m.fbx", model)],
+            false,
+        ));
+
+        run_to_completion(&mut state, &mut gpu);
+        assert_eq!(
+            gpu.texture_roles,
+            vec![TextureRole::Color, TextureRole::Normal],
+            "одна PNG даёт отдельные GPU-текстуры для роли Color и Normal"
+        );
     }
 
     #[test]
