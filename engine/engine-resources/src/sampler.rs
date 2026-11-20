@@ -56,8 +56,8 @@ impl ResourceSampler {
         self.current = stats;
     }
 
-    /// Группа «Resources»: счётчики и средние за последний интервал, `in flight` и максимумы с запуска.
-    /// До второго снимка интервальные строки равны `n/a`.
+    /// Группа «Resources»: счётчики и средние за последний интервал, `in flight`, максимумы
+    /// и приблизительные p95/p99 с запуска. До второго снимка интервальные строки равны `n/a`.
     pub fn profile_group(&self) -> ProfileGroup {
         let latest = self.latest;
         let count = |value: fn(&ResourceInterval) -> u64| match latest {
@@ -76,6 +76,11 @@ impl ResourceSampler {
                 ProfileValue::Single(timing.max)
             }
         };
+        let percentile = |timing: TimingTotals, percent: u8| {
+            timing
+                .percentile(percent)
+                .map_or(ProfileValue::Missing, ProfileValue::Single)
+        };
         ProfileGroup {
             name: "Resources",
             rows: vec![
@@ -89,8 +94,12 @@ impl ResourceSampler {
                 ),
                 row("queue avg / interval", average(|i| i.queue_avg)),
                 row("queue max / start", maximum(self.current.queue)),
+                row("queue p95 / start", percentile(self.current.queue, 95)),
+                row("queue p99 / start", percentile(self.current.queue, 99)),
                 row("read avg / interval", average(|i| i.read_avg)),
                 row("read max / start", maximum(self.current.read)),
+                row("read p95 / start", percentile(self.current.read, 95)),
+                row("read p99 / start", percentile(self.current.read, 99)),
             ],
         }
     }
@@ -116,7 +125,19 @@ mod tests {
             count,
             total: ms(total),
             max: ms(max),
+            ..TimingTotals::default()
         }
+    }
+
+    /// Фаза, у которой все замеры попали в бакет `[1024, 2048) мкс`.
+    fn timing_in_bucket(samples: u64, max: Duration) -> TimingTotals {
+        let mut timing = TimingTotals {
+            count: samples,
+            max,
+            ..TimingTotals::default()
+        };
+        timing.buckets[11] = samples;
+        timing
     }
 
     fn stats(completed: u64, bytes: u64, queue: TimingTotals) -> ResourceStats {
@@ -235,5 +256,38 @@ mod tests {
         sampler.sample(ResourceStats::default());
 
         assert_eq!(value(&sampler, "read max / start"), ProfileValue::Missing);
+    }
+
+    #[test]
+    fn percentile_rows_are_missing_without_histogram_and_estimated_with_it() {
+        let mut sampler = ResourceSampler::default();
+        sampler.sample(ResourceStats {
+            queue: timing(1, 2, 2),
+            ..ResourceStats::default()
+        });
+        assert_eq!(
+            value(&sampler, "queue p95 / start"),
+            ProfileValue::Missing,
+            "без гистограммы перцентиль неизвестен"
+        );
+
+        // Все замеры в одном бакете: оценка ограничена максимумом 1.5 мс.
+        sampler.sample(ResourceStats {
+            queue: timing_in_bucket(3, Duration::from_micros(1500)),
+            read: timing_in_bucket(2, Duration::from_micros(1500)),
+            ..ResourceStats::default()
+        });
+        assert_eq!(
+            value(&sampler, "queue p95 / start"),
+            ProfileValue::Single(Duration::from_micros(1500))
+        );
+        assert_eq!(
+            value(&sampler, "queue p99 / start"),
+            ProfileValue::Single(Duration::from_micros(1500))
+        );
+        assert_eq!(
+            value(&sampler, "read p95 / start"),
+            ProfileValue::Single(Duration::from_micros(1500))
+        );
     }
 }

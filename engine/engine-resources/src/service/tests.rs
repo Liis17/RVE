@@ -1305,3 +1305,108 @@ fn stats_count_request_cancelled_while_its_read_is_in_progress() {
     assert_eq!(stats.bytes, 0);
     assert_eq!(stats.in_flight, 0);
 }
+
+fn recorded_bucket(elapsed: Duration) -> usize {
+    let counters = TimingCounters::default();
+    counters.record(elapsed);
+    counters
+        .snapshot()
+        .buckets
+        .iter()
+        .position(|&count| count == 1)
+        .expect("одна запись попадает ровно в один бакет")
+}
+
+#[test]
+fn latency_buckets_split_at_powers_of_two_microseconds() {
+    assert_eq!(recorded_bucket(Duration::ZERO), 0);
+    assert_eq!(recorded_bucket(Duration::from_nanos(999)), 0);
+    assert_eq!(recorded_bucket(Duration::from_nanos(1_000)), 1);
+    assert_eq!(recorded_bucket(Duration::from_nanos(1_999)), 1);
+    for k in 0..=26u32 {
+        assert_eq!(
+            recorded_bucket(Duration::from_micros((1 << k) - 1)),
+            k as usize
+        );
+        assert_eq!(
+            recorded_bucket(Duration::from_micros(1 << k)),
+            k as usize + 1
+        );
+    }
+    assert_eq!(recorded_bucket(Duration::MAX), 27);
+}
+
+#[test]
+fn percentile_estimate_is_upper_bound_of_bucket_capped_by_max() {
+    let counters = TimingCounters::default();
+    for _ in 0..19 {
+        counters.record(Duration::from_micros(1_300));
+    }
+    counters.record(Duration::from_millis(5));
+    let timing = counters.snapshot();
+
+    // Истинные p95 = 1.3 мс и p99 = 5 мс. Оценка p95 — верхняя граница бакета [1024, 2048) мкс,
+    // оценка p99 ограничена максимумом 5 мс.
+    assert_eq!(timing.percentile(95), Some(Duration::from_micros(2_048)));
+    assert_eq!(timing.percentile(99), Some(Duration::from_millis(5)));
+}
+
+#[test]
+fn percentile_of_first_bucket_is_at_most_one_microsecond() {
+    let counters = TimingCounters::default();
+    counters.record(Duration::from_nanos(300));
+
+    assert_eq!(
+        counters.snapshot().percentile(95),
+        Some(Duration::from_nanos(300))
+    );
+}
+
+#[test]
+fn overflow_bucket_estimate_is_the_maximum() {
+    let counters = TimingCounters::default();
+    counters.record(Duration::from_secs(70));
+
+    assert_eq!(
+        counters.snapshot().percentile(95),
+        Some(Duration::from_secs(70))
+    );
+}
+
+#[test]
+fn stale_max_below_bucket_does_not_lower_the_estimate() {
+    let mut timing = TimingTotals {
+        max: Duration::from_micros(500),
+        ..TimingTotals::default()
+    };
+    timing.buckets[11] = 10;
+
+    // Максимум 500 мкс ниже бакета [1024, 2048) мкс: снимок рассогласован, берётся верхняя граница.
+    assert_eq!(timing.percentile(95), Some(Duration::from_micros(2_048)));
+}
+
+#[test]
+fn percentile_ranks_by_bucket_sum_and_ignores_count() {
+    let mut timing = TimingTotals {
+        count: 100,
+        max: Duration::from_micros(7),
+        ..TimingTotals::default()
+    };
+    timing.buckets[1] = 2;
+    timing.buckets[3] = 2;
+
+    assert_eq!(timing.percentile(50), Some(Duration::from_micros(2)));
+    assert_eq!(timing.percentile(95), Some(Duration::from_micros(7)));
+}
+
+#[test]
+fn percentile_of_empty_histogram_is_none() {
+    assert_eq!(TimingTotals::default().percentile(95), None);
+
+    let counted_without_buckets = TimingTotals {
+        count: 3,
+        max: Duration::from_millis(1),
+        ..TimingTotals::default()
+    };
+    assert_eq!(counted_without_buckets.percentile(95), None);
+}
