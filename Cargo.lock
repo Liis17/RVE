@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "engine-assets"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bevy_mikktspace",
  "engine-files",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "engine-console"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
 ]
@@ -1050,12 +1050,13 @@ dependencies = [
 
 [[package]]
 name = "engine-physics"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "engine-files",
  "engine-scene",
  "flume",
  "glam",
+ "log",
 ]
 
 [[package]]
@@ -1121,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.32.1"
+version = "0.33.1"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1134,7 +1135,6 @@ dependencies = [
  "engine-gui",
  "engine-input",
  "engine-network",
- "engine-neural",
  "engine-physics",
  "engine-platform",
  "engine-project",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "engine-ui"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "egui",
  "engine-console",
@@ -3147,7 +3147,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -3169,8 +3169,9 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
+ "base64",
  "blake3",
  "egui",
  "egui-winit",
@@ -3248,12 +3249,13 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.8.1"
+version = "0.9.1"
 dependencies = [
  "engine-assets",
  "engine-core",
  "engine-files",
  "engine-pak",
+ "engine-physics",
  "engine-platform",
  "engine-project",
  "engine-render",

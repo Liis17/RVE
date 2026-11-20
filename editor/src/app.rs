@@ -677,6 +677,7 @@ impl EditorApp {
         self.state.previews.clear();
         self.state.clear_lite_schemas();
         self.state.models.clear();
+        self.state.pick_cache.clear();
         self.state.screen_shader_errors.clear();
         self.state.materials = crate::materials::MaterialLibrary::default();
         self.state.inspected_asset = None;
@@ -2363,7 +2364,7 @@ fn render_scene_frame(
     let offscreen_capture = state
         .mcp_capture
         .as_ref()
-        .is_some_and(|job| job.plan.is_offscreen());
+        .is_some_and(capture::CaptureJob::wants_offscreen_frame);
     if !capture::needs_scene_frame(scene_size.is_some(), game_size.is_some(), offscreen_capture)
         && preview_size.is_none()
     {
@@ -2372,7 +2373,7 @@ fn render_scene_frame(
     let capture_frame = state
         .mcp_capture
         .as_ref()
-        .and_then(|job| capture::offscreen_frame(&job.plan));
+        .and_then(capture::CaptureJob::offscreen_frame);
     let preview_asset = state
         .inspected_asset
         .clone()
@@ -2982,8 +2983,14 @@ impl WindowHandler for EditorApp {
         let mut mcp_host = std::mem::take(&mut self.mcp_host);
         let handled_mcp_calls = mcp_host.drain(self);
         self.mcp_host = mcp_host;
-        let capture_pending = self.state.mcp_capture.is_some();
-        if handled_mcp_calls || capture_pending || *self.mcp_host.status() != previous_mcp_status {
+        // Фаза Encoding кадра не требует: её опрашивает `next_wakeup` каждые 16 мс.
+        let capture_rendering = self
+            .state
+            .mcp_capture
+            .as_ref()
+            .is_some_and(|job| job.rendering());
+        if handled_mcp_calls || capture_rendering || *self.mcp_host.status() != previous_mcp_status
+        {
             window.request_redraw();
         }
         let watcher_errors = self

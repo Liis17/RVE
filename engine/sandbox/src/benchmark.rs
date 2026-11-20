@@ -79,6 +79,8 @@ pub struct BenchmarkRecorder {
     cpu: [Vec<Duration>; CPU_PHASE_COUNT],
     gpu_total: Vec<Duration>,
     gpu_passes: [Vec<Duration>; GpuPass::COUNT],
+    /// Шаги физики, следующие за измеряемыми презентациями; пусто для сцен без физики.
+    physics_step: Vec<Duration>,
 }
 
 impl BenchmarkRecorder {
@@ -114,6 +116,7 @@ impl BenchmarkRecorder {
             cpu: std::array::from_fn(|_| Vec::with_capacity(measured)),
             gpu_total: Vec::with_capacity(measured),
             gpu_passes: std::array::from_fn(|_| Vec::with_capacity(measured)),
+            physics_step: Vec::with_capacity(measured),
         }
     }
 
@@ -132,6 +135,14 @@ impl BenchmarkRecorder {
         if observation.presented {
             self.last_presented = Some(observation.now);
             self.presented += 1;
+        }
+    }
+
+    /// Учитывает шаг физики, сделанный после презентации. Вызывается после [`Self::observe`] этой
+    /// презентации, поэтому шаг измеряется, если сама презентация была не раньше прогрева.
+    pub fn observe_physics_step(&mut self, step: Duration) {
+        if self.presented > self.warmup {
+            self.physics_step.push(step);
         }
     }
 
@@ -183,6 +194,8 @@ impl BenchmarkRecorder {
             present,
         ] = self.cpu;
         let gpu = self.gpu;
+        let physics_step_ms =
+            (settings.scene == Scene::Stress).then(|| summarize(self.physics_step));
         Ok(BenchmarkReport {
             schema: SCHEMA,
             sandbox_version: env!("CARGO_PKG_VERSION"),
@@ -241,6 +254,7 @@ impl BenchmarkRecorder {
                     .map(|(index, series)| (GpuPass::ALL[index].label(), summarize(series)))
                     .collect(),
             },
+            physics_step_ms,
         })
     }
 }
@@ -394,6 +408,9 @@ pub struct BenchmarkReport {
     frame_interval_ms: SeriesReport,
     cpu_ms: CpuReport,
     gpu_ms: GpuMsReport,
+    /// Только у `stress`: шаги физики после измеряемых презентаций, мс; у прочих сцен поля нет.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    physics_step_ms: Option<SeriesReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -659,6 +676,37 @@ mod tests {
         assert_eq!(value["reflex"]["active"], false);
         assert_eq!(value["gpu"]["vulkan"], "1.3");
         assert_eq!(value["gpu"]["name"], "Test GPU");
+    }
+
+    #[test]
+    fn physics_steps_count_only_after_the_warmup_presentations() {
+        let base = Instant::now();
+        let mut recorder = BenchmarkRecorder::new(4, 2, &capabilities(), None);
+        for (at, step) in [(0, 1), (10, 2), (20, 3), (30, 4)] {
+            recorder.observe(observation(base, at, true, None));
+            recorder.observe_physics_step(Duration::from_millis(step));
+        }
+
+        // Шаги после первых двух презентаций (до прогрева) в серию не попадают.
+        let value = report_value(recorder);
+        assert_eq!(value["physics_step_ms"]["samples"], 2);
+    }
+
+    #[test]
+    fn benchmark_json_omits_the_physics_series_for_scenes_without_physics() {
+        let base = Instant::now();
+        let mut recorder = BenchmarkRecorder::new(2, 0, &capabilities(), None);
+        recorder.observe(observation(base, 0, true, None));
+        recorder.observe(observation(base, 10, true, None));
+        let report = recorder
+            .finish(RunSettings {
+                scene: Scene::Cube,
+                ..settings()
+            })
+            .expect("прогон завершён");
+        let value = serde_json::to_value(&report).expect("отчёт сериализуется");
+        assert!(value.get("physics_step_ms").is_none());
+        assert_eq!(value["schema"], 1);
     }
 
     #[test]

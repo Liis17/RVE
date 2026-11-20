@@ -1,18 +1,28 @@
+use engine_files::VirtualPath;
+use engine_pak::{BuildCompression, Codec};
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build --help";
+pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server] [--compression none|lz4|zstd]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build check <project-dir>\n    проверяет проект без сборки архивов, player и скриптов; heavy-скрипты (cdylib), Vulkan и Windows-DLL не проверяются\n  rve-build explain <project-dir> <virtual-path>\n    показывает архив ресурса, причину выбора и кратчайшие цепочки ссылок от корней сборки\n  rve-build --help";
 
 pub(crate) enum CommandLine {
     Help,
     Scripts {
         project_dir: PathBuf,
     },
+    Check {
+        project_dir: PathBuf,
+    },
+    Explain {
+        project_dir: PathBuf,
+        path: VirtualPath,
+    },
     Build {
         project_dir: PathBuf,
         output: PathBuf,
         vulkan_sdk: Option<PathBuf>,
         with_server: bool,
+        compression: BuildCompression,
     },
     Run {
         project_dir: PathBuf,
@@ -28,7 +38,9 @@ pub(crate) enum CommandLine {
 pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandLine, String> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
-        return Err("ожидается команда build, run или --help".to_owned());
+        return Err(
+            "ожидается команда build, run, sdk, scripts, check, explain или --help".to_owned(),
+        );
     };
     if is_help(&command) {
         return Ok(CommandLine::Help);
@@ -38,21 +50,59 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandL
         Some("build") => parse_build(args),
         Some("run") => parse_run(args),
         Some("sdk") => parse_sdk(args),
-        Some("scripts") => {
-            let project_dir = args.next().ok_or("для scripts требуется <project-dir>")?;
-            if is_help(&project_dir) {
-                return Ok(CommandLine::Help);
-            }
-            if args.next().is_some() {
-                return Err("лишние аргументы scripts".to_owned());
-            }
-            Ok(CommandLine::Scripts {
-                project_dir: project_dir.into(),
-            })
-        }
+        Some("explain") => parse_explain(args),
+        Some("scripts") => Ok(match parse_project_dir("scripts", args)? {
+            Some(project_dir) => CommandLine::Scripts { project_dir },
+            None => CommandLine::Help,
+        }),
+        Some("check") => Ok(match parse_project_dir("check", args)? {
+            Some(project_dir) => CommandLine::Check { project_dir },
+            None => CommandLine::Help,
+        }),
         Some(value) => Err(format!("неизвестная команда {value:?}")),
         None => Err("имя команды должно быть текстом UTF-8".to_owned()),
     }
+}
+
+fn parse_explain(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
+    const REQUIRED: &str = "для explain требуются <project-dir> и <virtual-path>";
+    let project_dir = args.next().ok_or(REQUIRED)?;
+    if is_help(&project_dir) {
+        return Ok(CommandLine::Help);
+    }
+    let path = args.next().ok_or(REQUIRED)?;
+    if is_help(&path) {
+        return Ok(CommandLine::Help);
+    }
+    if args.next().is_some() {
+        return Err("лишние аргументы explain".to_owned());
+    }
+    let text = path
+        .to_str()
+        .ok_or("виртуальный путь должен быть текстом UTF-8")?;
+    let path = VirtualPath::parse(text)
+        .map_err(|error| format!("некорректный виртуальный путь {text:?}: {error}"))?;
+    Ok(CommandLine::Explain {
+        project_dir: project_dir.into(),
+        path,
+    })
+}
+
+/// Разбирает команду с одним аргументом `<project-dir>`. `None` — запрошена справка.
+fn parse_project_dir(
+    command: &str,
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let project_dir = args
+        .next()
+        .ok_or_else(|| format!("для {command} требуется <project-dir>"))?;
+    if is_help(&project_dir) {
+        return Ok(None);
+    }
+    if args.next().is_some() {
+        return Err(format!("лишние аргументы {command}"));
+    }
+    Ok(Some(project_dir.into()))
 }
 
 fn parse_sdk(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
@@ -119,6 +169,7 @@ fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, 
     let mut output = None;
     let mut vulkan_sdk = None;
     let mut with_server = false;
+    let mut compression = None;
     while let Some(argument) = args.next() {
         if is_help(&argument) {
             return Ok(CommandLine::Help);
@@ -148,6 +199,15 @@ fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, 
                         "после --vulkan-sdk требуется каталог".to_owned()
                     })?));
             }
+            Some("--compression") => {
+                if compression.is_some() {
+                    return Err("параметр --compression указан повторно".to_owned());
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| "после --compression требуется none, lz4 или zstd".to_owned())?;
+                compression = Some(parse_compression(&value)?);
+            }
             Some(value) => return Err(format!("неизвестный аргумент build: {value:?}")),
             None => return Err("аргумент build должен быть текстом UTF-8".to_owned()),
         }
@@ -158,6 +218,25 @@ fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, 
         output,
         vulkan_sdk,
         with_server,
+        compression: compression.unwrap_or_default(),
+    })
+}
+
+/// Значение `--compression`: кодек с параметрами по умолчанию, как у сборки без флага.
+fn parse_compression(value: &OsStr) -> Result<BuildCompression, String> {
+    let codec = match value.to_str() {
+        Some("none") => Codec::None,
+        Some("lz4") => Codec::Lz4,
+        Some("zstd") => Codec::Zstd,
+        _ => {
+            return Err(format!(
+                "неизвестный --compression {value:?}; допустимы none, lz4 и zstd"
+            ));
+        }
+    };
+    Ok(BuildCompression {
+        codec,
+        ..BuildCompression::default()
     })
 }
 
@@ -191,6 +270,8 @@ fn is_help(value: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{CommandLine, parse};
+    use engine_files::VirtualPath;
+    use engine_pak::{BuildCompression, Codec};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -230,7 +311,7 @@ mod tests {
                 "build", "my project", "--output", "out dir", "--vulkan-sdk", "sdk"
             ]))
             .unwrap(),
-            CommandLine::Build { project_dir, output, vulkan_sdk, with_server }
+            CommandLine::Build { project_dir, output, vulkan_sdk, with_server, .. }
                 if project_dir == Path::new("my project")
                     && output == Path::new("out dir")
                     && vulkan_sdk == Some(PathBuf::from("sdk"))
@@ -246,6 +327,122 @@ mod tests {
             parse(args(&["sdk", "--output", "sdk dir", "--no-rust-toolchain"])).unwrap(),
             CommandLine::Sdk { output, .. } if output == Path::new("sdk dir")
         ));
+    }
+
+    #[test]
+    fn check_takes_exactly_one_project_path() {
+        assert!(matches!(
+            parse(args(&["check", "my project"])).unwrap(),
+            CommandLine::Check { project_dir } if project_dir == Path::new("my project")
+        ));
+        assert!(matches!(
+            parse(args(&["check", "--help"])).unwrap(),
+            CommandLine::Help
+        ));
+        let error = parse(args(&["check"])).err().unwrap();
+        assert!(error.contains("check"), "{error}");
+        assert!(parse(args(&["check", "game", "extra"])).is_err());
+    }
+
+    #[test]
+    fn explain_takes_a_project_and_one_virtual_path() {
+        let expected = VirtualPath::parse("textures/wood.png").unwrap();
+        for text in ["/textures/wood.png", "textures/wood.png"] {
+            assert!(matches!(
+                parse(args(&["explain", "my game", text])).unwrap(),
+                CommandLine::Explain { project_dir, path }
+                    if project_dir == Path::new("my game") && path == expected
+            ));
+        }
+        assert!(matches!(
+            parse(args(&["explain", "--help"])).unwrap(),
+            CommandLine::Help
+        ));
+        assert!(matches!(
+            parse(args(&["explain", "game", "-h"])).unwrap(),
+            CommandLine::Help
+        ));
+    }
+
+    #[test]
+    fn explain_rejects_missing_extra_and_invalid_arguments() {
+        for values in [
+            vec!["explain"],
+            vec!["explain", "game"],
+            vec!["explain", "game", "/textures/wood.png", "extra"],
+            vec!["explain", "game", "../secret.png"],
+        ] {
+            let error = parse(args(&values)).err().unwrap();
+            assert!(!error.is_empty(), "{values:?}");
+        }
+        let error = parse(args(&["explain", "game", "../secret.png"]))
+            .err()
+            .unwrap();
+        assert!(error.contains("../secret.png"), "{error}");
+    }
+
+    #[test]
+    fn build_compression_accepts_one_of_three_codecs_with_default_levels() {
+        for (value, codec) in [
+            ("none", Codec::None),
+            ("lz4", Codec::Lz4),
+            ("zstd", Codec::Zstd),
+        ] {
+            let expected = BuildCompression {
+                codec,
+                ..BuildCompression::default()
+            };
+            assert!(
+                matches!(
+                    parse(args(&["build", "game", "--output", "out", "--compression", value])).unwrap(),
+                    CommandLine::Build { compression, .. } if compression == expected
+                ),
+                "{value}"
+            );
+        }
+        assert!(matches!(
+            parse(args(&["build", "game", "--output", "out"])).unwrap(),
+            CommandLine::Build { compression, .. } if compression == BuildCompression::default()
+        ));
+    }
+
+    #[test]
+    fn build_compression_rejects_unknown_repeated_or_missing_values() {
+        for values in [
+            vec!["build", "game", "--output", "out", "--compression"],
+            vec!["build", "game", "--output", "out", "--compression", "gzip"],
+            vec![
+                "build",
+                "game",
+                "--output",
+                "out",
+                "--compression",
+                "--output",
+            ],
+            vec![
+                "build",
+                "game",
+                "--output",
+                "out",
+                "--compression",
+                "zstd",
+                "--compression",
+                "lz4",
+            ],
+        ] {
+            assert!(parse(args(&values)).is_err(), "accepted {values:?}");
+        }
+        let error = parse(args(&[
+            "build",
+            "game",
+            "--output",
+            "out",
+            "--compression",
+            "gzip",
+        ]))
+        .err()
+        .unwrap();
+        assert!(error.contains("gzip"), "{error}");
     }
 
     #[test]

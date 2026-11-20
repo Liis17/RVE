@@ -1,6 +1,6 @@
 [package]
 name = "engine-runtime"
-version = "0.32.1"
+version = "0.33.1"
 edition.workspace = true
 license.workspace = true
 
@@ -23,7 +23,6 @@ engine-files = { path = "../engine-files" }
 engine-gui = { path = "../engine-gui" }
 engine-audio = { path = "../engine-audio" }
 engine-animation = { path = "../engine-animation" }
-engine-neural = { path = "../engine-neural" }
 engine-network = { path = "../engine-network" }
 engine-physics = { path = "../engine-physics" }
 engine-platform = { path = "../engine-platform" }

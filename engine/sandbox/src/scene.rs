@@ -18,14 +18,14 @@ pub enum Scene {
     Materials,
     Clustered,
     Particles,
-    /// Сетка неподвижных кубов для замеров draw calls и отсечения.
+    /// Сетка падающих кубов на полу: физика, замеры шага, draw calls и отсечение.
     Stress,
 }
 
 /// Число кубов по стороне сетки `--scene stress`.
 pub const STRESS_GRID: usize = 48;
 const STRESS_SPACING: f32 = 0.35;
-const STRESS_CUBE_SIZE: f32 = 0.18;
+pub const STRESS_CUBE_SIZE: f32 = 0.18;
 /// Половина стороны пола `--scene stress`; пол шире сетки, чтобы тени ложились на него.
 pub const STRESS_FLOOR_HALF_EXTENT: f32 = 9.0;
 

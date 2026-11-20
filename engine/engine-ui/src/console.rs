@@ -283,7 +283,7 @@ impl ConsoleOverlay {
         if token.is_empty() {
             return;
         }
-        let suggestions = catalog.complete(token);
+        let suggestions = catalog.matches(token);
         if suggestions.is_empty() {
             return;
         }
@@ -345,7 +345,7 @@ impl ConsoleOverlay {
         }
     }
 
-    fn current_suggestions(&self, catalog: &CommandCatalog) -> Vec<CommandSpec> {
+    fn current_suggestions<'a>(&self, catalog: &'a CommandCatalog) -> Vec<&'a CommandSpec> {
         if self.history_browsing {
             return Vec::new();
         }
@@ -360,7 +360,7 @@ impl ConsoleOverlay {
     fn select_suggestion(
         &mut self,
         query: &str,
-        suggestions: &[CommandSpec],
+        suggestions: &[&CommandSpec],
         index: usize,
         from_tab: bool,
     ) {
@@ -431,14 +431,14 @@ fn consume_key(ctx: &Context, key: Key) -> bool {
     ctx.input_mut(|input| input.consume_key(Modifiers::NONE, key))
 }
 
-fn command_suggestions(input: &str, catalog: &CommandCatalog) -> Vec<CommandSpec> {
+fn command_suggestions<'a>(input: &str, catalog: &'a CommandCatalog) -> Vec<&'a CommandSpec> {
     let Some((_, token, suffix)) = command_token(input) else {
         return Vec::new();
     };
     if token.is_empty() || !suffix.is_empty() {
         return Vec::new();
     }
-    catalog.complete(token)
+    catalog.matches(token)
 }
 
 fn command_token(input: &str) -> Option<(&str, &str, &str)> {

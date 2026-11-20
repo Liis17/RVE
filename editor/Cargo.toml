@@ -1,6 +1,6 @@
 [package]
 name = "rve-editor"
-version = "0.38.1"
+version = "0.38.2"
 edition.workspace = true
 license.workspace = true
 
@@ -46,6 +46,7 @@ getrandom.workspace = true
 
 [dev-dependencies]
 rve-sdk = { path = "../engine/rve-sdk" }
+base64.workspace = true
 
 [build-dependencies]
 # Растеризация иконок из IconsPack на этапе сборки; в рантайм-бинарь не попадает.
