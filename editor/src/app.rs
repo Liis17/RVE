@@ -2363,7 +2363,7 @@ fn render_scene_frame(
     let offscreen_capture = state
         .mcp_capture
         .as_ref()
-        .is_some_and(|job| job.rendering() && job.plan.is_offscreen());
+        .is_some_and(capture::CaptureJob::wants_offscreen_frame);
     if !capture::needs_scene_frame(scene_size.is_some(), game_size.is_some(), offscreen_capture)
         && preview_size.is_none()
     {
@@ -2372,7 +2372,7 @@ fn render_scene_frame(
     let capture_frame = state
         .mcp_capture
         .as_ref()
-        .and_then(|job| capture::offscreen_frame(&job.plan, &job.phase));
+        .and_then(capture::CaptureJob::offscreen_frame);
     let preview_asset = state
         .inspected_asset
         .clone()
