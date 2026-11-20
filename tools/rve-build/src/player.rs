@@ -105,13 +105,19 @@ pub(crate) fn build_distribution(
     #[cfg(not(windows))]
     let player = locate_player(PlayerFlavor::Distribution, false)?;
     let executable = player.executable;
-    let player_monitor = select_crash_monitor(player.crash_monitor, &executable);
+    let mut monitor_warnings = Vec::new();
+    let player_monitor =
+        select_crash_monitor(player.crash_monitor, &executable, &mut monitor_warnings);
     let (server_executable, server_monitor) = match with_server
         .then(|| locate_player(PlayerFlavor::Server, false))
         .transpose()?
     {
         Some(server) => {
-            let monitor = select_crash_monitor(server.crash_monitor, &server.executable);
+            let monitor = select_crash_monitor(
+                server.crash_monitor,
+                &server.executable,
+                &mut monitor_warnings,
+            );
             (Some(server.executable), monitor)
         }
         None => (None, None),
@@ -784,18 +790,28 @@ pub(crate) fn build_sdk_player(
 }
 
 /// Монитор нужен релизу, но SDK, собранный до его появления, его не содержит. Тогда релиз собирается
-/// без minidump: предупреждение на stderr, не ошибка.
-pub(crate) fn select_crash_monitor(monitor: Option<PathBuf>, player: &Path) -> Option<PathBuf> {
+/// без minidump: предупреждение на stderr, не ошибка. Игрок и сервер из одного SDK лежат в одном каталоге,
+/// поэтому предупреждение печатается один раз: `warnings` не даёт повторить текст.
+pub(crate) fn select_crash_monitor(
+    monitor: Option<PathBuf>,
+    player: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
     if monitor.is_none() {
-        eprintln!("{}", missing_crash_monitor_warning(player));
+        let warning = missing_crash_monitor_warning(player);
+        if !warnings.contains(&warning) {
+            eprintln!("{warning}");
+            warnings.push(warning);
+        }
     }
     monitor
 }
 
 fn missing_crash_monitor_warning(player: &Path) -> String {
+    let directory = player.parent().unwrap_or(player);
     format!(
-        "предупреждение: для {} нет {}: релиз собирается без minidump (пересоберите SDK)",
-        player.display(),
+        "предупреждение: в {} нет {}: релиз собирается без minidump (пересоберите SDK)",
+        directory.display(),
         sdk::crash_monitor_filename()
     )
 }
@@ -1475,13 +1491,17 @@ mod tests {
     #[test]
     fn missing_crash_monitor_warns_and_the_release_continues_without_it() {
         let player = Path::new("sdk/rve-player.exe");
-        assert_eq!(select_crash_monitor(None, player), None);
+        let mut warnings = Vec::new();
+        assert_eq!(select_crash_monitor(None, player, &mut warnings), None);
+        let sibling = Path::new("sdk/rve-server.exe");
+        assert_eq!(select_crash_monitor(None, sibling, &mut warnings), None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         let warning = missing_crash_monitor_warning(player);
         assert!(warning.contains(sdk::crash_monitor_filename()), "{warning}");
         assert!(warning.contains("без minidump"), "{warning}");
         let monitor = PathBuf::from("sdk/rve-crash-monitor.exe");
         assert_eq!(
-            select_crash_monitor(Some(monitor.clone()), player),
+            select_crash_monitor(Some(monitor.clone()), player, &mut warnings),
             Some(monitor)
         );
     }

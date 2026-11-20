@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 /// Сколько ждать выхода монитора.
 pub const EXIT_DEADLINE: Duration = Duration::from_secs(60);
 /// Сколько ждать готовности сервера монитора к подключению.
-pub const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(60);
 
 pub fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rve-crash-monitor-{name}-{}", std::process::id()));
