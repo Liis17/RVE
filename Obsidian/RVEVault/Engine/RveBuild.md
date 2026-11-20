@@ -2,8 +2,8 @@
 
 `tools/rve-build` собирает игровой релиз из каталога проекта или запускает его в
 dev-режиме. Инструмент является внешним crate workspace и зависит от
-`engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`,
-`engine-files`, `engine-script` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
+`engine-project`, `engine-scene`, `engine-assets`, `engine-render`, `engine-resources`,
+`engine-pak`, `engine-files`, `engine-gui`, `engine-script` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
 Подробности runtime layout проекта и релиза находятся в
 [[Engine/EngineRuntime]], формат сцены — в [[Engine/EngineScene]], а формат архива и
 реестр — в [[Engine/EnginePak]].
@@ -23,7 +23,7 @@ New Project при PATH только с системными каталогам�
 публикуется как обычный GitHub Release `sdk-<полный SHA>` с отметкой latest; повторный
 запуск заменяет asset того же релиза. Проверка не запускает GUI или GPU.
 
-`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]` читает
+`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server] [--compression none|lz4|zstd]` читает
 `project.rveproject` и `bootstrap.rves`, открывает `<project>/Assets` через
 `ResourceSystem` в `SourceMode::Loose`, затем проверяет каждую включённую сцену с
 помощью `SceneDocument`. Выключенные сцены не открываются. В сборку попадают файлы
@@ -33,6 +33,11 @@ asset `.camerasettings` проверяется как UTF-8/TOML с диапаз
 Иконка должна
 иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
 Неиспользуемые файлы каталога Assets не копируются.
+
+`--compression` задаёт кодек всех архивов релиза: `none`, `lz4` или `zstd`. Уровень zstd и
+размер чанка берутся из `BuildCompression::default()` engine-pak, поэтому без флага сборка
+идёт zstd, как и раньше. Повтор флага, отсутствие значения или неизвестный кодек — ошибка CLI
+с кодом 2. Кодек передаётся в `build_archive_set`, и `stat` архива возвращает его для файлов.
 
 Environment `.hdr` включается в архив как обычный объявленный asset из раскрытой
 сцены. Это также покрывает HDR, добавленный вложенным prefab; builder не декодирует
@@ -114,9 +119,49 @@ Dev-player использует библиотеку из проекта. При
 только если `RVE_DLSS_SDK` задан, и записывает `dlss_enabled` в `rve-sdk.toml`;
 `run`/`build` с проектом, требующим DLSS, отклоняют SDK player без этой feature.
 
+## Проверка без сборки
+
+`rve-build check <project-dir>` выполняет тот же разбор проекта, что и `build`
+(`prepare_project`), и проверку назначений и реестра архивов (`validate_project_archives`):
+зарезервированные пути `/rve/project.toml`, `/rve/assets.toml` и `/rve/prefabs.toml`,
+имя исполняемого файла. Проверяются сцены, префабы и их ресурсы, lite-скрипты с их схемой
+и `params`, ссылки объектов и ресурсов, а также наличие `heavy_scripts` при heavy-ссылках.
+Команда не вызывает Cargo, не собирает архивы и не пишет файлы. При успехе печатает число
+включённых сцен, ресурсов и архивов, код 0. Первая ошибка выводится как `rve-build: <сообщение>`:
+код 2 — ошибка проекта, код 1 — операционная. Отсутствующий ресурс называет виртуальный путь.
+
+Не проверяются:
+- имена и `params` heavy-скриптов — для них нужна собранная cdylib; их проверяют `build`,
+  `run` и `scripts`;
+- Windows-только DLL FSR/DLSS и размер ICO-иконки — их проверяет `build`;
+- наличие player и Vulkan SDK — их проверяют `build` и `run`.
+
+## Объяснение назначения
+
+`rve-build explain <project-dir> <virtual-path>` выполняет тот же разбор проекта, что и
+`build`, с трассировкой (`prepare_project_traced`) и печатает архив ресурса, причину выбора
+архива и по одной кратчайшей цепочке ссылок от каждого корня, из которого ресурс достижим.
+Корни: включённые сцены, записи `prefabs.rveprefabs` и AppIcon из `bootstrap.rves`. Путь
+разбирается как виртуальный, с ведущим `/` или без; ошибка разбора — код 2 на этапе CLI.
+Ресурс, которого нет в сборке, — ошибка проекта с кодом 2. Команда не пишет файлы.
+
+Ссылки трёх видов: объявлен в `[[assets]]` документа, экземпляр префаба и зависимость
+ресурса (текстура FBX, shader или текстура материала, текстура шейдера по умолчанию, LUT
+цветокоррекции, картинка или шрифт UI). Обход идёт только по рёбрам того контекста
+раскрытия, в котором документ раскрыт. Поэтому файл сцены, объявленный в `[[assets]]`
+другой сцены, и префаб, который тяжёлый префаб объявил, но не раскрыл, остаются листьями
+для этого корня.
+
+Причина повторяет ветку назначения, а не вычисляется отдельно. Файл включённой сцены и
+AppIcon — `base`. Явный архив указывает, где он задан: `[[assets]]` сцены, `[[assets]]`
+префаба (сцена переопределяет префаб) или запись `prefabs.rveprefabs`. Разные явные архивы
+тяжёлых префабов дают `shared` со списком назначений без повторов и с источником каждого.
+Ресурс, используемый одной сценой, — `scene-<stem>`; используемый несколькими сценами или
+ни одной — `shared`.
+
 ## Материалы и Surface shaders
 
-tools/rve-build/src/project.rs валидирует каждый используемый .rvemat, затем рекурсивно включает его .rveshader и текстуры из properties в ресурсный набор сцены. Эти dependencies получают archive owner по тем же правилам, что и остальные использованные файлы. .rveshader разбирается и проверяется как формат engine-scene; GLSL body не компилируется в builder, потому что rve-build не зависит от engine-render. Ошибки TOML, schema material или отсутствующие dependencies — ошибка проекта с кодом 2. Ошибка GLSL появляется в editor/runtime и использует magenta Lit fallback; формат и ограничение compile-time см. [[Engine/EngineMaterials]].
+tools/rve-build/src/project.rs валидирует каждый используемый .rvemat, затем рекурсивно включает его .rveshader и текстуры из properties в ресурсный набор сцены. Эти dependencies получают archive owner по тем же правилам, что и остальные использованные файлы. .rveshader разбирается и проверяется как формат engine-scene; GLSL body Surface shader в builder не компилируется (компилируются только экранные шейдеры `.glsl`). Ошибки TOML, schema material или отсутствующие dependencies — ошибка проекта с кодом 2. Ошибка GLSL появляется в editor/runtime и использует magenta Lit fallback; формат и ограничение compile-time см. [[Engine/EngineMaterials]].
 
 ## Назначение архивов
 
@@ -277,7 +322,8 @@ MoltenVK (Apache-2.0).
 требует совместимое устройство.
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
-`archives.rs`, `player.rs`, `sdk.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
+`archives.rs`, `check.rs`, `explain.rs`, `trace.rs`, `player.rs`, `sdk.rs`, `ico.rs`,
+`platform.rs`, `temporary.rs`.
 
 В SDK-режиме на macOS Build Player берёт Vulkan из bundled `Contents/Resources/Engine`;
 явный `--vulkan-sdk` сохраняет приоритет. Windows SDK принимает только toolchain

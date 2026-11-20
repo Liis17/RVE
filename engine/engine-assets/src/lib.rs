@@ -599,7 +599,8 @@ pub fn decode_png(bytes: &[u8]) -> Result<TextureData, String> {
     })
 }
 
-/// Декодирует Radiance RGBE в линейные float RGB.
+/// Декодирует Radiance RGBE в линейные float RGB. Порядок пикселей в результате канонический
+/// (строки сверху вниз, слева направо) для всех восьми ориентаций строки разрешения.
 pub fn decode_hdr(bytes: &[u8]) -> Result<HdrImageData, String> {
     if bytes.len() > HDR_DECODE_LIMIT {
         return Err("HDR превышает предел памяти декодера 512 MiB".to_owned());
@@ -625,24 +626,8 @@ pub fn decode_hdr(bytes: &[u8]) -> Result<HdrImageData, String> {
     let resolution = hdr_line(bytes, &mut cursor)?;
     let resolution =
         std::str::from_utf8(resolution).map_err(|_| "строка ориентации HDR должна быть ASCII")?;
-    let mut parts = resolution.split_ascii_whitespace();
-    let (Some(y_axis), Some(height_text), Some(x_axis), Some(width_text)) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err("поддерживается только ориентация -Y H +X W".to_owned());
-    };
-    if y_axis != "-Y" || x_axis != "+X" || parts.next().is_some() {
-        return Err("поддерживается только ориентация -Y H +X W".to_owned());
-    }
-    let height = height_text
-        .parse::<u32>()
-        .map_err(|_| "некорректная высота HDR")?;
-    let width = width_text
-        .parse::<u32>()
-        .map_err(|_| "некорректная ширина HDR")?;
-    if width == 0 || height == 0 {
-        return Err("размеры HDR должны быть больше нуля".to_owned());
-    }
+    let orientation = parse_hdr_orientation(resolution)?;
+    let (width, height) = (orientation.width, orientation.height);
     let pixel_count = (width as usize)
         .checked_mul(height as usize)
         .ok_or("размеры HDR переполняют память")?;
@@ -652,7 +637,8 @@ pub fn decode_hdr(bytes: &[u8]) -> Result<HdrImageData, String> {
     let output_bytes = float_count
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or("размеры HDR переполняют память")?;
-    let scanline_bytes = (width as usize)
+    let scanlen = orientation.scanlen();
+    let scanline_bytes = scanlen
         .checked_mul(4)
         .ok_or("размер строки HDR переполняет память")?;
     if bytes
@@ -673,42 +659,153 @@ pub fn decode_hdr(bytes: &[u8]) -> Result<HdrImageData, String> {
         .map_err(|_| "не удалось выделить память для строки HDR")?;
     scanline.resize(scanline_bytes, 0);
 
-    for row in 0..height as usize {
+    for scanline_index in 0..orientation.scanline_count() {
         let marker = take_hdr_bytes(bytes, &mut cursor, 4)?;
         let rle_width = ((marker[2] as usize) << 8) | marker[3] as usize;
-        if (8..=0x7fff).contains(&width)
+        if (8..=0x7fff).contains(&scanlen)
             && marker[0] == 2
             && marker[1] == 2
-            && rle_width == width as usize
+            && rle_width == scanlen
         {
             for channel in 0..4 {
-                decode_hdr_channel(bytes, &mut cursor, &mut scanline, width as usize, channel)?;
+                decode_hdr_channel(bytes, &mut cursor, &mut scanline, scanlen, channel)?;
             }
-            for x in 0..width as usize {
+            for pixel in 0..scanlen {
                 let rgbe = [
-                    scanline[x],
-                    scanline[width as usize + x],
-                    scanline[2 * width as usize + x],
-                    scanline[3 * width as usize + x],
+                    scanline[pixel],
+                    scanline[scanlen + pixel],
+                    scanline[2 * scanlen + pixel],
+                    scanline[3 * scanlen + pixel],
                 ];
-                write_hdr_pixel(&mut rgb, row * width as usize + x, rgbe);
+                let index = orientation.canonical_index(scanline_index, pixel);
+                write_hdr_pixel(&mut rgb, index, rgbe);
             }
         } else {
-            let row_bytes = width as usize * 4;
+            let row_bytes = scanlen * 4;
             scanline[..4].copy_from_slice(marker);
             let remaining = row_bytes - 4;
             scanline[4..row_bytes].copy_from_slice(take_hdr_bytes(bytes, &mut cursor, remaining)?);
-            for x in 0..width as usize {
-                let offset = x * 4;
+            for pixel in 0..scanlen {
+                let offset = pixel * 4;
+                let index = orientation.canonical_index(scanline_index, pixel);
                 write_hdr_pixel(
                     &mut rgb,
-                    row * width as usize + x,
+                    index,
                     scanline[offset..offset + 4].try_into().unwrap(),
                 );
             }
         }
     }
     Ok(HdrImageData { width, height, rgb })
+}
+
+/// Ось строки Radiance: первая ось заголовка задаёт scanline, вторая — пиксели внутри них.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HdrAxis {
+    X,
+    Y,
+}
+
+/// Ориентация Radiance: размеры и направления обхода, одинаковые для flat и RLE.
+#[derive(Clone, Copy)]
+struct HdrOrientation {
+    width: u32,
+    height: u32,
+    /// `true`, если первая ось заголовка — Y: scanline идут по строкам, иначе по столбцам.
+    y_major: bool,
+    x_negative: bool,
+    y_negative: bool,
+}
+
+impl HdrOrientation {
+    /// Число пикселей в одной scanline.
+    fn scanlen(self) -> usize {
+        if self.y_major {
+            self.width as usize
+        } else {
+            self.height as usize
+        }
+    }
+
+    /// Число scanline в файле.
+    fn scanline_count(self) -> usize {
+        if self.y_major {
+            self.height as usize
+        } else {
+            self.width as usize
+        }
+    }
+
+    /// Канонический индекс пикселя по номеру scanline и позиции в ней: строки сверху вниз, столбцы слева направо.
+    fn canonical_index(self, scanline: usize, pixel: usize) -> usize {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let (x, y) = if self.y_major {
+            (pixel, scanline)
+        } else {
+            (scanline, pixel)
+        };
+        // `-Y` идёт сверху вниз, `+Y` — снизу вверх; `-X` начинает справа, `+X` слева.
+        let row = if self.y_negative { y } else { height - 1 - y };
+        let column = if self.x_negative { width - 1 - x } else { x };
+        row * width + column
+    }
+}
+
+/// Разбирает `±Y H ±X W` или `±X W ±Y H`: оси должны различаться, число после X — ширина, после Y — высота.
+fn parse_hdr_orientation(line: &str) -> Result<HdrOrientation, String> {
+    let unsupported = || "ожидается ориентация ±Y H ±X W или ±X W ±Y H с разными осями".to_owned();
+    let mut parts = line.split_ascii_whitespace();
+    let (Some(first_axis), Some(first_size), Some(second_axis), Some(second_size), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(unsupported());
+    };
+    let (Some((first_axis, first_negative)), Some((second_axis, second_negative))) =
+        (parse_hdr_axis(first_axis), parse_hdr_axis(second_axis))
+    else {
+        return Err(unsupported());
+    };
+    if first_axis == second_axis {
+        return Err(unsupported());
+    }
+    let y_major = first_axis == HdrAxis::Y;
+    let (x_size, x_negative, y_size, y_negative) = if y_major {
+        (second_size, second_negative, first_size, first_negative)
+    } else {
+        (first_size, first_negative, second_size, second_negative)
+    };
+    let height = y_size
+        .parse::<u32>()
+        .map_err(|_| "некорректная высота HDR")?;
+    let width = x_size
+        .parse::<u32>()
+        .map_err(|_| "некорректная ширина HDR")?;
+    if width == 0 || height == 0 {
+        return Err("размеры HDR должны быть больше нуля".to_owned());
+    }
+    Ok(HdrOrientation {
+        width,
+        height,
+        y_major,
+        x_negative,
+        y_negative,
+    })
+}
+
+/// Разбирает токен оси `+X`, `-X`, `+Y` или `-Y`: возвращает ось и признак минуса.
+fn parse_hdr_axis(token: &str) -> Option<(HdrAxis, bool)> {
+    match token {
+        "+X" => Some((HdrAxis::X, false)),
+        "-X" => Some((HdrAxis::X, true)),
+        "+Y" => Some((HdrAxis::Y, false)),
+        "-Y" => Some((HdrAxis::Y, true)),
+        _ => None,
+    }
 }
 
 fn hdr_line<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
@@ -746,20 +843,20 @@ fn decode_hdr_channel(
     bytes: &[u8],
     cursor: &mut usize,
     scanline: &mut [u8],
-    width: usize,
+    scanlen: usize,
     channel: usize,
 ) -> Result<(), String> {
     let mut written = 0;
-    while written < width {
+    while written < scanlen {
         let code = take_hdr_bytes(bytes, cursor, 1)?[0] as usize;
         if code == 0 {
             return Err("некорректный нулевой run в HDR".to_owned());
         }
         let count = if code > 128 { code - 128 } else { code };
-        if count > width - written {
-            return Err("run HDR выходит за ширину строки".to_owned());
+        if count > scanlen - written {
+            return Err("run HDR выходит за длину строки".to_owned());
         }
-        let output_start = channel * width + written;
+        let output_start = channel * scanlen + written;
         if code > 128 {
             let value = take_hdr_bytes(bytes, cursor, 1)?[0];
             scanline[output_start..output_start + count].fill(value);
@@ -1685,9 +1782,10 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex,
-        TextureData, decode_hdr, decode_png, is_missing_texture_candidate, map_resource_error,
-        pack_metallic_roughness, supports_metallic_roughness, texture_candidates,
+        AssetError, Assets, HdrImageData, Model, ModelAlphaMode, ModelMaterial, ModelMesh,
+        ModelVertex, TextureData, decode_hdr, decode_png, is_missing_texture_candidate,
+        map_resource_error, pack_metallic_roughness, supports_metallic_roughness,
+        texture_candidates,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
@@ -1846,12 +1944,9 @@ mod tests {
 
         let wrong_format = b"#?RADIANCE\nFORMAT=32-bit_rgbe\n\n-Y 1 +X 1\n";
         assert!(decode_hdr(wrong_format).unwrap_err().contains("FORMAT"));
-        let wrong_orientation = b"#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n+Y 1 +X 1\n";
-        assert!(
-            decode_hdr(wrong_orientation)
-                .unwrap_err()
-                .contains("ориентация")
-        );
+        // `+Y 1 +X 1` — допустимая ориентация, данных нет: ошибка обрезанных данных.
+        let no_pixels = b"#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n+Y 1 +X 1\n";
+        assert!(decode_hdr(no_pixels).unwrap_err().contains("обрезаны"));
         let excessive_resolution = format!(
             "#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1 {}\n",
             "x ".repeat(100_000)
@@ -1863,6 +1958,201 @@ mod tests {
         );
         let oversized = hdr_header(u32::MAX, u32::MAX);
         assert!(decode_hdr(&oversized).unwrap_err().contains("размеры HDR"));
+    }
+
+    /// Восемь ориентаций Radiance: первая ось заголовка и вторая; стандартная — `-Y`, `+X`.
+    const HDR_ORIENTATIONS: [(&str, &str); 8] = [
+        ("-Y", "+X"),
+        ("-Y", "-X"),
+        ("+Y", "+X"),
+        ("+Y", "-X"),
+        ("+X", "-Y"),
+        ("+X", "+Y"),
+        ("-X", "-Y"),
+        ("-X", "+Y"),
+    ];
+
+    /// Файл Radiance с заданной строкой ориентации и без пикселей.
+    fn hdr_file(resolution: &str) -> Vec<u8> {
+        format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n{resolution}\n").into_bytes()
+    }
+
+    /// Строка ориентации для изображения `width` × `height`: размер после X — ширина, после Y — высота.
+    fn hdr_resolution(first: &str, second: &str, width: usize, height: usize) -> String {
+        let size = |axis: &str| if axis.ends_with('Y') { height } else { width };
+        format!("{first} {} {second} {}", size(first), size(second))
+    }
+
+    /// Порядок записи пикселей в файл как пары (столбец, строка) канонической раскладки.
+    /// Первая ось задаёт порядок scanline, вторая — порядок пикселей внутри них.
+    /// `-Y` начинает с верхней строки, `+Y` — с нижней; `+X` — с левого столбца, `-X` — с правого.
+    fn hdr_file_order(
+        first: &str,
+        second: &str,
+        width: usize,
+        height: usize,
+    ) -> Vec<(usize, usize)> {
+        let (x_axis, y_axis) = if first.ends_with('X') {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let columns: Vec<usize> = if x_axis.starts_with('+') {
+            (0..width).collect()
+        } else {
+            (0..width).rev().collect()
+        };
+        let rows: Vec<usize> = if y_axis.starts_with('-') {
+            (0..height).collect()
+        } else {
+            (0..height).rev().collect()
+        };
+        if first.ends_with('Y') {
+            rows.iter()
+                .flat_map(|&row| columns.iter().map(move |&column| (column, row)))
+                .collect()
+        } else {
+            columns
+                .iter()
+                .flat_map(|&column| rows.iter().map(move |&row| (column, row)))
+                .collect()
+        }
+    }
+
+    /// Кодирует канонические RGBE-пиксели (строки сверху вниз) в файл с ориентацией `first`/`second`.
+    fn encode_hdr(
+        first: &str,
+        second: &str,
+        width: usize,
+        height: usize,
+        rle: bool,
+        canonical: &[[u8; 4]],
+    ) -> Vec<u8> {
+        let scanlen = if first.ends_with('Y') { width } else { height };
+        let mut file = format!(
+            "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n{}\n",
+            hdr_resolution(first, second, width, height)
+        )
+        .into_bytes();
+        let order = hdr_file_order(first, second, width, height);
+        for scanline in order.chunks(scanlen) {
+            let pixels: Vec<[u8; 4]> = scanline
+                .iter()
+                .map(|&(column, row)| canonical[row * width + column])
+                .collect();
+            if rle {
+                file.extend_from_slice(&[2, 2, (scanlen >> 8) as u8, scanlen as u8]);
+                for channel in 0..4 {
+                    let values: Vec<u8> = pixels.iter().map(|pixel| pixel[channel]).collect();
+                    for literal in values.chunks(128) {
+                        file.push(literal.len() as u8);
+                        file.extend_from_slice(literal);
+                    }
+                }
+            } else {
+                file.extend(pixels.iter().flatten());
+            }
+        }
+        file
+    }
+
+    /// Ожидаемый результат декодирования: экспонента 136 даёт масштаб 1, поэтому канал равен байту + 0.5.
+    fn canonical_hdr(width: u32, height: u32, canonical: &[[u8; 4]]) -> HdrImageData {
+        let rgb = canonical
+            .iter()
+            .flat_map(|pixel| pixel[..3].iter().map(|&value| f32::from(value) + 0.5))
+            .collect();
+        HdrImageData { width, height, rgb }
+    }
+
+    #[test]
+    fn decodes_flat_3x2_in_all_eight_orientations_to_canonical_layout() {
+        // Явная таблица канонической раскладки 3×2: строка сверху, пиксели слева направо.
+        let canonical = [
+            [10, 40, 70, 136],
+            [11, 41, 71, 136],
+            [12, 42, 72, 136],
+            [13, 43, 73, 136],
+            [14, 44, 74, 136],
+            [15, 45, 75, 136],
+        ];
+        let expected = canonical_hdr(3, 2, &canonical);
+        for (first, second) in HDR_ORIENTATIONS {
+            let file = encode_hdr(first, second, 3, 2, false, &canonical);
+            assert_eq!(
+                decode_hdr(&file).unwrap(),
+                expected,
+                "ориентация {first} {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_rle_9x8_in_all_eight_orientations_to_canonical_layout() {
+        // Обе оси длиной не меньше 8, поэтому scanline в любой ориентации кодируется RLE.
+        let canonical: Vec<[u8; 4]> = (0..9 * 8)
+            .map(|index| [10 + index as u8, 40 + index as u8, 70 + index as u8, 136])
+            .collect();
+        let expected = canonical_hdr(9, 8, &canonical);
+        for (first, second) in HDR_ORIENTATIONS {
+            let file = encode_hdr(first, second, 9, 8, true, &canonical);
+            assert_eq!(
+                decode_hdr(&file).unwrap(),
+                expected,
+                "ориентация {first} {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_radiance_resolution_strings() {
+        for resolution in [
+            "-Y 2 +Y 3",
+            "+X 2 -X 3",
+            "Y 2 +X 3",
+            "-Y 2 X 3",
+            "-y 2 +x 3",
+            "-XY 2 +X 3",
+            "-Y 2 +X",
+            "-Y 2 +X 3 1",
+            "-Y 2 +X 3 -Y 4",
+        ] {
+            let error = decode_hdr(&hdr_file(resolution)).unwrap_err();
+            assert!(error.contains("ориентация"), "{resolution}: {error}");
+        }
+        assert!(
+            decode_hdr(&hdr_file("-Y 0 +X 3"))
+                .unwrap_err()
+                .contains("больше нуля")
+        );
+        assert!(
+            decode_hdr(&hdr_file("+X 0 -Y 2"))
+                .unwrap_err()
+                .contains("больше нуля")
+        );
+        assert!(
+            decode_hdr(&hdr_file("-Y two +X 3"))
+                .unwrap_err()
+                .contains("высота")
+        );
+        assert!(
+            decode_hdr(&hdr_file("-Y 2 +X -3"))
+                .unwrap_err()
+                .contains("ширина")
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_x_major_flat_and_rle_data() {
+        // `+X 2 +Y 3`: scanline — столбцы по 3 пикселя, нужно 2 × 3 × 4 байта.
+        let mut flat = hdr_file("+X 2 +Y 3");
+        flat.extend_from_slice(&[1; 16]);
+        assert!(decode_hdr(&flat).unwrap_err().contains("обрезаны"));
+
+        // `+X 9 -Y 8`: scanline длиной 8 кодируются RLE, но данных первого канала не хватает.
+        let mut rle = hdr_file("+X 9 -Y 8");
+        rle.extend_from_slice(&[2, 2, 0, 8, 8, 1, 2, 3]);
+        assert!(decode_hdr(&rle).unwrap_err().contains("обрезаны"));
     }
 
     #[test]
