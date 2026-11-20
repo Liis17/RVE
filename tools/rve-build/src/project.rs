@@ -984,10 +984,19 @@ fn project_file_error(path: &Path, error: std::io::Error) -> BuildError {
     }
 }
 
+/// Ошибка файла ресурса: отсутствующий файл называет виртуальный путь, а не только путь ФС.
+fn asset_file_error(path: &VirtualPath, source: &Path, error: std::io::Error) -> BuildError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        BuildError::input(format!("ресурс /{path} не найден ({})", source.display()))
+    } else {
+        project_file_error(source, error)
+    }
+}
+
 fn require_asset_file(root: &Path, path: &VirtualPath) -> Result<PathBuf, BuildError> {
     let source = root.join(path.as_str());
     let metadata =
-        fs::symlink_metadata(&source).map_err(|error| project_file_error(&source, error))?;
+        fs::symlink_metadata(&source).map_err(|error| asset_file_error(path, &source, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(BuildError::input(format!(
             "ресурс /{path} должен быть обычным файлом без symlink"
@@ -996,7 +1005,7 @@ fn require_asset_file(root: &Path, path: &VirtualPath) -> Result<PathBuf, BuildE
     let canonical_root = fs::canonicalize(root).map_err(|error| project_file_error(root, error))?;
     let canonical_root = normalize_project_path(&canonical_root)?;
     let canonical_source =
-        fs::canonicalize(&source).map_err(|error| project_file_error(&source, error))?;
+        fs::canonicalize(&source).map_err(|error| asset_file_error(path, &source, error))?;
     let canonical_source = normalize_project_path(&canonical_source)?;
     if !canonical_source.starts_with(&canonical_root) {
         return Err(BuildError::input(format!(

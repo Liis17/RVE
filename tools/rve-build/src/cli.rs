@@ -1,11 +1,14 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build --help";
+pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build check <project-dir>\n    проверяет проект без сборки архивов, player и скриптов; heavy-скрипты (cdylib), Vulkan и Windows-DLL не проверяются\n  rve-build --help";
 
 pub(crate) enum CommandLine {
     Help,
     Scripts {
+        project_dir: PathBuf,
+    },
+    Check {
         project_dir: PathBuf,
     },
     Build {
@@ -28,7 +31,7 @@ pub(crate) enum CommandLine {
 pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandLine, String> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
-        return Err("ожидается команда build, run или --help".to_owned());
+        return Err("ожидается команда build, run, sdk, scripts, check или --help".to_owned());
     };
     if is_help(&command) {
         return Ok(CommandLine::Help);
@@ -38,21 +41,34 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandL
         Some("build") => parse_build(args),
         Some("run") => parse_run(args),
         Some("sdk") => parse_sdk(args),
-        Some("scripts") => {
-            let project_dir = args.next().ok_or("для scripts требуется <project-dir>")?;
-            if is_help(&project_dir) {
-                return Ok(CommandLine::Help);
-            }
-            if args.next().is_some() {
-                return Err("лишние аргументы scripts".to_owned());
-            }
-            Ok(CommandLine::Scripts {
-                project_dir: project_dir.into(),
-            })
-        }
+        Some("scripts") => Ok(match parse_project_dir("scripts", args)? {
+            Some(project_dir) => CommandLine::Scripts { project_dir },
+            None => CommandLine::Help,
+        }),
+        Some("check") => Ok(match parse_project_dir("check", args)? {
+            Some(project_dir) => CommandLine::Check { project_dir },
+            None => CommandLine::Help,
+        }),
         Some(value) => Err(format!("неизвестная команда {value:?}")),
         None => Err("имя команды должно быть текстом UTF-8".to_owned()),
     }
+}
+
+/// Разбирает команду с одним аргументом `<project-dir>`. `None` — запрошена справка.
+fn parse_project_dir(
+    command: &str,
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let project_dir = args
+        .next()
+        .ok_or_else(|| format!("для {command} требуется <project-dir>"))?;
+    if is_help(&project_dir) {
+        return Ok(None);
+    }
+    if args.next().is_some() {
+        return Err(format!("лишние аргументы {command}"));
+    }
+    Ok(Some(project_dir.into()))
 }
 
 fn parse_sdk(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
@@ -246,6 +262,21 @@ mod tests {
             parse(args(&["sdk", "--output", "sdk dir", "--no-rust-toolchain"])).unwrap(),
             CommandLine::Sdk { output, .. } if output == Path::new("sdk dir")
         ));
+    }
+
+    #[test]
+    fn check_takes_exactly_one_project_path() {
+        assert!(matches!(
+            parse(args(&["check", "my project"])).unwrap(),
+            CommandLine::Check { project_dir } if project_dir == Path::new("my project")
+        ));
+        assert!(matches!(
+            parse(args(&["check", "--help"])).unwrap(),
+            CommandLine::Help
+        ));
+        let error = parse(args(&["check"])).err().unwrap();
+        assert!(error.contains("check"), "{error}");
+        assert!(parse(args(&["check", "game", "extra"])).is_err());
     }
 
     #[test]

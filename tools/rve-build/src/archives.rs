@@ -11,21 +11,44 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-pub(crate) fn build_project_archives(
+/// Генерируемые файлы релиза в `base`: `/rve/project.toml`, `/rve/assets.toml`, `/rve/prefabs.toml`.
+fn reserved_paths() -> [VirtualPath; 3] {
+    [
+        VirtualPath::parse("/rve/project.toml").expect("constant path"),
+        VirtualPath::parse("/rve/assets.toml").expect("constant path"),
+        VirtualPath::parse(PREFAB_CATALOG_RELEASE_PATH).expect("constant path"),
+    ]
+}
+
+/// Проверяет назначения и реестр архивов без записи файлов: зарезервированные пути нельзя
+/// назначить ресурсу, а реестр должен собираться из назначений проекта.
+pub(crate) fn validate_project_archives(
     project: &ProjectBuild,
-    output: &Path,
 ) -> Result<ArchiveSetRegistry, BuildError> {
-    let project_settings_path = VirtualPath::parse("/rve/project.toml").expect("constant path");
-    let registry_path = VirtualPath::parse("/rve/assets.toml").expect("constant path");
-    let prefabs_path = VirtualPath::parse(PREFAB_CATALOG_RELEASE_PATH).expect("constant path");
-    if [&project_settings_path, &registry_path, &prefabs_path]
+    let reserved = reserved_paths();
+    if reserved
         .iter()
-        .any(|path| project.assignments.contains_key(*path))
+        .any(|path| project.assignments.contains_key(path))
     {
         return Err(BuildError::input(
             "Assets не может содержать зарезервированные /rve/project.toml, /rve/assets.toml или /rve/prefabs.toml",
         ));
     }
+
+    let mut registry_paths = project.assignments.clone();
+    for path in reserved {
+        registry_paths.insert(path, "base".to_owned());
+    }
+    ArchiveSetRegistry::new(project.archives.clone(), registry_paths)
+        .map_err(|error| BuildError::input(format!("ошибка реестра ресурсов: {error}")))
+}
+
+pub(crate) fn build_project_archives(
+    project: &ProjectBuild,
+    output: &Path,
+) -> Result<ArchiveSetRegistry, BuildError> {
+    let registry = validate_project_archives(project)?;
+    let [project_settings_path, registry_path, prefabs_path] = reserved_paths();
 
     let generated = TempDir::create(&std::env::temp_dir(), "rve-build-generated")?;
     let generated_rve = generated.path().join("rve");
@@ -40,12 +63,6 @@ pub(crate) fn build_project_archives(
         .settings
         .to_toml()
         .map_err(|error| BuildError::input(format!("не удалось сериализовать проект: {error}")))?;
-    let mut registry_paths = project.assignments.clone();
-    registry_paths.insert(project_settings_path.clone(), "base".to_owned());
-    registry_paths.insert(registry_path.clone(), "base".to_owned());
-    registry_paths.insert(prefabs_path.clone(), "base".to_owned());
-    let registry = ArchiveSetRegistry::new(project.archives.clone(), registry_paths)
-        .map_err(|error| BuildError::input(format!("ошибка реестра ресурсов: {error}")))?;
     let registry_toml = registry
         .to_toml()
         .map_err(|error| BuildError::input(format!("ошибка реестра ресурсов: {error}")))?;
@@ -137,7 +154,7 @@ pub(crate) fn build_project_archives(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::build_project_archives;
     use crate::player::validate_staged_archives;
     use crate::project::prepare_project;
@@ -197,7 +214,7 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         fs::write(path, fbx).unwrap();
     }
 
-    pub(super) fn create_demo_like_project(root: &Path) {
+    pub(crate) fn create_demo_like_project(root: &Path) {
         let assets = root.join("Assets");
         for path in [
             "scenes",

@@ -2,8 +2,8 @@
 
 `tools/rve-build` собирает игровой релиз из каталога проекта или запускает его в
 dev-режиме. Инструмент является внешним crate workspace и зависит от
-`engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`,
-`engine-files`, `engine-script` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
+`engine-project`, `engine-scene`, `engine-assets`, `engine-render`, `engine-resources`,
+`engine-pak`, `engine-files`, `engine-gui`, `engine-script` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
 Подробности runtime layout проекта и релиза находятся в
 [[Engine/EngineRuntime]], формат сцены — в [[Engine/EngineScene]], а формат архива и
 реестр — в [[Engine/EnginePak]].
@@ -110,6 +110,21 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 Dev-player использует библиотеку из проекта. При сборке SDK команда включает DLSS,
 только если `RVE_DLSS_SDK` задан, и записывает `dlss_enabled` в `rve-sdk.toml`;
 `run`/`build` с проектом, требующим DLSS, отклоняют SDK player без этой feature.
+
+## Проверка без сборки
+
+`rve-build check <project-dir>` выполняет тот же разбор проекта, что и `build`
+(`prepare_project`), и проверку назначений и реестра архивов (`validate_project_archives`):
+зарезервированные пути `/rve/project.toml`, `/rve/assets.toml` и `/rve/prefabs.toml`,
+имя исполняемого файла. Проверяются сцены, префабы и их ресурсы, lite-скрипты с их схемой
+и `params`, ссылки объектов и ресурсов, а также наличие `heavy_scripts` при heavy-ссылках.
+Команда не вызывает Cargo, не собирает архивы и не пишет файлы. При успехе печатает число
+включённых сцен, ресурсов и архивов, код 0. Первая ошибка выводится как `rve-build: <сообщение>`:
+код 2 — ошибка проекта, код 1 — операционная. Отсутствующий ресурс называет виртуальный путь.
+
+Не проверяются имена и `params` heavy-скриптов, потому что для них нужна собранная cdylib,
+а также Windows-только DLL FSR/DLSS и размер ICO-иконки, наличие player и Vulkan SDK.
+Эти проверки выполняются в `build` и `scripts`.
 
 ## Материалы и Surface shaders
 
@@ -274,7 +289,7 @@ MoltenVK (Apache-2.0).
 требует совместимое устройство.
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
-`archives.rs`, `player.rs`, `sdk.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
+`archives.rs`, `check.rs`, `player.rs`, `sdk.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
 
 В SDK-режиме на macOS Build Player берёт Vulkan из bundled `Contents/Resources/Engine`;
 явный `--vulkan-sdk` сохраняет приоритет. Windows SDK принимает только toolchain

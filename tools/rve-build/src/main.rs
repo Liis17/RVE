@@ -1,4 +1,5 @@
 mod archives;
+mod check;
 mod cli;
 mod error;
 #[cfg(windows)]
@@ -28,6 +29,16 @@ fn main() {
                     "{}",
                     path.map(|p| p.display().to_string()).unwrap_or_default()
                 );
+                0
+            }
+            Err(error) => {
+                eprintln!("rve-build: {error}");
+                error.exit_code()
+            }
+        },
+        Ok(CommandLine::Check { project_dir }) => match check::check_project(&project_dir) {
+            Ok(summary) => {
+                print!("{summary}");
                 0
             }
             Err(error) => {
