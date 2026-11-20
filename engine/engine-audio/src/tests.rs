@@ -1,5 +1,7 @@
 use super::*;
 use engine_scene::AudioGroup;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 fn voice(id: u64) -> VoiceId {
@@ -270,6 +272,8 @@ impl Harness {
             pending: Vec::new(),
             mixer: Some(mixer_tx),
             outbox: VecDeque::new(),
+            in_mixer: HashSet::new(),
+            settings: MixerSettings::default(),
             events: events_tx,
             decode_tx,
             stream_tx: Some(stream_tx),
@@ -840,4 +844,472 @@ fn fade_out_and_group_effects_reach_the_mixer() {
             MixerCommand::SetGroupEffects { group: AudioGroup::Music, effects: sent },
         ] if *stopped == voice(7) && *seconds == 1.5 && *sent == effects
     ));
+}
+
+/// Сколько `VoiceEnded` пришло на голос.
+fn voice_ended_count(events: &[AudioEvent], voice_id: VoiceId) -> usize {
+    events
+        .iter()
+        .filter(|event| **event == AudioEvent::VoiceEnded(voice_id))
+        .count()
+}
+
+fn failed_events(events: &[AudioEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AudioEvent::Failed(message) => Some(message.clone()),
+            AudioEvent::VoiceEnded(_) => None,
+        })
+        .collect()
+}
+
+/// Открытое подставным `open` устройство: концы колец, которыми владеет тест, и сигналы callback-а.
+struct FakeDevice {
+    commands: Consumer<MixerCommand>,
+    ended: Producer<VoiceId>,
+    signals: Signals,
+}
+
+/// Поток `rve-audio` с подставным устройством. `script` задаёт исходы открытий по порядку;
+/// без записи в нём открытие удаётся. Время — смещения от `base`, сна нет.
+struct Rig {
+    h: Harness,
+    device: Device<()>,
+    devices: Rc<RefCell<Vec<FakeDevice>>>,
+    script: Rc<RefCell<VecDeque<bool>>>,
+    base: Instant,
+}
+
+impl Rig {
+    fn new(output: bool) -> Self {
+        let mut h = Harness::new();
+        h.core.mixer = None;
+        let devices = Rc::new(RefCell::new(Vec::new()));
+        let script = Rc::new(RefCell::new(VecDeque::new()));
+        let (opened, outcomes) = (Rc::clone(&devices), Rc::clone(&script));
+        let open: OpenOutput<()> = Box::new(move |channels: Channels, signals: Signals| {
+            if outcomes.borrow_mut().pop_front().unwrap_or(true) {
+                opened.borrow_mut().push(FakeDevice {
+                    commands: channels.commands,
+                    ended: channels.ended,
+                    signals,
+                });
+                Ok(())
+            } else {
+                Err("устройство занято".to_owned())
+            }
+        });
+        let base = Instant::now();
+        let device = Device::new(output.then_some(open), h.core.events.clone(), base);
+        Self {
+            h,
+            device,
+            devices,
+            script,
+            base,
+        }
+    }
+
+    /// Выполняет очередь потери и открытия в момент `ms` от старта.
+    fn poll_at(&mut self, ms: u64) {
+        let now = self.base + Duration::from_millis(ms);
+        self.device.poll(now, &mut self.h.core);
+    }
+
+    fn fail_next(&self, times: usize) {
+        self.script
+            .borrow_mut()
+            .extend(std::iter::repeat_n(false, times));
+    }
+
+    fn opened(&self) -> usize {
+        self.devices.borrow().len()
+    }
+
+    fn set_alive(&self, index: usize) {
+        self.devices.borrow()[index]
+            .signals
+            .alive
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn set_lost(&self, index: usize) {
+        self.devices.borrow()[index]
+            .signals
+            .lost
+            .store(true, AtomicOrdering::Release);
+    }
+
+    /// Команды, которые устройство `index` получило из кольца, в порядке поступления.
+    fn received(&mut self, index: usize) -> Vec<MixerCommand> {
+        let mut devices = self.devices.borrow_mut();
+        let commands = &mut devices[index].commands;
+        std::iter::from_fn(|| commands.pop().ok()).collect()
+    }
+
+    /// Голоса, которые устройство `index` получило командой `Play` или `PlayStream`.
+    fn played(&mut self, index: usize) -> Vec<VoiceId> {
+        self.received(index)
+            .iter()
+            .filter_map(|command| match command {
+                MixerCommand::Play { voice, .. } | MixerCommand::PlayStream { voice, .. } => {
+                    Some(*voice)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Callback устройства `index` сообщает, что голос закончился.
+    fn callback_ended(&self, index: usize, voice_id: VoiceId) {
+        self.devices.borrow_mut()[index]
+            .ended
+            .push(voice_id)
+            .expect("кольцо завершённых голосов свободно");
+    }
+}
+
+#[test]
+fn a_failed_start_reports_once_and_retries_a_quarter_second_later() {
+    let mut r = Rig::new(true);
+    r.fail_next(1);
+    r.poll_at(0);
+    let failed = failed_events(&r.h.handle.poll_events());
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].starts_with("звук отключён"), "{failed:?}");
+
+    r.poll_at(249);
+    assert_eq!(r.opened(), 0, "вторая попытка не раньше 0.25 с");
+    r.poll_at(250);
+    assert_eq!(r.opened(), 1);
+    assert!(failed_events(&r.h.handle.poll_events()).is_empty());
+
+    r.h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    r.h.step();
+    assert_eq!(
+        r.played(0),
+        vec![voice(1)],
+        "после второй попытки звук играет"
+    );
+}
+
+#[test]
+fn a_loss_reports_once_and_reopens_at_once_when_the_stream_had_run() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.set_alive(0);
+    r.poll_at(10);
+    r.set_lost(0);
+    r.fail_next(1);
+    r.poll_at(20);
+    let failed = failed_events(&r.h.handle.poll_events());
+    assert_eq!(failed.len(), 1, "одна потеря — одно Failed: {failed:?}");
+    assert!(failed[0].contains("потеряно"), "{failed:?}");
+    assert_eq!(r.opened(), 1, "первая попытка сразу, но она не удалась");
+
+    r.poll_at(269);
+    assert_eq!(r.opened(), 1);
+    r.poll_at(270);
+    assert_eq!(r.opened(), 2, "следующая попытка через 0.25 с");
+    assert!(
+        failed_events(&r.h.handle.poll_events()).is_empty(),
+        "повторные неудачи не дают новых Failed"
+    );
+}
+
+#[test]
+fn a_stream_that_dies_before_its_first_callback_waits_longer_each_time() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.set_lost(0);
+    r.poll_at(0);
+    assert_eq!(r.opened(), 1, "первая попытка после открытия ждёт 0.25 с");
+    r.poll_at(249);
+    assert_eq!(r.opened(), 1);
+    r.poll_at(250);
+    assert_eq!(r.opened(), 2);
+
+    r.set_lost(1);
+    r.poll_at(250);
+    r.poll_at(749);
+    assert_eq!(r.opened(), 2, "после второго сбоя без callback ждём 0.5 с");
+    r.poll_at(750);
+    assert_eq!(r.opened(), 3);
+}
+
+#[test]
+fn without_output_the_device_never_tries_to_open() {
+    let mut r = Rig::new(false);
+    for ms in (0..10_000).step_by(100) {
+        r.poll_at(ms);
+    }
+    assert_eq!(r.opened(), 0);
+    assert_eq!(r.device.retry_in(r.base), None);
+    assert!(r.h.handle.poll_events().is_empty());
+}
+
+#[test]
+fn a_loss_is_handled_before_the_commands_of_the_same_wakeup() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    r.h.step();
+    assert_eq!(
+        r.played(0),
+        vec![voice(1)],
+        "голос 1 звучит на первом устройстве"
+    );
+
+    r.set_alive(0);
+    r.poll_at(1);
+    r.set_lost(0);
+    r.h.handle
+        .play(voice(2), "audio/hum.wav", request(false))
+        .unwrap();
+    r.poll_at(2);
+    r.h.step();
+
+    let events = r.h.handle.poll_events();
+    assert_eq!(voice_ended_count(&events, voice(1)), 1);
+    assert_eq!(voice_ended_count(&events, voice(2)), 0);
+    assert_eq!(
+        r.played(1),
+        vec![voice(2)],
+        "команда дошла до нового устройства"
+    );
+}
+
+#[test]
+fn a_voice_in_the_mixer_ends_once_when_the_device_is_lost() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    r.h.step();
+    let _ = r.received(0);
+    r.callback_ended(0, voice(1));
+    r.set_alive(0);
+    r.poll_at(0);
+    r.set_lost(0);
+    r.poll_at(0);
+
+    let events = r.h.handle.poll_events();
+    assert_eq!(voice_ended_count(&events, voice(1)), 1, "{events:?}");
+    assert_eq!(r.h.handle.lane_of(voice(1)), None);
+    assert_eq!(r.opened(), 2, "открыто заново");
+}
+
+#[test]
+fn a_voice_the_old_ring_still_holds_ends_once() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    r.h.step();
+    r.callback_ended(0, voice(1));
+    r.set_lost(0);
+    r.poll_at(0);
+    r.h.core.mixer_ended(voice(1));
+
+    let events = r.h.handle.poll_events();
+    assert_eq!(voice_ended_count(&events, voice(1)), 1, "{events:?}");
+}
+
+#[test]
+fn a_voice_pushed_into_a_full_ring_ends_when_the_device_is_lost() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.h.handle
+        .play(voice(100), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    r.h.step();
+    for index in 0..MIXER_CAPACITY {
+        r.h.core.send_mixer(MixerCommand::SetGroupVolume {
+            group: AudioGroup::Music,
+            volume: index as f32,
+        });
+    }
+    r.h.handle
+        .play(voice(9), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.step();
+    assert!(!r.h.core.outbox.is_empty(), "команда ждёт места в кольце");
+
+    r.set_lost(0);
+    r.poll_at(0);
+    assert!(
+        r.h.core
+            .outbox
+            .iter()
+            .all(|command| !matches!(command, MixerCommand::Play { .. }))
+    );
+    let events = r.h.handle.poll_events();
+    assert_eq!(voice_ended_count(&events, voice(9)), 1, "{events:?}");
+    assert_eq!(voice_ended_count(&events, voice(100)), 1, "{events:?}");
+}
+
+#[test]
+fn a_voice_that_has_no_device_ends_at_once_and_plays_after_the_reopen() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    r.h.step();
+    r.set_alive(0);
+    r.poll_at(1);
+    r.set_lost(0);
+    r.fail_next(1);
+    r.poll_at(2);
+    let _ = r.h.handle.poll_events();
+
+    r.h.handle
+        .play(voice(2), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.step();
+    assert_eq!(voice_ended_count(&r.h.handle.poll_events(), voice(2)), 1);
+
+    r.poll_at(252);
+    r.h.handle
+        .play(voice(3), "audio/hum.wav", request(false))
+        .unwrap();
+    r.h.step();
+    assert_eq!(
+        r.played(1),
+        vec![voice(3)],
+        "после восстановления звук снова играет"
+    );
+}
+
+#[test]
+fn a_loaded_voice_waiting_for_its_clip_keeps_its_lane_and_plays_on_the_new_device() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.h.handle
+        .play(voice(1), "audio/new.wav", request(false))
+        .unwrap();
+    r.h.step();
+    assert_eq!(r.h.handle.lane_of(voice(1)), Some(0));
+
+    r.set_alive(0);
+    r.poll_at(1);
+    r.set_lost(0);
+    r.poll_at(1);
+    assert_eq!(r.h.handle.lane_of(voice(1)), Some(0), "полоса сохранена");
+    assert_eq!(voice_ended_count(&r.h.handle.poll_events(), voice(1)), 0);
+
+    r.h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    r.h.step();
+    assert_eq!(
+        r.played(1),
+        vec![voice(1)],
+        "после декодирования голос уходит в новое устройство"
+    );
+}
+
+#[test]
+fn a_stream_waiting_for_its_ring_survives_the_loss_and_starts_on_the_new_device() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    r.h.handle
+        .play(voice(1), "music/theme.ogg", stream_request(true))
+        .unwrap();
+    r.h.step();
+    let _ = r.h.stream_jobs.try_recv();
+
+    r.set_alive(0);
+    r.poll_at(1);
+    r.set_lost(0);
+    r.poll_at(1);
+    assert_eq!(voice_ended_count(&r.h.handle.poll_events(), voice(1)), 0);
+
+    r.h.core.stream_event(StreamEvent::Ready {
+        voice: voice(1),
+        reader: ready_reader(),
+    });
+    assert_eq!(
+        r.played(1),
+        vec![voice(1)],
+        "готовый стрим уходит в новое устройство"
+    );
+}
+
+#[test]
+fn mixer_settings_are_restored_first_on_the_new_device() {
+    let mut r = Rig::new(true);
+    r.poll_at(0);
+    let effects = AudioGroupEffects {
+        lowpass_hz: 800.0,
+        ..AudioGroupEffects::default()
+    };
+    r.h.handle.set_paused(true).unwrap();
+    r.h.handle.set_mono_output(true).unwrap();
+    r.h.handle.set_group_volume(AudioGroup::Music, 0.5).unwrap();
+    r.h.handle
+        .set_group_effects(AudioGroup::Music, effects)
+        .unwrap();
+    r.h.step();
+    let _ = r.received(0);
+
+    r.set_alive(0);
+    r.poll_at(1);
+    r.set_lost(0);
+    r.poll_at(1);
+    let restored = r.received(1);
+    assert!(
+        matches!(
+            restored.as_slice(),
+            [
+                MixerCommand::SetPaused(true),
+                MixerCommand::SetMonoOutput(true),
+                MixerCommand::SetGroupVolume { group: AudioGroup::Music, volume },
+                MixerCommand::SetGroupEffects { group: AudioGroup::Music, effects: restored_effects },
+            ] if *volume == 0.5 && *restored_effects == effects
+        ),
+        "{restored:?}"
+    );
+}
+
+#[test]
+fn a_loss_with_eviction_ends_both_voices_once_and_late_reports_are_ignored() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    for id in 2..=VOICE_SLOTS as u64 {
+        h.handle
+            .play(voice(id), "audio/hum.wav", request(false))
+            .unwrap();
+    }
+    h.handle
+        .play(
+            voice(VOICE_SLOTS as u64 + 1),
+            "audio/hum.wav",
+            request(false),
+        )
+        .unwrap();
+    h.step();
+
+    h.core.device_lost();
+    h.core.mixer_ended(voice(1));
+    let events = h.handle.poll_events();
+    for id in 1..=VOICE_SLOTS as u64 + 1 {
+        assert_eq!(voice_ended_count(&events, voice(id)), 1, "голос {id}");
+    }
+    assert_eq!(h.handle.lane_of(voice(1)), None);
 }
