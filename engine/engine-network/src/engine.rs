@@ -83,6 +83,8 @@ enum Command {
 /// Клонируемый доступ к сетевому потоку из других потоков.
 #[derive(Clone)]
 pub struct NetworkHandle {
+    /// Шаг квантования позиции, с которым поднят поток; `None` — поток создан без настроек сессии.
+    position_step: Option<f32>,
     commands: Sender<Command>,
     events: Receiver<NetworkEvent>,
 }
@@ -116,6 +118,11 @@ impl NetworkHandle {
     /// Забирает накопленные события.
     pub fn poll_events(&self) -> Vec<NetworkEvent> {
         self.events.try_iter().collect()
+    }
+
+    /// Шаг квантования позиции потока; `None` — поток создан без настроек сессии.
+    pub fn position_step(&self) -> Option<f32> {
+        self.position_step
     }
 }
 
@@ -201,7 +208,9 @@ impl NetworkEngine {
                 (Machine::Client(Box::new(client)), UdpTransport::bind(bind)?)
             }
         };
-        Ok(Self::from_parts(machine, Box::new(transport)))
+        let (engine, mut handle) = Self::from_parts(machine, Box::new(transport));
+        handle.position_step = Some(position_step);
+        Ok((engine, handle))
     }
 
     pub(crate) fn from_parts(
@@ -223,6 +232,7 @@ impl NetworkEngine {
             recv_failed: false,
         };
         let handle = NetworkHandle {
+            position_step: None,
             commands: command_tx,
             events: event_rx,
         };

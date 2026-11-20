@@ -15,7 +15,7 @@ use crate::crypto::{
 };
 use crate::handshake::{
     ACCEPT_BODY, COOKIE_BODY, HANDSHAKE_RESEND, HANDSHAKE_TIMEOUT, Hello, confirm_datagram,
-    hello_datagram, hello_v2_datagram, parse_accept, parse_reject,
+    hello_datagram, hello_v2_datagram, parse_accept, parse_reject, reject_server_version,
 };
 use crate::link::{
     Link, OP_DISCONNECT, OP_FRAMES, auth_body, disconnect_body, parse_disconnect, parse_welcome,
@@ -313,13 +313,19 @@ impl Client {
         if hs.stage != Stage::Hello {
             return;
         }
-        hs.diagnosis = match header.kind {
-            Kind::Cookie if body.len() == COOKIE_BODY => Some(format!(
-                "сервер использует версию протокола {version}, клиент {WIRE_VERSION}"
-            )),
-            Kind::Reject => Some(parse_reject(body)),
-            _ => None,
-        };
+        match header.kind {
+            Kind::Cookie if body.len() == COOKIE_BODY => {
+                hs.diagnosis = Some(format!(
+                    "сервер использует версию протокола {version}, клиент {WIRE_VERSION}"
+                ));
+            }
+            // Отказ версии 3 на диагностический пробник означает, что сервер того же протокола:
+            // причиной таймаута он быть не может.
+            Kind::Reject if reject_server_version(body) != Some(WIRE_VERSION) => {
+                hs.diagnosis = Some(parse_reject(body));
+            }
+            _ => {}
+        }
     }
 
     fn on_welcome(
@@ -795,6 +801,66 @@ mod tests {
             vec![NetworkEvent::Disconnected {
                 peer: SERVER_PEER_ID,
                 reason: "протокол не совпадает".into()
+            }]
+        );
+    }
+
+    /// Отказ v3-сервера на диагностический пробник версии 2 не становится причиной таймаута:
+    /// он означает, что сервер того же протокола, а Cookie просто потерян.
+    #[test]
+    fn v3_server_reject_to_the_v2_probe_is_not_a_timeout_reason() {
+        use crate::handshake::foreign_reject_datagram;
+
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        client.update(now);
+        let reject = foreign_reject_datagram(
+            2,
+            "версия сетевого протокола не совпадает: сервер 3, клиент 2",
+        );
+        let out = client.handle_datagram(server, &reject, now);
+        assert!(out.events.is_empty() && out.datagrams.is_empty());
+        let out = client.update(now + HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            out.events,
+            vec![NetworkEvent::Disconnected {
+                peer: SERVER_PEER_ID,
+                reason: "таймаут подключения".into()
+            }]
+        );
+    }
+
+    /// Чужой Data не стирает диагностику версии 2: её причина остаётся до таймаута.
+    #[test]
+    fn foreign_data_keeps_the_v2_diagnosis() {
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let mut v2_cookie = Vec::new();
+        Header {
+            kind: Kind::Cookie,
+            conn_id: 0,
+        }
+        .encode_as(2, &mut v2_cookie);
+        v2_cookie.extend_from_slice(&[0u8; COOKIE_BODY]);
+        client.handle_datagram(server, &v2_cookie, now);
+
+        let mut v2_data = Vec::new();
+        Header {
+            kind: Kind::Data,
+            conn_id: 7,
+        }
+        .encode_as(2, &mut v2_data);
+        v2_data.extend_from_slice(&[0u8; 64]);
+        client.handle_datagram(server, &v2_data, now);
+
+        let out = client.update(now + HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            out.events,
+            vec![NetworkEvent::Disconnected {
+                peer: SERVER_PEER_ID,
+                reason: "сервер использует версию протокола 2, клиент 3".into()
             }]
         );
     }

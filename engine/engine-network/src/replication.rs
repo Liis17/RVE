@@ -71,6 +71,8 @@ const ROTATION_BYTES: usize = 6;
 const ROTATION_BITS: u32 = 47;
 const COMPONENT_BITS: u32 = 15;
 const COMPONENT_MAX: u32 = (1 << COMPONENT_BITS) - 1;
+/// Середина шкалы: квантованное значение нуля. Уровни симметричны: `0..=2·CENTER` помещаются в 15 бит.
+const COMPONENT_CENTER: u32 = (1 << (COMPONENT_BITS - 1)) - 1;
 /// Компоненты, отличные от наибольшей, лежат в `[-RANGE, RANGE]`: квадрат наибольшей не меньше 1/4.
 const COMPONENT_RANGE: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -232,6 +234,9 @@ pub struct SpawnBody {
     pub pose: Pose,
     /// Живые сетевые дети корня с их позами и владельцами.
     pub children: Vec<ChildBody>,
+    /// Список `children` полный. `false` — сервер обрезал его по [`MAX_SPAWN_CHILDREN`]: клиент не
+    /// удаляет детей, которых в списке нет.
+    pub children_complete: bool,
 }
 
 /// Состояние одного объекта в пакете: `mask` — переданные поля позы.
@@ -622,6 +627,7 @@ fn write_spawn(out: &mut Vec<u8>, body: &SpawnBody, codec: PoseCodec) -> Result<
     put_opt_peer(out, body.owner);
     put_opt_peer(out, body.parent.map(NetId::get));
     put_pose(out, &body.pose, MASK_ALL, codec)?;
+    out.push(u8::from(body.children_complete));
     out.extend_from_slice(&(body.children.len() as u16).to_be_bytes());
     for child in &body.children {
         put_u32(out, child.object.get());
@@ -639,6 +645,11 @@ fn read_spawn(reader: &mut Reader<'_>, codec: PoseCodec) -> Result<SpawnBody, Ne
     let owner = read_opt_peer(reader)?;
     let parent = read_opt_peer(reader)?.map(NetId::from_raw);
     let (_, pose) = read_pose(reader, codec)?;
+    let children_complete = match take_u8(reader)? {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid("неверный признак полного списка детей")),
+    };
     let count = reader.u16().ok_or_else(truncated)? as usize;
     if count > MAX_SPAWN_CHILDREN {
         return Err(invalid("у корня больше допустимого числа сетевых детей"));
@@ -668,6 +679,7 @@ fn read_spawn(reader: &mut Reader<'_>, codec: PoseCodec) -> Result<SpawnBody, Ne
         parent,
         pose,
         children,
+        children_complete,
     })
 }
 
@@ -855,17 +867,16 @@ fn rotation_from_bits(bits: u64) -> Option<Quat> {
     Some(Quat::from_array(unit).normalize())
 }
 
+/// Симметричная шкала: 0 кодируется точно как середина `COMPONENT_CENTER`, шаг одинаков по обе стороны.
 fn quantize_component(value: f32) -> u32 {
     let clamped = value.clamp(-COMPONENT_RANGE, COMPONENT_RANGE);
-    let t = clamped / COMPONENT_RANGE * 0.5 + 0.5;
-    (t * COMPONENT_MAX as f32)
-        .round()
-        .clamp(0.0, COMPONENT_MAX as f32) as u32
+    let steps = (clamped / COMPONENT_RANGE * COMPONENT_CENTER as f32).round() as i32;
+    (steps + COMPONENT_CENTER as i32) as u32
 }
 
 fn dequantize_component(quantized: u32) -> f32 {
-    let t = quantized as f32 / COMPONENT_MAX as f32;
-    (t * 2.0 - 1.0) * COMPONENT_RANGE
+    let steps = quantized as i32 - COMPONENT_CENTER as i32;
+    steps as f32 / COMPONENT_CENTER as f32 * COMPONENT_RANGE
 }
 
 fn put_vec3(out: &mut Vec<u8>, value: Vec3) {

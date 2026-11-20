@@ -29,6 +29,7 @@ fn spawn_body(serial: u32) -> SpawnBody {
         owner: Some(2),
         parent: Some(NetId::scene(9).unwrap()),
         pose: pose(1.0),
+        children_complete: true,
         children: Vec::new(),
     }
 }
@@ -36,6 +37,7 @@ fn spawn_body(serial: u32) -> SpawnBody {
 fn sample_messages() -> Vec<Message> {
     vec![
         Message::Spawn(SpawnBody {
+            children_complete: true,
             children: vec![ChildBody {
                 object: child_net_id(NetId::spawned(7).unwrap(), "lid"),
                 owner: Some(3),
@@ -175,6 +177,7 @@ fn spawn_children_keep_owner_mask_and_pose() {
         pose: pose(2.0),
     };
     let body = SpawnBody {
+        children_complete: true,
         children: vec![child.clone()],
         ..spawn_body(7)
     };
@@ -198,6 +201,7 @@ fn too_many_spawn_children_are_refused() {
         pose: Pose::default(),
     };
     let body = SpawnBody {
+        children_complete: true,
         children: vec![child; MAX_SPAWN_CHILDREN + 1],
         ..spawn_body(1)
     };
@@ -613,6 +617,7 @@ fn epochs_and_identity_fields_survive_the_wire() {
     };
     let body = SpawnBody {
         epoch: 99,
+        children_complete: true,
         children: vec![child.clone()],
         ..spawn_body(5)
     };
@@ -853,4 +858,38 @@ fn scene_hash_ignores_objects_without_network_components() {
     let plain = format!("{CAMERA}[[objects]]\nid = \"wall\"\n");
     let with_wall = format!("{CAMERA}[[objects]]\nid = \"wall\"\nname = \"Стена\"\n");
     assert_eq!(scene_hash(&scene(&plain)), scene_hash(&scene(&with_wall)));
+}
+
+#[test]
+fn zero_components_of_axis_rotations_decode_exactly() {
+    // Нулевые компоненты кодируются точно: тождественный поворот и поворот вокруг одной оси
+    // не получают шума у компонент, которые равны нулю.
+    let identity = rotation_from_bits(rotation_bits(Quat::IDENTITY).unwrap()).unwrap();
+    assert_eq!(identity, Quat::IDENTITY);
+    for axis in [
+        Quat::from_rotation_x(0.7),
+        Quat::from_rotation_y(-1.9),
+        Quat::from_rotation_z(2.4),
+    ] {
+        let decoded = rotation_from_bits(rotation_bits(axis).unwrap()).unwrap();
+        let original = [axis.x, axis.y, axis.z];
+        let got = [decoded.x, decoded.y, decoded.z];
+        for (index, value) in original.iter().enumerate() {
+            if *value == 0.0 {
+                assert_eq!(got[index], 0.0, "{axis:?} декодирован как {decoded:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn truncated_child_list_flag_round_trips() {
+    let mut body = spawn_body(7);
+    body.children_complete = false;
+    let decoded = decode(
+        &encode(&Message::Spawn(body.clone()), codec()).unwrap(),
+        codec(),
+    )
+    .unwrap();
+    assert_eq!(decoded, quantized(&Message::Spawn(body)));
 }

@@ -18,8 +18,8 @@ use crate::crypto::{
     password_proof, random_bytes, reject_session, transcript_hash,
 };
 use crate::handshake::{
-    HANDSHAKE_TIMEOUT, Hello, accept_datagram, cookie_datagram, cookie_valid, make_cookie,
-    parse_confirm, reject_datagram, reject_datagram_as,
+    HANDSHAKE_TIMEOUT, Hello, accept_datagram, cookie_datagram, cookie_valid,
+    foreign_reject_datagram, make_cookie, parse_confirm, reject_datagram,
 };
 use crate::link::{
     AUTH_BODY, Link, OP_AUTH, OP_DISCONNECT, OP_FRAMES, disconnect_body, parse_disconnect,
@@ -347,7 +347,7 @@ impl Server {
             "версия сетевого протокола не совпадает: сервер {WIRE_VERSION}, клиент {version}"
         );
         out.datagrams
-            .push((from, reject_datagram_as(version, &reason)));
+            .push((from, foreign_reject_datagram(version, &reason)));
     }
 
     fn on_hello(&self, from: SocketAddr, bytes: &[u8], now: Instant, out: &mut Output) {
@@ -793,6 +793,12 @@ mod tests {
         assert_eq!(
             reason_of(&out),
             "версия сетевого протокола не совпадает: сервер 3, клиент 2"
+        );
+        let body = &out.datagrams[0].1[HEADER_LEN..];
+        assert_eq!(
+            crate::handshake::reject_server_version(body),
+            Some(WIRE_VERSION),
+            "отказ несёт версию сервера"
         );
         assert!(server.halves.is_empty(), "полуоткрытая сессия не создана");
         assert_eq!(server.peer_count(), 0);

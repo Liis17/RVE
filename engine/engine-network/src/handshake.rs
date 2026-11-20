@@ -164,6 +164,29 @@ pub(crate) fn reject_datagram_as(version: u16, reason: &str) -> Vec<u8> {
     out
 }
 
+/// Хвост отказа на Hello чужой версии: метка и версия сервера (u16, big-endian) после текста.
+/// Прежний разбор отказа хвост игнорирует, поэтому текст читается как раньше.
+const VERSION_TAIL: u8 = b'V';
+
+/// Отказ на Hello чужой версии: заголовок echo-ит версию запроса, в конце — версия сервера.
+pub(crate) fn foreign_reject_datagram(request_version: u16, reason: &str) -> Vec<u8> {
+    let mut out = reject_datagram_as(request_version, reason);
+    out.push(VERSION_TAIL);
+    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+    out
+}
+
+/// Версия сервера из хвоста отказа на чужую версию. `None` — хвоста нет, это отказ прежнего вида.
+pub(crate) fn reject_server_version(body: &[u8]) -> Option<u16> {
+    let mut reader = Reader::new(body);
+    let len = reader.u8()?;
+    reader.take(usize::from(len))?;
+    match reader.take(3)? {
+        &[VERSION_TAIL, high, low] => Some(u16::from_be_bytes([high, low])),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_reject(body: &[u8]) -> String {
     let mut reader = Reader::new(body);
     let bytes = reader.u8().and_then(|len| reader.take(usize::from(len)));

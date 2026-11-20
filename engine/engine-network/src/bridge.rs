@@ -61,6 +61,10 @@ pub trait NetLink {
     fn send(&self, target: NetTarget, channel: Channel, bytes: &[u8]) -> Result<(), NetError>;
     fn disconnect(&self, peer: PeerId, reason: &str) -> Result<(), NetError>;
     fn poll_events(&self) -> Vec<NetworkEvent>;
+    /// Шаг квантования позиции потока. `None` — не известен: сверки с мостом нет.
+    fn position_step(&self) -> Option<f32> {
+        None
+    }
 }
 
 impl NetLink for NetworkHandle {
@@ -74,6 +78,10 @@ impl NetLink for NetworkHandle {
 
     fn poll_events(&self) -> Vec<NetworkEvent> {
         NetworkHandle::poll_events(self)
+    }
+
+    fn position_step(&self) -> Option<f32> {
+        NetworkHandle::position_step(self)
     }
 }
 
@@ -129,6 +137,25 @@ enum Kind {
     Root(String),
 }
 
+/// Поток состояний: кому уходят пакеты и по каким объектам считается отправка.
+#[derive(Clone, Copy, Debug)]
+enum Stream {
+    /// Всем участникам без фильтра значимости.
+    Everyone,
+    /// Серверу от клиента-владельца: только его объекты.
+    Owner(PeerId),
+    /// Участнику при фильтре: только видимые ему объекты.
+    Viewer(PeerId),
+}
+
+/// Данные пересчёта значимости на один тик: корни (по глубине), глубины, наблюдатели и принудительно
+/// видимые корни каждого участника. Собираются один раз, а не на каждого участника.
+struct InterestTable {
+    roots: Vec<RootInfo>,
+    depths: HashMap<NetId, usize>,
+    observers: HashMap<PeerId, Vec<Vec3>>,
+    forced: HashMap<PeerId, HashSet<NetId>>,
+}
 struct Replica {
     handle: ObjectHandle,
     kind: Kind,
@@ -271,6 +298,14 @@ impl<L: NetLink> NetworkBridge<L> {
             return Err(NetError::Config("tick_hz должен быть больше нуля".into()));
         }
         let codec = PoseCodec::new(config.position_step)?;
+        if link
+            .position_step()
+            .is_some_and(|step| step.to_bits() != config.position_step.to_bits())
+        {
+            return Err(NetError::Config(
+                "шаг квантования позиции моста не совпадает с сетевым потоком".into(),
+            ));
+        }
         if !config.interest_radius.is_finite() || config.interest_radius < 0.0 {
             return Err(NetError::Config(
                 "радиус значимости должен быть конечным и не меньше нуля".into(),
@@ -331,14 +366,17 @@ impl<L: NetLink> NetworkBridge<L> {
         let mut out = Vec::new();
         for event in self.link.poll_events() {
             self.on_event(event, world, sink, now, &mut out);
+            // RPC, выпущенные из очереди при регистрации, идут сразу за событием, которое их выпустило.
+            out.append(&mut self.ready_rpc);
         }
-        out.append(&mut self.ready_rpc);
         if !out.is_empty() {
             sink.queue_events(world, out);
         }
     }
 
     /// Отправляет запросы скриптов. Запросы берутся из `ScriptHost::drain_network_requests`.
+    /// Смены владельца применяются первыми и рассылаются с одним пересчётом видимости, затем идут RPC:
+    /// они маршрутизируются уже по новой видимости.
     pub fn apply<S: WorldSink>(
         &mut self,
         requests: Vec<NetRequest>,
@@ -348,6 +386,15 @@ impl<L: NetLink> NetworkBridge<L> {
         if self.mode == NetMode::Offline {
             return;
         }
+        let mut changed = Vec::new();
+        for request in &requests {
+            if let NetRequest::SetOwner { object, peer } = request
+                && let Some(net) = self.set_owner_local(*object, *peer, sink)
+            {
+                changed.push((net, *peer));
+            }
+        }
+        self.announce_owners(&changed, world);
         let mut out = Vec::new();
         for request in requests {
             match request {
@@ -369,9 +416,7 @@ impl<L: NetLink> NetworkBridge<L> {
                     }
                     None => debug!("сообщение объекту без сетевого id отброшено"),
                 },
-                NetRequest::SetOwner { object, peer } => {
-                    self.set_owner_request(object, peer, world, sink)
-                }
+                NetRequest::SetOwner { .. } => {}
             }
         }
         if !out.is_empty() {
@@ -389,6 +434,8 @@ impl<L: NetLink> NetworkBridge<L> {
         now: Instant,
     ) {
         if self.mode == NetMode::Offline {
+            // Снятые до потери связи объекты, которые ещё грузятся, удаляются по готовности.
+            self.finish_orphans(world, sink);
             return;
         }
         self.flush_retry();
@@ -454,7 +501,7 @@ impl<L: NetLink> NetworkBridge<L> {
             }
             NetworkEvent::Connected { peer } => self.on_connected(peer, world, sink, out),
             NetworkEvent::Disconnected { peer, reason } => {
-                self.on_disconnected(peer, reason, sink, out)
+                self.on_disconnected(peer, reason, world, sink, out)
             }
             NetworkEvent::Message { peer, bytes, .. } => {
                 if self.mode == NetMode::Offline {
@@ -489,7 +536,8 @@ impl<L: NetLink> NetworkBridge<L> {
                 self.faults.remove(&peer);
                 // Снимок строится по видимости, которую участник получает сразу, без отдельных Spawn.
                 if self.filtering() {
-                    self.refresh_peer(peer, world, false);
+                    let table = self.interest_table(world);
+                    self.refresh_peer(peer, world, &table, false);
                 }
                 self.send_snapshot(peer, world);
                 out.push(NetEvent::PeerConnected { peer });
@@ -507,6 +555,7 @@ impl<L: NetLink> NetworkBridge<L> {
         &mut self,
         peer: PeerId,
         reason: String,
+        world: &mut World,
         sink: &mut S,
         out: &mut Vec<NetEvent>,
     ) {
@@ -519,11 +568,13 @@ impl<L: NetLink> NetworkBridge<L> {
         out.push(NetEvent::PeerDisconnected { peer, reason });
         if self.mode == NetMode::Client && peer == SERVER_PEER_ID {
             // Сервер ушёл: клиент работает офлайн, объекты остаются последними известными.
+            // Загрузки, начатые по Spawn, отменяются: их объекты не должны появиться без регистрации.
             self.mode = NetMode::Offline;
             self.snapshot_seen = None;
             self.rpc_queue.clear();
             self.rpc_bytes = 0;
             self.deferred.clear();
+            self.cancel_pending(world, sink);
         }
         self.sync_state(sink);
     }
@@ -611,7 +662,7 @@ impl<L: NetLink> NetworkBridge<L> {
                         name,
                         value,
                     }),
-                    Some(net) => self.on_object_rpc(net, epoch, name, value, size, world),
+                    Some(net) => self.on_object_rpc(net, epoch, name, value, size, world, out),
                 },
                 Message::Snapshot(items) => {
                     self.snapshot_seen.get_or_insert_with(HashSet::new);
@@ -790,7 +841,16 @@ impl<L: NetLink> NetworkBridge<L> {
                 Some(replica) => Some(replica.handle),
                 // Родитель ещё загружается: вложенный корень ждёт его регистрации.
                 None if self.awaits(parent) => {
-                    self.deferred.push(body);
+                    // Повтор того же корня (снимок, resync) заменяет отложенный только более новым появлением.
+                    match self
+                        .deferred
+                        .iter_mut()
+                        .find(|waiting| waiting.root == body.root)
+                    {
+                        Some(waiting) if waiting.epoch < body.epoch => *waiting = body,
+                        Some(_) => {}
+                        None => self.deferred.push(body),
+                    }
                     return Ok(());
                 }
                 None => return Err("родитель не найден".to_owned()),
@@ -835,7 +895,15 @@ impl<L: NetLink> NetworkBridge<L> {
             world,
             sink,
         );
-        self.adopt_children(root, body.epoch, handle, Some(&body.children), world, sink);
+        self.adopt_children(
+            root,
+            body.epoch,
+            handle,
+            Some(&body.children),
+            body.children_complete,
+            world,
+            sink,
+        );
     }
 
     /// Регистрирует объект: корень или ребёнок. Возвращает `false`, если id уже занят.
@@ -866,13 +934,16 @@ impl<L: NetLink> NetworkBridge<L> {
 
     /// Регистрирует детей живого spawn-корня и применяет к новым объектам буферизованные позы.
     /// `children` — дети из Spawn на клиенте: сетевой ребёнок вне списка уже удалён сервером.
-    /// `None` — сервер регистрирует всех живых детей.
+    /// `None` — сервер регистрирует всех живых детей. `complete` — список полный: сетевой ребёнок вне
+    /// списка удаляется только тогда; обрезанный список детей не удаляет.
+    #[allow(clippy::too_many_arguments)]
     fn adopt_children<S: WorldSink>(
         &mut self,
         root: NetId,
         epoch: u32,
         handle: ObjectHandle,
         children: Option<&[ChildBody]>,
+        complete: bool,
         world: &mut World,
         sink: &mut S,
     ) {
@@ -894,7 +965,7 @@ impl<L: NetLink> NetworkBridge<L> {
             };
             let net = child_net_id(root, &relative);
             let body = children.and_then(|list| list.iter().find(|body| body.object == net));
-            if children.is_some() && body.is_none() {
+            if children.is_some() && body.is_none() && complete {
                 // Сервер удалил этого ребёнка: в мире он остался от префаба, но не появляется.
                 stale.push(child);
                 continue;
@@ -941,6 +1012,20 @@ impl<L: NetLink> NetworkBridge<L> {
             .get(&root)
             .map(|replica| replica.epoch)
             .or_else(|| self.pending.get(&root).map(|pending| pending.body.epoch))
+    }
+
+    /// Отменяет загрузки корней, ещё не зарегистрированных. Объект, который не удаётся снять, станет
+    /// снятым сиротой: его удалит [`Self::finish_orphans`].
+    fn cancel_pending<S: WorldSink>(&mut self, world: &mut World, sink: &mut S) {
+        for (net, pending) in std::mem::take(&mut self.pending) {
+            if !sink.despawn(world, pending.handle) {
+                if world.is_reserved(pending.handle) {
+                    self.orphans.push(pending.handle);
+                } else {
+                    warn!("загрузка сетевого объекта {:#010x} не отменена", net.get());
+                }
+            }
+        }
     }
 
     fn finish_pending<S: WorldSink>(&mut self, world: &mut World, sink: &mut S) {
@@ -1090,10 +1175,15 @@ impl<L: NetLink> NetworkBridge<L> {
                 self.remove_temporarily(net, epoch, world, sink);
             }
         }
+        // Отложенные вложенные корни, которых снимок не содержит, тоже не должны появиться.
+        self.deferred.retain(|body| seen.contains(&body.root));
     }
 
     /// Клиент: сервер снял появление корня `root` (`Leave`). Поддерево снимается временно.
     fn on_leave<S: WorldSink>(&mut self, root: NetId, epoch: u32, world: &mut World, sink: &mut S) {
+        // Вложенный корень, ждущий родителя, тоже снят: иначе он появится после загрузки родителя.
+        self.deferred
+            .retain(|body| body.root != root || body.epoch > epoch);
         if self.known_epoch(root).is_some_and(|known| known <= epoch) {
             self.remove_temporarily(root, epoch, world, sink);
         }
@@ -1165,48 +1255,63 @@ impl<L: NetLink> NetworkBridge<L> {
         }
     }
 
-    fn set_owner_request<S: WorldSink>(
+    /// Меняет владельца объекта сервера. Возвращает его сетевой id, если смена состоялась: рассылает её
+    /// [`Self::announce_owners`] после всех смен в шаге.
+    fn set_owner_local<S: WorldSink>(
         &mut self,
         object: ObjectHandle,
         peer: PeerId,
-        world: &World,
         sink: &mut S,
-    ) {
+    ) -> Option<NetId> {
         if !self.is_server() {
             warn!("set_net_owner вызван не на сервере и проигнорирован");
-            return;
+            return None;
         }
         let Some(net) = self.net_of(object) else {
             debug!("set_net_owner для объекта без сетевого id проигнорирован");
-            return;
+            return None;
         };
         if let Some(replica) = self.replicas.get_mut(&net) {
             replica.owner = Some(peer);
             sink.set_object_net(replica.handle, net, Some(peer));
         }
-        if !self.filtering() {
-            self.transmit(
-                NetTarget::All,
-                Channel::Reliable,
-                &Message::SetOwner {
-                    object: net,
-                    owner: Some(peer),
-                },
-            );
+        Some(net)
+    }
+
+    /// Рассылает смены владельца. Видимость пересчитывается один раз для всех смен: новый владелец мог
+    /// войти в зону, а старый выйти. `SetOwner` получают только участники, которые видят объект.
+    fn announce_owners(&mut self, changed: &[(NetId, PeerId)], world: &World) {
+        if changed.is_empty() {
             return;
         }
-        // Новый владелец мог войти в зону, а старый выйти: видимость пересчитывается до SetOwner,
-        // чтобы сообщение получили только те, кто видит объект.
+        if !self.filtering() {
+            for (net, peer) in changed {
+                self.transmit(
+                    NetTarget::All,
+                    Channel::Reliable,
+                    &Message::SetOwner {
+                        object: *net,
+                        owner: Some(*peer),
+                    },
+                );
+            }
+            return;
+        }
         self.refresh_all(world, true);
-        let viewers: Vec<PeerId> = self.peers.iter().copied().collect();
-        for viewer in viewers {
-            if self.view(viewer, net).is_some() {
+        for (net, peer) in changed {
+            let viewers: Vec<PeerId> = self
+                .peers
+                .iter()
+                .copied()
+                .filter(|viewer| self.view(*viewer, *net).is_some())
+                .collect();
+            for viewer in viewers {
                 self.transmit(
                     NetTarget::Peer(viewer),
                     Channel::Reliable,
                     &Message::SetOwner {
-                        object: net,
-                        owner: Some(peer),
+                        object: *net,
+                        owner: Some(*peer),
                     },
                 );
             }
@@ -1350,38 +1455,42 @@ impl<L: NetLink> NetworkBridge<L> {
         None
     }
 
-    /// Пересчёт значимости для всех участников. `emit` — отправлять ли Spawn и Leave сразу.
-    fn refresh_all(&mut self, world: &World, emit: bool) {
-        let peers: Vec<PeerId> = self.peers.iter().copied().collect();
-        for peer in peers {
-            self.refresh_peer(peer, world, emit);
-        }
-    }
-
-    /// Пересчёт значимости одного участника: решает [`interest::visible_roots`] по его наблюдателям,
-    /// затем рассылает Leave (глубокие раньше) и Spawn (предки раньше) при переходах.
-    fn refresh_peer(&mut self, peer: PeerId, world: &World, emit: bool) {
-        let Some(radius) = self.interest_radius else {
-            return;
-        };
-        let observers: Vec<Vec3> = self
+    /// Собирает данные значимости за один проход: мировые позиции объектов, корни с предками и
+    /// глубиной, наблюдателей и принудительно видимые корни каждого участника.
+    fn interest_table(&self, world: &World) -> InterestTable {
+        let positions: HashMap<NetId, Vec3> = self
             .replicas
-            .values()
-            .filter(|replica| replica.owner == Some(peer))
-            .filter_map(|replica| world.world_position(replica.handle))
+            .iter()
+            .filter_map(|(net, replica)| Some((*net, world.world_position(replica.handle)?)))
             .collect();
-        let mut forced = HashSet::new();
+        let parents: HashMap<NetId, Option<NetId>> = self
+            .replicas
+            .iter()
+            .filter(|(_, replica)| matches!(replica.kind, Kind::Root(_)))
+            .map(|(net, _)| (*net, self.parent_root(*net, world)))
+            .collect();
+        let mut observers: HashMap<PeerId, Vec<Vec3>> = HashMap::new();
+        for (net, replica) in &self.replicas {
+            if let (Some(owner), Some(position)) = (replica.owner, positions.get(net)) {
+                observers.entry(owner).or_default().push(*position);
+            }
+        }
+        let mut forced: HashMap<PeerId, HashSet<NetId>> = HashMap::new();
         for replica in self
             .replicas
             .values()
-            .filter(|replica| replica.owner == Some(peer) && !matches!(replica.kind, Kind::Scene))
+            .filter(|replica| replica.owner.is_some() && !matches!(replica.kind, Kind::Scene))
         {
+            let Some(owner) = replica.owner else {
+                continue;
+            };
+            let set = forced.entry(owner).or_default();
             let mut cursor = Some(replica.root);
             while let Some(net) = cursor {
-                if !forced.insert(net) {
+                if !set.insert(net) {
                     break;
                 }
-                cursor = self.parent_root(net, world);
+                cursor = parents.get(&net).copied().flatten();
             }
         }
         let mut roots: Vec<RootInfo> = self
@@ -1391,22 +1500,51 @@ impl<L: NetLink> NetworkBridge<L> {
             .filter_map(|(net, replica)| {
                 Some(RootInfo {
                     net: *net,
-                    position: world.world_position(replica.handle)?,
+                    position: *positions.get(net)?,
                     always: world
                         .network_identity(replica.handle)
                         .is_some_and(|identity| identity.always_relevant),
-                    parent: self.parent_root(*net, world),
+                    parent: parents.get(net).copied().flatten(),
                     depth: tree_depth(world, replica.handle),
                 })
             })
             .collect();
         roots.sort_by_key(|root| root.depth);
-        let depths: HashMap<NetId, usize> =
-            roots.iter().map(|root| (root.net, root.depth)).collect();
-        let depth_of = |net: &NetId| depths.get(net).copied().unwrap_or(0);
+        let depths = roots.iter().map(|root| (root.net, root.depth)).collect();
+        InterestTable {
+            roots,
+            depths,
+            observers,
+            forced,
+        }
+    }
+
+    /// Пересчёт значимости для всех участников. `emit` — отправлять ли Spawn и Leave сразу.
+    /// Фильтр выключен или участников нет — ничего не делает.
+    fn refresh_all(&mut self, world: &World, emit: bool) {
+        if !self.filtering() || self.peers.is_empty() {
+            return;
+        }
+        let table = self.interest_table(world);
+        let peers: Vec<PeerId> = self.peers.iter().copied().collect();
+        for peer in peers {
+            self.refresh_peer(peer, world, &table, emit);
+        }
+    }
+
+    /// Пересчёт значимости одного участника: решает [`interest::visible_roots`] по его наблюдателям,
+    /// затем рассылает Leave (глубокие раньше) и Spawn (предки раньше) при переходах.
+    fn refresh_peer(&mut self, peer: PeerId, world: &World, table: &InterestTable, emit: bool) {
+        let Some(radius) = self.interest_radius else {
+            return;
+        };
+        let observers = table.observers.get(&peer).map_or(&[][..], Vec::as_slice);
+        let no_forced = HashSet::new();
+        let forced = table.forced.get(&peer).unwrap_or(&no_forced);
+        let depth_of = |net: &NetId| table.depths.get(net).copied().unwrap_or(0);
 
         let previous = self.visible.get(&peer).cloned().unwrap_or_default();
-        let shown = interest::visible_roots(radius, &roots, &observers, &forced, &previous);
+        let shown = interest::visible_roots(radius, &table.roots, observers, forced, &previous);
 
         let mut left: Vec<(NetId, u32)> = previous
             .iter()
@@ -1589,11 +1727,11 @@ impl<L: NetLink> NetworkBridge<L> {
         ) {
             return;
         }
-        self.adopt_children(net, 0, root.handle, None, world, sink);
-        if self.filtering() {
-            // Новый корень получает Spawn только участникам, в чьей зоне он оказался.
-            self.refresh_all(world, true);
-        } else if let Some(body) = self.spawn_body(net, world) {
+        self.adopt_children(net, 0, root.handle, None, true, world, sink);
+        // При фильтре Spawn новому корню рассылает пересчёт значимости в конце тика: один на всю пачку.
+        if !self.filtering()
+            && let Some(body) = self.spawn_body(net, world)
+        {
             self.transmit(NetTarget::All, Channel::Reliable, &Message::Spawn(body));
         }
     }
@@ -1608,6 +1746,7 @@ impl<L: NetLink> NetworkBridge<L> {
             Some(parent) => Some(*self.by_handle.get(&parent)?),
             None => None,
         };
+        let (children, children_complete) = self.child_bodies(net, replica.handle, world);
         Some(SpawnBody {
             root: net,
             epoch: 0,
@@ -1616,16 +1755,22 @@ impl<L: NetLink> NetworkBridge<L> {
             owner: replica.owner,
             parent,
             pose: Pose::from_local(&object.transform),
-            children: self.child_bodies(net, replica.handle, world),
+            children,
+            children_complete,
         })
     }
 
     /// Живые сетевые дети spawn-корня с владельцами и синхронизируемыми позами. Ребёнок считается
     /// своим, только если его id выводится из корня (как в `adopt_children`): дети вложенного
-    /// корня сюда не попадают. Лишние сверх лимита сообщения отбрасываются с записью в лог.
-    fn child_bodies(&self, root_net: NetId, root: ObjectHandle, world: &World) -> Vec<ChildBody> {
+    /// корня сюда не попадают. Сверх лимита сообщения дети не передаются: признак полноты в ответе.
+    fn child_bodies(
+        &self,
+        root_net: NetId,
+        root: ObjectHandle,
+        world: &World,
+    ) -> (Vec<ChildBody>, bool) {
         let Some(root_id) = world.object(root).map(|object| object.id.clone()) else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
         let prefix = format!("{root_id}.");
         let mut children = Vec::new();
@@ -1658,11 +1803,12 @@ impl<L: NetLink> NetworkBridge<L> {
                 pose: Pose::from_local(local),
             });
         }
-        if children.len() > replication::MAX_SPAWN_CHILDREN {
-            warn!("у корня больше сетевых детей, чем помещается в spawn: лишние отброшены");
+        let complete = children.len() <= replication::MAX_SPAWN_CHILDREN;
+        if !complete {
+            warn!("у корня больше сетевых детей, чем помещается в spawn: лишние не переданы");
             children.truncate(replication::MAX_SPAWN_CHILDREN);
         }
-        children
+        (children, complete)
     }
 
     fn send_snapshot(&mut self, peer: PeerId, world: &World) {
@@ -1730,8 +1876,8 @@ impl<L: NetLink> NetworkBridge<L> {
             return;
         }
         let tick = self.clock.server_tick(now);
-        let due = self.due_states(world, now, |_| true);
-        self.send_batches(NetTarget::All, tick, &due, now);
+        let due = self.due_states(world, now, Stream::Everyone);
+        self.send_stream(Stream::Everyone, tick, &due, now);
     }
 
     /// Состояния при фильтре: каждому участнику — только видимые объекты, с общим бюджетом за тик.
@@ -1751,21 +1897,35 @@ impl<L: NetLink> NetworkBridge<L> {
                 break;
             }
             let peer = peers[(start + step) % peers.len()];
-            let mut due = self.due_for_peer(peer, world, now);
+            let mut due = self.due_states(world, now, Stream::Viewer(peer));
             due.truncate(budget);
             budget -= due.len();
-            if !due.is_empty() && self.send_states_to(peer, tick, &due, now) {
+            if !due.is_empty() && self.send_stream(Stream::Viewer(peer), tick, &due, now) {
                 blocked.get_or_insert(peer);
             }
         }
         self.state_turn = blocked.unwrap_or(peers[(start + 1) % peers.len()]);
     }
 
-    /// Состояния, которые пора отправить участнику: видимые ему объекты по его `sent`.
-    fn due_for_peer(&self, peer: PeerId, world: &World, now: Instant) -> Vec<StateItem> {
+    /// Клиент-владелец шлёт позу своих объектов серверу.
+    fn send_owned_states(&mut self, world: &World, now: Instant) {
+        if !self.peers.contains(&SERVER_PEER_ID) {
+            return;
+        }
+        let Some(local) = self.local_peer else {
+            return;
+        };
+        let tick = self.clock.last_tick;
+        let due = self.due_states(world, now, Stream::Owner(local));
+        self.send_stream(Stream::Owner(local), tick, &due, now);
+    }
+
+    /// Состояния, которые пора отправить потоку. Не меняет последнюю отправленную позу: её обновляет
+    /// [`Self::send_stream`] для состояний, которые приняла очередь.
+    fn due_states(&self, world: &World, now: Instant, stream: Stream) -> Vec<StateItem> {
         let mut due = Vec::new();
         for (net, replica) in &self.replicas {
-            let Some(epoch) = self.view(peer, *net) else {
+            let Some(epoch) = self.epoch_in(stream, *net, replica) else {
                 continue;
             };
             let Some(sync) = replica.sync else {
@@ -1779,14 +1939,14 @@ impl<L: NetLink> NetworkBridge<L> {
                 continue;
             };
             let pose = Pose::from_local(local);
-            let send = match self.sent.get(&(peer, *net)) {
+            let send = match self.last_sent(stream, *net, replica) {
                 None => true,
                 Some((previous, at)) => {
-                    let elapsed = now.saturating_duration_since(*at);
+                    let elapsed = now.saturating_duration_since(at);
                     let interval =
                         Duration::from_secs_f64(1.0 / f64::from(sync.send_rate_hz.max(1)));
                     elapsed >= KEYFRAME_INTERVAL
-                        || (elapsed >= interval && pose.differs(previous, mask, self.codec))
+                        || (elapsed >= interval && pose.differs(&previous, mask, self.codec))
                 }
             };
             if send {
@@ -1801,97 +1961,33 @@ impl<L: NetLink> NetworkBridge<L> {
         due
     }
 
-    /// Отправляет состояния одному участнику пакетами. Возвращает `true`, если очередь команд
-    /// отказала. `sent` меняется только у состояний, которые приняла очередь.
-    fn send_states_to(&mut self, peer: PeerId, tick: u32, due: &[StateItem], now: Instant) -> bool {
-        let mut blocked = false;
-        for range in state_batches(due, self.codec) {
-            let message = Message::States {
-                tick,
-                items: due[range.clone()].to_vec(),
-            };
-            let bytes = match replication::encode(&message, self.codec) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    error!("пакет состояний не закодирован: {err}");
-                    continue;
-                }
-            };
-            match self.try_send(NetTarget::Peer(peer), Channel::State, bytes) {
-                Ok(()) => {
-                    for item in &due[range] {
-                        self.sent.insert((peer, item.object), (item.pose, now));
-                    }
-                }
-                Err(err) => {
-                    warn!("состояния участнику {peer} не отправлены: {err}");
-                    blocked = true;
-                }
-            }
+    /// Номер появления объекта в потоке; `None` — объекта в нём нет. У серверного потока номер —
+    /// появление у участника, у остальных потоков — 0.
+    fn epoch_in(&self, stream: Stream, net: NetId, replica: &Replica) -> Option<u32> {
+        match stream {
+            Stream::Everyone => Some(0),
+            Stream::Owner(local) => owned_by(replica, Some(local)).then_some(0),
+            Stream::Viewer(peer) => self.view(peer, net),
         }
-        blocked
     }
 
-    /// Клиент-владелец шлёт позу своих объектов серверу.
-    fn send_owned_states(&mut self, world: &World, now: Instant) {
-        if !self.peers.contains(&SERVER_PEER_ID) {
-            return;
+    /// Последняя отправленная поза объекта в потоке: у участника своя, у остальных — общая.
+    fn last_sent(&self, stream: Stream, net: NetId, replica: &Replica) -> Option<(Pose, Instant)> {
+        match stream {
+            Stream::Viewer(peer) => self.sent.get(&(peer, net)).copied(),
+            Stream::Everyone | Stream::Owner(_) => replica.last_sent,
         }
-        let local = self.local_peer;
-        let tick = self.clock.last_tick;
-        let due = self.due_states(world, now, |replica| owned_by(replica, local));
-        self.send_batches(NetTarget::Server, tick, &due, now);
     }
 
-    /// Состояния, которые пора отправить. Не меняет `last_sent`: его обновляет [`Self::send_batches`]
-    /// для принятых очередью состояний.
-    fn due_states(
-        &self,
-        world: &World,
-        now: Instant,
-        filter: impl Fn(&Replica) -> bool,
-    ) -> Vec<StateItem> {
-        let mut due = Vec::new();
-        for (net, replica) in self.replicas.iter() {
-            if !filter(replica) {
-                continue;
-            }
-            let Some(sync) = replica.sync else {
-                continue;
-            };
-            let mask = sync_mask(&sync);
-            if mask == 0 {
-                continue;
-            }
-            let Some(local) = world.local_transform(replica.handle) else {
-                continue;
-            };
-            let pose = Pose::from_local(local);
-            let send = match replica.last_sent {
-                None => true,
-                Some((previous, at)) => {
-                    let elapsed = now.saturating_duration_since(at);
-                    let interval =
-                        Duration::from_secs_f64(1.0 / f64::from(sync.send_rate_hz.max(1)));
-                    elapsed >= KEYFRAME_INTERVAL
-                        || (elapsed >= interval && pose.differs(&previous, mask, self.codec))
-                }
-            };
-            if send {
-                due.push(StateItem {
-                    object: *net,
-                    epoch: 0,
-                    mask,
-                    pose,
-                });
-            }
-        }
-        due
-    }
-
-    /// Отправляет состояния пакетами. `last_sent` меняется только у состояний, которые приняла
-    /// очередь: непринятые уйдут в следующем тике, а не будут ждать keyframe.
-    fn send_batches(&mut self, target: NetTarget, tick: u32, due: &[StateItem], now: Instant) {
+    /// Отправляет состояния потоку пакетами. Последняя поза запоминается только у состояний, которые
+    /// приняла очередь: непринятые уйдут в следующем тике, а не будут ждать keyframe. Возвращает
+    /// `true`, если очередь команд отказала хотя бы для одного пакета.
+    fn send_stream(&mut self, stream: Stream, tick: u32, due: &[StateItem], now: Instant) -> bool {
+        let target = match stream {
+            Stream::Everyone => NetTarget::All,
+            Stream::Owner(_) => NetTarget::Server,
+            Stream::Viewer(peer) => NetTarget::Peer(peer),
+        };
         let mut lost = 0;
         let mut reason = None;
         for range in state_batches(due, self.codec) {
@@ -1909,8 +2005,15 @@ impl<L: NetLink> NetworkBridge<L> {
             match self.try_send(target, Channel::State, bytes) {
                 Ok(()) => {
                     for item in &due[range] {
-                        if let Some(replica) = self.replicas.get_mut(&item.object) {
-                            replica.last_sent = Some((item.pose, now));
+                        match stream {
+                            Stream::Viewer(peer) => {
+                                self.sent.insert((peer, item.object), (item.pose, now));
+                            }
+                            Stream::Everyone | Stream::Owner(_) => {
+                                if let Some(replica) = self.replicas.get_mut(&item.object) {
+                                    replica.last_sent = Some((item.pose, now));
+                                }
+                            }
                         }
                     }
                 }
@@ -1920,9 +2023,11 @@ impl<L: NetLink> NetworkBridge<L> {
                 }
             }
         }
+        let blocked = reason.is_some();
         if let Some(err) = reason {
             warn!("{lost} состояний не отправлено: {err}");
         }
+        blocked
     }
 
     /// Клиент применяет интерполированные позы к объектам с буфером состояний. Свои объекты
@@ -2000,6 +2105,7 @@ impl<L: NetLink> NetworkBridge<L> {
 
     /// Клиент: объектный RPC. Адресат создан и номер совпал — сразу в события; адресат ещё не
     /// создан (RPC обогнал Spawn) — в ограниченную очередь; устаревший номер — отбрасывается.
+    #[allow(clippy::too_many_arguments)]
     fn on_object_rpc(
         &mut self,
         net: NetId,
@@ -2008,11 +2114,12 @@ impl<L: NetLink> NetworkBridge<L> {
         value: ParamValue,
         size: usize,
         world: &World,
+        out: &mut Vec<NetEvent>,
     ) {
         if let Some(replica) = self.replicas.get(&net) {
             if replica.epoch == epoch {
                 match self.resolve(net, world) {
-                    Some(handle) => self.ready_rpc.push(NetEvent::Message {
+                    Some(handle) => out.push(NetEvent::Message {
                         peer: SERVER_PEER_ID,
                         object: Some(handle),
                         name,

@@ -29,6 +29,22 @@ const FAULT_BURST: usize = 32;
 const STEP: Duration = Duration::from_millis(10);
 const CRATE: &str = "prefabs/crate.rveprefab";
 const OWNED: &str = "prefabs/owned.rveprefab";
+/// Корень с числом детей больше лимита одного Spawn.
+const BIG: &str = "prefabs/big.rveprefab";
+const BIG_CHILDREN: usize = replication::MAX_SPAWN_CHILDREN + 1;
+
+fn big_text() -> String {
+    let mut text = "[[objects]]\nid = \"body\"\n[objects.network_identity]\n\
+        [objects.network_transform]\n"
+        .to_owned();
+    for index in 0..BIG_CHILDREN {
+        text.push_str(&format!(
+            "[[objects]]\nid = \"c{index}\"\nparent = \"body\"\n\
+             [objects.network_identity]\n[objects.network_transform]\n"
+        ));
+    }
+    text
+}
 const HEAVY: &str = "prefabs/heavy.rveprefab";
 const ALWAYS: &str = "prefabs/always.rveprefab";
 const ALWAYS_TEXT: &str = "[[objects]]\nid = \"beacon\"\n[objects.network_identity]\n\
@@ -64,6 +80,8 @@ struct Hub {
     snapshot_ends: usize,
     /// Доставленные `Spawn`: корень и сетевые id его детей, как их передал сервер.
     spawns: Vec<(NetId, Vec<NetId>)>,
+    /// Доставленные `Despawn`: адресат отправки и сетевой id.
+    despawns: Vec<(NetTarget, NetId)>,
     /// Сколько состояний сервер принимает за шаг; `None` — без ограничения.
     state_budget: Option<usize>,
     state_sent: usize,
@@ -99,6 +117,7 @@ impl Hub {
             match replication::decode(&bytes, codec()) {
                 Ok(Message::Snapshot(_)) => self.snapshot_messages += 1,
                 Ok(Message::SnapshotEnd) => self.snapshot_ends += 1,
+                Ok(Message::Despawn(net)) => self.despawns.push((target, net)),
                 Ok(Message::Spawn(body)) => self.spawns.push((
                     body.root,
                     body.children.iter().map(|child| child.object).collect(),
@@ -218,6 +237,10 @@ impl NetLink for Endpoint {
             .drain(..)
             .collect()
     }
+
+    fn position_step(&self) -> Option<f32> {
+        Some(POSITION_STEP)
+    }
 }
 
 /// Мир сцены с заглушками скриптового хоста: тяжёлые префабы ждут загрузки, отказы задаются.
@@ -244,6 +267,7 @@ impl TestSink {
         ] {
             templates.insert(path.to_owned(), load_template(path, text));
         }
+        templates.insert(BIG.to_owned(), load_template(BIG, &big_text()));
         Self {
             templates,
             heavy: heavy.iter().map(|path| (*path).to_owned()).collect(),
@@ -403,6 +427,15 @@ impl Session {
 
     /// Сессия с сервером, у которого радиус значимости `radius` (0 — без фильтра).
     fn with_radius(radius: f32) -> Self {
+        Self::with_mode(NetMode::Server, radius)
+    }
+
+    /// Сессия с хостом (сервер и локальный игрок в одном процессе) с радиусом `radius`.
+    fn host_with_radius(radius: f32) -> Self {
+        Self::with_mode(NetMode::Host, radius)
+    }
+
+    fn with_mode(mode: NetMode, radius: f32) -> Self {
         let hub = Rc::new(RefCell::new(Hub::default()));
         let now = Instant::now();
         let mut world = scene_world();
@@ -413,7 +446,7 @@ impl Session {
                 hub: hub.clone(),
             },
             BridgeConfig {
-                mode: NetMode::Server,
+                mode,
                 tick_hz: TICK_HZ,
                 position_step: POSITION_STEP,
                 interest_radius: radius,
@@ -1772,5 +1805,387 @@ fn leave_during_heavy_loading_cancels_the_spawn() {
     assert!(
         mirror(session.client(1), net).is_none(),
         "снятый до загрузки объект не появляется"
+    );
+}
+
+fn rpc_names(events: &[NetEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            NetEvent::Message { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn object_rpc_keeps_its_arrival_order_among_other_events() {
+    for radius in [0.0, RADIUS] {
+        let mut session = Session::with_radius(radius);
+        session.connect();
+        if radius > 0.0 {
+            let player = session.spawn_on_server(OWNED);
+            session.own(player, 1);
+        }
+        let root = session.spawn_on_server(CRATE);
+        let net = session.net_of(root);
+        session.step_n(2, STEP);
+
+        let epoch = session.epoch_for(1, net).expect("корень виден участнику");
+        session.client_mut(1).sink.events.clear();
+        session.inject_from(
+            Side::Server,
+            NetTarget::Peer(1),
+            &Message::Rpc {
+                object: Some(net),
+                epoch,
+                name: "object".to_owned(),
+                value: ParamValue::Bool(true),
+            },
+            Channel::Rpc,
+        );
+        session.inject_from(
+            Side::Server,
+            NetTarget::Peer(1),
+            &Message::Rpc {
+                object: None,
+                epoch: 0,
+                name: "global".to_owned(),
+                value: ParamValue::Bool(true),
+            },
+            Channel::Rpc,
+        );
+        session.step_n(2, STEP);
+        assert_eq!(
+            rpc_names(&session.client(1).sink.events),
+            ["object", "global"],
+            "радиус {radius}: порядок прихода сохраняется"
+        );
+    }
+}
+
+#[test]
+fn leave_removes_a_deferred_nested_root_before_its_parent_loads() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect_with(&[HEAVY]);
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let parent = session.spawn_on_server(HEAVY);
+    session.step_n(2, STEP);
+
+    // Вложенный корень появляется у клиента, пока родитель ещё загружается, и отложен.
+    let parent_id = session.server.world.object(parent).unwrap().id.clone();
+    let lid = session
+        .server
+        .world
+        .handle(&format!("{parent_id}.lid"))
+        .unwrap();
+    let nested = session
+        .server
+        .sink
+        .spawn(
+            &mut session.server.world,
+            CRATE,
+            SpawnOptions {
+                parent: Some(lid),
+                ..SpawnOptions::default()
+            },
+        )
+        .unwrap();
+    session.server.spawned.push(SpawnedRoot {
+        handle: nested,
+        prefab: CRATE.to_owned(),
+    });
+    session.step_n(2, STEP);
+    let nested_net = session.net_of(nested);
+
+    // Вложенный корень уходит из зоны: сервер шлёт Leave, пока клиент его ещё ждёт.
+    set_position(
+        &mut session.server.world,
+        nested,
+        Vec3::new(500.0, 0.0, 0.0),
+    );
+    session.step_n(2, STEP);
+
+    let node = session.client_mut(1);
+    node.sink.finish_loading(&mut node.world);
+    session.step_n(3, STEP);
+    assert!(
+        mirror(session.client(1), nested_net).is_none(),
+        "снятый вложенный корень не появляется после загрузки родителя"
+    );
+}
+
+#[test]
+fn server_loss_cancels_the_pending_spawn_so_no_unregistered_object_appears() {
+    let mut session = Session::new();
+    session.connect_with(&[HEAVY]);
+    let root = session.spawn_on_server(HEAVY);
+    let net = session.net_of(root);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(1), net).is_none(),
+        "префаб ещё загружается"
+    );
+
+    // Сервер пропал: клиент уходит в Offline, пока загрузка идёт.
+    session.hub.borrow_mut().deliver(
+        Side::Client(1),
+        NetworkEvent::Disconnected {
+            peer: 0,
+            reason: "потеряна связь".to_owned(),
+        },
+    );
+    session.step_n(2, STEP);
+
+    let node = session.client_mut(1);
+    node.sink.finish_loading(&mut node.world);
+    session.step_n(2, STEP);
+    let spawned = replication::spawn_id(net, HEAVY);
+    assert!(
+        session.client(1).world.handle(&spawned).is_none(),
+        "объект, начатый до потери сервера, не появляется незарегистрированным"
+    );
+}
+
+#[test]
+fn truncated_child_list_keeps_the_children_it_leaves_out() {
+    let mut session = Session::new();
+    session.connect();
+    let root = session.spawn_on_server(BIG);
+    let net = session.net_of(root);
+    session.step_n(3, STEP);
+
+    let client = session.client(1);
+    let mirrored = mirror(client, net).expect("корень создан");
+    // Список детей в Spawn обрезан по лимиту, но ни один ребёнок сервера не удаляется клиентом.
+    assert_eq!(client.world.subtree(&[mirrored]).len(), 1 + BIG_CHILDREN);
+    for index in 0..BIG_CHILDREN {
+        let child = child_net_id(net, &format!("c{index}"));
+        assert!(
+            mirror(client, child).is_some(),
+            "ребёнок c{index} зарегистрирован"
+        );
+    }
+}
+
+#[test]
+fn bridge_refuses_a_position_step_that_differs_from_the_network() {
+    let hub = Rc::new(RefCell::new(Hub::default()));
+    let mut world = scene_world();
+    let mut sink = TestSink::new(&[]);
+    let result = NetworkBridge::attach(
+        Endpoint {
+            side: Side::Server,
+            hub,
+        },
+        BridgeConfig {
+            mode: NetMode::Server,
+            tick_hz: TICK_HZ,
+            position_step: 0.5,
+            interest_radius: 0.0,
+        },
+        &mut world,
+        &mut sink,
+        Instant::now(),
+    );
+    assert!(
+        matches!(result, Err(NetError::Config(_))),
+        "шаг моста должен совпадать с шагом сетевого потока"
+    );
+}
+
+#[test]
+fn spawn_batch_in_one_tick_reaches_every_viewer() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    session.connect();
+    let first = session.spawn_on_server(OWNED);
+    session.own(first, 1);
+    let second = session.spawn_on_server(OWNED);
+    session.own(second, 2);
+    session.step_n(2, STEP);
+
+    // Пять корней появляются в одном тике: каждый видящий участник получает все пять.
+    let mut roots = Vec::new();
+    for _ in 0..5 {
+        let handle = session
+            .server
+            .sink
+            .spawn(&mut session.server.world, CRATE, SpawnOptions::default())
+            .unwrap();
+        session.server.spawned.push(SpawnedRoot {
+            handle,
+            prefab: CRATE.to_owned(),
+        });
+        roots.push(handle);
+    }
+    session.step_n(3, STEP);
+
+    for peer in [1, 2] {
+        for handle in &roots {
+            let net = session.net_of(*handle);
+            assert!(
+                mirror(session.client(peer), net).is_some(),
+                "участник {peer} получил корень {:#010x}",
+                net.get()
+            );
+        }
+    }
+}
+
+#[test]
+fn despawn_outside_the_zone_reaches_only_the_viewers_of_the_root() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    session.connect();
+    let near_player = session.spawn_on_server(OWNED);
+    session.own(near_player, 1);
+    let far_player = session.spawn_at(OWNED, 500.0);
+    session.own(far_player, 2);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.step_n(2, STEP);
+    assert!(
+        mirror(session.client(2), net).is_none(),
+        "участник 2 не видит корень"
+    );
+
+    assert!(session.server.sink.despawn(&mut session.server.world, root));
+    session.step_n(3, STEP);
+    let despawns = session.hub.borrow().despawns.clone();
+    let recipients: Vec<NetTarget> = despawns
+        .iter()
+        .filter(|(_, sent)| *sent == net)
+        .map(|(target, _)| *target)
+        .collect();
+    assert_eq!(
+        recipients,
+        vec![NetTarget::Peer(1)],
+        "Despawn получает только видевший участник"
+    );
+    assert!(mirror(session.client(1), net).is_none());
+}
+
+#[test]
+fn spawn_of_a_despawned_root_is_not_sent_again() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let root = session.spawn_on_server(CRATE);
+    let net = session.net_of(root);
+    session.step_n(2, STEP);
+    assert!(session.server.sink.despawn(&mut session.server.world, root));
+    session.step_n(5, STEP);
+
+    let spawns = session
+        .hub
+        .borrow()
+        .spawns
+        .iter()
+        .filter(|(sent, _)| *sent == net)
+        .count();
+    assert_eq!(spawns, 1, "после удаления новый Spawn того же id не уходит");
+}
+
+#[test]
+fn host_delivers_its_own_object_rpc_locally_while_remote_peers_see_only_the_zone() {
+    let mut session = Session::host_with_radius(RADIUS);
+    session.connect();
+    let far = session.spawn_at(CRATE, 500.0);
+    session.step_n(2, STEP);
+    let server = &mut session.server;
+    server.bridge.apply(
+        vec![NetRequest::ObjectSend {
+            object: far,
+            name: "local".to_owned(),
+            value: ParamValue::Bool(true),
+            target: NetTarget::All,
+            reliable: true,
+        }],
+        &mut server.world,
+        &mut server.sink,
+    );
+    assert!(
+        has_message(&session.server.sink.events, 0, Some(far), "local"),
+        "хост получает RPC своего объекта вне зоны"
+    );
+    session.step_n(2, STEP);
+    assert!(
+        !has_rpc(&session.client(1).sink.events, "local"),
+        "удалённый участник вне зоны RPC не получает"
+    );
+}
+
+#[test]
+fn queue_full_on_every_step_still_serves_each_participant() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    session.connect();
+    let first = session.spawn_on_server(OWNED);
+    session.own(first, 1);
+    let second = session.spawn_on_server(OWNED);
+    session.own(second, 2);
+    let crate_root = session.spawn_on_server(CRATE);
+    let net = session.net_of(crate_root);
+    session.step_n(3, STEP);
+
+    // Очередь команд принимает одно состояние за шаг: участники обслуживаются по кругу.
+    session.hub.borrow_mut().state_budget = Some(1);
+    set_position(
+        &mut session.server.world,
+        crate_root,
+        Vec3::new(5.0, 0.0, 0.0),
+    );
+    session.step_n(30, STEP);
+    for peer in [1, 2] {
+        let handle = mirror(session.client(peer), net).expect("корень у участника");
+        assert!(
+            (position_of(&session.client(peer).world, handle).x - 5.0).abs() < 1e-3,
+            "участник {peer} получает движение при переполненной очереди"
+        );
+    }
+}
+
+#[test]
+fn filtered_resync_snapshot_carries_only_visible_objects_and_returns_them_later() {
+    let mut session = Session::with_radius(RADIUS);
+    session.connect();
+    let player = session.spawn_on_server(OWNED);
+    session.own(player, 1);
+    let near = session.spawn_on_server(CRATE);
+    let far = session.spawn_at(CRATE, 500.0);
+    session.step_n(2, STEP);
+    let near_net = session.net_of(near);
+    let far_net = session.net_of(far);
+    assert!(mirror(session.client(1), far_net).is_none());
+
+    session.inject(Side::Client(1), &Message::ResyncRequest, Channel::Reliable);
+    session.step_n(3, STEP);
+    assert!(
+        mirror(session.client(1), near_net).is_some(),
+        "видимый объект в снимке"
+    );
+    assert!(
+        mirror(session.client(1), far_net).is_none(),
+        "невидимый объект не в снимке"
+    );
+
+    // Объект уходит из зоны: снимок без него снимает его временно, а вернувшийся появляется снова.
+    session.place(near, 500.0);
+    session.step(Duration::from_secs(6));
+    session.inject(Side::Client(1), &Message::ResyncRequest, Channel::Reliable);
+    session.step_n(3, STEP);
+    assert!(
+        mirror(session.client(1), near_net).is_none(),
+        "ушедший из зоны снят"
+    );
+
+    session.place(near, 0.0);
+    session.step_n(3, STEP);
+    assert!(
+        mirror(session.client(1), near_net).is_some(),
+        "вернувшийся объект появился"
     );
 }
