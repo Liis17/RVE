@@ -112,7 +112,7 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 входного проекта с кодом 2.
 
 Если Windows-проект задаёт `runtime.dlss_library`, builder проверяет, что
-`nvngx_dlss.dll` находится внутри проекта, собирает checkout player с feature `dlss`
+`nvngx_dlss.dll` находится внутри проекта, собирает checkout player с feature `rve-player/dlss`
 и копирует runtime DLL в `Engine/`. Для player build требуется `RVE_DLSS_SDK` с
 официальным Windows x64 SDK и `nvsdk_ngx_s.lib`; NGX binaries репозиторий не содержит.
 Dev-player использует библиотеку из проекта. При сборке SDK команда включает DLSS,
@@ -187,14 +187,14 @@ tools/rve-build/src/project.rs валидирует каждый использ�
 
 Без маркера используется checkout-режим. Distribution flavor собирает пакеты
 `rve-player` и `rve-crash-monitor` одним вызовом `cargo build --release --locked -p rve-player -p rve-crash-monitor
---no-default-features --features rve-player/crash-dumps` и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`; dev flavor
+--no-default-features --features rve-player/crash-dumps,rve-crash-monitor/server` и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`; dev flavor
 собирает default features (включая `crash-dumps`) вместе с монитором в `build/player-dev`. Для Windows-проекта с
-`runtime.dlss_library` добавляется feature `rve-player/dlss`, а `RVE_DLSS_SDK` должен
+`runtime.dlss_library` в тот же список features добавляется `rve-player/dlss`, а `RVE_DLSS_SDK` должен
 указывать на SDK root с `nvsdk_ngx_s.lib`. Путь к исполняемому файлу берётся из
 Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to date` по полю `fresh`
 этого артефакта.
 
-Выделенный сервер `rve-server` собирается тем же механизмом командой `cargo build --release --locked -p rve-server -p rve-crash-monitor --no-default-features --features rve-server/crash-dumps` в `build/server`. Сборка без dev-console и DLSS; при сборке SDK он копируется как соседний executable `rve-server` (`rve-server.exe` на Windows), монитор — рядом с ним.
+Выделенный сервер `rve-server` собирается тем же механизмом командой `cargo build --release --locked -p rve-server -p rve-crash-monitor --no-default-features --features rve-server/crash-dumps,rve-crash-monitor/server` в `build/server`. Сборка без dev-console и DLSS; при сборке SDK он копируется как соседний executable `rve-server` (`rve-server.exe` на Windows), монитор — рядом с ним.
 
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
 `engine_version`, `abi_version`, `target` и `dlss_enabled`. Последнее поле по
