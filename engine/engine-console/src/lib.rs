@@ -5,7 +5,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const CONSOLE_BUFFER_CAPACITY: usize = 2_000;
 pub const COMMAND_HISTORY_CAPACITY: usize = 100;
@@ -222,6 +225,20 @@ impl fmt::Display for CatalogError {
 
 impl Error for CatalogError {}
 
+/// Встроенные команды, отсортированные по имени; в `CommandCatalog` не хранятся.
+static BUILTIN_COMMANDS: LazyLock<[CommandSpec; 2]> = LazyLock::new(|| {
+    [
+        CommandSpec {
+            name: "clear".into(),
+            description: "clear console output".into(),
+        },
+        CommandSpec {
+            name: "help".into(),
+            description: "list commands, optionally filtered by prefix".into(),
+        },
+    ]
+});
+
 #[derive(Clone, Debug, Default)]
 pub struct CommandCatalog {
     commands: BTreeMap<String, CommandSpec>,
@@ -250,28 +267,30 @@ impl CommandCatalog {
         self.commands.get(name)
     }
 
+    /// Встроенные и зарегистрированные команды по имени, без копирования и сортировки.
+    pub fn iter(&self) -> impl Iterator<Item = &CommandSpec> {
+        let mut builtins = BUILTIN_COMMANDS.iter().peekable();
+        let mut registered = self.commands.values().peekable();
+        std::iter::from_fn(move || {
+            let builtin = builtins.next_if(|builtin| {
+                registered
+                    .peek()
+                    .is_none_or(|registered| builtin.name <= registered.name)
+            });
+            builtin.or_else(|| registered.next())
+        })
+    }
+
     pub fn commands(&self) -> Vec<CommandSpec> {
-        let mut commands = vec![
-            CommandSpec {
-                name: "clear".into(),
-                description: "clear console output".into(),
-            },
-            CommandSpec {
-                name: "help".into(),
-                description: "list commands, optionally filtered by prefix".into(),
-            },
-        ];
-        commands.extend(self.commands.values().cloned());
-        commands.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        commands
+        self.iter().cloned().collect()
     }
 
     /// Prefix matches are returned first; remaining substring matches follow, all by name.
-    pub fn complete(&self, input: &str) -> Vec<CommandSpec> {
+    pub fn matches(&self, input: &str) -> Vec<&CommandSpec> {
         let input = input.to_ascii_lowercase();
         let mut prefix = Vec::new();
         let mut substring = Vec::new();
-        for command in self.commands() {
+        for command in self.iter() {
             if command.name.starts_with(&input) {
                 prefix.push(command);
             } else if command.name.contains(&input) {
@@ -282,25 +301,30 @@ impl CommandCatalog {
         prefix
     }
 
+    pub fn complete(&self, input: &str) -> Vec<CommandSpec> {
+        self.matches(input).into_iter().cloned().collect()
+    }
+
+    /// Common prefix of the prefix matches, or of the substring matches when there are none.
     pub fn common_prefix(&self, input: &str) -> String {
         let input = input.to_ascii_lowercase();
-        let prefix_matches: Vec<_> = self
-            .commands()
-            .into_iter()
-            .filter(|command| command.name.starts_with(&input))
-            .collect();
-        if prefix_matches.is_empty() {
-            let matches = self.complete(&input);
-            common_prefix(matches.iter().map(|command| command.name.as_str()))
-        } else {
-            common_prefix(prefix_matches.iter().map(|command| command.name.as_str()))
-        }
+        let has_prefix_match = self.iter().any(|command| command.name.starts_with(&input));
+        let names = self
+            .iter()
+            .map(|command| command.name.as_str())
+            .filter(|name| {
+                if has_prefix_match {
+                    name.starts_with(&input)
+                } else {
+                    name.contains(&input)
+                }
+            });
+        common_prefix(names)
     }
 
     pub fn help(&self, prefix: &str) -> Vec<String> {
         let prefix = prefix.to_ascii_lowercase();
-        self.commands()
-            .into_iter()
+        self.iter()
             .filter(|command| command.name.starts_with(&prefix))
             .map(|command| format!("{} — {}", command.name, command.description))
             .collect()
@@ -540,6 +564,106 @@ mod tests {
                 .help("help")
                 .iter()
                 .any(|entry| entry.starts_with("help —"))
+        );
+    }
+
+    fn catalog_with(names: &[&str]) -> CommandCatalog {
+        let mut catalog = CommandCatalog::default();
+        for name in names {
+            catalog
+                .register(CommandSpec::new(*name, "description").unwrap())
+                .unwrap();
+        }
+        catalog
+    }
+
+    fn names<'a>(specs: impl IntoIterator<Item = &'a CommandSpec>) -> Vec<&'a str> {
+        specs.into_iter().map(|spec| spec.name.as_str()).collect()
+    }
+
+    #[test]
+    fn builtins_are_merged_into_name_order() {
+        let mut catalog = catalog_with(&["zz", "aaa", "help_me", "mid"]);
+        let expected = ["aaa", "clear", "help", "help_me", "mid", "zz"];
+        assert_eq!(names(catalog.iter()), expected);
+        assert_eq!(
+            catalog
+                .commands()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(names(catalog.matches("")), expected);
+
+        catalog.remove("aaa");
+        catalog
+            .register(CommandSpec::new("b", "x").unwrap())
+            .unwrap();
+        assert_eq!(
+            names(catalog.iter()),
+            ["b", "clear", "help", "help_me", "mid", "zz"]
+        );
+    }
+
+    #[test]
+    fn builtins_are_not_stored_in_the_registry() {
+        let mut catalog = CommandCatalog::default();
+        assert!(catalog.get("help").is_none());
+        assert!(catalog.get("clear").is_none());
+        assert!(!catalog.remove("help"));
+        assert!(!catalog.remove("clear"));
+        assert_eq!(names(catalog.iter()), ["clear", "help"]);
+    }
+
+    #[test]
+    fn prefix_and_substring_groups_are_each_ordered_by_name() {
+        let catalog = catalog_with(&["xab", "ab_b", "zab", "ab_a", "cab"]);
+        assert_eq!(
+            names(catalog.matches("ab")),
+            ["ab_a", "ab_b", "cab", "xab", "zab"]
+        );
+        assert_eq!(names(catalog.matches("e")), ["clear", "help"]);
+        assert_eq!(names(catalog.matches("el")), ["help"]);
+    }
+
+    #[test]
+    fn matching_ignores_input_case() {
+        let catalog = catalog_with(&["ab_a", "ab_b"]);
+        assert_eq!(names(catalog.matches("HE")), ["help"]);
+        assert_eq!(names(catalog.matches("AB")), ["ab_a", "ab_b"]);
+        assert_eq!(catalog.complete("Ab")[0].name, "ab_a");
+        assert_eq!(catalog.common_prefix("Ab"), "ab_");
+    }
+
+    #[test]
+    fn common_prefix_uses_substring_matches_only_without_prefix_matches() {
+        let catalog = catalog_with(&["game.spawn_a", "game.spawn_b"]);
+        assert_eq!(catalog.common_prefix("spawn"), "game.spawn_");
+        assert_eq!(catalog.common_prefix("zzz"), "");
+        assert_eq!(catalog.common_prefix("cl"), "clear");
+    }
+
+    #[test]
+    fn empty_input_lists_every_command_and_has_no_common_prefix() {
+        let catalog = catalog_with(&["alpha", "beta"]);
+        assert_eq!(
+            names(catalog.matches("")),
+            ["alpha", "beta", "clear", "help"]
+        );
+        assert_eq!(catalog.common_prefix(""), "");
+    }
+
+    #[test]
+    fn help_lists_builtins_and_registered_commands_in_order() {
+        let catalog = catalog_with(&["alpha", "help_x"]);
+        let lines = catalog.help("h");
+        assert_eq!(
+            lines,
+            [
+                "help — list commands, optionally filtered by prefix",
+                "help_x — description",
+            ]
         );
     }
 
