@@ -144,15 +144,34 @@ impl SkeletonBuilder {
 
 /// Веса вершины по кандидатам `(кость, вес)`: четыре крупнейших, нормализованных.
 ///
+/// Кандидаты с весом не больше нуля или не конечным отбрасываются. Топ-4 держится
+/// во фиксированном массиве вставкой без аллокаций: при равных весах более ранний
+/// кандидат остаётся впереди, как при стабильной сортировке по убыванию с обрезкой до четырёх.
 /// Вершина без положительных весов привязывается к `rigid` с весом 1.
-pub(crate) fn influences(candidates: &[(u32, f32)], rigid: u32) -> ([u32; 4], [f32; 4]) {
-    let mut sorted: Vec<(u32, f32)> = candidates
-        .iter()
-        .copied()
-        .filter(|&(_, weight)| weight.is_finite() && weight > 0.0)
-        .collect();
-    sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
-    sorted.truncate(4);
+pub(crate) fn influences(
+    candidates: impl IntoIterator<Item = (u32, f32)>,
+    rigid: u32,
+) -> ([u32; 4], [f32; 4]) {
+    let mut top = [(0, 0.0_f32); 4];
+    let mut len = 0;
+    for (joint, weight) in candidates {
+        if !(weight.is_finite() && weight > 0.0) {
+            continue;
+        }
+        // Новый кандидат встаёт после всех не меньших весов, поэтому равные сохраняют порядок входа.
+        let position = top[..len]
+            .iter()
+            .position(|&(_, kept)| weight > kept)
+            .unwrap_or(len);
+        if position == top.len() {
+            continue;
+        }
+        // Последний слот вытесняется, если список уже полон.
+        top.copy_within(position..len.min(3), position + 1);
+        top[position] = (joint, weight);
+        len = (len + 1).min(top.len());
+    }
+    let sorted = &top[..len];
     let sum: f32 = sorted.iter().map(|&(_, weight)| weight).sum();
     if sum <= 0.0 {
         return ([rigid, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
@@ -173,19 +192,24 @@ pub(crate) fn corner_influences(
     control_point: usize,
     rigid: u32,
 ) -> ([u32; 4], [f32; 4]) {
-    let mut candidates = Vec::new();
-    if let Some(vertex) = deformer.vertices.get(control_point) {
-        let begin = vertex.weight_begin as usize;
-        let end = begin.saturating_add(vertex.num_weights as usize);
-        if let Some(weights) = deformer.weights.get(begin..end) {
-            for weight in weights {
-                if let Some(Some(joint)) = joints.get(weight.cluster_index as usize) {
-                    candidates.push((*joint, weight.weight as f32));
-                }
-            }
-        }
-    }
-    influences(&candidates, rigid)
+    let weights = deformer
+        .vertices
+        .get(control_point)
+        .and_then(|vertex| {
+            let begin = vertex.weight_begin as usize;
+            let end = begin.saturating_add(vertex.num_weights as usize);
+            deformer.weights.get(begin..end)
+        })
+        .unwrap_or_default();
+    influences(
+        weights
+            .iter()
+            .filter_map(|weight| match joints.get(weight.cluster_index as usize) {
+                Some(Some(joint)) => Some((*joint, weight.weight as f32)),
+                _ => None,
+            }),
+        rigid,
+    )
 }
 
 fn inherit_mode(mode: ufbx::InheritMode) -> ModelInheritMode {
@@ -221,9 +245,35 @@ fn matrix_columns(matrix: &ufbx::Matrix) -> [[f32; 4]; 4] {
 mod tests {
     use super::influences;
 
+    /// Прежняя реализация с `Vec` и сортировкой: эталон для побитового сравнения.
+    fn previous_influences(candidates: &[(u32, f32)], rigid: u32) -> ([u32; 4], [f32; 4]) {
+        let mut sorted: Vec<(u32, f32)> = candidates
+            .iter()
+            .copied()
+            .filter(|&(_, weight)| weight.is_finite() && weight > 0.0)
+            .collect();
+        sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+        sorted.truncate(4);
+        let sum: f32 = sorted.iter().map(|&(_, weight)| weight).sum();
+        if sum <= 0.0 {
+            return ([rigid, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        }
+        let mut joints = [0; 4];
+        let mut weights = [0.0; 4];
+        for (slot, &(joint, weight)) in sorted.iter().enumerate() {
+            joints[slot] = joint;
+            weights[slot] = weight / sum;
+        }
+        (joints, weights)
+    }
+
+    fn bits((joints, weights): ([u32; 4], [f32; 4])) -> ([u32; 4], [u32; 4]) {
+        (joints, weights.map(f32::to_bits))
+    }
+
     #[test]
     fn influences_keep_four_largest_weights_sorted_and_normalized() {
-        let (joints, weights) = influences(&[(0, 0.1), (1, 0.5), (2, 0.2), (3, 0.3), (4, 0.4)], 9);
+        let (joints, weights) = influences([(0, 0.1), (1, 0.5), (2, 0.2), (3, 0.3), (4, 0.4)], 9);
         assert_eq!(joints, [1, 4, 3, 2]);
         let sum: f32 = weights.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
@@ -233,16 +283,74 @@ mod tests {
     #[test]
     fn influences_ignore_zero_and_non_finite_weights_and_fall_back_to_rigid_joint() {
         assert_eq!(
-            influences(&[(1, 0.0), (2, f32::NAN), (3, -1.0)], 7),
+            influences([(1, 0.0), (2, f32::NAN), (3, -1.0)], 7),
             ([7, 0, 0, 0], [1.0, 0.0, 0.0, 0.0])
         );
-        assert_eq!(influences(&[], 4), ([4, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(influences([], 4), ([4, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
     }
 
     #[test]
     fn influences_normalize_partial_weights_to_one() {
-        let (joints, weights) = influences(&[(5, 0.25), (6, 0.25)], 0);
+        let (joints, weights) = influences([(5, 0.25), (6, 0.25)], 0);
         assert_eq!(&joints[..2], &[5, 6]);
         assert_eq!(weights, [0.5, 0.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn influences_keep_input_order_for_equal_weights() {
+        // Пять равных кандидатов: в четвёрке остаются первые четыре по порядку входа.
+        let (joints, _) = influences([(1, 0.25), (2, 0.25), (3, 0.25), (4, 0.25), (5, 0.25)], 0);
+        assert_eq!(joints, [1, 2, 3, 4]);
+        // Более крупный вес вытесняет последнего из равных, а не первого.
+        let (joints, weights) =
+            influences([(1, 0.25), (2, 0.25), (3, 0.25), (4, 0.25), (5, 0.5)], 0);
+        assert_eq!(joints, [5, 1, 2, 3]);
+        assert_eq!(weights, [0.4, 0.2, 0.2, 0.2]);
+    }
+
+    #[test]
+    fn influences_match_previous_implementation_bit_for_bit() {
+        const POOL: [f32; 12] = [
+            0.0,
+            -0.0,
+            0.25,
+            0.5,
+            0.125,
+            1.0,
+            0.3,
+            1e-30,
+            3.5,
+            f32::NAN,
+            f32::INFINITY,
+            -1.0,
+        ];
+        // Детерминированный генератор: повторяющиеся значения дают равные веса и ничьи.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+        for case in 0..4000_u32 {
+            let count = (next() % 9) as usize;
+            let candidates: Vec<(u32, f32)> = (0..count)
+                .map(|_| {
+                    let joint = next() % 6;
+                    let weight = if next() % 2 == 0 {
+                        POOL[next() as usize % POOL.len()]
+                    } else {
+                        (next() % 1000) as f32 / 97.0
+                    };
+                    (joint, weight)
+                })
+                .collect();
+            let rigid = case % 5;
+            assert_eq!(
+                bits(influences(candidates.iter().copied(), rigid)),
+                bits(previous_influences(&candidates, rigid)),
+                "случай {case}: {candidates:?}"
+            );
+        }
     }
 }

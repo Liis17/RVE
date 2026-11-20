@@ -153,6 +153,7 @@ fn cube() -> Arc<Model> {
                     position,
                     normal: [0.0, 1.0, 0.0],
                     uv: [0.0, 0.0],
+                    tangent: [0.0; 4],
                 })
                 .to_vec(),
             indices: vec![
