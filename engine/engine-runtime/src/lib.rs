@@ -812,16 +812,6 @@ fn start_modules(
         },
     )?;
 
-    let (neural_tx, neural_rx) = std::sync::mpsc::channel();
-    modules.spawn(
-        "rve-neural",
-        move || {
-            let _ = neural_tx.send(());
-        },
-        move || {
-            engine_neural::NeuralEngine::new().run(neural_rx);
-        },
-    )?;
     if let Some((engine, handle)) = network {
         modules.spawn(
             "rve-network",
