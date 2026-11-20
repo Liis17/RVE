@@ -19,7 +19,7 @@ use engine_render::{
     FrameStatus, LatencyHandle, LatencyMarker, LowLatencyMode, Material, MaterialId, MeshId,
     ParticleBlend, ParticleCollision, ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape,
     PostProcess, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
-    Tonemapper as RenderTonemapper, ViewSettings,
+    TextureRole, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{
@@ -781,6 +781,7 @@ impl Sandbox {
                         &mut texture_cache,
                         index,
                         TextureColorSpace::Srgb,
+                        TextureRole::Color,
                     )
                 })
                 .transpose()?;
@@ -794,6 +795,7 @@ impl Sandbox {
                         &mut texture_cache,
                         index,
                         TextureColorSpace::Linear,
+                        TextureRole::Color,
                     )
                 })
                 .transpose()?;
@@ -807,6 +809,7 @@ impl Sandbox {
                         &mut texture_cache,
                         index,
                         TextureColorSpace::Linear,
+                        TextureRole::Normal,
                     )
                 })
                 .transpose()?;
@@ -820,6 +823,7 @@ impl Sandbox {
                         &mut texture_cache,
                         index,
                         TextureColorSpace::Srgb,
+                        TextureRole::Color,
                     )
                 })
                 .transpose()?;
@@ -833,6 +837,7 @@ impl Sandbox {
                         &mut texture_cache,
                         index,
                         TextureColorSpace::Linear,
+                        TextureRole::Color,
                     )
                 })
                 .transpose()?;
@@ -1185,20 +1190,27 @@ impl WindowHandler for Sandbox {
 fn upload_content_texture(
     renderer: &mut Renderer,
     textures: &[engine_assets::TextureData],
-    cache: &mut HashMap<(usize, TextureColorSpace), TextureId>,
+    cache: &mut HashMap<(usize, TextureColorSpace, TextureRole), TextureId>,
     index: usize,
     color_space: TextureColorSpace,
+    role: TextureRole,
 ) -> Result<TextureId, String> {
-    if let Some(&texture_id) = cache.get(&(index, color_space)) {
+    if let Some(&texture_id) = cache.get(&(index, color_space, role)) {
         return Ok(texture_id);
     }
     let texture = textures
         .get(index)
         .ok_or_else(|| format!("материал ссылается на отсутствующую текстуру {index}"))?;
     let texture_id = renderer
-        .create_texture_with_color_space(texture.width, texture.height, &texture.rgba, color_space)
+        .create_texture_with_role(
+            texture.width,
+            texture.height,
+            &texture.rgba,
+            color_space,
+            role,
+        )
         .map_err(|error| format!("ошибка создания текстуры: {error}"))?;
-    cache.insert((index, color_space), texture_id);
+    cache.insert((index, color_space, role), texture_id);
     Ok(texture_id)
 }
 

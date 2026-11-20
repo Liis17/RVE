@@ -3,6 +3,7 @@
 //! PNG или HDR не задерживает кадр интерфейса.
 
 use engine_assets::{Assets, HdrImageData, TextureData};
+use engine_render::NormalMipChain;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -10,12 +11,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ImageKind {
     Texture,
+    /// Текстура для роли Normal: поток строит её mip-цепочку.
+    NormalTexture,
     Hdr,
 }
 
 #[derive(Debug)]
 pub enum DecodedImage {
     Texture(TextureData),
+    NormalTexture(NormalMipChain),
     Hdr(HdrImageData),
 }
 
@@ -62,6 +66,14 @@ impl Worker {
     }
 }
 
+/// Mip-цепочка normal map для фонового потока. Ошибка построения (например, нехватка памяти)
+/// идёт тем же путём, что ошибка декодирования: в лог, с сохранением прежней версии.
+fn normal_texture_chain(texture: &TextureData) -> Result<DecodedImage, String> {
+    NormalMipChain::build(texture.width, texture.height, &texture.rgba)
+        .map(DecodedImage::NormalTexture)
+        .map_err(|error| error.to_string())
+}
+
 impl ImageLoader {
     /// Декодирует изображения из ресурсов проекта; прежняя очередь сбрасывается.
     pub fn restart(&mut self, assets: Assets) {
@@ -70,6 +82,10 @@ impl ImageLoader {
                 .load_texture(path)
                 .map(DecodedImage::Texture)
                 .map_err(|error| error.to_string()),
+            ImageKind::NormalTexture => assets
+                .load_texture(path)
+                .map_err(|error| error.to_string())
+                .and_then(|texture| normal_texture_chain(&texture)),
             ImageKind::Hdr => assets
                 .load_hdr(path)
                 .map(DecodedImage::Hdr)
@@ -198,6 +214,7 @@ mod tests {
             seen.lock().unwrap().push((kind, path.to_owned()));
             match kind {
                 ImageKind::Texture => Ok(texture(2)),
+                ImageKind::NormalTexture => Err("не запрошен".to_owned()),
                 ImageKind::Hdr => Err("битый HDR".to_owned()),
             }
         }));
@@ -247,6 +264,63 @@ mod tests {
 
     fn release(gate: &SyncSender<()>) {
         gate.send(()).unwrap();
+    }
+
+    fn rgba_texture(width: u32, height: u32) -> TextureData {
+        TextureData {
+            width,
+            height,
+            rgba: vec![128; width as usize * height as usize * 4],
+        }
+    }
+
+    #[test]
+    fn normal_request_returns_a_chain_and_color_request_decodes_separately() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let mut loader = ImageLoader::default();
+        loader.restart_with(Arc::new(move |kind, path: &str| {
+            seen.lock().unwrap().push((kind, path.to_owned()));
+            match kind {
+                ImageKind::Texture => Ok(DecodedImage::Texture(rgba_texture(2, 2))),
+                ImageKind::NormalTexture => normal_texture_chain(&rgba_texture(2, 2)),
+                ImageKind::Hdr => Err("не запрошен".to_owned()),
+            }
+        }));
+        assert!(loader.request(ImageKind::NormalTexture, "n.png"));
+        assert!(
+            loader.request(ImageKind::NormalTexture, "n.png"),
+            "дубликат"
+        );
+        assert!(loader.request(ImageKind::Texture, "n.png"));
+        let mut results = Vec::new();
+        while results.len() < 2 {
+            results.extend(loader.wait_finished());
+        }
+        let normal = results
+            .iter()
+            .find(|(kind, _, _)| *kind == ImageKind::NormalTexture)
+            .unwrap();
+        match normal.2.as_ref().unwrap() {
+            DecodedImage::NormalTexture(chain) => assert_eq!(chain.mip_levels(), 2),
+            other => panic!("ожидалась mip-цепочка: {other:?}"),
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "дубликат normal-запроса не декодируется"
+        );
+    }
+
+    #[test]
+    fn normal_texture_chain_reports_build_errors_as_decode_errors() {
+        let broken = TextureData {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 3],
+        };
+        let error = normal_texture_chain(&broken).unwrap_err();
+        assert!(error.contains("2x2"), "{error}");
     }
 
     #[test]

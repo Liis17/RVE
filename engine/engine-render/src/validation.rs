@@ -247,10 +247,40 @@ pub(crate) fn validate_shader_destroyable(references: usize) -> Result<(), Rende
     }
 }
 
+/// Normal map хранит векторы в линейном кодировании; sRGB-декодирование исказило бы их.
+pub(crate) fn validate_texture_role(
+    role: TextureRole,
+    color_space: TextureColorSpace,
+) -> Result<(), RenderError> {
+    if role == TextureRole::Normal && color_space == TextureColorSpace::Srgb {
+        return Err(RenderError::InvalidTexture(
+            "normal map должна иметь линейное цветовое пространство".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_texture(
     width: u32,
     height: u32,
     byte_count: usize,
+    max_size: u32,
+) -> Result<(), RenderError> {
+    validate_texture_extent(width, height, max_size)?;
+    let expected = texture_staging_size(width, height);
+    if expected != Some(byte_count) {
+        return Err(RenderError::InvalidTexture(format!(
+            "для RGBA8 {width}x{height} нужно {} байт, передано {byte_count}",
+            expected.map_or_else(|| "больше usize::MAX".to_owned(), |bytes| bytes.to_string())
+        )));
+    }
+    Ok(())
+}
+
+/// Размеры текстуры: ненулевые и не больше предела GPU.
+pub(crate) fn validate_texture_extent(
+    width: u32,
+    height: u32,
     max_size: u32,
 ) -> Result<(), RenderError> {
     if width == 0 || height == 0 {
@@ -261,13 +291,6 @@ pub(crate) fn validate_texture(
     if width > max_size || height > max_size {
         return Err(RenderError::InvalidTexture(format!(
             "{width}x{height} больше предела GPU {max_size}x{max_size}"
-        )));
-    }
-    let expected = texture_staging_size(width, height);
-    if expected != Some(byte_count) {
-        return Err(RenderError::InvalidTexture(format!(
-            "для RGBA8 {width}x{height} нужно {} байт, передано {byte_count}",
-            expected.map_or_else(|| "больше usize::MAX".to_owned(), |bytes| bytes.to_string())
         )));
     }
     Ok(())

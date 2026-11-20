@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "engine-assets"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bevy_mikktspace",
  "engine-files",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3147,7 +3147,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "blake3",
  "egui",
