@@ -5,10 +5,15 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const CONSOLE_BUFFER_CAPACITY: usize = 2_000;
 pub const COMMAND_HISTORY_CAPACITY: usize = 100;
+/// Сколько последних Info/Warn/Error строк всегда хранится для отчётов о падении.
+pub const LOG_TAIL_CAPACITY: usize = 200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsoleLevel {
@@ -386,11 +391,28 @@ impl CommandHistory {
 
 pub struct ConsoleLogger {
     sink: Option<Arc<Mutex<ConsoleBuffer>>>,
+    tail: Mutex<ConsoleBuffer>,
 }
 
 impl ConsoleLogger {
     pub fn new(sink: Option<Arc<Mutex<ConsoleBuffer>>>) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            tail: Mutex::new(ConsoleBuffer::with_capacity(LOG_TAIL_CAPACITY)),
+        }
+    }
+
+    fn tail_snapshot(&self) -> Vec<ConsoleLine> {
+        lock_buffer(&self.tail).snapshot()
+    }
+
+    /// Не ждёт блокировку: `None`, если её держит другой поток.
+    fn try_tail_snapshot(&self) -> Option<Vec<ConsoleLine>> {
+        match self.tail.try_lock() {
+            Ok(buffer) => Some(buffer.snapshot()),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().snapshot()),
+            Err(TryLockError::WouldBlock) => None,
+        }
     }
 
     pub fn log_record(&self, record: &Record<'_>) {
@@ -409,13 +431,15 @@ impl ConsoleLogger {
                 let _ = writeln!(io::stderr().lock(), "{text}");
             }
         }
+        let line = ConsoleLine {
+            level,
+            source: record.target().to_owned(),
+            text,
+        };
         if let Some(sink) = &self.sink {
-            lock_buffer(sink).push(ConsoleLine {
-                level,
-                source: record.target().to_owned(),
-                text,
-            });
+            lock_buffer(sink).push(line.clone());
         }
+        lock_buffer(&self.tail).push(line);
     }
 }
 
@@ -444,6 +468,21 @@ pub fn install_logger(sink: Option<Arc<Mutex<ConsoleBuffer>>>) -> Result<(), log
     log::set_logger(logger)?;
     log::set_max_level(Level::Info.to_level_filter());
     Ok(())
+}
+
+/// Последние Info/Warn/Error строки процесса; пусто, если логгер не установлен. Ждёт блокировку.
+pub fn log_tail() -> Vec<ConsoleLine> {
+    LOGGER
+        .get()
+        .map_or_else(Vec::new, ConsoleLogger::tail_snapshot)
+}
+
+/// Как [`log_tail`], но не ждёт: `None`, если хвост сейчас занят другим потоком.
+/// Нужен обработчику panic, который не должен зависнуть на чужой блокировке.
+pub fn try_log_tail() -> Option<Vec<ConsoleLine>> {
+    LOGGER
+        .get()
+        .map_or_else(|| Some(Vec::new()), ConsoleLogger::try_tail_snapshot)
 }
 
 fn lock_buffer(buffer: &Mutex<ConsoleBuffer>) -> std::sync::MutexGuard<'_, ConsoleBuffer> {
@@ -618,5 +657,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["[script] event", "[script] event", "[script] event"]
         );
+    }
+
+    fn log_record_at(logger: &ConsoleLogger, level: Level, text: &str) {
+        let args = format_args!("{text}");
+        let record = Record::builder()
+            .args(args)
+            .level(level)
+            .target("test")
+            .build();
+        logger.log_record(&record);
+    }
+
+    #[test]
+    fn log_tail_keeps_only_the_last_200_lines() {
+        let logger = ConsoleLogger::new(None);
+        for index in 0..LOG_TAIL_CAPACITY + 5 {
+            log_record_at(&logger, Level::Info, &format!("line {index}"));
+        }
+        let tail = logger.tail_snapshot();
+        assert_eq!(tail.len(), LOG_TAIL_CAPACITY);
+        assert_eq!(tail.first().unwrap().text, "line 5");
+        assert_eq!(
+            tail.last().unwrap().text,
+            format!("line {}", LOG_TAIL_CAPACITY + 4)
+        );
+    }
+
+    #[test]
+    fn log_tail_skips_debug_and_trace_records() {
+        let logger = ConsoleLogger::new(None);
+        log_record_at(&logger, Level::Debug, "debug detail");
+        log_record_at(&logger, Level::Trace, "trace detail");
+        log_record_at(&logger, Level::Warn, "kept");
+        assert_eq!(
+            logger
+                .tail_snapshot()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["kept"]
+        );
+    }
+
+    #[test]
+    fn try_log_tail_reports_unavailable_only_while_the_lock_is_held() {
+        let logger = ConsoleLogger::new(None);
+        log_record_at(&logger, Level::Error, "before lock");
+        {
+            let _held = logger.tail.lock().unwrap();
+            assert_eq!(logger.try_tail_snapshot(), None);
+        }
+        let tail = logger.try_tail_snapshot().unwrap();
+        assert_eq!(tail[0].text, "before lock");
+    }
+
+    #[test]
+    fn try_log_tail_reads_a_poisoned_tail() {
+        let logger = ConsoleLogger::new(None);
+        log_record_at(&logger, Level::Info, "survives poison");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = logger.tail.lock().unwrap();
+            panic!("poison the tail lock");
+        }));
+        let tail = logger
+            .try_tail_snapshot()
+            .expect("poisoned lock is readable");
+        assert_eq!(tail[0].text, "survives poison");
     }
 }
