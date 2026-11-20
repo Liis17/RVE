@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn stress_scene_places_a_static_cube_grid_on_its_floor_with_shadowed_lights() {
+    fn stress_scene_lays_out_a_cube_grid_on_its_floor_with_shadowed_lights() {
         let content = Content::from_scene(Scene::Stress);
 
         assert_eq!(content.copies.len(), STRESS_GRID * STRESS_GRID);

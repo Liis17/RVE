@@ -1,6 +1,7 @@
 mod benchmark;
 mod content;
 mod debug_overlay;
+mod physics;
 mod scene;
 
 use benchmark::{
@@ -27,6 +28,7 @@ use engine_scene::{
 };
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use glam::{Mat4, Vec3};
+use physics::{StepStats, StressPhysics};
 use scene::Scene;
 use std::collections::HashMap;
 use std::env;
@@ -606,6 +608,8 @@ struct Sandbox {
     profile_summary: ProfileSummary,
     /// Замеры `--benchmark-json`; создаются после появления renderer.
     benchmark: Option<BenchmarkRecorder>,
+    /// Физика сцены `stress`; `None` для остальных сцен.
+    stress: Option<StressPhysics>,
     failure: Option<String>,
 }
 
@@ -616,6 +620,8 @@ struct ProfileSummary {
     prepare: Duration,
     record: Duration,
     last_draws: DrawStats,
+    /// Шаги физики и число бодрствующих тел в конце прогона; `None` без физики.
+    physics: Option<(StepStats, usize)>,
 }
 
 impl ProfileSummary {
@@ -633,7 +639,7 @@ impl ProfileSummary {
         }
         let average_ms = |total: Duration| total.as_secs_f64() * 1000.0 / f64::from(self.frames);
         let draws = self.last_draws;
-        Some(format!(
+        let mut line = format!(
             "profile: {} frames, renderer CPU avg prepare {:.3} ms, record {:.3} ms; last frame draws scene {} (culled {}), shadow {} (culled {})",
             self.frames,
             average_ms(self.prepare),
@@ -642,7 +648,16 @@ impl ProfileSummary {
             draws.scene_culled,
             draws.shadow_draw_calls,
             draws.shadow_culled,
-        ))
+        );
+        if let Some((stats, awake)) = self.physics {
+            line.push_str(&format!(
+                "; physics step avg {:.3} ms (max {:.3} ms, {} steps), awake {awake}",
+                stats.avg_ms(),
+                stats.max_ms(),
+                stats.steps,
+            ));
+        }
+        Some(line)
     }
 }
 
@@ -686,6 +701,7 @@ impl Sandbox {
             particle_emitters: Vec::new(),
             profile_summary: ProfileSummary::default(),
             benchmark: None,
+            stress: None,
             failure: None,
         }
     }
@@ -1000,15 +1016,32 @@ impl WindowHandler for Sandbox {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
         };
-        let models = self
-            .content
-            .models(elapsed)
-            .zip(
-                self.content
-                    .models(self.previous_elapsed.unwrap_or(elapsed)),
-            )
-            .map(|(model, previous)| (model.to_cols_array_2d(), previous.to_cols_array_2d()))
-            .collect::<Vec<_>>();
+        let models = match self.stress.as_ref() {
+            // Копии `stress` берут позы физики; `model` сохраняет подгонку модели (fit).
+            Some(stress) => {
+                let model = self.content.model(elapsed);
+                let (current, previous) = stress.frame_transforms();
+                current
+                    .iter()
+                    .zip(previous)
+                    .map(|(current, previous)| {
+                        (
+                            (*current * model).to_cols_array_2d(),
+                            (*previous * model).to_cols_array_2d(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+            None => self
+                .content
+                .models(elapsed)
+                .zip(
+                    self.content
+                        .models(self.previous_elapsed.unwrap_or(elapsed)),
+                )
+                .map(|(model, previous)| (model.to_cols_array_2d(), previous.to_cols_array_2d()))
+                .collect::<Vec<_>>(),
+        };
         let identity = [(
             glam::Mat4::IDENTITY.to_cols_array_2d(),
             glam::Mat4::IDENTITY.to_cols_array_2d(),
@@ -1136,6 +1169,27 @@ impl WindowHandler for Sandbox {
                 present_mode: renderer.present_mode(),
                 profile: frame_profile,
             });
+        }
+        // Физика шагает после каждой презентации, включая последнюю, и ждёт следующей.
+        if physics_advances(&status)
+            && let Some(stress) = self.stress.as_mut()
+        {
+            match stress.advance_after_presentation() {
+                Ok(step) => {
+                    if stress.take_truncation_warning() {
+                        eprintln!(
+                            "предупреждение: broadphase физики остановился на пределе сравнений; новые контакты появляются с задержкой"
+                        );
+                    }
+                    if let Some(benchmark) = self.benchmark.as_mut() {
+                        benchmark.observe_physics_step(step);
+                    }
+                }
+                Err(error) => {
+                    self.failure = Some(format!("ошибка физики: {error}"));
+                    return false;
+                }
+            }
         }
         match status {
             Ok(FrameStatus::Presented) => {
@@ -1321,6 +1375,17 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let stress = if content.motion == Scene::Stress {
+        match StressPhysics::new(&content.copies) {
+            Ok(physics) => Some(physics),
+            Err(error) => {
+                eprintln!("Ошибка физики: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
     let mut app = Sandbox::new(
         options,
         content,
@@ -1333,6 +1398,7 @@ fn main_after_vulkan_environment() -> ExitCode {
     app.post_process = post_process;
     app.color_lut_source = color_lut_source;
     app.reflex = reflex;
+    app.stress = stress;
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
     let mut exit_code = match (run_result, failure) {
@@ -1346,6 +1412,10 @@ fn main_after_vulkan_environment() -> ExitCode {
         }
         (Ok(()), None) => 0,
     };
+    app.profile_summary.physics = app
+        .stress
+        .as_ref()
+        .map(|stress| (stress.stats(), stress.awake()));
     if let Some(line) = app.profile_summary.line() {
         println!("{line}");
     }
@@ -1386,14 +1456,20 @@ fn main_after_vulkan_environment() -> ExitCode {
     ExitCode::from(exit_code)
 }
 
+/// Мир `stress` шагает только после презентации кадра: пропущенный кадр и сбой рендера шага не делают.
+fn physics_advances<E>(status: &Result<FrameStatus, E>) -> bool {
+    matches!(status, Ok(FrameStatus::Presented))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CameraSettings, Content, EnvironmentMode, Options, ProfileSummary, RESIZE_SIZE,
-        RESTORE_SIZE, Sandbox, Scene, parse_args, with_executable_directory,
+        RESTORE_SIZE, Sandbox, Scene, StepStats, parse_args, physics_advances,
+        with_executable_directory,
     };
     use engine_assets::Assets;
-    use engine_render::{DrawStats, FrameProfile};
+    use engine_render::{DrawStats, FrameProfile, FrameStatus};
     use engine_resources::{ResourceConfig, ResourceSystem};
     use std::time::Duration;
 
@@ -1434,6 +1510,26 @@ mod tests {
                 "profile: 2 frames, renderer CPU avg prepare 0.000 ms, record 3.000 ms; last frame draws scene 12 (culled 3), shadow 7 (culled 1)"
             )
         );
+    }
+
+    #[test]
+    fn profile_line_appends_physics_step_time_and_awake_count_only_when_present() {
+        let mut summary = ProfileSummary {
+            frames: 1,
+            ..ProfileSummary::default()
+        };
+        let without = summary.line();
+        summary.physics = Some((
+            StepStats {
+                steps: 2,
+                total: Duration::from_millis(6),
+                max: Duration::from_millis(4),
+            },
+            5,
+        ));
+        let with = summary.line().expect("профиль есть");
+        assert!(with.starts_with(without.as_deref().expect("профиль есть")));
+        assert!(with.ends_with("; physics step avg 3.000 ms (max 4.000 ms, 2 steps), awake 5"));
     }
 
     #[test]
@@ -1609,6 +1705,13 @@ mod tests {
         sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
         assert!(!sandbox.resize_test.initial_resized);
         assert!(!sandbox.resize_test.restore_size);
+    }
+
+    #[test]
+    fn physics_steps_only_after_a_presented_frame() {
+        assert!(physics_advances::<()>(&Ok(FrameStatus::Presented)));
+        assert!(!physics_advances::<()>(&Ok(FrameStatus::Skipped)));
+        assert!(!physics_advances::<()>(&Err(())));
     }
 
     #[test]
