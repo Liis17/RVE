@@ -1171,6 +1171,11 @@ impl WindowHandler for Sandbox {
                 if let Some(stress) = self.stress.as_mut() {
                     match stress.advance_after_presentation() {
                         Ok(step) => {
+                            if stress.take_truncation_warning() {
+                                eprintln!(
+                                    "предупреждение: broadphase физики остановился на пределе сравнений; новые контакты появляются с задержкой"
+                                );
+                            }
                             if let Some(benchmark) = self.benchmark.as_mut() {
                                 benchmark.observe_physics_step(step);
                             }

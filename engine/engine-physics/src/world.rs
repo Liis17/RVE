@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use glam::{Mat3, Quat, Vec3};
 
-use crate::broad::sweep_and_prune_pairable;
+use crate::broad::{BroadItem, BroadPhase, BroadPhaseOutput, CandidatePair};
 use crate::material::PhysicsMaterial;
 use crate::narrow::{ManifoldCache, PairKey, collide};
 use crate::query::{QueryCollider, QueryColliderDesc, QueryError, QuerySnapshot};
@@ -532,6 +532,12 @@ pub struct PhysicsWorld {
     manifolds: ManifoldCache,
     next_body_id: u64,
     skipped_pairs: usize,
+    /// Персистентный порядок broadphase между шагами.
+    broad: BroadPhase,
+    /// Число refresh'ей с обрезкой broadphase с начала текущего `advance_step*`.
+    broadphase_truncations: usize,
+    /// Broadphase обрезан и предупреждение уже записано; выхода из деградации ещё не было.
+    broadphase_degraded: bool,
     /// Маска слоёв для каждого слоя; по умолчанию все пары разрешены.
     collision_matrix: [u32; PHYSICS_LAYER_COUNT],
 }
@@ -554,6 +560,9 @@ impl PhysicsWorld {
             manifolds: ManifoldCache::default(),
             next_body_id: 1,
             skipped_pairs: 0,
+            broad: BroadPhase::default(),
+            broadphase_truncations: 0,
+            broadphase_degraded: false,
             collision_matrix: [u32::MAX; PHYSICS_LAYER_COUNT],
         })
     }
@@ -764,8 +773,7 @@ impl PhysicsWorld {
     fn refresh_pairs(&mut self) -> Result<Vec<PhysicsEvent>, PhysicsWorldError> {
         self.wake_sleepers_under_changed_statics()?;
         let mut proxies = Vec::new();
-        let mut bounds = Vec::new();
-        let mut paired = Vec::new();
+        let mut items = Vec::new();
         let mut frozen = HashSet::new();
         for body in self.bodies.values_mut() {
             if !body.collider.enabled {
@@ -783,8 +791,11 @@ impl PhysicsWorld {
             if !is_paired {
                 frozen.insert(body.handle);
             }
-            paired.push(is_paired);
-            bounds.push(aabb);
+            items.push(BroadItem {
+                key: body.handle.0,
+                bounds: aabb,
+                paired: is_paired,
+            });
             proxies.push((
                 body.handle,
                 body.collider.clone(),
@@ -798,13 +809,31 @@ impl PhysicsWorld {
         }
         // Неактивные тела не двигались и не менялись, поэтому их пары переносятся как есть.
         // Пары с активным телом пересчитываются broadphase и narrowphase.
-        let candidates = sweep_and_prune_pairable(&bounds, |index| paired[index])?;
+        let output = self.broad.update(&items)?;
+        self.note_broadphase(&output, items.len());
         let mut current = BTreeMap::new();
         for (key, pair) in &self.active_pairs {
             if frozen.contains(&BodyHandle(key.first)) && frozen.contains(&BodyHandle(key.second)) {
                 current.insert(*key, pair.clone());
             }
         }
+        // Пары, которые обрезанный sweep не сравнил, не переносятся вслепую: narrowphase проверяет
+        // их заново, поэтому разошедшиеся пары дают Exit, а пересекающиеся сохраняются.
+        let index_of = |handle: u64| items.binary_search_by_key(&handle, |item| item.key).ok();
+        let mut candidates = Vec::new();
+        for key in self.active_pairs.keys() {
+            if frozen.contains(&BodyHandle(key.first)) && frozen.contains(&BodyHandle(key.second)) {
+                continue;
+            }
+            let (Some(first), Some(second)) = (index_of(key.first), index_of(key.second)) else {
+                continue;
+            };
+            if !output.pair_compared(first, second) {
+                candidates.push(CandidatePair { first, second });
+            }
+        }
+        candidates.extend(output.pairs);
+        candidates.sort_by_key(|pair| (pair.first, pair.second));
         for candidate in candidates {
             let (handle_a, collider_a, kind_a, pose_a, layer_a) = &proxies[candidate.first];
             let (handle_b, collider_b, kind_b, pose_b, layer_b) = &proxies[candidate.second];
@@ -866,6 +895,28 @@ impl PhysicsWorld {
             .collect();
         self.manifolds.retain(&contact_keys);
         Ok(events)
+    }
+
+    /// Учитывает обрезку broadphase: предупреждение пишется один раз при входе в деградацию и
+    /// одно сообщение при выходе из неё. Счётчик попадает в `StepResult.broadphase_truncated`.
+    fn note_broadphase(&mut self, output: &BroadPhaseOutput, bodies: usize) {
+        match output.cut {
+            Some(cut) => {
+                self.broadphase_truncations += 1;
+                if !self.broadphase_degraded {
+                    self.broadphase_degraded = true;
+                    log::warn!(
+                        "physics broadphase stopped at sweep position {cut} of {bodies} bodies after {} comparisons; new contacts in the tail appear late",
+                        output.comparisons
+                    );
+                }
+            }
+            None if self.broadphase_degraded => {
+                self.broadphase_degraded = false;
+                log::info!("physics broadphase restored: all body pairs are compared again");
+            }
+            None => {}
+        }
     }
 
     fn wake_contact_pair(&mut self, first: BodyHandle, second: BodyHandle) {
@@ -1261,6 +1312,9 @@ pub struct StepResult {
     pub skipped_pairs: usize,
     /// Collider and body-property commands the solver rejected; their bodies kept old values.
     pub skipped_commands: usize,
+    /// Refresh'и пар в этом вызове, где broadphase остановился на пределе сравнений. Новые пары
+    /// в хвосте sweep появляются позже, а прежние проверяются narrowphase заново.
+    pub broadphase_truncated: usize,
 }
 
 /// Fixed-step accumulator shared by physics and script update scheduling.
@@ -1371,6 +1425,7 @@ impl StepDriver {
             events: Vec::new(),
             skipped_pairs: 0,
             skipped_commands: 0,
+            broadphase_truncated: 0,
         }
     }
 
@@ -1393,6 +1448,7 @@ impl StepDriver {
     ) -> Result<StepResult, PhysicsWorldError> {
         validate_nonnegative_dt(dt)?;
         self.world.skipped_pairs = 0;
+        self.world.broadphase_truncations = 0;
         let mut events = Vec::new();
         for change in changes {
             match change {
@@ -1444,6 +1500,7 @@ impl StepDriver {
             events,
             skipped_pairs: self.world.skipped_pairs,
             skipped_commands,
+            broadphase_truncated: self.world.broadphase_truncations,
         })
     }
 }
@@ -1522,6 +1579,7 @@ mod tests {
         PhysicsEvent, PhysicsWorld, PhysicsWorldError, SLEEP_ANGULAR_SPEED, SLEEP_LINEAR_SPEED,
         StepDriver,
     };
+    use crate::broad::MAX_BROADPHASE_COMPARISONS;
     use crate::{Hull, PhysicsMaterial, Pose, Shape, TriMesh};
     use glam::{Quat, Vec3};
     use std::sync::Arc;
@@ -3477,6 +3535,144 @@ mod tests {
         assert!(peak_speed < SLEEP_LINEAR_SPEED, "peak speed {peak_speed}");
         assert!(peak_spin < SLEEP_ANGULAR_SPEED, "peak spin {peak_spin}");
         assert!(peak_drift < 1.0e-3, "horizontal drift {peak_drift}");
+    }
+
+    /// Перехват записей лога одного потока: параллельные тесты не попадают в счёт.
+    struct Capture;
+
+    static RECORDS: std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    static CAPTURE: Capture = Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                RECORDS.lock().unwrap().push((
+                    std::thread::current().id(),
+                    record.level(),
+                    record.args().to_string(),
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Логгер ставится до первой записи теста: записи, сделанные без него, не перехватываются.
+    fn install_capture() {
+        let _ = log::set_logger(&CAPTURE);
+        log::set_max_level(log::LevelFilter::Info);
+    }
+
+    fn records_on_this_thread(level: log::Level) -> Vec<String> {
+        let current = std::thread::current().id();
+        RECORDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(thread, record_level, _)| *thread == current && *record_level == level)
+            .map(|(_, _, text)| text.clone())
+            .collect()
+    }
+
+    /// Динамические боксы в ряд по X с перекрытием: все пары пересекаются. Sweep по X обрабатывает
+    /// тела по порядку, поэтому при лимите 3 последнее тело оказывается в хвосте.
+    fn overlapping_row(count: usize) -> (PhysicsWorld, Vec<BodyHandle>) {
+        let mut world = PhysicsWorld::default();
+        let mut handles = Vec::new();
+        for index in 0..count {
+            let pose = Pose::new(Vec3::new(index as f32 * 0.2, 5.0, 0.0), Quat::IDENTITY).unwrap();
+            handles.push(
+                world
+                    .insert_body(BodyDesc::dynamic(box_shape(0.5), pose, 1.0))
+                    .unwrap(),
+            );
+        }
+        (world, handles)
+    }
+
+    #[test]
+    fn truncated_tail_pairs_are_rechecked_and_kept_while_they_still_overlap() {
+        let (mut world, _) = overlapping_row(4);
+        world.refresh_pairs().unwrap();
+        assert_eq!(world.active_pair_count(), 6);
+
+        world.broad.comparison_limit = 3;
+        for _ in 0..2 {
+            assert!(world.refresh_pairs().unwrap().is_empty());
+        }
+        assert_eq!(world.active_pair_count(), 6);
+    }
+
+    #[test]
+    fn diverged_tail_pairs_exit_once_and_stay_gone_under_truncation() {
+        let (mut world, handles) = overlapping_row(4);
+        world.refresh_pairs().unwrap();
+        world.broad.comparison_limit = 3;
+        let tail = world.bodies.get_mut(&handles[3]).unwrap();
+        tail.pose.position.y = 7.0;
+        tail.mark_pose_changed();
+
+        let events = world.refresh_pairs().unwrap();
+        let exits: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, PhysicsEvent::CollisionExit { .. }))
+            .collect();
+        assert_eq!(
+            exits.len(),
+            3,
+            "каждая разошедшаяся пара даёт ровно один Exit"
+        );
+        assert!(exits.iter().all(|event| matches!(
+            event,
+            PhysicsEvent::CollisionExit { second, .. } if *second == handles[3]
+        )));
+        assert!(world.refresh_pairs().unwrap().is_empty());
+        assert_eq!(world.active_pair_count(), 3);
+    }
+
+    #[test]
+    fn sleeping_body_pair_in_the_truncated_tail_is_kept_without_exit() {
+        let (mut world, handles) = overlapping_row(4);
+        world.refresh_pairs().unwrap();
+        world.bodies.get_mut(&handles[3]).unwrap().sleeping = true;
+        world.broad.comparison_limit = 3;
+        assert!(world.refresh_pairs().unwrap().is_empty());
+        assert_eq!(world.active_pair_count(), 6);
+    }
+
+    #[test]
+    fn dense_cluster_step_completes_and_reports_truncated_refreshes() {
+        let (mut world, _) = overlapping_row(6);
+        world.broad.comparison_limit = 3;
+        let mut driver = StepDriver::new(world, 60, 4).unwrap();
+        let result = driver
+            .advance_step(1.0 / 60.0, Vec::<PhysicsCommand>::new())
+            .unwrap();
+        assert_eq!(result.substeps, 1);
+        // Предварительный refresh и refresh одного подшага.
+        assert_eq!(result.broadphase_truncated, 2);
+    }
+
+    #[test]
+    fn degradation_warns_once_on_entry_and_logs_once_on_recovery() {
+        install_capture();
+        let (mut world, _) = overlapping_row(4);
+        world.broad.comparison_limit = 3;
+        world.refresh_pairs().unwrap();
+        world.refresh_pairs().unwrap();
+        assert_eq!(records_on_this_thread(log::Level::Warn).len(), 1);
+        assert!(records_on_this_thread(log::Level::Info).is_empty());
+
+        world.broad.comparison_limit = MAX_BROADPHASE_COMPARISONS;
+        world.refresh_pairs().unwrap();
+        world.refresh_pairs().unwrap();
+        assert_eq!(records_on_this_thread(log::Level::Warn).len(), 1);
+        assert_eq!(records_on_this_thread(log::Level::Info).len(), 1);
     }
 }
 

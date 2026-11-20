@@ -64,6 +64,9 @@ pub struct StressPhysics {
     /// Матрицы кубов последней презентации; до первой презентации предыдущий кадр равен текущему.
     presented: Option<Vec<Mat4>>,
     stats: StepStats,
+    /// Число refresh'ей с обрезкой broadphase за весь прогон.
+    truncated_refreshes: usize,
+    truncation_reported: bool,
 }
 
 impl StressPhysics {
@@ -114,6 +117,8 @@ impl StressPhysics {
             cubes,
             presented: None,
             stats: StepStats::default(),
+            truncated_refreshes: 0,
+            truncation_reported: false,
         })
     }
 
@@ -147,12 +152,23 @@ impl StressPhysics {
     pub fn advance_after_presentation(&mut self) -> Result<Duration, String> {
         self.presented = Some(self.transforms());
         let started = Instant::now();
-        self.driver
+        let result = self
+            .driver
             .advance_step(1.0 / FIXED_HZ as f32, std::iter::empty::<PhysicsCommand>())
             .map_err(|error| error.to_string())?;
         let step = started.elapsed();
         self.stats.record(step);
+        self.truncated_refreshes += result.broadphase_truncated;
         Ok(step)
+    }
+
+    /// Истинно один раз, когда broadphase впервые обрезался: sandbox выводит предупреждение.
+    pub fn take_truncation_warning(&mut self) -> bool {
+        if self.truncated_refreshes > 0 && !self.truncation_reported {
+            self.truncation_reported = true;
+            return true;
+        }
+        false
     }
 
     pub fn stats(&self) -> StepStats {
