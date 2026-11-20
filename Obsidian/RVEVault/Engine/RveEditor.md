@@ -207,6 +207,8 @@ Play передаёт хосту включённые сцены проекта 
 ## Сеть в Play
 
 - Компоненты `network_identity` и `network_transform` добавляются и удаляются в Inspector (значки `network-identity` и `network-transform`). Правки идут тем же путём, что у остальных компонентов: проверка `SceneDocument::validate`, undo и prefab overrides. Удаление `network_identity` уносит и `network_transform`.
+- Inspector: чекбокс `Always relevant` у `network_identity` ставит флаг `always_relevant`: корень видим всем участникам вне зоны значимости. Правка идёт через undo; prefab override заменяет `network_identity` целиком, поэтому флаг в override указывается заново (см. [[Engine/EngineNetwork]], раздел «Значимость»).
+- Play передаёт `position_step` и `interest_radius` из `[network]` проекта и в сетевой поток, и в мост; мост проверяет совпадение шага при запуске.
 - Меню `Network: <режим>` в строке инструментов доступно только вне работающей сессии. Режимы — `Offline`, `Host` (порт, по умолчанию `[network].port` проекта) и `Client` (адрес, отпечаток 64 hex-символа или флаг «Insecure: no pin», пароль). `Host` и `Client` недоступны, пока `[network].enabled` выключен, и подсказка указывает на эту настройку.
 - `PlayNetwork` (`editor/src/play_network.rs`) владеет сетевым потоком, мостом и `WorldSink` сессии, как `PlayAudio`. Мост вызывается в тех же точках шага, что и в runtime: `receive` до `update`, `apply` и `tick` после него. Stop отправляет отключения и дожидается завершения потока.
 - Host генерирует эфемерный ключ сервера и выводит его отпечаток в Console. Клиент вводит этот отпечаток либо подключается с флагом «no pin».
