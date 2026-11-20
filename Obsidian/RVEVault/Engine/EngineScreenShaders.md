@@ -77,7 +77,7 @@ Push constants занимают 112 байт. Вход — линейный цв
 
 ### Script ABI 14
 
-`RVE_SCRIPT_ABI_VERSION = 14`. `RveHost` получает в конце три nullable callbacks: `screen_shader_count(object, *u32)`, `get_screen_shader(object, slot, *RveScreenShaderState)` и `set_screen_shader(object, slot, *RveScreenShaderState)`. Структура `RveScreenShaderState` (`repr(C)`, 68 байт) содержит `enabled: u32` и `params: [f32; 16]`. Слоты нумеруются с нуля. Модули ABI 13 загружаются без изменений, потому что старые поля `RveHost` не сдвинуты.
+Начиная с ABI v14, `RveHost` предоставляет три nullable callbacks: `screen_shader_count(object, *u32)`, `get_screen_shader(object, slot, *RveScreenShaderState)` и `set_screen_shader(object, slot, *RveScreenShaderState)`. Структура `RveScreenShaderState` (`repr(C)`, 68 байт) содержит `enabled: u32` и `params: [f32; 16]`. Слоты нумеруются с нуля. Модули ABI 13 загружаются без изменений, потому что старые поля `RveHost` не сдвинуты.
 
 Гостевой API `rve-sdk` добавляет к камере методы `screen_shader_count`, `screen_shader` и `set_screen_shader`.
 

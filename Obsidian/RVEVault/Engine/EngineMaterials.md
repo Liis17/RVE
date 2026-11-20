@@ -30,7 +30,7 @@ MaterialAsset::dependencies() возвращает уникальные пути
 
 ## Формат .rveshader
 
-Файл состоит из TOML header и GLSL body, разделённых строкой ---. Header содержит [shader] с lighting = "lit" (default) или "unlit" и упорядоченные [[properties]]:
+Файл состоит из TOML header и GLSL body, разделённых строкой ---. Header содержит [shader] с lighting = "lit" (default) или "unlit" и упорядоченные `[[properties]]`:
 
 - name — уникальный GLSL identifier; label необязателен и по умолчанию получается из name;
 - type — float, vec2, vec3, vec4, color или texture; default, min и max задают default и диапазон чисел;
@@ -44,7 +44,7 @@ GLSL body определяет void surface(inout Surface s). Surface несёт
 
 Renderer::create_surface_shader(&SurfaceShaderSource) компилирует SPIR-V для alpha Opaque, Mask и Blend, после чего создаёт четыре graphics pipelines: opaque, opaque-after-depth-prepass, mask и blend. Частичный сбой уничтожает уже созданные shader/pipeline объекты. Выбор pipeline учитывает ShaderId, alpha mode и проход; wireframe и overdraw debug draws используют встроенные pipelines.
 
-Material.shader: Option<ShaderId>, user_values: [[f32; 4]; 16] и user_textures: [Option<TextureId>; 8] передают выбранный Surface Shader и его фиксированные данные. create_material проверяет shader id, layout slots, texture ids и color spaces; нарушение shader-контракта возвращает RenderError::InvalidShader, а material/texture ошибки — InvalidMaterial. destroy_surface_shader возвращает ошибку, пока хоть один живой material ссылается на этот shader. Сначала уничтожаются такие materials, затем shader.
+Material.shader: Option<ShaderId>, `user_values: [[f32; 4]; 16]` и user_textures: [Option<TextureId>; 8] передают выбранный Surface Shader и его фиксированные данные. create_material проверяет shader id, layout slots, texture ids и color spaces; нарушение shader-контракта возвращает RenderError::InvalidShader, а material/texture ошибки — InvalidMaterial. destroy_surface_shader возвращает ошибку, пока хоть один живой material ссылается на этот shader. Сначала уничтожаются такие materials, затем shader.
 
 Пользовательский shader проходит через тот же Lit lighting path при lighting = "lit" либо не добавляет освещение при unlit. Ошибка shader/material не уничтожает прежнюю валидную GPU-версию при editor reload; для нового слота runtime и editor показывают magenta Lit error material и пишут ошибку в log/Console. Этот fallback принадлежит потребителям renderer, не renderer API.
 

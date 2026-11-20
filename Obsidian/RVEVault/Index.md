@@ -5,6 +5,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 ## Архитектура
 
 - [[Architecture|Архитектура]] — устройство workspace, зависимости, поток кадра и ограничения
+- [[Glossary|Словарь терминов]] — ресурсы, префабы и смена сцены
 
 ## Компоненты
 
@@ -24,7 +25,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EnginePhysics]] | Геометрия, столкновения, solver и fixed-step physics world |
 | [[Engine/EngineScene]] | Формат сцен `.rvescene`, runtime-граф `World` со spawn/despawn и CPU-переносом persistent roots, камеры, трансформации и свет |
 | [[Engine/EnginePostProcess]] | Формат `.postprocess` и LUT `.cube`, разрешение с legacy `[color]`, порядок проходов экспозиции, bloom, GTAO и composite |
-| [[Engine/EngineScreenShaders]] | Пользовательские GLSL-шейдеры камеры: стадии `before_post`/`after_post`, prelude, проверка IR, ABI 14, Lua и редактор |
+| [[Engine/EngineScreenShaders]] | Пользовательские GLSL-шейдеры камеры: стадии `before_post`/`after_post`, prelude, проверка IR, гостевой API, Lua и редактор |
 | [[Engine/EngineScript]] | Lua host и ABI-загрузка Rust-скриптов, lifecycle, spawn/destroy и отмена Lua |
 | [[Engine/EngineAudio]] | Звук: декодирование WAV/Ogg, микшер на `cpal`, мост сцены и Play |
 | [[Engine/EngineInput]] | Геймпады: `gilrs`-бэкенд, перевод событий, слоты 1–4, фокусный гейт снимка и вибрация |
@@ -38,7 +39,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/RveEditor]] | Графический редактор сцен на egui: панели, правки с undo, вьюпорт и Play |
 | [[Engine/EngineMcp]] | Локальный MCP-сервер редактора: Streamable HTTP на `127.0.0.1`, сессии, права и очередь вызовов |
 
-Пустой модуль `engine-neural` описан в [[Architecture]]; отдельной заметки для него нет.
+Модуль-заглушка `engine-neural` описан в [[Architecture]]; отдельной заметки для него нет.
 
 ## Обновление памяти
 
