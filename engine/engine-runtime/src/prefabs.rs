@@ -1103,6 +1103,7 @@ fn prefab_collider_geometry(
 pub(crate) fn load_prefab(
     resources: &ResourceHandle,
     token: PrefabToken,
+    build_normal_chains: bool,
     stop: &AtomicBool,
 ) -> Result<LoadedPrefab, LoadError> {
     let interrupted = || stop.load(Ordering::Acquire);
@@ -1120,8 +1121,15 @@ pub(crate) fn load_prefab(
         .check_spawnable()
         .map_err(|error| LoadError::Failed(error.to_string()))?;
     let assets = Assets::with_resources(resources.clone());
-    let prepared = prepare_template(resources, &assets, &token.path, &template, &interrupted)
-        .map_err(classify)?;
+    let prepared = prepare_template(
+        resources,
+        &assets,
+        &token.path,
+        &template,
+        build_normal_chains,
+        &interrupted,
+    )
+    .map_err(classify)?;
     if interrupted() {
         return Err(LoadError::Interrupted);
     }
@@ -1154,6 +1162,7 @@ pub(crate) fn start_prefab_loader(
     resources: ResourceHandle,
     script_tx: Sender<ScriptControl>,
     render_tx: Sender<RenderResourceRequest>,
+    build_normal_chains: bool,
 ) -> std::io::Result<(Sender<LoaderRequest>, mpsc::Receiver<()>)> {
     let (requests_tx, requests_rx) = flume::unbounded();
     let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
@@ -1167,7 +1176,14 @@ pub(crate) fn start_prefab_loader(
             let _ = stop_requests.send(LoaderRequest::Shutdown);
         },
         move || {
-            run_loader(&requests_rx, &resources, &stop, &script_tx, &render_tx);
+            run_loader(
+                &requests_rx,
+                &resources,
+                &stop,
+                &script_tx,
+                &render_tx,
+                build_normal_chains,
+            );
             let _ = stopped_tx.try_send(());
         },
     )?;
@@ -1180,6 +1196,7 @@ fn run_loader(
     stop: &AtomicBool,
     script_tx: &Sender<ScriptControl>,
     render_tx: &Sender<RenderResourceRequest>,
+    build_normal_chains: bool,
 ) {
     while let Ok(request) = requests.recv() {
         let LoaderRequest::Load(token) = request else {
@@ -1188,7 +1205,7 @@ fn run_loader(
         if stop.load(Ordering::Acquire) {
             break;
         }
-        match load_prefab(resources, token.clone(), stop) {
+        match load_prefab(resources, token.clone(), build_normal_chains, stop) {
             Ok(prefab) => {
                 if render_tx
                     .send(RenderResourceRequest::Upload(Box::new(prefab)))
@@ -1489,7 +1506,8 @@ mod tests {
                     },
                 )]);
                 let normal_chains =
-                    NormalChains::build(&models, &textures, &BTreeSet::new(), &|| false).unwrap();
+                    NormalChains::build(true, &models, &textures, &BTreeSet::new(), &|| false)
+                        .unwrap();
                 PreparedMaterialAssets {
                     models,
                     textures,

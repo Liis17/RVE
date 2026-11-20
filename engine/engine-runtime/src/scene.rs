@@ -110,11 +110,15 @@ impl NormalChains {
     /// построение на render thread. Ошибка построения пропускает текстуру: загрузка повторит
     /// построение и вернёт её ошибку, как и раньше. `None` — подготовка прервана через `stop`.
     pub(crate) fn build(
+        enabled: bool,
         models: &HashMap<String, Model>,
         textures: &HashMap<String, TextureData>,
         scene_paths: &BTreeSet<String>,
         stop: &dyn Fn() -> bool,
     ) -> Option<Self> {
+        if !enabled {
+            return Some(Self::default());
+        }
         let mut chains = Self::default();
         for (model_path, model) in models {
             let indices = model
@@ -300,6 +304,7 @@ pub(crate) fn load_scene(
     resources: &ResourceHandle,
     assets: &Assets,
     scene_path: &str,
+    build_normal_chains: bool,
 ) -> Result<PreparedScene, String> {
     let contents = read_utf8(resources, scene_path)?;
     let document =
@@ -321,7 +326,15 @@ pub(crate) fn load_scene(
             read_utf8(resources, &format!("/{}", path.as_str()))
         })
         .map_err(|error| error.to_string())?;
-    let mut prepared = prepare_scene(resources, assets, scene_path, world, prefabs, scene_hash)?;
+    let mut prepared = prepare_scene(
+        resources,
+        assets,
+        scene_path,
+        world,
+        prefabs,
+        scene_hash,
+        build_normal_chains,
+    )?;
     prepared.render_assets.ui_images = ui.images.clone();
     prepared.ui = ui;
     Ok(prepared)
@@ -403,6 +416,7 @@ fn prepare_scene(
     world: World,
     prefabs: PreparedPrefabs,
     scene_hash: [u8; 32],
+    build_normal_chains: bool,
 ) -> Result<PreparedScene, String> {
     prepare_scene_with_model_loader(
         resources,
@@ -411,6 +425,7 @@ fn prepare_scene(
         world,
         prefabs,
         scene_hash,
+        build_normal_chains,
         |path| assets.load_model(path).map_err(|error| error.to_string()),
     )
 }
@@ -441,6 +456,7 @@ struct ObjectParts<'a> {
     lite_scripts: &'a [LiteScript],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_scene_with_model_loader(
     resources: &ResourceHandle,
     assets: &Assets,
@@ -448,6 +464,7 @@ fn prepare_scene_with_model_loader(
     mut world: World,
     prefabs: PreparedPrefabs,
     scene_hash: [u8; 32],
+    build_normal_chains: bool,
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
 ) -> Result<PreparedScene, String> {
     // Пути файлов камер собираются до изменения мира; каждый файл читается один раз.
@@ -559,11 +576,14 @@ fn prepare_scene_with_model_loader(
     }
     set.load_surface_assets(resources, assets, scene_path);
     // Без `stop`: подготовка сцены не прерывается, `None` невозможен.
-    let normal_chains =
-        NormalChains::build(&set.models, &set.textures, &set.normal_scene_paths, &|| {
-            false
-        })
-        .unwrap_or_default();
+    let normal_chains = NormalChains::build(
+        build_normal_chains,
+        &set.models,
+        &set.textures,
+        &set.normal_scene_paths,
+        &|| false,
+    )
+    .unwrap_or_default();
 
     let RenderAssetSet {
         models,
@@ -1506,6 +1526,7 @@ pub(crate) fn prepare_template(
     assets: &Assets,
     label: &str,
     template: &PrefabTemplate,
+    build_normal_chains: bool,
     stop: &dyn Fn() -> bool,
 ) -> Result<PreparedTemplate, String> {
     const STOPPED: &str = "подготовка префаба прервана";
@@ -1547,9 +1568,14 @@ pub(crate) fn prepare_template(
         }
     }
     set.load_surface_assets(resources, assets, label);
-    let normal_chains =
-        NormalChains::build(&set.models, &set.textures, &set.normal_scene_paths, stop)
-            .ok_or_else(|| STOPPED.to_owned())?;
+    let normal_chains = NormalChains::build(
+        build_normal_chains,
+        &set.models,
+        &set.textures,
+        &set.normal_scene_paths,
+        stop,
+    )
+    .ok_or_else(|| STOPPED.to_owned())?;
     let RenderAssetSet {
         models,
         textures,
@@ -2856,6 +2882,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert!(prepared.render_assets.models.is_empty());
@@ -2878,6 +2905,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
 
@@ -2902,7 +2930,7 @@ id = "camera"
             "/scenes/main.rvescene",
             "/scenes/second.rvescene",
         ] {
-            let prepared = load_scene(&handle, &resources.assets, scene)
+            let prepared = load_scene(&handle, &resources.assets, scene, true)
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
             let geometry = prepared.physics_geometry();
             prepared
@@ -2910,7 +2938,8 @@ id = "camera"
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
         }
 
-        let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let prepared =
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene", true).unwrap();
         let resolved = |id: &str| {
             prepared
                 .world
@@ -2958,7 +2987,8 @@ id = "camera"
         ));
         let resources = LooseResources::new(assets);
         let handle = resources.system.handle();
-        let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let prepared =
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene", true).unwrap();
 
         for path in ["prefabs/bullet.rveprefab", "prefabs/bullet_hole.rveprefab"] {
             assert!(prepared.prefabs.templates.contains_key(path), "{path}");
@@ -3012,7 +3042,7 @@ id = "camera"
         let resources = LooseResources::new(&demo.join("Assets"));
         let handle = resources.system.handle();
         let mut prepared =
-            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene", true).unwrap();
         let project = engine_project::ProjectSettings::parse(
             &fs::read_to_string(demo.join("project.rveproject")).unwrap(),
         )
@@ -3103,6 +3133,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3119,6 +3150,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3142,6 +3174,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let blade = prepared.world.handle("spinner1.blade").unwrap();
@@ -3170,6 +3203,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let EnvironmentSource::Equirect { width, height, rgb } = prepared
@@ -3205,6 +3239,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3220,6 +3255,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3248,6 +3284,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert!(
@@ -3278,6 +3315,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let prefab_assets = PreparedMaterialAssets::default();
@@ -3302,6 +3340,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let collider = prepared
@@ -3323,6 +3362,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3333,6 +3373,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3349,6 +3390,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3366,6 +3408,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3379,6 +3422,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3399,6 +3443,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         for id in ["camera", "second"] {
@@ -3475,6 +3520,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -3537,6 +3583,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -3586,6 +3633,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         for id in ["camera", "second"] {
@@ -3607,6 +3655,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let handle = prepared.world.handle("camera").unwrap();
@@ -3629,6 +3678,7 @@ id = "camera"
                 &resources.system.handle(),
                 &resources.assets,
                 "scene.rvescene",
+                true,
             )
             .err()
             .unwrap();
@@ -3658,6 +3708,7 @@ id = "camera"
             world,
             PreparedPrefabs::default(),
             [0; 32],
+            true,
             |path| {
                 assert_eq!(path, "models/quad.fbx");
                 load_count.set(load_count.get() + 1);
@@ -3704,6 +3755,7 @@ id = "camera"
             world,
             PreparedPrefabs::default(),
             [0; 32],
+            true,
             |_| {
                 Ok(Model {
                     meshes: vec![ModelMesh {
@@ -3744,6 +3796,52 @@ id = "camera"
     }
 
     #[test]
+    fn normal_chains_stay_empty_when_the_build_flag_is_off() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"models/quad.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"quad\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", &scene_text).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            PreparedPrefabs::default(),
+            [0; 32],
+            false,
+            |_| {
+                Ok(Model {
+                    meshes: vec![ModelMesh {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                        skin: None,
+                        material: ModelMaterial {
+                            normal_texture: Some(2),
+                            ..ModelMaterial::default()
+                        },
+                    }],
+                    textures: vec![rgba_texture(4, 4), rgba_texture(4, 4), rgba_texture(4, 4)],
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.render_assets.models.len(), 1);
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .get("models/quad.fbx", &MaterialTextureSource::Model(2))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn normal_chain_build_skips_broken_textures_and_honours_interruption() {
         let textures = HashMap::from([
             (
@@ -3760,11 +3858,15 @@ id = "camera"
             "tex/broken.png".to_owned(),
             "tex/normal.png".to_owned(),
         ]);
-        let chains = NormalChains::build(&HashMap::new(), &textures, &paths, &|| false).unwrap();
+        let chains =
+            NormalChains::build(true, &HashMap::new(), &textures, &paths, &|| false).unwrap();
         let scene = |path: &str| MaterialTextureSource::Scene(path.to_owned());
         assert!(chains.get("", &scene("tex/broken.png")).is_none());
         assert!(chains.get("", &scene("tex/normal.png")).is_some());
-        assert!(NormalChains::build(&HashMap::new(), &textures, &paths, &|| true).is_none());
+        assert!(NormalChains::build(true, &HashMap::new(), &textures, &paths, &|| true).is_none());
+        let disabled =
+            NormalChains::build(false, &HashMap::new(), &textures, &paths, &|| true).unwrap();
+        assert!(disabled.get("", &scene("tex/normal.png")).is_none());
     }
 
     #[test]
@@ -3785,6 +3887,7 @@ id = "camera"
             world,
             PreparedPrefabs::default(),
             [0; 32],
+            true,
             |path| {
                 loaded_paths.push(path.to_owned());
                 Ok(Model {
@@ -4159,6 +4262,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
 
@@ -4201,6 +4305,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert!(
@@ -4234,6 +4339,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -4259,6 +4365,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let path = "prefabs/sky.rveprefab";
@@ -4324,6 +4431,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let EnvironmentSource::Equirect { width, height, rgb } = prepared
@@ -4376,6 +4484,7 @@ id = "camera"
             world,
             prefabs,
             [0; 32],
+            true,
             |path| {
                 loaded_paths.borrow_mut().push(path.to_owned());
                 Ok(Model {
@@ -4428,6 +4537,7 @@ id = "camera"
             world,
             prefabs,
             [0; 32],
+            true,
             |_| {
                 Ok(Model {
                     meshes: Vec::new(),
