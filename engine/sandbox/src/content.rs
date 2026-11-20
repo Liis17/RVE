@@ -370,6 +370,7 @@ mod tests {
             position,
             normal: [0.0, 0.0, 1.0],
             uv: [0.25, 0.75],
+            tangent: [0.0; 4],
         };
         Model {
             meshes: vec![

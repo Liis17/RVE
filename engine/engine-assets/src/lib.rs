@@ -9,6 +9,7 @@ mod skin;
 pub use animation::{ModelAnimation, ModelKey, ModelTrack};
 pub use skin::{ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelSkin, ModelTransform};
 
+use bevy_mikktspace::{Geometry, TangentSpace};
 use engine_resources::{ResourceError, ResourceErrorKind, ResourceHandle, ResourceStat};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -53,6 +54,12 @@ pub struct ModelVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// Единичное направление ∂P/∂u в пространстве модели (xyz) и знак `w` ±1.
+    ///
+    /// Bitangent равен `cross(normal, tangent.xyz) * w` и указывает в сторону роста
+    /// исходного FBX `v`, то есть в сторону убывания `uv.y` (загрузчик пишет `uv.y = 1 − v`).
+    /// `[0, 0, 0, 0]` — tangent отсутствует: у модели нет UV или базис вырожденный.
+    pub tangent: [f32; 4],
 }
 
 /// Часть модели с одним материалом; каждые три индекса образуют треугольник.
@@ -847,8 +854,15 @@ fn load_fbx(
             None => (None, None, Vec::new()),
         };
         triangle.resize(mesh.max_face_triangles * 3, 0);
+        // Слои tangent и bitangent файла (оба) имеют приоритет над MikkTSpace.
+        let file_tangents = mesh.vertex_tangent.exists && mesh.vertex_bitangent.exists;
         for part in mesh.material_parts.iter() {
-            let mut builder = MeshPartBuilder::new(part.num_triangles * 3, rigid.is_some());
+            let mut corners = Vec::with_capacity(part.num_triangles * 3);
+            let mut influences = Vec::with_capacity(if rigid.is_some() {
+                part.num_triangles * 3
+            } else {
+                0
+            });
             for &face_index in part.face_indices.iter() {
                 let face = mesh.faces[face_index as usize];
                 let triangles = mesh.triangulate_face(&mut triangle, face) as usize;
@@ -860,6 +874,7 @@ fn load_fbx(
                     );
                     let normal =
                         ufbx::transform_direction(&normal_matrix, mesh.vertex_normal[index]);
+                    let normal = normalize([normal.x as f32, normal.y as f32, normal.z as f32]);
                     let uv = if mesh.vertex_uv.exists {
                         let uv = mesh.vertex_uv[index];
                         // В FBX ось v направлена вверх от нижнего края текстуры.
@@ -867,28 +882,59 @@ fn load_fbx(
                     } else {
                         [0.0, 0.0]
                     };
-                    let vertex = ModelVertex {
-                        position: [position.x as f32, position.y as f32, position.z as f32],
-                        normal: normalize([normal.x as f32, normal.y as f32, normal.z as f32]),
-                        uv,
+                    let tangent = if file_tangents {
+                        let tangent = ufbx::transform_direction(
+                            &node.geometry_to_world,
+                            mesh.vertex_tangent[index],
+                        );
+                        let bitangent = ufbx::transform_direction(
+                            &node.geometry_to_world,
+                            mesh.vertex_bitangent[index],
+                        );
+                        tangent_from_layers(
+                            normal,
+                            [tangent.x as f32, tangent.y as f32, tangent.z as f32],
+                            [bitangent.x as f32, bitangent.y as f32, bitangent.z as f32],
+                        )
+                    } else {
+                        [0.0; 4]
                     };
-                    // Веса берутся по контрольной точке: углы одной точки получают одинаковые веса.
-                    let influence = rigid.map(|rigid| match deformer {
-                        Some(deformer) => skin::corner_influences(
-                            deformer,
-                            &cluster_joints,
-                            mesh.vertex_indices[index] as usize,
-                            rigid,
-                        ),
-                        None => ([rigid, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
+                    corners.push(ModelVertex {
+                        position: [position.x as f32, position.y as f32, position.z as f32],
+                        normal,
+                        uv,
+                        tangent,
                     });
-                    builder
-                        .push(vertex, influence)
-                        .map_err(|message| decode_error(message.to_owned()))?;
+                    if let Some(rigid) = rigid {
+                        // Веса берутся по контрольной точке: углы одной точки получают одинаковые веса.
+                        influences.push(match deformer {
+                            Some(deformer) => skin::corner_influences(
+                                deformer,
+                                &cluster_joints,
+                                mesh.vertex_indices[index] as usize,
+                                rigid,
+                            ),
+                            None => ([rigid, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
+                        });
+                    }
                 }
             }
-            if builder.is_empty() {
+            if corners.is_empty() {
                 continue;
+            }
+            if !file_tangents && mesh.vertex_uv.exists {
+                // Ошибок у bevy_mikktspace 1.0 нет (тип ошибки пуст). Угол без результата
+                // остаётся с нулевым tangent.
+                let _ = bevy_mikktspace::generate_tangents(&mut MikkGeometry {
+                    corners: &mut corners,
+                    mirrored,
+                });
+            }
+            let mut builder = MeshPartBuilder::new(corners.len(), rigid.is_some());
+            for (index, vertex) in corners.into_iter().enumerate() {
+                builder
+                    .push(vertex, influences.get(index).copied())
+                    .map_err(|message| decode_error(message.to_owned()))?;
             }
             let material = match materials.get(part.index as usize) {
                 Some(material) => load_model_material(
@@ -915,8 +961,8 @@ fn load_fbx(
     Ok(model)
 }
 
-/// Битовый ключ вершины: позиция, нормаль, UV, индексы и веса суставов.
-type VertexKey = [u32; 16];
+/// Битовый ключ вершины: позиция, нормаль, UV, tangent, веса и индексы суставов.
+type VertexKey = [u32; 20];
 
 /// Собирает часть меша из углов треугольников, объединяя углы с побитово равными
 /// итоговыми атрибутами. Порядок треугольников и вершин в них сохраняется, поэтому
@@ -948,12 +994,13 @@ impl MeshPartBuilder {
         influence: Option<([u32; 4], [f32; 4])>,
     ) -> Result<(), &'static str> {
         let (joints, weights) = influence.unwrap_or_default();
-        let mut key = [0; 16];
+        let mut key = [0; 20];
         let attributes = vertex
             .position
             .iter()
             .chain(&vertex.normal)
             .chain(&vertex.uv)
+            .chain(&vertex.tangent)
             .chain(&weights)
             .map(|value| value.to_bits())
             .chain(joints);
@@ -978,10 +1025,6 @@ impl MeshPartBuilder {
         Ok(())
     }
 
-    fn is_empty(&self) -> bool {
-        self.indices.is_empty()
-    }
-
     /// Готовая часть; у зеркального узла winding каждого треугольника разворачивается.
     fn finish(mut self, material: ModelMaterial, mirrored: bool) -> ModelMesh {
         if mirrored {
@@ -996,6 +1039,84 @@ impl MeshPartBuilder {
             skin: self.skin,
         }
     }
+}
+
+/// Углы части для MikkTSpace: грани — треугольники в итоговом winding.
+///
+/// Зеркальный узел переставляет вершины грани так же, как [`MeshPartBuilder::finish`],
+/// поэтому знак `w` соответствует winding, который увидит renderer.
+struct MikkGeometry<'a> {
+    corners: &'a mut [ModelVertex],
+    mirrored: bool,
+}
+
+impl MikkGeometry<'_> {
+    /// Индекс угла части для вершины `vert` грани `face` в итоговом порядке.
+    fn corner(&self, face: usize, vert: usize) -> usize {
+        let vert = match (self.mirrored, vert) {
+            (true, 1) => 2,
+            (true, 2) => 1,
+            _ => vert,
+        };
+        face * 3 + vert
+    }
+}
+
+impl Geometry for MikkGeometry<'_> {
+    fn num_faces(&self) -> usize {
+        self.corners.len() / 3
+    }
+
+    fn num_vertices_of_face(&self, _face: usize) -> usize {
+        3
+    }
+
+    fn position(&self, face: usize, vert: usize) -> [f32; 3] {
+        self.corners[self.corner(face, vert)].position
+    }
+
+    fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
+        self.corners[self.corner(face, vert)].normal
+    }
+
+    fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
+        // Загрузчик хранит uv.y = 1 − v; MikkTSpace должен получить исходный v,
+        // иначе знак `w` инвертируется. Возврат через 1 − (1 − v) ошибается не больше ulp.
+        let [u, v] = self.corners[self.corner(face, vert)].uv;
+        [u, 1.0 - v]
+    }
+
+    fn set_tangent(&mut self, tangent: Option<TangentSpace>, face: usize, vert: usize) {
+        let index = self.corner(face, vert);
+        self.corners[index].tangent = tangent.map_or([0.0; 4], |tangent| tangent.tangent_encoded());
+    }
+}
+
+/// Tangent из слоёв файла: `tangent` ортогонализуется к нормали, `w` выбирает сторону `bitangent`.
+///
+/// Нулевой tangent или bitangent, лежащий в плоскости tangent и нормали, даёт `[0, 0, 0, 0]`.
+fn tangent_from_layers(normal: [f32; 3], tangent: [f32; 3], bitangent: [f32; 3]) -> [f32; 4] {
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let along_normal = dot(tangent, normal);
+    let orthogonal: [f32; 3] =
+        std::array::from_fn(|axis| tangent[axis] - normal[axis] * along_normal);
+    let length = dot(orthogonal, orthogonal).sqrt();
+    if !length.is_finite() || length <= 0.0 {
+        return [0.0; 4];
+    }
+    let [x, y, z] = orthogonal.map(|value| value / length);
+    // bitangent = cross(normal, tangent) * w: знак w — знак проекции bitangent на это направление.
+    let side = [
+        normal[1] * z - normal[2] * y,
+        normal[2] * x - normal[0] * z,
+        normal[0] * y - normal[1] * x,
+    ];
+    let w = match dot(side, bitangent) {
+        handedness if handedness > 0.0 => 1.0,
+        handedness if handedness < 0.0 => -1.0,
+        _ => return [0.0; 4],
+    };
+    [x, y, z, w]
 }
 
 /// Файловая текстура основного цвета: классический diffuse FBX или base color PBR.
@@ -1747,7 +1868,7 @@ mod tests {
         AssetError, Assets, MeshPartBuilder, Model, ModelAlphaMode, ModelMaterial, ModelMesh,
         ModelVertex, TextureData, decode_hdr, decode_png, is_missing_texture_candidate,
         map_resource_error, normalize, pack_metallic_roughness, supports_metallic_roughness,
-        texture_candidates,
+        tangent_from_layers, texture_candidates,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
@@ -2389,6 +2510,7 @@ mod tests {
             position,
             normal,
             uv,
+            tangent: [0.0; 4],
         }
     }
 
@@ -2529,6 +2651,149 @@ mod tests {
         {
             assert_eq!(*triangle, [source[0], source[2], source[1]]);
         }
+    }
+
+    fn assert_tangent_close(actual: [f32; 4], expected: [f32; 4]) {
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 1e-5, "{actual:?} != {expected:?}");
+        }
+    }
+
+    #[test]
+    fn fbx_quad_uv_tangent_follows_u_with_positive_handedness() {
+        let temp = TempAssets::new("tangent-quad");
+        temp.write("model/quad.fbx", quad_fbx(None).as_bytes());
+
+        let model = temp.assets().load_model("/model/quad.fbx").unwrap();
+
+        for vertex in &model.meshes[0].vertices {
+            assert_tangent_close(vertex.tangent, [1.0, 0.0, 0.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn fbx_mirrored_node_tangent_follows_mirrored_u_and_flips_handedness() {
+        let temp = TempAssets::new("tangent-mirrored");
+        let fbx = quad_fbx(None).replace(
+            "P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,0",
+            "P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,0\n\t\t\tP: \"Lcl Scaling\", \"Lcl Scaling\", \"\", \"A\",-1,1,1",
+        );
+        temp.write("model/mirrored.fbx", fbx.as_bytes());
+
+        let model = temp.assets().load_model("/model/mirrored.fbx").unwrap();
+
+        for vertex in &model.meshes[0].vertices {
+            assert_tangent_close(vertex.tangent, [-1.0, 0.0, 0.0, -1.0]);
+        }
+    }
+
+    #[test]
+    fn fbx_tangent_and_bitangent_layers_take_precedence_over_uv_tangent() {
+        let temp = TempAssets::new("tangent-layers");
+        // Слой файла повёрнут в плоскости квадрата: MikkTSpace дал бы (1, 0, 0, 1).
+        let fbx = quad_fbx(None)
+            .replace(
+                "\t\tLayerElementMaterial: 0 {",
+                "\t\tLayerElementTangent: 0 {\n\t\t\tVersion: 101\n\t\t\tName: \"UVMap\"\n\t\t\tMappingInformationType: \"ByPolygonVertex\"\n\t\t\tReferenceInformationType: \"Direct\"\n\t\t\tTangents: *12 {\n\t\t\t\ta: 0.6,0.8,0,0.6,0.8,0,0.6,0.8,0,0.6,0.8,0\n\t\t\t}\n\t\t}\n\t\tLayerElementBinormal: 0 {\n\t\t\tVersion: 101\n\t\t\tName: \"UVMap\"\n\t\t\tMappingInformationType: \"ByPolygonVertex\"\n\t\t\tReferenceInformationType: \"Direct\"\n\t\t\tBinormals: *12 {\n\t\t\t\ta: -0.8,0.6,0,-0.8,0.6,0,-0.8,0.6,0,-0.8,0.6,0\n\t\t\t}\n\t\t}\n\t\tLayerElementMaterial: 0 {",
+            )
+            .replace(
+                "LayerElement:  {\n\t\t\t\tType: \"LayerElementMaterial\"",
+                "LayerElement:  {\n\t\t\t\tType: \"LayerElementTangent\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n\t\t\tLayerElement:  {\n\t\t\t\tType: \"LayerElementBinormal\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n\t\t\tLayerElement:  {\n\t\t\t\tType: \"LayerElementMaterial\"",
+            );
+        temp.write("model/layers.fbx", fbx.as_bytes());
+
+        let model = temp.assets().load_model("/model/layers.fbx").unwrap();
+
+        for vertex in &model.meshes[0].vertices {
+            assert_tangent_close(vertex.tangent, [0.6, 0.8, 0.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn fbx_without_uv_layer_has_zero_tangent() {
+        let temp = TempAssets::new("tangent-no-uv");
+        let mut fbx = quad_fbx(None);
+        let uv_block = fbx.find("\t\tLayerElementUV: 0 {").unwrap();
+        let material_block = fbx.find("\t\tLayerElementMaterial: 0 {").unwrap();
+        fbx.replace_range(uv_block..material_block, "");
+        let uv_entry = fbx
+            .find("\t\t\tLayerElement:  {\n\t\t\t\tType: \"LayerElementUV\"")
+            .unwrap();
+        let uv_entry_end = uv_entry + fbx[uv_entry..].find("}\n").unwrap() + 2;
+        fbx.replace_range(uv_entry..uv_entry_end, "");
+        temp.write("model/no-uv.fbx", fbx.as_bytes());
+
+        let model = temp.assets().load_model("/model/no-uv.fbx").unwrap();
+
+        for vertex in &model.meshes[0].vertices {
+            assert_eq!(vertex.uv, [0.0, 0.0]);
+            assert_eq!(vertex.tangent, [0.0; 4]);
+        }
+    }
+
+    #[test]
+    fn fbx_degenerate_uv_gives_zero_tangent_without_failing_the_load() {
+        let temp = TempAssets::new("tangent-degenerate-uv");
+        let fbx = quad_fbx(None).replace(
+            "UV: *8 {\n\t\t\t\ta: 0,0,1,0,1,1,0,1",
+            "UV: *8 {\n\t\t\t\ta: 0,0,0,0,0,0,0,0",
+        );
+        temp.write("model/flat-uv.fbx", fbx.as_bytes());
+
+        let model = temp.assets().load_model("/model/flat-uv.fbx").unwrap();
+
+        let mesh = &model.meshes[0];
+        assert_eq!(mesh.indices.len(), 6);
+        for vertex in &mesh.vertices {
+            assert_eq!(vertex.tangent, [0.0; 4]);
+        }
+    }
+
+    #[test]
+    fn mesh_part_builder_keeps_tangent_seams_apart() {
+        let base = corner([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
+        let positive = ModelVertex {
+            tangent: [1.0, 0.0, 0.0, 1.0],
+            ..base
+        };
+        let mirrored = ModelVertex {
+            tangent: [1.0, 0.0, 0.0, -1.0],
+            ..base
+        };
+        let corners = [positive, mirrored, positive, mirrored, positive, positive];
+        let mesh = build_part(&corners, None, false);
+        assert_eq!(mesh.vertices.len(), 2);
+        assert_eq!(mesh.indices, [0, 1, 0, 1, 0, 0]);
+        assert_eq!(expanded_corners(&mesh), corners);
+    }
+
+    #[test]
+    fn tangent_from_layers_orthogonalizes_and_takes_sign_from_bitangent() {
+        assert_tangent_close(
+            tangent_from_layers([0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        assert_tangent_close(
+            tangent_from_layers([0.0, 0.0, 1.0], [2.0, 0.0, 0.0], [0.0, -3.0, 0.0]),
+            [1.0, 0.0, 0.0, -1.0],
+        );
+    }
+
+    #[test]
+    fn tangent_from_layers_degenerate_bases_have_zero_tangent() {
+        // Tangent вдоль нормали, нулевой bitangent и bitangent вдоль tangent не задают базис.
+        assert_eq!(
+            tangent_from_layers([0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 1.0, 0.0]),
+            [0.0; 4]
+        );
+        assert_eq!(
+            tangent_from_layers([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+            [0.0; 4]
+        );
+        assert_eq!(
+            tangent_from_layers([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            [0.0; 4]
+        );
     }
 
     #[test]
@@ -3380,6 +3645,7 @@ mod tests {
             position,
             normal: [0.0, 1.0, 0.0],
             uv: [0.0, 0.0],
+            tangent: [0.0; 4],
         };
         let mesh = |positions: [[f32; 3]; 3]| ModelMesh {
             vertices: positions.map(vertex).to_vec(),

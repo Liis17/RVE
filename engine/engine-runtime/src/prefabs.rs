@@ -1370,6 +1370,7 @@ mod tests {
                             position: [0.0; 3],
                             normal: [0.0, 1.0, 0.0],
                             uv: [0.0; 2],
+                            tangent: [0.0; 4],
                         };
                         3
                     ],

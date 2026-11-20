@@ -99,6 +99,7 @@ mod tests {
             position: position.to_array(),
             normal: [0.0, 0.0, 1.0],
             uv: [0.0, 0.0],
+            tangent: [0.0; 4],
         };
         Model {
             meshes: vec![ModelMesh {
