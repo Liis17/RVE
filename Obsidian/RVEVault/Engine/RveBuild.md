@@ -23,7 +23,7 @@ New Project при PATH только с системными каталогам�
 публикуется как обычный GitHub Release `sdk-<полный SHA>` с отметкой latest; повторный
 запуск заменяет asset того же релиза. Проверка не запускает GUI или GPU.
 
-`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server]` читает
+`rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>] [--with-server] [--compression none|lz4|zstd]` читает
 `project.rveproject` и `bootstrap.rves`, открывает `<project>/Assets` через
 `ResourceSystem` в `SourceMode::Loose`, затем проверяет каждую включённую сцену с
 помощью `SceneDocument`. Выключенные сцены не открываются. В сборку попадают файлы
@@ -33,6 +33,11 @@ asset `.camerasettings` проверяется как UTF-8/TOML с диапаз
 Иконка должна
 иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
 Неиспользуемые файлы каталога Assets не копируются.
+
+`--compression` задаёт кодек всех архивов релиза: `none`, `lz4` или `zstd`. Уровень zstd и
+размер чанка берутся из `BuildCompression::default()` engine-pak, поэтому без флага сборка
+идёт zstd, как и раньше. Повтор флага, отсутствие значения или неизвестный кодек — ошибка CLI
+с кодом 2. Кодек передаётся в `build_archive_set`, и `stat` архива возвращает его для файлов.
 
 Environment `.hdr` включается в архив как обычный объявленный asset из раскрытой
 сцены. Это также покрывает HDR, добавленный вложенным prefab; builder не декодирует

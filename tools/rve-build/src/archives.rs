@@ -46,6 +46,7 @@ pub(crate) fn validate_project_archives(
 pub(crate) fn build_project_archives(
     project: &ProjectBuild,
     output: &Path,
+    compression: BuildCompression,
 ) -> Result<ArchiveSetRegistry, BuildError> {
     let registry = validate_project_archives(project)?;
     let [project_settings_path, registry_path, prefabs_path] = reserved_paths();
@@ -142,13 +143,8 @@ pub(crate) fn build_project_archives(
             }
         })
         .collect();
-    build_archive_set(
-        archives,
-        output,
-        BuildCompression::default(),
-        BuildOptions::default(),
-    )
-    .map_err(|error| BuildError::operational(format!("не удалось собрать архивы: {error}")))?;
+    build_archive_set(archives, output, compression, BuildOptions::default())
+        .map_err(|error| BuildError::operational(format!("не удалось собрать архивы: {error}")))?;
 
     Ok(registry)
 }
@@ -160,7 +156,10 @@ pub(crate) mod tests {
     use crate::project::prepare_project;
     use crate::temporary::TempDir;
     use engine_files::VirtualPath;
-    use engine_pak::{Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, CatalogLimits};
+    use engine_pak::{
+        Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, BuildCompression,
+        CatalogLimits, Codec,
+    };
     use png::{BitDepth, ColorType, Encoder};
     use std::collections::BTreeMap;
     use std::fs;
@@ -319,7 +318,8 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         create_demo_like_project(project_root.path());
         let project = prepare_project(project_root.path()).unwrap();
         let archives_dir = project_root.path().join("out-assets");
-        let registry = build_project_archives(&project, &archives_dir).unwrap();
+        let registry =
+            build_project_archives(&project, &archives_dir, BuildCompression::default()).unwrap();
         validate_staged_archives(&archives_dir).unwrap();
 
         assert_eq!(
@@ -434,7 +434,8 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         fs::write(luts.join("unused.cube"), "LUT_3D_SIZE 2\n").unwrap();
         let project = prepare_project(project_root.path()).unwrap();
         let archives_dir = project_root.path().join("out-assets");
-        let registry = build_project_archives(&project, &archives_dir).unwrap();
+        let registry =
+            build_project_archives(&project, &archives_dir, BuildCompression::default()).unwrap();
         let assignments = file_assignments(&registry);
         assert_eq!(
             assignments["/luts/film.cube"],
@@ -477,6 +478,32 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
             "{error}"
         );
         assert!(error.to_string().contains("intensity"), "{error}");
+    }
+    #[test]
+    fn compression_profile_sets_the_codec_of_every_packed_file() {
+        for codec in [Codec::None, Codec::Lz4, Codec::Zstd] {
+            let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-codec").unwrap();
+            create_demo_like_project(project_root.path());
+            let project = prepare_project(project_root.path()).unwrap();
+            let archives_dir = project_root.path().join("out-assets");
+            let compression = BuildCompression {
+                codec,
+                ..BuildCompression::default()
+            };
+            build_project_archives(&project, &archives_dir, compression).unwrap();
+
+            for (archive, path) in [
+                ("base", "/rve/project.toml"),
+                ("base", "/icons/app.png"),
+                ("shared", "/textures/shared.png"),
+                ("scene-main", "/textures/main-only.png"),
+            ] {
+                let packed =
+                    Archive::open_file(archives_dir.join(format!("{archive}.rvepak"))).unwrap();
+                let stat = packed.stat(&VirtualPath::parse(path).unwrap()).unwrap();
+                assert_eq!(stat.codec, codec, "{archive}: {path}");
+            }
+        }
     }
 }
 
@@ -533,7 +560,7 @@ mod prefab_list_tests {
     use crate::project::prepare_project;
     use crate::temporary::TempDir;
     use engine_files::VirtualPath;
-    use engine_pak::Archive;
+    use engine_pak::{Archive, BuildCompression};
     use engine_project::PrefabCatalogFile;
     use std::fs;
     use std::path::Path;
@@ -586,7 +613,8 @@ mod prefab_list_tests {
         );
         let build = prepare_project(root.path()).unwrap();
         let archives_dir = root.path().join("out-assets");
-        let registry = build_project_archives(&build, &archives_dir).unwrap();
+        let registry =
+            build_project_archives(&build, &archives_dir, BuildCompression::default()).unwrap();
 
         let text = base_text(&archives_dir, "/rve/prefabs.toml");
         assert_eq!(PrefabCatalogFile::parse(&text).unwrap(), build.prefabs);
@@ -600,7 +628,7 @@ mod prefab_list_tests {
         project(root.path(), None);
         let build = prepare_project(root.path()).unwrap();
         let archives_dir = root.path().join("out-assets");
-        build_project_archives(&build, &archives_dir).unwrap();
+        build_project_archives(&build, &archives_dir, BuildCompression::default()).unwrap();
 
         let text = base_text(&archives_dir, "/rve/prefabs.toml");
         assert!(PrefabCatalogFile::parse(&text).unwrap().prefabs.is_empty());
@@ -617,7 +645,12 @@ mod prefab_list_tests {
         )
         .unwrap();
         let build = prepare_project(root.path()).unwrap();
-        let error = build_project_archives(&build, &root.path().join("out-assets")).unwrap_err();
+        let error = build_project_archives(
+            &build,
+            &root.path().join("out-assets"),
+            BuildCompression::default(),
+        )
+        .unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("/rve/prefabs.toml"), "{error}");
     }

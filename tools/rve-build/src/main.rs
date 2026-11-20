@@ -65,11 +65,13 @@ fn main() {
             output,
             vulkan_sdk,
             with_server,
+            compression,
         }) => match player::build_distribution(
             &project_dir,
             &output,
             vulkan_sdk.as_deref(),
             with_server,
+            compression,
         ) {
             Ok(()) => 0,
             Err(error) => {
