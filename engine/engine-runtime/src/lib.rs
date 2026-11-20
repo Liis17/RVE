@@ -7,6 +7,7 @@ mod activation;
 mod cli;
 #[cfg(feature = "dev-console")]
 mod console;
+mod crash;
 mod cursor;
 #[cfg(any(feature = "dev-console", test))]
 mod dev_overlays;
@@ -29,6 +30,7 @@ use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_
 use cli::{PlayerArgs, SERVER_USAGE, USAGE};
 #[cfg(feature = "dev-console")]
 use console::{CommandCatalogSnapshot, ConsoleUiSlot};
+use crash::Role;
 use cursor::CursorControl;
 use engine_assets::{Assets, TextureData};
 #[cfg(feature = "dev-console")]
@@ -93,8 +95,8 @@ pub fn run_player() -> ExitCode {
     let _ = install_logger(Some(Arc::clone(&console_buffer)));
     #[cfg(not(feature = "dev-console"))]
     let _ = install_logger(None);
-    let release_root = match executable_dir() {
-        Ok(exe_dir) => release_root(&exe_dir),
+    let exe_dir = match executable_dir() {
+        Ok(exe_dir) => exe_dir,
         Err(error) => {
             return fail(
                 2,
@@ -102,14 +104,23 @@ pub fn run_player() -> ExitCode {
             );
         }
     };
+    crash::install(Role::Player, &exe_dir);
+    let release_root = release_root(&exe_dir);
     // SAFETY: this is the first runtime operation that can affect process-wide
     // Vulkan configuration, and no runtime, resource, or activation thread exists yet.
     unsafe { engine_platform::prepare_vulkan_environment(&release_root) };
     let activation = PendingActivation::default();
     #[cfg(feature = "dev-console")]
-    return run_from_args(release_root, args, false, activation, console_buffer);
+    return run_from_args(
+        release_root,
+        exe_dir,
+        args,
+        false,
+        activation,
+        console_buffer,
+    );
     #[cfg(not(feature = "dev-console"))]
-    run_from_args(release_root, args, false, activation)
+    run_from_args(release_root, exe_dir, args, false, activation)
 }
 
 /// Runs a dedicated headless server (`rve-server`): no window, renderer, GPU probe or audio output.
@@ -129,8 +140,8 @@ pub fn run_server() -> ExitCode {
         }
     };
     let _ = install_logger(None);
-    let release_root = match executable_dir() {
-        Ok(exe_dir) => server_release_root(&exe_dir),
+    let exe_dir = match executable_dir() {
+        Ok(exe_dir) => exe_dir,
         Err(error) => {
             return fail(
                 2,
@@ -138,18 +149,27 @@ pub fn run_server() -> ExitCode {
             );
         }
     };
+    crash::install(Role::Server, &exe_dir);
+    let release_root = server_release_root(&exe_dir);
     #[cfg(feature = "dev-console")]
     let console_buffer = Arc::new(Mutex::new(ConsoleBuffer::default()));
     #[cfg(feature = "dev-console")]
     return run_from_args(
         release_root,
+        exe_dir,
         args,
         true,
         PendingActivation::default(),
         console_buffer,
     );
     #[cfg(not(feature = "dev-console"))]
-    run_from_args(release_root, args, true, PendingActivation::default())
+    run_from_args(
+        release_root,
+        exe_dir,
+        args,
+        true,
+        PendingActivation::default(),
+    )
 }
 
 fn executable_dir() -> Result<PathBuf, String> {
@@ -165,6 +185,7 @@ fn executable_dir() -> Result<PathBuf, String> {
 /// Vulkan, иконка, экземпляр и звуковой вывод есть только у игры.
 fn run_from_args(
     release_root: PathBuf,
+    exe_dir: PathBuf,
     args: PlayerArgs,
     headless: bool,
     activation: PendingActivation,
@@ -175,7 +196,7 @@ fn run_from_args(
     let command_catalog = Arc::new(Mutex::new(CommandCatalogSnapshot::default()));
     #[cfg(feature = "dev-console")]
     let console_ui = Arc::new(ConsoleUiSlot::default());
-    let layout = match args.project {
+    let (layout, report_dir) = match args.project {
         Some(project) => {
             let project = match normalize_layout_path(&project) {
                 Ok(path) if path.is_dir() => path,
@@ -187,9 +208,12 @@ fn run_from_args(
                 }
                 Err(error) => return fail(2, format!("проект {}: {error}", project.display())),
             };
-            Layout::dev(&project)
+            (Layout::dev(&project), crash::dev_report_dir(&project))
         }
-        None => Layout::release(&release_root),
+        None => (
+            Layout::release(&release_root),
+            crash::release_report_dir(&exe_dir, cfg!(target_os = "macos")),
+        ),
     };
     let scripts_override = match args.scripts.as_deref() {
         Some(path) => match normalize_scripts_path(path) {
@@ -228,6 +252,8 @@ fn run_from_args(
         Ok(project) => project,
         Err(error) => return fail(2, format!("ошибка проекта: {error}")),
     };
+    let role = if headless { Role::Server } else { Role::Player };
+    crash::set_target(role, report_dir, &project.name);
     let prefab_list = match load_prefab_catalog(&layout.prefab_catalog, &resource_handle) {
         Ok(list) => list,
         Err(error) => return fail(2, format!("ошибка списка префабов: {error}")),

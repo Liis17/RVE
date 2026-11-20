@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1143,6 +1143,7 @@ dependencies = [
  "log",
  "png",
  "rfd",
+ "rve-crash-monitor",
  "rve-sdk",
  "sysinfo",
  "winit",
@@ -3159,6 +3160,10 @@ dependencies = [
  "toml",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "rve-crash-monitor"
+version = "0.1.0"
 
 [[package]]
 name = "rve-editor"
