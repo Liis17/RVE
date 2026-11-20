@@ -247,6 +247,19 @@ pub(crate) fn validate_shader_destroyable(references: usize) -> Result<(), Rende
     }
 }
 
+/// Normal map хранит векторы в линейном кодировании; sRGB-декодирование исказило бы их.
+pub(crate) fn validate_texture_role(
+    role: TextureRole,
+    color_space: TextureColorSpace,
+) -> Result<(), RenderError> {
+    if role == TextureRole::Normal && color_space == TextureColorSpace::Srgb {
+        return Err(RenderError::InvalidTexture(
+            "normal map должна иметь линейное цветовое пространство".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_texture(
     width: u32,
     height: u32,

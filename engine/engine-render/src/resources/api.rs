@@ -182,8 +182,23 @@ impl Renderer {
         rgba: &[u8],
         color_space: TextureColorSpace,
     ) -> Result<TextureId, RenderError> {
+        self.create_texture_with_role(width, height, rgba, color_space, TextureRole::Color)
+    }
+
+    /// Записывает RGBA8-текстуру с заданной ролью. `Normal` требует `Linear` и строит mip-уровни
+    /// нормализованным усреднением векторов на CPU. Ошибка отправки batch — как у `create_texture`.
+    pub fn create_texture_with_role(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        color_space: TextureColorSpace,
+        role: TextureRole,
+    ) -> Result<TextureId, RenderError> {
+        validate_texture_role(role, color_space)?;
         validate_texture(width, height, rgba.len(), self.max_texture_size)?;
-        let texture = Arc::new(self.upload_texture(width, height, rgba, color_space)?);
+        let texture =
+            Arc::new(self.upload_texture_with_role(width, height, rgba, color_space, role)?);
         self.textures.push(Some(texture));
         Ok(TextureId(self.textures.len() - 1))
     }
@@ -351,8 +366,14 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?;
         let device = self.device()?.clone();
         let image_set_layout = self.texture_set_layout()?;
-        let (image, upload_serial) =
-            self.upload_image(UI_TEXTURE_FORMAT, 1, width, height, rgba)?;
+        let (image, upload_serial) = self.upload_image(
+            UI_TEXTURE_FORMAT,
+            1,
+            width,
+            height,
+            rgba,
+            TextureRole::Color,
+        )?;
         let (pool, set) = match allocate_image_set(&device, image_set_layout, image.view, sampler) {
             Ok(resources) => resources,
             Err(error) => {

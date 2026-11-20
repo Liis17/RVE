@@ -49,6 +49,15 @@ pub enum TextureColorSpace {
     Linear,
 }
 
+/// Назначение RGBA8-текстуры; определяет способ построения её mip-уровней.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureRole {
+    /// Обычная текстура: mip-уровни строятся blit-ом на GPU.
+    Color,
+    /// Normal map в кодировании `v * 0.5 + 0.5`: mip-уровни усредняются и нормализуются на CPU.
+    Normal,
+}
+
 /// Обработка альфа-канала материала.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum AlphaMode {

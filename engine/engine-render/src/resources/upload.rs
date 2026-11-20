@@ -11,9 +11,30 @@ impl Renderer {
         rgba: &[u8],
         color_space: TextureColorSpace,
     ) -> Result<Texture, RenderError> {
+        self.upload_texture_with_role(width, height, rgba, color_space, TextureRole::Color)
+    }
+
+    /// Для `Normal` mip-цепочка строится на CPU и копируется по уровням; для `Color` — blit на GPU.
+    pub(crate) fn upload_texture_with_role(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        color_space: TextureColorSpace,
+        role: TextureRole,
+    ) -> Result<Texture, RenderError> {
         let mip_levels = mip_level_count(width, height);
         let format = texture_format(color_space);
-        let (image, upload_serial) = self.upload_image(format, mip_levels, width, height, rgba)?;
+        let chain;
+        let data = match role {
+            TextureRole::Color => rgba,
+            TextureRole::Normal => {
+                chain = normal_mip_chain(width, height, rgba);
+                chain.as_slice()
+            }
+        };
+        let (image, upload_serial) =
+            self.upload_image(format, mip_levels, width, height, data, role)?;
         Ok(Texture {
             image,
             color_space,
@@ -21,26 +42,32 @@ impl Renderer {
         })
     }
 
+    /// `data` — либо базовый уровень, либо вся mip-цепочка (для `Normal`).
     pub(crate) fn upload_image(
         &mut self,
         format: vk::Format,
         mip_levels: u32,
         width: u32,
         height: u32,
-        rgba: &[u8],
+        data: &[u8],
+        role: TextureRole,
     ) -> Result<(DeviceImage, u64), RenderError> {
         let instance = self.instance()?.clone();
         let device = self.device()?.clone();
-        let layout = upload_data_layout(0, rgba.len(), self.upload_alignment).ok_or(
+        let layout = upload_data_layout(0, data.len(), self.upload_alignment).ok_or(
             RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
         )?;
         let capacity = upload_batch_capacity(layout.1, self.upload_alignment).ok_or(
             RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
         )?;
         let must_flush = self.pending_upload.as_ref().is_some_and(|batch| {
-            batch.oversized
-                || upload_data_layout(batch.cursor, rgba.len(), self.upload_alignment)
-                    .is_none_or(|(_, end)| end > batch.capacity)
+            upload_flush_required(
+                batch.oversized,
+                batch.cursor,
+                batch.capacity,
+                data.len(),
+                self.upload_alignment,
+            )
         });
         if must_flush {
             self.flush_uploads()?;
@@ -77,11 +104,11 @@ impl Renderer {
             .pending_upload
             .as_mut()
             .ok_or(RenderError::InvalidState("upload batch отсутствует"))?;
-        let layout = upload_data_layout(batch.cursor, rgba.len(), self.upload_alignment).ok_or(
+        let layout = upload_data_layout(batch.cursor, data.len(), self.upload_alignment).ok_or(
             RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
         )?;
-        batch.staging.write_at(layout.0, rgba)?;
-        batch.record_image_upload(image.image, width, height, mip_levels, layout.0);
+        batch.staging.write_at(layout.0, data)?;
+        batch.record_image_upload(image.image, width, height, mip_levels, layout.0, role);
         batch.cursor = layout.1;
         let upload_serial = batch.serial;
         Ok((image, upload_serial))
@@ -448,6 +475,45 @@ pub(crate) fn upload_batch_flush_required(
     Some(mesh_upload_layout(cursor, vertex_size, index_size, alignment)?.end > capacity)
 }
 
+/// Нужно ли отправить пачку перед записью данных текстуры размером `data_len`.
+pub(crate) fn upload_flush_required(
+    oversized: bool,
+    cursor: usize,
+    capacity: usize,
+    data_len: usize,
+    alignment: usize,
+) -> bool {
+    oversized
+        || upload_data_layout(cursor, data_len, alignment).is_none_or(|(_, end)| end > capacity)
+}
+
+/// Способ записи mip-уровней текстуры из staging.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MipUploadPlan {
+    /// Копируется только базовый уровень, остальные строит GPU blit-ом.
+    Blit,
+    /// Каждый уровень копируется из staging: `(уровень, абсолютное смещение буфера, размер)`.
+    Copies(Vec<(u32, usize, vk::Extent2D)>),
+}
+
+pub(crate) fn mip_upload_plan(
+    role: TextureRole,
+    base_offset: usize,
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+) -> MipUploadPlan {
+    match role {
+        TextureRole::Color => MipUploadPlan::Blit,
+        TextureRole::Normal => MipUploadPlan::Copies(
+            mip_chain_layout(width, height, mip_levels)
+                .into_iter()
+                .map(|(level, offset, extent)| (level, base_offset + offset, extent))
+                .collect(),
+        ),
+    }
+}
+
 /// Записываемая пачка копирований и её staging память.
 pub(crate) struct UploadBatch {
     pub(crate) device: ash::Device,
@@ -603,28 +669,23 @@ impl UploadBatch {
         }
     }
 
-    pub(crate) fn record_image_upload(
+    /// Копирует один уровень из staging по абсолютному смещению буфера.
+    fn record_level_copy(
         &self,
         image: vk::Image,
-        width: u32,
-        height: u32,
-        mip_levels: u32,
+        level: u32,
         buffer_offset: usize,
+        extent: vk::Extent2D,
     ) {
-        pipeline_barrier(
-            &self.device,
-            self.command_buffer,
-            texture_upload_barrier(image, mip_levels),
-        );
         let region = [vk::BufferImageCopy::default()
             .buffer_offset(buffer_offset as vk::DeviceSize)
-            .image_subresource(color_subresource_layers())
+            .image_subresource(color_subresource_layers().mip_level(level))
             .image_extent(vk::Extent3D {
-                width,
-                height,
+                width: extent.width,
+                height: extent.height,
                 depth: 1,
             })];
-        // SAFETY: the aligned staging range contains exactly the base-level RGBA8 texels.
+        // SAFETY: the staging range holds exactly this level's RGBA8 texels at an aligned offset.
         unsafe {
             self.device.cmd_copy_buffer_to_image(
                 self.command_buffer,
@@ -634,6 +695,38 @@ impl UploadBatch {
                 &region,
             )
         };
+    }
+
+    pub(crate) fn record_image_upload(
+        &self,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        buffer_offset: usize,
+        role: TextureRole,
+    ) {
+        pipeline_barrier(
+            &self.device,
+            self.command_buffer,
+            texture_upload_barrier(image, mip_levels),
+        );
+        let plan = mip_upload_plan(role, buffer_offset, width, height, mip_levels);
+        if let MipUploadPlan::Copies(levels) = plan {
+            for (level, offset, extent) in levels {
+                self.record_level_copy(image, level, offset, extent);
+            }
+            pipeline_barrier(
+                &self.device,
+                self.command_buffer,
+                texture_mip_destination_shader_barrier(
+                    image,
+                    color_mip_subresource_range(0, mip_levels),
+                ),
+            );
+            return;
+        }
+        self.record_level_copy(image, 0, buffer_offset, vk::Extent2D { width, height });
         let mut source_extent = vk::Extent2D { width, height };
         for mip_level in 1..mip_levels {
             let source_range = color_mip_subresource_range(mip_level - 1, 1);
