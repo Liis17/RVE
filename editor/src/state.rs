@@ -79,18 +79,32 @@ pub enum Action {
     SaveThen(Box<Action>),
     /// Выполнить действие, отбросив несохранённые изменения.
     Discard(Box<Action>),
-    /// Открыть сцену из найденного автосохранения.
-    RestoreAutosave,
-    /// Удалить найденное автосохранение.
+    /// Открыть сцену из найденной копии автосохранения с данным индексом.
+    RestoreAutosave(usize),
+    /// Удалить найденные автосохранения.
     DiscardAutosave,
+    /// Закрыть окно восстановления, оставив копии на диске.
+    KeepAutosave,
 }
 
 /// Найденное при открытии сцены автосохранение.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryPrompt {
-    /// Сцена копии; `None` — несохранённая новая сцена.
+    /// Сцена копий; `None` — несохранённая новая сцена.
     pub scene: Option<VirtualPath>,
+    /// Исправные копии, на которые можно нажать Restore.
+    pub copies: Vec<RecoveryCopy>,
+    /// Ошибки чтения файлов копий.
+    pub errors: Vec<String>,
+}
+
+/// Копия в окне восстановления.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCopy {
     pub contents: String,
+    pub saved_at: std::time::SystemTime,
+    /// Причина неудачного Restore; окно остаётся открытым.
+    pub restore_error: Option<String>,
 }
 
 /// Подтверждение действия при несохранённых изменениях сцены.

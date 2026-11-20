@@ -47,6 +47,31 @@ fn invalid_arguments_exit_with_code_two_and_usage_before_opening_a_window() {
         vec!["--render-scale", "0.5", "--render-scale", "1"],
         vec!["--resize-test", "--frames", "119"],
         vec!["--debug-overlay", "--debug-overlay"],
+        vec!["--benchmark-json", "bench.json"],
+        vec!["--frames", "300", "--warmup-frames", "5"],
+        vec![
+            "--frames",
+            "10",
+            "--benchmark-json",
+            "bench.json",
+            "--warmup-frames",
+            "10",
+        ],
+        vec![
+            "--frames",
+            "300",
+            "--benchmark-json",
+            "bench.json",
+            "--resize-test",
+        ],
+        vec![
+            "--frames",
+            "300",
+            "--benchmark-json",
+            "bench.json",
+            "--warmup-frames",
+            "x",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
             .args(&arguments)
@@ -60,6 +85,10 @@ fn invalid_arguments_exit_with_code_two_and_usage_before_opening_a_window() {
             stderr.contains(
                 "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings"
             ),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("[--benchmark-json /путь.json] [--warmup-frames N]"),
             "{stderr}"
         );
         assert!(output.stdout.is_empty(), "{arguments:?}");
@@ -171,6 +200,22 @@ fn assert_startup_resource_error(directory: &Path, expected: &str) {
     assert!(stderr.contains("Ошибка ресурса:"), "{stderr}");
     assert!(stderr.contains(expected), "{stderr}");
     assert!(output.stdout.is_empty(), "window startup must not run");
+}
+
+#[test]
+fn benchmark_output_directory_is_checked_before_opening_a_window() {
+    let directory = temporary_directory("benchmark-missing-dir");
+    let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
+        .args(["--frames", "300", "--benchmark-json", "no_such_dir/b.json"])
+        .current_dir(&directory)
+        .output()
+        .expect("sandbox binary should start");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("Ошибка --benchmark-json:"), "{stderr}");
+    assert!(stderr.contains("no_such_dir"), "{stderr}");
+    assert!(output.stdout.is_empty(), "window startup must not run");
+    let _ = fs::remove_dir_all(directory);
 }
 
 #[test]

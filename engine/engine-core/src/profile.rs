@@ -14,6 +14,8 @@ use std::time::Duration;
 pub struct StatSummary {
     pub last: Duration,
     pub avg: Duration,
+    /// Перцентиль 95 по окну (см. [`percentile`]).
+    pub p95: Duration,
     pub max: Duration,
     pub samples: usize,
 }
@@ -24,10 +26,25 @@ impl StatSummary {
         Self {
             last: value,
             avg: value,
+            p95: value,
             max: value,
             samples: 1,
         }
     }
+}
+
+/// Перцентиль методом nearest-rank: ранг `ceil(percent / 100 * n)` по возрастанию, 1-based.
+///
+/// Переставляет `samples` (частичная сортировка); порядок после вызова не гарантирован.
+/// Пустой срез даёт `None`. `percent` вне `0..=100` зажимается в диапазон ранга.
+pub fn percentile(samples: &mut [Duration], percent: u8) -> Option<Duration> {
+    if samples.is_empty() {
+        return None;
+    }
+    let count = samples.len();
+    let rank = (usize::from(percent) * count).div_ceil(100).clamp(1, count);
+    let (_, value, _) = samples.select_nth_unstable(rank - 1);
+    Some(*value)
 }
 
 /// Кольцевой буфер последних измерений фиксированной ёмкости.
@@ -71,7 +88,8 @@ impl RollingStat {
         self.last = Duration::ZERO;
     }
 
-    /// Возвращает последнее, среднее и максимальное значение окна.
+    /// Возвращает последнее, среднее, перцентиль 95 и максимальное значение окна.
+    /// Перцентиль считается по копии окна, поэтому строит аллокацию на каждый вызов.
     pub fn summary(&self) -> StatSummary {
         if self.samples.is_empty() {
             return StatSummary::default();
@@ -83,9 +101,12 @@ impl RollingStat {
             max = max.max(value);
         }
         let count = u32::try_from(self.samples.len()).unwrap_or(u32::MAX);
+        // Копия окна для перцентиля: частичная сортировка не должна менять порядок кольца.
+        let mut window = self.samples.clone();
         StatSummary {
             last: self.last,
             avg: sum / count,
+            p95: percentile(&mut window, 95).unwrap_or_default(),
             max,
             samples: self.samples.len(),
         }
@@ -144,10 +165,11 @@ impl fmt::Display for ProfileReport {
                 match row.value {
                     ProfileValue::Timing(s) => writeln!(
                         f,
-                        "  {:<28} last {:>9.3} ms  avg {:>9.3} ms  max {:>9.3} ms  n={}",
+                        "  {:<28} last {:>9.3} ms  avg {:>9.3} ms  p95 {:>9.3} ms  max {:>9.3} ms  n={}",
                         row.label,
                         millis(s.last),
                         millis(s.avg),
+                        millis(s.p95),
                         millis(s.max),
                         s.samples,
                     )?,
@@ -225,7 +247,7 @@ fn lock(slot: &Mutex<Option<Arc<ProfileReport>>>) -> MutexGuard<'_, Option<Arc<P
 mod tests {
     use super::{
         ProfileBoard, ProfileGroup, ProfileReport, ProfileRow, ProfileValue, RollingStat,
-        StatSummary,
+        StatSummary, percentile,
     };
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Barrier};
@@ -354,6 +376,103 @@ mod tests {
         assert!(text.contains("2.000 ms"));
         assert!(text.contains("Wireframe") && text.contains("n/a"));
         assert!(text.contains("completed") && text.contains(" 7"));
+    }
+
+    #[test]
+    fn report_display_prints_p95_between_avg_and_max() {
+        let mut stat = RollingStat::new(100);
+        for value in 1..=100 {
+            stat.push(ms(value));
+        }
+        let report = ProfileReport {
+            groups: vec![ProfileGroup {
+                name: "Render",
+                rows: vec![ProfileRow {
+                    label: "Opaque",
+                    value: ProfileValue::Timing(stat.summary()),
+                }],
+            }],
+        };
+
+        let text = report.to_string();
+        let line = text.lines().nth(1).expect("строка метки");
+        let avg = line.find("avg").expect("avg");
+        let p95 = line.find("p95 ").expect("p95");
+        let max = line.find("max").expect("max");
+        assert!(avg < p95 && p95 < max, "{line}");
+        assert!(line.contains("p95    95.000 ms"), "{line}");
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank_on_unsorted_input() {
+        let mut samples: Vec<Duration> = (1..=100).rev().map(ms).collect();
+
+        assert_eq!(percentile(&mut samples, 95), Some(ms(95)));
+        assert_eq!(percentile(&mut samples, 50), Some(ms(50)));
+        assert_eq!(percentile(&mut samples, 100), Some(ms(100)));
+    }
+
+    #[test]
+    fn percentile_clamps_rank_at_both_ends() {
+        let mut samples: Vec<Duration> = (1..=100).map(ms).collect();
+
+        assert_eq!(percentile(&mut samples, 0), Some(ms(1)));
+        assert_eq!(percentile(&mut samples, 200), Some(ms(100)));
+    }
+
+    #[test]
+    fn percentile_of_single_sample_is_that_sample() {
+        assert_eq!(percentile(&mut [ms(7)], 95), Some(ms(7)));
+        assert_eq!(percentile(&mut [ms(7)], 0), Some(ms(7)));
+    }
+
+    #[test]
+    fn percentile_of_empty_slice_is_none() {
+        assert_eq!(percentile(&mut [], 95), None);
+    }
+
+    #[test]
+    fn percentile_handles_duplicates_and_takes_lower_median_of_even_count() {
+        let mut samples = [ms(9), ms(1), ms(9), ms(1)];
+
+        assert_eq!(percentile(&mut samples, 50), Some(ms(1)));
+        assert_eq!(percentile(&mut samples, 75), Some(ms(9)));
+    }
+
+    #[test]
+    fn summary_p95_uses_window_samples_only() {
+        let mut stat = RollingStat::new(3);
+        for value in [10, 1, 2, 3] {
+            stat.push(ms(value));
+        }
+
+        // Вытесненное 10 мс не должно попасть в p95.
+        assert_eq!(stat.summary().p95, ms(3));
+    }
+
+    #[test]
+    fn summary_p95_is_zero_for_empty_and_the_value_for_one_sample() {
+        assert_eq!(RollingStat::new(4).summary().p95, Duration::ZERO);
+
+        let mut stat = RollingStat::new(4);
+        stat.push(ms(6));
+        assert_eq!(stat.summary().p95, ms(6));
+    }
+
+    #[test]
+    fn summary_does_not_reorder_the_ring() {
+        let mut stat = RollingStat::new(3);
+        for value in [5, 1, 9] {
+            stat.push(ms(value));
+        }
+        let first = stat.summary();
+        assert_eq!(stat.summary(), first);
+
+        // Следующая запись должна заменить самое старое значение 5, а не другое.
+        stat.push(ms(2));
+        let summary = stat.summary();
+        assert_eq!(summary.avg, ms(4), "окно должно быть {{2, 1, 9}}");
+        assert_eq!(summary.max, ms(9));
     }
 
     #[test]

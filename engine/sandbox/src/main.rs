@@ -1,7 +1,12 @@
+mod benchmark;
 mod content;
 mod debug_overlay;
 mod scene;
 
+use benchmark::{
+    BenchmarkOptions, BenchmarkRecorder, DEFAULT_WARMUP_FRAMES, MAX_MEASURED_FRAMES, Observation,
+    RunSettings, validate_output_path,
+};
 use content::Content;
 use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets, ModelAlphaMode};
@@ -32,7 +37,7 @@ use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--post-process /путь.postprocess] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles|stress] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--post-process /путь.postprocess] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles|stress] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay] [--benchmark-json /путь.json] [--warmup-frames N]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -50,6 +55,7 @@ struct Options {
     environment: Option<EnvironmentMode>,
     /// Показывать панель FPS, памяти и загрузки CPU/GPU.
     debug_overlay: bool,
+    benchmark: Option<BenchmarkOptions>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +80,8 @@ where
     let mut texture = None;
     let mut environment = None;
     let mut debug_overlay = false;
+    let mut benchmark_json = None;
+    let mut warmup_frames = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--frames" => {
@@ -216,6 +224,27 @@ where
                     EnvironmentMode::Hdr(path.as_str().to_owned())
                 });
             }
+            "--benchmark-json" => {
+                if benchmark_json.is_some() {
+                    return Err("флаг --benchmark-json указан повторно".to_owned());
+                }
+                benchmark_json =
+                    Some(args.next().ok_or_else(|| {
+                        "после --benchmark-json требуется путь к файлу".to_owned()
+                    })?);
+            }
+            "--warmup-frames" => {
+                if warmup_frames.is_some() {
+                    return Err("флаг --warmup-frames указан повторно".to_owned());
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| "после --warmup-frames требуется N".to_owned())?;
+                let value = value.parse::<u64>().map_err(|_| {
+                    "значение --warmup-frames должно быть неотрицательным целым u64".to_owned()
+                })?;
+                warmup_frames = Some(value);
+            }
             _ => return Err(format!("неизвестный аргумент: {argument}")),
         }
     }
@@ -225,6 +254,33 @@ where
     if resize_test && frames.is_some_and(|count| count < 120) {
         return Err("с --resize-test значение --frames должно быть не меньше 120".to_owned());
     }
+    let benchmark = match (benchmark_json, warmup_frames) {
+        (None, Some(_)) => return Err("--warmup-frames требует --benchmark-json".to_owned()),
+        (None, None) => None,
+        (Some(path), warmup) => {
+            let Some(frames) = frames else {
+                return Err("--benchmark-json требует --frames".to_owned());
+            };
+            if resize_test {
+                return Err("--benchmark-json нельзя сочетать с --resize-test".to_owned());
+            }
+            let warmup_frames = warmup.unwrap_or(DEFAULT_WARMUP_FRAMES);
+            if warmup_frames >= frames {
+                return Err(format!(
+                    "--frames ({frames}) должен быть больше --warmup-frames ({warmup_frames}, по умолчанию {DEFAULT_WARMUP_FRAMES})"
+                ));
+            }
+            if frames - warmup_frames > MAX_MEASURED_FRAMES {
+                return Err(format!(
+                    "--benchmark-json поддерживает не более {MAX_MEASURED_FRAMES} измеряемых кадров"
+                ));
+            }
+            Some(BenchmarkOptions {
+                path,
+                warmup_frames,
+            })
+        }
+    };
     Ok(Options {
         frames,
         render_scale,
@@ -236,6 +292,7 @@ where
         texture,
         environment,
         debug_overlay,
+        benchmark,
     })
 }
 
@@ -547,6 +604,8 @@ struct Sandbox {
     debug_overlay: Option<DebugOverlay>,
     particle_emitters: Vec<ParticleEmitterFrame>,
     profile_summary: ProfileSummary,
+    /// Замеры `--benchmark-json`; создаются после появления renderer.
+    benchmark: Option<BenchmarkRecorder>,
     failure: Option<String>,
 }
 
@@ -626,6 +685,7 @@ impl Sandbox {
             debug_overlay: None,
             particle_emitters: Vec::new(),
             profile_summary: ProfileSummary::default(),
+            benchmark: None,
             failure: None,
         }
     }
@@ -901,6 +961,14 @@ impl WindowHandler for Sandbox {
                         Instant::now(),
                     ));
                 }
+                if let Some(benchmark) = self.options.benchmark.as_ref() {
+                    self.benchmark = Some(BenchmarkRecorder::new(
+                        self.options.frames.unwrap_or(0),
+                        benchmark.warmup_frames,
+                        renderer.capabilities(),
+                        self.reflex,
+                    ));
+                }
                 self.renderer = Some(renderer);
                 true
             }
@@ -968,17 +1036,8 @@ impl WindowHandler for Sandbox {
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();
-        let frame_profile = renderer.take_frame_profile();
-        if let Some(profile) = &frame_profile {
-            self.profile_summary.add(profile);
-        }
         let overlay = match self.debug_overlay.as_mut() {
-            Some(overlay) => {
-                if let Some(profile) = &frame_profile {
-                    overlay.record_frame_profile(profile);
-                }
-                overlay.update(Instant::now(), gpu_time)
-            }
+            Some(overlay) => overlay.update(Instant::now(), gpu_time),
             None => &[],
         };
         let shadow_cascades = self.content.shadow_cascades(
@@ -1060,7 +1119,25 @@ impl WindowHandler for Sandbox {
             particle_step,
         };
         renderer.set_latency_frame(frame_id);
-        match renderer.render_frame(&frame) {
+        let status = renderer.render_frame(&frame);
+        // Профиль относится к только что отправленному вызову: берём его после render_frame.
+        let frame_profile = renderer.take_frame_profile();
+        if let Some(profile) = &frame_profile {
+            self.profile_summary.add(profile);
+            if let Some(overlay) = self.debug_overlay.as_mut() {
+                overlay.record_frame_profile(profile);
+            }
+        }
+        if let Some(benchmark) = self.benchmark.as_mut() {
+            benchmark.observe(Observation {
+                presented: matches!(status, Ok(FrameStatus::Presented)),
+                now: Instant::now(),
+                size: (self.size.width, self.size.height),
+                present_mode: renderer.present_mode(),
+                profile: frame_profile,
+            });
+        }
+        match status {
             Ok(FrameStatus::Presented) => {
                 self.previous_skipped = false;
                 self.previous_elapsed = Some(elapsed);
@@ -1172,6 +1249,12 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(benchmark) = options.benchmark.as_ref()
+        && let Err(error) = validate_output_path(Path::new(&benchmark.path))
+    {
+        eprintln!("Ошибка --benchmark-json: {error}");
+        return ExitCode::from(2);
+    }
     let bootstrap = match BootstrapConfig::load("bootstrap.rves") {
         Ok(config) => config,
         Err(error) => {
@@ -1266,11 +1349,37 @@ fn main_after_vulkan_environment() -> ExitCode {
     if let Some(line) = app.profile_summary.line() {
         println!("{line}");
     }
+    let benchmark = app.options.benchmark.clone().map(|options| {
+        let settings = RunSettings {
+            scene: app.options.scene,
+            model: app.options.model.clone(),
+            texture: app.options.texture.clone(),
+            environment: app.options.environment.as_ref().map(|mode| match mode {
+                EnvironmentMode::Procedural => "procedural".to_owned(),
+                EnvironmentMode::Hdr(path) => path.clone(),
+            }),
+            camera_settings: app.options.camera_settings.clone(),
+            post_process: app.options.post_process.clone(),
+            render_scale: app.camera_settings.render.render_scale,
+            debug_overlay: app.options.debug_overlay,
+        };
+        (PathBuf::from(options.path), app.benchmark.take(), settings)
+    });
     app.save_pipeline_cache();
     drop(app);
     if let Err(error) = resources.shutdown() {
         eprintln!("Ошибка завершения ресурсного сервиса: {error}");
         if exit_code == 0 {
+            exit_code = 1;
+        }
+    }
+    if let Some((path, recorder, settings)) = benchmark.filter(|_| exit_code == 0) {
+        let result = match recorder {
+            Some(recorder) => benchmark::finish_and_write(recorder, settings, &path),
+            None => Err("бенчмарк прерван: измерения не начались".to_owned()),
+        };
+        if let Err(error) = result {
+            eprintln!("{error}");
             exit_code = 1;
         }
     }
@@ -1467,6 +1576,7 @@ mod tests {
             texture: None,
             environment: None,
             debug_overlay: false,
+            benchmark: None,
         });
         sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
         sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
@@ -1631,5 +1741,105 @@ mod tests {
         assert_eq!(options.model, None);
         assert_eq!(options.texture, None);
         assert!(!options.debug_overlay);
+        assert_eq!(options.benchmark, None);
+    }
+
+    #[test]
+    fn benchmark_json_uses_default_warmup_and_accepts_zero_warmup() {
+        let options = parse_args(["--frames", "300", "--benchmark-json", "bench.json"])
+            .expect("valid benchmark arguments");
+        let benchmark = options.benchmark.expect("benchmark enabled");
+        assert_eq!(benchmark.path, "bench.json");
+        assert_eq!(benchmark.warmup_frames, 60);
+
+        let options = parse_args([
+            "--frames",
+            "10",
+            "--benchmark-json",
+            "bench.json",
+            "--warmup-frames",
+            "0",
+        ])
+        .expect("zero warmup is valid");
+        assert_eq!(options.benchmark.expect("enabled").warmup_frames, 0);
+    }
+
+    #[test]
+    fn benchmark_json_accepts_the_measured_frame_limit_exactly() {
+        let options = parse_args(["--frames", "100060", "--benchmark-json", "bench.json"])
+            .expect("100000 measured frames after default warmup are valid");
+        assert_eq!(options.frames, Some(100_060));
+    }
+
+    #[test]
+    fn rejects_invalid_benchmark_combinations_with_clear_errors() {
+        let cases: [(&[&str], &str); 9] = [
+            (&["--benchmark-json", "b.json"], "требует --frames"),
+            (
+                &["--frames", "300", "--warmup-frames", "5"],
+                "требует --benchmark-json",
+            ),
+            (
+                &["--frames", "60", "--benchmark-json", "b.json"],
+                "по умолчанию 60",
+            ),
+            (
+                &[
+                    "--frames",
+                    "10",
+                    "--benchmark-json",
+                    "b.json",
+                    "--warmup-frames",
+                    "10",
+                ],
+                "--frames (10)",
+            ),
+            (
+                &[
+                    "--frames",
+                    "120",
+                    "--benchmark-json",
+                    "b.json",
+                    "--resize-test",
+                ],
+                "--resize-test",
+            ),
+            (
+                &["--frames", "100061", "--benchmark-json", "b.json"],
+                "не более 100000",
+            ),
+            (
+                &["--frames", "300", "--benchmark-json"],
+                "после --benchmark-json требуется путь",
+            ),
+            (
+                &[
+                    "--frames",
+                    "300",
+                    "--benchmark-json",
+                    "b.json",
+                    "--warmup-frames",
+                    "x",
+                ],
+                "--warmup-frames должно быть",
+            ),
+            (
+                &[
+                    "--frames",
+                    "300",
+                    "--benchmark-json",
+                    "a.json",
+                    "--benchmark-json",
+                    "b.json",
+                ],
+                "указан повторно",
+            ),
+        ];
+        for (arguments, expected) in cases {
+            let error = parse_args(arguments.iter().copied())
+                .err()
+                .expect("invalid combination");
+            assert!(error.contains(expected), "{arguments:?}: {error}");
+        }
     }
 }

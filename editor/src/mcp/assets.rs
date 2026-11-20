@@ -849,13 +849,17 @@ mod tests {
         // Путь существует в разрешениях MCP только после проверки, поэтому открытие вызывается напрямую.
         assert!(app.mcp_open_scene("scenes/missing.rvescene", true).is_err());
         assert_eq!(
-            store.read(scene_path.as_ref()).as_deref(),
+            store
+                .read(scene_path.as_ref())
+                .copies
+                .first()
+                .map(|copy| copy.contents.as_str()),
             Some("autosaved")
         );
         assert!(app.mcp_state_mut().scene.as_ref().unwrap().is_dirty());
 
         app.mcp_new_scene(true).unwrap();
-        assert!(store.read(scene_path.as_ref()).is_none());
+        assert!(store.read(scene_path.as_ref()).copies.is_empty());
     }
 
     #[test]
