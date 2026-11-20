@@ -12,7 +12,7 @@ Parent: [[Index]]
 |---|---|---|
 | `engine/sandbox/src/main.rs` | `parse_args`, `load_content`, `Sandbox`, `WindowHandler`, `main` | Подготовка Vulkan-окружения до потоков, разбор CLI, загрузка ресурсов, инициализация renderer, кадры и коды завершения |
 | `engine/sandbox/src/content.rs` | `Content`, `Mesh`, `local_light_shadows` | Меши, материалы и текстуры кадра из демонстрационной сцены или модели; point/spot shadow matrices showcase, вписывание модели, окружение и замена base-color map |
-| `engine/sandbox/src/scene.rs` | `Scene`, `plane_mesh`, `materials_plane_mesh`, `cube_mesh`, `material_sphere_meshes`, `sinusoidal_normal_texture`, `checker_texture`, `triangle_view_projection`, `cube_view_projection`, `shadows_light_view_projection`, `materials_light_view_projection` | Геометрия и параметры демонстрационных сцен; камеры и свет используют [[Engine/EngineScene]] |
+| `engine/sandbox/src/scene.rs` | `Scene`, `plane_mesh`, `materials_plane_mesh`, `cube_mesh`, `material_sphere_meshes`, `sinusoidal_normal_texture`, `checker_texture`, `triangle_view_projection`, `cube_view_projection`, `shadows_light_direction` | Геометрия и параметры демонстрационных сцен; камеры и свет используют [[Engine/EngineScene]] |
 | `engine/sandbox/src/debug_overlay.rs` | `DebugOverlay` | Метрики `--debug-overlay`, их история и геометрия панели со шрифтом font8x8 |
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Общий разбор и загрузка начальных настроек `bootstrap.rves` |
 | `bootstrap.rves.example` | `WindowSizeX`, `WindowSizeY`, `WindowTitle`, `AllowMultipleInstances` | Шаблон локального файла настроек |
