@@ -6,7 +6,7 @@ use crate::state::{AssetDrag, EditorState, ViewCommand};
 use crate::viewport::camera::{Ray, ground_point, project_point, screen_ray};
 use crate::viewport::colliders::{ColliderWire, WireSource, WireStyle, source_wires};
 use crate::viewport::gizmo::{DragTarget, GizmoDrag, GizmoTool, gizmo_axes};
-use crate::viewport::picking::{nearest_hit, ray_model};
+use crate::viewport::picking::{nearest_hit, ray_model_cached};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use engine_physics::object_world_transform;
 use glam::{Mat4, Vec3};
@@ -421,8 +421,10 @@ fn pick(
     let selected = nearest_hit(marker).or_else(|| {
         let ray = pointer_ray(view_projection, rect, pointer)?;
         nearest_hit(markers.iter().filter_map(|marker| {
-            let model = state.models.get(marker.model.as_ref()?)?;
-            Some((marker.id.clone(), ray_model(ray, model, marker.world)?))
+            let key = marker.model.as_deref()?;
+            let model = state.models.get(key)?;
+            let distance = ray_model_cached(&mut state.pick_cache, key, model, ray, marker.world)?;
+            Some((marker.id.clone(), distance))
         }))
     });
     if let Some(scene) = &mut state.scene {

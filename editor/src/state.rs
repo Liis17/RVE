@@ -20,6 +20,7 @@ use crate::viewport::camera::{EditorCamera, View};
 use crate::viewport::colliders::ColliderCache;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
+use crate::viewport::picking::PickCache;
 use engine_animation::AnimationBridge;
 use engine_assets::Model;
 use engine_files::VirtualPath;
@@ -203,6 +204,8 @@ pub struct EditorState {
     pub mcp_generation: u64,
     /// Незавершённый `capture_view`: ответ отправляется, когда кадр отдал PNG или задача снята.
     pub(crate) mcp_capture: Option<crate::mcp::capture::CaptureJob>,
+    /// Кодировщик PNG для `capture_view`; поток `rve-mcp-png` создаётся при первом задании.
+    pub(crate) png_encoder: crate::mcp::capture::PngEncoder,
     pub project: Option<OpenProject>,
     /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
     pub project_prefabs: Option<ProjectPrefabs>,
@@ -294,6 +297,8 @@ pub struct EditorState {
     pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
+    /// BVH для picking по ключам `models`; сбрасывается вместе с ними.
+    pub pick_cache: PickCache,
     /// Объект, чьи overrides ждут подтверждения переноса в префаб.
     pub apply_prompt: Option<String>,
     /// Идущая сборка релиза; одновременно — не больше одной.
@@ -331,6 +336,7 @@ impl EditorState {
             ui_editor_rect: None,
             mcp_generation: 0,
             mcp_capture: None,
+            png_encoder: crate::mcp::capture::PngEncoder::new(),
             project: None,
             project_prefabs: None,
             tags_layers: None,
@@ -395,6 +401,7 @@ impl EditorState {
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
+            pick_cache: PickCache::default(),
             build: None,
             build_output_tail: Vec::new(),
             build_succeeded: None,

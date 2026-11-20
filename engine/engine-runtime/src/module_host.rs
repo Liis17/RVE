@@ -73,6 +73,14 @@ impl ModuleHost {
         thread.join.take().is_some()
     }
 
+    #[cfg(test)]
+    pub fn names(&self) -> Vec<&str> {
+        self.threads
+            .iter()
+            .map(|thread| thread.name.as_str())
+            .collect()
+    }
+
     pub fn shutdown(&mut self) -> Vec<String> {
         if self.shutdown_started {
             return Vec::new();
