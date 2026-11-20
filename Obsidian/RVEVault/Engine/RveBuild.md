@@ -155,7 +155,7 @@ AppIcon — `base`. Явный архив указывает, где он зад
 
 ## Материалы и Surface shaders
 
-tools/rve-build/src/project.rs валидирует каждый используемый .rvemat, затем рекурсивно включает его .rveshader и текстуры из properties в ресурсный набор сцены. Эти dependencies получают archive owner по тем же правилам, что и остальные использованные файлы. .rveshader разбирается и проверяется как формат engine-scene; GLSL body не компилируется в builder, потому что rve-build не зависит от engine-render. Ошибки TOML, schema material или отсутствующие dependencies — ошибка проекта с кодом 2. Ошибка GLSL появляется в editor/runtime и использует magenta Lit fallback; формат и ограничение compile-time см. [[Engine/EngineMaterials]].
+tools/rve-build/src/project.rs валидирует каждый используемый .rvemat, затем рекурсивно включает его .rveshader и текстуры из properties в ресурсный набор сцены. Эти dependencies получают archive owner по тем же правилам, что и остальные использованные файлы. .rveshader разбирается и проверяется как формат engine-scene; GLSL body Surface shader в builder не компилируется (компилируются только экранные шейдеры `.glsl`). Ошибки TOML, schema material или отсутствующие dependencies — ошибка проекта с кодом 2. Ошибка GLSL появляется в editor/runtime и использует magenta Lit fallback; формат и ограничение compile-time см. [[Engine/EngineMaterials]].
 
 ## Назначение архивов
 
