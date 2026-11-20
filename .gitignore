@@ -30,5 +30,6 @@ rustc-ice-*.txt
 default.profraw
 /release/
 
-# Crash reports written next to a dev project or a release build
-Logs/
+# Crash reports: release Logs next to the executable, dev Logs in example projects
+/Logs/
+examples/**/Logs/

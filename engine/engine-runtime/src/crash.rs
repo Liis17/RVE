@@ -11,11 +11,10 @@ use rve_crash_monitor::{
 };
 use std::any::Any;
 use std::backtrace::Backtrace;
-use std::cell::Cell;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
+use std::panic::{self, PanicHookInfo};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once, OnceLock, RwLock, TryLockError};
@@ -56,10 +55,6 @@ static INSTALL: Once = Once::new();
 static INITIAL: OnceLock<Arc<ReportTarget>> = OnceLock::new();
 static CURRENT: RwLock<Option<Arc<ReportTarget>>> = RwLock::new(None);
 
-thread_local! {
-    static IN_HOOK: Cell<bool> = const { Cell::new(false) };
-}
-
 /// Ставит хук panic на процесс. Повторные вызовы ничего не меняют.
 pub(crate) fn install(role: Role, exe_dir: &Path) {
     INSTALL.call_once(|| {
@@ -80,9 +75,7 @@ pub(crate) fn install(role: Role, exe_dir: &Path) {
 /// Выбирает каталог отчётов после загрузки проекта и запоминает его для хука.
 /// Возвращает выбранный каталог, созданный на диске, или `None`, если его нет.
 pub(crate) fn set_target(role: Role, primary: PathBuf, project: &str) -> Option<PathBuf> {
-    let dir = report_dir_candidates(primary, project)
-        .into_iter()
-        .find(|dir| prepare_dir(dir));
+    let dir = choose_report_dir(&report_dir_candidates(primary, project));
     if dir.is_none() {
         let _ = writeln!(
             io::stderr(),
@@ -137,19 +130,23 @@ fn report_dir_candidates(primary: PathBuf, project: &str) -> Vec<PathBuf> {
     dirs
 }
 
+/// Первый каталог из списка, который удалось создать; `None`, если подходящего нет.
+fn choose_report_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|dir| prepare_dir(dir)).cloned()
+}
+
 fn prepare_dir(dir: &Path) -> bool {
     fs::create_dir_all(dir).is_ok() && dir.is_dir()
 }
 
+/// Вызывается из хука. Хук не должен паниковать: std в этом случае завершает процесс с abort
+/// и отчёт не записывается до конца. Поэтому здесь нет `unwrap`/`expect`/индексации, а ошибки записи
+/// возвращаются значениями и печатаются в stderr.
 fn report_panic(info: &PanicHookInfo<'_>) {
-    let Some(_guard) = HookGuard::enter() else {
-        return;
-    };
     let Some(slot) = claim_report_slot(&REPORTS_WRITTEN, REPORT_LIMIT) else {
         return;
     };
-    // Ошибка записи отчёта не должна превратиться во вторую panic внутри хука.
-    let _ = panic::catch_unwind(AssertUnwindSafe(|| write_panic_report(info, slot)));
+    write_panic_report(info, slot);
 }
 
 /// Резервирует номер отчёта до `limit`; `None`, когда лимит исчерпан.
@@ -205,30 +202,20 @@ fn write_panic_report(info: &PanicHookInfo<'_>, slot: usize) {
 }
 
 fn current_target() -> Option<Arc<ReportTarget>> {
-    let current = match CURRENT.try_read() {
+    target_snapshot(&CURRENT, &INITIAL)
+}
+
+/// Снимок для хука: `current` читается без ожидания; если он занят или ещё не задан, берётся `initial`.
+fn target_snapshot(
+    current: &RwLock<Option<Arc<ReportTarget>>>,
+    initial: &OnceLock<Arc<ReportTarget>>,
+) -> Option<Arc<ReportTarget>> {
+    let snapshot = match current.try_read() {
         Ok(guard) => guard.clone(),
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
         Err(TryLockError::WouldBlock) => None,
     };
-    current.or_else(|| INITIAL.get().cloned())
-}
-
-/// Защита от рекурсии: panic внутри записи отчёта не запускает запись повторно.
-struct HookGuard;
-
-impl HookGuard {
-    fn enter() -> Option<Self> {
-        IN_HOOK
-            .try_with(|flag| if flag.replace(true) { None } else { Some(Self) })
-            .ok()
-            .flatten()
-    }
-}
-
-impl Drop for HookGuard {
-    fn drop(&mut self) {
-        let _ = IN_HOOK.try_with(|flag| flag.set(false));
-    }
+    snapshot.or_else(|| initial.get().cloned())
 }
 
 /// Записывает отчёт в новый файл и затем удаляет лишние старые файлы `crash-*`.
@@ -449,9 +436,7 @@ mod tests {
         fs::write(&blocked, b"not a directory").unwrap();
         let second = root.join("second");
 
-        let chosen = [blocked, second.clone()]
-            .into_iter()
-            .find(|dir| prepare_dir(dir));
+        let chosen = choose_report_dir(&[blocked, second.clone()]);
 
         assert_eq!(chosen, Some(second));
         let _ = fs::remove_dir_all(&root);
@@ -462,8 +447,35 @@ mod tests {
         let root = scratch_dir("unusable");
         let blocked = root.join("blocked");
         fs::write(&blocked, b"not a directory").unwrap();
-        assert!(!prepare_dir(&blocked));
+        assert_eq!(choose_report_dir(&[blocked]), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn busy_current_target_falls_back_to_the_startup_snapshot() {
+        let initial_target = Arc::new(ReportTarget {
+            role: Role::Player,
+            project: None,
+            dir: Some(PathBuf::from("startup")),
+        });
+        let initial = OnceLock::new();
+        let _ = initial.set(Arc::clone(&initial_target));
+        let current: RwLock<Option<Arc<ReportTarget>>> = RwLock::new(None);
+
+        let busy = current.write().unwrap();
+        assert_eq!(
+            target_snapshot(&current, &initial),
+            Some(initial_target.clone())
+        );
+        drop(busy);
+
+        let set = Arc::new(ReportTarget {
+            role: Role::Server,
+            project: Some("demo".into()),
+            dir: Some(PathBuf::from("project")),
+        });
+        *current.write().unwrap() = Some(Arc::clone(&set));
+        assert_eq!(target_snapshot(&current, &initial), Some(set));
     }
 
     #[test]

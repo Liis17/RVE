@@ -272,7 +272,6 @@ fn run_from_args(
     };
     let role = if headless { Role::Server } else { Role::Player };
     let report_dir = crash::set_target(role, report_dir, &project.name);
-    start_crash_dumps(&exe_dir, report_dir.as_deref());
     let prefab_list = match load_prefab_catalog(&layout.prefab_catalog, &resource_handle) {
         Ok(list) => list,
         Err(error) => return fail(2, format!("ошибка списка префабов: {error}")),
@@ -316,6 +315,9 @@ fn run_from_args(
         }
     }
 
+    // Монитор запускается только после проверки единственного экземпляра: второй экземпляр
+    // не должен поднимать второй монитор и подключаться к той же игре.
+    start_crash_dumps(&exe_dir, report_dir.as_deref());
     let mut startup = StartupProfile::default();
     let mut phase_started = Instant::now();
     let mut system = System::new();
