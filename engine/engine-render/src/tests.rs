@@ -1339,7 +1339,7 @@ fn mip_chain_layout_packs_levels_densely_from_base() {
 #[test]
 fn normal_mip_chain_keeps_flat_normal_exact_on_every_level() {
     let rgba = [128, 128, 255, 255].repeat(16);
-    let chain = normal_mip_chain(4, 4, &rgba);
+    let chain = normal_mip_chain(4, 4, &rgba).unwrap();
     assert_eq!(chain.len(), 84);
     assert!(
         chain
@@ -1355,7 +1355,7 @@ fn normal_mip_chain_level_zero_is_copied_unchanged() {
     let rgba: Vec<u8> = (0..3 * 3 * 4)
         .map(|index| (index * 7 % 256) as u8)
         .collect();
-    let chain = normal_mip_chain(3, 3, &rgba);
+    let chain = normal_mip_chain(3, 3, &rgba).unwrap();
     assert_eq!(&chain[..rgba.len()], rgba.as_slice());
     assert_eq!(chain.len(), 36 + 4);
 }
@@ -1369,7 +1369,7 @@ fn normal_mip_levels_decode_to_unit_length_within_quantization() {
             (state >> 24) as u8
         })
         .collect();
-    let chain = normal_mip_chain(8, 8, &rgba);
+    let chain = normal_mip_chain(8, 8, &rgba).unwrap();
     let layout = mip_chain_layout(8, 8, mip_level_count(8, 8));
     for (level, (_, offset, extent)) in layout.iter().enumerate().skip(1) {
         let area = extent.width as usize * extent.height as usize;
@@ -1393,11 +1393,11 @@ fn normal_mip_chain_cancels_complementary_normals_to_flat_fallback() {
     let rgba = [
         127, 128, 0, 255, 128, 127, 255, 255, 127, 128, 0, 255, 128, 127, 255, 255,
     ];
-    let chain = normal_mip_chain(2, 2, &rgba);
+    let chain = normal_mip_chain(2, 2, &rgba).unwrap();
     assert_eq!(&chain[16..20], &[128, 128, 255, 255]);
 
     let extremes = [0, 0, 0, 255, 255, 255, 255, 255];
-    let chain = normal_mip_chain(2, 1, &extremes);
+    let chain = normal_mip_chain(2, 1, &extremes).unwrap();
     assert_eq!(&chain[8..12], &[128, 128, 255, 255]);
 }
 
@@ -1407,7 +1407,7 @@ fn normal_mip_chain_averages_known_two_by_two_input() {
     let rgba = [
         255, 128, 128, 255, 128, 255, 128, 255, 255, 128, 128, 255, 128, 255, 128, 255,
     ];
-    let chain = normal_mip_chain(2, 2, &rgba);
+    let chain = normal_mip_chain(2, 2, &rgba).unwrap();
     assert_eq!(&chain[16..20], &[218, 218, 128, 255]);
 }
 
@@ -1415,7 +1415,7 @@ fn normal_mip_chain_averages_known_two_by_two_input() {
 fn normal_mip_chain_three_by_three_uses_corner_texel_in_rgb_and_alpha() {
     let mut rgba = [128, 128, 255, 0].repeat(9);
     rgba[32..36].copy_from_slice(&[255, 128, 128, 255]);
-    let chain = normal_mip_chain(3, 3, &rgba);
+    let chain = normal_mip_chain(3, 3, &rgba).unwrap();
     assert_eq!(
         chain_texel(&chain, &mip_chain_layout(3, 3, 2), 1, 0, 0),
         [144, 128, 254, 28]
@@ -1426,7 +1426,7 @@ fn normal_mip_chain_three_by_three_uses_corner_texel_in_rgb_and_alpha() {
 fn normal_mip_chain_five_by_one_gives_edge_texel_fractional_weight() {
     let mut rgba = [128, 128, 255, 0].repeat(5);
     rgba[16..20].copy_from_slice(&[255, 128, 128, 255]);
-    let chain = normal_mip_chain(5, 1, &rgba);
+    let chain = normal_mip_chain(5, 1, &rgba).unwrap();
     let layout = mip_chain_layout(5, 1, mip_level_count(5, 1));
     // Второй texel уровня 1 покрывает [2.5, 5): texel 2 вносит половину веса, texel 4 — полный.
     assert_eq!(chain_texel(&chain, &layout, 1, 1, 0), [198, 128, 233, 102]);
@@ -1442,7 +1442,7 @@ fn normal_mip_levels_match_normalized_mean_of_level_zero_region() {
             (state >> 24) as u8
         })
         .collect();
-    let chain = normal_mip_chain(8, 4, &rgba);
+    let chain = normal_mip_chain(8, 4, &rgba).unwrap();
     let layout = mip_chain_layout(8, 4, mip_level_count(8, 4));
     for (level, _, extent) in layout.iter().skip(1) {
         let block_width = 8 / extent.width as usize;
@@ -1469,13 +1469,40 @@ fn normal_mip_chain_last_level_is_mean_of_odd_source_row() {
             (state >> 24) as u8
         })
         .collect();
-    let chain = normal_mip_chain(13, 1, &rgba);
+    let chain = normal_mip_chain(13, 1, &rgba).unwrap();
     let layout = mip_chain_layout(13, 1, mip_level_count(13, 1));
     let last = layout.len() - 1;
     assert_eq!(
         chain_texel(&chain, &layout, last, 0, 0),
         reference_normal_block(&rgba, 13, [0, 0, 13, 1])
     );
+}
+
+#[test]
+fn normal_mip_chain_one_by_one_is_input_unchanged() {
+    let rgba = [10, 200, 30, 40];
+    assert_eq!(normal_mip_chain(1, 1, &rgba).unwrap(), rgba);
+}
+
+#[test]
+fn normal_mip_chain_inexact_weights_still_cancel_to_flat_fallback() {
+    // 7×2 → 3×1: веса частичных ячеек 1/3 и 2/3 неточны в f32. Строки противоположны по всем
+    // каналам, поэтому сумма каждого texel-а нулевая, а не только округлённо близкая к нулю.
+    let rgba: Vec<u8> = (0..7 * 2)
+        .flat_map(|index| {
+            let value = if index < 7 { 127 } else { 128 };
+            [value, value, value, 255]
+        })
+        .collect();
+    let chain = normal_mip_chain(7, 2, &rgba).unwrap();
+    let layout = mip_chain_layout(7, 2, mip_level_count(7, 2));
+    for x in 0..3 {
+        assert_eq!(
+            chain_texel(&chain, &layout, 1, x, 0),
+            [128, 128, 255, 255],
+            "texel {x} уровня 1"
+        );
+    }
 }
 
 #[test]
@@ -1507,6 +1534,32 @@ fn mip_upload_plan_copies_normal_levels_at_absolute_offsets() {
         assert_eq!(offset % 4, 0);
         assert!(*offset + size <= 256 + 84, "регион выходит за staging");
     }
+}
+
+#[test]
+fn mip_upload_plan_normal_single_level_copies_only_base() {
+    let MipUploadPlan::Copies(copies) = mip_upload_plan(TextureRole::Normal, 64, 1, 1, 1) else {
+        panic!("normal map должна копировать уровни");
+    };
+    assert_eq!(
+        copies,
+        vec![(
+            0,
+            64,
+            vk::Extent2D {
+                width: 1,
+                height: 1
+            }
+        )]
+    );
+}
+
+#[test]
+fn normal_mip_chain_reports_impossible_allocation_as_invalid_texture() {
+    // Цепочка около 4/3 · 2^63 байт больше `isize::MAX`: `try_reserve_exact` отказывает до
+    // аллокации, поэтому тест детерминирован и не расходует память.
+    let result = normal_mip_chain(1 << 31, 1 << 30, &[]);
+    assert!(matches!(result, Err(RenderError::InvalidTexture(_))));
 }
 
 #[test]

@@ -29,7 +29,7 @@ impl Renderer {
         let data = match role {
             TextureRole::Color => rgba,
             TextureRole::Normal => {
-                chain = normal_mip_chain(width, height, rgba);
+                chain = normal_mip_chain(width, height, rgba)?;
                 chain.as_slice()
             }
         };
