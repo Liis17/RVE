@@ -62,6 +62,10 @@ impl PlayerFlavor {
         if dlss {
             features.push(format!("{package}/dlss"));
         }
+        if self != Self::Dev {
+            // Monitor собирается с `--no-default-features` тоже, поэтому его feature `server` указываем явно.
+            features.push(format!("{CRASH_MONITOR_PACKAGE}/server"));
+        }
         if !features.is_empty() {
             arguments.push("--features".to_owned());
             arguments.push(features.join(","));
@@ -1358,7 +1362,7 @@ mod tests {
                 "rve-crash-monitor",
                 "--no-default-features",
                 "--features",
-                "rve-player/crash-dumps",
+                "rve-player/crash-dumps,rve-crash-monitor/server",
                 "--message-format=json",
             ]
         );
@@ -1376,7 +1380,10 @@ mod tests {
         );
         assert_eq!(
             PlayerFlavor::Distribution.cargo_arguments(true)[8..10],
-            ["--features", "rve-player/crash-dumps,rve-player/dlss"]
+            [
+                "--features",
+                "rve-player/crash-dumps,rve-player/dlss,rve-crash-monitor/server"
+            ]
         );
         assert_eq!(
             PlayerFlavor::Dev.cargo_arguments(true)[6..8],
@@ -1402,7 +1409,7 @@ mod tests {
                 "rve-crash-monitor",
                 "--no-default-features",
                 "--features",
-                "rve-server/crash-dumps",
+                "rve-server/crash-dumps,rve-crash-monitor/server",
                 "--message-format=json",
             ]
         );

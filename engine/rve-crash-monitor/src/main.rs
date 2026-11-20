@@ -5,7 +5,10 @@
 
 use std::process::ExitCode;
 
-#[cfg(any(all(windows, target_arch = "x86_64"), target_os = "macos"))]
+#[cfg(all(
+    feature = "server",
+    any(all(windows, target_arch = "x86_64"), target_os = "macos")
+))]
 mod server;
 
 fn main() -> ExitCode {
@@ -19,12 +22,18 @@ fn main() -> ExitCode {
     run(args)
 }
 
-#[cfg(any(all(windows, target_arch = "x86_64"), target_os = "macos"))]
+#[cfg(all(
+    feature = "server",
+    any(all(windows, target_arch = "x86_64"), target_os = "macos")
+))]
 fn run(args: rve_crash_monitor::MonitorArgs) -> ExitCode {
     server::run(args)
 }
 
-#[cfg(not(any(all(windows, target_arch = "x86_64"), target_os = "macos")))]
+#[cfg(not(all(
+    feature = "server",
+    any(all(windows, target_arch = "x86_64"), target_os = "macos")
+)))]
 fn run(_args: rve_crash_monitor::MonitorArgs) -> ExitCode {
     eprintln!("rve-crash-monitor поддерживает только Windows x86_64 и macOS");
     ExitCode::from(2)
