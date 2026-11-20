@@ -3164,6 +3164,7 @@ dependencies = [
 name = "rve-editor"
 version = "0.37.0"
 dependencies = [
+ "blake3",
  "egui",
  "egui-winit",
  "egui_dock",

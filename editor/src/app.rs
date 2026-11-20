@@ -222,6 +222,8 @@ pub struct EditorApp {
     /// Ревизия сцены в последней копии автосохранения и время записи.
     autosaved_revision: Option<u64>,
     last_autosave: Instant,
+    /// Предупреждения последней записи копии; одинаковые не выводятся в Console повторно.
+    autosave_warnings: Vec<String>,
     exit: bool,
     pub exit_code: u8,
     window_title: String,
@@ -269,6 +271,7 @@ impl EditorApp {
             continuous_redraw: false,
             autosaved_revision: None,
             last_autosave: Instant::now(),
+            autosave_warnings: Vec::new(),
             exit: false,
             exit_code: 0,
             window_title: String::new(),
@@ -333,6 +336,7 @@ impl EditorApp {
             continuous_redraw: false,
             autosaved_revision: None,
             last_autosave: Instant::now(),
+            autosave_warnings: Vec::new(),
             exit: false,
             exit_code: 0,
             window_title: String::new(),
@@ -947,6 +951,7 @@ impl EditorApp {
                 .into_iter()
                 .map(|copy| RecoveryCopy {
                     contents: copy.contents,
+                    saved_at: copy.saved_at,
                     restore_error: None,
                 })
                 .collect(),
@@ -1035,7 +1040,17 @@ impl EditorApp {
             .map_err(|error| error.to_string())
             .and_then(|text| store.write(scene.path(), &text));
         match result {
-            Ok(()) => self.autosaved_revision = Some(revision),
+            Ok(warnings) => {
+                self.autosaved_revision = Some(revision);
+                if warnings != self.autosave_warnings {
+                    for warning in &warnings {
+                        self.state
+                            .log
+                            .push(LogLevel::Warn, format!("автосохранение: {warning}"));
+                    }
+                    self.autosave_warnings = warnings;
+                }
+            }
             Err(error) => self
                 .state
                 .log
@@ -3382,6 +3397,7 @@ mod tests {
             scene: None,
             copies: vec![RecoveryCopy {
                 contents: "[[objects]\n".to_owned(),
+                saved_at: std::time::SystemTime::UNIX_EPOCH,
                 restore_error: None,
             }],
             errors: Vec::new(),
@@ -3396,6 +3412,36 @@ mod tests {
             .as_ref()
             .expect("window stays open");
         assert!(prompt.copies[0].restore_error.is_some());
+    }
+
+    #[test]
+    fn autosave_warning_is_logged_once_while_it_stays_the_same() {
+        let root = temp_project("autosave-warning");
+        // Прежний файл `~untitled` — каталог: вторая запись не может его удалить.
+        std::fs::create_dir_all(root.join(".rve/editor/autosave/~untitled.autosave")).unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.project = Some(OpenProject::open(&root).unwrap());
+        app.state.scene = Some(EditorScene::new_untitled().unwrap());
+        let warnings = |app: &EditorApp| {
+            app.state
+                .log
+                .entries()
+                .filter(|entry| {
+                    entry.level == LogLevel::Warn && entry.message.contains("~untitled.autosave")
+                })
+                .count()
+        };
+
+        for _ in 0..3 {
+            app.state
+                .create_object(&crate::scene_edit::NewObject::Empty, None);
+            app.write_autosave();
+        }
+
+        // Первая запись заполняет один слот, вторая и третья пытаются удалить прежний файл.
+        assert_eq!(warnings(&app), 1);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

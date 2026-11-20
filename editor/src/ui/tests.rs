@@ -658,6 +658,7 @@ fn recovery_prompt_offers_restore_and_blocks_escape() {
         scene: None,
         copies: vec![crate::state::RecoveryCopy {
             contents: String::new(),
+            saved_at: std::time::SystemTime::now(),
             restore_error: None,
         }],
         errors: Vec::new(),

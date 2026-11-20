@@ -19,6 +19,7 @@ pub mod toolbar;
 #[cfg(test)]
 mod tests;
 
+use crate::autosave::age_text;
 use crate::layout::{EditorTabs, Tab};
 use crate::state::{Action, AssetDrag, EditorState};
 use egui_dock::{DockArea, DockState, Style};
@@ -217,10 +218,14 @@ fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {
             ));
         }
         ui.add_space(8.0);
+        let now = std::time::SystemTime::now();
         for (index, copy) in prompt.copies.iter().enumerate() {
-            if ui.button("Restore").clicked() {
-                action = Some(Action::RestoreAutosave(index));
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Restore").clicked() {
+                    action = Some(Action::RestoreAutosave(index));
+                }
+                ui.label(age_text(copy.saved_at, now));
+            });
             if let Some(error) = &copy.restore_error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }

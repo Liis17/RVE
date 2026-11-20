@@ -102,6 +102,7 @@ pub struct RecoveryPrompt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryCopy {
     pub contents: String,
+    pub saved_at: std::time::SystemTime,
     /// Причина неудачного Restore; окно остаётся открытым.
     pub restore_error: Option<String>,
 }
