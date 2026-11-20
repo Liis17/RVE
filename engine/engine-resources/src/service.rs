@@ -22,13 +22,74 @@ pub struct ResourceStat {
     pub size: u64,
 }
 
-/// Число замеров и сумма, максимум одной фазы запросов.
+/// Число бакетов log2-гистограммы задержек, см. `latency_bucket`.
+const LATENCY_BUCKETS: usize = 28;
+/// Последний бакет открыт сверху: все задержки от 2^26 мкс (~67 с).
+const OVERFLOW_BUCKET: usize = LATENCY_BUCKETS - 1;
+
+/// Число замеров, сумма, максимум и гистограмма одной фазы запросов.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TimingTotals {
     /// Число замеров: по одному на каждый запрос, дошедший до этой фазы.
     pub count: u64,
     pub total: Duration,
     pub max: Duration,
+    /// Log2-гистограмма в мкс: бакет 0 — `[0, 1 мкс)`, `i` в `1..=26` — `[2^(i-1), 2^i) мкс`,
+    /// последний — `≥ 2^26 мкс`. Сумма бакетов может расходиться с `count` в снимке.
+    pub(crate) buckets: [u64; LATENCY_BUCKETS],
+}
+
+impl TimingTotals {
+    /// Перцентиль nearest-rank по гистограмме снимка; `None`, если бакеты пусты.
+    ///
+    /// Оценка — верхняя граница бакета, ограниченная `max`, если `max` не ниже нижней границы
+    /// бакета; иначе снимок рассогласован и берётся граница бакета. Для переполнения оценка —
+    /// `max` (или нижняя граница, если `max` ниже неё). Обычные бакеты переоценивают не более чем вдвое.
+    pub fn percentile(&self, percent: u8) -> Option<Duration> {
+        let total: u128 = self.buckets.iter().map(|&count| u128::from(count)).sum();
+        if total == 0 {
+            return None;
+        }
+        let rank = (u128::from(percent.min(100)) * total)
+            .div_ceil(100)
+            .clamp(1, total);
+        let mut seen = 0u128;
+        let index = self.buckets.iter().position(|&count| {
+            seen += u128::from(count);
+            seen >= rank
+        })?;
+        Some(self.estimate(index))
+    }
+
+    fn estimate(&self, index: usize) -> Duration {
+        let (lower, upper) = latency_bucket_bounds(index);
+        if self.max < lower {
+            return upper.unwrap_or(lower);
+        }
+        upper.map_or(self.max, |upper| upper.min(self.max))
+    }
+}
+
+/// Индекс log2-бакета задержки в мкс; наносекунды ниже 1 мкс попадают в бакет 0.
+fn latency_bucket(nanos: u64) -> usize {
+    let micros = nanos / 1_000;
+    if micros == 0 {
+        return 0;
+    }
+    let bits = (u64::BITS - micros.leading_zeros()) as usize;
+    bits.min(OVERFLOW_BUCKET)
+}
+
+/// Нижняя граница бакета и верхняя (`None` для открытого бакета переполнения).
+fn latency_bucket_bounds(index: usize) -> (Duration, Option<Duration>) {
+    match index {
+        0 => (Duration::ZERO, Some(Duration::from_micros(1))),
+        OVERFLOW_BUCKET => (Duration::from_micros(1 << (OVERFLOW_BUCKET - 1)), None),
+        index => (
+            Duration::from_micros(1 << (index - 1)),
+            Some(Duration::from_micros(1 << index)),
+        ),
+    }
 }
 
 /// Снимок статистики запросов [`ResourceHandle`].
@@ -101,6 +162,7 @@ struct TimingCounters {
     count: AtomicU64,
     total_nanos: AtomicU64,
     max_nanos: AtomicU64,
+    buckets: [AtomicU64; LATENCY_BUCKETS],
 }
 
 impl TimingCounters {
@@ -109,6 +171,7 @@ impl TimingCounters {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+        self.buckets[latency_bucket(nanos)].fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> TimingTotals {
@@ -116,6 +179,7 @@ impl TimingCounters {
             count: self.count.load(Ordering::Relaxed),
             total: Duration::from_nanos(self.total_nanos.load(Ordering::Relaxed)),
             max: Duration::from_nanos(self.max_nanos.load(Ordering::Relaxed)),
+            buckets: std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
         }
     }
 }

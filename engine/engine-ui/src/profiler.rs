@@ -1,4 +1,4 @@
-//! Таблица профайлера для egui: группы строк с последним, средним и максимальным временем в миллисекундах.
+//! Таблица профайлера для egui: группы строк с последним, средним, p95 и максимальным временем в миллисекундах.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,13 +16,14 @@ pub fn show(ui: &mut Ui, report: &ProfileReport) {
     for group in &report.groups {
         ui.label(RichText::new(group.name).strong());
         egui::Grid::new(("engine_profiler", group.name))
-            .num_columns(5)
+            .num_columns(6)
             .spacing([12.0, 2.0])
             .show(ui, |ui| {
                 for header in [
                     "metric",
                     "last, ms / count",
                     "avg, ms",
+                    "p95, ms",
                     "max, ms",
                     "avg / max",
                 ] {
@@ -35,15 +36,15 @@ pub fn show(ui: &mut Ui, report: &ProfileReport) {
                         ProfileValue::Timing(summary) => show_summary(ui, summary, scale),
                         ProfileValue::Single(value) => {
                             ui.monospace(format_ms(value));
-                            show_empty_cells(ui, 3);
+                            show_empty_cells(ui, 4);
                         }
                         ProfileValue::Count(value) => {
                             ui.monospace(value.to_string());
-                            show_empty_cells(ui, 3);
+                            show_empty_cells(ui, 4);
                         }
                         ProfileValue::Missing => {
                             ui.label("n/a");
-                            show_empty_cells(ui, 3);
+                            show_empty_cells(ui, 4);
                         }
                     }
                     ui.end_row();
@@ -70,6 +71,7 @@ pub fn overlay(ctx: &Context, reports: &[Arc<ProfileReport>]) {
 fn show_summary(ui: &mut Ui, summary: StatSummary, scale: Duration) {
     ui.monospace(format_ms(summary.last));
     ui.monospace(format_ms(summary.avg));
+    ui.monospace(format_ms(summary.p95));
     ui.monospace(format_ms(summary.max));
     let fraction = bar_fraction(summary.avg, scale);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(BAR_WIDTH, BAR_HEIGHT), Sense::hover());

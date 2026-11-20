@@ -22,7 +22,8 @@ Parent: [[Index]]
 | `Time::elapsed(&self) -> Duration` | Возвращает длительность с момента создания |
 | `Time::frame(&self) -> u64` | Возвращает число выполненных тиков |
 | `Default for Time` | Создаёт новое значение через `Time::new()` |
-| `profile::RollingStat::new(capacity)`, `push`, `summary() -> StatSummary` | Кольцевое окно замеров фиксированной ёмкости; память выделяется в `new`, `push` её не расширяет. Пустое окно даёт нулевой итог с `samples == 0` |
+| `profile::RollingStat::new(capacity)`, `push`, `summary() -> StatSummary` | Кольцевое окно замеров фиксированной ёмкости; память выделяется в `new`, `push` её не расширяет. Пустое окно даёт нулевой итог с `samples == 0`. `StatSummary::p95` — перцентиль 95 по окну, `summary()` считает его по копии окна |
+| `profile::percentile(samples, percent) -> Option<Duration>` | Перцентиль nearest-rank; переставляет переданный срез, пустой срез даёт `None`, `percent` зажимается в ранг |
 | `profile::ProfileReport`, `ProfileGroup`, `ProfileRow`, `ProfileValue` | Отчёт для показа: группы строк, метка и значение строки. Значение — итоги окна (`Timing`), одна длительность (`Single`), счётчик (`Count`) или отсутствие значения (`Missing`, показывается как `n/a`). `Display` даёт текст для консоли и лога |
 | `profile::ProfileBoard::new(sources)`, `publish(source, report)`, `reports()` | Доска отчётов по фиксированному набору источников. Публикация меняет `Arc` под коротким lock; чтение возвращает отчёты в порядке регистрации |
 
