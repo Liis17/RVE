@@ -202,6 +202,7 @@ impl World {
             self.objects[index].transform = transform;
         }
         self.topological_order = order;
+        self.mark_dirty(index);
         self.recalculate_world_matrices();
         self.record_activity(&before);
         Ok(())
@@ -215,6 +216,7 @@ impl World {
     ) -> Result<(), SceneError> {
         let index = self.live_index_or_error(handle)?;
         self.objects[index].transform.position = self.local_position_for_world(index, position)?;
+        self.mark_dirty(index);
         Ok(())
     }
 
@@ -262,6 +264,7 @@ impl World {
         let index = self.live_index_or_error(handle)?;
         self.objects[index].transform.rotation_deg =
             self.local_rotation_for_world(index, rotation_deg)?;
+        self.mark_dirty(index);
         Ok(())
     }
 
