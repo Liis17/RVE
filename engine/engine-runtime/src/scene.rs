@@ -2765,10 +2765,11 @@ fn create_material_texture(
 mod tests {
     use super::{
         ColorLutGpu, CubeLut, GpuTextureCache, MaterialAssetView, MaterialTextureSource,
-        NormalChains, PreparedMaterialAssets, PreparedPrefabs, ScreenShaderGpu, color_lut_paths,
-        get_or_insert_gpu, load_color_luts, load_scene, load_screen_shader_sources,
-        material_cache_key, normal_texture_role, prepare_scene_with_model_loader, resolve_material,
-        resolve_material_asset, screen_shader_paths, upload_color_luts, upload_screen_shaders,
+        NormalChains, PreparedMaterialAssets, PreparedPrefabs, PreparedScene, ScreenShaderGpu,
+        color_lut_paths, get_or_insert_gpu, load_color_luts, load_scene,
+        load_screen_shader_sources, material_cache_key, normal_texture_role,
+        prepare_scene_with_model_loader, resolve_material, resolve_material_asset,
+        screen_shader_paths, upload_color_luts, upload_screen_shaders,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, TextureData};
     use engine_files::VirtualPath;
@@ -3855,6 +3856,130 @@ id = "camera"
                 .normal_chains
                 .take("models/quad.fbx", &MaterialTextureSource::Model(2))
                 .is_none()
+        );
+    }
+
+    /// Одно-пиксельный RGBA PNG: текстура сцены читается с диска и декодируется.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// Готовит сцену проекта с пустой моделью; цепочки строятся, как в игровом клиенте.
+    fn prepare_candidate_scene(project: &TempProject, scene_text: &str) -> PreparedScene {
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", scene_text).unwrap();
+        let world = World::from_document(&document).unwrap();
+        prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            PreparedPrefabs::default(),
+            [0; 32],
+            true,
+            |_| {
+                Ok(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rvemat_without_shader_puts_its_normal_slot_among_the_chain_candidates() {
+        let project = TempProject::new();
+        project.write(
+            "materials/plain.rvemat",
+            b"[properties]\nnormal_texture = \"/textures/normal.png\"\n",
+        );
+        project.write("textures/normal.png", PNG_1X1);
+        let scene_text = format!("[[assets]]\npath = \"/materials/plain.rvemat\"\n{CAMERA_SCENE}");
+        let prepared = prepare_candidate_scene(&project, &scene_text);
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .take(
+                    "",
+                    &MaterialTextureSource::Scene("textures/normal.png".to_owned())
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rvemat_with_shader_keeps_its_slot_out_of_the_chain_candidates() {
+        let project = TempProject::new();
+        // Третья текстура шейдера занимает слот 2, который у встроенного Lit — normal map.
+        let shader = ShaderAsset::template("custom").replacen(
+            "\n---\n",
+            "\n[[properties]]\nname = \"mask\"\nlabel = \"Mask\"\ntype = \"texture\"\ncolor_space = \"linear\"\nfallback = \"white\"\n\n[[properties]]\nname = \"detail\"\nlabel = \"Detail\"\ntype = \"texture\"\ncolor_space = \"linear\"\nfallback = \"white\"\n\n---\n",
+            1,
+        );
+        let material = "shader = \"/shaders/custom.rveshader\"\n[properties]\ndetail = \"/textures/normal.png\"\n";
+        project.write("shaders/custom.rveshader", shader.as_bytes());
+        project.write("materials/custom.rvemat", material.as_bytes());
+        project.write("textures/normal.png", PNG_1X1);
+        let schema = ShaderAsset::parse("/shaders/custom.rveshader", &shader)
+            .unwrap()
+            .layout();
+        let resolved = MaterialAsset::parse("/materials/custom.rvemat", material)
+            .unwrap()
+            .resolve(&schema);
+        assert!(matches!(
+            resolved.textures.get(2),
+            Some(Some((path, _))) if path.as_str() == "textures/normal.png"
+        ));
+
+        let scene_text = format!(
+            "[[assets]]\npath = \"/materials/custom.rvemat\"\n[[assets]]\npath = \"/shaders/custom.rveshader\"\n{CAMERA_SCENE}"
+        );
+        let prepared = prepare_candidate_scene(&project, &scene_text);
+        assert!(
+            prepared
+                .render_assets
+                .shader_assets
+                .get("shaders/custom.rveshader")
+                .is_some_and(Result::is_ok)
+        );
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .take(
+                    "",
+                    &MaterialTextureSource::Scene("textures/normal.png".to_owned())
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn material_override_normal_texture_is_a_chain_candidate() {
+        let project = TempProject::new();
+        project.write("textures/normal.png", PNG_1X1);
+        let scene_text = format!(
+            "[[assets]]\npath = \"/models/quad.fbx\"\n[[assets]]\npath = \"/textures/normal.png\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"quad\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n[objects.mesh_renderer.material]\nnormal_texture = \"/textures/normal.png\"\n"
+        );
+        let prepared = prepare_candidate_scene(&project, &scene_text);
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .take(
+                    "",
+                    &MaterialTextureSource::Scene("textures/normal.png".to_owned())
+                )
+                .is_some()
         );
     }
 
