@@ -20,6 +20,7 @@ use crate::viewport::camera::{EditorCamera, View};
 use crate::viewport::colliders::ColliderCache;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
+use crate::viewport::picking::PickCache;
 use engine_animation::AnimationBridge;
 use engine_assets::Model;
 use engine_files::VirtualPath;
@@ -294,6 +295,8 @@ pub struct EditorState {
     pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
+    /// BVH для picking по ключам `models`; сбрасывается вместе с ними.
+    pub pick_cache: PickCache,
     /// Объект, чьи overrides ждут подтверждения переноса в префаб.
     pub apply_prompt: Option<String>,
     /// Идущая сборка релиза; одновременно — не больше одной.
@@ -395,6 +398,7 @@ impl EditorState {
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
+            pick_cache: PickCache::default(),
             build: None,
             build_output_tail: Vec::new(),
             build_succeeded: None,

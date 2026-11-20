@@ -40,7 +40,7 @@ Parent: [[Index]]
 | `editor/src/play.rs` | `PlaySession`, `PlayPhysics`, `PlayAudio`, `HeavyLoads`, `Watchdog` | Копия мира, скрипты, per-Play physics thread, звуковой поток, фоновая загрузка тяжёлых префабов, прерывание зависшего Lua и мост анимации Play |
 | `editor/src/viewport/animation.rs` | `EditorAnimation`, `AnimationPreview`, `PreviewStatus`, `project_bridge`, `project_preview_bridge` | Мост превью выбранного аниматора, его настройки и сведения для инспектора; Play-мост строится через `project_bridge` |
 | `editor/src/play_cursor.rs` | `PlayCursor`, `play_cursor_captured`, `sync`, `focus_game_tab` | Захват курсора панелью Game во время Play и состояние, отправляемое в окно |
-| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `ImageLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
+| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `ImageLoader`, `EditorCamera`, `GizmoDrag`, `ray_model`, `ray_model_cached`, `ModelBvh`, `PickCache` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
 | `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `scene_assets`, `project_prefabs`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
 | `editor/src/project_prefabs.rs` | `ProjectPrefabs` | Редактируемый список `prefabs.rveprefabs` подокна Project Prefabs: проверка правок, явное сохранение |
 
@@ -435,6 +435,16 @@ Edit → Scene Navigation выбирает Auto (по умолчанию), Track
 Smart zoom доступен на macOS: DoubleTapGesture взводит однокадровый флаг и запрашивает redraw; над доступной Scene вне Play он вызывает Frame выделения. Флаг сбрасывается в конце UI даже при скрытой Scene. На macOS Ctrl+ЛКМ преобразуется в ПКМ до egui; отпускание сохраняет преобразование после отпускания Ctrl. Ввод скриптов Play через WindowHandler не меняется.
 
 Numpad в Scene повторяет раскладку Blender. `app.rs` (`numpad_command`) распознаёт физические коды `Numpad*`, а команды копятся в `EditorState::view_commands` и выполняются в `toolbar::handle_shortcuts` через `scene_view::apply_view_command`. Клавиша `.` — Frame выделения; 1/3/7 — Front/Right/Top, с Ctrl — Back/Left/Bottom; 4/6/2/8 — поворот глаза вокруг цели на 15° (4 — влево, 8 — вверх), повторяется при удержании; 9 — противоположный вид; 0 — камера Scene совпадает с камерой вкладки Game (без камеры ничего не делает). Виды задают `EditorCamera::set_view`, глаз Front на +Z, взгляд вдоль -Z. Top и Bottom упираются в `MAX_PITCH`, то есть около 88°. Команды отбрасываются при модальном окне, открытой консоли или вводе текста. В Play они действуют, только если Scene показана и курсор не над Game.
+
+## Picking во вьюпорте Scene
+
+Щелчок по Scene сначала проверяет маркеры камер и источников света в радиусе `MARKER_HIT_POINTS`, затем луч по геометрии. Геометрия берётся из CPU-моделей `EditorState::models` в bind pose, поэтому скиннинг и анимация на выбор не влияют. `scene_view.rs::pick` выбирает ближайшее попадание через `nearest_hit`.
+
+Луч проверяется по BVH (`editor/src/viewport/picking.rs`, `ModelBvh`). Дерево строится в локальных координатах модели при первом щелчке по ней: лист содержит до 4 треугольников, разбиение идёт по медиане центроидов вдоль длинной оси. Луч переводится обратной матрицей экземпляра без нормализации, поэтому `t` совпадает с мировым расстоянием. Треугольники с индексами вне вершин пропускаются.
+
+`PickCache` хранит BVH по ключу модели (пути в `models`) вместе со `Weak<Model>`. BVH используется, пока по ключу лежит тот же `Arc`; перезагрузка даёт новый `Arc`, и BVH пересобирается. Мёртвые записи удаляются при вставке, очистка идёт вместе с `models` при сбросе проекта. `Weak` не даёт освободить аллокацию прежней модели, так что новый `Arc` не может совпасть с ней по адресу.
+
+Порог Мёллера — Трумбора `1e-10` задан в мировых координатах. В локальных координатах он равен `1e-10 / |det(M₃ₓ₃)|`, поэтому попадания совпадают с мировым перебором при любом масштабе; например, треугольник с катетами 1e-5 при масштабе 100 попадает. Если `|det(M₃ₓ₃)|` меньше `1e-12` или результат нефинитен, используется мировой перебор `ray_model`.
 
 ## Эмиттеры частиц
 
