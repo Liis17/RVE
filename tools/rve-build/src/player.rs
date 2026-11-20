@@ -7,7 +7,9 @@ use crate::project::{HeavyScriptUse, ProjectBuild, prepare_project, validate_scr
 use crate::sdk::{self, PlayerLocation};
 use crate::temporary::TempDir;
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
-use engine_pak::{Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, CatalogLimits};
+use engine_pak::{
+    Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, BuildCompression, CatalogLimits,
+};
 use engine_script::ScriptLibrary;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -63,6 +65,7 @@ pub(crate) fn build_distribution(
     output: &Path,
     vulkan_sdk: Option<&Path>,
     with_server: bool,
+    compression: BuildCompression,
 ) -> Result<(), BuildError> {
     let output = absolute_output_path(output)?;
     ensure_output_missing(&output)?;
@@ -141,7 +144,7 @@ pub(crate) fn build_distribution(
     #[cfg(windows)]
     copy_dlss_runtime(&project, &engine_dir)?;
     let assets_dir = resources_dir.join("Assets");
-    build_project_archives(&project, &assets_dir)?;
+    build_project_archives(&project, &assets_dir, compression)?;
     validate_staged_archives(&assets_dir)?;
 
     #[cfg(target_os = "macos")]
@@ -1105,6 +1108,7 @@ mod tests {
     use crate::project::{HeavyScriptUse, ProjectBuild, ScriptReferenceContext};
     use crate::temporary::TempDir;
     use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
+    use engine_pak::BuildCompression;
     use engine_project::ProjectSettings;
     use engine_scene::{ParamValue, SceneDocument};
     use engine_script::ScriptLibrary;
@@ -1757,8 +1761,14 @@ id = "plain"
         let output = root.path().join("existing-output");
         fs::create_dir(&output).unwrap();
         fs::write(output.join("marker"), b"keep").unwrap();
-        let error = build_distribution(&root.path().join("missing-project"), &output, None, false)
-            .unwrap_err();
+        let error = build_distribution(
+            &root.path().join("missing-project"),
+            &output,
+            None,
+            false,
+            BuildCompression::default(),
+        )
+        .unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert_eq!(fs::read(output.join("marker")).unwrap(), b"keep");
         assert!(!root.path().join("missing-project/.rve").exists());

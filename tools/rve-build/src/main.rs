@@ -1,6 +1,8 @@
 mod archives;
+mod check;
 mod cli;
 mod error;
+mod explain;
 #[cfg(windows)]
 mod ico;
 mod platform;
@@ -8,6 +10,7 @@ mod player;
 mod project;
 mod sdk;
 mod temporary;
+mod trace;
 
 use cli::CommandLine;
 use std::process;
@@ -35,16 +38,40 @@ fn main() {
                 error.exit_code()
             }
         },
+        Ok(CommandLine::Explain { project_dir, path }) => {
+            match explain::explain_asset(&project_dir, &path) {
+                Ok(explanation) => {
+                    print!("{explanation}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("rve-build: {error}");
+                    error.exit_code()
+                }
+            }
+        }
+        Ok(CommandLine::Check { project_dir }) => match check::check_project(&project_dir) {
+            Ok(summary) => {
+                print!("{summary}");
+                0
+            }
+            Err(error) => {
+                eprintln!("rve-build: {error}");
+                error.exit_code()
+            }
+        },
         Ok(CommandLine::Build {
             project_dir,
             output,
             vulkan_sdk,
             with_server,
+            compression,
         }) => match player::build_distribution(
             &project_dir,
             &output,
             vulkan_sdk.as_deref(),
             with_server,
+            compression,
         ) {
             Ok(()) => 0,
             Err(error) => {

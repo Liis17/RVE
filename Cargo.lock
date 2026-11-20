@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "engine-assets"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-files",
  "engine-pak",
@@ -1043,12 +1043,13 @@ dependencies = [
 
 [[package]]
 name = "engine-physics"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "engine-files",
  "engine-scene",
  "flume",
  "glam",
+ "log",
 ]
 
 [[package]]
@@ -3139,7 +3140,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -3240,12 +3241,13 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "engine-assets",
  "engine-core",
  "engine-files",
  "engine-pak",
+ "engine-physics",
  "engine-platform",
  "engine-project",
  "engine-render",
