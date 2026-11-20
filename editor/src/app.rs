@@ -3480,8 +3480,13 @@ mod tests {
     #[test]
     fn failed_discard_keeps_the_recovery_window_open_with_the_path() {
         let root = temp_project("failed-discard");
-        // Непустой каталог на месте прежнего файла: `remove_file` его не удалит.
-        let legacy = root.join(".rve/editor/autosave/~untitled.autosave");
+        // Непустой каталог на месте прежнего файла: `remove_file` его не удалит. Путь собирается
+        // по компонентам, как в `AutosaveStore::for_project`, чтобы `display()` совпал на Windows.
+        let legacy = root
+            .join(".rve")
+            .join("editor")
+            .join("autosave")
+            .join("~untitled.autosave");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("inner"), "x").unwrap();
         let mut app = EditorApp::new(None, None, None, false);
