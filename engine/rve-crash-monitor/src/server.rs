@@ -1,22 +1,19 @@
-//! Сервер minidump: принимает одного клиента и пишет один дамп. Выход: после дампа, после
-//! отключения клиента, при смерти процесса игры или если клиент так и не подключился.
+//! Сервер minidump. Монитор обслуживает запросы дампа от любого подключения, но останавливается,
+//! когда установленный клиент (тот, что прислал hello) отключился. Выход также при записи дампа,
+//! смерти процесса игры и если установленного клиента не было за отведённое время.
 
 use minidumper::{LoopAction, MinidumpBinary, Server, ServerHandler, SocketName};
-use rve_crash_monitor::{
-    MonitorArgs, RETAINED_CRASH_FILES, RETENTION_GRACE, create_dump_file, prune_crash_files,
-};
+use rve_crash_monitor::{HELLO_MESSAGE_KIND, MonitorArgs, create_dump_file, prune_after_dump};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Если клиент не подключился за это время, монитор выходит.
-const CLIENT_DEADLINE: Duration = Duration::from_secs(10);
-const CLIENT_POLL: Duration = Duration::from_millis(50);
+const ESTABLISHED_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) fn run(args: MonitorArgs) -> ExitCode {
     let mut server = match Server::with_name(SocketName::Path(&args.socket)) {
@@ -27,13 +24,17 @@ pub(crate) fn run(args: MonitorArgs) -> ExitCode {
         }
     };
     let shutdown = Arc::new(AtomicBool::new(false));
-    let clients = Arc::new(AtomicUsize::new(0));
+    let established = Arc::new(AtomicBool::new(false));
     watch_parent(args.parent, Arc::clone(&shutdown));
-    watch_first_client(Arc::clone(&clients), Arc::clone(&shutdown));
+    watch_established(
+        Arc::clone(&established),
+        Arc::clone(&shutdown),
+        args.client_timeout,
+    );
     let handler = Handler {
         dir: args.dir.clone(),
         parent: args.parent,
-        clients,
+        established,
         dump: Mutex::new(None),
     };
     let result = server.run(Box::new(handler), &shutdown, None);
@@ -54,7 +55,9 @@ pub(crate) fn run(args: MonitorArgs) -> ExitCode {
 struct Handler {
     dir: PathBuf,
     parent: u32,
-    clients: Arc<AtomicUsize>,
+    /// Установлен, когда клиент прислал hello. Только отключение установленного клиента
+    /// останавливает монитор; ранние и посторонние подключения этого не делают.
+    established: Arc<AtomicBool>,
     /// Путь дампа, который сейчас пишется.
     dump: Mutex<Option<PathBuf>>,
 }
@@ -80,31 +83,31 @@ impl ServerHandler for Handler {
             }
         }
         if let Some(own) = &dump {
-            let _ = prune_crash_files(
-                &self.dir,
-                own,
-                RETAINED_CRASH_FILES,
-                SystemTime::now(),
-                RETENTION_GRACE,
-            );
+            let _ = prune_after_dump(&self.dir, own, SystemTime::now());
         }
         LoopAction::Exit
     }
 
-    fn on_message(&self, _kind: u32, _buffer: Vec<u8>) {}
+    fn on_message(&self, kind: u32, _buffer: Vec<u8>) {
+        if kind == HELLO_MESSAGE_KIND {
+            self.established.store(true, Ordering::SeqCst);
+        }
+    }
 
-    /// Обслуживается только первый клиент. Второе подключение к приватному сокету считается
-    /// чужим и останавливает монитор: библиотека не даёт отказать одному клиенту и принять другого.
+    /// Подключение не останавливает монитор: клиенты, не приславшие hello, учитываются только при отключении.
+    /// Библиотека не даёт отказать подключению, поэтому запрос дампа от такого клиента тоже будет обработан.
     fn on_client_connected(&self, _clients: usize) -> LoopAction {
-        if self.clients.fetch_add(1, Ordering::SeqCst) == 0 {
-            LoopAction::Continue
-        } else {
-            LoopAction::Exit
-        }
+        LoopAction::Continue
     }
 
-    fn on_client_disconnected(&self, _clients: usize) -> LoopAction {
-        LoopAction::Exit
+    /// Выход только когда установленный клиент отключился и других подключений не осталось.
+    /// Если посторонний клиент держит сокет открытым, остановит монитор выход родителя.
+    fn on_client_disconnected(&self, clients: usize) -> LoopAction {
+        if self.established.load(Ordering::SeqCst) && clients == 0 {
+            LoopAction::Exit
+        } else {
+            LoopAction::Continue
+        }
     }
 }
 
@@ -114,15 +117,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn watch_first_client(clients: Arc<AtomicUsize>, shutdown: Arc<AtomicBool>) {
+/// Если за `timeout` клиент не прислал hello, монитор останавливается.
+fn watch_established(established: Arc<AtomicBool>, shutdown: Arc<AtomicBool>, timeout: Duration) {
     thread::spawn(move || {
-        let deadline = Instant::now() + CLIENT_DEADLINE;
-        while clients.load(Ordering::SeqCst) == 0 {
+        let deadline = Instant::now() + timeout;
+        while !established.load(Ordering::SeqCst) {
             if Instant::now() >= deadline {
                 shutdown.store(true, Ordering::SeqCst);
                 return;
             }
-            thread::sleep(CLIENT_POLL);
+            thread::sleep(ESTABLISHED_POLL);
         }
     });
 }

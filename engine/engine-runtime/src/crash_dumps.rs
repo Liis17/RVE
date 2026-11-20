@@ -4,6 +4,7 @@
 
 use crash_handler::{CrashContext, CrashEventResult, CrashHandler, make_crash_event};
 use minidumper::{Client, SocketName};
+use rve_crash_monitor::HELLO_MESSAGE_KIND;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -74,7 +75,13 @@ pub(crate) fn start(exe_dir: &Path, logs_dir: Option<&Path>) {
 }
 
 fn attach(socket: &Path, mut monitor: Child, ipc_dir: &Path) {
-    match connect(socket, &mut monitor) {
+    match connect(socket, &mut monitor).and_then(|client| {
+        // Представляемся монитору: только установленный клиент не даёт ему выйти раньше времени.
+        client
+            .send_message(HELLO_MESSAGE_KIND, [])
+            .map(|()| client)
+            .map_err(|error| format!("приветствие монитору не отправлено: {error}"))
+    }) {
         Ok(client) => {
             // SAFETY: обработчик лишь передаёт контекст сбоя монитору и возвращает управление.
             let event = unsafe {

@@ -10,6 +10,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Версия крейта, заданная в `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Пользовательское сообщение, которым клиент представляется монитору сразу после подключения.
+/// Без него монитор не считает подключение установленным и не выходит при его отключении.
+pub const HELLO_MESSAGE_KIND: u32 = 0;
+
+/// Сколько ждать установленного клиента по умолчанию.
+pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Сколько последних файлов `crash-*` хранится в каталоге отчётов.
 pub const RETAINED_CRASH_FILES: usize = 20;
 
@@ -38,6 +45,11 @@ pub fn utc_datetime(time: SystemTime) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
         t.year, t.month, t.day, t.hour, t.minute, t.second
     )
+}
+
+/// Правило хранения после записи дампа: 20 последних файлов, свежие и собственный дамп не трогаются.
+pub fn prune_after_dump(dir: &Path, dump: &Path, now: SystemTime) -> io::Result<usize> {
+    prune_crash_files(dir, dump, RETAINED_CRASH_FILES, now, RETENTION_GRACE)
 }
 
 /// Удаляет самые старые файлы `crash-*` сверх `keep`, возвращает число удалённых.
@@ -138,9 +150,12 @@ pub struct MonitorArgs {
     pub socket: PathBuf,
     pub dir: PathBuf,
     pub parent: u32,
+    /// Сколько ждать первого hello от клиента, прежде чем выйти.
+    pub client_timeout: Duration,
 }
 
-/// Разбирает `--socket <path> --dir <path> --parent <pid>` в любом порядке.
+/// Разбирает `--socket <path> --dir <path> --parent <pid>` и необязательный `--client-timeout-ms <ms>`
+/// в любом порядке. Последний нужен тестам; игра его не передаёт.
 pub fn parse_args<I>(args: I) -> Result<MonitorArgs, String>
 where
     I: IntoIterator<Item = OsString>,
@@ -148,6 +163,7 @@ where
     let mut socket = None;
     let mut dir = None;
     let mut parent = None;
+    let mut client_timeout = DEFAULT_CLIENT_TIMEOUT;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
@@ -164,6 +180,13 @@ where
                     .ok_or_else(|| "--parent должен быть pid больше нуля".to_owned())?;
                 parent = Some(pid);
             }
+            Some("--client-timeout-ms") => {
+                let millis = value
+                    .to_str()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    .ok_or_else(|| "--client-timeout-ms должен быть числом".to_owned())?;
+                client_timeout = Duration::from_millis(millis);
+            }
             _ => return Err(format!("неизвестный аргумент {}", flag.to_string_lossy())),
         }
     }
@@ -171,6 +194,7 @@ where
         socket: socket.ok_or("нужен --socket")?,
         dir: dir.ok_or("нужен --dir")?,
         parent: parent.ok_or("нужен --parent")?,
+        client_timeout,
     })
 }
 
@@ -338,7 +362,37 @@ mod args_and_dumps_tests {
                 socket: PathBuf::from("s"),
                 dir: PathBuf::from("Logs"),
                 parent: 4242,
+                client_timeout: DEFAULT_CLIENT_TIMEOUT,
             }
+        );
+    }
+
+    #[test]
+    fn client_timeout_is_optional_and_parsed_in_milliseconds() {
+        let parsed = parse_args(args(&[
+            "--socket",
+            "s",
+            "--dir",
+            "d",
+            "--parent",
+            "7",
+            "--client-timeout-ms",
+            "250",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.client_timeout, Duration::from_millis(250));
+        assert!(
+            parse_args(args(&[
+                "--socket",
+                "s",
+                "--dir",
+                "d",
+                "--parent",
+                "7",
+                "--client-timeout-ms",
+                "x"
+            ]))
+            .is_err()
         );
     }
 
@@ -354,6 +408,35 @@ mod args_and_dumps_tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn dump_rotation_keeps_the_new_dump_and_the_newest_twenty_files() {
+        let dir = std::env::temp_dir().join(format!("rve-dump-rotation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let old = UNIX_EPOCH + Duration::from_secs(1_000);
+        for index in 0..RETAINED_CRASH_FILES {
+            let path = dir.join(format!("crash-20200101-000000-1-{index:02}.txt"));
+            fs::write(&path, b"old").unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let (file, dump) =
+            create_dump_file(&dir, 9, UNIX_EPOCH + Duration::from_secs(2_000_000_000)).unwrap();
+        drop(file);
+
+        let removed =
+            prune_after_dump(&dir, &dump, UNIX_EPOCH + Duration::from_secs(2_000_000_100)).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(dump.exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), RETAINED_CRASH_FILES);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
