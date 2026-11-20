@@ -19,6 +19,8 @@ layout(location = 12) in vec4 in_previous_model_0;
 layout(location = 13) in vec4 in_previous_model_1;
 layout(location = 14) in vec4 in_previous_model_2;
 layout(location = 15) in vec4 in_previous_model_3;
+// Tangent вершины (xyz — ∂P/∂u в модели, w — знак bitangent); [0, 0, 0, 0] — tangent отсутствует.
+layout(location = 16) in vec4 in_tangent;
 
 layout(location = 0) out vec3 out_normal;
 layout(location = 1) out vec2 out_uv;
@@ -27,6 +29,7 @@ layout(location = 3) out vec4 out_shadow_clip[4];
 layout(location = 7) out vec3 out_world_position;
 layout(location = 8) out vec4 out_current_clip;
 layout(location = 9) out vec4 out_previous_clip;
+layout(location = 10) out vec4 out_tangent;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
@@ -76,4 +79,9 @@ void main() {
     out_normal = normal_from_model * in_normal;
     out_uv = in_uv;
     out_color = in_color;
+    // Зеркальный экземпляр (отрицательный determinant) меняет handedness: знак w переворачивается,
+    // чтобы bitangent оставался направлением роста FBX v в мировом пространстве.
+    mat3 linear_model = mat3(model);
+    out_tangent = vec4(linear_model * in_tangent.xyz,
+        in_tangent.w * sign(determinant(linear_model)));
 }

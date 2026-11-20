@@ -2009,6 +2009,7 @@ pub(crate) fn upload_scene(
                         normal: vertex.normal,
                         uv: vertex.uv,
                         color: [1.0; 3],
+                        tangent: vertex.tangent,
                     })
                     .collect::<Vec<_>>();
                 let mesh_id = match &mesh.skin {

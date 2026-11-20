@@ -5,7 +5,9 @@ use crate::*;
 /// Вершина меша в пространстве модели.
 ///
 /// `uv` отсчитывается от левого верхнего угла текстуры, `color` умножается
-/// на цвет текстуры в линейном RGB.
+/// на цвет текстуры в линейном RGB. `tangent` — единичное направление ∂P/∂u в xyz и знак
+/// bitangent в w (±1): bitangent = `cross(normal, tangent.xyz) * w`. `[0, 0, 0, 0]` означает,
+/// что tangent отсутствует, и шейдер строит базис по производным экрана.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vertex {
@@ -13,6 +15,7 @@ pub struct Vertex {
     pub normal: [f32; 3],
     pub uv: [f32; 2],
     pub color: [f32; 3],
+    pub tangent: [f32; 4],
 }
 
 /// Вершина 2D-оверлея, рисуемого поверх кадра в разрешении окна.

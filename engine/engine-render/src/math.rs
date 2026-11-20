@@ -147,6 +147,112 @@ pub(crate) fn transform_tangent_normal(
     try_normalize3(mapped).unwrap_or(normal)
 }
 
+/// CPU-зеркало выбора базиса в `mesh.frag::rve_perturb_normal` по вершинному tangent.
+///
+/// Возвращает `None`, когда шейдер уходит на производные экрана: sentinel `[0, 0, 0, 0]`,
+/// нефинитный tangent, дробный `w` (`|w| <= 0.99`: шов или вырожденный экземпляр) или tangent,
+/// вырожденный после проекции на нормаль.
+#[cfg(test)]
+pub(crate) fn vertex_tangent_basis(
+    tangent: [f32; 4],
+    normal: [f32; 3],
+) -> Option<([f32; 3], [f32; 3])> {
+    if !tangent.into_iter().all(f32::is_finite) || tangent[3].abs() <= 0.99 {
+        return None;
+    }
+    let normal = try_normalize3(normal).unwrap_or([0.0, 0.0, 1.0]);
+    let direction = [tangent[0], tangent[1], tangent[2]];
+    let projected = sub3(direction, scale3(normal, dot3(direction, normal)));
+    let length = dot3(projected, projected).sqrt();
+    if !length.is_finite() || length <= 1e-6 {
+        return None;
+    }
+    let tangent_axis = scale3(projected, length.recip());
+    let bitangent = scale3(cross3(normal, tangent_axis), glsl_sign(tangent[3]));
+    Some((tangent_axis, bitangent))
+}
+
+/// CPU-зеркало `mesh.vert`: `mat3(model) * t.xyz` и `w * sign(determinant(mat3(model)))`.
+/// Столбцы `linear` — первые три столбца матрицы модели экземпляра.
+#[cfg(test)]
+pub(crate) fn transform_vertex_tangent(tangent: [f32; 4], linear: [[f32; 3]; 3]) -> [f32; 4] {
+    let direction = mat3_mul_vector(linear, [tangent[0], tangent[1], tangent[2]]);
+    [
+        direction[0],
+        direction[1],
+        direction[2],
+        tangent[3] * glsl_sign(determinant3(linear)),
+    ]
+}
+
+/// CPU-зеркало `skin.comp` для tangent: `Σ wᵢ·mat3(Pᵢ)·t` нормализуется, знак `w` умножается
+/// на `sign(det(Σ wᵢ·mat3(Pᵢ)))`. Влияния с весом `<= 0` пропускаются, как в шейдере.
+/// При нулевой сумме весов tangent возвращается без изменений.
+#[cfg(test)]
+pub(crate) fn skinned_vertex_tangent(
+    tangent: [f32; 4],
+    influences: &[(f32, [[f32; 3]; 3])],
+) -> [f32; 4] {
+    let direction = [tangent[0], tangent[1], tangent[2]];
+    let mut total_weight = 0.0;
+    let mut skinned = [0.0; 3];
+    let mut blended = [[0.0; 3]; 3];
+    for &(weight, linear) in influences.iter().filter(|(weight, _)| *weight > 0.0) {
+        skinned = add3(skinned, scale3(mat3_mul_vector(linear, direction), weight));
+        for (target, column) in blended.iter_mut().zip(linear) {
+            *target = add3(*target, scale3(column, weight));
+        }
+        total_weight += weight;
+    }
+    if total_weight <= 0.0 {
+        return tangent;
+    }
+    let length = dot3(skinned, skinned).sqrt();
+    if length > 0.0 {
+        skinned = scale3(skinned, length.recip());
+    }
+    [
+        skinned[0],
+        skinned[1],
+        skinned[2],
+        tangent[3] * glsl_sign(determinant3(blended)),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn mat3_mul_vector(linear: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
+    add3(
+        add3(scale3(linear[0], vector[0]), scale3(linear[1], vector[1])),
+        scale3(linear[2], vector[2]),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn determinant3(linear: [[f32; 3]; 3]) -> f32 {
+    dot3(linear[0], cross3(linear[1], linear[2]))
+}
+
+#[cfg(test)]
+pub(crate) fn cross3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    ]
+}
+
+/// `sign` из GLSL: для нуля возвращает 0, в отличие от `f32::signum`.
+#[cfg(test)]
+pub(crate) fn glsl_sign(value: f32) -> f32 {
+    if value > 0.0 {
+        1.0
+    } else if value < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn try_normalize3(value: [f32; 3]) -> Option<[f32; 3]> {
     let length_squared = dot3(value, value);

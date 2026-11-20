@@ -322,6 +322,7 @@ pub(crate) fn inspect_device(
     .optimal_tiling_features;
     let mut reasons = evaluation.reasons;
     reasons.extend(cluster_device_limit_reasons(&properties.limits));
+    reasons.extend(vertex_input_attribute_reasons(&properties.limits));
     reasons.extend(particle_gpu::particle_device_limit_reasons(
         &properties.limits,
     ));
@@ -370,6 +371,21 @@ pub(crate) fn cluster_device_limit_reasons(limits: &vk::PhysicalDeviceLimits) ->
         );
     }
     reasons
+}
+
+/// Число входных вершинных атрибутов mesh-пайплайна: locations 0–16. Location 16 — tangent;
+/// минимум Vulkan — 16, поэтому устройство с 16 атрибутами не подходит.
+pub(crate) const MESH_VERTEX_INPUT_ATTRIBUTES: u32 = 17;
+
+pub(crate) fn vertex_input_attribute_reasons(limits: &vk::PhysicalDeviceLimits) -> Vec<String> {
+    if limits.max_vertex_input_attributes < MESH_VERTEX_INPUT_ATTRIBUTES {
+        vec![format!(
+            "maxVertexInputAttributes {} меньше {MESH_VERTEX_INPUT_ATTRIBUTES} (нужен tangent в location 16)",
+            limits.max_vertex_input_attributes
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 pub(crate) fn shadow_image_device_reasons(

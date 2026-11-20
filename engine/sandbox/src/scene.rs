@@ -214,6 +214,7 @@ fn uv_sphere_mesh(center: Vec3, radius: f32) -> (Vec<Vertex>, Vec<u32>) {
                 normal: normal.to_array(),
                 uv: [u, v],
                 color: [1.0; 3],
+                tangent: [0.0; 4],
             });
         }
     }
@@ -263,6 +264,7 @@ pub fn tiled_plane_mesh(half_extent: f32, uv_tiles: f32) -> (Vec<Vertex>, Vec<u3
             normal: [0.0, 1.0, 0.0],
             uv,
             color: [0.78, 0.78, 0.78],
+            tangent: [0.0; 4],
         })
         .collect();
     (vertices, vec![0, 1, 2, 0, 2, 3])
@@ -314,6 +316,7 @@ pub fn plane_mesh() -> (Vec<Vertex>, Vec<u32>) {
             normal: [0.0, 1.0, 0.0],
             uv,
             color: [0.78, 0.78, 0.78],
+            tangent: [0.0; 4],
         })
         .collect();
     (vertices, vec![0, 1, 2, 0, 2, 3])
@@ -327,18 +330,21 @@ pub const TRIANGLE_VERTICES: [Vertex; 3] = [
         normal: TRIANGLE_NORMAL,
         uv: [0.5, 0.0],
         color: [1.0, 0.0, 0.0],
+        tangent: [0.0; 4],
     },
     Vertex {
         position: [-0.52, -0.3, 0.0],
         normal: TRIANGLE_NORMAL,
         uv: [0.0, 1.0],
         color: [0.0, 1.0, 0.0],
+        tangent: [0.0; 4],
     },
     Vertex {
         position: [0.52, -0.3, 0.0],
         normal: TRIANGLE_NORMAL,
         uv: [1.0, 1.0],
         color: [0.0, 0.0, 1.0],
+        tangent: [0.0; 4],
     },
 ];
 pub const TRIANGLE_INDICES: [u32; 3] = [0, 1, 2];
@@ -369,6 +375,7 @@ pub fn cube_mesh() -> (Vec<Vertex>, Vec<u32>) {
                 // Ось v текстуры направлена вниз, а ось v грани — вверх.
                 uv: [s, 1.0 - t],
                 color: [1.0, 1.0, 1.0],
+                tangent: [0.0; 4],
             });
         }
         indices.extend([0, 1, 2, 0, 2, 3].map(|offset| first + offset));

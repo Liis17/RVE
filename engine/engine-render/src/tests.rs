@@ -18,25 +18,27 @@ use super::{
     TONEMAP_FRAGMENT_SHADER, TemporalBackend, TextureColorSpace, TextureId, Tonemapper,
     UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, VELOCITY_FORMAT, Vertex, ViewSettings,
     align_upload_offset, best_device_index, check_extensions, classify_acquire_result,
-    classify_probe_instance_failure, cluster_device_limit_reasons, deduplicate_names,
-    derivative_tangent_basis, draw_rasterization_state, effective_view_settings, evaluate_device,
-    frame_uniform_bytes, index_bytes, index_local_light_shadows, inverse_extent, local_light_bytes,
-    local_light_bytes_for_selected, local_light_contribution, local_shadow_matrix_bytes,
-    material_sampler_info, material_uniform_bytes, mesh_upload_layout, mip_extent, mip_level_count,
-    missing_extensions, missing_offscreen_format_features, missing_post_format_features,
+    classify_probe_instance_failure, cluster_device_limit_reasons, cross3, deduplicate_names,
+    derivative_tangent_basis, dot3, draw_rasterization_state, effective_view_settings,
+    evaluate_device, frame_uniform_bytes, index_bytes, index_local_light_shadows, inverse_extent,
+    local_light_bytes, local_light_bytes_for_selected, local_light_contribution,
+    local_shadow_matrix_bytes, mat3_mul_vector, material_sampler_info, material_uniform_bytes,
+    mesh_upload_layout, mip_extent, mip_level_count, missing_extensions,
+    missing_offscreen_format_features, missing_post_format_features,
     missing_texture_format_features, missing_velocity_format_features, normal_matrix,
     offscreen_previous_use, offscreen_sampled_stages, overlay_vertex_bytes,
-    point_shadow_face_index, push_constant_bytes, sampler_anisotropy, scaled_extent,
+    point_shadow_face_index, push_constant_bytes, sampler_anisotropy, scale3, scaled_extent,
     scene_viewport, select_composite_alpha, select_local_light_entries, select_local_lights,
     select_local_shadow_slots, select_present_mode, select_surface_extent, select_temporal_backend,
     shadow_array_limits_suitable, shadow_caster_is_outside, shadow_casters, shadow_layout_source,
-    shadow_subresource_range, texture_format, texture_format_reasons, texture_mip_blit_region,
-    texture_mip_destination_shader_barrier, texture_mip_shader_barrier, texture_mip_source_barrier,
-    texture_staging_size, texture_upload_barrier, timestamp_duration, transform_tangent_normal,
-    upload_batch_capacity, upload_batch_flush_required, upload_data_layout, usable_surface_extent,
-    validate_debug_view, validate_draws, validate_material, validate_mesh, validate_overlay,
-    validate_pipeline_cache, validate_render_scale, validate_texture, validate_view_settings,
-    vertex_bytes,
+    shadow_subresource_range, skinned_vertex_tangent, texture_format, texture_format_reasons,
+    texture_mip_blit_region, texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
+    texture_mip_source_barrier, texture_staging_size, texture_upload_barrier, timestamp_duration,
+    transform_tangent_normal, transform_vertex_tangent, upload_batch_capacity,
+    upload_batch_flush_required, upload_data_layout, usable_surface_extent, validate_debug_view,
+    validate_draws, validate_material, validate_mesh, validate_overlay, validate_pipeline_cache,
+    validate_render_scale, validate_texture, validate_view_settings, vertex_bytes,
+    vertex_input_attribute_reasons, vertex_tangent_basis,
 };
 use super::{Exposure, PostProcess};
 use super::{
@@ -2824,21 +2826,209 @@ fn texture_validation_requires_rgba8_bytes_within_gpu_limits() {
 }
 
 #[test]
+fn vertex_tangent_basis_takes_only_finite_full_sign_tangents() {
+    let normal = [0.0, 0.0, 1.0];
+    // Sentinel, дробный w (шов между вершинами с разным знаком) и NaN уходят на производные.
+    assert_eq!(vertex_tangent_basis([0.0; 4], normal), None);
+    assert_eq!(vertex_tangent_basis([1.0, 0.0, 0.0, 0.5], normal), None);
+    assert_eq!(vertex_tangent_basis([1.0, 0.0, 0.0, 0.0], normal), None);
+    assert_eq!(
+        vertex_tangent_basis([f32::NAN, 0.0, 0.0, 1.0], normal),
+        None
+    );
+    // Tangent вдоль нормали после проекции не даёт базиса.
+    assert_eq!(vertex_tangent_basis([0.0, 0.0, 2.0, 1.0], normal), None);
+
+    let (tangent, bitangent) = vertex_tangent_basis([3.0, 0.0, 0.0, -1.0], normal).unwrap();
+    assert_close(tangent, [1.0, 0.0, 0.0]);
+    assert_close(bitangent, [0.0, -1.0, 0.0]);
+    // Нормальная компонента tangent убирается, B остаётся ортогональным T.
+    let (tangent, bitangent) = vertex_tangent_basis([1.0, 0.0, 1.0, 1.0], normal).unwrap();
+    assert_close(tangent, [1.0, 0.0, 0.0]);
+    assert_close(bitangent, [0.0, 1.0, 0.0]);
+}
+
+#[test]
+fn vertex_tangent_basis_matches_derivative_basis_for_orthogonal_uvs() {
+    // Квадрат в плоскости XY; UV ортогональны осям. Stored uv.y = 1 − v, поэтому bitangent
+    // (рост FBX v) совпадает с −Y при растущем вдоль +Y uv.y и знаке w = −1.
+    let normal = [0.0, 0.0, 1.0];
+    let cases = [
+        ([1.0, 0.0], [0.0, 1.0], -1.0),
+        ([2.0, 0.0], [0.0, 3.0], -1.0),
+        // uv.y убывает вдоль +Y: рост FBX v идёт вдоль +Y, w = +1.
+        ([0.5, 0.0], [0.0, -4.0], 1.0),
+    ];
+    for (duv1, duv2, sign) in cases {
+        let derivative =
+            derivative_tangent_basis([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], duv1, duv2, normal).unwrap();
+        let vertex = vertex_tangent_basis([1.0, 0.0, 0.0, sign], normal).unwrap();
+        assert_close(vertex.0, derivative.0);
+        assert_close(vertex.1, derivative.1);
+    }
+}
+
+#[test]
+fn vertex_tangent_basis_orthogonalizes_bitangent_where_derivative_basis_does_not() {
+    // u = s + 0.5·t, v = t: dP/du = X у обоих базисов, а dP/dv = (−0.5, 1, 0) не ортогонален X.
+    // Вершинный базис даёт B = cross(N, T)·w, производный оставляет проекцию dP/dv на плоскость N.
+    // Это документированное отличие, а не ошибка: для скошенных UV результат расходится.
+    let normal = [0.0, 0.0, 1.0];
+    let (tangent, bitangent) = vertex_tangent_basis([1.0, 0.0, 0.0, -1.0], normal).unwrap();
+    let (derivative_tangent, derivative_bitangent) = derivative_tangent_basis(
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0],
+        [0.5, 1.0],
+        normal,
+    )
+    .unwrap();
+    assert_close(tangent, derivative_tangent);
+    assert!(dot3(bitangent, tangent).abs() < 1e-6);
+    // Косинус между B производного базиса и T равен 1/√5 ≈ 0.447.
+    assert!(dot3(derivative_bitangent, derivative_tangent) > 0.4);
+    assert!(dot3(derivative_bitangent, bitangent) < 0.9);
+}
+
+#[test]
+fn mirrored_fbx_tangent_keeps_bitangent_on_geometry_under_instance_transform() {
+    // Геометрия задаёт B_world = M·B_model при любом знаке det(M) и любом знаке w из FBX.
+    // Нормаль не меняется для всех трёх матриц: диагональ по Z и вращение вокруг Z оставляют Z.
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mirror_x = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let rotate_z = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    let normal = [0.0, 0.0, 1.0];
+    for fbx_sign in [1.0, -1.0] {
+        let model_tangent = [1.0, 0.0, 0.0, fbx_sign];
+        let model_bitangent = scale3(cross3(normal, [1.0, 0.0, 0.0]), fbx_sign);
+        for linear in [identity, mirror_x, rotate_z] {
+            let world = transform_vertex_tangent(model_tangent, linear);
+            let (tangent, bitangent) = vertex_tangent_basis(world, normal).unwrap();
+            assert_close(tangent, mat3_mul_vector(linear, [1.0, 0.0, 0.0]));
+            assert_close(bitangent, mat3_mul_vector(linear, model_bitangent));
+        }
+    }
+}
+
+#[test]
+fn instance_transform_flips_w_only_for_mirrors_and_keeps_sentinel() {
+    let mirror_x = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let rotate_z = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    assert_eq!(
+        transform_vertex_tangent([1.0, 0.0, 0.0, 1.0], rotate_z),
+        [0.0, 1.0, 0.0, 1.0]
+    );
+    assert_eq!(
+        transform_vertex_tangent([1.0, 0.0, 0.0, 1.0], mirror_x),
+        [-1.0, 0.0, 0.0, -1.0]
+    );
+    // Sentinel остаётся нулевым при любом экземпляре: его w равен нулю.
+    assert_eq!(
+        transform_vertex_tangent([0.0; 4], mirror_x),
+        [0.0, 0.0, 0.0, 0.0]
+    );
+    // Вырожденный экземпляр (нулевой масштаб) даёт w = 0, то есть запасной путь.
+    let flattened = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    assert_eq!(
+        transform_vertex_tangent([1.0, 0.0, 0.0, 1.0], flattened)[3],
+        0.0
+    );
+}
+
+#[test]
+fn skinned_tangent_follows_bone_rotation_and_flips_sign_under_mirrored_bone() {
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mirror_x = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let rotate_z = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    let tangent = [1.0, 0.0, 0.0, 1.0];
+    assert_eq!(
+        skinned_vertex_tangent(tangent, &[(1.0, rotate_z)]),
+        [0.0, 1.0, 0.0, 1.0]
+    );
+    // Костью-зеркалом w меняет знак, как и экземпляр с отрицательным масштабом.
+    assert_eq!(
+        skinned_vertex_tangent(tangent, &[(1.0, mirror_x)]),
+        [-1.0, 0.0, 0.0, -1.0]
+    );
+    // Смесь поворота и единичной матрицы: направление нормализуется, знак остаётся.
+    let blended = skinned_vertex_tangent(tangent, &[(0.5, rotate_z), (0.5, identity)]);
+    let half = std::f32::consts::FRAC_1_SQRT_2;
+    assert!((blended[0] - half).abs() < 1e-6 && (blended[1] - half).abs() < 1e-6);
+    assert!(blended[2].abs() < 1e-6);
+    assert_eq!(blended[3], 1.0);
+    // Смесь зеркала и единичной матрицы схлопывает tangent и знак: запасной путь.
+    assert_eq!(
+        skinned_vertex_tangent(tangent, &[(0.5, identity), (0.5, mirror_x)]),
+        [0.0, 0.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn skinned_tangent_keeps_source_without_weight_and_ignores_zero_weights() {
+    let rotate_z = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let tangent = [1.0, 0.0, 0.0, -1.0];
+    // Нулевая сумма весов: вершина не двигается, tangent сохраняет и направление, и знак.
+    assert_eq!(skinned_vertex_tangent(tangent, &[(0.0, rotate_z)]), tangent);
+    assert_eq!(skinned_vertex_tangent(tangent, &[]), tangent);
+    // Нулевой вес не участвует в смеси, даже с зеркальной матрицей.
+    assert_eq!(
+        skinned_vertex_tangent(tangent, &[(0.0, rotate_z), (1.0, identity)]),
+        tangent
+    );
+    // Sentinel остаётся нулевым при любых весах.
+    assert_eq!(
+        skinned_vertex_tangent([0.0; 4], &[(1.0, rotate_z)]),
+        [0.0, 0.0, 0.0, 0.0]
+    );
+    // Дробный w проходит через skinning без изменений, но базис по нему не строится.
+    let fractional = skinned_vertex_tangent([1.0, 0.0, 0.0, 0.5], &[(1.0, identity)]);
+    assert_eq!(fractional[3], 0.5);
+    assert_eq!(vertex_tangent_basis(fractional, [0.0, 0.0, 1.0]), None);
+}
+
+#[test]
+fn perturb_normal_takes_screen_derivatives_before_any_tangent_branch() {
+    // dFdx/dFdy требуют uniform control flow, поэтому производные вычисляются до ветвления по tangent.
+    let shader = include_str!("../shaders/mesh.frag");
+    let perturb = shader.find("vec3 rve_perturb_normal(").unwrap();
+    let body = &shader[perturb..];
+    let derivative = body.find("dFdx(in_world_position)").unwrap();
+    let vertex_branch = body.find("if (!any(isnan(in_tangent))").unwrap();
+    assert!(derivative < vertex_branch);
+}
+
+#[test]
+fn mesh_tangent_location_needs_seventeen_vertex_input_attributes() {
+    let mut limits = vk::PhysicalDeviceLimits {
+        max_vertex_input_attributes: 16,
+        ..vk::PhysicalDeviceLimits::default()
+    };
+    let reasons = vertex_input_attribute_reasons(&limits);
+    assert_eq!(reasons.len(), 1);
+    assert!(reasons[0].contains("maxVertexInputAttributes 16"));
+    limits.max_vertex_input_attributes = 17;
+    assert!(vertex_input_attribute_reasons(&limits).is_empty());
+}
+
+#[test]
 fn vertex_layout_matches_shader_inputs() {
-    assert_eq!(size_of::<Vertex>(), 44);
+    assert_eq!(size_of::<Vertex>(), 60);
     assert_eq!(std::mem::offset_of!(Vertex, position), 0);
     assert_eq!(std::mem::offset_of!(Vertex, normal), 12);
     assert_eq!(std::mem::offset_of!(Vertex, uv), 24);
     assert_eq!(std::mem::offset_of!(Vertex, color), 32);
+    assert_eq!(std::mem::offset_of!(Vertex, tangent), 44);
     let vertices = [Vertex {
         position: [1.0, 2.0, 3.0],
         normal: [4.0, 5.0, 6.0],
         uv: [7.0, 8.0],
         color: [9.0, 10.0, 11.0],
+        tangent: [12.0, 13.0, 14.0, 15.0],
     }];
     assert_eq!(
         floats(vertex_bytes(&vertices)),
-        (1..=11).map(|value| value as f32).collect::<Vec<_>>()
+        (1..=15).map(|value| value as f32).collect::<Vec<_>>()
     );
     assert_eq!(
         index_bytes(&[1, 2]),

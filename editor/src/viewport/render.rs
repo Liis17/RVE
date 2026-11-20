@@ -3226,6 +3226,7 @@ fn upload_model(
                     normal: vertex.normal,
                     uv: vertex.uv,
                     color: [1.0; 3],
+                    tangent: vertex.tangent,
                 })
                 .collect::<Vec<_>>();
             let mesh_id = match (&model_mesh.skin, model.skeleton.as_ref()) {
@@ -3603,6 +3604,7 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
             normal: [0.0, 1.0, 0.0],
             uv: [0.0, 0.0],
             color,
+            tangent: [0.0; 4],
         }));
         indices.extend([first, first + 2, first + 1, first, first + 3, first + 2]);
     };

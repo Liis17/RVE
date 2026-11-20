@@ -7,6 +7,8 @@ layout(location = 3) in vec4 in_shadow_clip[4];
 layout(location = 7) in vec3 in_world_position;
 layout(location = 8) in vec4 in_current_clip;
 layout(location = 9) in vec4 in_previous_clip;
+// Tangent из vertex shader: xyz — направление ∂P/∂u в мире, w — знак bitangent.
+layout(location = 10) in vec4 in_tangent;
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec2 out_velocity;
@@ -263,6 +265,7 @@ vec3 cascade_color(int index) {
 }
 
 vec3 rve_perturb_normal(vec3 tangent_normal) {
+    // Производные считаются безусловно до любых ветвлений: dFdx/dFdy требуют uniform control flow.
     vec3 dp1 = dFdx(in_world_position);
     vec3 dp2 = dFdy(in_world_position);
     vec2 duv1 = dFdx(in_uv);
@@ -270,9 +273,24 @@ vec3 rve_perturb_normal(vec3 tangent_normal) {
     vec3 geometric_normal = safe_normalize(in_normal, vec3(0.0, 0.0, 1.0));
     vec3 tangent = vec3(0.0);
     vec3 bitangent = vec3(0.0);
+    bool valid_basis = false;
+    // Вершинный базис: T — tangent без нормальной компоненты, B = cross(N, T) * sign(w) (ортогонален T).
+    // Sentinel [0,0,0,0] и дробный w (шов или вырожденный экземпляр) дают запасной путь.
+    if (!any(isnan(in_tangent)) && !any(isinf(in_tangent)) && abs(in_tangent.w) > 0.99) {
+        vec3 projected_tangent = in_tangent.xyz
+            - geometric_normal * dot(in_tangent.xyz, geometric_normal);
+        float projected_length = length(projected_tangent);
+        if (projected_length > 1e-6) {
+            tangent = projected_tangent / projected_length;
+            bitangent = cross(geometric_normal, tangent) * sign(in_tangent.w);
+            valid_basis = true;
+        }
+    }
+    // Запасной путь без tangent: базис по производным UV в экранных соседях, как раньше.
     float determinant = duv1.x * duv2.y - duv1.y * duv2.x;
-    bool valid_basis = !isnan(determinant) && !isinf(determinant) && abs(determinant) > 1e-8;
-    if (valid_basis && !any(isnan(dp1)) && !any(isinf(dp1))
+    bool derivative_basis = !valid_basis && !isnan(determinant) && !isinf(determinant)
+        && abs(determinant) > 1e-8;
+    if (derivative_basis && !any(isnan(dp1)) && !any(isinf(dp1))
         && !any(isnan(dp2)) && !any(isinf(dp2))) {
         vec3 raw_tangent = (dp1 * duv2.y - dp2 * duv1.y) / determinant;
         vec3 raw_bitangent = -(dp2 * duv1.x - dp1 * duv2.x) / determinant;
