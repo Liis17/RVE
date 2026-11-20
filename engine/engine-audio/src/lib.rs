@@ -27,6 +27,7 @@ use engine_resources::{ResourceHandle, ResourceRequest};
 use engine_scene::{AudioGroup, AudioGroupEffects, VoiceId};
 use flume::{Receiver, Selector, Sender, TrySendError};
 use mixer::{MixerCommand, RETIRED_CAPACITY, Spatial, VOICE_SLOTS};
+use output::{Channels, Reconnect, Signals};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -35,7 +36,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use stream::{ByteSource, OpenSource, StreamEvent, StreamJob, StreamReader, stream_loop};
 
 /// Бюджет декодированных клипов в кеше (512 МБ).
@@ -381,12 +382,6 @@ pub struct AudioEngine {
     config: AudioConfig,
     commands: Receiver<Command>,
     events_tx: Sender<AudioEvent>,
-    ended_tx: Producer<VoiceId>,
-    ended_rx: Consumer<VoiceId>,
-    mixer_tx: Producer<MixerCommand>,
-    mixer_rx: Consumer<MixerCommand>,
-    retired_tx: Producer<StreamReader>,
-    retired_rx: Consumer<StreamReader>,
     lanes: Arc<Mutex<Lanes>>,
     spatial: Arc<Spatial>,
     stopping: Arc<AtomicBool>,
@@ -396,9 +391,6 @@ impl AudioEngine {
     pub fn new(config: AudioConfig) -> (Self, AudioHandle) {
         let (command_tx, commands) = flume::bounded(COMMAND_CAPACITY);
         let (events_tx, events_rx) = flume::unbounded();
-        let (ended_tx, ended_rx) = RingBuffer::new(mixer::ENDED_CAPACITY);
-        let (mixer_tx, mixer_rx) = RingBuffer::new(MIXER_CAPACITY);
-        let (retired_tx, retired_rx) = RingBuffer::new(RETIRED_CAPACITY);
         let lanes = Arc::new(Mutex::new(Lanes::default()));
         let spatial = Arc::new(Spatial::new());
         let stopping = Arc::new(AtomicBool::new(false));
@@ -417,12 +409,6 @@ impl AudioEngine {
             config,
             commands,
             events_tx,
-            ended_tx,
-            ended_rx,
-            mixer_tx,
-            mixer_rx,
-            retired_tx,
-            retired_rx,
             lanes,
             spatial,
             stopping,
@@ -431,18 +417,13 @@ impl AudioEngine {
     }
 
     /// Блокирует поток до [`AudioHandle::shutdown`] или до освобождения всех хендлов.
-    /// Ошибка открытия устройства не прерывает работу: звук выключается с предупреждением.
+    /// Ошибка открытия и потеря устройства не прерывают работу: звук выключается с предупреждением
+    /// и открывается заново по расписанию [`Reconnect`].
     pub fn run(self) {
         let AudioEngine {
             config,
             commands,
             events_tx,
-            ended_tx,
-            mut ended_rx,
-            mixer_tx,
-            mixer_rx,
-            retired_tx,
-            mut retired_rx,
             lanes,
             spatial,
             stopping,
@@ -476,20 +457,13 @@ impl AudioEngine {
         }
 
         let read = read_source(config.resources);
-        let (output, mixer) = if config.output {
-            match output::open(mixer_rx, ended_tx, retired_tx, Arc::clone(&spatial)) {
-                Ok(output) => (Some(output), Some(mixer_tx)),
-                Err(error) => {
-                    let message =
-                        format!("звук отключён: {error}; игра продолжает работу без звука");
-                    log::warn!("{message}");
-                    let _ = events_tx.send(AudioEvent::Failed(message));
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
+        // Открытие устройства передаётся замыканием: тесты подставляют своё.
+        let open: Option<OpenOutput<output::Output>> = config.output.then(|| {
+            let spatial = Arc::clone(&spatial);
+            Box::new(move |channels: Channels, signals: Signals| {
+                output::open_device(channels, Arc::clone(&spatial), signals)
+            }) as OpenOutput<output::Output>
+        });
 
         let mut core = Core {
             lanes,
@@ -500,28 +474,38 @@ impl AudioEngine {
             cache_bytes: 0,
             failed: HashSet::new(),
             pending: Vec::new(),
-            mixer,
+            mixer: None,
             outbox: VecDeque::new(),
-            events: events_tx,
+            in_mixer: HashSet::new(),
+            settings: MixerSettings::default(),
+            events: events_tx.clone(),
             decode_tx,
             stream_tx: streamer.is_ok().then_some(stream_tx),
             streams: Vec::new(),
         };
+        let mut device = Device::new(open, events_tx, Instant::now());
         loop {
             if stopping.load(Ordering::Acquire) {
                 break;
             }
             // Устройство присылает завершённые голоса через кольцо: опрашиваем его при каждом
             // пробуждении, а пробуждаемся не реже READ_POLL, пока есть микшер или чтения.
+            // Ожидание не длиннее времени до следующей попытки открытия.
+            let mut timeout = if core.mixer.is_some() || !core.loading.is_empty() {
+                READ_POLL
+            } else {
+                IDLE_POLL
+            };
+            if let Some(retry) = device.retry_in(Instant::now()) {
+                timeout = timeout.min(retry);
+            }
             let incoming = Selector::new()
                 .recv(&commands, Incoming::Command)
                 .recv(&decoded_rx, Incoming::Decoded)
                 .recv(&stream_events, Incoming::Stream)
-                .wait_timeout(if core.mixer.is_some() || !core.loading.is_empty() {
-                    READ_POLL
-                } else {
-                    IDLE_POLL
-                });
+                .wait_timeout(timeout);
+            // Потеря устройства обрабатывается до команд этого пробуждения: они попадут уже в новый микшер.
+            device.poll(Instant::now(), &mut core);
             match incoming {
                 Ok(Incoming::Command(Ok(command))) => {
                     if !core.command(command) {
@@ -534,13 +518,7 @@ impl AudioEngine {
                 // `keepalive_*` живут до конца `run`, поэтому отключения не бывает.
                 Ok(Incoming::Decoded(Err(_))) | Ok(Incoming::Stream(Err(_))) | Err(_) => {}
             }
-            while let Ok(voice) = ended_rx.pop() {
-                core.voice_ended(voice);
-            }
-            // Кольца завершённых стрим-голосов освобождаются здесь, а не в callback.
-            while let Ok(reader) = retired_rx.pop() {
-                drop(reader);
-            }
+            device.drain(&mut core);
             core.flush_mixer();
             core.poll_reads();
         }
@@ -549,7 +527,7 @@ impl AudioEngine {
         // Сначала останавливаем устройство: голоса микшера держат `Arc<Clip>`, и их последняя
         // ссылка не должна освободиться в callback. Кеш `core` живёт дольше потока вывода.
         stream_cancel.store(true, Ordering::Relaxed);
-        drop(output);
+        drop(device);
         drop(core);
         drop(keepalive_decoded);
         drop(keepalive_stream_events);
@@ -602,12 +580,54 @@ struct Core {
     mixer: Option<Producer<MixerCommand>>,
     /// Команды микшера, которые не влезли в кольцо; уходят в порядке поступления.
     outbox: VecDeque<MixerCommand>,
+    /// Голоса, которые отданы микшеру (`Play`/`PlayStream` в `outbox` или в кольце) и ещё не
+    /// завершились. При потере устройства завершаются все они, по одному разу.
+    in_mixer: HashSet<VoiceId>,
+    /// Настройки микшера, заданные командами: новый микшер получает их первыми.
+    settings: MixerSettings,
     events: Sender<AudioEvent>,
     decode_tx: Sender<DecodeJob>,
     /// Задания потоку стриминга; `None`, если поток не запустился.
     stream_tx: Option<Sender<StreamJob>>,
     /// Стрим-голоса, которые ждут заполнения кольца.
     streams: Vec<Pending>,
+}
+
+/// Настройки микшера, которые переживают смену устройства.
+#[derive(Default)]
+struct MixerSettings {
+    paused: bool,
+    mono: bool,
+    volumes: Vec<(AudioGroup, f32)>,
+    effects: Vec<(AudioGroup, AudioGroupEffects)>,
+}
+
+impl MixerSettings {
+    fn commands(&self) -> Vec<MixerCommand> {
+        let mut commands = vec![
+            MixerCommand::SetPaused(self.paused),
+            MixerCommand::SetMonoOutput(self.mono),
+        ];
+        commands.extend(
+            self.volumes
+                .iter()
+                .map(|&(group, volume)| MixerCommand::SetGroupVolume { group, volume }),
+        );
+        commands.extend(
+            self.effects
+                .iter()
+                .map(|&(group, effects)| MixerCommand::SetGroupEffects { group, effects }),
+        );
+        commands
+    }
+}
+
+/// Запоминает последнее значение группы; в списке не больше одной записи на группу.
+fn remember<T>(entries: &mut Vec<(AudioGroup, T)>, group: AudioGroup, value: T) {
+    match entries.iter_mut().find(|(entry, _)| *entry == group) {
+        Some(entry) => entry.1 = value,
+        None => entries.push((group, value)),
+    }
 }
 
 impl Core {
@@ -632,8 +652,14 @@ impl Core {
                 self.cancel_pending(|_| true);
                 self.send_mixer(MixerCommand::StopAll);
             }
-            Command::SetPaused(paused) => self.send_mixer(MixerCommand::SetPaused(paused)),
-            Command::SetMonoOutput(mono) => self.send_mixer(MixerCommand::SetMonoOutput(mono)),
+            Command::SetPaused(paused) => {
+                self.settings.paused = paused;
+                self.send_mixer(MixerCommand::SetPaused(paused));
+            }
+            Command::SetMonoOutput(mono) => {
+                self.settings.mono = mono;
+                self.send_mixer(MixerCommand::SetMonoOutput(mono));
+            }
             Command::SetVoiceVolume { voice, volume } => {
                 for pending in self
                     .pending
@@ -646,9 +672,11 @@ impl Core {
                 self.send_mixer(MixerCommand::SetVoiceVolume { voice, volume });
             }
             Command::SetGroupVolume { group, volume } => {
+                remember(&mut self.settings.volumes, group, volume);
                 self.send_mixer(MixerCommand::SetGroupVolume { group, volume });
             }
             Command::SetGroupEffects { group, effects } => {
+                remember(&mut self.settings.effects, group, effects);
                 self.send_mixer(MixerCommand::SetGroupEffects { group, effects });
             }
             Command::Preload(paths) => {
@@ -725,6 +753,7 @@ impl Core {
                 if self.mixer.is_none() {
                     return self.voice_ended(voice);
                 }
+                self.in_mixer.insert(voice);
                 self.send_mixer(MixerCommand::PlayStream {
                     voice,
                     lane: pending.lane,
@@ -832,6 +861,7 @@ impl Core {
         if self.mixer.is_none() {
             return self.voice_ended(voice);
         }
+        self.in_mixer.insert(voice);
         self.send_mixer(MixerCommand::Play {
             voice,
             lane,
@@ -874,6 +904,32 @@ impl Core {
         let _ = self.events.send(AudioEvent::VoiceEnded(voice));
     }
 
+    /// Завершение голоса из кольца микшера. Голос, которого нет в учёте, уже завершён (например,
+    /// при потере устройства): повтор игнорируется, поэтому `VoiceEnded` уходит ровно один раз.
+    fn mixer_ended(&mut self, voice: VoiceId) {
+        if self.in_mixer.remove(&voice) {
+            self.voice_ended(voice);
+        }
+    }
+
+    /// Устройство потеряно: микшер и его очередь больше не действуют. Голоса, которые микшер
+    /// не вернул, завершаются здесь. Ожидающие загрузки и стрима голоса сохраняются.
+    fn device_lost(&mut self) {
+        self.mixer = None;
+        self.outbox.clear();
+        for voice in std::mem::take(&mut self.in_mixer) {
+            self.voice_ended(voice);
+        }
+    }
+
+    /// Новое устройство: сначала возвращаются настройки микшера, затем продолжается очередь.
+    fn device_opened(&mut self, mixer: Producer<MixerCommand>) {
+        self.mixer = Some(mixer);
+        for command in self.settings.commands() {
+            self.send_mixer(command);
+        }
+    }
+
     fn release(&mut self, voice: VoiceId) {
         self.lanes
             .lock()
@@ -900,6 +956,156 @@ impl Core {
                 break;
             }
         }
+    }
+}
+
+/// Открытие выходного устройства: получает концы колец и сигналы callback-а, возвращает владельца потока.
+type OpenOutput<O> = Box<dyn FnMut(Channels, Signals) -> Result<O, String>>;
+
+/// Выходное устройство: открытие, потеря и повторные попытки. Открытие передаётся замыканием,
+/// поэтому тесты подменяют устройство, а время приходит аргументом.
+struct Device<O> {
+    /// `None`, если вывод отключён (`output: false`): попыток нет.
+    open: Option<OpenOutput<O>>,
+    /// Открытое устройство. Дроп `output` останавливает callback.
+    active: Option<Active<O>>,
+    reconnect: Reconnect,
+    /// Эпизод потери или отказа уже сообщён `Failed`; сбрасывается, когда открытый поток отработал.
+    reported: bool,
+    events: Sender<AudioEvent>,
+}
+
+struct Active<O> {
+    output: O,
+    signals: Signals,
+    ended: Consumer<VoiceId>,
+    retired: Consumer<StreamReader>,
+}
+
+impl<O> Device<O> {
+    fn new(open: Option<OpenOutput<O>>, events: Sender<AudioEvent>, now: Instant) -> Self {
+        let mut reconnect = Reconnect::default();
+        if open.is_some() {
+            reconnect.schedule(now);
+        }
+        Self {
+            open,
+            active: None,
+            reconnect,
+            reported: false,
+            events,
+        }
+    }
+
+    /// Сколько ждать до следующей попытки открытия; `None`, если устройство открыто или попытка не запланирована.
+    fn retry_in(&self, now: Instant) -> Option<Duration> {
+        if self.active.is_some() {
+            return None;
+        }
+        self.reconnect.wait(now)
+    }
+
+    /// Проверяет сигналы callback-а и открывает устройство, когда пришло время попытки.
+    fn poll(&mut self, now: Instant, core: &mut Core) {
+        let (lost, alive) = self.active.as_ref().map_or((false, false), |active| {
+            (
+                active.signals.lost.load(Ordering::Acquire),
+                active.signals.alive.load(Ordering::Acquire),
+            )
+        });
+        if lost {
+            self.lose(now, core);
+        } else if alive {
+            self.reconnect.alive();
+            self.reported = false;
+        }
+        if self.active.is_none() && self.reconnect.due(now) {
+            self.attempt(now, core);
+        }
+    }
+
+    /// Переносит завершённые голоса и освобождает кольца стрим-голосов. Кольцо `retired`
+    /// освобождается здесь, а не в callback.
+    fn drain(&mut self, core: &mut Core) {
+        if let Some(active) = self.active.as_mut() {
+            drain_rings(&mut active.ended, &mut active.retired, core);
+        }
+    }
+
+    fn lose(&mut self, now: Instant, core: &mut Core) {
+        let Some(Active {
+            output,
+            mut ended,
+            mut retired,
+            ..
+        }) = self.active.take()
+        else {
+            return;
+        };
+        // Сначала останавливаем поток: после этого callback не пишет в кольца.
+        drop(output);
+        drain_rings(&mut ended, &mut retired, core);
+        core.device_lost();
+        self.reconnect.schedule(now);
+        self.report("устройство вывода потеряно; звук вернётся автоматически".to_owned());
+    }
+
+    fn attempt(&mut self, now: Instant, core: &mut Core) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let (mixer_tx, commands) = RingBuffer::new(MIXER_CAPACITY);
+        let (ended_tx, ended) = RingBuffer::new(mixer::ENDED_CAPACITY);
+        let (retired_tx, retired) = RingBuffer::new(RETIRED_CAPACITY);
+        let signals = Signals::default();
+        let channels = Channels {
+            commands,
+            ended: ended_tx,
+            retired: retired_tx,
+        };
+        match open(channels, signals.clone()) {
+            Ok(output) => {
+                self.reconnect.opened();
+                self.active = Some(Active {
+                    output,
+                    signals,
+                    ended,
+                    retired,
+                });
+                core.device_opened(mixer_tx);
+                log::info!("звук: устройство вывода открыто");
+            }
+            Err(error) => {
+                self.reconnect.failed(now);
+                self.report(format!(
+                    "звук отключён: {error}; попытки открыть устройство продолжатся автоматически"
+                ));
+            }
+        }
+    }
+
+    /// Сообщает об эпизоде один раз; повторные неудачи попадают только в журнал.
+    fn report(&mut self, message: String) {
+        if self.reported {
+            log::debug!("{message}");
+            return;
+        }
+        self.reported = true;
+        log::warn!("{message}");
+        let _ = self.events.send(AudioEvent::Failed(message));
+    }
+}
+
+fn drain_rings(
+    ended: &mut Consumer<VoiceId>,
+    retired: &mut Consumer<StreamReader>,
+    core: &mut Core,
+) {
+    while let Ok(voice) = ended.pop() {
+        core.mixer_ended(voice);
+    }
+    while let Ok(reader) = retired.pop() {
+        drop(reader);
     }
 }
 
