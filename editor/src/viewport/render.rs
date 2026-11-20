@@ -17,12 +17,12 @@ use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, LocalLight,
-    LocalLightShadow, LocalLightShadowMatrices, Material, MaterialId, MeshId, ParticleBlend,
-    ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleEmitterFrame,
-    ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey, PostProcess,
-    ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, ShaderId, SkinBinding, SkinId,
-    SkinVertex, SurfaceLighting, SurfaceShaderSource, TextureColorSpace, TextureId, TextureRole,
-    Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
+    LocalLightShadow, LocalLightShadowMatrices, Material, MaterialId, MeshId, NormalMipChain,
+    ParticleBlend, ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc,
+    ParticleEmitterFrame, ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey,
+    PostProcess, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, ShaderId,
+    SkinBinding, SkinId, SkinVertex, SurfaceLighting, SurfaceShaderSource, TextureColorSpace,
+    TextureId, TextureRole, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_render::{
     ColorLutId, SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage,
@@ -527,8 +527,9 @@ impl SceneRenderer {
                             format!("{path}: не удалось прочитать зависимости модели: {warning}"),
                         );
                     }
+                    let normal_chains = loaded.normal_chains;
                     let model = Arc::new(loaded.model);
-                    let gpu = match upload_model(renderer, &model) {
+                    let gpu = match upload_model(renderer, &model, &normal_chains) {
                         Ok(gpu) => gpu,
                         Err(error) if is_resource_error(&error) => {
                             self.models.insert(path.clone(), previous);
@@ -615,7 +616,9 @@ impl SceneRenderer {
                 };
                 if !self.models.contains_key(model_path) {
                     match cpu_models.get(model_path).cloned() {
-                        Some(model) => match upload_model(renderer, &model) {
+                        // Цепочки normal map освобождены после первой загрузки: путь без них
+                        // строит их при создании текстуры.
+                        Some(model) => match upload_model(renderer, &model, &HashMap::new()) {
                             Ok(gpu) => {
                                 self.models.insert(model_path.to_owned(), Some(gpu));
                                 self.failed_reloads.remove(model_path);
@@ -812,9 +815,10 @@ impl SceneRenderer {
                 .or_default()
                 .insert((*color_space, *role));
         }
-        // Файл декодируется один раз на путь; результат применяется ко всем ролям из `texture_wants`.
-        for path in texture_reload_paths(&texture_keys) {
-            self.images.reload(ImageKind::Texture, &path);
+        // Файл декодируется по разу на вид (цвет и normal map); результат применяется к ролям из
+        // `texture_wants` того же вида.
+        for (kind, path) in texture_reload_requests(&texture_keys) {
+            self.images.reload(kind, &path);
         }
 
         // Изменённый `.glsl` (при rescan — все кэшированные) перекомпилируется; ошибка оставляет
@@ -921,20 +925,14 @@ impl SceneRenderer {
         path: String,
         color_space: TextureColorSpace,
         role: TextureRole,
-        result: Result<&engine_assets::TextureData, String>,
+        result: Result<&DecodedImage, String>,
     ) -> Result<(), RenderError> {
         let key = (path.clone(), color_space, role);
         let previous = self.textures.get(&key).copied().flatten();
         let had_previous = previous.is_some();
         match result {
-            Ok(data) => {
-                let replacement = match renderer.create_texture_with_role(
-                    data.width,
-                    data.height,
-                    &data.rgba,
-                    color_space,
-                    role,
-                ) {
+            Ok(image) => {
+                let replacement = match create_editor_texture(renderer, image, color_space, role) {
                     Ok(replacement) => replacement,
                     Err(error) if is_resource_error(&error) => {
                         let (current, _, error) = cache_update(previous, Err(error.to_string()));
@@ -1063,34 +1061,52 @@ impl SceneRenderer {
     ) -> Result<(), RenderError> {
         self.ensure_image_loader(project);
         for (kind, path, result) in self.images.finished() {
-            match (kind, result) {
-                (ImageKind::Texture, result) => {
-                    let data = result.map(|image| match image {
-                        DecodedImage::Texture(data) => data,
-                        DecodedImage::Hdr(_) => unreachable!("запрос текстуры вернул HDR"),
-                    });
-                    let wants = self.texture_wants.remove(&path).unwrap_or_default();
-                    for (color_space, role) in wants {
+            match kind {
+                ImageKind::Texture | ImageKind::NormalTexture => {
+                    let role = match kind {
+                        ImageKind::NormalTexture => TextureRole::Normal,
+                        _ => TextureRole::Color,
+                    };
+                    for (color_space, role) in self.take_texture_wants(&path, role) {
                         self.apply_texture(
                             renderer,
                             log,
                             path.clone(),
                             color_space,
                             role,
-                            data.as_ref().map_err(Clone::clone),
+                            result.as_ref().map_err(Clone::clone),
                         )?;
                     }
                 }
-                (ImageKind::Hdr, result) => {
+                ImageKind::Hdr => {
                     let image = result.map(|image| match image {
                         DecodedImage::Hdr(image) => image,
-                        DecodedImage::Texture(_) => unreachable!("запрос HDR вернул текстуру"),
+                        _ => unreachable!("запрос HDR вернул текстуру"),
                     });
                     self.apply_hdr(renderer, log, path, image)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Забирает ожидающие роли пути, которые читает вид декодирования `role`. Роли другого вида
+    /// остаются в очереди: их результат придёт отдельно.
+    fn take_texture_wants(
+        &mut self,
+        path: &str,
+        role: TextureRole,
+    ) -> Vec<(TextureColorSpace, TextureRole)> {
+        let Some(wants) = self.texture_wants.remove(path) else {
+            return Vec::new();
+        };
+        let (taken, kept): (HashSet<_>, HashSet<_>) = wants
+            .into_iter()
+            .partition(|(_, want_role)| *want_role == role);
+        if !kept.is_empty() {
+            self.texture_wants.insert(path.to_owned(), kept);
+        }
+        taken.into_iter().collect()
     }
 
     /// Декодер изображений работает с ресурсами открытого проекта; смена проекта
@@ -1132,7 +1148,7 @@ impl SceneRenderer {
         {
             return Ok(());
         }
-        if self.images.request(ImageKind::Texture, path) {
+        if self.images.request(image_kind(role), path) {
             self.texture_wants
                 .entry(path.to_owned())
                 .or_default()
@@ -3058,15 +3074,45 @@ fn changed_texture_keys<'a>(
         .collect()
 }
 
-/// Пути для перезагрузки без повторов: путь с несколькими ролями читается из файла один раз.
-fn texture_reload_paths(keys: &[EditorTextureKey]) -> Vec<String> {
-    let mut paths = keys
-        .iter()
-        .map(|(path, _, _)| path.clone())
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    paths
+/// Вид декодирования для роли текстуры: normal map строит mip-цепочку в фоновом потоке.
+fn image_kind(role: TextureRole) -> ImageKind {
+    match role {
+        TextureRole::Color => ImageKind::Texture,
+        TextureRole::Normal => ImageKind::NormalTexture,
+    }
+}
+
+/// GPU-текстура из декодированного изображения: normal map загружается из готовой цепочки.
+fn create_editor_texture(
+    renderer: &mut Renderer,
+    image: &DecodedImage,
+    color_space: TextureColorSpace,
+    role: TextureRole,
+) -> Result<TextureId, RenderError> {
+    match image {
+        DecodedImage::Texture(data) => renderer.create_texture_with_role(
+            data.width,
+            data.height,
+            &data.rgba,
+            color_space,
+            role,
+        ),
+        DecodedImage::NormalTexture(chain) => renderer.create_texture_from_mip_chain(chain),
+        DecodedImage::Hdr(_) => unreachable!("HDR не создаётся как текстура материала"),
+    }
+}
+
+/// Запросы перечитывания без повторов: путь читается по разу на каждый вид декодирования, поэтому
+/// путь, который используется и как Color, и как Normal, получает оба запроса.
+fn texture_reload_requests(keys: &[EditorTextureKey]) -> Vec<(ImageKind, String)> {
+    let mut requests = Vec::new();
+    for (path, _, role) in keys {
+        let request = (image_kind(*role), path.clone());
+        if !requests.contains(&request) {
+            requests.push(request);
+        }
+    }
+    requests
 }
 
 fn key_matches_changes(changes: &AssetChanges, key: &str) -> bool {
@@ -3110,7 +3156,11 @@ fn same_virtual_path(left: &str, right: &str) -> bool {
     )
 }
 
-fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, RenderError> {
+fn upload_model(
+    renderer: &mut Renderer,
+    model: &Model,
+    normal_chains: &HashMap<usize, NormalMipChain>,
+) -> Result<GpuModel, RenderError> {
     let mut textures_by_role = HashMap::new();
     let mut textures = Vec::new();
     let mut meshes = Vec::with_capacity(model.meshes.len());
@@ -3136,6 +3186,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 metallic_roughness_texture: model_texture(
                     renderer,
@@ -3145,6 +3196,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 normal_texture: model_texture(
                     renderer,
@@ -3154,6 +3206,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     TextureRole::Normal,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 emissive_texture: model_texture(
                     renderer,
@@ -3163,6 +3216,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 occlusion_texture: model_texture(
                     renderer,
@@ -3172,6 +3226,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 normal_scale: base.normal_scale,
                 occlusion_strength: base.occlusion_strength,
@@ -3238,6 +3293,7 @@ fn skin_vertices(skin: &engine_assets::ModelSkin) -> Vec<SkinVertex> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn model_texture(
     renderer: &mut Renderer,
     model: &Model,
@@ -3246,6 +3302,7 @@ fn model_texture(
     role: TextureRole,
     cache: &mut HashMap<(usize, TextureColorSpace, TextureRole), TextureId>,
     owned: &mut Vec<TextureId>,
+    normal_chains: &HashMap<usize, NormalMipChain>,
 ) -> Result<Option<TextureId>, RenderError> {
     let Some(index) = index else {
         return Ok(None);
@@ -3256,13 +3313,19 @@ fn model_texture(
     let data = model.textures.get(index).ok_or_else(|| {
         RenderError::InvalidMaterial(format!("Model texture index {index} is out of range"))
     })?;
-    let texture = renderer.create_texture_with_role(
-        data.width,
-        data.height,
-        &data.rgba,
-        color_space,
-        role,
-    )?;
+    let chain = (role == TextureRole::Normal)
+        .then(|| normal_chains.get(&index))
+        .flatten();
+    let texture = match chain {
+        Some(chain) => renderer.create_texture_from_mip_chain(chain)?,
+        None => renderer.create_texture_with_role(
+            data.width,
+            data.height,
+            &data.rgba,
+            color_space,
+            role,
+        )?,
+    };
     cache.insert((index, color_space, role), texture);
     owned.push(texture);
     Ok(Some(texture))
@@ -3983,7 +4046,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_reload_decodes_a_png_once_for_all_its_roles() {
+    fn hot_reload_decodes_a_png_once_per_kind_so_both_roles_get_results() {
         let keys = [
             (
                 "/textures/a.png".to_owned(),
@@ -4002,8 +4065,13 @@ mod tests {
             ),
         ];
         assert_eq!(
-            texture_reload_paths(&keys),
-            vec!["/textures/a.png".to_owned(), "/textures/b.png".to_owned()]
+            texture_reload_requests(&keys),
+            vec![
+                (ImageKind::Texture, "/textures/a.png".to_owned()),
+                (ImageKind::NormalTexture, "/textures/a.png".to_owned()),
+                (ImageKind::Texture, "/textures/b.png".to_owned()),
+            ],
+            "путь в обеих ролях перечитывается по одному разу на каждый вид"
         );
     }
 
