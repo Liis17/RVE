@@ -204,6 +204,8 @@ pub struct EditorState {
     pub mcp_generation: u64,
     /// Незавершённый `capture_view`: ответ отправляется, когда кадр отдал PNG или задача снята.
     pub(crate) mcp_capture: Option<crate::mcp::capture::CaptureJob>,
+    /// Кодировщик PNG для `capture_view`; поток `rve-mcp-png` создаётся при первом задании.
+    pub(crate) png_encoder: crate::mcp::capture::PngEncoder,
     pub project: Option<OpenProject>,
     /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
     pub project_prefabs: Option<ProjectPrefabs>,
@@ -334,6 +336,7 @@ impl EditorState {
             ui_editor_rect: None,
             mcp_generation: 0,
             mcp_capture: None,
+            png_encoder: crate::mcp::capture::PngEncoder::new(),
             project: None,
             project_prefabs: None,
             tags_layers: None,
