@@ -32,7 +32,8 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
 - Память должна соответствовать текущему коду. Если изменение затрагивает описанный контракт, поток, зависимость, ограничение или решение, обнови заметку в той же задаче.
 - Найденное расхождение между заметкой и кодом исправляй, даже если оно не связано с задачей.
 - Для нового значимого компонента найди подходящую заметку или создай новую и добавь её в `Index.md`. Внутренние вспомогательные функции, косметические правки и рефакторинг без изменения поведения не документируй.
-- Контракты описывай по смыслу. Не копируй код и полные списки методов и полей. Указывай реальные пути и важные символы.
+- Контракты описывай по смыслу. Не копируй код и полные списки методов и полей. Указывай реальные пути и важные символы. Для локальных технических деталей предпочитай комментарий возле кода.
+- Описание контракта или основание решения храни в одной заметке, из остальных ссылайся на неё. При общих архитектурных изменениях обновляй `Architecture.md`; изменившееся решение исправляй на месте, а не добавляй противоречащий раздел.
 - Причины решений записывай только подтверждённые: документацией, комментарием или словами пользователя. Неизвестную причину не выдумывай.
 - Удалённое и неверное убирай из описаний. Changelog, дневники задач и датированные записи не веди: история хранится в git.
 - Файлы заметок и папки доменов называй по-английски; текст может быть на русском. При переименовании исправляй wikilinks, ссылки и пути в `AGENTS.md`.
@@ -47,15 +48,15 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
 
 ### Ветки и коммиты
 
-Основная защищённая ветка — `mommy`. PR в неё создаёт и сливает пользователь. Агент работает в отдельной ветке от актуальной `origin/son-croissant`, например `feat/scene-loader`. В начале работы выполни `git fetch origin`, проверь текущую ветку и `git merge-base --is-ancestor origin/son-croissant HEAD`. Если база другая или открыта сама базовая ветка, создай рабочую ветку от `origin/son-croissant`. Если мешают локальные изменения, сохрани их на месте, сообщи об этом и продолжи в текущей ветке. Сообщи имя проверенной ветки. Коммиты напрямую в базовые ветки запрещены.
+Основная защищённая ветка — `mommy`. PR в неё создаёт и сливает пользователь. Агент работает в отдельной ветке от актуальной `origin/son-croissant`, например `feat/scene-loader`. В начале работы выполни `git fetch origin`, проверь текущую ветку и `git merge-base --is-ancestor origin/son-croissant HEAD`. Если база другая или открыта сама базовая ветка, создай рабочую ветку от `origin/son-croissant`. Если мешают локальные изменения, не удаляй и не прячь их в stash: оставь на месте, сообщи об этом и продолжи в текущей ветке. Сообщи имя проверенной ветки. Коммиты напрямую в базовые ветки запрещены. Не создавай рабочие ветки от `mommy` и не обновляй их из `mommy`.
 
-После каждого завершённого этапа большой задачи делай отдельный логический коммит. Перед ним проверь diff и обязательные проверки. Пиши краткие английские сообщения до 200 символов целиком, без обязательного scope. Для названий PR используй тот же стиль. Подписи AI и Co-Authored-By добавляй только по запросу. Не перезаписывай чужие изменения. Для git reset --hard, git clean -fd или force push требуется явное разрешение.
+После каждого завершённого этапа большой задачи делай отдельный логический коммит. Перед ним проверь diff и обязательные проверки. Пиши краткие английские сообщения до 200 символов целиком, без обязательного scope. Если сообщение не помещается, сократи его, а самостоятельные изменения раздели на отдельные коммиты. Для названий PR используй тот же стиль. Подписи AI и Co-Authored-By добавляй только по запросу. Не перезаписывай чужие изменения. Для git reset --hard, git clean -fd или force push требуется явное разрешение.
 
 ### Интеграция и PR
 
 После коммита выполни `git fetch origin` и `git merge origin/son-croissant` без rebase и force push. При пересечении изменений адаптируй результат и повтори обязательные проверки. Если обе ветки изменили один компонент, повысь его версию.
 
-Если задача изменила репозиторий, отправь ветку в origin и открой один PR в son-croissant либо обнови существующий PR этой задачи. Просьба только подготовить изменения исключает push и создание PR. Проверь полный diff относительно целевой ветки, включая совместимость, актуальность памяти и отсутствие посторонних файлов или секретов.
+Если задача изменила репозиторий, отправь ветку в origin и открой один PR в son-croissant либо обнови существующий PR этой задачи. Один PR решает одну логически связанную задачу: не объединяй несвязанные исправления, рефакторинг и новые функции. Просьба только подготовить изменения исключает push и создание PR. Проверь полный diff относительно целевой ветки, включая совместимость, актуальность памяти и отсутствие посторонних файлов или секретов.
 
 Описание PR:
 
@@ -66,132 +67,81 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
 - Compatibility & Risks — затронутые крейты и платформы Windows/macOS, изменения публичного API, WindowHandler, настроек renderer, CLI или конфигурации; ограничения и необходимые действия для запуска.
 - Visual Changes — для изменений изображения или поведения окна приложи доступные скриншоты, для существенного изменения движения — короткую видеодемонстрацию, если возможно.
 
-После push проверь базу PR, дождись результата Rust CI и проверь комментарии к последней версии. Исправляй ошибки отдельными коммитами и повторяй проверки. Для замечаний автоматического ревью проверь исходники и поясняй ложные срабатывания. Не обходи проверки. Слияние PR выполняет пользователь.
+После push проверь базу PR, дождись результата Rust CI и проверь комментарии к последней версии. Исправляй ошибки отдельными коммитами и повторяй проверки. Для замечаний автоматического ревью проверь исходники и поясняй ложные срабатывания. Не обходи проверки и не утверждай, что CI прошёл, пока это не подтверждено GitHub. Слияние PR выполняет пользователь.
 <!-- git-rules:end -->
 
 <!-- verification:start -->
 ## Проверка изменений
 
+### Команды
+
+Артефакты Cargo хранятся только в `build/` в корне репозитория (`target-dir` в `.cargo/config.toml`), каталог исключён из Git. Сборку, проверки и запуск движка выполняй с рабочим каталогом `build/`; Cargo найдёт workspace в родительской папке. При первом запуске создай `build/` из корня репозитория. Если задана переменная окружения `RVE_BUILD_CACHE` (общий кеш сторонних крейтов на том же томе, что и worktree), выполни `bash tools/build-cache.sh` из корня перед первой сборкой и ещё раз после успешных обязательных проверок: скрипт подставляет в `build/` готовые артефакты жёсткими ссылками и дополняет кеш новыми. Без переменной скрипт ничего не делает.
+
+| Действие | Команда |
+|----------|---------|
+| Подготовка | `mkdir build`, `bash tools/build-cache.sh`, `cd build` |
+| Форматирование | `cargo fmt --all --check` |
+| Линтер | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| Сборка | `cargo build --workspace --locked` |
+| Все тесты | `cargo test --workspace --locked` (unit-, integration- и doc-тесты) |
+| Один тест | `cargo test -p <крейт> <имя_теста>` |
+| Выбор крейтов в CI | `python3 -B -m unittest discover -s .github/scripts -v` из корня |
+| Sandbox | `cargo run -p sandbox`, `cargo run -p sandbox -- --frames 120`, `cargo run -p sandbox -- --frames 120 --render-scale 0.5`, `cargo run -p sandbox -- --frames 300 --resize-test` |
+| Редактор | `cargo run -p rve-editor -- --project ../examples/demo-game` |
+| Сервер | `cargo run -p rve-server -- --project ../examples/demo-game` |
+
+`rve-server` требует `[network].enabled = true` в `project.rveproject`; в `examples/demo-game` этой секции сейчас нет, поэтому команда завершится кодом 2, пока её не добавить. CLI sandbox описан в `Obsidian/RVEVault/Engine/Sandbox.md`, требования Vulkan — в `Obsidian/RVEVault/Engine/EngineRender.md`.
+
+### Затронутые компоненты
+
 Перед завершением задачи определяй компоненты, которые могут зависеть от изменений.
 
-- В engine-core, engine-window и engine-render проверяй публичный API и его использование в engine/sandbox.
-- Изменения engine-window, engine-render, engine-platform, engine-scene, engine-audio,
-  engine-script, engine-resources, engine-project, engine-physics, engine-input, engine-network и engine-animation проверяй также на
-  потребителях engine-runtime/rve-player и rve-build, если они используют
-  изменённый крейт. Прямые workspace-зависимости:
-  - engine-runtime: engine-core, engine-animation, engine-assets, engine-files, engine-audio,
-    engine-neural, engine-network, engine-input, engine-gui, engine-physics, engine-platform,
-    engine-project, engine-render, engine-resources, engine-scene,
-    engine-script, engine-window, engine-console, engine-ui.
-  - rve-build: engine-render, engine-assets, engine-files, engine-pak, engine-project,
-    engine-resources, engine-scene, engine-script, engine-gui, rve-sdk.
+- В engine-core, engine-window и engine-render проверяй публичный API и его использование в engine/sandbox. Sandbox также использует engine-assets, engine-files, engine-platform, engine-project, engine-resources и engine-scene.
+- Изменения engine-window, engine-render, engine-platform, engine-scene, engine-audio, engine-script, engine-resources, engine-project, engine-physics, engine-input, engine-network, engine-animation и engine-neural проверяй также на потребителях engine-runtime/rve-player и rve-build, если они используют изменённый крейт. Прямые workspace-зависимости:
+  - engine-runtime: engine-core, engine-animation, engine-assets, engine-files, engine-audio, engine-neural, engine-network, engine-input, engine-gui, engine-physics, engine-platform, engine-project, engine-render, engine-resources, engine-scene, engine-script, engine-window, engine-console, engine-ui.
+  - rve-build: engine-render, engine-assets, engine-files, engine-pak, engine-project, engine-resources, engine-scene, engine-script, engine-gui, rve-sdk.
   - engine-script (потребители engine-runtime, rve-editor и rve-build): engine-console, engine-files, engine-platform, engine-project, engine-gui, engine-physics, engine-scene, rve-sdk.
   - engine-gui (потребители engine-script, engine-ui, engine-runtime, rve-editor и rve-build): engine-files, epaint, serde, toml, skrifa.
   - engine-ui (потребители engine-runtime и rve-editor): engine-gui, engine-render, engine-core, engine-console; egui-мост включается feature `egui`.
   - engine-audio (потребители engine-runtime и rve-editor): engine-resources, engine-scene, cpal, lewton, flume, rtrb, log.
   - engine-animation (потребители engine-runtime и rve-editor): engine-assets, engine-files, engine-scene, glam.
-  - engine-network (потребители engine-runtime и rve-editor): engine-scene, blake3, chacha20poly1305, ed25519-dalek,
-    x25519-dalek, getrandom, zeroize, engine-files, flume, glam, log. От скриптов, runtime, renderer и окна не зависит.
+  - engine-network (потребители engine-runtime и rve-editor): engine-scene, blake3, chacha20poly1305, ed25519-dalek, x25519-dalek, getrandom, zeroize, engine-files, flume, glam, log. От скриптов, runtime, renderer и окна не зависит.
   - engine-input (потребители engine-runtime и rve-editor): gilrs, log, rve-sdk.
   - engine-mcp (потребитель rve-editor): tiny_http, base64, getrandom, flume, serde_json.
+  - engine-pak (потребители engine-resources, rve-build и утилита rvepak): engine-files.
   - rve-player: engine-runtime.
   - rve-server: engine-runtime (headless-путь без окна и renderer).
-  - rve-editor: engine-core, engine-platform, engine-animation, engine-assets, engine-files, engine-gui, engine-input, engine-network, engine-physics, engine-project, engine-render,
-    engine-audio, engine-resources, engine-scene, engine-script, engine-window,
-    engine-console, engine-ui, engine-mcp.
+  - rve-editor: engine-core, engine-platform, engine-animation, engine-assets, engine-files, engine-gui, engine-input, engine-network, engine-physics, engine-project, engine-render, engine-audio, engine-resources, engine-scene, engine-script, engine-window, engine-console, engine-ui, engine-mcp.
 - При изменении engine-platform проверяй общий интерфейс, адаптеры engine-platform-windows и engine-platform-macos и вызовы из renderer.
 - Контракты: учитывай WindowHandler, WindowConfig, RendererConfig, FrameStatus, ошибки библиотек, CLI sandbox и коды завершения. При их изменении проверяй производителей и потребителей.
 - Платформы: учитывай Windows с Vulkan-драйвером и macOS с Vulkan loader и MoltenVK. Меняй только затронутые платформы и явно указывай непроверенные.
-- Не ломай существующие публичные контракты без явной необходимости. При добавлении создания или подключения ресурса проверяй освобождение, отключение и восстановление после ошибки.
+- Совместимость: не ломай существующие публичные контракты без явной необходимости. При добавлении создания или подключения ресурса проверяй освобождение, отключение и восстановление после ошибки.
 
-Архитектурные границы:
-
-- Сохраняй разделение: engine-core — время, engine-window — окно и события winit, engine-render — общая отрисовка, engine-platform-* — интеграция с ОС, sandbox — сборка приложения и CLI.
-- Разбор CLI проверяет аргументы и передаёт настройки компонентам; не помещай в него реализацию рендеринга или платформенной интеграции.
-- engine-render принимает окно через raw-window-handle и не зависит от winit. Платформенные адаптеры не зависят от renderer; выбор адаптера остаётся в target-specific зависимостях engine-platform.
-- Перед созданием общей абстракции проверь существующие API engine-core и engine-platform; не переноси туда логику одного потребителя ради предполагаемого повторного использования.
-- При изменении владения ресурсами проверяй порядок уничтожения Vulkan-объектов и окна, resize, нулевой размер и выход при ошибке.
-
-Быстрые команды:
-
-Артефакты Cargo хранятся только в build/ в корне репозитория (настроено в
-.cargo/config.toml). Каталог исключён из Git. Сборку, проверки и запуск движка
-выполняй с рабочим каталогом build/; Cargo найдёт workspace в родительской папке.
-При первом запуске создай build/ из корня репозитория, затем перейди в него.
-Если задана переменная окружения RVE_BUILD_CACHE (общий кеш сторонних крейтов на
-том же томе, что и worktree), выполни bash tools/build-cache.sh из корня перед
-первой сборкой и ещё раз после успешных обязательных проверок: скрипт подставляет
-в build/ готовые артефакты жёсткими ссылками и дополняет кеш новыми. Без
-переменной скрипт ничего не делает.
-
-mkdir build
-bash tools/build-cache.sh
-cd build
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
-cargo test --workspace
-cargo run -p sandbox
-cargo run -p sandbox -- --frames 120
-cargo run -p sandbox -- --frames 120 --render-scale 0.5
-cargo run -p sandbox -- --frames 300 --resize-test
-cargo run -p rve-editor -- --project ../examples/demo-game
-cargo run -p rve-server -- --project ../examples/demo-game
-
-`rve-server` требует `[network].enabled = true` в `project.rveproject`; в `examples/demo-game` этой секции сейчас нет, поэтому команда завершится кодом 2, пока её не добавить.
-
-Для CLI sandbox смотри Obsidian/RVEVault/Engine/Sandbox.md, для требований Vulkan — Obsidian/RVEVault/Engine/EngineRender.md; для контрактов — соответствующие заметки в Obsidian/RVEVault/.
-
-Начальные параметры окна читаются из bootstrap.rves в текущем рабочем каталоге,
-при обычном запуске sandbox — build/bootstrap.rves. Формат: один параметр
-Имя=Значение на строку: WindowSizeX, WindowSizeY, WindowTitle,
-AllowMultipleInstances (true/false) и необязательный AppIcon (virtual path в
-Assets), PresentMode (Fifo, Mailbox или Immediate), Reflex (Off, On или Boost). Sandbox читает файл из cwd; rve-player использует Engine/bootstrap.rves
-рядом с exe (на macOS — в Contents/Resources .app) в release layout или файл в каталоге проекта при --project.
-При первой подготовке файл можно создать копированием bootstrap.rves.example в
-build/bootstrap.rves; существующий файл настроек не перезаписывай. Отсутствующий
-файл или параметр сохраняет соответствующее значение по умолчанию (размер окна —
-1280×720); некорректные настройки дают код выхода 2. Подробности:
-Obsidian/RVEVault/Engine/EngineProject.md.
-
-Тесты и CI:
+### Тесты
 
 - Каждая новая фича или изменение поведения должны сопровождаться автоматическими тестами в том же коммите: основной сценарий, существенные граничные случаи и ошибки. Для исправления бага добавляй регрессионный тест, воспроизводящий проблему до исправления.
 - Это правило действует для всех крейтов workspace. Для крейтов-скелетов тесты появляются вместе с первой реализацией; пустые тесты без проверяемого поведения не добавляй.
 - Проверяй наблюдаемое поведение и публичные контракты. Тесты должны быть воспроизводимыми: без реального GPU, Vulkan loader, окна, сети и ожиданий через sleep. Графический runtime проверяй отдельно командами sandbox.
-- Для изменений только в Obsidian и правилах агентов сверяй утверждения с исходниками и манифестами, проверяй пути, ссылки, заголовки и diff. Сборка и тесты движка для таких правок не требуются.
-- Для остальных изменений перед коммитом запускай cargo fmt --all --check, cargo clippy --workspace --all-targets --locked -- -D warnings, cargo build --workspace --locked и cargo test --workspace --locked. Последняя команда включает unit-, integration- и doc-тесты.
-- .github/workflows/ci.yml запускается на pull request в son-croissant и mommy, на push в mommy и вручную (push в feature-ветки без PR не запускает CI). Проверка на Windows и macOS изменённые крейты и все транзитивно зависящие от них крейты через -p. Граф берётся из Cargo metadata. Общие настройки, lockfile, CI, неизвестные пути, ручной запуск и push без доступной базы запускают полную проверку. Изменения только документации вне крейтов пропускают проверки Rust; точные правила описаны в Obsidian/RVEVault/Architecture.md.
-- Логику выбора крейтов проверяй командой python3 -B -m unittest discover -s .github/scripts -v из корня; CI запускает эти тесты на Ubuntu перед выбором крейтов.
 - Во время работы проверяй изменённый компонент, затронутые тесты и зависимые контракты; обязательные проверки перед коммитом выполняй полностью.
+- Обязательные проверки перед коммитом: форматирование, линтер, сборка и все тесты из таблицы команд, с `--locked`.
+- Для изменений только в Obsidian и правилах агентов сверяй утверждения с исходниками и манифестами, проверяй пути, ссылки, заголовки и diff. Сборка и тесты движка для таких правок не требуются.
+- `.github/workflows/ci.yml` запускается на pull request в son-croissant и mommy, на push в mommy и вручную (push в feature-ветки без PR не запускает CI). Проверка на Windows и macOS изменённые крейты и все транзитивно зависящие от них крейты через `-p`. Граф берётся из Cargo metadata. Общие настройки, lockfile, CI, неизвестные пути, ручной запуск и push без доступной базы запускают полную проверку. Изменения только документации вне крейтов пропускают проверки Rust; точные правила описаны в `Obsidian/RVEVault/Architecture.md`. CI запускает тесты выбора крейтов на Ubuntu перед выбором крейтов.
 - Не добавляй тесты, лишь повторяющие реализацию или очевидную передачу параметров. Для событийного кода проверяй наблюдаемое событие или состояние вместо произвольных задержек.
 - Не сообщай об успешных проверках, которые не запускались. Если проверка недоступна, укажи конкретную причину; cross-check без линковки не заменяет сборку и runtime на целевой ОС.
 
-Безопасность окружения:
+### Безопасность окружения
 
 - Не удаляй пользовательские данные и не выполняй разрушающие команды окружения без разрешения.
-- Не останавливай процессы по шаблону имени через pkill -f или аналогичные команды. Останавливай только процессы, принадлежность которых текущей задаче подтверждена.
+- Не останавливай процессы по шаблону имени через `pkill -f` или аналогичные команды. Останавливай только процессы, принадлежность которых текущей задаче подтверждена.
 - Не изменяй секреты, токены, реальные конфигурации и переменные окружения без необходимости и разрешения.
 - Для тестов используй отдельное окружение и изолированные данные.
 - Не коммить временные файлы агента, диагностические дампы, логи и исследовательские заметки.
 
-Производительность:
+### Завершение задачи
 
-- При изменении цикла кадра, обработки событий, resize или синхронизации Vulkan оцени влияние на задержки, память, CPU и GPU.
-- Избегай ненужных аллокаций, повторного создания ресурсов и перерисовок; не добавляй блокирующее ожидание в обработчики событий без обоснования.
-- Не оптимизируй без доказанной причины: сначала установи проблему, затем устраняй её.
-
-Завершение задачи:
-
-Перед завершением проверь выполнение требований, отсутствие лишних изменений, зависимые контракты и платформы, обратную совместимость и результаты доступных проверок.
+Перед завершением проверь выполнение требований, отсутствие лишних изменений, зависимые контракты и платформы, обратную совместимость, актуальность памяти проекта и результаты доступных проверок.
 
 В финальном ответе кратко укажи, что изменено, что проверено и с каким результатом, какие проверки недоступны и какие ограничения или риски остались.
-
-Версии компонентов:
-
-- Версия движка (engine-*), редактора (rve-editor) и собственных библиотек (например, rve-sdk) задаётся полем version в их Cargo.toml по SemVer. Если крейт наследует version.workspace = true, сначала задай ему собственную версию.
-- Каждый такой крейт публикует константу VERSION = env!("CARGO_PKG_VERSION"), чтобы версия была доступна из кода.
-- При изменении публичного API, поведения, формата или ABI крейта повышай его версию в этой же задаче. Версию меняй только у изменённых компонентов.
 <!-- verification:end -->
 
 <!-- context7:start -->
@@ -205,6 +155,32 @@ Obsidian/RVEVault/Engine/EngineProject.md.
 
 В T3 Code в начале каждой рабочей задачи используй навык `orchestration`, если он доступен в текущей среде. Если навыка нет, работай по остальным правилам этого файла.
 <!-- orchestration:end -->
+
+## Дополнительные правила проекта
+
+### Архитектурные границы
+
+- Сохраняй разделение: engine-core — время, engine-window — окно и события winit, engine-render — общая отрисовка, engine-platform-* — интеграция с ОС, sandbox — сборка приложения и CLI.
+- Разбор CLI проверяет аргументы и передаёт настройки компонентам; не помещай в него реализацию рендеринга или платформенной интеграции.
+- engine-render принимает окно через raw-window-handle и не зависит от winit. Платформенные адаптеры не зависят от renderer; выбор адаптера остаётся в target-specific зависимостях engine-platform.
+- Перед созданием общей абстракции проверь существующие API engine-core и engine-platform; не переноси туда логику одного потребителя ради предполагаемого повторного использования.
+- При изменении владения ресурсами проверяй порядок уничтожения Vulkan-объектов и окна, resize, нулевой размер и выход при ошибке.
+
+### Производительность
+
+- При изменении цикла кадра, обработки событий, resize или синхронизации Vulkan оцени влияние на задержки, память, CPU и GPU.
+- Избегай ненужных аллокаций, повторного создания ресурсов и перерисовок; не добавляй блокирующее ожидание в обработчики событий без обоснования.
+- Не оптимизируй без доказанной причины: сначала установи проблему, затем устраняй её.
+
+### Версии компонентов
+
+- Версия движка (engine-*), редактора (rve-editor) и собственных библиотек (например, rve-sdk) задаётся полем version в их Cargo.toml по SemVer. Если крейт наследует `version.workspace = true`, сначала задай ему собственную версию.
+- Каждый такой крейт публикует константу `VERSION = env!("CARGO_PKG_VERSION")`, чтобы версия была доступна из кода.
+- При изменении публичного API, поведения, формата или ABI крейта повышай его версию в этой же задаче. Версию меняй только у изменённых компонентов.
+
+### Начальные настройки окна
+
+Начальные параметры окна читаются из `bootstrap.rves` в текущем рабочем каталоге, при обычном запуске sandbox — `build/bootstrap.rves`. Формат: один параметр `Имя=Значение` на строку: `WindowSizeX`, `WindowSizeY`, `WindowTitle`, `AllowMultipleInstances` (true/false) и необязательные `AppIcon` (virtual path в Assets), `PresentMode` (Fifo, Mailbox или Immediate), `Reflex` (Off, On или Boost). Sandbox читает файл из cwd; rve-player использует `Engine/bootstrap.rves` рядом с exe (на macOS — в `Contents/Resources` .app) в release layout или файл в каталоге проекта при `--project`. При первой подготовке файл можно создать копированием `bootstrap.rves.example` в `build/bootstrap.rves`; существующий файл настроек не перезаписывай. Отсутствующий файл или параметр сохраняет значение по умолчанию (размер окна — 1280×720); некорректные настройки дают код выхода 2. Подробности: `Obsidian/RVEVault/Engine/EngineProject.md`.
 
 <!-- behavior:start -->
 ## Поведенческие правила
