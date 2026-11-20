@@ -15,6 +15,7 @@ class SDKReleaseSelectionTests(unittest.TestCase):
             package("render", ["core"]),
             package("rve-editor", ["render"], directory="editor"),
             package("rve-player", ["core"]),
+            package("rve-crash-monitor", directory="engine/rve-crash-monitor"),
             package("rve-build", directory="tools/rve-build"),
             package("rve-sdk"),
             package("sandbox", ["render"]),
@@ -30,6 +31,7 @@ class SDKReleaseSelectionTests(unittest.TestCase):
             "editor/src/app.rs", "editor/templates/new_project/Assets/models/cube.fbx",
             "engine/core/src/lib.rs", "engine/render/Cargo.toml",
             "engine/rve-player/src/main.rs", "engine/rve-sdk/src/lib.rs",
+            "engine/rve-crash-monitor/src/server.rs",
             "tools/rve-build/src/sdk.rs",
         ]:
             with self.subTest(path=path):
@@ -70,7 +72,7 @@ class SDKArchiveTests(unittest.TestCase):
         self.sdk = self.root / "sdk"
         self.archive = self.root / "sdk-verified.zip"
         for relative in [
-            "rve-editor.exe", "rve-build.exe", "rve-player.exe", "rve-player-dev.exe",
+            "rve-editor.exe", "rve-build.exe", "rve-player.exe", "rve-player-dev.exe", "rve-crash-monitor.exe",
             "rve-sdk.toml", "rve-sdk/Cargo.toml", "rve-sdk/src/lib.rs",
             "toolchain/bin/cargo.exe", "toolchain/bin/rustc.exe",
             "toolchain/lib/rustlib/x86_64-pc-windows-gnu/bin/rust-lld.exe",

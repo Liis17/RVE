@@ -108,6 +108,15 @@ fn validate_sdk_manifest(manifest: &SdkManifest) -> Result<(), BuildError> {
 }
 
 /// Имя исполняемого файла варианта player или сервера рядом с rve-build и в release-раскладке.
+/// Имя монитора падений рядом с игроком и сервером в SDK и в release.
+pub(crate) fn crash_monitor_filename() -> &'static str {
+    if cfg!(windows) {
+        "rve-crash-monitor.exe"
+    } else {
+        "rve-crash-monitor"
+    }
+}
+
 pub(crate) fn player_filename(flavor: player::PlayerFlavor) -> &'static str {
     match (cfg!(windows), flavor) {
         (true, player::PlayerFlavor::Distribution) => "rve-player.exe",
@@ -169,6 +178,7 @@ pub(crate) fn build_sdk(
     let rve_server = player::build_sdk_binary("rve-server", true, false)?;
     let rve_editor = player::build_sdk_binary("rve-editor", false, false)?;
     let rve_build = player::build_sdk_binary("rve-build", false, false)?;
+    let rve_crash_monitor = player::build_sdk_binary(player::CRASH_MONITOR_PACKAGE, false, false)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -226,6 +236,7 @@ pub(crate) fn build_sdk(
             rve_player: &rve_player,
             rve_player_dev: &rve_player_dev,
             rve_server: &rve_server,
+            rve_crash_monitor: &rve_crash_monitor,
             rve_sdk: &root.join("engine/rve-sdk"),
             engine_version: env!("CARGO_PKG_VERSION"),
             abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
@@ -262,6 +273,7 @@ struct SdkSources<'a> {
     rve_player: &'a Path,
     rve_player_dev: &'a Path,
     rve_server: &'a Path,
+    rve_crash_monitor: &'a Path,
     rve_sdk: &'a Path,
     engine_version: &'a str,
     abi_version: u32,
@@ -287,6 +299,10 @@ fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), B
     player::copy_file(
         sources.rve_server,
         &staging.join(player_filename(player::PlayerFlavor::Server)),
+    )?;
+    player::copy_file(
+        sources.rve_crash_monitor,
+        &staging.join(crash_monitor_filename()),
     )?;
 
     let sdk_directory = staging.join("rve-sdk");
@@ -407,7 +423,8 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
 mod tests {
     use super::{
         PlayerLocation, SdkManifest, SdkSources, assemble_sdk_layout, checkout_player_for_sdk,
-        current_target, locate_player_in, locate_player_in_with_dlss, player_filename,
+        crash_monitor_filename, current_target, locate_player_in, locate_player_in_with_dlss,
+        player_filename,
     };
     use crate::error::BuildError;
     use crate::player::PlayerFlavor;
@@ -697,6 +714,7 @@ mod tests {
         fs::write(source.join("rve-player"), b"player binary").unwrap();
         fs::write(source.join("rve-player-dev"), b"dev player binary").unwrap();
         fs::write(source.join("rve-server"), b"server binary").unwrap();
+        fs::write(source.join(crash_monitor_filename()), b"monitor binary").unwrap();
         fs::write(
             sdk_source.join("Cargo.toml"),
             b"[package]\nname = \"rve-sdk\"\n",
@@ -742,6 +760,7 @@ mod tests {
         let rve_player = source.join("rve-player");
         let rve_player_dev = source.join("rve-player-dev");
         let rve_server = source.join("rve-server");
+        let rve_crash_monitor = source.join(crash_monitor_filename());
         let target = current_target();
         assemble_sdk_layout(
             &staging,
@@ -752,6 +771,7 @@ mod tests {
                 rve_player: &rve_player,
                 rve_player_dev: &rve_player_dev,
                 rve_server: &rve_server,
+                rve_crash_monitor: &rve_crash_monitor,
                 rve_sdk: &sdk_source,
                 engine_version: "0.1.0-test",
                 abi_version: 42,
@@ -776,6 +796,10 @@ mod tests {
         assert_eq!(
             fs::read(staging.join(server_name())).unwrap(),
             b"server binary"
+        );
+        assert_eq!(
+            fs::read(staging.join(crash_monitor_filename())).unwrap(),
+            b"monitor binary"
         );
         assert_eq!(
             fs::read(staging.join("rve-sdk/Cargo.toml")).unwrap(),
