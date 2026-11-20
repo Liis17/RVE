@@ -4,7 +4,9 @@
 //! Мост не владеет GPU-ресурсами и не читает файлы сам: модели и клипы приходят через
 //! замыкания, поэтому тот же код работает в runtime и в редакторе.
 
-use crate::animator::{Animator, Motion, MotionEvent, MotionSource, PlayOptions, TreePoint};
+use crate::animator::{
+    Animator, Motion, MotionEvent, MotionSource, PlayOptions, SampleBuffers, TreePoint,
+};
 use crate::clip::Clip;
 use crate::pose::Pose;
 use crate::skeleton::Skeleton;
@@ -55,6 +57,8 @@ pub struct AnimationBridge {
     unbuilt: HashMap<ObjectHandle, String>,
     /// Уже переданные предупреждения: повтор одного и того же сообщения не попадает в журнал.
     reported: HashSet<String>,
+    /// Рабочие позы для сэмплинга. Один набор на все объекты: они обрабатываются по очереди.
+    buffers: SampleBuffers,
 }
 
 impl AnimationBridge {
@@ -218,7 +222,9 @@ impl AnimationBridge {
                 let MotionEvent::Finished { motion } = event;
                 events.push(AnimationEvent::Finished { object, motion });
             }
-            state.animator.sample(&state.skeleton, &mut state.scratch);
+            state
+                .animator
+                .sample_into(&state.skeleton, &mut self.buffers, &mut state.scratch);
             state
                 .scratch
                 .skin_matrices(&state.skeleton, &mut state.palette);
@@ -377,7 +383,9 @@ impl AnimationBridge {
             skeleton,
             palette: Vec::new(),
         };
-        state.animator.sample(&state.skeleton, &mut state.scratch);
+        state
+            .animator
+            .sample_into(&state.skeleton, &mut self.buffers, &mut state.scratch);
         state
             .scratch
             .skin_matrices(&state.skeleton, &mut state.palette);
