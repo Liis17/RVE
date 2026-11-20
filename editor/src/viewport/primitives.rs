@@ -17,6 +17,7 @@ fn vertex(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Vertex {
         normal,
         uv,
         color: [1.0; 3],
+        tangent: [0.0; 4],
     }
 }
 

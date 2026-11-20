@@ -1035,6 +1035,7 @@ fn gpu_vertices(mesh: &engine_assets::ModelMesh) -> Vec<Vertex> {
             normal: vertex.normal,
             uv: vertex.uv,
             color: [1.0; 3],
+            tangent: [0.0; 4],
         })
         .collect()
 }

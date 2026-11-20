@@ -149,6 +149,12 @@ impl Renderer {
                 .binding(1)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(std::mem::offset_of!(Vertex, position) as u32),
+            // Tangent — location 16, 17-й входной атрибут: нужен maxVertexInputAttributes ≥ 17.
+            vk::VertexInputAttributeDescription::default()
+                .location(16)
+                .binding(0)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, tangent) as u32),
         ]
         .into_iter()
         .chain(instance_attributes(
@@ -485,6 +491,12 @@ impl Renderer {
                 .binding(1)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(std::mem::offset_of!(Vertex, position) as u32),
+            // Tangent — location 16, 17-й входной атрибут: нужен maxVertexInputAttributes ≥ 17.
+            vk::VertexInputAttributeDescription::default()
+                .location(16)
+                .binding(0)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, tangent) as u32),
         ]
         .into_iter()
         .chain(instance_attributes(

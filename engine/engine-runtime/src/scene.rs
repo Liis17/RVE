@@ -1842,6 +1842,7 @@ pub(crate) fn upload_scene(
                         normal: vertex.normal,
                         uv: vertex.uv,
                         color: [1.0; 3],
+                        tangent: [0.0; 4],
                     })
                     .collect::<Vec<_>>();
                 let mesh_id = match &mesh.skin {

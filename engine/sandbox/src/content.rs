@@ -152,6 +152,7 @@ impl Content {
                         normal: vertex.normal,
                         uv: vertex.uv,
                         color: [1.0, 1.0, 1.0],
+                        tangent: [0.0; 4],
                     })
                     .collect(),
                 indices: mesh.indices,
