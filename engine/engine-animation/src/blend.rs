@@ -32,34 +32,38 @@ pub(crate) fn blend_with<'a>(
     }
     let nodes = reference.transforms.len();
     out.transforms.resize(nodes, Transform::IDENTITY);
-    for node in 0..nodes {
-        let reference_rotation = reference.transforms[node].rotation;
-        let mut translation = glam::Vec3::ZERO;
-        let mut scale = glam::Vec3::ZERO;
-        let mut rotation = glam::Vec4::ZERO;
-        for (pose, weight) in usable() {
-            let factor = weight / total;
+    // Суммы копятся прямо в `out` по входам, а не по узлам: отбор входов выполняется один раз.
+    // Для каждого узла слагаемые складываются в том же порядке, что и раньше, поэтому результат
+    // совпадает бит-в-бит. Вращение копится как Vec4 в поле `rotation`: `Quat::from_vec4` лишь
+    // переупаковывает компоненты.
+    for sum in &mut out.transforms {
+        sum.translation = glam::Vec3::ZERO;
+        sum.rotation = Quat::from_array([0.0; 4]);
+        sum.scale = glam::Vec3::ZERO;
+    }
+    for (pose, weight) in usable() {
+        let factor = weight / total;
+        for (node, sum) in out.transforms.iter_mut().enumerate() {
+            let reference_rotation = reference.transforms[node].rotation;
             let transform = pose.transforms[node];
-            translation += transform.translation * factor;
-            scale += transform.scale * factor;
+            sum.translation += transform.translation * factor;
+            sum.scale += transform.scale * factor;
             let aligned = if reference_rotation.dot(transform.rotation) < 0.0 {
                 -transform.rotation
             } else {
                 transform.rotation
             };
-            rotation += glam::Vec4::from(aligned) * factor;
+            let rotation = glam::Vec4::from(sum.rotation) + glam::Vec4::from(aligned) * factor;
+            sum.rotation = Quat::from_vec4(rotation);
         }
-        let rotation = Quat::from_vec4(rotation);
-        let rotation = if rotation.length_squared() > 1e-12 {
-            rotation.normalize()
+    }
+    for (node, sum) in out.transforms.iter_mut().enumerate() {
+        let reference_rotation = reference.transforms[node].rotation;
+        if sum.rotation.length_squared() > 1e-12 {
+            sum.rotation = sum.rotation.normalize();
         } else {
-            reference_rotation
-        };
-        out.transforms[node] = Transform {
-            translation,
-            rotation,
-            scale,
-        };
+            sum.rotation = reference_rotation;
+        }
     }
 }
 
