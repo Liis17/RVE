@@ -61,6 +61,8 @@ impl Lcg {
 pub struct StressPhysics {
     driver: StepDriver,
     cubes: Vec<BodyHandle>,
+    /// Матрицы кубов текущего кадра; пересчитываются один раз после каждого шага.
+    current: Vec<Mat4>,
     /// Матрицы кубов последней презентации; до первой презентации предыдущий кадр равен текущему.
     presented: Option<Vec<Mat4>>,
     stats: StepStats,
@@ -112,14 +114,17 @@ impl StressPhysics {
         }
         let driver =
             StepDriver::new(world, FIXED_HZ, MAX_SUBSTEPS).map_err(|error| error.to_string())?;
-        Ok(Self {
+        let mut physics = Self {
             driver,
             cubes,
+            current: Vec::new(),
             presented: None,
             stats: StepStats::default(),
             truncated_refreshes: 0,
             truncation_reported: false,
-        })
+        };
+        physics.current = physics.transforms();
+        Ok(physics)
     }
 
     /// Текущие матрицы кубов (поза и размер коллайдера); без трансформации сцены.
@@ -142,15 +147,14 @@ impl StressPhysics {
     }
 
     /// Матрицы текущего кадра и предыдущей презентации.
-    pub fn frame_transforms(&self) -> (Vec<Mat4>, Vec<Mat4>) {
-        let current = self.transforms();
-        let previous = self.presented.clone().unwrap_or_else(|| current.clone());
-        (current, previous)
+    pub fn frame_transforms(&self) -> (&[Mat4], &[Mat4]) {
+        let previous = self.presented.as_deref().unwrap_or(&self.current);
+        (&self.current, previous)
     }
 
     /// Фиксирует позы показанного кадра и продвигает мир на один шаг для следующего кадра.
     pub fn advance_after_presentation(&mut self) -> Result<Duration, String> {
-        self.presented = Some(self.transforms());
+        self.presented = Some(std::mem::take(&mut self.current));
         let started = Instant::now();
         let result = self
             .driver
@@ -159,6 +163,7 @@ impl StressPhysics {
         let step = started.elapsed();
         self.stats.record(step);
         self.truncated_refreshes += result.broadphase_truncated;
+        self.current = self.transforms();
         Ok(step)
     }
 
@@ -207,6 +212,11 @@ mod tests {
         model.w_axis.y
     }
 
+    /// Копия кадра: шаг меняет мир, поэтому заимствование из `frame_transforms` нельзя держать.
+    fn owned((current, previous): (&[Mat4], &[Mat4])) -> (Vec<Mat4>, Vec<Mat4>) {
+        (current.to_vec(), previous.to_vec())
+    }
+
     #[test]
     fn stress_world_has_one_dynamic_cube_per_grid_copy() {
         let physics = StressPhysics::new(&Scene::Stress.copies()).unwrap();
@@ -247,7 +257,7 @@ mod tests {
     #[test]
     fn presented_skipped_presented_takes_two_steps_and_previous_is_last_presented() {
         let mut physics = StressPhysics::new(&block_copies()).unwrap();
-        let (first_current, first_previous) = physics.frame_transforms();
+        let (first_current, first_previous) = owned(physics.frame_transforms());
         assert_eq!(
             first_current, first_previous,
             "до презентации предыдущий кадр равен текущему"
@@ -255,16 +265,35 @@ mod tests {
         physics.advance_after_presentation().unwrap();
 
         // Пропущенный кадр не презентован: шага нет, предыдущей остаётся первая презентация.
-        let (skipped_current, skipped_previous) = physics.frame_transforms();
+        let (skipped_current, skipped_previous) = owned(physics.frame_transforms());
         assert_eq!(physics.stats().steps, 1);
         assert_eq!(skipped_previous, first_current);
 
         // Следующий показанный кадр видит ту же позу, что пропущенный, и предыдущую презентацию.
-        let (current, previous) = physics.frame_transforms();
+        let (current, previous) = owned(physics.frame_transforms());
         assert_eq!(current, skipped_current);
         assert_eq!(previous, first_current);
         assert_ne!(current, previous, "после шага кубы сдвинулись");
         physics.advance_after_presentation().unwrap();
         assert_eq!(physics.stats().steps, 2);
+    }
+
+    #[test]
+    fn current_frame_matches_the_poses_after_each_step() {
+        let mut physics = StressPhysics::new(&block_copies()).unwrap();
+        for _ in 0..3 {
+            physics.advance_after_presentation().unwrap();
+            let (current, _) = physics.frame_transforms();
+            assert_eq!(current, physics.transforms().as_slice());
+        }
+    }
+
+    #[test]
+    fn truncation_warning_is_taken_once_after_a_truncated_refresh() {
+        let mut physics = StressPhysics::new(&block_copies()).unwrap();
+        assert!(!physics.take_truncation_warning());
+        physics.truncated_refreshes = 1;
+        assert!(physics.take_truncation_warning());
+        assert!(!physics.take_truncation_warning());
     }
 }

@@ -1018,7 +1018,7 @@ impl WindowHandler for Sandbox {
                 let (current, previous) = stress.frame_transforms();
                 current
                     .iter()
-                    .zip(&previous)
+                    .zip(previous)
                     .map(|(current, previous)| {
                         (
                             (*current * model).to_cols_array_2d(),
@@ -1165,27 +1165,29 @@ impl WindowHandler for Sandbox {
                 profile: frame_profile,
             });
         }
-        match status {
-            Ok(FrameStatus::Presented) => {
-                // Физика шагает после каждой презентации, включая последнюю, и ждёт следующей.
-                if let Some(stress) = self.stress.as_mut() {
-                    match stress.advance_after_presentation() {
-                        Ok(step) => {
-                            if stress.take_truncation_warning() {
-                                eprintln!(
-                                    "предупреждение: broadphase физики остановился на пределе сравнений; новые контакты появляются с задержкой"
-                                );
-                            }
-                            if let Some(benchmark) = self.benchmark.as_mut() {
-                                benchmark.observe_physics_step(step);
-                            }
-                        }
-                        Err(error) => {
-                            self.failure = Some(format!("ошибка физики: {error}"));
-                            return false;
-                        }
+        // Физика шагает после каждой презентации, включая последнюю, и ждёт следующей.
+        if physics_advances(&status)
+            && let Some(stress) = self.stress.as_mut()
+        {
+            match stress.advance_after_presentation() {
+                Ok(step) => {
+                    if stress.take_truncation_warning() {
+                        eprintln!(
+                            "предупреждение: broadphase физики остановился на пределе сравнений; новые контакты появляются с задержкой"
+                        );
+                    }
+                    if let Some(benchmark) = self.benchmark.as_mut() {
+                        benchmark.observe_physics_step(step);
                     }
                 }
+                Err(error) => {
+                    self.failure = Some(format!("ошибка физики: {error}"));
+                    return false;
+                }
+            }
+        }
+        match status {
+            Ok(FrameStatus::Presented) => {
                 self.previous_skipped = false;
                 self.previous_elapsed = Some(elapsed);
                 self.presented_frames += 1;
@@ -1442,14 +1444,20 @@ fn main_after_vulkan_environment() -> ExitCode {
     ExitCode::from(exit_code)
 }
 
+/// Мир `stress` шагает только после презентации кадра: пропущенный кадр и сбой рендера шага не делают.
+fn physics_advances<E>(status: &Result<FrameStatus, E>) -> bool {
+    matches!(status, Ok(FrameStatus::Presented))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CameraSettings, Content, EnvironmentMode, Options, ProfileSummary, RESIZE_SIZE,
-        RESTORE_SIZE, Sandbox, Scene, StepStats, parse_args, with_executable_directory,
+        RESTORE_SIZE, Sandbox, Scene, StepStats, parse_args, physics_advances,
+        with_executable_directory,
     };
     use engine_assets::Assets;
-    use engine_render::{DrawStats, FrameProfile};
+    use engine_render::{DrawStats, FrameProfile, FrameStatus};
     use engine_resources::{ResourceConfig, ResourceSystem};
     use std::time::Duration;
 
@@ -1685,6 +1693,13 @@ mod tests {
         sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
         assert!(!sandbox.resize_test.initial_resized);
         assert!(!sandbox.resize_test.restore_size);
+    }
+
+    #[test]
+    fn physics_steps_only_after_a_presented_frame() {
+        assert!(physics_advances::<()>(&Ok(FrameStatus::Presented)));
+        assert!(!physics_advances::<()>(&Ok(FrameStatus::Skipped)));
+        assert!(!physics_advances::<()>(&Err(())));
     }
 
     #[test]
