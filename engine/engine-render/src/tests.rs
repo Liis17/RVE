@@ -49,8 +49,9 @@ use super::{
     batch_draws, instance_attributes, instance_binding, pack_instances,
 };
 use super::{
-    MipUploadPlan, TextureRole, color_mip_subresource_range, mip_chain_layout, mip_upload_plan,
-    normal_mip_chain, upload_flush_required, validate_texture_role,
+    MipUploadPlan, NormalMipChain, TextureRole, color_mip_subresource_range, mip_chain_layout,
+    mip_upload_plan, normal_mip_chain, upload_flush_required, validate_texture_extent,
+    validate_texture_role,
 };
 use ash::vk;
 use std::time::{Duration, Instant};
@@ -1560,6 +1561,86 @@ fn normal_mip_chain_reports_impossible_allocation_as_invalid_texture() {
     // аллокации, поэтому тест детерминирован и не расходует память.
     let result = normal_mip_chain(1 << 31, 1 << 30, &[]);
     assert!(matches!(result, Err(RenderError::InvalidTexture(_))));
+}
+
+#[test]
+fn normal_mip_chain_build_rejects_bad_dimensions_and_lengths() {
+    assert!(matches!(
+        NormalMipChain::build(0, 4, &[]),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(matches!(
+        NormalMipChain::build(2, 2, &[0; 15]),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(matches!(
+        NormalMipChain::build(2, 2, &[0; 17]),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(NormalMipChain::build(2, 2, &[0; 16]).is_ok());
+}
+
+#[test]
+fn normal_mip_chain_build_matches_chain_function_and_layout() {
+    let rgba: Vec<u8> = (0..3 * 3 * 4).map(|byte| (byte * 7 % 251) as u8).collect();
+    let chain = NormalMipChain::build(3, 3, &rgba).unwrap();
+    assert_eq!(
+        (chain.width(), chain.height(), chain.mip_levels()),
+        (3, 3, 2)
+    );
+    assert_eq!(chain.data(), normal_mip_chain(3, 3, &rgba).unwrap());
+    let layout = mip_chain_layout(3, 3, 2);
+    let (_, last_offset, last_extent) = layout[1];
+    assert_eq!(
+        chain.data().len(),
+        last_offset + last_extent.width as usize * last_extent.height as usize * 4
+    );
+}
+
+#[test]
+fn normal_mip_chain_is_send_and_sync_with_compact_debug() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<NormalMipChain>();
+    let chain = NormalMipChain::build(64, 64, &[128; 64 * 64 * 4]).unwrap();
+    let debug = format!("{chain:?}");
+    assert!(debug.contains("mip_levels: 7"), "{debug}");
+    assert!(
+        debug.len() < 200,
+        "Debug не должен печатать пиксели: {debug}"
+    );
+}
+
+#[test]
+fn normal_mip_chain_upload_copies_end_exactly_at_chain_length() {
+    // Загрузка готовой цепочки выбирает Copies: последний регион заканчивается на границе данных.
+    let chain = NormalMipChain::build(5, 3, &[128; 5 * 3 * 4]).unwrap();
+    let MipUploadPlan::Copies(copies) = mip_upload_plan(
+        TextureRole::Normal,
+        0,
+        chain.width(),
+        chain.height(),
+        chain.mip_levels(),
+    ) else {
+        panic!("normal map должна копироваться по уровням");
+    };
+    let end = copies
+        .iter()
+        .map(|(_, offset, extent)| offset + extent.width as usize * extent.height as usize * 4)
+        .max();
+    assert_eq!(end, Some(chain.data().len()));
+}
+
+#[test]
+fn texture_extent_rejects_zero_and_sizes_above_gpu_limit() {
+    assert!(matches!(
+        validate_texture_extent(0, 1, 4096),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(matches!(
+        validate_texture_extent(4097, 1, 4096),
+        Err(RenderError::InvalidTexture(_))
+    ));
+    assert!(validate_texture_extent(4096, 4096, 4096).is_ok());
 }
 
 #[test]

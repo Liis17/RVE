@@ -58,6 +58,57 @@ pub enum TextureRole {
     Normal,
 }
 
+/// Готовая RGBA8 mip-цепочка normal map. Строится без `Renderer` (например, в фоновом потоке
+/// загрузки) и отправляется в GPU через `Renderer::create_texture_from_mip_chain`.
+pub struct NormalMipChain {
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+    data: Vec<u8>,
+}
+
+impl NormalMipChain {
+    /// Строит цепочку из RGBA8 уровня 0 (строки сверху вниз, кодирование `v * 0.5 + 0.5`).
+    /// Размеры и длина `rgba` проверяются как у текстур; предела GPU здесь нет, он проверяется
+    /// при загрузке.
+    pub fn build(width: u32, height: u32, rgba: &[u8]) -> Result<Self, RenderError> {
+        validate_texture(width, height, rgba.len(), u32::MAX)?;
+        Ok(Self {
+            width,
+            height,
+            mip_levels: mip_level_count(width, height),
+            data: normal_mip_chain(width, height, rgba)?,
+        })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn mip_levels(&self) -> u32 {
+        self.mip_levels
+    }
+
+    /// Плотные RGBA8-уровни от уровня 0 до последнего, раскладка — `mip_chain_layout`.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl std::fmt::Debug for NormalMipChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NormalMipChain")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("mip_levels", &self.mip_levels)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Обработка альфа-канала материала.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum AlphaMode {

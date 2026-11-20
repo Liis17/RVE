@@ -266,6 +266,23 @@ pub(crate) fn validate_texture(
     byte_count: usize,
     max_size: u32,
 ) -> Result<(), RenderError> {
+    validate_texture_extent(width, height, max_size)?;
+    let expected = texture_staging_size(width, height);
+    if expected != Some(byte_count) {
+        return Err(RenderError::InvalidTexture(format!(
+            "для RGBA8 {width}x{height} нужно {} байт, передано {byte_count}",
+            expected.map_or_else(|| "больше usize::MAX".to_owned(), |bytes| bytes.to_string())
+        )));
+    }
+    Ok(())
+}
+
+/// Размеры текстуры: ненулевые и не больше предела GPU.
+pub(crate) fn validate_texture_extent(
+    width: u32,
+    height: u32,
+    max_size: u32,
+) -> Result<(), RenderError> {
     if width == 0 || height == 0 {
         return Err(RenderError::InvalidTexture(
             "размеры должны быть больше нуля".to_owned(),
@@ -274,13 +291,6 @@ pub(crate) fn validate_texture(
     if width > max_size || height > max_size {
         return Err(RenderError::InvalidTexture(format!(
             "{width}x{height} больше предела GPU {max_size}x{max_size}"
-        )));
-    }
-    let expected = texture_staging_size(width, height);
-    if expected != Some(byte_count) {
-        return Err(RenderError::InvalidTexture(format!(
-            "для RGBA8 {width}x{height} нужно {} байт, передано {byte_count}",
-            expected.map_or_else(|| "больше usize::MAX".to_owned(), |bytes| bytes.to_string())
         )));
     }
     Ok(())

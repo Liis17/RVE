@@ -203,6 +203,19 @@ impl Renderer {
         Ok(TextureId(self.textures.len() - 1))
     }
 
+    /// Загружает normal map из готовой [`NormalMipChain`] (линейная, роль `Normal`). На render
+    /// thread остаётся только копирование уровней в upload batch; цепочка строится заранее.
+    /// Ошибка отправки batch — как у `create_texture`.
+    pub fn create_texture_from_mip_chain(
+        &mut self,
+        chain: &NormalMipChain,
+    ) -> Result<TextureId, RenderError> {
+        validate_texture_extent(chain.width(), chain.height(), self.max_texture_size)?;
+        let texture = Arc::new(self.upload_mip_chain(chain)?);
+        self.textures.push(Some(texture));
+        Ok(TextureId(self.textures.len() - 1))
+    }
+
     /// Uploads an equirectangular Radiance image or procedural sky and precomputes its IBL maps.
     pub fn create_environment(
         &mut self,

@@ -15,6 +15,7 @@ impl Renderer {
     }
 
     /// Для `Normal` mip-цепочка строится на CPU и копируется по уровням; для `Color` — blit на GPU.
+    /// `Normal` всегда линейный: проверяется вызывающим кодом.
     pub(crate) fn upload_texture_with_role(
         &mut self,
         width: u32,
@@ -23,21 +24,44 @@ impl Renderer {
         color_space: TextureColorSpace,
         role: TextureRole,
     ) -> Result<Texture, RenderError> {
-        let mip_levels = mip_level_count(width, height);
-        let format = texture_format(color_space);
-        let chain;
-        let data = match role {
-            TextureRole::Color => rgba,
-            TextureRole::Normal => {
-                chain = normal_mip_chain(width, height, rgba)?;
-                chain.as_slice()
+        match role {
+            TextureRole::Color => {
+                let (image, upload_serial) = self.upload_image(
+                    texture_format(color_space),
+                    mip_level_count(width, height),
+                    width,
+                    height,
+                    rgba,
+                    role,
+                )?;
+                Ok(Texture {
+                    image,
+                    color_space,
+                    upload_serial,
+                })
             }
-        };
-        let (image, upload_serial) =
-            self.upload_image(format, mip_levels, width, height, data, role)?;
+            TextureRole::Normal => {
+                self.upload_mip_chain(&NormalMipChain::build(width, height, rgba)?)
+            }
+        }
+    }
+
+    /// Загружает готовую mip-цепочку normal map: уровни копируются из staging, GPU их не строит.
+    pub(crate) fn upload_mip_chain(
+        &mut self,
+        chain: &NormalMipChain,
+    ) -> Result<Texture, RenderError> {
+        let (image, upload_serial) = self.upload_image(
+            texture_format(TextureColorSpace::Linear),
+            chain.mip_levels(),
+            chain.width(),
+            chain.height(),
+            chain.data(),
+            TextureRole::Normal,
+        )?;
         Ok(Texture {
             image,
-            color_space,
+            color_space: TextureColorSpace::Linear,
             upload_serial,
         })
     }
