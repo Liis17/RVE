@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.31.1"
+version = "0.32.1"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.37.1"
+version = "0.38.1"
 dependencies = [
  "blake3",
  "egui",

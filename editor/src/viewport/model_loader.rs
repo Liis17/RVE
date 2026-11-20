@@ -3,6 +3,7 @@
 
 use engine_assets::{Assets, Model};
 use engine_files::VirtualPath;
+use engine_render::NormalMipChain;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,31 @@ pub struct LoadedModel {
     pub model: Model,
     pub dependencies: Vec<VirtualPath>,
     pub dependency_warning: Option<String>,
+    /// Mip-цепочки текстур модели, на которые ссылаются `normal_texture` материалов; ключ —
+    /// индекс в `model.textures`. Передаются в GPU-загрузку модели и не кэшируются.
+    pub normal_chains: HashMap<usize, NormalMipChain>,
+}
+
+/// Строит mip-цепочки для индексов `normal_texture` материалов модели. Ошибка построения —
+/// ошибка загрузки модели, как и ошибка разбора.
+fn build_normal_chains(model: &Model) -> Result<HashMap<usize, NormalMipChain>, String> {
+    let mut chains = HashMap::new();
+    for index in model
+        .meshes
+        .iter()
+        .filter_map(|mesh| mesh.material.normal_texture)
+    {
+        if chains.contains_key(&index) {
+            continue;
+        }
+        let Some(texture) = model.textures.get(index) else {
+            continue;
+        };
+        let chain = NormalMipChain::build(texture.width, texture.height, &texture.rgba)
+            .map_err(|error| format!("normal map (текстура {index}): {error}"))?;
+        chains.insert(index, chain);
+    }
+    Ok(chains)
 }
 
 /// Очередь загрузки моделей. Поколение растёт только при смене проекта.
@@ -74,6 +100,8 @@ impl ModelLoader {
             if cancel.load(Ordering::Relaxed) {
                 return Err(format!("{path}: загрузка отменена"));
             }
+            let normal_chains =
+                build_normal_chains(&model).map_err(|error| format!("{path}: {error}"))?;
             let (dependencies, dependency_warning) = match assets
                 .model_dependencies(path)
                 .map_err(|error| error.to_string())
@@ -91,6 +119,7 @@ impl ModelLoader {
                 model,
                 dependencies,
                 dependency_warning,
+                normal_chains,
             })
         }));
     }
@@ -232,7 +261,56 @@ mod tests {
                 .map(|path| VirtualPath::parse(path).unwrap())
                 .collect(),
             dependency_warning: None,
+            normal_chains: HashMap::new(),
         }
+    }
+
+    fn model_with_normal_texture(
+        normal: usize,
+        base: usize,
+        textures: Vec<engine_assets::TextureData>,
+    ) -> Model {
+        let mesh = engine_assets::ModelMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            skin: None,
+            material: engine_assets::ModelMaterial {
+                base_color_texture: Some(base),
+                normal_texture: Some(normal),
+                ..engine_assets::ModelMaterial::default()
+            },
+        };
+        Model {
+            meshes: vec![mesh],
+            textures,
+            skeleton: None,
+            animations: Vec::new(),
+        }
+    }
+
+    fn rgba_texture(width: u32, height: u32) -> engine_assets::TextureData {
+        engine_assets::TextureData {
+            width,
+            height,
+            rgba: vec![128; width as usize * height as usize * 4],
+        }
+    }
+
+    #[test]
+    fn model_chains_cover_only_normal_texture_indices() {
+        let model = model_with_normal_texture(1, 0, vec![rgba_texture(2, 2), rgba_texture(2, 2)]);
+        let chains = build_normal_chains(&model).unwrap();
+        assert_eq!(chains.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(chains[&1].mip_levels(), 2);
+    }
+
+    #[test]
+    fn broken_normal_texture_fails_the_model_load() {
+        let mut broken = rgba_texture(2, 2);
+        broken.rgba.truncate(3);
+        let model = model_with_normal_texture(0, 1, vec![broken, rgba_texture(2, 2)]);
+        let error = build_normal_chains(&model).unwrap_err();
+        assert!(error.contains("normal map"), "{error}");
     }
 
     #[test]

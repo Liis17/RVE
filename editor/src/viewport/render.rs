@@ -17,12 +17,12 @@ use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, LocalLight,
-    LocalLightShadow, LocalLightShadowMatrices, Material, MaterialId, MeshId, ParticleBlend,
-    ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleEmitterFrame,
-    ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey, PostProcess,
-    ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, ShaderId, SkinBinding, SkinId,
-    SkinVertex, SurfaceLighting, SurfaceShaderSource, TextureColorSpace, TextureId,
-    Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
+    LocalLightShadow, LocalLightShadowMatrices, Material, MaterialId, MeshId, NormalMipChain,
+    ParticleBlend, ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc,
+    ParticleEmitterFrame, ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey,
+    PostProcess, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, ShaderId,
+    SkinBinding, SkinId, SkinVertex, SurfaceLighting, SurfaceShaderSource, TextureColorSpace,
+    TextureId, TextureRole, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_render::{
     ColorLutId, SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage,
@@ -63,11 +63,14 @@ struct GpuModel {
     skeleton: Option<ModelSkeleton>,
 }
 
+/// Ключ GPU-текстуры редактора: путь, цветовое пространство и роль.
+type EditorTextureKey = (String, TextureColorSpace, TextureRole);
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AssetMaterialKey {
     material_revision: u64,
     shader_generation: u64,
-    texture_revisions: Vec<(String, TextureColorSpace, u64)>,
+    texture_revisions: Vec<(String, TextureColorSpace, TextureRole, u64)>,
 }
 
 struct GpuAssetMaterial {
@@ -135,8 +138,8 @@ pub struct SceneRenderer {
     /// Поколение каждой модели на момент последней загрузки или ошибки; мост превью
     /// пересобирается только при смене поколения модели аниматора.
     model_versions: HashMap<String, u64>,
-    textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
-    texture_revisions: HashMap<(String, TextureColorSpace), u64>,
+    textures: HashMap<EditorTextureKey, Option<TextureId>>,
+    texture_revisions: HashMap<EditorTextureKey, u64>,
     next_texture_revision: u64,
     asset_materials: HashMap<String, GpuAssetMaterial>,
     surface_shaders: HashMap<String, GpuSurfaceShader>,
@@ -156,7 +159,7 @@ pub struct SceneRenderer {
     images: ImageLoader,
     images_root: Option<std::path::PathBuf>,
     /// Цветовые пространства, в которых ждут декодирования PNG по пути.
-    texture_wants: HashMap<String, HashSet<TextureColorSpace>>,
+    texture_wants: HashMap<String, HashSet<(TextureColorSpace, TextureRole)>>,
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
     failed_environment: Option<EditorEnvironmentKey>,
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
@@ -524,8 +527,9 @@ impl SceneRenderer {
                             format!("{path}: не удалось прочитать зависимости модели: {warning}"),
                         );
                     }
+                    let normal_chains = loaded.normal_chains;
                     let model = Arc::new(loaded.model);
-                    let gpu = match upload_model(renderer, &model) {
+                    let gpu = match upload_model(renderer, &model, &normal_chains) {
                         Ok(gpu) => gpu,
                         Err(error) if is_resource_error(&error) => {
                             self.models.insert(path.clone(), previous);
@@ -579,6 +583,7 @@ impl SceneRenderer {
                     log,
                     path.as_str(),
                     TextureColorSpace::Srgb,
+                    TextureRole::Color,
                 )?;
             }
         }
@@ -611,7 +616,9 @@ impl SceneRenderer {
                 };
                 if !self.models.contains_key(model_path) {
                     match cpu_models.get(model_path).cloned() {
-                        Some(model) => match upload_model(renderer, &model) {
+                        // Цепочки normal map освобождены после первой загрузки: путь без них
+                        // строит их при создании текстуры.
+                        Some(model) => match upload_model(renderer, &model, &HashMap::new()) {
                             Ok(gpu) => {
                                 self.models.insert(model_path.to_owned(), Some(gpu));
                                 self.failed_reloads.remove(model_path);
@@ -634,32 +641,42 @@ impl SceneRenderer {
             }
             for level in 0..levels {
                 if let Some(path) = lod_texture_path(mesh, object.lod_group.as_ref(), level) {
-                    self.sync_texture(renderer, project, log, path, TextureColorSpace::Srgb)?;
+                    self.sync_texture(
+                        renderer,
+                        project,
+                        log,
+                        path,
+                        TextureColorSpace::Srgb,
+                        TextureRole::Color,
+                    )?;
                 }
             }
             if let Some(override_material) = &mesh.material {
-                for (path, color_space) in [
+                for (path, color_space, role) in [
                     override_material
                         .metallic_roughness_texture
                         .as_ref()
-                        .map(|path| (path.as_str(), TextureColorSpace::Linear)),
-                    override_material
-                        .normal_texture
-                        .as_ref()
-                        .map(|path| (path.as_str(), TextureColorSpace::Linear)),
+                        .map(|path| (path.as_str(), TextureColorSpace::Linear, TextureRole::Color)),
+                    override_material.normal_texture.as_ref().map(|path| {
+                        (
+                            path.as_str(),
+                            TextureColorSpace::Linear,
+                            TextureRole::Normal,
+                        )
+                    }),
                     override_material
                         .emissive_texture
                         .as_ref()
-                        .map(|path| (path.as_str(), TextureColorSpace::Srgb)),
+                        .map(|path| (path.as_str(), TextureColorSpace::Srgb, TextureRole::Color)),
                     override_material
                         .occlusion_texture
                         .as_ref()
-                        .map(|path| (path.as_str(), TextureColorSpace::Linear)),
+                        .map(|path| (path.as_str(), TextureColorSpace::Linear, TextureRole::Color)),
                 ]
                 .into_iter()
                 .flatten()
                 {
-                    self.sync_texture(renderer, project, log, path, color_space)?;
+                    self.sync_texture(renderer, project, log, path, color_space, role)?;
                 }
             }
         }
@@ -791,18 +808,17 @@ impl SceneRenderer {
         log: &mut ConsoleLog,
         screen_errors: &mut HashMap<String, String>,
     ) -> Result<(), RenderError> {
-        let texture_keys = self
-            .textures
-            .keys()
-            .filter(|(path, _)| key_matches_changes(changes, path))
-            .cloned()
-            .collect::<Vec<_>>();
-        for (path, color_space) in texture_keys {
+        let texture_keys = changed_texture_keys(self.textures.keys(), changes);
+        for (path, color_space, role) in &texture_keys {
             self.texture_wants
                 .entry(path.clone())
                 .or_default()
-                .insert(color_space);
-            self.images.reload(ImageKind::Texture, &path);
+                .insert((*color_space, *role));
+        }
+        // Файл декодируется по разу на вид (цвет и normal map); результат применяется к ролям из
+        // `texture_wants` того же вида.
+        for (kind, path) in texture_reload_requests(&texture_keys) {
+            self.images.reload(kind, &path);
         }
 
         // Изменённый `.glsl` (при rescan — все кэшированные) перекомпилируется; ошибка оставляет
@@ -908,19 +924,15 @@ impl SceneRenderer {
         log: &mut ConsoleLog,
         path: String,
         color_space: TextureColorSpace,
-        result: Result<&engine_assets::TextureData, String>,
+        role: TextureRole,
+        result: Result<&DecodedImage, String>,
     ) -> Result<(), RenderError> {
-        let key = (path.clone(), color_space);
+        let key = (path.clone(), color_space, role);
         let previous = self.textures.get(&key).copied().flatten();
         let had_previous = previous.is_some();
         match result {
-            Ok(data) => {
-                let replacement = match renderer.create_texture_with_color_space(
-                    data.width,
-                    data.height,
-                    &data.rgba,
-                    color_space,
-                ) {
+            Ok(image) => {
+                let replacement = match create_editor_texture(renderer, image, color_space, role) {
                     Ok(replacement) => replacement,
                     Err(error) if is_resource_error(&error) => {
                         let (current, _, error) = cache_update(previous, Err(error.to_string()));
@@ -939,7 +951,7 @@ impl SceneRenderer {
                 };
                 let (current, old, _) = cache_update(previous, Ok(replacement));
                 self.textures.insert(key, current);
-                self.bump_texture_revision((path.clone(), color_space));
+                self.bump_texture_revision((path.clone(), color_space, role));
                 if let Some(old) = old {
                     renderer.destroy_texture(old)?;
                 }
@@ -1049,27 +1061,29 @@ impl SceneRenderer {
     ) -> Result<(), RenderError> {
         self.ensure_image_loader(project);
         for (kind, path, result) in self.images.finished() {
-            match (kind, result) {
-                (ImageKind::Texture, result) => {
-                    let data = result.map(|image| match image {
-                        DecodedImage::Texture(data) => data,
-                        DecodedImage::Hdr(_) => unreachable!("запрос текстуры вернул HDR"),
-                    });
-                    let wants = self.texture_wants.remove(&path).unwrap_or_default();
-                    for color_space in wants {
+            match kind {
+                ImageKind::Texture | ImageKind::NormalTexture => {
+                    let role = match kind {
+                        ImageKind::NormalTexture => TextureRole::Normal,
+                        _ => TextureRole::Color,
+                    };
+                    for (color_space, role) in
+                        take_wants_for_role(&mut self.texture_wants, &path, role)
+                    {
                         self.apply_texture(
                             renderer,
                             log,
                             path.clone(),
                             color_space,
-                            data.as_ref().map_err(Clone::clone),
+                            role,
+                            result.as_ref().map_err(Clone::clone),
                         )?;
                     }
                 }
-                (ImageKind::Hdr, result) => {
+                ImageKind::Hdr => {
                     let image = result.map(|image| match image {
                         DecodedImage::Hdr(image) => image,
-                        DecodedImage::Texture(_) => unreachable!("запрос HDR вернул текстуру"),
+                        _ => unreachable!("запрос HDR вернул текстуру"),
                     });
                     self.apply_hdr(renderer, log, path, image)?;
                 }
@@ -1102,8 +1116,9 @@ impl SceneRenderer {
         log: &mut ConsoleLog,
         path: &str,
         color_space: TextureColorSpace,
+        role: TextureRole,
     ) -> Result<(), RenderError> {
-        let key = (path.to_owned(), color_space);
+        let key = (path.to_owned(), color_space, role);
         if self.textures.contains_key(&key) {
             return Ok(());
         }
@@ -1112,15 +1127,15 @@ impl SceneRenderer {
             || self
                 .texture_wants
                 .get(path)
-                .is_some_and(|wants| wants.contains(&color_space))
+                .is_some_and(|wants| wants.contains(&(color_space, role)))
         {
             return Ok(());
         }
-        if self.images.request(ImageKind::Texture, path) {
+        if self.images.request(image_kind(role), path) {
             self.texture_wants
                 .entry(path.to_owned())
                 .or_default()
-                .insert(color_space);
+                .insert((color_space, role));
         } else {
             log.error(format!("{path}: фоновая загрузка недоступна"));
             self.textures.insert(key, None);
@@ -1128,7 +1143,7 @@ impl SceneRenderer {
         Ok(())
     }
 
-    fn bump_texture_revision(&mut self, key: (String, TextureColorSpace)) {
+    fn bump_texture_revision(&mut self, key: EditorTextureKey) {
         self.next_texture_revision = self.next_texture_revision.wrapping_add(1).max(1);
         self.texture_revisions
             .insert(key, self.next_texture_revision);
@@ -1350,10 +1365,18 @@ impl SceneRenderer {
                 ShaderColorSpace::Srgb => TextureColorSpace::Srgb,
                 ShaderColorSpace::Linear => TextureColorSpace::Linear,
             };
-            self.sync_texture(renderer, project, log, texture_path.as_str(), render_space)?;
+            let role = slot_texture_role(&schema, slot);
+            self.sync_texture(
+                renderer,
+                project,
+                log,
+                texture_path.as_str(),
+                render_space,
+                role,
+            )?;
             let texture_id = self
                 .textures
-                .get(&(texture_path.as_str().to_owned(), render_space))
+                .get(&(texture_path.as_str().to_owned(), render_space, role))
                 .copied()
                 .flatten();
             if schema.builtin_lit {
@@ -1367,10 +1390,15 @@ impl SceneRenderer {
             }
             let revision = self
                 .texture_revisions
-                .get(&(texture_path.as_str().to_owned(), render_space))
+                .get(&(texture_path.as_str().to_owned(), render_space, role))
                 .copied()
                 .unwrap_or(0);
-            texture_revisions.push((texture_path.as_str().to_owned(), render_space, revision));
+            texture_revisions.push((
+                texture_path.as_str().to_owned(),
+                render_space,
+                role,
+                revision,
+            ));
         }
         Ok((
             AssetMaterialKey {
@@ -2116,10 +2144,22 @@ impl SceneRenderer {
                 ShaderColorSpace::Srgb => TextureColorSpace::Srgb,
                 ShaderColorSpace::Linear => TextureColorSpace::Linear,
             };
-            self.sync_texture(renderer, project, log, texture_path.as_str(), render_space)?;
+            // Пользовательский шейдер: все текстуры слотов получают роль Color.
+            self.sync_texture(
+                renderer,
+                project,
+                log,
+                texture_path.as_str(),
+                render_space,
+                TextureRole::Color,
+            )?;
             let texture_id = self
                 .textures
-                .get(&(texture_path.as_str().to_owned(), render_space))
+                .get(&(
+                    texture_path.as_str().to_owned(),
+                    render_space,
+                    TextureRole::Color,
+                ))
                 .copied()
                 .flatten();
             if let Some(target) = material.user_textures.get_mut(slot) {
@@ -2127,10 +2167,19 @@ impl SceneRenderer {
             }
             let revision = self
                 .texture_revisions
-                .get(&(texture_path.as_str().to_owned(), render_space))
+                .get(&(
+                    texture_path.as_str().to_owned(),
+                    render_space,
+                    TextureRole::Color,
+                ))
                 .copied()
                 .unwrap_or(0);
-            texture_revisions.push((texture_path.as_str().to_owned(), render_space, revision));
+            texture_revisions.push((
+                texture_path.as_str().to_owned(),
+                render_space,
+                TextureRole::Color,
+                revision,
+            ));
         }
         let key = AssetMaterialKey {
             material_revision: 0,
@@ -2210,7 +2259,7 @@ impl SceneRenderer {
                 .map(|path| path.as_str().to_owned());
             let texture = texture_path.as_ref().and_then(|path| {
                 self.textures
-                    .get(&(path.clone(), TextureColorSpace::Srgb))
+                    .get(&(path.clone(), TextureColorSpace::Srgb, TextureRole::Color))
                     .copied()
                     .flatten()
             });
@@ -2459,7 +2508,7 @@ fn lod_texture_path<'a>(
 
 struct DrawResources<'a> {
     models: &'a HashMap<String, Option<GpuModel>>,
-    textures: &'a HashMap<(String, TextureColorSpace), Option<TextureId>>,
+    textures: &'a HashMap<EditorTextureKey, Option<TextureId>>,
     asset_materials: &'a HashMap<String, (Material, MaterialId)>,
     error_material: Option<MaterialId>,
     object_materials: &'a mut HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
@@ -2549,7 +2598,7 @@ fn append_world_draws(
             lod_texture_path(mesh, object.lod_group.as_ref(), level).and_then(|path| {
                 resources
                     .textures
-                    .get(&(path.to_owned(), TextureColorSpace::Srgb))
+                    .get(&(path.to_owned(), TextureColorSpace::Srgb, TextureRole::Color))
                     .copied()
                     .flatten()
             });
@@ -2573,7 +2622,11 @@ fn append_world_draws(
                 .and_then(|path| {
                     resources
                         .textures
-                        .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
+                        .get(&(
+                            path.as_str().to_owned(),
+                            TextureColorSpace::Linear,
+                            TextureRole::Color,
+                        ))
                         .copied()
                         .flatten()
                 });
@@ -2582,7 +2635,11 @@ fn append_world_draws(
                 .and_then(|path| {
                     resources
                         .textures
-                        .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
+                        .get(&(
+                            path.as_str().to_owned(),
+                            TextureColorSpace::Linear,
+                            TextureRole::Normal,
+                        ))
                         .copied()
                         .flatten()
                 });
@@ -2591,7 +2648,11 @@ fn append_world_draws(
                 .and_then(|path| {
                     resources
                         .textures
-                        .get(&(path.as_str().to_owned(), TextureColorSpace::Srgb))
+                        .get(&(
+                            path.as_str().to_owned(),
+                            TextureColorSpace::Srgb,
+                            TextureRole::Color,
+                        ))
                         .copied()
                         .flatten()
                 });
@@ -2600,7 +2661,11 @@ fn append_world_draws(
                 .and_then(|path| {
                     resources
                         .textures
-                        .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
+                        .get(&(
+                            path.as_str().to_owned(),
+                            TextureColorSpace::Linear,
+                            TextureRole::Color,
+                        ))
                         .copied()
                         .flatten()
                 });
@@ -2982,6 +3047,57 @@ fn load_screen_shader(
         .map_err(|error| format!("/{path}: {error}"))
 }
 
+/// Ключи GPU-текстур, путь которых совпал с изменением. Каждый ключ перечитывается с его ролью.
+fn changed_texture_keys<'a>(
+    keys: impl Iterator<Item = &'a EditorTextureKey>,
+    changes: &AssetChanges,
+) -> Vec<EditorTextureKey> {
+    keys.filter(|(path, _, _)| key_matches_changes(changes, path))
+        .cloned()
+        .collect()
+}
+
+/// Вид декодирования для роли текстуры: normal map строит mip-цепочку в фоновом потоке.
+fn image_kind(role: TextureRole) -> ImageKind {
+    match role {
+        TextureRole::Color => ImageKind::Texture,
+        TextureRole::Normal => ImageKind::NormalTexture,
+    }
+}
+
+/// GPU-текстура из декодированного изображения: normal map загружается из готовой цепочки.
+fn create_editor_texture(
+    renderer: &mut Renderer,
+    image: &DecodedImage,
+    color_space: TextureColorSpace,
+    role: TextureRole,
+) -> Result<TextureId, RenderError> {
+    match image {
+        DecodedImage::Texture(data) => renderer.create_texture_with_role(
+            data.width,
+            data.height,
+            &data.rgba,
+            color_space,
+            role,
+        ),
+        DecodedImage::NormalTexture(chain) => renderer.create_texture_from_mip_chain(chain),
+        DecodedImage::Hdr(_) => unreachable!("HDR не создаётся как текстура материала"),
+    }
+}
+
+/// Запросы перечитывания без повторов: путь читается по разу на каждый вид декодирования, поэтому
+/// путь, который используется и как Color, и как Normal, получает оба запроса.
+fn texture_reload_requests(keys: &[EditorTextureKey]) -> Vec<(ImageKind, String)> {
+    let mut requests = Vec::new();
+    for (path, _, role) in keys {
+        let request = (image_kind(*role), path.clone());
+        if !requests.contains(&request) {
+            requests.push(request);
+        }
+    }
+    requests
+}
+
 fn key_matches_changes(changes: &AssetChanges, key: &str) -> bool {
     if changes.rescan {
         return true;
@@ -3023,7 +3139,11 @@ fn same_virtual_path(left: &str, right: &str) -> bool {
     )
 }
 
-fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, RenderError> {
+fn upload_model(
+    renderer: &mut Renderer,
+    model: &Model,
+    normal_chains: &HashMap<usize, NormalMipChain>,
+) -> Result<GpuModel, RenderError> {
     let mut textures_by_role = HashMap::new();
     let mut textures = Vec::new();
     let mut meshes = Vec::with_capacity(model.meshes.len());
@@ -3046,40 +3166,50 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     model,
                     base.base_color_texture,
                     TextureColorSpace::Srgb,
+                    TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 metallic_roughness_texture: model_texture(
                     renderer,
                     model,
                     base.metallic_roughness_texture,
                     TextureColorSpace::Linear,
+                    TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 normal_texture: model_texture(
                     renderer,
                     model,
                     base.normal_texture,
                     TextureColorSpace::Linear,
+                    TextureRole::Normal,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 emissive_texture: model_texture(
                     renderer,
                     model,
                     base.emissive_texture,
                     TextureColorSpace::Srgb,
+                    TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 occlusion_texture: model_texture(
                     renderer,
                     model,
                     base.occlusion_texture,
                     TextureColorSpace::Linear,
+                    TextureRole::Color,
                     &mut textures_by_role,
                     &mut textures,
+                    normal_chains,
                 )?,
                 normal_scale: base.normal_scale,
                 occlusion_strength: base.occlusion_strength,
@@ -3147,30 +3277,40 @@ fn skin_vertices(skin: &engine_assets::ModelSkin) -> Vec<SkinVertex> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn model_texture(
     renderer: &mut Renderer,
     model: &Model,
     index: Option<usize>,
     color_space: TextureColorSpace,
-    cache: &mut HashMap<(usize, TextureColorSpace), TextureId>,
+    role: TextureRole,
+    cache: &mut HashMap<(usize, TextureColorSpace, TextureRole), TextureId>,
     owned: &mut Vec<TextureId>,
+    normal_chains: &HashMap<usize, NormalMipChain>,
 ) -> Result<Option<TextureId>, RenderError> {
     let Some(index) = index else {
         return Ok(None);
     };
-    if let Some(texture) = cache.get(&(index, color_space)) {
+    if let Some(texture) = cache.get(&(index, color_space, role)) {
         return Ok(Some(*texture));
     }
     let data = model.textures.get(index).ok_or_else(|| {
         RenderError::InvalidMaterial(format!("Model texture index {index} is out of range"))
     })?;
-    let texture = renderer.create_texture_with_color_space(
-        data.width,
-        data.height,
-        &data.rgba,
-        color_space,
-    )?;
-    cache.insert((index, color_space), texture);
+    let chain = (role == TextureRole::Normal)
+        .then(|| normal_chains.get(&index))
+        .flatten();
+    let texture = match chain {
+        Some(chain) => renderer.create_texture_from_mip_chain(chain)?,
+        None => renderer.create_texture_with_role(
+            data.width,
+            data.height,
+            &data.rgba,
+            color_space,
+            role,
+        )?,
+    };
+    cache.insert((index, color_space, role), texture);
     owned.push(texture);
     Ok(Some(texture))
 }
@@ -3270,6 +3410,21 @@ fn resolved_asset_material(resolved: &ResolvedMaterialAsset, shader: Option<Shad
         material.occlusion_strength = lit.occlusion_strength;
     }
     material
+}
+
+/// Роль текстуры слота шаблона: `Normal` только у `normal_texture` встроенного Lit.
+fn slot_texture_role(schema: &engine_scene::ShaderSchema, slot: usize) -> TextureRole {
+    let is_lit_normal = schema.builtin_lit
+        && schema.properties.iter().any(|property| {
+            property.property.kind == ShaderPropertyKind::Texture
+                && property.slot == slot
+                && property.property.name == "normal_texture"
+        });
+    if is_lit_normal {
+        TextureRole::Normal
+    } else {
+        TextureRole::Color
+    }
 }
 
 fn set_lit_texture(material: &mut Material, name: &str, texture: Option<TextureId>) {
@@ -3659,6 +3814,25 @@ fn unused_surface_shaders<T: Copy + Eq + Hash>(
         .collect()
 }
 
+/// Забирает ожидающие роли пути, которые читает вид декодирования `role`. Роли другого вида
+/// остаются в очереди: их результат придёт отдельно. Пустая запись пути удаляется.
+fn take_wants_for_role(
+    texture_wants: &mut HashMap<String, HashSet<(TextureColorSpace, TextureRole)>>,
+    path: &str,
+    role: TextureRole,
+) -> Vec<(TextureColorSpace, TextureRole)> {
+    let Some(wants) = texture_wants.remove(path) else {
+        return Vec::new();
+    };
+    let (taken, kept): (HashSet<_>, HashSet<_>) = wants
+        .into_iter()
+        .partition(|(_, want_role)| *want_role == role);
+    if !kept.is_empty() {
+        texture_wants.insert(path.to_owned(), kept);
+    }
+    taken.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3670,6 +3844,35 @@ mod tests {
     fn fake_lut(value: usize) -> ColorLutId {
         // SAFETY: ColorLutId — обёртка над одним usize; любое значение допустимо для теста.
         unsafe { std::mem::transmute(value) }
+    }
+
+    #[test]
+    fn take_wants_for_role_returns_only_that_role_and_keeps_the_other() {
+        let mut wants = HashMap::from([(
+            "tex.png".to_owned(),
+            HashSet::from([
+                (TextureColorSpace::Linear, TextureRole::Normal),
+                (TextureColorSpace::Srgb, TextureRole::Color),
+            ]),
+        )]);
+        let taken = take_wants_for_role(&mut wants, "tex.png", TextureRole::Normal);
+        assert_eq!(taken, [(TextureColorSpace::Linear, TextureRole::Normal)]);
+        assert_eq!(
+            wants["tex.png"],
+            HashSet::from([(TextureColorSpace::Srgb, TextureRole::Color)])
+        );
+    }
+
+    #[test]
+    fn take_wants_for_role_removes_the_path_once_its_last_role_is_taken() {
+        let mut wants = HashMap::from([(
+            "tex.png".to_owned(),
+            HashSet::from([(TextureColorSpace::Srgb, TextureRole::Color)]),
+        )]);
+        let taken = take_wants_for_role(&mut wants, "tex.png", TextureRole::Color);
+        assert_eq!(taken, [(TextureColorSpace::Srgb, TextureRole::Color)]);
+        assert!(!wants.contains_key("tex.png"));
+        assert!(take_wants_for_role(&mut wants, "tex.png", TextureRole::Color).is_empty());
     }
 
     #[test]
@@ -3839,6 +4042,114 @@ mod tests {
         };
         let plan = model_reload_plan(&fbx_change, &models, &dependencies, &HashSet::new(), &[]);
         assert_eq!(plan.cached, HashSet::from(["/models/a.fbx".to_owned()]));
+    }
+
+    #[test]
+    fn hot_reload_rereads_every_slot_version_of_a_png_with_its_role() {
+        // Одна PNG в metallic-roughness и normal слотах .rvemat: два ключа с разными ролями.
+        let keys = [
+            (
+                "/textures/a.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
+            (
+                "/textures/a.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Normal,
+            ),
+            (
+                "/textures/b.png".to_owned(),
+                TextureColorSpace::Srgb,
+                TextureRole::Color,
+            ),
+        ];
+        let changes = AssetChanges {
+            paths: HashSet::from([VirtualPath::parse("textures/a.png").unwrap()]),
+            ..AssetChanges::default()
+        };
+        let changed = changed_texture_keys(keys.iter(), &changes);
+        assert_eq!(changed.len(), 2);
+        assert!(changed.contains(&keys[0]));
+        assert!(
+            changed.contains(&keys[1]),
+            "normal-версия перечитывается с ролью Normal"
+        );
+        assert!(!changed.contains(&keys[2]));
+    }
+
+    #[test]
+    fn hot_reload_decodes_a_png_once_per_kind_so_both_roles_get_results() {
+        let keys = [
+            (
+                "/textures/a.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
+            (
+                "/textures/a.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Normal,
+            ),
+            (
+                "/textures/b.png".to_owned(),
+                TextureColorSpace::Srgb,
+                TextureRole::Color,
+            ),
+        ];
+        assert_eq!(
+            texture_reload_requests(&keys),
+            vec![
+                (ImageKind::Texture, "/textures/a.png".to_owned()),
+                (ImageKind::NormalTexture, "/textures/a.png".to_owned()),
+                (ImageKind::Texture, "/textures/b.png".to_owned()),
+            ],
+            "путь в обеих ролях перечитывается по одному разу на каждый вид"
+        );
+    }
+
+    fn lit_texture_slot(name: &str) -> usize {
+        engine_scene::ShaderSchema::lit()
+            .properties
+            .iter()
+            .find(|layout| layout.property.name == name)
+            .map(|layout| layout.slot)
+            .expect("встроенный Lit имеет текстурный слот с этим именем")
+    }
+
+    #[test]
+    fn slot_texture_role_is_normal_only_for_builtin_lit_normal_texture() {
+        let lit = engine_scene::ShaderSchema::lit();
+        assert_eq!(
+            slot_texture_role(&lit, lit_texture_slot("normal_texture")),
+            TextureRole::Normal
+        );
+        assert_eq!(
+            slot_texture_role(&lit, lit_texture_slot("metallic_roughness_texture")),
+            TextureRole::Color
+        );
+    }
+
+    #[test]
+    fn slot_texture_role_keeps_custom_shader_normal_slot_as_color() {
+        let custom = engine_scene::ShaderSchema {
+            lighting: engine_scene::ShaderLighting::Lit,
+            builtin_lit: false,
+            properties: vec![engine_scene::ShaderPropertyLayout {
+                property: engine_scene::ShaderProperty {
+                    name: "normal_texture".to_owned(),
+                    label: "normal_texture".to_owned(),
+                    kind: ShaderPropertyKind::Texture,
+                    default: engine_scene::ShaderPropertyDefault::Texture(None),
+                    min: None,
+                    max: None,
+                    color_space: None,
+                    fallback: None,
+                },
+                slot: 0,
+            }],
+        };
+        assert_eq!(slot_texture_role(&custom, 0), TextureRole::Color);
     }
 
     #[test]

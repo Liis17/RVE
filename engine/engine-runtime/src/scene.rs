@@ -10,11 +10,11 @@ use engine_physics::{
 };
 use engine_project::PhysicsSettings;
 use engine_render::{
-    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, ParticleBlend, ParticleBurst,
-    ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook, ParticleShape,
-    ParticleSizeKey, RenderError, Renderer, ShaderId, SkinVertex, SurfaceLighting, SurfaceProperty,
-    SurfacePropertyKind, SurfaceShaderSource, SurfaceTextureFallback, TextureColorSpace, TextureId,
-    Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, NormalMipChain, ParticleBlend,
+    ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook,
+    ParticleShape, ParticleSizeKey, RenderError, Renderer, ShaderId, SkinVertex, SurfaceLighting,
+    SurfaceProperty, SurfacePropertyKind, SurfaceShaderSource, SurfaceTextureFallback,
+    TextureColorSpace, TextureId, TextureRole, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::prefab::PREFAB_EXTENSION;
@@ -31,7 +31,7 @@ use glam::Vec3;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Ресурсы одного объекта с мешом: уровни LOD (модель и текстура) и замена материала.
 #[derive(Clone, Debug)]
@@ -69,6 +69,8 @@ pub(crate) struct PreparedRenderAssets {
     /// 3D LUT цветокоррекции камер по каноническому пути `.cube`. Как и экранные шейдеры,
     /// читаются только игровым клиентом.
     pub color_luts: BTreeMap<String, CubeLut>,
+    /// Mip-цепочки normal map, построенные при подготовке (в потоке загрузки).
+    pub normal_chains: NormalChains,
 }
 
 #[derive(Default)]
@@ -77,6 +79,107 @@ pub(crate) struct PreparedMaterialAssets {
     pub textures: HashMap<String, TextureData>,
     pub material_assets: HashMap<String, Result<MaterialAsset, String>>,
     pub shader_assets: HashMap<String, Result<ShaderAsset, String>>,
+    pub normal_chains: NormalChains,
+}
+
+/// Mip-цепочки normal map для текстур, которые могут занять слот `normal_texture` встроенного
+/// Lit. Строятся при подготовке; ключи совпадают с ключами загрузки в `upload_material_texture`
+/// и `TextureSources`: модельные — путь модели и индекс текстуры, сценовые — путь. Текстура без
+/// цепочки (например, назначенная скриптом через `set_material`) строится на render thread.
+///
+/// Цепочка выдаётся один раз ([`NormalChains::take`]): после создания GPU-текстуры она уходит из
+/// подготовленных ресурсов и не живёт всю сессию. Повторное создание (после выселения из кэша)
+/// идёт по inline-пути.
+#[derive(Default)]
+pub(crate) struct NormalChains {
+    slots: Mutex<NormalChainSlots>,
+}
+
+#[derive(Default)]
+struct NormalChainSlots {
+    models: HashMap<String, HashMap<usize, NormalMipChain>>,
+    scene: HashMap<String, NormalMipChain>,
+}
+
+impl NormalChains {
+    /// Забирает цепочку из подготовленных ресурсов; повторный запрос вернёт `None`.
+    pub(crate) fn take(
+        &self,
+        model_path: &str,
+        source: &MaterialTextureSource,
+    ) -> Option<NormalMipChain> {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        match source {
+            MaterialTextureSource::Model(index) => slots.models.get_mut(model_path)?.remove(index),
+            MaterialTextureSource::Scene(path) => slots.scene.remove(path),
+        }
+    }
+
+    /// Строит цепочки для кандидатов: индексы normal-текстур мешей моделей и пути normal-текстур
+    /// материалов сцены (переопределения и `.rvemat` без шейдера). Кандидаты — надмножество
+    /// того, что выберет загрузка: лишняя цепочка стоит памяти, пропущенная даёт только
+    /// построение на render thread. Ошибка построения пропускает текстуру: загрузка повторит
+    /// построение и вернёт её ошибку, как и раньше. `None` — подготовка прервана через `stop`.
+    pub(crate) fn build(
+        enabled: bool,
+        models: &HashMap<String, Model>,
+        textures: &HashMap<String, TextureData>,
+        scene_paths: &BTreeSet<String>,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Self> {
+        if !enabled {
+            return Some(Self::default());
+        }
+        let mut chains = NormalChainSlots::default();
+        for (model_path, model) in models {
+            let indices = model
+                .meshes
+                .iter()
+                .filter_map(|mesh| mesh.material.normal_texture)
+                .collect::<BTreeSet<_>>();
+            for index in indices {
+                if stop() {
+                    return None;
+                }
+                let Some(texture) = model.textures.get(index) else {
+                    continue;
+                };
+                if let Some(chain) = build_normal_chain(model_path, texture) {
+                    chains
+                        .models
+                        .entry(model_path.clone())
+                        .or_default()
+                        .insert(index, chain);
+                }
+            }
+        }
+        for path in scene_paths {
+            if stop() {
+                return None;
+            }
+            let Some(texture) = textures.get(path) else {
+                continue;
+            };
+            if let Some(chain) = build_normal_chain(path, texture) {
+                chains.scene.insert(path.clone(), chain);
+            }
+        }
+        Some(Self {
+            slots: Mutex::new(chains),
+        })
+    }
+}
+
+fn build_normal_chain(owner: &str, texture: &TextureData) -> Option<NormalMipChain> {
+    match NormalMipChain::build(texture.width, texture.height, &texture.rgba) {
+        Ok(chain) => Some(chain),
+        Err(error) => {
+            log::warn!(
+                "[material] {owner}: mip-цепочка normal map не построена: {error}; цепочка строится при загрузке"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +188,7 @@ pub(crate) struct MaterialAssetView<'a> {
     pub textures: &'a HashMap<String, TextureData>,
     pub material_assets: &'a HashMap<String, Result<MaterialAsset, String>>,
     pub shader_assets: &'a HashMap<String, Result<ShaderAsset, String>>,
+    normal_chains: &'a NormalChains,
     fallback: Option<&'a PreparedRenderAssets>,
 }
 
@@ -95,6 +199,7 @@ impl<'a> MaterialAssetView<'a> {
             textures: &assets.textures,
             material_assets: &assets.material_assets,
             shader_assets: &assets.shader_assets,
+            normal_chains: &assets.normal_chains,
             fallback: None,
         }
     }
@@ -108,8 +213,20 @@ impl<'a> MaterialAssetView<'a> {
             textures: &assets.textures,
             material_assets: &assets.material_assets,
             shader_assets: &assets.shader_assets,
+            normal_chains: &assets.normal_chains,
             fallback,
         }
+    }
+
+    fn normal_chain(
+        &self,
+        model_path: &str,
+        source: &MaterialTextureSource,
+    ) -> Option<NormalMipChain> {
+        self.normal_chains.take(model_path, source).or_else(|| {
+            self.fallback
+                .and_then(|assets| assets.normal_chains.take(model_path, source))
+        })
     }
 
     fn model(&self, path: &str) -> Option<&'a Model> {
@@ -200,6 +317,7 @@ pub(crate) fn load_scene(
     resources: &ResourceHandle,
     assets: &Assets,
     scene_path: &str,
+    build_normal_chains: bool,
 ) -> Result<PreparedScene, String> {
     let contents = read_utf8(resources, scene_path)?;
     let document =
@@ -221,7 +339,15 @@ pub(crate) fn load_scene(
             read_utf8(resources, &format!("/{}", path.as_str()))
         })
         .map_err(|error| error.to_string())?;
-    let mut prepared = prepare_scene(resources, assets, scene_path, world, prefabs, scene_hash)?;
+    let mut prepared = prepare_scene(
+        resources,
+        assets,
+        scene_path,
+        world,
+        prefabs,
+        scene_hash,
+        build_normal_chains,
+    )?;
     prepared.render_assets.ui_images = ui.images.clone();
     prepared.ui = ui;
     Ok(prepared)
@@ -303,6 +429,7 @@ fn prepare_scene(
     world: World,
     prefabs: PreparedPrefabs,
     scene_hash: [u8; 32],
+    build_normal_chains: bool,
 ) -> Result<PreparedScene, String> {
     prepare_scene_with_model_loader(
         resources,
@@ -311,6 +438,7 @@ fn prepare_scene(
         world,
         prefabs,
         scene_hash,
+        build_normal_chains,
         |path| assets.load_model(path).map_err(|error| error.to_string()),
     )
 }
@@ -327,6 +455,8 @@ struct RenderAssetSet {
     environments: HashMap<String, Arc<EnvironmentSource>>,
     clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
     lite_paths: BTreeSet<String>,
+    /// Normal-текстуры переопределений материала объектов (кандидаты для mip-цепочек).
+    normal_scene_paths: BTreeSet<String>,
 }
 
 /// Компоненты объекта, из которых готовятся его ресурсы. Одинаковы для объекта мира и для
@@ -339,6 +469,7 @@ struct ObjectParts<'a> {
     lite_scripts: &'a [LiteScript],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_scene_with_model_loader(
     resources: &ResourceHandle,
     assets: &Assets,
@@ -346,6 +477,7 @@ fn prepare_scene_with_model_loader(
     mut world: World,
     prefabs: PreparedPrefabs,
     scene_hash: [u8; 32],
+    build_normal_chains: bool,
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
 ) -> Result<PreparedScene, String> {
     // Пути файлов камер собираются до изменения мира; каждый файл читается один раз.
@@ -456,6 +588,15 @@ fn prepare_scene_with_model_loader(
         }
     }
     set.load_surface_assets(resources, assets, scene_path);
+    // Без `stop`: подготовка сцены не прерывается, `None` невозможен.
+    let normal_chains = NormalChains::build(
+        build_normal_chains,
+        &set.models,
+        &set.textures,
+        &set.normal_scene_paths,
+        &|| false,
+    )
+    .unwrap_or_default();
 
     let RenderAssetSet {
         models,
@@ -466,6 +607,7 @@ fn prepare_scene_with_model_loader(
         clips,
         lite_paths,
         material_paths: _,
+        normal_scene_paths: _,
     } = set;
     let mut sources = BTreeMap::new();
     for path in lite_paths {
@@ -492,6 +634,7 @@ fn prepare_scene_with_model_loader(
             particles,
             prefab_particles,
             ui_images: BTreeMap::new(),
+            normal_chains,
         },
         prefabs,
     })
@@ -561,6 +704,12 @@ impl RenderAssetSet {
                 }
             }
             let material = mesh.material.clone();
+            if let Some(path) = material
+                .as_ref()
+                .and_then(|material| material.normal_texture.as_ref())
+            {
+                self.normal_scene_paths.insert(path.as_str().to_owned());
+            }
             for path in mesh.materials.iter().flatten() {
                 self.material_paths.insert(path.as_str().to_owned());
             }
@@ -684,6 +833,12 @@ impl RenderAssetSet {
                 None => engine_scene::ShaderSchema::lit(),
             };
             let resolved = material.resolve(&schema);
+            // Без шейдера normal-слот — встроенный Lit, его текстура может стать Normal.
+            if material.shader.is_none()
+                && let Some(Some((path, _))) = resolved.textures.get(2)
+            {
+                self.normal_scene_paths.insert(path.as_str().to_owned());
+            }
             texture_paths.extend(
                 resolved
                     .textures
@@ -753,8 +908,8 @@ pub(crate) struct MaterialUploadCaches {
 }
 
 pub(crate) struct GpuTextureCache<T> {
-    model: HashMap<(String, usize, TextureColorSpace), T>,
-    scene: HashMap<(String, TextureColorSpace), T>,
+    model: HashMap<(String, usize, TextureColorSpace, TextureRole), T>,
+    scene: HashMap<(String, TextureColorSpace, TextureRole), T>,
 }
 
 impl<T> Default for GpuTextureCache<T> {
@@ -1360,6 +1515,7 @@ pub(crate) struct PreparedTemplate {
     pub sources: BTreeMap<String, String>,
     /// `.rveui` шаблона и их ассеты: регистрируются в скриптах и загружаются в GPU при `PrefabReady`.
     pub ui: PreparedUi,
+    pub normal_chains: NormalChains,
 }
 
 /// Заспавненные объекты пока не получают анимацию: аниматор шаблона не готовится, и предупреждение
@@ -1383,6 +1539,7 @@ pub(crate) fn prepare_template(
     assets: &Assets,
     label: &str,
     template: &PrefabTemplate,
+    build_normal_chains: bool,
     stop: &dyn Fn() -> bool,
 ) -> Result<PreparedTemplate, String> {
     const STOPPED: &str = "подготовка префаба прервана";
@@ -1424,6 +1581,14 @@ pub(crate) fn prepare_template(
         }
     }
     set.load_surface_assets(resources, assets, label);
+    let normal_chains = NormalChains::build(
+        build_normal_chains,
+        &set.models,
+        &set.textures,
+        &set.normal_scene_paths,
+        stop,
+    )
+    .ok_or_else(|| STOPPED.to_owned())?;
     let RenderAssetSet {
         models,
         textures,
@@ -1433,6 +1598,7 @@ pub(crate) fn prepare_template(
         clips: _,
         lite_paths,
         material_paths: _,
+        normal_scene_paths: _,
     } = set;
     let mut sources = BTreeMap::new();
     for path in lite_paths {
@@ -1455,6 +1621,7 @@ pub(crate) fn prepare_template(
         particles,
         sources,
         ui,
+        normal_chains,
     })
 }
 
@@ -2116,7 +2283,7 @@ fn particle_desc(
             ))?;
             Some(get_or_insert_gpu(
                 &mut texture_cache.scene,
-                (path.clone(), TextureColorSpace::Srgb),
+                (path.clone(), TextureColorSpace::Srgb, TextureRole::Color),
                 || {
                     renderer.create_texture_with_color_space(
                         data.width,
@@ -2304,6 +2471,7 @@ fn upload_resolved_material(
         renderer,
         resolved.base_color_texture.as_ref(),
         TextureColorSpace::Srgb,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2313,6 +2481,7 @@ fn upload_resolved_material(
         renderer,
         resolved.metallic_roughness_texture.as_ref(),
         TextureColorSpace::Linear,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2322,6 +2491,7 @@ fn upload_resolved_material(
         renderer,
         resolved.normal_texture.as_ref(),
         TextureColorSpace::Linear,
+        normal_texture_role(resolved),
         model_path,
         model,
         assets,
@@ -2331,6 +2501,7 @@ fn upload_resolved_material(
         renderer,
         resolved.emissive_texture.as_ref(),
         TextureColorSpace::Srgb,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2340,6 +2511,7 @@ fn upload_resolved_material(
         renderer,
         resolved.occlusion_texture.as_ref(),
         TextureColorSpace::Linear,
+        TextureRole::Color,
         model_path,
         model,
         assets,
@@ -2348,7 +2520,7 @@ fn upload_resolved_material(
     let mut user_textures = [None; 8];
     for (slot, source) in resolved.user_texture_sources.iter().enumerate() {
         let Some(source) = source else { continue };
-        let key = (source.path.clone(), source.color_space);
+        let key = (source.path.clone(), source.color_space, TextureRole::Color);
         let data = assets.texture(&source.path).ok_or_else(|| {
             RenderError::InvalidTexture(format!(
                 "ресурсная текстура /{} отсутствует или не загружена",
@@ -2514,10 +2686,21 @@ fn upload_error_material(
     Ok(material)
 }
 
+/// Роль слота `normal_texture`: `Normal` только у встроенного Lit, пользовательский шейдер — `Color`.
+pub(crate) fn normal_texture_role(resolved: &ResolvedMaterial) -> TextureRole {
+    if resolved.shader_path.is_none() {
+        TextureRole::Normal
+    } else {
+        TextureRole::Color
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn upload_material_texture(
     renderer: &mut Renderer,
     source: Option<&MaterialTextureSource>,
     color_space: TextureColorSpace,
+    role: TextureRole,
     model_path: &str,
     model: &Model,
     assets: MaterialAssetView<'_>,
@@ -2526,55 +2709,76 @@ fn upload_material_texture(
     let Some(source) = source else {
         return Ok(None);
     };
+    // Цепочка забирается только при создании GPU-текстуры (промах кэша).
     let texture_id = match source {
         MaterialTextureSource::Model(index) => {
-            let key = (model_path.to_owned(), *index, color_space);
+            let key = (model_path.to_owned(), *index, color_space, role);
             let texture = model.textures.get(*index).ok_or_else(|| {
                 RenderError::InvalidTexture(format!(
                     "модель {model_path:?} ссылается на отсутствующую текстуру {index}"
                 ))
             })?;
             get_or_insert_gpu(&mut texture_cache.model, key, || {
-                renderer.create_texture_with_color_space(
-                    texture.width,
-                    texture.height,
-                    &texture.rgba,
-                    color_space,
-                )
+                let chain = (role == TextureRole::Normal)
+                    .then(|| assets.normal_chain(model_path, source))
+                    .flatten();
+                create_material_texture(renderer, texture, color_space, role, chain)
             })?
         }
         MaterialTextureSource::Scene(path) => {
-            let key = (path.clone(), color_space);
+            let key = (path.clone(), color_space, role);
             let texture = assets.texture(path).ok_or({
                 RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
             })?;
             get_or_insert_gpu(&mut texture_cache.scene, key, || {
-                renderer.create_texture_with_color_space(
-                    texture.width,
-                    texture.height,
-                    &texture.rgba,
-                    color_space,
-                )
+                let chain = (role == TextureRole::Normal)
+                    .then(|| assets.normal_chain(model_path, source))
+                    .flatten();
+                create_material_texture(renderer, texture, color_space, role, chain)
             })?
         }
     };
     Ok(Some(texture_id))
 }
 
+/// GPU-текстура материала: готовая mip-цепочка normal map загружается без вычислений, иначе
+/// цепочка строится здесь (путь для текстур без подготовленной цепочки).
+fn create_material_texture(
+    renderer: &mut Renderer,
+    texture: &TextureData,
+    color_space: TextureColorSpace,
+    role: TextureRole,
+    chain: Option<NormalMipChain>,
+) -> Result<TextureId, RenderError> {
+    match chain {
+        Some(chain) => renderer.create_texture_from_mip_chain(&chain),
+        None => renderer.create_texture_with_role(
+            texture.width,
+            texture.height,
+            &texture.rgba,
+            color_space,
+            role,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ColorLutGpu, CubeLut, GpuTextureCache, MaterialAssetView, MaterialTextureSource,
-        PreparedMaterialAssets, PreparedPrefabs, ScreenShaderGpu, color_lut_paths,
-        get_or_insert_gpu, load_color_luts, load_scene, load_screen_shader_sources,
-        material_cache_key, prepare_scene_with_model_loader, resolve_material,
-        resolve_material_asset, screen_shader_paths, upload_color_luts, upload_screen_shaders,
+        NormalChains, PreparedMaterialAssets, PreparedPrefabs, PreparedScene, ScreenShaderGpu,
+        color_lut_paths, get_or_insert_gpu, load_color_luts, load_scene,
+        load_screen_shader_sources, material_cache_key, normal_texture_role,
+        prepare_scene_with_model_loader, resolve_material, resolve_material_asset,
+        screen_shader_paths, upload_color_luts, upload_screen_shaders,
     };
-    use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
+    use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, TextureData};
     use engine_files::VirtualPath;
     use engine_physics::BodyKind;
     use engine_project::PhysicsSettings;
-    use engine_render::{AlphaMode, EnvironmentSource, RenderError, TextureColorSpace};
+    use engine_render::{
+        AlphaMode, EnvironmentSource, RenderError, TextureColorSpace, TextureRole,
+    };
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{
         MaterialAlphaMode, MaterialAsset, MaterialOverride, PrefabTemplate, SceneDocument,
@@ -2586,6 +2790,7 @@ mod tests {
     };
     use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -2696,6 +2901,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert!(prepared.render_assets.models.is_empty());
@@ -2718,6 +2924,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
 
@@ -2742,7 +2949,7 @@ id = "camera"
             "/scenes/main.rvescene",
             "/scenes/second.rvescene",
         ] {
-            let prepared = load_scene(&handle, &resources.assets, scene)
+            let prepared = load_scene(&handle, &resources.assets, scene, true)
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
             let geometry = prepared.physics_geometry();
             prepared
@@ -2750,7 +2957,8 @@ id = "camera"
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
         }
 
-        let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let prepared =
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene", true).unwrap();
         let resolved = |id: &str| {
             prepared
                 .world
@@ -2798,7 +3006,8 @@ id = "camera"
         ));
         let resources = LooseResources::new(assets);
         let handle = resources.system.handle();
-        let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let prepared =
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene", true).unwrap();
 
         for path in ["prefabs/bullet.rveprefab", "prefabs/bullet_hole.rveprefab"] {
             assert!(prepared.prefabs.templates.contains_key(path), "{path}");
@@ -2852,7 +3061,7 @@ id = "camera"
         let resources = LooseResources::new(&demo.join("Assets"));
         let handle = resources.system.handle();
         let mut prepared =
-            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene", true).unwrap();
         let project = engine_project::ProjectSettings::parse(
             &fs::read_to_string(demo.join("project.rveproject")).unwrap(),
         )
@@ -2943,6 +3152,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -2959,6 +3169,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -2982,6 +3193,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let blade = prepared.world.handle("spinner1.blade").unwrap();
@@ -3010,6 +3222,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let EnvironmentSource::Equirect { width, height, rgb } = prepared
@@ -3045,6 +3258,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3060,6 +3274,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3088,6 +3303,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert!(
@@ -3118,6 +3334,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let prefab_assets = PreparedMaterialAssets::default();
@@ -3142,6 +3359,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let collider = prepared
@@ -3163,6 +3381,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3173,6 +3392,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3189,6 +3409,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3206,6 +3427,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3219,6 +3441,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3239,6 +3462,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         for id in ["camera", "second"] {
@@ -3315,6 +3539,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -3377,6 +3602,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -3426,6 +3652,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         for id in ["camera", "second"] {
@@ -3447,6 +3674,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let handle = prepared.world.handle("camera").unwrap();
@@ -3469,6 +3697,7 @@ id = "camera"
                 &resources.system.handle(),
                 &resources.assets,
                 "scene.rvescene",
+                true,
             )
             .err()
             .unwrap();
@@ -3498,6 +3727,7 @@ id = "camera"
             world,
             PreparedPrefabs::default(),
             [0; 32],
+            true,
             |path| {
                 assert_eq!(path, "models/quad.fbx");
                 load_count.set(load_count.get() + 1);
@@ -3519,6 +3749,280 @@ id = "camera"
         );
     }
 
+    fn rgba_texture(width: u32, height: u32) -> TextureData {
+        TextureData {
+            width,
+            height,
+            rgba: vec![128; width as usize * height as usize * 4],
+        }
+    }
+
+    #[test]
+    fn normal_chains_cover_only_the_normal_slot_of_prepared_models() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"models/quad.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"quad\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", &scene_text).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            PreparedPrefabs::default(),
+            [0; 32],
+            true,
+            |_| {
+                Ok(Model {
+                    meshes: vec![ModelMesh {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                        skin: None,
+                        material: ModelMaterial {
+                            base_color_texture: Some(0),
+                            metallic_roughness_texture: Some(1),
+                            normal_texture: Some(2),
+                            ..ModelMaterial::default()
+                        },
+                    }],
+                    textures: vec![rgba_texture(4, 4), rgba_texture(4, 4), rgba_texture(4, 4)],
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+        let chains = &prepared.render_assets.normal_chains;
+        let model = "models/quad.fbx";
+        assert!(
+            chains
+                .take(model, &MaterialTextureSource::Model(2))
+                .is_some()
+        );
+        assert!(
+            chains
+                .take(model, &MaterialTextureSource::Model(0))
+                .is_none()
+        );
+        assert!(
+            chains
+                .take(model, &MaterialTextureSource::Model(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn normal_chains_stay_empty_when_the_build_flag_is_off() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"models/quad.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"quad\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", &scene_text).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            PreparedPrefabs::default(),
+            [0; 32],
+            false,
+            |_| {
+                Ok(Model {
+                    meshes: vec![ModelMesh {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                        skin: None,
+                        material: ModelMaterial {
+                            normal_texture: Some(2),
+                            ..ModelMaterial::default()
+                        },
+                    }],
+                    textures: vec![rgba_texture(4, 4), rgba_texture(4, 4), rgba_texture(4, 4)],
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.render_assets.models.len(), 1);
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .take("models/quad.fbx", &MaterialTextureSource::Model(2))
+                .is_none()
+        );
+    }
+
+    /// Одно-пиксельный RGBA PNG: текстура сцены читается с диска и декодируется.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// Готовит сцену проекта с пустой моделью; цепочки строятся, как в игровом клиенте.
+    fn prepare_candidate_scene(project: &TempProject, scene_text: &str) -> PreparedScene {
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", scene_text).unwrap();
+        let world = World::from_document(&document).unwrap();
+        prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            PreparedPrefabs::default(),
+            [0; 32],
+            true,
+            |_| {
+                Ok(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rvemat_without_shader_puts_its_normal_slot_among_the_chain_candidates() {
+        let project = TempProject::new();
+        project.write(
+            "materials/plain.rvemat",
+            b"[properties]\nnormal_texture = \"/textures/normal.png\"\n",
+        );
+        project.write("textures/normal.png", PNG_1X1);
+        let scene_text = format!("[[assets]]\npath = \"/materials/plain.rvemat\"\n{CAMERA_SCENE}");
+        let prepared = prepare_candidate_scene(&project, &scene_text);
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .take(
+                    "",
+                    &MaterialTextureSource::Scene("textures/normal.png".to_owned())
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rvemat_with_shader_keeps_its_slot_out_of_the_chain_candidates() {
+        let project = TempProject::new();
+        // Третья текстура шейдера занимает слот 2, который у встроенного Lit — normal map.
+        let shader = ShaderAsset::template("custom").replacen(
+            "\n---\n",
+            "\n[[properties]]\nname = \"mask\"\nlabel = \"Mask\"\ntype = \"texture\"\ncolor_space = \"linear\"\nfallback = \"white\"\n\n[[properties]]\nname = \"detail\"\nlabel = \"Detail\"\ntype = \"texture\"\ncolor_space = \"linear\"\nfallback = \"white\"\n\n---\n",
+            1,
+        );
+        let material = "shader = \"/shaders/custom.rveshader\"\n[properties]\ndetail = \"/textures/normal.png\"\n";
+        project.write("shaders/custom.rveshader", shader.as_bytes());
+        project.write("materials/custom.rvemat", material.as_bytes());
+        project.write("textures/normal.png", PNG_1X1);
+        let schema = ShaderAsset::parse("/shaders/custom.rveshader", &shader)
+            .unwrap()
+            .layout();
+        let resolved = MaterialAsset::parse("/materials/custom.rvemat", material)
+            .unwrap()
+            .resolve(&schema);
+        assert!(matches!(
+            resolved.textures.get(2),
+            Some(Some((path, _))) if path.as_str() == "textures/normal.png"
+        ));
+
+        let scene_text = format!(
+            "[[assets]]\npath = \"/materials/custom.rvemat\"\n[[assets]]\npath = \"/shaders/custom.rveshader\"\n{CAMERA_SCENE}"
+        );
+        let prepared = prepare_candidate_scene(&project, &scene_text);
+        assert!(
+            prepared
+                .render_assets
+                .shader_assets
+                .get("shaders/custom.rveshader")
+                .is_some_and(Result::is_ok)
+        );
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .take(
+                    "",
+                    &MaterialTextureSource::Scene("textures/normal.png".to_owned())
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn material_override_normal_texture_is_a_chain_candidate() {
+        let project = TempProject::new();
+        project.write("textures/normal.png", PNG_1X1);
+        let scene_text = format!(
+            "[[assets]]\npath = \"/models/quad.fbx\"\n[[assets]]\npath = \"/textures/normal.png\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"quad\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n[objects.mesh_renderer.material]\nnormal_texture = \"/textures/normal.png\"\n"
+        );
+        let prepared = prepare_candidate_scene(&project, &scene_text);
+        assert!(
+            prepared
+                .render_assets
+                .normal_chains
+                .take(
+                    "",
+                    &MaterialTextureSource::Scene("textures/normal.png".to_owned())
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn normal_chain_build_skips_broken_textures_and_honours_interruption() {
+        let textures = HashMap::from([
+            (
+                "tex/broken.png".to_owned(),
+                TextureData {
+                    width: 2,
+                    height: 2,
+                    rgba: vec![0; 3],
+                },
+            ),
+            ("tex/normal.png".to_owned(), rgba_texture(2, 2)),
+        ]);
+        let paths = std::collections::BTreeSet::from([
+            "tex/broken.png".to_owned(),
+            "tex/normal.png".to_owned(),
+        ]);
+        let chains =
+            NormalChains::build(true, &HashMap::new(), &textures, &paths, &|| false).unwrap();
+        let scene = |path: &str| MaterialTextureSource::Scene(path.to_owned());
+        assert!(chains.take("", &scene("tex/broken.png")).is_none());
+        assert!(chains.take("", &scene("tex/normal.png")).is_some());
+        assert!(NormalChains::build(true, &HashMap::new(), &textures, &paths, &|| true).is_none());
+        let disabled =
+            NormalChains::build(false, &HashMap::new(), &textures, &paths, &|| true).unwrap();
+        assert!(disabled.take("", &scene("tex/normal.png")).is_none());
+    }
+
+    #[test]
+    fn normal_chain_is_handed_out_once_and_later_requests_fall_back() {
+        let textures = HashMap::from([("tex/normal.png".to_owned(), rgba_texture(2, 2))]);
+        let paths = std::collections::BTreeSet::from(["tex/normal.png".to_owned()]);
+        let chains =
+            NormalChains::build(true, &HashMap::new(), &textures, &paths, &|| false).unwrap();
+        let scene = MaterialTextureSource::Scene("tex/normal.png".to_owned());
+        assert!(chains.take("", &scene).is_some());
+        assert!(chains.take("", &scene).is_none());
+    }
+
     #[test]
     fn lod_models_load_once_and_keep_document_level_order() {
         let project = TempProject::new();
@@ -3537,6 +4041,7 @@ id = "camera"
             world,
             PreparedPrefabs::default(),
             [0; 32],
+            true,
             |path| {
                 loaded_paths.push(path.to_owned());
                 Ok(Model {
@@ -3762,6 +4267,20 @@ id = "camera"
     }
 
     #[test]
+    fn normal_slot_role_is_normal_only_for_builtin_lit() {
+        let model = ModelMaterial {
+            normal_texture: Some(0),
+            ..ModelMaterial::default()
+        };
+        let builtin = resolve_material(&model, None, None);
+        assert_eq!(normal_texture_role(&builtin), TextureRole::Normal);
+
+        let mut shaded = builtin.clone();
+        shaded.shader_path = Some("/shaders/water.rveshader".to_owned());
+        assert_eq!(normal_texture_role(&shaded), TextureRole::Color);
+    }
+
+    #[test]
     fn material_cache_key_matches_equal_inputs_and_separates_model_textures_and_shaders() {
         let model = ModelMaterial {
             base_color_texture: Some(0),
@@ -3784,11 +4303,41 @@ id = "camera"
     }
 
     #[test]
+    fn gpu_texture_cache_keeps_normal_and_color_roles_of_one_png_apart() {
+        let mut cache = GpuTextureCache::<u32>::default();
+        let uploads = Cell::new(0_u32);
+        let key = |role| {
+            (
+                "textures/normal.png".to_owned(),
+                TextureColorSpace::Linear,
+                role,
+            )
+        };
+        let color = get_or_insert_gpu(&mut cache.scene, key(TextureRole::Color), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let normal = get_or_insert_gpu(&mut cache.scene, key(TextureRole::Normal), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        assert_ne!(color, normal);
+        assert_eq!(uploads.get(), 2);
+    }
+
+    #[test]
     fn gpu_texture_cache_reuses_uploads_per_source_and_color_space() {
         let mut cache = GpuTextureCache::<u32>::default();
         let uploads = Cell::new(0_u32);
 
-        let model_srgb_key = ("models/a.fbx".to_owned(), 0, TextureColorSpace::Srgb);
+        let model_srgb_key = (
+            "models/a.fbx".to_owned(),
+            0,
+            TextureColorSpace::Srgb,
+            TextureRole::Color,
+        );
         let model_srgb = get_or_insert_gpu(&mut cache.model, model_srgb_key.clone(), || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
@@ -3801,7 +4350,12 @@ id = "camera"
         .unwrap();
         let model_linear = get_or_insert_gpu(
             &mut cache.model,
-            ("models/a.fbx".to_owned(), 0, TextureColorSpace::Linear),
+            (
+                "models/a.fbx".to_owned(),
+                0,
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
             || {
                 uploads.set(uploads.get() + 1);
                 Ok(uploads.get())
@@ -3811,7 +4365,11 @@ id = "camera"
         assert_eq!(model_srgb, model_srgb_reused);
         assert_ne!(model_srgb, model_linear);
 
-        let scene_srgb_key = ("textures/shared.png".to_owned(), TextureColorSpace::Srgb);
+        let scene_srgb_key = (
+            "textures/shared.png".to_owned(),
+            TextureColorSpace::Srgb,
+            TextureRole::Color,
+        );
         let scene_srgb = get_or_insert_gpu(&mut cache.scene, scene_srgb_key.clone(), || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
@@ -3824,7 +4382,11 @@ id = "camera"
         .unwrap();
         let scene_linear = get_or_insert_gpu(
             &mut cache.scene,
-            ("textures/shared.png".to_owned(), TextureColorSpace::Linear),
+            (
+                "textures/shared.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
             || {
                 uploads.set(uploads.get() + 1);
                 Ok(uploads.get())
@@ -3854,6 +4416,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
 
@@ -3896,6 +4459,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         assert!(
@@ -3929,6 +4493,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .err()
         .unwrap();
@@ -3954,6 +4519,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let path = "prefabs/sky.rveprefab";
@@ -4019,6 +4585,7 @@ id = "camera"
             &resources.system.handle(),
             &resources.assets,
             "scene.rvescene",
+            true,
         )
         .unwrap();
         let EnvironmentSource::Equirect { width, height, rgb } = prepared
@@ -4071,6 +4638,7 @@ id = "camera"
             world,
             prefabs,
             [0; 32],
+            true,
             |path| {
                 loaded_paths.borrow_mut().push(path.to_owned());
                 Ok(Model {
@@ -4123,6 +4691,7 @@ id = "camera"
             world,
             prefabs,
             [0; 32],
+            true,
             |_| {
                 Ok(Model {
                     meshes: Vec::new(),
@@ -4383,7 +4952,7 @@ mod material_resource_ownership_tests {
 mod scene_upload_rollback_tests {
     use super::{
         GpuTextureCache, SceneUploadCleanupGpu, SceneUploadResources, TextureColorSpace,
-        remove_new_cached_textures, restore_shader_cache, rollback_scene_upload,
+        TextureRole, remove_new_cached_textures, restore_shader_cache, rollback_scene_upload,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -4504,9 +5073,15 @@ mod scene_upload_rollback_tests {
             let original_textures = HashSet::from([1]);
             let original_shader_paths = HashSet::from(["old.glsl".to_owned()]);
             let mut texture_cache = GpuTextureCache::<usize>::default();
-            texture_cache
-                .model
-                .insert(("old.png".to_owned(), 0, TextureColorSpace::Srgb), 1);
+            texture_cache.model.insert(
+                (
+                    "old.png".to_owned(),
+                    0,
+                    TextureColorSpace::Srgb,
+                    TextureRole::Color,
+                ),
+                1,
+            );
             let mut shader_cache = HashMap::from([("old.glsl".to_owned(), Ok(1))]);
             let mut material_cache = HashMap::new();
             let original_error_material = Some(1);
@@ -4532,9 +5107,14 @@ mod scene_upload_rollback_tests {
                         error_material = Some(id);
                     }
                     Kind::Texture => {
-                        texture_cache
-                            .scene
-                            .insert(("new.png".to_owned(), TextureColorSpace::Srgb), id);
+                        texture_cache.scene.insert(
+                            (
+                                "new.png".to_owned(),
+                                TextureColorSpace::Srgb,
+                                TextureRole::Color,
+                            ),
+                            id,
+                        );
                     }
                     Kind::SurfaceShader => {
                         shader_cache.insert("new.glsl".to_owned(), Ok(id));
@@ -4596,15 +5176,31 @@ mod scene_upload_rollback_tests {
     #[test]
     fn failed_upload_restores_texture_and_shader_cache_entries() {
         let mut textures = GpuTextureCache::<usize>::default();
-        textures
-            .model
-            .insert(("model.png".to_owned(), 0, TextureColorSpace::Srgb), 1);
-        textures
-            .scene
-            .insert(("scene.png".to_owned(), TextureColorSpace::Linear), 2);
-        textures
-            .scene
-            .insert(("new.png".to_owned(), TextureColorSpace::Srgb), 3);
+        textures.model.insert(
+            (
+                "model.png".to_owned(),
+                0,
+                TextureColorSpace::Srgb,
+                TextureRole::Color,
+            ),
+            1,
+        );
+        textures.scene.insert(
+            (
+                "scene.png".to_owned(),
+                TextureColorSpace::Linear,
+                TextureRole::Color,
+            ),
+            2,
+        );
+        textures.scene.insert(
+            (
+                "new.png".to_owned(),
+                TextureColorSpace::Srgb,
+                TextureRole::Color,
+            ),
+            3,
+        );
         assert_eq!(
             remove_new_cached_textures(&mut textures, &HashSet::from([1, 2])),
             HashSet::from([3])

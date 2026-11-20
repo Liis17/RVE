@@ -35,6 +35,8 @@ pub(crate) struct SceneLoader {
     physics: PhysicsSettings,
     /// Исходники экранных шейдеров и LUT нужны только GPU-клиенту, как при старте.
     screen_shaders: bool,
+    /// Mip-цепочки normal map нужны только GPU-клиенту, как при старте.
+    normal_chains: bool,
 }
 
 impl SceneLoader {
@@ -42,11 +44,13 @@ impl SceneLoader {
         resources: ResourceHandle,
         physics: PhysicsSettings,
         screen_shaders: bool,
+        normal_chains: bool,
     ) -> Self {
         Self {
             resources,
             physics,
             screen_shaders,
+            normal_chains,
         }
     }
 
@@ -57,7 +61,7 @@ impl SceneLoader {
         path: &str,
     ) -> Result<(PreparedScene, Vec<engine_physics::ModelGeometry>), String> {
         let assets = Assets::with_resources(self.resources.clone());
-        let mut prepared = load_scene(&self.resources, &assets, path)?;
+        let mut prepared = load_scene(&self.resources, &assets, path, self.normal_chains)?;
         if self.screen_shaders {
             prepared.render_assets.screen_shaders =
                 load_screen_shader_sources(&self.resources, &prepared.world);
@@ -772,7 +776,8 @@ return Script
                 ..ResourceConfig::default()
             })
             .unwrap();
-            let loader = SceneLoader::new(resources.handle(), PhysicsSettings::default(), false);
+            let loader =
+                SceneLoader::new(resources.handle(), PhysicsSettings::default(), false, false);
             let (prepared, geometry) = loader.prepare(start).unwrap();
             let (_, bindings) = prepared
                 .build_physics(&geometry, &PhysicsSettings::default())
