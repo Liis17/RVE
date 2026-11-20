@@ -848,11 +848,7 @@ fn load_fbx(
         };
         triangle.resize(mesh.max_face_triangles * 3, 0);
         for part in mesh.material_parts.iter() {
-            let mut vertices = Vec::with_capacity(part.num_triangles * 3);
-            let mut skin = rigid.map(|_| ModelSkin {
-                joints: Vec::with_capacity(part.num_triangles * 3),
-                weights: Vec::with_capacity(part.num_triangles * 3),
-            });
+            let mut builder = MeshPartBuilder::new(part.num_triangles * 3, rigid.is_some());
             for &face_index in part.face_indices.iter() {
                 let face = mesh.faces[face_index as usize];
                 let triangles = mesh.triangulate_face(&mut triangle, face) as usize;
@@ -871,29 +867,27 @@ fn load_fbx(
                     } else {
                         [0.0, 0.0]
                     };
-                    vertices.push(ModelVertex {
+                    let vertex = ModelVertex {
                         position: [position.x as f32, position.y as f32, position.z as f32],
                         normal: normalize([normal.x as f32, normal.y as f32, normal.z as f32]),
                         uv,
+                    };
+                    // Веса берутся по контрольной точке: углы одной точки получают одинаковые веса.
+                    let influence = rigid.map(|rigid| match deformer {
+                        Some(deformer) => skin::corner_influences(
+                            deformer,
+                            &cluster_joints,
+                            mesh.vertex_indices[index] as usize,
+                            rigid,
+                        ),
+                        None => ([rigid, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
                     });
-                    if let (Some(skin), Some(rigid)) = (skin.as_mut(), rigid) {
-                        // Веса берутся по контрольной точке: углы одной точки получают одинаковые веса.
-                        let control_point = mesh.vertex_indices[index] as usize;
-                        let (joints, weights) = match deformer {
-                            Some(deformer) => skin::corner_influences(
-                                deformer,
-                                &cluster_joints,
-                                control_point,
-                                rigid,
-                            ),
-                            None => ([rigid, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
-                        };
-                        skin.joints.push(joints);
-                        skin.weights.push(weights);
-                    }
+                    builder
+                        .push(vertex, influence)
+                        .map_err(|message| decode_error(message.to_owned()))?;
                 }
             }
-            if vertices.is_empty() {
+            if builder.is_empty() {
                 continue;
             }
             let material = match materials.get(part.index as usize) {
@@ -907,15 +901,7 @@ fn load_fbx(
                 )?,
                 None => ModelMaterial::default(),
             };
-            let vertex_count = u32::try_from(vertices.len())
-                .map_err(|_| decode_error("в меше больше u32::MAX вершин".to_owned()))?;
-            let mut indices = sequential_triangle_indices(vertex_count, mirrored);
-            model.meshes.push(ModelMesh {
-                vertices,
-                indices: std::mem::take(&mut indices),
-                material,
-                skin,
-            });
+            model.meshes.push(builder.finish(material, mirrored));
         }
     }
     if model.meshes.is_empty() {
@@ -929,14 +915,87 @@ fn load_fbx(
     Ok(model)
 }
 
-fn sequential_triangle_indices(vertex_count: u32, mirrored: bool) -> Vec<u32> {
-    let mut indices = (0..vertex_count).collect::<Vec<_>>();
-    if mirrored {
-        for triangle in indices.as_chunks_mut::<3>().0 {
-            triangle.swap(1, 2);
+/// Битовый ключ вершины: позиция, нормаль, UV, индексы и веса суставов.
+type VertexKey = [u32; 16];
+
+/// Собирает часть меша из углов треугольников, объединяя углы с побитово равными
+/// итоговыми атрибутами. Порядок треугольников и вершин в них сохраняется, поэтому
+/// швы UV/нормалей и skinning остаются отдельными вершинами.
+struct MeshPartBuilder {
+    vertices: Vec<ModelVertex>,
+    skin: Option<ModelSkin>,
+    indices: Vec<u32>,
+    lookup: HashMap<VertexKey, u32>,
+}
+
+impl MeshPartBuilder {
+    fn new(corner_capacity: usize, skinned: bool) -> Self {
+        Self {
+            vertices: Vec::new(),
+            skin: skinned.then(|| ModelSkin {
+                joints: Vec::new(),
+                weights: Vec::new(),
+            }),
+            indices: Vec::with_capacity(corner_capacity),
+            lookup: HashMap::new(),
         }
     }
-    indices
+
+    /// Добавляет угол треугольника; `influence` задаётся только для частей со skin.
+    fn push(
+        &mut self,
+        vertex: ModelVertex,
+        influence: Option<([u32; 4], [f32; 4])>,
+    ) -> Result<(), &'static str> {
+        let (joints, weights) = influence.unwrap_or_default();
+        let mut key = [0; 16];
+        let attributes = vertex
+            .position
+            .iter()
+            .chain(&vertex.normal)
+            .chain(&vertex.uv)
+            .chain(&weights)
+            .map(|value| value.to_bits())
+            .chain(joints);
+        for (slot, bits) in key.iter_mut().zip(attributes) {
+            *slot = bits;
+        }
+        let index = match self.lookup.get(&key) {
+            Some(&index) => index,
+            None => {
+                let index = u32::try_from(self.vertices.len())
+                    .map_err(|_| "в меше больше u32::MAX вершин")?;
+                self.lookup.insert(key, index);
+                self.vertices.push(vertex);
+                if let Some(skin) = self.skin.as_mut() {
+                    skin.joints.push(joints);
+                    skin.weights.push(weights);
+                }
+                index
+            }
+        };
+        self.indices.push(index);
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    /// Готовая часть; у зеркального узла winding каждого треугольника разворачивается.
+    fn finish(mut self, material: ModelMaterial, mirrored: bool) -> ModelMesh {
+        if mirrored {
+            for triangle in self.indices.as_chunks_mut::<3>().0 {
+                triangle.swap(1, 2);
+            }
+        }
+        ModelMesh {
+            vertices: self.vertices,
+            indices: self.indices,
+            material,
+            skin: self.skin,
+        }
+    }
 }
 
 /// Файловая текстура основного цвета: классический diffuse FBX или base color PBR.
@@ -1685,9 +1744,10 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex,
-        TextureData, decode_hdr, decode_png, is_missing_texture_candidate, map_resource_error,
-        pack_metallic_roughness, supports_metallic_roughness, texture_candidates,
+        AssetError, Assets, MeshPartBuilder, Model, ModelAlphaMode, ModelMaterial, ModelMesh,
+        ModelVertex, TextureData, decode_hdr, decode_png, is_missing_texture_candidate,
+        map_resource_error, normalize, pack_metallic_roughness, supports_metallic_roughness,
+        texture_candidates,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
@@ -2222,8 +2282,9 @@ mod tests {
         let mesh = &model.meshes[0];
         assert_eq!(mesh.material.base_color_texture, None);
         assert!(!mesh.material.double_sided);
-        assert_eq!(mesh.indices, [0, 1, 2, 3, 4, 5]);
-        assert_eq!(mesh.vertices.len(), 6);
+        // Общие углы двух треугольников квадрата объединены.
+        assert_eq!(mesh.indices, [0, 1, 2, 2, 3, 0]);
+        assert_eq!(mesh.vertices.len(), 4);
         for vertex in &mesh.vertices {
             // Единица файла — сантиметр, поэтому координата 1 становится 0.01 м.
             for coordinate in vertex.position {
@@ -2261,7 +2322,7 @@ mod tests {
 
         let mesh = &model.meshes[0];
         assert!(mesh.material.double_sided);
-        assert_eq!(mesh.indices, [0, 2, 1, 3, 5, 4]);
+        assert_eq!(mesh.indices, [0, 2, 1, 2, 0, 3]);
         for triangle in mesh.indices.as_chunks::<3>().0 {
             let a = mesh.vertices[triangle[0] as usize].position;
             let b = mesh.vertices[triangle[1] as usize].position;
@@ -2275,6 +2336,198 @@ mod tests {
                 ab[0] * ac[1] - ab[1] * ac[0],
             ];
             assert!(face[0] * normal[0] + face[1] * normal[1] + face[2] * normal[2] > 0.0);
+        }
+    }
+
+    /// Квадрат из двух треугольных полигонов; углы второго получают UV `second_uvs`.
+    fn two_triangle_fbx(second_uvs: &str) -> String {
+        quad_fbx(None)
+            .replace("a: 0,1,2,-4", "a: 0,1,-3,0,2,-4")
+            .replace(
+                "Normals: *12 {\n\t\t\t\ta: 0,0,1,0,0,1,0,0,1,0,0,1",
+                "Normals: *18 {\n\t\t\t\ta: 0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1",
+            )
+            .replace(
+                "UV: *8 {\n\t\t\t\ta: 0,0,1,0,1,1,0,1",
+                &format!("UV: *12 {{\n\t\t\t\ta: 0,0,1,0,1,1,{second_uvs}"),
+            )
+            .replace(
+                "UVIndex: *4 {\n\t\t\t\ta: 0,1,2,3",
+                "UVIndex: *6 {\n\t\t\t\ta: 0,1,2,3,4,5",
+            )
+    }
+
+    #[test]
+    fn fbx_corners_with_equal_attributes_share_vertices_but_uv_seams_stay_split() {
+        let temp = TempAssets::new("uv-seam");
+        // Второй треугольник повторяет UV общих углов 0 и 2: шва нет.
+        temp.write(
+            "model/shared.fbx",
+            two_triangle_fbx("0,0,1,1,0,1").as_bytes(),
+        );
+        // Второй треугольник смещает UV общих углов: шов по диагонали.
+        temp.write(
+            "model/seam.fbx",
+            two_triangle_fbx("0.5,0,1,0.5,0,1").as_bytes(),
+        );
+
+        let shared = temp.assets().load_model("/model/shared.fbx").unwrap();
+        let mesh = &shared.meshes[0];
+        assert_eq!(mesh.vertices.len(), 4);
+        assert_eq!(mesh.indices, [0, 1, 2, 0, 2, 3]);
+
+        let seam = temp.assets().load_model("/model/seam.fbx").unwrap();
+        let mesh = &seam.meshes[0];
+        assert_eq!(mesh.vertices.len(), 6);
+        assert_eq!(mesh.indices, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(mesh.vertices[0].position, mesh.vertices[3].position);
+        assert_ne!(mesh.vertices[0].uv, mesh.vertices[3].uv);
+    }
+
+    fn corner(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> ModelVertex {
+        ModelVertex {
+            position,
+            normal,
+            uv,
+        }
+    }
+
+    /// Углы треугольников куба ±1: 12 треугольников, наружный winding.
+    /// `smooth` даёт общую нормаль в каждой вершине, иначе нормаль грани.
+    fn cube_corners(smooth: bool) -> Vec<ModelVertex> {
+        let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
+            ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+            ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+            ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
+        ];
+        let mut corners = Vec::new();
+        for (normal, u, v) in faces {
+            let point = |a: f32, b: f32| -> [f32; 3] {
+                std::array::from_fn(|axis| normal[axis] + a * u[axis] + b * v[axis])
+            };
+            let quad = [
+                point(-1.0, -1.0),
+                point(1.0, -1.0),
+                point(1.0, 1.0),
+                point(-1.0, 1.0),
+            ];
+            for index in [0, 1, 2, 0, 2, 3] {
+                let position = quad[index];
+                let normal = if smooth { normalize(position) } else { normal };
+                corners.push(corner(position, normal, [0.0, 0.0]));
+            }
+        }
+        corners
+    }
+
+    fn build_part(
+        corners: &[ModelVertex],
+        influences: Option<&[([u32; 4], [f32; 4])]>,
+        mirrored: bool,
+    ) -> ModelMesh {
+        let mut builder = MeshPartBuilder::new(corners.len(), influences.is_some());
+        for (index, &vertex) in corners.iter().enumerate() {
+            builder
+                .push(vertex, influences.map(|influences| influences[index]))
+                .unwrap();
+        }
+        builder.finish(ModelMaterial::default(), mirrored)
+    }
+
+    /// Треугольники части как последовательность углов: то, что увидит rasterizer.
+    fn expanded_corners(mesh: &ModelMesh) -> Vec<ModelVertex> {
+        mesh.indices
+            .iter()
+            .map(|&index| mesh.vertices[index as usize])
+            .collect()
+    }
+
+    #[test]
+    fn mesh_part_builder_shares_cube_corners_and_keeps_the_same_triangles() {
+        let smooth = cube_corners(true);
+        let mesh = build_part(&smooth, None, false);
+        assert_eq!(mesh.vertices.len(), 8);
+        assert_eq!(mesh.indices.len(), 36);
+        assert_eq!(expanded_corners(&mesh), smooth);
+        assert!(mesh.skin.is_none());
+
+        // Нормали граней — шов на каждом ребре: по 4 вершины на грань.
+        let flat = cube_corners(false);
+        let mesh = build_part(&flat, None, false);
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(expanded_corners(&mesh), flat);
+    }
+
+    #[test]
+    fn mesh_part_builder_keeps_uv_seams_and_compares_exact_bits() {
+        let a = corner([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
+        let b = corner([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0]);
+        let c = corner([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0]);
+        let seam = ModelVertex {
+            uv: [0.5, 0.0],
+            ..a
+        };
+        let negative_zero = ModelVertex {
+            position: [-0.0, 0.0, 0.0],
+            ..a
+        };
+        let corners = [a, b, c, seam, b, c, negative_zero, b, c];
+        let mesh = build_part(&corners, None, false);
+        assert_eq!(mesh.indices, [0, 1, 2, 3, 1, 2, 4, 1, 2]);
+        assert_eq!(expanded_corners(&mesh), corners);
+    }
+
+    #[test]
+    fn mesh_part_builder_splits_vertices_with_different_skin_influences() {
+        let a = corner([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
+        let b = corner([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0]);
+        let c = corner([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0]);
+        let rigid = ([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        let other_joint = ([1, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        let other_weight = ([0, 1, 0, 0], [0.5, 0.5, 0.0, 0.0]);
+        let corners = [a, b, c, a, b, c, a, b, c];
+        let influences = [
+            rigid,
+            rigid,
+            rigid,
+            other_joint,
+            rigid,
+            rigid,
+            other_weight,
+            rigid,
+            rigid,
+        ];
+        let mesh = build_part(&corners, Some(&influences), false);
+        assert_eq!(mesh.indices, [0, 1, 2, 3, 1, 2, 4, 1, 2]);
+        let skin = mesh.skin.as_ref().unwrap();
+        assert_eq!(skin.joints.len(), mesh.vertices.len());
+        assert_eq!(skin.weights.len(), mesh.vertices.len());
+        for (corner, &index) in mesh.indices.iter().enumerate() {
+            let index = index as usize;
+            assert_eq!(mesh.vertices[index], corners[corner]);
+            assert_eq!(
+                (skin.joints[index], skin.weights[index]),
+                influences[corner]
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_part_builder_reverses_winding_of_mirrored_parts() {
+        let corners = cube_corners(true);
+        let mesh = build_part(&corners, None, true);
+        assert_eq!(mesh.vertices.len(), 8);
+        let expanded = expanded_corners(&mesh);
+        for (triangle, source) in expanded
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(corners.as_chunks::<3>().0)
+        {
+            assert_eq!(*triangle, [source[0], source[2], source[1]]);
         }
     }
 

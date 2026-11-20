@@ -501,6 +501,31 @@ mod tests {
         assert_eq!(max, Vec3::new(2.0, 3.0, 1.0));
     }
 
+    #[test]
+    fn shared_edges_count_once_toward_the_edge_limit() {
+        // Четыре треугольника тетраэдра имеют 12 рёбер по сторонам треугольников,
+        // но общие рёбра соседних граней дают только 6 уникальных. Лимит 6 проходит,
+        // иначе общие рёбра учитывались бы дважды и модель уходила бы в AABB.
+        let mesh = TriMesh::new(
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ],
+            vec![[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]],
+        )
+        .unwrap();
+        let wires = mesh_segments(&mesh, Vec3::ONE, &identity(), 6);
+        assert_eq!(wires.len(), 6);
+        let boxed = mesh_segments(&mesh, Vec3::ONE, &identity(), 5);
+        assert_eq!(
+            boxed.len(),
+            12,
+            "AABB вместо каркаса при 6 рёбрах и лимите 5"
+        );
+    }
+
     fn model_with_points(points: &[[f32; 3]]) -> Arc<Model> {
         let vertices = points
             .iter()

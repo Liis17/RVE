@@ -236,7 +236,7 @@ Play передаёт хосту включённые сцены проекта 
 - Поле `Layer` объекта в Inspector задаёт слой его collider/body; оно использует индекс слота `[layers]` и отображает имя слоя, если оно задано.
 - Add Component предлагает `Collider` и `Character Controller`, если у объекта нет конфликтующего компонента, и `Rigid Body` только при наличии коллайдера.
 - Префаб переопределяет `collider`, `rigid_body` и `character_controller` целиком, как и `point_light`.
-- Флажок `Colliders` во вьюпорте Scene рисует рёбра коллайдеров всех объектов; без него рисуются только выделенные. Геометрия строится функциями `engine-physics` в `editor/src/viewport/colliders.rs`. Trimesh с более чем `MAX_MESH_WIRE_EDGES` = 4096 рёбрами рисуется своим AABB.
+- Флажок `Colliders` во вьюпорте Scene рисует рёбра коллайдеров всех объектов; без него рисуются только выделенные. Геометрия строится функциями `engine-physics` в `editor/src/viewport/colliders.rs`. Trimesh с более чем `MAX_MESH_WIRE_EDGES` = 4096 уникальными рёбрами рисуется своим AABB; общее ребро двух треугольников считается один раз (`unique_edges`).
 
 ## Префабы
 

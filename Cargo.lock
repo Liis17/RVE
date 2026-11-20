@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "engine-assets"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "engine-files",
  "engine-pak",

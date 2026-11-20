@@ -95,10 +95,14 @@ fn oracle_positions(scene: &ufbx::Scene, anim: &ufbx::Anim, time: f32, name: &st
         .collect()
 }
 
-/// Позиции вершин меша после линейного смешивания палитрами, как в renderer.
+/// Позиции углов меша после линейного смешивания палитрами, как в renderer.
+///
+/// Вершины общие для углов (дедупликация), поэтому смешанные позиции вершин
+/// разворачиваются через `mesh.indices` в порядок углов, которым пользуется оракул.
 fn skinned_positions(mesh: &ModelMesh, palettes: &[[[f32; 4]; 4]]) -> Vec<Vec3> {
     let skin = mesh.skin.as_ref().expect("skin у меша");
-    mesh.vertices
+    let vertices: Vec<Vec3> = mesh
+        .vertices
         .iter()
         .zip(&skin.joints)
         .zip(&skin.weights)
@@ -113,6 +117,10 @@ fn skinned_positions(mesh: &ModelMesh, palettes: &[[[f32; 4]; 4]]) -> Vec<Vec3> 
                     acc + palette.transform_point3(rest) * *weight
                 })
         })
+        .collect();
+    mesh.indices
+        .iter()
+        .map(|&index| vertices[index as usize])
         .collect()
 }
 
