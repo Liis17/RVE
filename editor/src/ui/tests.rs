@@ -688,6 +688,50 @@ fn recovery_prompt_offers_restore_and_blocks_escape() {
 }
 
 #[test]
+fn recovery_prompt_offers_a_restore_for_each_copy_and_shows_its_failure() {
+    let mut harness = Harness::new();
+    let copy = |contents: &str, restore_error: Option<&str>| crate::state::RecoveryCopy {
+        contents: contents.to_owned(),
+        saved_at: std::time::SystemTime::now(),
+        restore_error: restore_error.map(str::to_owned),
+    };
+    harness.state.recovery_prompt = Some(crate::state::RecoveryPrompt {
+        scene: None,
+        copies: vec![
+            copy("newest", Some("строка 1: ошибка разбора")),
+            copy("older", None),
+        ],
+        errors: Vec::new(),
+    });
+
+    let mut dock = default_layout();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness.ctx.run_ui(input, |ui| show(ui, state, &mut dock));
+        output.textures_delta.clear();
+        output.shapes
+    };
+    // Окно получает размер на втором кадре: надписи первого кадра могут отсутствовать.
+    frame(&mut harness, Vec::new());
+    let shapes = frame(&mut harness, Vec::new());
+    assert!(find_text(&shapes, "Последняя").is_some());
+    assert!(find_text(&shapes, "Предыдущая").is_some());
+    assert!(find_text(&shapes, "строка 1: ошибка разбора").is_some());
+
+    let restores = find_all_text(&shapes, "Restore");
+    assert_eq!(restores.len(), 2);
+    let at = restores[1];
+    frame(&mut harness, vec![Event::PointerMoved(at)]);
+    frame(&mut harness, vec![button(at, PointerButton::Primary, true)]);
+    frame(
+        &mut harness,
+        vec![button(at, PointerButton::Primary, false)],
+    );
+    assert_eq!(harness.state.actions, [Action::RestoreAutosave(1)]);
+}
+
+#[test]
 fn recovery_prompt_shows_read_errors_without_restore_and_keep_emits_keep() {
     let mut harness = Harness::new();
     let error = "/project/.rve/editor/autosave/~untitled.autosave: Is a directory (os error 21)";
@@ -995,18 +1039,29 @@ fn scene_and_game_views_keep_independent_debug_modes() {
 
 /// Центр первой надписи `text` среди фигур кадра.
 fn find_text(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<Pos2> {
-    fn visit(shape: &egui::Shape, text: &str) -> Option<Pos2> {
+    find_all_text(shapes, text).into_iter().next()
+}
+
+/// Центры всех надписей `text` среди фигур кадра, в порядке отрисовки.
+fn find_all_text(shapes: &[egui::epaint::ClippedShape], text: &str) -> Vec<Pos2> {
+    fn visit(shape: &egui::Shape, text: &str, found: &mut Vec<Pos2>) {
         match shape {
             egui::Shape::Text(shape) if shape.galley.text() == text => {
-                Some(shape.pos + shape.galley.rect.center().to_vec2())
+                found.push(shape.pos + shape.galley.rect.center().to_vec2());
             }
-            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| visit(shape, text)),
-            _ => None,
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, text, found);
+                }
+            }
+            _ => {}
         }
     }
-    shapes
-        .iter()
-        .find_map(|clipped| visit(&clipped.shape, text))
+    let mut found = Vec::new();
+    for clipped in shapes {
+        visit(&clipped.shape, text, &mut found);
+    }
+    found
 }
 
 #[test]

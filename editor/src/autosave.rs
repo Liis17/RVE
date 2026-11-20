@@ -750,6 +750,42 @@ mod tests {
     }
 
     #[test]
+    fn third_write_replaces_the_oldest_of_two_kept_generations() {
+        let project = TempDir::new();
+        let store = AutosaveStore::for_project(&project.0);
+        store.write(None, "first").unwrap();
+        store.write(None, "second").unwrap();
+        assert_eq!(texts(&store, None), ["second", "first"]);
+
+        store.write(None, "third").unwrap();
+        assert_eq!(texts(&store, None), ["third", "second"]);
+    }
+
+    #[test]
+    fn read_returns_the_readable_copies_and_reports_the_broken_slot() {
+        let project = TempDir::new();
+        let store = AutosaveStore::for_project(&project.0);
+        let scene = path("/scenes/a.rvescene");
+        std::fs::create_dir_all(&store.legacy_dir).unwrap();
+        std::fs::write(store.legacy_file(Some(&scene)), "legacy").unwrap();
+        store.write(Some(&scene), "first").unwrap();
+        let broken = store.slot(Some(&scene), "b");
+        std::fs::write(&broken, "без заголовка").unwrap();
+
+        let found = store.read(Some(&scene));
+        assert_eq!(
+            found
+                .copies
+                .iter()
+                .map(|copy| copy.contents.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "legacy"]
+        );
+        assert_eq!(found.errors.len(), 1);
+        assert!(found.errors[0].starts_with(&broken.display().to_string()));
+    }
+
+    #[test]
     fn age_text_is_relative_and_never_negative() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
         let ago = |seconds: u64| now - Duration::from_secs(seconds);

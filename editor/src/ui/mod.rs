@@ -220,11 +220,17 @@ fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {
         ui.add_space(8.0);
         let now = std::time::SystemTime::now();
         for (index, copy) in prompt.copies.iter().enumerate() {
+            let title = if index == 0 {
+                "Последняя"
+            } else {
+                "Предыдущая"
+            };
             ui.horizontal(|ui| {
+                ui.label(title);
+                ui.label(age_text(copy.saved_at, now));
                 if ui.button("Restore").clicked() {
                     action = Some(Action::RestoreAutosave(index));
                 }
-                ui.label(age_text(copy.saved_at, now));
             });
             if let Some(error) = &copy.restore_error {
                 ui.colored_label(ui.visuals().error_fg_color, error);

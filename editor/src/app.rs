@@ -3415,6 +3415,50 @@ mod tests {
     }
 
     #[test]
+    fn broken_newest_copy_is_skipped_by_restoring_the_previous_one_from_the_same_window() {
+        let previous = EditorScene::new_untitled()
+            .unwrap()
+            .document()
+            .to_toml()
+            .unwrap();
+        let mut app = EditorApp::new(None, None, None, false);
+        app.state.recovery_prompt = Some(RecoveryPrompt {
+            scene: None,
+            copies: vec![
+                RecoveryCopy {
+                    contents: "[[objects]\n".to_owned(),
+                    saved_at: std::time::SystemTime::UNIX_EPOCH,
+                    restore_error: None,
+                },
+                RecoveryCopy {
+                    contents: previous,
+                    saved_at: std::time::SystemTime::UNIX_EPOCH,
+                    restore_error: None,
+                },
+            ],
+            errors: Vec::new(),
+        });
+
+        app.state.action(Action::RestoreAutosave(0));
+        app.run_actions();
+        let prompt = app
+            .state
+            .recovery_prompt
+            .as_ref()
+            .expect("window stays open");
+        assert!(prompt.copies[0].restore_error.is_some());
+        assert!(prompt.copies[1].restore_error.is_none());
+
+        app.state.action(Action::RestoreAutosave(1));
+        app.run_actions();
+        assert!(app.state.recovery_prompt.is_none());
+        assert_eq!(
+            app.state.scene.as_ref().unwrap().document().objects.len(),
+            2
+        );
+    }
+
+    #[test]
     fn autosave_warning_is_logged_once_while_it_stays_the_same() {
         let root = temp_project("autosave-warning");
         // Прежний файл `~untitled` — каталог: вторая запись не может его удалить.
