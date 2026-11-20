@@ -783,6 +783,7 @@ pub(crate) fn record_particles(
     let needs_compute = pass.works.iter().any(|work| {
         work.owner || (work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Alpha)
     });
+    let stages = particle_stages(pass.works);
     if needs_compute {
         // Предыдущие кадры и виды могли читать или писать общие буферы: барьер на всё.
         let barrier = vk::MemoryBarrier2::default()
@@ -799,7 +800,7 @@ pub(crate) fn record_particles(
     }
     // Очистка новых буферов перед первым спавном эмиттера.
     let mut cleared = false;
-    for work in pass.works.iter().filter(|work| work.owner && work.clear) {
+    for work in pass.works.iter().filter(|work| clears(work)) {
         // SAFETY: the buffer was created with TRANSFER_DST and is not in use by pending work.
         unsafe { device.cmd_fill_buffer(command_buffer, work.buffer, 0, vk::WHOLE_SIZE, 0) };
         cleared = true;
@@ -819,7 +820,7 @@ pub(crate) fn record_particles(
     }
 
     for work in pass.works.iter().filter(|work| work.owner) {
-        for spawn in &work.spawns {
+        for spawn in work.spawns.iter().filter(|spawn| spawn.count > 0) {
             let push = SpawnPushGpu {
                 transform: work.transform,
                 first_slot: spawn.first_slot,
@@ -851,11 +852,7 @@ pub(crate) fn record_particles(
         }
     }
     compute_barrier(device, command_buffer);
-    for work in pass
-        .works
-        .iter()
-        .filter(|work| work.owner && work.sim_count > 0 && work.sim_step > 0.0)
-    {
+    for work in pass.works.iter().filter(|work| simulates(work)) {
         let push = SimPushGpu {
             step: work.sim_step,
             draw_first: work.sim_first,
@@ -875,14 +872,21 @@ pub(crate) fn record_particles(
             pass.pipelines.sim,
         );
     }
+    if stages.simulation {
+        mark_pass(
+            device,
+            command_buffer,
+            timestamps,
+            GpuPass::ParticleSimulation,
+        );
+    }
     // Ключи alpha сортируются в каждом виде, где эмиттер рисуется: после симуляции.
     compute_barrier(device, command_buffer);
-    for work in pass
-        .works
-        .iter()
-        .filter(|work| work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Alpha)
-    {
+    for work in pass.works.iter().filter(|work| sorts(work)) {
         record_sort(device, command_buffer, pass, work, target.depth_set);
+    }
+    if stages.sort {
+        mark_pass(device, command_buffer, timestamps, GpuPass::ParticleSort);
     }
 
     // Публикуем результаты симуляции и сортировки для вершинного и фрагментного чтения.
@@ -899,7 +903,56 @@ pub(crate) fn record_particles(
     unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 
     record_draws(device, command_buffer, target, render_extent, pass);
-    mark_pass(device, command_buffer, timestamps, GpuPass::Particles);
+    if stages.draw {
+        mark_pass(device, command_buffer, timestamps, GpuPass::ParticleDraw);
+    }
+}
+
+/// Стадии частиц вида, которые запишет [`record_particles`]: общие для записи предикаты.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ParticleStages {
+    /// Clear буферов, spawn или шаг симуляции владельца.
+    pub(crate) simulation: bool,
+    /// Сортировка хотя бы одного alpha-эмиттера вида.
+    pub(crate) sort: bool,
+    /// Billboards хотя бы одного видимого эмиттера вида.
+    pub(crate) draw: bool,
+}
+
+/// Какие стадии записываются для работ вида. Стадия без команд не получает метку.
+pub(crate) fn particle_stages(works: &[ParticleWork]) -> ParticleStages {
+    ParticleStages {
+        simulation: works
+            .iter()
+            .any(|work| clears(work) || spawns(work) || simulates(work)),
+        sort: works.iter().any(sorts),
+        draw: works.iter().any(draws),
+    }
+}
+
+/// Владелец очищает буферы перед первым спавном.
+fn clears(work: &ParticleWork) -> bool {
+    work.owner && work.clear
+}
+
+/// Владелец записывает хотя бы один spawn (пустые батчи не диспатчатся).
+fn spawns(work: &ParticleWork) -> bool {
+    work.owner && work.spawns.iter().any(|spawn| spawn.count > 0)
+}
+
+/// Владелец записывает шаг симуляции.
+fn simulates(work: &ParticleWork) -> bool {
+    work.owner && work.sim_count > 0 && work.sim_step > 0.0
+}
+
+/// Видимый alpha-эмиттер сортируется в этом виде.
+fn sorts(work: &ParticleWork) -> bool {
+    work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Alpha
+}
+
+/// Видимый эмиттер рисуется в этом виде.
+fn draws(work: &ParticleWork) -> bool {
+    work.visible && work.draw_count > 0
 }
 
 /// Барьер между compute-проходами частиц: запись storage-буферов → чтение и запись.
@@ -959,11 +1012,7 @@ fn record_draws(
 ) {
     let mut additive = Vec::new();
     let mut alpha = Vec::new();
-    for work in pass
-        .works
-        .iter()
-        .filter(|work| work.visible && work.draw_count > 0)
-    {
+    for work in pass.works.iter().filter(|work| draws(work)) {
         match work.blend {
             ParticleBlend::Additive => additive.push(work),
             ParticleBlend::Alpha => alpha.push(work),
@@ -1189,6 +1238,117 @@ mod tests {
     #[test]
     fn particle_storage_stride_matches_shader_struct() {
         assert_eq!(PARTICLE_GPU_SIZE, 48);
+    }
+
+    fn work(owner: bool, blend: ParticleBlend) -> ParticleWork {
+        ParticleWork {
+            set: vk::DescriptorSet::null(),
+            buffer: vk::Buffer::null(),
+            owner,
+            clear: false,
+            seed: 0,
+            capacity: 64,
+            transform: [[0.0; 4]; 4],
+            spawns: Vec::new(),
+            sim_step: 0.0,
+            sim_first: 0,
+            sim_count: 0,
+            visible: false,
+            draw_first: 0,
+            draw_count: 0,
+            blend,
+            sort_count: 0,
+            distance_sq: 0.0,
+        }
+    }
+
+    fn spawn(count: u32) -> crate::particles::SpawnBatch {
+        crate::particles::SpawnBatch {
+            first_serial: 0,
+            first_slot: 0,
+            count,
+            pre_age: crate::particles::PreAge::Random,
+            origin: crate::particles::ParticleAabb {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+        }
+    }
+
+    fn stages(simulation: bool, sort: bool, draw: bool) -> ParticleStages {
+        ParticleStages {
+            simulation,
+            sort,
+            draw,
+        }
+    }
+
+    #[test]
+    fn particle_stages_of_empty_pass_are_absent() {
+        assert_eq!(particle_stages(&[]), stages(false, false, false));
+    }
+
+    #[test]
+    fn owner_without_spawn_or_sim_count_records_no_simulation() {
+        let owner = work(true, ParticleBlend::Additive);
+        assert_eq!(particle_stages(&[owner]), stages(false, false, false));
+    }
+
+    #[test]
+    fn owner_with_zero_count_spawn_and_zero_sim_count_records_no_simulation() {
+        // Шаг задан, но диспатчей нет: пустой spawn и `sim_count == 0`.
+        let mut owner = work(true, ParticleBlend::Additive);
+        owner.sim_step = 1.0;
+        owner.spawns.push(spawn(0));
+        assert_eq!(particle_stages(&[owner]), stages(false, false, false));
+    }
+
+    #[test]
+    fn clear_only_owner_records_simulation_stage_alone() {
+        let mut owner = work(true, ParticleBlend::Additive);
+        owner.clear = true;
+        assert_eq!(particle_stages(&[owner]), stages(true, false, false));
+    }
+
+    #[test]
+    fn spawn_dispatch_alone_records_simulation() {
+        let mut owner = work(true, ParticleBlend::Additive);
+        owner.spawns.push(spawn(4));
+        assert_eq!(particle_stages(&[owner]), stages(true, false, false));
+    }
+
+    #[test]
+    fn invisible_owner_simulates_without_sort_or_draw() {
+        let mut owner = work(true, ParticleBlend::Alpha);
+        owner.sim_step = 1.0;
+        owner.sim_count = 8;
+        owner.draw_count = 8;
+        assert_eq!(particle_stages(&[owner]), stages(true, false, false));
+    }
+
+    #[test]
+    fn view_without_owner_records_only_draw() {
+        let mut view = work(false, ParticleBlend::Additive);
+        view.visible = true;
+        view.draw_count = 4;
+        assert_eq!(particle_stages(&[view]), stages(false, false, true));
+    }
+
+    fn alpha_view() -> ParticleWork {
+        let mut alpha = work(false, ParticleBlend::Alpha);
+        alpha.visible = true;
+        alpha.draw_count = 4;
+        alpha.sort_count = 4;
+        alpha
+    }
+
+    #[test]
+    fn alpha_sorts_in_each_view_that_draws_it() {
+        assert_eq!(particle_stages(&[alpha_view()]), stages(false, true, true));
+        assert_eq!(
+            particle_stages(&[alpha_view(), alpha_view()]),
+            stages(false, true, true)
+        );
     }
 }
 

@@ -449,6 +449,158 @@ pub(crate) fn texture_mip_destination_shader_barrier(
     )
 }
 
+/// Плотная раскладка RGBA8 mip-цепочки: `(уровень, смещение от начала цепочки, размер)`.
+pub(crate) fn mip_chain_layout(
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+) -> Vec<(u32, usize, vk::Extent2D)> {
+    let mut offset = 0;
+    (0..mip_levels)
+        .map(|level| {
+            let extent = mip_extent(width, height, level);
+            let entry = (level, offset, extent);
+            offset += extent.width as usize * extent.height as usize * 4;
+            entry
+        })
+        .collect()
+}
+
+/// Сумма по области texel-ов уровня 0: `[R, G, B, A, масса]`. RGB — взвешенная сумма `2c - 255`,
+/// alpha — взвешенная сумма `a`. `f32` вдвое уже `f64`: суммы уровня 1 для 4096² занимают 80 МиБ.
+/// Для степеней двойки веса точные, суммы целые; выше 2^24 возможны отличия в последнем знаке.
+type MipSum = [f32; 5];
+
+/// Строит RGBA8 mip-цепочку normal map. Уровень 0 копируется без изменений; уровни `n >= 1`
+/// содержат нормализованное среднее векторов области уровня 0 (через цепочку взвешенных сумм),
+/// alpha — линейное среднее с теми же весами. Крупные буферы резервируются через
+/// `try_reserve_exact`: при нехватке памяти возвращается `InvalidTexture`, а не паника.
+pub(crate) fn normal_mip_chain(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<Vec<u8>, RenderError> {
+    let mip_levels = mip_level_count(width, height);
+    let layout = mip_chain_layout(width, height, mip_levels);
+    let total = layout.last().map_or(0, |(_, offset, extent)| {
+        offset + extent.width as usize * extent.height as usize * 4
+    });
+    let mut chain = Vec::new();
+    chain
+        .try_reserve_exact(total)
+        .map_err(|_| normal_mip_allocation_error(total))?;
+    chain.resize(total, 0);
+    chain[..rgba.len()].copy_from_slice(rgba);
+    let mut sums: Vec<MipSum> = Vec::new();
+    for level in 1..mip_levels {
+        let source = mip_extent(width, height, level - 1);
+        let destination = mip_extent(width, height, level);
+        let sample = |index: usize| -> MipSum {
+            if level == 1 {
+                let texel = &rgba[index * 4..index * 4 + 4];
+                [
+                    f32::from(2 * i16::from(texel[0]) - 255),
+                    f32::from(2 * i16::from(texel[1]) - 255),
+                    f32::from(2 * i16::from(texel[2]) - 255),
+                    f32::from(texel[3]),
+                    1.0,
+                ]
+            } else {
+                sums[index]
+            }
+        };
+        sums = box_sums(source, destination, sample)?;
+        let (_, offset, _) = layout[level as usize];
+        encode_normal_level(&sums, &mut chain[offset..]);
+    }
+    Ok(chain)
+}
+
+fn normal_mip_allocation_error(bytes: usize) -> RenderError {
+    RenderError::InvalidTexture(format!(
+        "не хватает памяти для mip-цепочки normal map: {bytes} байт"
+    ))
+}
+
+/// Весовые ячейки источника для каждого texel-а приёмника по одной оси, в целых единицах
+/// `dst` (без ошибок округления): доля `[d*src/dst, (d+1)*src/dst)` в ячейке `s`.
+fn box_axis_weights(source: u32, destination: u32) -> Vec<Vec<(usize, f32)>> {
+    let (source, destination) = (u64::from(source), u64::from(destination));
+    (0..destination)
+        .map(|index| {
+            let start = index * source;
+            let end = (index + 1) * source;
+            (start / destination..end.div_ceil(destination))
+                .filter_map(|cell| {
+                    let cell_start = cell * destination;
+                    let cell_end = cell_start + destination;
+                    let overlap = end.min(cell_end).saturating_sub(start.max(cell_start));
+                    (overlap > 0)
+                        .then(|| (cell as usize, (overlap as f64 / destination as f64) as f32))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Двумерный box-фильтр сумм: каждый texel приёмника — взвешенная сумма texel-ов источника.
+fn box_sums(
+    source: vk::Extent2D,
+    destination: vk::Extent2D,
+    sample: impl Fn(usize) -> MipSum,
+) -> Result<Vec<MipSum>, RenderError> {
+    let columns = box_axis_weights(source.width, destination.width);
+    let rows = box_axis_weights(source.height, destination.height);
+    let count = destination.width as usize * destination.height as usize;
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| normal_mip_allocation_error(count * std::mem::size_of::<MipSum>()))?;
+    for row in &rows {
+        for column in &columns {
+            let mut sum = [0.0; 5];
+            for &(y, wy) in row {
+                for &(x, wx) in column {
+                    let texel = sample(y * source.width as usize + x);
+                    for (total, value) in sum.iter_mut().zip(texel) {
+                        *total += value * wx * wy;
+                    }
+                }
+            }
+            out.push(sum);
+        }
+    }
+    Ok(out)
+}
+
+/// Кодирует нормализованные векторы и alpha-среднее одного уровня в RGBA8. Нормализация — одно
+/// деление на длину; вычисление идёт в `f64`, как и прежде, поэтому кодирование не меняется.
+fn encode_normal_level(sums: &[MipSum], out: &mut [u8]) {
+    for (index, sum) in sums.iter().enumerate() {
+        let [x, y, z] = [f64::from(sum[0]), f64::from(sum[1]), f64::from(sum[2])];
+        let mass = f64::from(sum[4]);
+        let length = (x * x + y * y + z * z).sqrt();
+        let vector = if length > NORMAL_ZERO_RELATIVE * 255.0 * mass {
+            let inv = 1.0 / length;
+            [x * inv, y * inv, z * inv]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let texel = &mut out[index * 4..index * 4 + 4];
+        for (byte, component) in texel.iter_mut().zip(vector) {
+            *byte = ((component * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        texel[3] = (f64::from(sum[3]) / mass).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Относительный порог нулевой суммы: `|Σ| ≤ NORMAL_ZERO_RELATIVE · 255 · масса` даёт fallback
+/// `(0, 0, 1)`. Порог относительный, потому что ошибка `f32` растёт вместе с величиной суммы:
+/// абсолютный порог не различает шум округления при массе 2^24 и не сводит пару 127/128 с весом
+/// 1/3 к нулю. Для степеней двойки накопленная ошибка не превышает ~3e-6 от `255 · масса`; порог
+/// `1e-4` — с запасом около ×30 над ней и примерно на два порядка ниже шага 8-битного квантования
+/// направления (`2/255`). Средняя длина ниже `1e-4` уже не задаёт направление данными.
+const NORMAL_ZERO_RELATIVE: f64 = 1e-4;
+
 pub(crate) fn material_sampler_info(anisotropy: Option<f32>) -> vk::SamplerCreateInfo<'static> {
     let mut info = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)

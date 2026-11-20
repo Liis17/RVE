@@ -365,7 +365,7 @@ fn run_from_args(
         Some(path) => path.to_owned(),
         None => return fail(2, "в проекте не указана стартовая сцена"),
     };
-    let mut prepared = match load_scene(&resource_handle, &assets, &scene_path) {
+    let mut prepared = match load_scene(&resource_handle, &assets, &scene_path, !headless) {
         Ok(prepared) => prepared,
         Err(error) => return fail(2, format!("ошибка загрузки сцены: {error}")),
     };
@@ -474,6 +474,7 @@ fn run_from_args(
         resource_handle.clone(),
         script_tx.clone(),
         resource_tx.clone(),
+        !headless,
     ) {
         Ok(started) => started,
         Err(error) => {
@@ -512,6 +513,7 @@ fn run_from_args(
             scene_loader: Some(scene_switch::SceneLoader::new(
                 resource_handle.clone(),
                 project.physics.clone(),
+                !headless,
                 !headless,
             )),
             gpu_render: !headless,
