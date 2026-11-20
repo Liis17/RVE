@@ -62,7 +62,7 @@ TOML с таблицами `exposure`, `tonemapping`, `bloom`, `ambient_occlusio
 
 ### Script ABI 12
 
-`RVE_SCRIPT_ABI_VERSION` = 12, `RvePostProcessSettings` (`repr(C)`, плоские поля, коды enum `RVE_EXPOSURE_MODE_*` и `RVE_AO_QUALITY_*`). Host callbacks `get_post_process` и `set_post_process` работают только с камерами. Layout `RveCameraSettings` не менялся: его поля exposure и tonemapper стали проксирующими к постобработке камеры и помечены как устаревшие.
+С ABI v12 доступна структура `RvePostProcessSettings` (`repr(C)`, плоские поля, коды enum `RVE_EXPOSURE_MODE_*` и `RVE_AO_QUALITY_*`). Host callbacks `get_post_process` и `set_post_process` работают только с камерами. Layout `RveCameraSettings` не менялся: его поля exposure и tonemapper стали проксирующими к постобработке камеры и помечены как устаревшие.
 
 В Lua доступен API `post_process` на камере. Вызовы `set_camera_settings` и `set_post_process` в одном кадре применяются по порядку: обе операции меняют одну очередь постобработки камеры. Legacy-прокси читает exposure и tonemapper из эффективной постобработки (с учётом уже поставленных в очередь изменений), а не из `[color]`. Legacy-запись меняет копию постобработки только если значение отличается от эффективного.
 
