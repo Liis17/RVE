@@ -819,21 +819,30 @@ impl PhysicsWorld {
         }
         // Пары, которые обрезанный sweep не сравнил, не переносятся вслепую: narrowphase проверяет
         // их заново, поэтому разошедшиеся пары дают Exit, а пересекающиеся сохраняются.
-        let index_of = |handle: u64| items.binary_search_by_key(&handle, |item| item.key).ok();
-        let mut candidates = Vec::new();
-        for key in self.active_pairs.keys() {
-            if frozen.contains(&BodyHandle(key.first)) && frozen.contains(&BodyHandle(key.second)) {
-                continue;
-            }
-            let (Some(first), Some(second)) = (index_of(key.first), index_of(key.second)) else {
-                continue;
-            };
-            if !output.pair_compared(first, second) {
-                candidates.push(CandidatePair { first, second });
+        let truncated = output.cut.is_some();
+        let mut recheck = Vec::new();
+        if truncated {
+            let index_of = |handle: u64| items.binary_search_by_key(&handle, |item| item.key).ok();
+            for key in self.active_pairs.keys() {
+                if frozen.contains(&BodyHandle(key.first))
+                    && frozen.contains(&BodyHandle(key.second))
+                {
+                    continue;
+                }
+                let (Some(first), Some(second)) = (index_of(key.first), index_of(key.second))
+                else {
+                    continue;
+                };
+                if !output.pair_compared(first, second) {
+                    recheck.push(CandidatePair { first, second });
+                }
             }
         }
-        candidates.extend(output.pairs);
-        candidates.sort_by_key(|pair| (pair.first, pair.second));
+        let mut candidates = output.pairs;
+        if truncated {
+            candidates.extend(recheck);
+            candidates.sort_by_key(|pair| (pair.first, pair.second));
+        }
         for candidate in candidates {
             let (handle_a, collider_a, kind_a, pose_a, layer_a) = &proxies[candidate.first];
             let (handle_b, collider_b, kind_b, pose_b, layer_b) = &proxies[candidate.second];

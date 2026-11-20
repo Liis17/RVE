@@ -10,6 +10,9 @@ pub const MAX_BROADPHASE_COMPARISONS: usize = 1_000_000;
 const AXIS_SWITCH_RATIO: f64 = 1.5;
 /// Если изменилась больше доли `1 / FULL_SORT_CHURN_DIVISOR` тел, порядок пересортировывается целиком.
 const FULL_SORT_CHURN_DIVISOR: usize = 8;
+/// Сортировка вставками делает не больше `INSERTION_SWAPS_PER_BODY · N` перестановок; дальше порядок
+/// доупорядочивается полной сортировкой, чтобы почти перевёрнутый порядок не давал O(N²).
+const INSERTION_SWAPS_PER_BODY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CandidatePair {
@@ -39,7 +42,7 @@ impl std::error::Error for BroadPhaseError {}
 /// Тело для broadphase. Ключ уникален и строго возрастает во входном срезе; по нему порядок
 /// sweep переносится между обновлениями.
 #[derive(Clone, Copy, Debug)]
-pub struct BroadItem {
+pub(crate) struct BroadItem {
     pub key: u64,
     pub bounds: Aabb,
     /// `false` — тело не сравнивается с другими непарными телами (неактивная статика, спящее тело).
@@ -48,7 +51,7 @@ pub struct BroadItem {
 
 /// Результат одного обновления [`BroadPhase`].
 #[derive(Clone, Debug)]
-pub struct BroadPhaseOutput {
+pub(crate) struct BroadPhaseOutput {
     /// Пересекающиеся пары индексов входного среза, по возрастанию `(first, second)`.
     pub pairs: Vec<CandidatePair>,
     /// Выполненные сравнения тел по оси.
@@ -73,7 +76,7 @@ impl BroadPhaseOutput {
 /// Персистентный sweep-and-prune. Порядок по оси переживает обновления: при неизменных ключах
 /// переиспользуется за O(N), при изменении набора досортировывается вставками. Ось выбирается по
 /// разбросу центров относительно размера тел, с гистерезисом.
-pub struct BroadPhase {
+pub(crate) struct BroadPhase {
     /// Ось sweep: 0 — X, 1 — Y, 2 — Z.
     axis: usize,
     /// Ось уже выбрана по оценке; до этого первое обновление с двумя телами выбирает лучшую сразу.
@@ -120,11 +123,10 @@ impl BroadPhase {
             full_sort = true;
         }
         let axis = self.axis;
-        if full_sort {
+        let swap_budget = INSERTION_SWAPS_PER_BODY * items.len();
+        if full_sort || !insertion_sort(&mut self.order, items, axis, swap_budget) {
             self.order
                 .sort_unstable_by(|&a, &b| sweep_order(items, axis, a, b));
-        } else {
-            insertion_sort(&mut self.order, items, axis);
         }
         self.sweep(items)
     }
@@ -174,10 +176,6 @@ impl BroadPhase {
 
     fn sweep(&self, items: &[BroadItem]) -> Result<BroadPhaseOutput, BroadPhaseError> {
         let axis = self.axis;
-        let mut positions = vec![0; items.len()];
-        for (position, &index) in self.order.iter().enumerate() {
-            positions[index] = position;
-        }
         let mut active_paired = Vec::<usize>::new();
         let mut active_unpaired = Vec::<usize>::new();
         let mut pairs = Vec::new();
@@ -222,6 +220,14 @@ impl BroadPhase {
             }
         }
         pairs.sort_by_key(|pair| (pair.first, pair.second));
+        // Позиции нужны только `pair_compared` при обрезке; без неё массив не строится.
+        let mut positions = Vec::new();
+        if cut.is_some() {
+            positions = vec![0; items.len()];
+            for (position, &index) in self.order.iter().enumerate() {
+                positions[index] = position;
+            }
+        }
         Ok(BroadPhaseOutput {
             pairs,
             comparisons,
@@ -239,7 +245,10 @@ fn sweep_order(items: &[BroadItem], axis: usize, a: usize, b: usize) -> Ordering
         .then(a.cmp(&b))
 }
 
-fn insertion_sort(order: &mut [usize], items: &[BroadItem], axis: usize) {
+/// Сортировка вставками. Возвращает `false`, если перестановок стало больше `budget`: тогда порядок
+/// лишь частично упорядочен и его нужно доупорядочить полной сортировкой.
+fn insertion_sort(order: &mut [usize], items: &[BroadItem], axis: usize, budget: usize) -> bool {
+    let mut swaps = 0;
     for index in 1..order.len() {
         let mut position = index;
         while position > 0
@@ -247,8 +256,13 @@ fn insertion_sort(order: &mut [usize], items: &[BroadItem], axis: usize) {
         {
             order.swap(position, position - 1);
             position -= 1;
+            swaps += 1;
+            if swaps > budget {
+                return false;
+            }
         }
     }
+    true
 }
 
 /// Дисперсия центров по оси, делённая на квадрат средней ширины тел. Считается в f64 двумя
@@ -283,7 +297,7 @@ pub fn sweep_and_prune(bounds: &[Aabb]) -> Result<Vec<CandidatePair>, BroadPhase
 /// Used to skip static–static pairs that the narrowphase filter would discard anyway, so they
 /// neither cost comparisons against the limit nor appear in the candidate list.
 ///
-/// Одноразовая обёртка над [`BroadPhase`]: при превышении порога сравнений возвращает ошибку.
+/// Одноразовая обёртка над внутренним `BroadPhase`: при превышении порога сравнений возвращает ошибку.
 pub fn sweep_and_prune_pairable(
     bounds: &[Aabb],
     paired: impl Fn(usize) -> bool,
@@ -307,8 +321,9 @@ pub fn sweep_and_prune_pairable(
 #[cfg(test)]
 mod tests {
     use super::{
-        BroadItem, BroadPhase, BroadPhaseError, CandidatePair, MAX_BROADPHASE_COMPARISONS,
-        MAX_BROADPHASE_ITEMS, sweep_and_prune, sweep_and_prune_pairable,
+        BroadItem, BroadPhase, BroadPhaseError, CandidatePair, INSERTION_SWAPS_PER_BODY,
+        MAX_BROADPHASE_COMPARISONS, MAX_BROADPHASE_ITEMS, insertion_sort, sweep_and_prune,
+        sweep_and_prune_pairable, sweep_order,
     };
     use crate::Aabb;
     use glam::Vec3;
@@ -636,5 +651,155 @@ mod tests {
         assert!(output.pair_compared(0, 1));
         assert!(!output.pair_compared(2, 3));
         assert!(!output.pair_compared(0, 3));
+    }
+
+    #[test]
+    fn empty_and_single_body_updates_yield_no_pairs_and_keep_the_axis() {
+        let mut phase = BroadPhase::default();
+        let spread_z: Vec<BroadItem> = (0..10u64)
+            .map(|key| {
+                let z = key as f32 * 5.0;
+                BroadItem {
+                    key,
+                    bounds: Aabb::new(Vec3::new(0.0, 0.0, z), Vec3::new(1.0, 1.0, z + 1.0))
+                        .unwrap(),
+                    paired: true,
+                }
+            })
+            .collect();
+        phase.update(&spread_z).unwrap();
+        assert_eq!(phase.axis, 2);
+
+        let empty = phase.update(&[]).unwrap();
+        assert!(empty.pairs.is_empty());
+        assert_eq!(empty.cut, None);
+        assert_eq!(phase.axis, 2);
+
+        let single = [BroadItem {
+            key: 7,
+            bounds: Aabb::new(Vec3::ZERO, Vec3::ONE).unwrap(),
+            paired: true,
+        }];
+        let output = phase.update(&single).unwrap();
+        assert!(output.pairs.is_empty());
+        assert_eq!(output.cut, None);
+        assert_eq!(phase.axis, 2);
+    }
+
+    #[test]
+    fn insertion_sort_gives_up_on_reversed_order_and_keeps_nearly_sorted_order() {
+        let items: Vec<BroadItem> = (0..64u64)
+            .map(|key| {
+                let x = -(key as f32);
+                BroadItem {
+                    key,
+                    bounds: Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0))
+                        .unwrap(),
+                    paired: true,
+                }
+            })
+            .collect();
+        // Ключи возрастают, а минимум по X убывает: по возрастанию минимума порядок перевёрнут.
+        let budget = INSERTION_SWAPS_PER_BODY * items.len();
+        let expected: Vec<usize> = (0..items.len()).rev().collect();
+
+        let mut reversed: Vec<usize> = (0..items.len()).collect();
+        assert!(!insertion_sort(&mut reversed, &items, 0, budget));
+        reversed.sort_unstable_by(|&a, &b| sweep_order(&items, 0, a, b));
+        assert_eq!(reversed, expected);
+
+        let mut nearly = expected.clone();
+        nearly.swap(10, 11);
+        assert!(insertion_sort(&mut nearly, &items, 0, budget));
+        assert_eq!(nearly, expected);
+    }
+
+    #[test]
+    fn nearly_reversed_order_through_update_matches_brute_force() {
+        // Ключи прежние, позиции по X перевёрнуты: вставки упираются в бюджет и порядок
+        // досортировывается полностью.
+        let count = 300u64;
+        let box_at =
+            |x: f32| Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 3.0, 1.0, 1.0)).unwrap();
+        let mut phase = BroadPhase::default();
+        let ascending: Vec<BroadItem> = (0..count)
+            .map(|key| BroadItem {
+                key,
+                bounds: box_at(key as f32),
+                paired: true,
+            })
+            .collect();
+        phase.update(&ascending).unwrap();
+
+        let reversed: Vec<BroadItem> = (0..count)
+            .map(|key| BroadItem {
+                key,
+                bounds: box_at((count - 1 - key) as f32),
+                paired: true,
+            })
+            .collect();
+        let output = phase.update(&reversed).unwrap();
+        let bounds: Vec<Aabb> = reversed.iter().map(|item| item.bounds).collect();
+        let paired = vec![true; reversed.len()];
+        assert_eq!(output.cut, None);
+        assert_eq!(output.pairs, brute_force_pairs(&bounds, &paired));
+        assert!(!output.pairs.is_empty());
+    }
+
+    #[test]
+    fn small_churn_insertion_path_matches_brute_force_and_a_fresh_phase() {
+        // Разброс по X доминирует, поэтому ось не меняется. Чётные раунды двигают тела с теми же
+        // ключами, нечётные добавляют и удаляют по три тела: churn меньше len/8, порядок
+        // досортировывается вставками.
+        let make = |random: &mut Lcg| {
+            let x = random.range(0.0, 400.0);
+            let y = random.range(0.0, 1.0);
+            let size = Vec3::new(random.range(1.0, 4.0), 1.0, 1.0);
+            let min = Vec3::new(x, y, 0.0);
+            (Aabb::new(min, min + size).unwrap(), random.unit() < 0.8)
+        };
+        let mut random = Lcg(23);
+        let mut bodies: BTreeMap<u64, (Aabb, bool)> = BTreeMap::new();
+        for key in 0..250u64 {
+            bodies.insert(key * 4, make(&mut random));
+        }
+
+        let mut phase = BroadPhase::default();
+        for round in 0..8u64 {
+            let items = items_from(&bodies);
+            let bounds: Vec<Aabb> = items.iter().map(|item| item.bounds).collect();
+            let paired: Vec<bool> = items.iter().map(|item| item.paired).collect();
+            let output = phase.update(&items).unwrap();
+            let mut fresh = BroadPhase::default();
+            let fresh_output = fresh.update(&items).unwrap();
+            assert_eq!(output.cut, None, "round {round}");
+            assert_eq!(
+                output.pairs,
+                brute_force_pairs(&bounds, &paired),
+                "round {round}"
+            );
+            assert_eq!(output.pairs, fresh_output.pairs, "round {round}");
+            assert_eq!(phase.axis, fresh.axis, "round {round}");
+            assert_eq!(phase.order, fresh.order, "round {round}");
+
+            let keys: Vec<u64> = bodies.keys().copied().collect();
+            if round % 2 == 1 {
+                for index in 0..3 {
+                    let victim = keys[(round as usize * 17 + index * 41) % keys.len()];
+                    bodies.remove(&victim);
+                    let anchor = keys[(round as usize * 29 + index * 67 + 5) % keys.len()];
+                    let newcomer = make(&mut random);
+                    bodies.insert(anchor + 1 + index as u64, newcomer);
+                }
+            }
+            for index in 0..5 {
+                let key = keys[(round as usize * 13 + index * 97) % keys.len()];
+                let dx = random.range(-0.1, 0.1);
+                if let Some((bounds, _)) = bodies.get_mut(&key) {
+                    bounds.min.x += dx;
+                    bounds.max.x += dx;
+                }
+            }
+        }
     }
 }
