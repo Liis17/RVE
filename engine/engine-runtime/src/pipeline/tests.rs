@@ -4029,6 +4029,7 @@ kind = \"dynamic\"
         resources.handle(),
         engine_project::PhysicsSettings::default(),
         false,
+        false,
     );
     let world =
         World::from_document(&SceneDocument::parse("levels/a.rvescene", START).unwrap()).unwrap();
@@ -4101,6 +4102,7 @@ return Switcher
     let loader = SceneLoader::new(
         resources.handle(),
         engine_project::PhysicsSettings::default(),
+        false,
         false,
     );
     let (render_tx, render_rx) = flume::unbounded();
