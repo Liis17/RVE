@@ -182,6 +182,103 @@ return Input
     assert!(modules.shutdown().is_empty());
 }
 
+#[test]
+fn scripts_see_the_project_string_tables_language() {
+    let document = SceneDocument::parse(
+        "input.rvescene",
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    )
+    .unwrap();
+    let world = World::from_document(&document).unwrap();
+    let script = r#"
+local Input = {}
+function Input:on_update()
+  if rve.ui.language() == "ru" then
+    self.transform.position = { x = 9, y = 0, z = 0 }
+  end
+end
+return Input
+"#;
+    let (script_tx, script_rx) = flume::unbounded();
+    let (frame_tx, frame_rx) = flume::bounded(1);
+    let (render_tx, render_rx) = flume::unbounded();
+    let input = test_input();
+    let mut localization = engine_gui::strings::Localization::new(
+        "en",
+        BTreeMap::from([
+            ("en".to_owned(), engine_gui::strings::StringTable::default()),
+            ("ru".to_owned(), engine_gui::strings::StringTable::default()),
+        ]),
+    )
+    .unwrap();
+    localization.set_language("ru").unwrap();
+    let mut modules = ModuleHost::new();
+    let thread = start_scripts(
+        &mut modules,
+        world,
+        ScriptThreadConfig {
+            scene_loader: None,
+            platform: Default::default(),
+            gpu_render: false,
+            ui: crate::game_ui::PreparedUi {
+                localization: Some(localization),
+                ..crate::game_ui::PreparedUi::default()
+            },
+            ui_text_focus: Default::default(),
+            scene_name: "input.rvescene".to_owned(),
+            enabled_scenes: Vec::new(),
+            save_path: None,
+            save_schema: engine_script::SaveSchema::default(),
+            cursor: CursorControl::default(),
+            sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
+            input_settings: InputSettings::default(),
+            scripts_library: None,
+            prefabs: PreparedPrefabs::default(),
+            physics_geometry: Vec::new(),
+            prefab_loader: flume::unbounded().0,
+            render_resources: flume::unbounded().0,
+            network: None,
+            frame_limit: None,
+            physics_client: None,
+            physics_initialization: None,
+            audio: None,
+            script_module: None,
+            interrupt: ScriptInterruptHandle::new(),
+            clock: Arc::new(FakeClock::default()),
+            background_tick_hz: 30,
+            gamepad_devices: false,
+            control_tx: script_tx.clone(),
+            control_rx: script_rx,
+            frame_tx,
+            render_tx,
+            status: Arc::new(RuntimeStatus::default()),
+            input,
+            #[cfg(feature = "dev-console")]
+            command_catalog: test_command_catalog(),
+        },
+    )
+    .unwrap();
+    thread.ready.recv().unwrap().unwrap();
+    script_tx.send(ScriptControl::Go(Box::default())).unwrap();
+    let snapshot = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(snapshot.camera.position.x, 9.0);
+
+    script_tx.send(ScriptControl::Shutdown).unwrap();
+    thread.stopped.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
+    modules.join_named(SCRIPTS_THREAD).unwrap();
+    assert!(modules.shutdown().is_empty());
+}
+
 #[cfg(feature = "dev-console")]
 fn test_command_catalog() -> Arc<Mutex<CommandCatalogSnapshot>> {
     Arc::new(Mutex::new(CommandCatalogSnapshot::default()))

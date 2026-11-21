@@ -42,6 +42,13 @@ pub(crate) fn explain_asset(
     if trace.icon.as_ref() == Some(path) {
         chains.push(format!("bootstrap.rves → /{path} (AppIcon)"));
     }
+    for (language, table) in &trace.string_tables {
+        if table == path {
+            chains.push(format!(
+                "project.rveproject → /{path} ([localization] {language})"
+            ));
+        }
+    }
     if trace.save_migration.as_ref() == Some(path) {
         chains.push(format!("project.rveproject → /{path} ([save] migration)"));
     }
@@ -138,6 +145,9 @@ fn reason_text(trace: &BuildTrace, path: &VirtualPath, reason: &ArchiveReason) -
     match reason {
         ArchiveReason::SceneFile => "файл включённой сцены всегда лежит в base".to_owned(),
         ArchiveReason::AppIcon => "AppIcon всегда лежит в base".to_owned(),
+        ArchiveReason::StringTable { language } => {
+            format!("таблица строк языка {language:?} из [localization] всегда лежит в base")
+        }
         ArchiveReason::SaveMigration => "мигратор сохранений всегда лежит в base".to_owned(),
         ArchiveReason::Explicit { owner, archive } => {
             match trace.archive_source(path, owner, archive) {
@@ -698,6 +708,36 @@ mod tests {
         assert!(
             scene_text.contains("  сцена /scenes/main.rvescene (корень)\n"),
             "{scene_text}"
+        );
+    }
+
+    #[test]
+    fn string_table_is_explained_by_the_localization_section() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-explain-strings").unwrap();
+        create_demo_like_project(root.path());
+        let settings = root.path().join("project.rveproject");
+        let mut source = std::fs::read_to_string(&settings).unwrap();
+        source.push_str(
+            "[localization]\ndefault_language = \"en\"\ntables = { en = \"/locales/en.toml\" }\n",
+        );
+        std::fs::write(&settings, source).unwrap();
+        std::fs::create_dir_all(root.path().join("Assets/locales")).unwrap();
+        std::fs::write(root.path().join("Assets/locales/en.toml"), "hi = \"Hi\"\n").unwrap();
+
+        let text = explain(root.path(), "/locales/en.toml");
+        assert!(
+            text.starts_with("/locales/en.toml → архив base\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "причина: таблица строк языка \"en\" из [localization] всегда лежит в base\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  project.rveproject → /locales/en.toml ([localization] en)\n"),
+            "{text}"
         );
     }
 

@@ -14,6 +14,14 @@ Parent: [[Index]]
 
 `RectSpec` задаёт для каждой границы пару `anchor + offset` относительно соответствующей границы родителя: `min = parent.min + anchor_min * parent.size + offset_min`, `max = parent.min + anchor_max * parent.size + offset_max`. Растянутые и точечные якоря используют ту же формулу. `pivot` не участвует в разрешении layout; он определяет точку, относительно которой инспектор преобразует позицию и размер в offsets при перемещении/resize. Порядок элементов задаёт отрисовку: родитель до потомков, соседи в document order. ScrollView пересекает clip области с ограничениями предков.
 
+## Локализация
+
+Текст `text.string`, `input_field.placeholder` и пункты `dropdown.options` можно задать ключом таблицы строк: `text.key`, `input_field.placeholder_key`, `dropdown.option_keys`. Ключ непустой и не задаётся вместе с непустым литералом того же поля; для dropdown `selected` проверяется по числу ключей. Литералы работают как раньше.
+
+`strings::StringTable` разбирает TOML одного языка: строковые значения по ключу, вложенные таблицы дают ключи через точку (`[menu] start` = `menu.start`), прочие типы значений — ошибка с ключом. `strings::Localization` хранит таблицы по коду языка, язык по умолчанию (у него обязана быть таблица) и текущий язык. Строка ищется в текущем языке, затем в языке по умолчанию, иначе показывается сам ключ; неизвестный ключ ошибкой не считается.
+
+`UiSystem::set_localization` задаёт таблицы, `set_language` меняет язык (без таблиц или для языка без таблицы — `InvalidValue`, состояние не меняется), `language` и `localize` читают. Строки подставляются в копию элементов канваса при `open` и во всех открытых канвасах при смене языка; UI перерисовывается. Без таблиц ключи показываются как есть, в том числе в превью редактора. `set_text` у Text и `set_options` у Dropdown делают значение литералом: ключ снимается, и смена языка его больше не заменяет; снимок канваса возвращает ключ вместе с элементами. Настройки проекта и загрузка таблиц — [[Engine/EngineProject#Локализация]], API скриптов — [[Engine/EngineScript]].
+
 ## Runtime-состояние, ввод и события
 
 `UiSystem` владеет открытыми канвасами, generation-checked handles, layout, focus/hover, popup, изменяемыми значениями и состояниями видимости/interactability. Канвасы с большим layer рисуются поверх меньших и первыми получают pointer; при одинаковом layer позже открытый канвас выше. Сценовый `ui_canvas.layer`, если задан, заменяет layer документа; его `visible` задаёт начальную видимость.
@@ -34,4 +42,4 @@ Paint собирается в batches по текстуре и clip rect; изо
 
 ## Источники
 
-Схема/layout/state/input/paint: `engine/engine-gui/src/{document,layout,system,input,capture,events,paint}.rs`. Загрузка, транзакции и Lua/ABI bridge: `engine/engine-script/src/{ui_assets,ui,ui_input,ui_lua,abi_host,library}.rs`. GPU-кэш: `engine/engine-ui/src/game.rs`; runtime кадр: `engine/engine-runtime/src/{game_ui,pipeline}.rs`. Сценовая ссылка — [[Engine/EngineScene]], редактор — [[RveEditor]], ABI — [[RveSdk]].
+Схема/layout/state/input/paint/таблицы строк: `engine/engine-gui/src/{document,layout,system,input,capture,events,paint,strings}.rs`. Загрузка, транзакции и Lua/ABI bridge: `engine/engine-script/src/{ui_assets,ui,ui_input,ui_lua,abi_host,library}.rs`. GPU-кэш: `engine/engine-ui/src/game.rs`; runtime кадр: `engine/engine-runtime/src/{game_ui,pipeline}.rs`. Сценовая ссылка — [[Engine/EngineScene]], редактор — [[RveEditor]], ABI — [[RveSdk]].

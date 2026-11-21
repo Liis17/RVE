@@ -102,6 +102,8 @@ pub(crate) struct UiJournal {
     closes: Vec<UiCanvasHandle>,
     /// События фокуса, созданные вызовом; попадают в очередь только после commit.
     events: Vec<QueuedUiEvent>,
+    /// Язык до первой смены в вызове: при откате возвращается вместе с текстами канвасов.
+    language_before: Option<String>,
 }
 
 impl UiJournal {
@@ -124,6 +126,7 @@ impl UiJournal {
     pub(crate) fn commit(&mut self, system: &mut UiSystem) -> Vec<QueuedUiEvent> {
         self.snapshots.clear();
         self.focus_before = None;
+        self.language_before = None;
         self.opened.clear();
         let mut queued = std::mem::take(&mut self.events);
         for canvas in self.closes.drain(..) {
@@ -139,6 +142,11 @@ impl UiJournal {
         self.events.clear();
         for canvas in self.opened.drain(..) {
             let _ = system.close(canvas);
+        }
+        // Сначала язык: он заново подставляет строки во все канвасы, а снимки затем возвращают
+        // тронутые вызовом канвасы к состоянию до него.
+        if let Some(language) = self.language_before.take() {
+            let _ = system.set_language(&language);
         }
         for (canvas, snapshot) in self.snapshots.drain(..) {
             let _ = system.restore_canvas(canvas, snapshot);
@@ -439,6 +447,23 @@ impl ScriptTransaction {
                 .into_iter()
                 .filter_map(|event| queue_live(&state.system, event)),
         );
+        Ok(())
+    }
+
+    /// Текущий язык UI; `None` без таблиц строк проекта.
+    pub(crate) fn ui_language(&self) -> Option<String> {
+        self.ui.borrow().system.language().map(str::to_owned)
+    }
+
+    /// Меняет язык UI для всех канвасов; откат вызова возвращает прежний язык.
+    pub(crate) fn ui_set_language(&mut self, language: &str) -> Result<(), String> {
+        self.ui_write_guard()?;
+        let mut state = self.ui.borrow_mut();
+        let previous = state.system.language().map(str::to_owned);
+        state.system.set_language(language).map_err(ui_error)?;
+        if self.ui_journal.language_before.is_none() {
+            self.ui_journal.language_before = previous;
+        }
         Ok(())
     }
 

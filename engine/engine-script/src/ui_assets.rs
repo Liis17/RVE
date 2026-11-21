@@ -7,7 +7,9 @@ use crate::host::ScriptHost;
 use engine_files::VirtualPath;
 use engine_gui::document::{AssetKind, UiDocument, asset_kind};
 use engine_gui::paint::UiImageData;
+use engine_gui::strings::{Localization, StringTable};
 use engine_gui::system::UiSystem;
+use engine_project::LocalizationSettings;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -17,6 +19,9 @@ pub struct PreparedUi {
     pub documents: BTreeMap<String, Arc<UiDocument>>,
     pub fonts: BTreeMap<String, Arc<Vec<u8>>>,
     pub images: BTreeMap<String, Arc<UiImageData>>,
+    /// Таблицы строк проекта. Задаются при запуске игры или Play; у UI сцены, загружаемой
+    /// позже, — `None`, и регистрация оставляет текущий язык.
+    pub localization: Option<Localization>,
 }
 
 /// Источник текстов, шрифтов и картинок для `load_ui`. Метки — `/путь` внутри проекта.
@@ -33,6 +38,24 @@ pub fn is_ui_document(path: &VirtualPath) -> bool {
     path.as_str()
         .rsplit_once('.')
         .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("rveui"))
+}
+
+/// Загружает таблицы строк `[localization]` проекта; текущим становится язык по умолчанию.
+/// Нечитаемая или неверная таблица — ошибка с её путём.
+pub fn load_localization(
+    source: &impl UiAssetSource,
+    settings: &LocalizationSettings,
+) -> Result<Localization, String> {
+    let mut tables = BTreeMap::new();
+    for (language, path) in &settings.tables {
+        let path = VirtualPath::parse(path)
+            .map_err(|error| format!("таблица строк {language:?}: {error}"))?;
+        let label = format!("/{}", path.as_str());
+        let text = source.read_text(&label)?;
+        let table = StringTable::parse(&label, &text).map_err(|error| error.to_string())?;
+        tables.insert(language.clone(), table);
+    }
+    Localization::new(settings.default_language.clone(), tables)
 }
 
 /// Загружает документы из путей и все их ассеты. Ошибка разбора, отсутствующий или нечитаемый
@@ -100,6 +123,7 @@ pub struct UiRegistration {
     documents: Vec<(VirtualPath, Arc<UiDocument>)>,
     fonts: Vec<(String, Vec<u8>)>,
     images: Vec<(String, [u32; 2])>,
+    localization: Option<Localization>,
 }
 
 impl UiRegistry {
@@ -109,6 +133,7 @@ impl UiRegistry {
             documents: Vec::new(),
             fonts: Vec::new(),
             images: Vec::new(),
+            localization: ui.localization.clone(),
         };
         let mut probe = UiSystem::default();
         for (path, document) in &ui.documents {
@@ -143,6 +168,7 @@ impl UiRegistry {
             documents,
             fonts,
             images,
+            localization,
         } = registration;
         for (path, document) in documents {
             self.documents.insert(path.as_str().to_owned());
@@ -160,6 +186,9 @@ impl UiRegistry {
                 .register_image(&path, size)
                 .expect("image registration was validated during UI preparation");
             self.images.insert(path);
+        }
+        if let Some(localization) = localization {
+            system.set_localization(localization);
         }
     }
 
@@ -306,5 +335,61 @@ mod tests {
             registry.register(&mut host, &prepared).is_err(),
             "failed font must not be marked registered"
         );
+    }
+
+    fn localization_settings(tables: &[(&str, &str)]) -> LocalizationSettings {
+        LocalizationSettings {
+            default_language: "en".to_owned(),
+            tables: tables
+                .iter()
+                .map(|(language, path)| ((*language).to_owned(), (*path).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn string_tables_load_from_the_source() {
+        let source = Memory {
+            texts: BTreeMap::from([
+                ("/locales/en.toml".to_owned(), "hi = \"Hi\"\n".to_owned()),
+                (
+                    "/locales/ru.toml".to_owned(),
+                    "hi = \"Привет\"\n".to_owned(),
+                ),
+            ]),
+            ..Memory::default()
+        };
+        let mut localization = load_localization(
+            &source,
+            &localization_settings(&[("en", "/locales/en.toml"), ("ru", "locales/ru.toml")]),
+        )
+        .unwrap();
+        assert_eq!(localization.language(), "en");
+        assert_eq!(localization.resolve("hi"), "Hi");
+        localization.set_language("ru").unwrap();
+        assert_eq!(localization.resolve("hi"), "Привет");
+    }
+
+    #[test]
+    fn missing_or_broken_string_table_names_its_path() {
+        let source = Memory {
+            texts: BTreeMap::from([("/locales/en.toml".to_owned(), "hi = 1\n".to_owned())]),
+            ..Memory::default()
+        };
+        let broken = load_localization(
+            &source,
+            &localization_settings(&[("en", "/locales/en.toml")]),
+        )
+        .unwrap_err();
+        assert!(
+            broken.contains("/locales/en.toml") && broken.contains("hi"),
+            "{broken}"
+        );
+        let missing = load_localization(
+            &source,
+            &localization_settings(&[("en", "/locales/xx.toml")]),
+        )
+        .unwrap_err();
+        assert!(missing.contains("/locales/xx.toml"), "{missing}");
     }
 }

@@ -6,6 +6,7 @@ pub mod events;
 pub mod input;
 pub mod layout;
 pub mod paint;
+pub mod strings;
 pub mod system;
 mod text;
 

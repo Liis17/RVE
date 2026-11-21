@@ -1,7 +1,7 @@
 use crate::input_settings::InputSettings;
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,56 @@ pub struct ProjectSettings {
     /// Схема сохранений игры: `[save]`. Значения по умолчанию не сериализуются.
     #[serde(default, skip_serializing_if = "SaveSettings::is_default")]
     pub save: SaveSettings,
+    /// Таблицы строк игрового UI: `[localization]`. Без секции ключи показываются как есть.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub localization: Option<LocalizationSettings>,
+}
+
+/// Локализация проекта: таблица строк на каждый язык и язык по умолчанию.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalizationSettings {
+    /// Язык при запуске и запасной язык для отсутствующих строк; у него обязана быть таблица.
+    pub default_language: String,
+    /// Код языка `[A-Za-z0-9_-]{1,32}` → виртуальный путь таблицы строк в Assets.
+    pub tables: BTreeMap<String, String>,
+}
+
+impl LocalizationSettings {
+    fn validate(&self) -> Result<(), String> {
+        if self.tables.is_empty() {
+            return Err("localization.tables должен содержать хотя бы один язык".to_owned());
+        }
+        let mut paths = HashSet::new();
+        for (language, path) in &self.tables {
+            if !is_language_code(language) {
+                return Err(format!(
+                    "localization.tables: код языка {language:?} должен соответствовать [A-Za-z0-9_-]{{1,32}}"
+                ));
+            }
+            let virtual_path = VirtualPath::parse(path)
+                .map_err(|error| format!("localization.tables.{language}: {error}"))?;
+            if !paths.insert(virtual_path) {
+                return Err(format!(
+                    "localization.tables.{language}: путь {path:?} уже занят другим языком"
+                ));
+            }
+        }
+        if !self.tables.contains_key(&self.default_language) {
+            return Err(format!(
+                "localization.default_language {:?} отсутствует в localization.tables",
+                self.default_language
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_language_code(code: &str) -> bool {
+    (1..=32).contains(&code.len())
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 /// Наибольшее число слоёв проекта; `layer` объекта меньше этого значения.
@@ -405,6 +455,9 @@ impl ProjectSettings {
         self.input.validate()?;
         self.tags.validate()?;
         self.layers.validate()?;
+        if let Some(localization) = &self.localization {
+            localization.validate()?;
+        }
         self.save.validate()?;
         if let Some(path) = &self.heavy_scripts
             && !is_relative_project_path(path)
@@ -585,6 +638,59 @@ mod tests {
 
     fn project(scene_lines: &str) -> String {
         format!("id = \"demo-game\"\nname = \"Demo Game\"\nversion = \"1.2.3\"\n{scene_lines}")
+    }
+
+    #[test]
+    fn localization_parses_round_trips_and_is_optional() {
+        const SCENE: &str = "[[scenes]]\npath = \"scene.rvescene\"\n";
+        let plain = ProjectSettings::parse(&project(SCENE)).unwrap();
+        assert_eq!(plain.localization, None);
+        assert!(!plain.to_toml().unwrap().contains("localization"));
+
+        let source = project(&format!(
+            "{SCENE}[localization]\ndefault_language = \"en\"\ntables = {{ en = \"/locales/en.toml\", pt-BR = \"/locales/pt.toml\" }}\n"
+        ));
+        let settings = ProjectSettings::parse(&source).unwrap();
+        let localization = settings.localization.as_ref().unwrap();
+        assert_eq!(localization.default_language, "en");
+        assert_eq!(localization.tables["pt-BR"], "/locales/pt.toml");
+        let again = ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap();
+        assert_eq!(again, settings);
+    }
+
+    #[test]
+    fn localization_rejects_bad_languages_paths_and_default() {
+        let cases = [
+            ("default_language = \"en\"\ntables = {}", "хотя бы один"),
+            (
+                "default_language = \"de\"\ntables = { en = \"/en.toml\" }",
+                "default_language",
+            ),
+            (
+                "default_language = \"en\"\ntables = { \"e n\" = \"/en.toml\" }",
+                "код языка",
+            ),
+            (
+                "default_language = \"en\"\ntables = { en = \"../en.toml\" }",
+                "localization.tables.en",
+            ),
+            (
+                "default_language = \"en\"\ntables = { en = \"/a.toml\", ru = \"/a.toml\" }",
+                "уже занят",
+            ),
+            (
+                "default_language = \"en\"\ntables = { en = \"/en.toml\" }\nextra = 1",
+                "extra",
+            ),
+            ("tables = { en = \"/en.toml\" }", "default_language"),
+        ];
+        for (section, needle) in cases {
+            let source = project(&format!(
+                "[[scenes]]\npath = \"scene.rvescene\"\n[localization]\n{section}\n"
+            ));
+            let error = ProjectSettings::parse(&source).unwrap_err();
+            assert!(error.contains(needle), "{section}: {error}");
+        }
     }
 
     #[test]

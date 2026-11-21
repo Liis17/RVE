@@ -30,7 +30,8 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 24 appends window and file dialog callbacks after the v23 quit callback.
 /// Version 25 appends the nullable `interrupt` flag after the v24 file dialog callbacks.
 /// Version 26 appends audio fade, group effect and streaming callbacks after the v25 interrupt flag.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 26;
+/// Version 27 appends the UI language callbacks after the v26 audio tail.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 27;
 
 /// Validate an external property write before any `Script::set_property` hook runs.
 pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
@@ -1750,6 +1751,11 @@ pub type RveUiSetImageFn =
     unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32, path: RveStr) -> u32;
 /// Moves focus to a focusable element.
 pub type RveUiFocusFn = unsafe extern "C" fn(ctx: *mut c_void, canvas: u64, element: u32) -> u32;
+/// Writes the current UI language as a call-scoped string value; `false` without project string
+/// tables. Appended in ABI v27.
+pub type RveUiLanguageFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveValue) -> bool;
+/// Switches the UI language of every canvas; returns an `RVE_UI_*` status. Appended in ABI v27.
+pub type RveUiSetLanguageFn = unsafe extern "C" fn(ctx: *mut c_void, language: RveStr) -> u32;
 /// Guest `on_ui_event` callback.
 pub type RveUiEventFn = unsafe extern "C" fn(
     instance: *mut c_void,
@@ -2020,6 +2026,10 @@ pub struct RveHost {
     pub audio_get_source_playback: Option<RveAudioGetPlaybackFn>,
     /// Writes an audio source's streaming and fade-in settings. Appended in ABI v26.
     pub audio_set_source_playback: Option<RveAudioSetPlaybackFn>,
+    /// Reads the current UI language. Appended in ABI v27.
+    pub ui_language: Option<RveUiLanguageFn>,
+    /// Switches the UI language. Appended in ABI v27.
+    pub ui_set_language: Option<RveUiSetLanguageFn>,
 }
 
 impl RveHost {
@@ -2976,7 +2986,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -3030,7 +3040,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -3057,7 +3067,7 @@ mod tests {
     fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
         use std::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(size_of::<super::RveScriptTime>(), 40);
         assert_eq!(align_of::<super::RveScriptTime>(), 8);
@@ -3126,7 +3136,7 @@ mod tests {
     fn abi21_callbacks_append_after_the_abi20_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         assert_eq!(
             offset_of!(super::RveHost, save_set),
             offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()
@@ -3197,7 +3207,7 @@ mod tests {
     fn abi23_app_quit_callback_appends_after_the_scene_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(
             offset_of!(super::RveHost, app_quit),
@@ -3214,7 +3224,7 @@ mod tests {
     fn abi24_window_and_dialog_callbacks_append_after_the_abi23_quit_callback() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         let pointer = size_of::<usize>();
         assert_eq!(size_of::<Option<super::RveWindowFullscreenFn>>(), pointer);
         assert_eq!(
@@ -3243,7 +3253,7 @@ mod tests {
     fn abi25_interrupt_flag_appends_after_the_abi24_dialog_callbacks() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         let pointer = size_of::<usize>();
         assert_eq!(
             offset_of!(super::RveHost, interrupt),
@@ -3259,7 +3269,7 @@ mod tests {
     fn abi26_audio_callbacks_append_after_the_abi25_interrupt_flag() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
         let pointer = size_of::<usize>();
         let tail = [
             offset_of!(super::RveHost, audio_stop_source_fade),
@@ -3273,10 +3283,31 @@ mod tests {
         for pair in tail.windows(2) {
             assert_eq!(pair[1], pair[0] + pointer);
         }
-        assert_eq!(size_of::<super::RveHost>(), tail[5] + pointer);
+        assert_eq!(offset_of!(super::RveHost, ui_language), tail[5] + pointer);
         assert_eq!(size_of::<super::RveAudioPlayback>(), 8);
         assert_eq!(offset_of!(super::RveAudioPlayback, fade_in), 4);
         assert_eq!(size_of::<super::RveAudioGroupEffects>(), 24);
         assert_eq!(offset_of!(super::RveAudioGroupEffects, reverb), 12);
+    }
+
+    #[test]
+    fn abi27_ui_language_callbacks_append_after_the_abi26_audio_tail() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        let pointer = size_of::<usize>();
+        assert_eq!(size_of::<Option<super::RveUiLanguageFn>>(), pointer);
+        assert_eq!(
+            offset_of!(super::RveHost, ui_language),
+            offset_of!(super::RveHost, audio_set_source_playback) + pointer
+        );
+        assert_eq!(
+            offset_of!(super::RveHost, ui_set_language),
+            offset_of!(super::RveHost, ui_language) + pointer
+        );
+        assert_eq!(
+            size_of::<super::RveHost>(),
+            offset_of!(super::RveHost, ui_set_language) + pointer
+        );
     }
 }

@@ -39,6 +39,8 @@ pub(crate) enum ArchiveReason {
     SceneFile,
     /// AppIcon из `bootstrap.rves` всегда лежит в `base`.
     AppIcon,
+    /// Таблица строк языка из `[localization]` проекта всегда лежит в `base`.
+    StringTable { language: String },
     /// Lua-мигратор `[save] migration` всегда лежит в `base`.
     SaveMigration,
     /// Явный архив, заданный владельцем; источник ищется в трассе по владельцу и имени архива.
@@ -59,6 +61,8 @@ pub(crate) struct BuildTrace {
     pub(crate) roots: Vec<(Owner, VirtualPath)>,
     /// AppIcon из `bootstrap.rves`, если задан.
     pub(crate) icon: Option<VirtualPath>,
+    /// Таблицы строк `[localization]`: язык и путь.
+    pub(crate) string_tables: Vec<(String, VirtualPath)>,
     /// Lua-мигратор сохранений `[save] migration`, если задан.
     pub(crate) save_migration: Option<VirtualPath>,
     pub(crate) reasons: BTreeMap<VirtualPath, ArchiveReason>,

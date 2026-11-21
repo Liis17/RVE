@@ -885,6 +885,8 @@ fn host(state: &mut HostState) -> RveHost {
         audio_play_clip_playback: None,
         audio_get_source_playback: None,
         audio_set_source_playback: None,
+        ui_language: None,
+        ui_set_language: None,
     }
 }
 
@@ -2807,7 +2809,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -3082,7 +3084,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
 }
 
 #[test]
@@ -3104,7 +3106,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
 }
 
 #[test]
@@ -3128,7 +3130,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
 }
 
 #[test]
@@ -3164,7 +3166,7 @@ fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
         offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
 }
 
 #[test]
@@ -3210,7 +3212,7 @@ fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
 fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
     assert_eq!(RVE_TRIGGER_STAY, 4);
     assert_eq!(
         offset_of!(RveHost, physics_get_collider),
@@ -3227,7 +3229,7 @@ fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
 fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
     assert_eq!(
         offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
@@ -3263,7 +3265,7 @@ fn runtime_physics_value_types_are_c_layout_in_v18() {
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 26);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);
@@ -4063,6 +4065,28 @@ unsafe extern "C" fn ui_focus(ctx: *mut c_void, canvas: u64, element: u32) -> u3
     state.ui_status
 }
 
+/// Отдаёт `ui_text` как язык; пустой текст — хост без таблиц строк.
+unsafe extern "C" fn ui_language(ctx: *mut c_void, out: *mut RveValue) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    state.ui_calls.push("language".to_owned());
+    if state.ui_text.is_empty() {
+        return false;
+    }
+    // SAFETY: the output slot is valid; the string lives in the state for this callback.
+    unsafe { *out = RveValue::string(&state.ui_text) };
+    true
+}
+
+unsafe extern "C" fn ui_set_language(ctx: *mut c_void, language: RveStr) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { ui_state(ctx) };
+    // SAFETY: the test passes valid UTF-8 codes.
+    let language = unsafe { language.to_str() }.unwrap();
+    state.ui_calls.push(format!("set_language {language}"));
+    state.ui_status
+}
+
 fn ui_host(state: &mut HostState) -> RveHost {
     let mut host = self::host(state);
     host.ui_open = Some(ui_open);
@@ -4078,7 +4102,47 @@ fn ui_host(state: &mut HostState) -> RveHost {
     host.ui_set_options = Some(ui_set_options);
     host.ui_set_image = Some(ui_set_image);
     host.ui_focus = Some(ui_focus);
+    host.ui_language = Some(ui_language);
+    host.ui_set_language = Some(ui_set_language);
     host
+}
+
+#[test]
+fn sdk_ui_language_reads_switches_and_reports_refusals() {
+    let mut state = HostState {
+        ui_text: "ru".to_owned(),
+        ..HostState::default()
+    };
+    let host = ui_host(&mut state);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(context.ui().language(), Some("ru".to_owned()));
+    assert_eq!(context.ui().set_language("en"), Ok(()));
+    assert_eq!(state.ui_calls, ["language", "set_language en"]);
+
+    let mut refused = HostState {
+        ui_status: crate::abi::RVE_UI_REJECTED,
+        ..HostState::default()
+    };
+    let host = ui_host(&mut refused);
+    let mut properties = Params::new();
+    let context = Context::new(&host, &mut properties).unwrap();
+    assert_eq!(context.ui().language(), None, "хост без таблиц строк");
+    assert_eq!(
+        context.ui().set_language("de"),
+        Err(crate::UiError::Rejected)
+    );
+
+    // Хост до ABI v27 не передаёт callback.
+    let mut bare = HostState::default();
+    let bare_host = self::host(&mut bare);
+    let mut properties = Params::new();
+    let context = Context::new(&bare_host, &mut properties).unwrap();
+    assert_eq!(context.ui().language(), None);
+    assert_eq!(
+        context.ui().set_language("en"),
+        Err(crate::UiError::Unavailable)
+    );
 }
 
 #[test]

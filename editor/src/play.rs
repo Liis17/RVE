@@ -16,7 +16,9 @@ use engine_physics::{
     PhysicsCommand, PhysicsInitialization, PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync,
     PhysicsServer, PhysicsServerError, ShapeCache,
 };
-use engine_project::{GamepadSettings, InputSettings, PhysicsSettings, PrefabCatalogFile};
+use engine_project::{
+    GamepadSettings, InputSettings, LocalizationSettings, PhysicsSettings, PrefabCatalogFile,
+};
 use engine_resources::ResourceHandle;
 use engine_scene::document::mesh_collider_model;
 use engine_scene::prefab::PREFAB_EXTENSION;
@@ -172,6 +174,27 @@ impl PlayPrefabs {
             return Err("ресурсы проекта недоступны для UI Canvas".to_owned());
         };
         self.ui = engine_script::load_ui(&ProjectUiAssets { resources, assets }, paths.iter())?;
+        Ok(())
+    }
+
+    /// Загружает таблицы строк проекта для Play; вызывать после [`Self::prepare_ui`].
+    /// Без `[localization]` ключи UI показываются как есть.
+    pub fn prepare_localization(
+        &mut self,
+        settings: Option<&LocalizationSettings>,
+        assets: &Assets,
+    ) -> Result<(), String> {
+        let Some(settings) = settings else {
+            return Ok(());
+        };
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or_else(|| "ресурсы проекта недоступны для таблиц строк".to_owned())?;
+        self.ui.localization = Some(engine_script::load_localization(
+            &ProjectUiAssets { resources, assets },
+            settings,
+        )?);
         Ok(())
     }
 
@@ -3095,6 +3118,50 @@ return Spawner
             let _ = self.resources.shutdown();
             let _ = std::fs::remove_dir_all(&self.parent);
         }
+    }
+
+    #[test]
+    fn play_loads_project_string_tables_after_ui() {
+        let assets = TempAssets::new(&[
+            ("locales/en.toml", "menu.title = \"Menu\"\n"),
+            ("locales/ru.toml", "menu.title = 1\n"),
+        ]);
+        let project_assets = Assets::with_resources(assets.handle());
+        let settings = |tables: &[(&str, &str)]| LocalizationSettings {
+            default_language: "en".to_owned(),
+            tables: tables
+                .iter()
+                .map(|(language, path)| ((*language).to_owned(), (*path).to_owned()))
+                .collect(),
+        };
+
+        let mut prefabs = PlayPrefabs::default().with_resources(assets.handle());
+        prefabs.prepare_localization(None, &project_assets).unwrap();
+        assert!(
+            prefabs.ui.localization.is_none(),
+            "без [localization] таблиц нет"
+        );
+
+        prefabs
+            .prepare_localization(
+                Some(&settings(&[("en", "/locales/en.toml")])),
+                &project_assets,
+            )
+            .unwrap();
+        let localization = prefabs.ui.localization.as_ref().unwrap();
+        assert_eq!(localization.language(), "en");
+        assert_eq!(localization.resolve("menu.title"), "Menu");
+
+        let error = prefabs
+            .prepare_localization(
+                Some(&settings(&[
+                    ("en", "/locales/en.toml"),
+                    ("ru", "/locales/ru.toml"),
+                ])),
+                &project_assets,
+            )
+            .unwrap_err();
+        assert!(error.contains("/locales/ru.toml"), "{error}");
     }
 
     /// Запускает Play со сценой `source`; тяжёлые префабы из `catalog` грузятся из `assets`.

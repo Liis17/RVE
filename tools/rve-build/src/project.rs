@@ -3,6 +3,7 @@ use crate::trace::{ArchiveReason, BuildTrace};
 use engine_assets::{AssetError, Assets};
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
 use engine_gui::document::UiDocument;
+use engine_gui::strings::StringTable;
 use engine_project::{
     BootstrapConfig, PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile, ProjectSettings,
 };
@@ -376,6 +377,20 @@ fn prepare_with_resources(
     if let Some(trace) = trace.as_deref_mut() {
         trace.save_migration = save_migration.clone();
     }
+    let mut base_reasons = BTreeMap::new();
+    if let Some(migration) = &save_migration {
+        base_reasons.insert(migration.clone(), ArchiveReason::SaveMigration);
+    }
+    if let Some(icon_path) = &icon {
+        base_reasons.insert(icon_path.clone(), ArchiveReason::AppIcon);
+    }
+    for (language, table) in string_tables(&settings, &assets_dir)? {
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.string_tables.push((language.clone(), table.clone()));
+        }
+        base_paths.insert(table.clone());
+        base_reasons.insert(table, ArchiveReason::StringTable { language });
+    }
 
     let files = usages
         .keys()
@@ -384,13 +399,8 @@ fn prepare_with_resources(
         .into_iter()
         .map(|path| Ok((path.clone(), require_asset_file(&assets_dir, path)?)))
         .collect::<Result<BTreeMap<_, _>, BuildError>>()?;
-    let (assignments, reasons) = assign_archives(
-        &enabled_scenes,
-        &usages,
-        &base_paths,
-        icon.as_ref(),
-        save_migration.as_ref(),
-    )?;
+    let (assignments, reasons) =
+        assign_archives(&enabled_scenes, &usages, &base_paths, &base_reasons)?;
     if let Some(trace) = trace {
         trace.reasons = reasons;
     }
@@ -989,8 +999,8 @@ fn assign_archives(
     scenes: &[EnabledScene],
     usages: &BTreeMap<VirtualPath, AssetUsage>,
     base_paths: &BTreeSet<VirtualPath>,
-    icon: Option<&VirtualPath>,
-    save_migration: Option<&VirtualPath>,
+    // Причина для файлов `base`, не являющихся сценами: AppIcon и таблицы строк.
+    base_reasons: &BTreeMap<VirtualPath, ArchiveReason>,
 ) -> Result<Assignments, BuildError> {
     let mut assignments = BTreeMap::new();
     let mut reasons = BTreeMap::new();
@@ -1001,18 +1011,25 @@ fn assign_archives(
     {
         let usage = usages.get(path);
         if base_paths.contains(path) {
+            let base_reason = base_reasons
+                .get(path)
+                .cloned()
+                .unwrap_or(ArchiveReason::SceneFile);
             if let Some((owner, archive)) = usage.and_then(|usage| {
                 usage
                     .explicit_archives
                     .iter()
                     .find(|(_, archive)| archive != "base")
             }) {
-                let reason = if icon == Some(path) {
-                    "AppIcon всегда должен находиться в base"
-                } else if save_migration == Some(path) {
-                    "мигратор сохранений всегда должен находиться в base"
-                } else {
-                    "файл включённой сцены всегда должен находиться в base"
+                let reason = match base_reason {
+                    ArchiveReason::AppIcon => "AppIcon всегда должен находиться в base",
+                    ArchiveReason::SaveMigration => {
+                        "мигратор сохранений всегда должен находиться в base"
+                    }
+                    ArchiveReason::StringTable { .. } => {
+                        "таблица строк всегда должна находиться в base"
+                    }
+                    _ => "файл включённой сцены всегда должен находиться в base",
                 };
                 return Err(BuildError::input(format!(
                     "{reason}: /{path} явно назначен в архив {archive:?} ({})",
@@ -1020,16 +1037,7 @@ fn assign_archives(
                 )));
             }
             assignments.insert((*path).clone(), "base".to_owned());
-            reasons.insert(
-                (*path).clone(),
-                if icon == Some(path) {
-                    ArchiveReason::AppIcon
-                } else if save_migration == Some(path) {
-                    ArchiveReason::SaveMigration
-                } else {
-                    ArchiveReason::SceneFile
-                },
-            );
+            reasons.insert((*path).clone(), base_reason);
             continue;
         }
 
@@ -1187,6 +1195,29 @@ fn is_reserved_windows_name(name: &str) -> bool {
         })
 }
 
+/// Таблицы строк `[localization]`: путь каждого языка проверяется как обычный файл Assets и
+/// разбирается тем же парсером, что и в игре.
+fn string_tables(
+    settings: &ProjectSettings,
+    assets_dir: &Path,
+) -> Result<Vec<(String, VirtualPath)>, BuildError> {
+    let Some(localization) = &settings.localization else {
+        return Ok(Vec::new());
+    };
+    let mut tables = Vec::with_capacity(localization.tables.len());
+    for (language, path) in &localization.tables {
+        let path = VirtualPath::parse(path).map_err(|error| {
+            BuildError::input(format!("таблица строк языка {language:?}: {error}"))
+        })?;
+        let file = require_asset_file(assets_dir, &path)?;
+        let text = read_project_text(&file)?;
+        StringTable::parse(&format!("/{path}"), &text)
+            .map_err(|error| BuildError::input(format!("таблица строк: {error}")))?;
+        tables.push((language.clone(), path));
+    }
+    Ok(tables)
+}
+
 fn read_project_text(path: &Path) -> Result<String, BuildError> {
     let bytes = fs::read(path).map_err(|error| project_file_error(path, error))?;
     String::from_utf8(bytes).map_err(|error| {
@@ -1291,8 +1322,8 @@ fn extension_is(path: &str, extension: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetUsage, EnabledScene, HeavyScriptUse, Owner, ScriptReferenceContext, assign_archives,
-        validate_heavy_scripts_configured,
+        ArchiveReason, AssetUsage, EnabledScene, HeavyScriptUse, Owner, ScriptReferenceContext,
+        assign_archives, validate_heavy_scripts_configured,
     };
     use engine_files::VirtualPath;
     use engine_project::ProjectSettings;
@@ -1364,7 +1395,7 @@ mod tests {
             },
         );
         let (assignments, _) =
-            assign_archives(&scenes(), &usages, &BTreeSet::new(), None, None).unwrap();
+            assign_archives(&scenes(), &usages, &BTreeSet::new(), &BTreeMap::new()).unwrap();
         assert_eq!(assignments[&path("/models/one.fbx")], "scene-main");
         assert_eq!(assignments[&path("/models/shared.fbx")], "shared");
         assert_eq!(assignments[&path("/models/props.fbx")], "props");
@@ -1383,7 +1414,8 @@ mod tests {
                 ],
             },
         )]);
-        let error = assign_archives(&scenes(), &usages, &BTreeSet::new(), None, None).unwrap_err();
+        let error =
+            assign_archives(&scenes(), &usages, &BTreeSet::new(), &BTreeMap::new()).unwrap_err();
         assert!(error.to_string().contains("/scenes/main.rvescene"));
         assert!(error.to_string().contains("/scenes/second.rvescene"));
     }
@@ -1406,7 +1438,8 @@ mod tests {
                 },
             ),
         ]);
-        let error = assign_archives(&scenes(), &usages, &BTreeSet::new(), None, None).unwrap_err();
+        let error =
+            assign_archives(&scenes(), &usages, &BTreeSet::new(), &BTreeMap::new()).unwrap_err();
         assert!(error.to_string().contains("Props"));
         assert!(error.to_string().contains("props"));
     }
@@ -1425,8 +1458,7 @@ mod tests {
             &scenes(),
             &usages,
             &BTreeSet::from([icon.clone()]),
-            Some(&icon),
-            None,
+            &BTreeMap::from([(icon.clone(), ArchiveReason::AppIcon)]),
         )
         .unwrap_err();
         assert!(error.to_string().contains("AppIcon"));
@@ -1446,7 +1478,8 @@ mod tests {
                 explicit_archives: Vec::new(),
             },
         )]);
-        let error = assign_archives(&[scene], &usages, &BTreeSet::new(), None, None).unwrap_err();
+        let error =
+            assign_archives(&[scene], &usages, &BTreeSet::new(), &BTreeMap::new()).unwrap_err();
         assert!(error.to_string().contains("scene-bad scene"));
         assert!(error.to_string().contains("имени сцены"));
     }

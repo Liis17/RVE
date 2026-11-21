@@ -421,6 +421,62 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         );
     }
 
+    /// Добавляет `[localization]` с таблицами `en` и `ru` в проект и пишет их файлы.
+    fn attach_localization(project: &Path, ru: Option<&str>) {
+        let settings = project.join("project.rveproject");
+        let mut source = fs::read_to_string(&settings).unwrap();
+        source.push_str("[localization]\ndefault_language = \"en\"\ntables = { en = \"/locales/en.toml\", ru = \"/locales/ru.toml\" }\n");
+        fs::write(&settings, source).unwrap();
+        let locales = project.join("Assets/locales");
+        fs::create_dir_all(&locales).unwrap();
+        fs::write(locales.join("en.toml"), "[menu]\nstart = \"Start\"\n").unwrap();
+        if let Some(ru) = ru {
+            fs::write(locales.join("ru.toml"), ru).unwrap();
+        }
+    }
+
+    #[test]
+    fn string_tables_are_validated_and_packed_into_base() {
+        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-strings").unwrap();
+        create_demo_like_project(project_root.path());
+        attach_localization(project_root.path(), Some("menu.start = \"Начать\"\n"));
+        let project = prepare_project(project_root.path()).unwrap();
+        let archives_dir = project_root.path().join("out-assets");
+        let registry =
+            build_project_archives(&project, &archives_dir, BuildCompression::default(), None)
+                .unwrap();
+        let assignments = file_assignments(&registry);
+        assert_eq!(assignments["/locales/en.toml"], "base");
+        assert_eq!(assignments["/locales/ru.toml"], "base");
+        let base = Archive::open_file(archives_dir.join("base.rvepak")).unwrap();
+        let settings = base
+            .read_all(&VirtualPath::parse("/rve/project.toml").unwrap())
+            .unwrap();
+        assert!(
+            String::from_utf8(settings)
+                .unwrap()
+                .contains("[localization]"),
+            "релиз сохраняет секцию проекта"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_string_table() {
+        for (name, ru) in [("missing", None), ("invalid", Some("menu.start = 1\n"))] {
+            let project_root =
+                TempDir::create(&std::env::temp_dir(), &format!("rve-build-strings-{name}"))
+                    .unwrap();
+            create_demo_like_project(project_root.path());
+            attach_localization(project_root.path(), ru);
+            let error = prepare_project(project_root.path()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{name}: {error}");
+            assert!(
+                error.to_string().contains("/locales/ru.toml"),
+                "{name}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn rejects_invalid_camera_settings_during_project_preparation() {
         let project_root =

@@ -9,6 +9,7 @@ use crate::events::{UiEvent, UiEventKind, UiValue};
 use crate::layout::{
     Layout, canvas_scale, canvas_size, layout as compute_layout, max_scroll, resolve_rect,
 };
+use crate::strings::Localization;
 use epaint::Vec2;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -150,6 +151,8 @@ pub struct UiSystem {
     pub(crate) focus: Option<UiElementHandle>,
     pub(crate) repeat: Option<crate::input::Repeat>,
     pub(crate) pointer_over: bool,
+    /// Таблицы строк и текущий язык; без них ключи показываются как есть.
+    localization: Option<Localization>,
 }
 
 impl UiSystem {
@@ -184,6 +187,7 @@ impl UiSystem {
             default_focus_pending: document.canvas.default_focus.is_some(),
             document,
         };
+        localize_canvas(&mut canvas, self.localization.as_ref());
         refresh_layout(&mut canvas, self.screen);
         self.slots[index as usize].canvas = Some(canvas);
         self.paint_dirty = true;
@@ -314,7 +318,11 @@ impl UiSystem {
         let (canvas, index) = self.element_mut(handle)?;
         let id = canvas.elements[index].id.clone();
         match &mut canvas.elements[index].kind {
-            ElementKind::Text(spec) => spec.string = text.to_owned(),
+            ElementKind::Text(spec) => {
+                // Текст скрипта — литерал: смена языка его больше не заменяет.
+                spec.key = None;
+                spec.string = text.to_owned();
+            }
             ElementKind::InputField(spec) => {
                 check_input_text(spec.content, spec.max_length, text)
                     .map_err(UiSystemError::InvalidValue)?;
@@ -525,6 +533,7 @@ impl UiSystem {
                 {
                     spec.selected = None;
                 }
+                spec.option_keys.clear();
                 spec.options = options;
             }
             _ => return Err(unsupported(&id, "options")),
@@ -533,6 +542,48 @@ impl UiSystem {
             canvas.popup = None;
         }
         Ok(())
+    }
+
+    /// Задаёт таблицы строк; текущим становится язык `localization`. Тексты с ключами во всех
+    /// открытых канвасах подставляются заново.
+    pub fn set_localization(&mut self, localization: Localization) {
+        self.localization = Some(localization);
+        self.localize_all();
+    }
+
+    /// Текущий язык; `None`, если таблицы строк не заданы.
+    pub fn language(&self) -> Option<&str> {
+        self.localization.as_ref().map(Localization::language)
+    }
+
+    /// Меняет язык и заново подставляет тексты с ключами во всех открытых канвасах. Без таблиц
+    /// строк или для языка без таблицы — ошибка, состояние не меняется.
+    pub fn set_language(&mut self, language: &str) -> Result<(), UiSystemError> {
+        let localization = self.localization.as_mut().ok_or_else(|| {
+            UiSystemError::InvalidValue("таблицы строк проекта не заданы".to_owned())
+        })?;
+        localization
+            .set_language(language)
+            .map_err(UiSystemError::InvalidValue)?;
+        self.localize_all();
+        Ok(())
+    }
+
+    /// Строка ключа на текущем языке с запасными вариантами; без таблиц — сам ключ.
+    pub fn localize<'a>(&'a self, key: &'a str) -> &'a str {
+        self.localization
+            .as_ref()
+            .map_or(key, |localization| localization.resolve(key))
+    }
+
+    fn localize_all(&mut self) {
+        let localization = self.localization.as_ref();
+        for slot in &mut self.slots {
+            if let Some(canvas) = &mut slot.canvas {
+                localize_canvas(canvas, localization);
+            }
+        }
+        self.paint_dirty = true;
     }
 
     /// Копия runtime-состояния канваса; возвращается в [`UiSystem::restore_canvas`] при откате.
@@ -688,6 +739,29 @@ impl UiSystem {
     }
 }
 
+/// Подставляет строки ключей в элементы канваса: Text, placeholder InputField и пункты Dropdown.
+fn localize_canvas(canvas: &mut UiCanvas, localization: Option<&Localization>) {
+    let resolve = |key: &str| {
+        localization
+            .map_or(key, |localization| localization.resolve(key))
+            .to_owned()
+    };
+    for element in &mut canvas.elements {
+        match &mut element.kind {
+            ElementKind::Text(spec) if spec.key.is_some() => {
+                spec.string = resolve(spec.key.as_deref().unwrap_or_default());
+            }
+            ElementKind::InputField(spec) if spec.placeholder_key.is_some() => {
+                spec.placeholder = resolve(spec.placeholder_key.as_deref().unwrap_or_default());
+            }
+            ElementKind::Dropdown(spec) if !spec.option_keys.is_empty() => {
+                spec.options = spec.option_keys.iter().map(|key| resolve(key)).collect();
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn event_for(
     element: UiElementHandle,
     kind: UiEventKind,
@@ -812,6 +886,158 @@ mod tests {
 
     pub(crate) fn document(input: &str) -> Arc<UiDocument> {
         Arc::new(UiDocument::parse("system-test.rveui", input).unwrap())
+    }
+
+    const LOCALIZED: &str = r#"
+[[elements]]
+id = "title"
+text = { key = "menu.title" }
+
+[[elements]]
+id = "plain"
+text = { string = "Literal" }
+
+[[elements]]
+id = "name"
+input_field = { placeholder_key = "menu.name" }
+
+[[elements]]
+id = "mode"
+dropdown = { option_keys = ["mode.easy", "mode.hard"], selected = 1 }
+"#;
+
+    fn localization() -> Localization {
+        use crate::strings::StringTable;
+        let en = StringTable::parse(
+            "en.toml",
+            "[menu]\ntitle = \"Menu\"\nname = \"Name\"\n[mode]\neasy = \"Easy\"\nhard = \"Hard\"\n",
+        )
+        .unwrap();
+        let ru = StringTable::parse(
+            "ru.toml",
+            "[menu]\ntitle = \"Меню\"\n[mode]\neasy = \"Легко\"\n",
+        )
+        .unwrap();
+        Localization::new(
+            "en",
+            BTreeMap::from([("en".to_owned(), en), ("ru".to_owned(), ru)]),
+        )
+        .unwrap()
+    }
+
+    fn localized_texts(
+        system: &UiSystem,
+        canvas: UiCanvasHandle,
+    ) -> (String, String, String, Vec<String>) {
+        let find = |id| system.find(canvas, id).unwrap();
+        let placeholder = match &system.canvas_ref(canvas).unwrap().elements[2].kind {
+            ElementKind::InputField(spec) => spec.placeholder.clone(),
+            _ => unreachable!(),
+        };
+        (
+            system.text(find("title")).unwrap(),
+            system.text(find("plain")).unwrap(),
+            placeholder,
+            system.options(find("mode")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn keys_resolve_on_open_and_follow_language_with_fallbacks() {
+        let mut system = UiSystem::default();
+        system.set_localization(localization());
+        assert_eq!(system.language(), Some("en"));
+        let canvas = system.open(document(LOCALIZED), 1);
+        assert_eq!(
+            localized_texts(&system, canvas),
+            (
+                "Menu".into(),
+                "Literal".into(),
+                "Name".into(),
+                vec!["Easy".into(), "Hard".into()]
+            )
+        );
+
+        system.paint_dirty = false;
+        system.set_language("ru").unwrap();
+        assert!(system.paint_dirty, "смена языка перерисовывает UI");
+        assert_eq!(system.language(), Some("ru"));
+        // Нет в ru — строка языка по умолчанию; литерал не меняется.
+        assert_eq!(
+            localized_texts(&system, canvas),
+            (
+                "Меню".into(),
+                "Literal".into(),
+                "Name".into(),
+                vec!["Легко".into(), "Hard".into()]
+            )
+        );
+        assert_eq!(system.localize("mode.hard"), "Hard");
+        assert_eq!(system.localize("no.such.key"), "no.such.key");
+
+        // Канвас, открытый после смены языка, сразу на новом языке.
+        let later = system.open(document(LOCALIZED), 2);
+        assert_eq!(localized_texts(&system, later).0, "Меню");
+    }
+
+    #[test]
+    fn keys_without_tables_show_the_key() {
+        let mut system = UiSystem::default();
+        let canvas = system.open(document(LOCALIZED), 1);
+        assert_eq!(
+            localized_texts(&system, canvas),
+            (
+                "menu.title".into(),
+                "Literal".into(),
+                "menu.name".into(),
+                vec!["mode.easy".into(), "mode.hard".into()]
+            )
+        );
+        assert_eq!(system.language(), None);
+        assert!(matches!(
+            system.set_language("en"),
+            Err(UiSystemError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_language_keeps_texts_and_language() {
+        let mut system = UiSystem::default();
+        system.set_localization(localization());
+        let canvas = system.open(document(LOCALIZED), 1);
+        assert!(matches!(
+            system.set_language("de"),
+            Err(UiSystemError::InvalidValue(_))
+        ));
+        assert_eq!(system.language(), Some("en"));
+        assert_eq!(localized_texts(&system, canvas).0, "Menu");
+    }
+
+    #[test]
+    fn script_literals_replace_keys_and_survive_language_change() {
+        let mut system = UiSystem::default();
+        system.set_localization(localization());
+        let canvas = system.open(document(LOCALIZED), 1);
+        let title = system.find(canvas, "title").unwrap();
+        let mode = system.find(canvas, "mode").unwrap();
+        system.set_text(title, "Score: 10").unwrap();
+        system.set_options(mode, vec!["One".into()]).unwrap();
+        system.set_language("ru").unwrap();
+        assert_eq!(system.text(title).unwrap(), "Score: 10");
+        assert_eq!(system.options(mode).unwrap(), vec!["One".to_owned()]);
+    }
+
+    #[test]
+    fn restored_snapshot_brings_back_keys() {
+        let mut system = UiSystem::default();
+        system.set_localization(localization());
+        let canvas = system.open(document(LOCALIZED), 1);
+        let title = system.find(canvas, "title").unwrap();
+        let snapshot = system.snapshot_canvas(canvas).unwrap();
+        system.set_text(title, "literal").unwrap();
+        system.restore_canvas(canvas, snapshot).unwrap();
+        system.set_language("ru").unwrap();
+        assert_eq!(system.text(title).unwrap(), "Меню");
     }
 
     pub(crate) const BASIC: &str = r#"

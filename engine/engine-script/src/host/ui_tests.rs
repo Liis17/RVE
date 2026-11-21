@@ -635,3 +635,170 @@ fn demo_hud_script_updates_progress_and_status_from_ui_events() {
             .any(|m| m == "HUD: fire button clicked")
     );
 }
+
+const LOCALIZED_MENU: &str = r#"
+[[elements]]
+id = "title"
+text = { key = "menu.title" }
+"#;
+
+fn localization() -> engine_gui::strings::Localization {
+    use engine_gui::strings::{Localization, StringTable};
+    let table = |text: &str| StringTable::parse("strings.toml", text).unwrap();
+    Localization::new(
+        "en",
+        BTreeMap::from([
+            ("en".to_owned(), table("menu.title = \"Menu\"\n")),
+            ("ru".to_owned(), table("menu.title = \"Меню\"\n")),
+        ]),
+    )
+    .unwrap()
+}
+
+/// Хост со сценовым канвасом локализованного меню и таблицами строк `en`/`ru`.
+fn localized_host(script: &str) -> (World, ScriptHost) {
+    let world = scene(&canvas_object("menu", "menu.lua"), &["menu.lua"]);
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("menu.lua", script)]), None).unwrap();
+    host.register_ui_document(
+        VirtualPath::parse("ui/menu.rveui").unwrap(),
+        Arc::new(UiDocument::parse("ui/menu.rveui", LOCALIZED_MENU).unwrap()),
+    );
+    let ui = crate::PreparedUi {
+        localization: Some(localization()),
+        ..crate::PreparedUi::default()
+    };
+    crate::UiRegistry::default()
+        .register(&mut host, &ui)
+        .unwrap();
+    (world, host)
+}
+
+fn title(host: &ScriptHost, world: &World) -> String {
+    let canvas = component(host, world, "menu");
+    host.ui().text(element(host, canvas, "title")).unwrap()
+}
+
+const LANGUAGE_SCRIPT: &str = r#"
+local Menu = {}
+function Menu:on_start()
+  rve.log_info("start " .. rve.ui.language())
+  rve.ui.set_language("ru")
+  rve.log_info("now " .. rve.ui.language() .. " " .. rve.ui.canvas(self.object):find("title"):get_text())
+  local ok, message = pcall(rve.ui.set_language, "de")
+  rve.log_info("unknown " .. tostring(ok) .. " " .. rve.ui.language())
+  if not ok and string.find(tostring(message), "rve.ui.set_language", 1, true) then
+    rve.log_info("error names the call")
+  end
+end
+return Menu
+"#;
+
+#[test]
+fn lua_switches_ui_language_and_rejects_unknown_language() {
+    let (mut world, mut host) = localized_host(LANGUAGE_SCRIPT);
+    host.start(&mut world, ScriptTime::default());
+    let events = messages(&mut host);
+    for expected in [
+        "start en",
+        "now ru Меню",
+        "unknown false ru",
+        "error names the call",
+    ] {
+        assert!(
+            events.contains(&expected.to_owned()),
+            "{expected}: {events:?}"
+        );
+    }
+    assert_eq!(host.ui().language(), Some("ru"));
+    assert_eq!(title(&host, &world), "Меню");
+}
+
+const FAILING_LANGUAGE_SCRIPT: &str = r#"
+local Menu = {}
+function Menu:on_update(dt)
+  rve.ui.set_language("ru")
+  error("callback failed")
+end
+return Menu
+"#;
+
+#[test]
+fn failed_callback_rolls_back_the_language_and_texts() {
+    let (mut world, mut host) = localized_host(FAILING_LANGUAGE_SCRIPT);
+    // Канвас, который вызов не трогал напрямую, тоже возвращается к прежнему языку.
+    let other = host.ui_mut().open(
+        Arc::new(UiDocument::parse("ui/menu.rveui", LOCALIZED_MENU).unwrap()),
+        7,
+    );
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message.contains("callback failed"))
+    );
+    assert_eq!(host.ui().language(), Some("en"));
+    assert_eq!(title(&host, &world), "Menu");
+    let other_title = host.ui().find(other, "title").unwrap();
+    assert_eq!(host.ui().text(other_title), Ok("Menu".to_owned()));
+}
+
+const NO_TABLES_SCRIPT: &str = r#"
+local Menu = {}
+function Menu:on_start()
+  rve.log_info("language " .. tostring(rve.ui.language()))
+  local ok = pcall(rve.ui.set_language, "en")
+  rve.log_info("set " .. tostring(ok))
+  rve.log_info("title " .. rve.ui.canvas(self.object):find("title"):get_text())
+end
+return Menu
+"#;
+
+#[test]
+fn without_string_tables_language_is_nil_and_keys_are_shown() {
+    let mut world = scene(&canvas_object("menu", "menu.lua"), &["menu.lua"]);
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("menu.lua", NO_TABLES_SCRIPT)]),
+        None,
+    )
+    .unwrap();
+    host.register_ui_document(
+        VirtualPath::parse("ui/menu.rveui").unwrap(),
+        Arc::new(UiDocument::parse("ui/menu.rveui", LOCALIZED_MENU).unwrap()),
+    );
+    host.start(&mut world, ScriptTime::default());
+    let events = messages(&mut host);
+    for expected in ["language nil", "set false", "title menu.title"] {
+        assert!(
+            events.contains(&expected.to_owned()),
+            "{expected}: {events:?}"
+        );
+    }
+}
+
+const TOP_LEVEL_LANGUAGE_SCRIPT: &str = r#"
+local ok = pcall(rve.ui.set_language, "ru")
+rve.log_info("top-level " .. tostring(ok))
+return {}
+"#;
+
+#[test]
+fn language_change_is_rejected_outside_lifecycle_calls() {
+    let (_world, mut host) = localized_host(TOP_LEVEL_LANGUAGE_SCRIPT);
+    assert!(messages(&mut host).contains(&"top-level false".to_owned()));
+    assert_eq!(host.ui().language(), Some("en"));
+}
+
+#[test]
+fn later_ui_registration_without_tables_keeps_the_language() {
+    let (mut world, mut host) = localized_host(LANGUAGE_SCRIPT);
+    host.start(&mut world, ScriptTime::default());
+    // UI сцены, загруженной позже, приходит без таблиц: язык и строки остаются.
+    crate::UiRegistry::default()
+        .register(&mut host, &crate::PreparedUi::default())
+        .unwrap();
+    assert_eq!(host.ui().language(), Some("ru"));
+    assert_eq!(title(&host, &world), "Меню");
+}
