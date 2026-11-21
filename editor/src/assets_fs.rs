@@ -115,8 +115,7 @@ impl AssetsDir {
         if path.is_empty() {
             return Err(invalid_input("нельзя переименовать корень ресурсов"));
         }
-        let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
-        let target_path = join(parent, new_name);
+        let target_path = renamed_path(path, new_name);
         let source = self.resolve(path)?;
         let target = self.resolve(&target_path)?;
         // Смена только регистра на нечувствительной ФС — это тот же файл, а не коллизия.
@@ -189,6 +188,12 @@ impl AssetsDir {
         }
         unreachable!("u32 номеров хватает для файлов одной папки")
     }
+}
+
+/// Путь, который получит `path` после переименования в `new_name` в той же папке.
+pub fn renamed_path(path: &str, new_name: &str) -> String {
+    let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    join(parent, new_name)
 }
 
 fn join(parent: &str, name: &str) -> String {

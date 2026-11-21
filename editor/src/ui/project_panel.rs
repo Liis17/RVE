@@ -558,6 +558,7 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
         }
         return;
     }
+    let project_root = project.root.clone();
     let assets = project.assets_dir.clone();
     let result = match dialog {
         ProjectDialog::NewFolder { name } => assets
@@ -568,14 +569,21 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
             name,
             references,
             update_references,
-        } => match assets.rename(path, name) {
-            Ok(target) => {
+        } => match asset_refs::rename_with_references(
+            &project_root,
+            &assets,
+            path,
+            name,
+            &references.files,
+            *update_references,
+        ) {
+            Ok((target, written)) => {
                 let message = format!("{path} переименован в {target}");
                 let remap = PathRemap::new(path, &target);
-                follow_rename(state, &remap, references, *update_references);
+                follow_rename(state, &remap, written, *update_references);
                 Ok(message)
             }
-            Err(error) => Err(error),
+            Err(error) => Err(std::io::Error::other(error)),
         },
         ProjectDialog::NewPhysicsMaterial { .. } | ProjectDialog::NewUi { .. } => return,
         ProjectDialog::NewMaterial { .. } | ProjectDialog::NewShader { .. } => return,
@@ -660,30 +668,21 @@ fn show_references(ui: &mut egui::Ui, references: &AssetReferences) {
         });
 }
 
-/// После переименования переписывает ссылки в файлах и открытых документах и переносит путь
-/// открытой сцены, если переименован её файл или папка.
+/// После успешного переименования с переписанными файлами `written` переводит открытые документы
+/// на новые пути и переносит путь открытой сцены, если переименован её файл или папка.
 fn follow_rename(
     state: &mut EditorState,
     remap: &PathRemap,
-    references: &AssetReferences,
+    written: Vec<ReferenceSource>,
     update_references: bool,
 ) {
-    let mut written = Vec::new();
-    if update_references && let Some(project) = state.project.as_ref() {
-        let (files, errors) =
-            asset_refs::rewrite_files(&project.root, &project.assets_dir, &references.files, remap);
-        for error in errors {
-            state.log.error(format!("Ссылки не обновлены: {error}"));
-        }
-        if !files.is_empty() {
-            let list = files
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            state.log.info(format!("Обновлены ссылки: {list}"));
-        }
-        written = files;
+    if !written.is_empty() {
+        let list = written
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        state.log.info(format!("Обновлены ссылки: {list}"));
     }
     if let Some(scene) = state.scene.as_mut() {
         scene.follow_rename(remap);

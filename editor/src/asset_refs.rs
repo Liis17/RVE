@@ -5,7 +5,7 @@
 //! начинающееся с пути папки и `/`. Файлы переписываются через `toml_edit`, поэтому меняются
 //! только сами строки, а комментарии и форматирование сохраняются.
 
-use crate::assets_fs::{AssetEntry, AssetKind, AssetsDir};
+use crate::assets_fs::{AssetEntry, AssetKind, AssetsDir, renamed_path};
 use crate::scene_edit::write_atomic;
 use engine_project::{PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
 use engine_scene::SceneDocument;
@@ -176,45 +176,130 @@ fn collect_documents(entries: &[AssetEntry], files: &mut Vec<String>) {
     }
 }
 
-/// Переписывает ссылки в найденных до переименования файлах. Вызывается после переименования,
-/// поэтому файл внутри переименованной папки ищется по новому пути. Результат проверяется тем же
-/// разбором, что и при загрузке; файл, не прошедший проверку, не меняется.
-/// Возвращает переписанные файлы и ошибки.
-pub fn rewrite_files(
+/// Запись файла; в тестах подменяется, чтобы воспроизвести сбой посередине.
+type FileWriter<'a> = dyn FnMut(&Path, &[u8]) -> Result<(), String> + 'a;
+
+/// Правка одного файла, подготовленная до переименования.
+struct PreparedRewrite {
+    /// Файл после переименования.
+    source: ReferenceSource,
+    original: String,
+    rewritten: String,
+}
+
+/// Переименовывает `path` в `new_name` и, если `update_references`, переписывает ссылки в
+/// найденных до переименования файлах. Возвращает новый путь и переписанные файлы.
+///
+/// Все правки читаются по старым путям и проверяются тем же разбором, что и при загрузке, до
+/// переименования; любая ошибка отменяет операцию без изменений на диске. Если запись падает
+/// после переименования, уже записанные файлы восстанавливаются, а ресурс получает исходное имя.
+pub fn rename_with_references(
     project_root: &Path,
     assets: &AssetsDir,
+    path: &str,
+    new_name: &str,
     references: &[Reference],
-    remap: &PathRemap,
-) -> (Vec<ReferenceSource>, Vec<String>) {
-    let mut written = Vec::new();
-    let mut errors = Vec::new();
+    update_references: bool,
+) -> Result<(String, Vec<ReferenceSource>), String> {
+    rename_with_writer(
+        project_root,
+        assets,
+        path,
+        new_name,
+        if update_references { references } else { &[] },
+        &mut |file, contents| write_atomic(file, contents),
+    )
+}
+
+fn rename_with_writer(
+    project_root: &Path,
+    assets: &AssetsDir,
+    path: &str,
+    new_name: &str,
+    references: &[Reference],
+    write: &mut FileWriter<'_>,
+) -> Result<(String, Vec<ReferenceSource>), String> {
+    let remap = PathRemap::new(path, &renamed_path(path, new_name));
+    let mut prepared = Vec::new();
     for reference in references {
-        let source = match &reference.source {
-            ReferenceSource::Asset(path) => {
-                ReferenceSource::Asset(remap.map_asset_path(path).unwrap_or_else(|| path.clone()))
-            }
-            ReferenceSource::ProjectPrefabs => ReferenceSource::ProjectPrefabs,
-        };
-        let file = match &source {
-            ReferenceSource::Asset(path) => assets.resolve(path).map_err(|error| error.to_string()),
-            ReferenceSource::ProjectPrefabs => Ok(project_root.join(PREFAB_CATALOG_FILE_NAME)),
-        };
-        let result = file.and_then(|file| {
-            let text = std::fs::read_to_string(&file).map_err(|error| error.to_string())?;
-            let Some(rewritten) = rewrite_text(&text, remap)? else {
-                return Ok(false);
-            };
-            validate(&source, &rewritten)?;
-            write_atomic(&file, rewritten.as_bytes())?;
-            Ok(true)
-        });
+        let rewrite = prepare_rewrite(project_root, assets, &reference.source, &remap)
+            .map_err(|error| format!("{}: {error}", reference.source))?;
+        prepared.extend(rewrite);
+    }
+    let target = assets
+        .rename(path, new_name)
+        .map_err(|error| error.to_string())?;
+
+    let mut written: Vec<(&PreparedRewrite, std::path::PathBuf)> = Vec::new();
+    for rewrite in &prepared {
+        let result = source_file(project_root, assets, &rewrite.source)
+            .and_then(|file| write(&file, rewrite.rewritten.as_bytes()).map(|()| file));
         match result {
-            Ok(true) => written.push(source),
-            Ok(false) => {}
-            Err(error) => errors.push(format!("{source}: {error}")),
+            Ok(file) => written.push((rewrite, file)),
+            Err(error) => {
+                let mut message = format!(
+                    "{}: {error}; переименование {path} отменено",
+                    rewrite.source
+                );
+                for (restored, file) in written.iter().rev() {
+                    if let Err(error) = write(file, restored.original.as_bytes()) {
+                        message
+                            .push_str(&format!("; не восстановлен {}: {error}", restored.source));
+                    }
+                }
+                let original_name = path.rsplit('/').next().unwrap_or(path);
+                if let Err(error) = assets.rename(&target, original_name) {
+                    message.push_str(&format!(
+                        "; {target} не переименован обратно в {path}: {error}"
+                    ));
+                }
+                return Err(message);
+            }
         }
     }
-    (written, errors)
+    let written = written
+        .into_iter()
+        .map(|(rewrite, _)| rewrite.source.clone())
+        .collect();
+    Ok((target, written))
+}
+
+/// Читает файл по пути до переименования и готовит его новый текст; `None` — ссылок нет.
+fn prepare_rewrite(
+    project_root: &Path,
+    assets: &AssetsDir,
+    source: &ReferenceSource,
+    remap: &PathRemap,
+) -> Result<Option<PreparedRewrite>, String> {
+    let file = source_file(project_root, assets, source)?;
+    let original = std::fs::read_to_string(&file).map_err(|error| error.to_string())?;
+    let Some(rewritten) = rewrite_text(&original, remap)? else {
+        return Ok(None);
+    };
+    // Файл внутри переименованной папки после переименования лежит по новому пути.
+    let source = match source {
+        ReferenceSource::Asset(path) => {
+            ReferenceSource::Asset(remap.map_asset_path(path).unwrap_or_else(|| path.clone()))
+        }
+        ReferenceSource::ProjectPrefabs => ReferenceSource::ProjectPrefabs,
+    };
+    validate(&source, &rewritten)?;
+    Ok(Some(PreparedRewrite {
+        source,
+        original,
+        rewritten,
+    }))
+}
+
+fn source_file(
+    project_root: &Path,
+    assets: &AssetsDir,
+    source: &ReferenceSource,
+) -> Result<std::path::PathBuf, String> {
+    match source {
+        ReferenceSource::Asset(path) => assets.resolve(path).map_err(|error| error.to_string()),
+        ReferenceSource::ProjectPrefabs => Ok(project_root.join(PREFAB_CATALOG_FILE_NAME)),
+    }
 }
 
 fn validate(source: &ReferenceSource, text: &str) -> Result<(), String> {
@@ -361,9 +446,16 @@ mod tests {
         assert_eq!(scan.errors.len(), 1, "{:?}", scan.errors);
         assert!(scan.errors[0].contains("broken.rvescene"));
 
-        assets.rename("prefabs", "heavy").unwrap();
-        let (written, errors) = rewrite_files(&project.0, &assets, &scan.references, &remap);
-        assert!(errors.is_empty(), "{errors:?}");
+        let (target, written) = rename_with_references(
+            &project.0,
+            &assets,
+            "prefabs",
+            "heavy",
+            &scan.references,
+            true,
+        )
+        .unwrap();
+        assert_eq!(target, "heavy");
         assert_eq!(written.len(), 3);
         assert_eq!(
             project.read("Assets/scenes/main.rvescene"),
@@ -381,19 +473,171 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_that_breaks_validation_leaves_the_file_unchanged() {
+    fn rewrite_that_breaks_validation_cancels_the_rename_before_any_change() {
         let project = TempProject::new();
         let assets = project.assets();
         let scene = "[[assets]]\npath = \"/models/a.fbx\"\n\n[[objects]]\nid = \"a\"\n\
                      [objects.mesh_renderer]\nmodel = \"/models/a.fbx\"\n";
+        let other = "[[assets]]\npath = \"/models/a.fbx\"\n\n[[objects]]\nid = \"b\"\n";
         project.write("Assets/s.rvescene", scene);
+        project.write("Assets/t.rvescene", other);
+        project.write("Assets/models/a.fbx", "model");
         // Модель, переименованная в PNG, больше не модель: сцена с такой ссылкой невалидна.
         let remap = PathRemap::new("models/a.fbx", "models/a.png");
         let scan = scan(&project.0, &assets, &remap);
-        assert_eq!(scan.references.len(), 1);
-        let (written, errors) = rewrite_files(&project.0, &assets, &scan.references, &remap);
-        assert!(written.is_empty());
-        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(scan.references.len(), 2);
+
+        let error = rename_with_references(
+            &project.0,
+            &assets,
+            "models/a.fbx",
+            "a.png",
+            &scan.references,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("s.rvescene"), "{error}");
         assert_eq!(project.read("Assets/s.rvescene"), scene);
+        assert_eq!(project.read("Assets/t.rvescene"), other);
+        assert_eq!(project.read("Assets/models/a.fbx"), "model");
+        assert!(!project.0.join("Assets/models/a.png").exists());
+    }
+
+    /// Проект со ссылками из трёх файлов на папку `prefabs`.
+    fn three_referencing_files(project: &TempProject) -> Vec<(&'static str, String)> {
+        let files = vec![
+            ("Assets/scenes/a.rvescene", SCENE.to_owned()),
+            ("Assets/scenes/b.rvescene", SCENE.replace("# сцена", "# b")),
+            ("Assets/scenes/c.rvescene", SCENE.replace("# сцена", "# c")),
+        ];
+        project.write("Assets/prefabs/p.rveprefab", "[[objects]]\nid = \"root\"\n");
+        for (path, text) in &files {
+            project.write(path, text);
+        }
+        files
+    }
+
+    fn assert_project_unchanged(project: &TempProject, files: &[(&str, String)]) {
+        for (path, text) in files {
+            assert_eq!(&project.read(path), text, "{path}");
+        }
+        assert!(project.0.join("Assets/prefabs/p.rveprefab").is_file());
+        assert!(!project.0.join("Assets/heavy").exists());
+    }
+
+    #[test]
+    fn write_failure_in_the_middle_restores_written_files_and_the_original_name() {
+        let project = TempProject::new();
+        let assets = project.assets();
+        let files = three_referencing_files(&project);
+        let remap = PathRemap::new("prefabs", "heavy");
+        let references = scan(&project.0, &assets, &remap).references;
+        assert_eq!(references.len(), 3);
+
+        let mut calls = 0;
+        let error = rename_with_writer(
+            &project.0,
+            &assets,
+            "prefabs",
+            "heavy",
+            &references,
+            &mut |file, contents| {
+                calls += 1;
+                if calls == 2 {
+                    return Err("диск переполнен".to_owned());
+                }
+                write_atomic(file, contents)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("диск переполнен"), "{error}");
+        assert!(error.contains("отменено"), "{error}");
+        // Первая запись, сбой на второй и восстановление первой.
+        assert_eq!(calls, 3);
+        assert_project_unchanged(&project, &files);
+    }
+
+    #[test]
+    fn failed_rollback_reports_every_file_left_changed() {
+        let project = TempProject::new();
+        let assets = project.assets();
+        three_referencing_files(&project);
+        let remap = PathRemap::new("prefabs", "heavy");
+        let references = scan(&project.0, &assets, &remap).references;
+
+        let mut calls = 0;
+        let error = rename_with_writer(
+            &project.0,
+            &assets,
+            "prefabs",
+            "heavy",
+            &references,
+            &mut |file, contents| {
+                calls += 1;
+                match calls {
+                    1 => write_atomic(file, contents),
+                    _ => Err("нет доступа".to_owned()),
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("не восстановлен"), "{error}");
+        // Имя возвращается и тогда, когда файл восстановить не удалось.
+        assert!(project.0.join("Assets/prefabs/p.rveprefab").is_file());
+        assert!(!project.0.join("Assets/heavy").exists());
+    }
+
+    #[test]
+    fn rename_without_reference_updates_and_case_only_rename_rewrite_and_roll_back() {
+        let project = TempProject::new();
+        let assets = project.assets();
+        let files = three_referencing_files(&project);
+        let remap = PathRemap::new("prefabs", "Prefabs");
+        let references = scan(&project.0, &assets, &remap).references;
+
+        let mut calls = 0;
+        rename_with_writer(
+            &project.0,
+            &assets,
+            "prefabs",
+            "Prefabs",
+            &references,
+            &mut |_, _| {
+                calls += 1;
+                Err("сбой".to_owned())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        for (path, text) in &files {
+            assert_eq!(&project.read(path), text, "{path}");
+        }
+        let names = fs::read_dir(project.0.join("Assets"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"prefabs".to_owned()), "{names:?}");
+
+        let (target, written) =
+            rename_with_references(&project.0, &assets, "prefabs", "Prefabs", &references, true)
+                .unwrap();
+        assert_eq!(target, "Prefabs");
+        assert_eq!(written.len(), 3);
+        assert!(
+            project
+                .read("Assets/scenes/a.rvescene")
+                .contains("/Prefabs/p.rveprefab")
+        );
+
+        let (target, written) =
+            rename_with_references(&project.0, &assets, "Prefabs", "heavy", &references, false)
+                .unwrap();
+        assert_eq!(target, "heavy");
+        assert!(written.is_empty());
+        assert!(
+            project
+                .read("Assets/scenes/a.rvescene")
+                .contains("/Prefabs/p.rveprefab")
+        );
     }
 }
