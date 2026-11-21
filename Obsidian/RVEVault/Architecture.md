@@ -17,7 +17,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 | ash 0.38.0 | Vulkan bindings и runtime-загрузка loader | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
 | naga 30.0.1 | GLSL → SPIR-V для встроенных shaders при сборке, Surface GLSL при runtime shader creation и пользовательских экранных шейдеров камер при runtime и в `rve-build`, без Vulkan SDK | `engine/engine-render/build.rs`, `engine/engine-render/src/surface_shader.rs`, `engine/engine-render/src/screen_shader.rs` |
 | glam 0.34.1 | Камеры, трансформации, свет, матрицы сцены и physics-геометрия | `engine/engine-scene/src`, `engine/engine-physics/src`, `engine/sandbox/src/scene.rs`, `engine/sandbox/src/content.rs` |
-| blake3 1.8.7 | ArchiveId, hashes chunks и полных decoded blobs; ключи протокола, transcript и `scene_hash` сети | `engine/engine-pak/src`, `engine/engine-network/src` |
+| blake3 1.8.7 | ArchiveId, hashes chunks и полных decoded blobs, ключи кеша сжатых блоков; ключи протокола, transcript и `scene_hash` сети | `engine/engine-pak/src`, `engine/engine-network/src` |
 | chacha20poly1305 0.11.0, x25519-dalek 2.0.1, ed25519-dalek 2.2.0, getrandom 0.4.3, zeroize 1.9.1 | Шифрование датаграмм, обмен ключами, подпись ключа сервера, случайные секреты и обнуление ключей сетевого протокола | `Cargo.toml`, `engine/engine-network/Cargo.toml` |
 | serde 1.0.229, toml 0.8.23 | Строгая типизированная конфигурация manifest для builder | `engine/engine-pak/src/builder.rs` |
 | zstd 0.14.2 | Независимые Zstandard frames в RVEPAK | `engine/engine-pak/src` |
@@ -68,7 +68,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineMaterials]] — форматы .rvemat/.rveshader, shader schema и связь материал-слот-renderer.
 - [[Engine/EngineFiles]] — канонические virtual paths, Windows filesystem path normalization и `ReadAt` для позиционного чтения.
 - [[Engine/EngineProject]] — общие форматы настроек проекта и bootstrap для приложений и инструментов.
-- [[Engine/EnginePak]] — чтение RVEPAK v1/v2, запись v2, потоковый writer и каталог архивов.
+- [[Engine/EnginePak]] — чтение RVEPAK v1/v2, запись v2, потоковый writer, каталог архивов и кеш сжатых блоков для повторной упаковки.
 - [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG/Radiance HDR в память CPU, без зависимости от renderer.
