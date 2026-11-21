@@ -19,7 +19,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineGui]] | Игровой UI: формат `.rveui`, layout, интерактивные виджеты и draw list |
 | [[Engine/EngineMaterials]] | Форматы .rvemat/.rveshader, shader properties и renderer material contract |
 | [[Engine/EngineFiles]] | Канонические пути и позиционное чтение файлов |
-| [[Engine/EnginePak]] | Формат RVEPAK, builder manifest, CLI и межархивный каталог |
+| [[Engine/EnginePak]] | Формат RVEPAK, builder manifest, CLI, межархивный каталог и кеш сжатых блоков |
 | [[Engine/EngineResources]] | Фоновое чтение loose и packed бинарных ресурсов |
 | [[Engine/EngineAssets]] | Пути ресурсов, загрузка моделей FBX, текстур PNG и Radiance HDR environments |
 | [[Engine/EnginePhysics]] | Геометрия, столкновения, solver и fixed-step physics world |

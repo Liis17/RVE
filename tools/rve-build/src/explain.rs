@@ -49,6 +49,9 @@ pub(crate) fn explain_asset(
             ));
         }
     }
+    if trace.save_migration.as_ref() == Some(path) {
+        chains.push(format!("project.rveproject → /{path} ([save] migration)"));
+    }
 
     Ok(Explanation {
         path: path.clone(),
@@ -145,6 +148,7 @@ fn reason_text(trace: &BuildTrace, path: &VirtualPath, reason: &ArchiveReason) -
         ArchiveReason::StringTable { language } => {
             format!("таблица строк языка {language:?} из [localization] всегда лежит в base")
         }
+        ArchiveReason::SaveMigration => "мигратор сохранений всегда лежит в base".to_owned(),
         ArchiveReason::Explicit { owner, archive } => {
             match trace.archive_source(path, owner, archive) {
                 Some(ArchiveSource::Document(document))
@@ -283,6 +287,38 @@ mod tests {
 
     fn explain(root: &Path, asset_path: &str) -> String {
         explain_asset(root, &path(asset_path)).unwrap().to_string()
+    }
+
+    #[test]
+    fn save_migration_is_explained_as_a_project_root_in_base() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-explain-save").unwrap();
+        project(root.path(), &["/scenes/main.rvescene"], None);
+        let settings = root.path().join("project.rveproject");
+        let mut contents = fs::read_to_string(&settings).unwrap();
+        contents.push_str("[save]\nversion = 1\nmigration = \"/scripts/save_migration.lua\"\n");
+        fs::write(&settings, contents).unwrap();
+        scene(root.path(), "main", "");
+        asset(
+            root.path(),
+            "scripts/save_migration.lua",
+            "return { migrate = function(_, values) return values end }\n",
+        );
+
+        let text = explain(root.path(), "/scripts/save_migration.lua");
+        assert!(
+            text.starts_with("/scripts/save_migration.lua → архив base\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("причина: мигратор сохранений всегда лежит в base\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  project.rveproject → /scripts/save_migration.lua ([save] migration)\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

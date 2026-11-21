@@ -17,6 +17,7 @@ mod physics;
 mod platform;
 mod platform_lua;
 mod save_file;
+mod save_migration;
 mod save_writer;
 mod scene_state;
 mod script_refs;
@@ -41,7 +42,8 @@ pub use lifecycle::{
 };
 pub use platform::{FileDialogFilter, FileDialogKind, FileDialogRequest, PlatformRequest};
 pub use rve_sdk::{Key, MouseButton};
-pub use save_file::{decode_save_data, encode_save_data};
+pub use save_file::{SaveData, decode_save_data, encode_save_data};
+pub use save_migration::{LuaSaveMigration, SaveSchema};
 pub use types::{
     MAX_RUMBLE_SECONDS, RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel,
     ScriptFrameTime, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,

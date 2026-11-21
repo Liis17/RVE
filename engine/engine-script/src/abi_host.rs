@@ -5016,15 +5016,15 @@ impl OwnedAbiValue {
     }
 }
 
-struct OwnedAbiParams {
+pub(crate) struct OwnedAbiParams {
     _keys: Vec<String>,
     _values: Vec<OwnedAbiValue>,
     _entries: Vec<RveParamEntry>,
-    abi: RveParams,
+    pub(crate) abi: RveParams,
 }
 
 impl OwnedAbiParams {
-    fn new(
+    pub(crate) fn new(
         params: &BTreeMap<String, ParamValue>,
         object_refs: &std::collections::HashMap<String, ScriptObjectRef>,
     ) -> Self {

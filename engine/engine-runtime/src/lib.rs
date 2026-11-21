@@ -276,6 +276,10 @@ fn run_from_args(
         Ok(list) => list,
         Err(error) => return fail(2, format!("ошибка списка префабов: {error}")),
     };
+    let save_schema = match load_save_schema(&project.save, &resource_handle) {
+        Ok(schema) => schema,
+        Err(error) => return fail(2, format!("ошибка схемы сохранений: {error}")),
+    };
     let fsr_library = layout.fsr_library_path(project.runtime.fsr_library.as_deref());
     let dlss_library = layout.dlss_library_path(project.runtime.dlss_library.as_deref());
 
@@ -527,6 +531,7 @@ fn run_from_args(
             gpu_render: !headless,
             scene_name: name,
             save_path: engine_platform::save_data_path(&project.name),
+            save_schema,
             enabled_scenes: project
                 .scenes
                 .iter()
@@ -717,6 +722,33 @@ fn add_heavy_prefabs(catalog: &mut PrefabCatalog, list: &PrefabCatalogFile) -> R
         );
     }
     Ok(())
+}
+
+/// Читает Lua-мигратор `[save] migration` через ресурсы: loose-файл в dev и RVEPAK в release.
+fn load_save_schema(
+    settings: &engine_project::SaveSettings,
+    resources: &ResourceHandle,
+) -> Result<engine_script::SaveSchema, String> {
+    let lua_migration = match settings.migration_path() {
+        Some(path) => {
+            let bytes = resources
+                .read_all(format!("/{path}"))
+                .map_err(|error| format!("/{path}: {error}"))?
+                .wait()
+                .map_err(|error| format!("/{path}: {error}"))?;
+            let source = String::from_utf8(bytes)
+                .map_err(|error| format!("/{path}: мигратор должен быть UTF-8: {error}"))?;
+            Some(engine_script::LuaSaveMigration {
+                path: path.as_str().to_owned(),
+                source,
+            })
+        }
+        None => None,
+    };
+    Ok(engine_script::SaveSchema {
+        version: settings.version,
+        lua_migration,
+    })
 }
 
 fn load_project_settings(

@@ -19,8 +19,7 @@ use crate::profiling::{
 };
 use crate::scene::{
     MaterialAssetView, MaterialUploadCaches, ObjectModel, ParticleSource, PreparedMaterialAssets,
-    PreparedPrefabs, PreparedRenderAssets, SceneParticles, particle_emitter_desc,
-    upload_object_levels, upload_scene,
+    PreparedPrefabs, PreparedRenderAssets, SceneParticles, upload_object_levels, upload_scene,
 };
 use crate::scene_switch::{
     SceneCommit, SceneGpuIds, SceneLoader, SceneSwitch, SceneUpload, SceneUploadReply,
@@ -59,6 +58,7 @@ use engine_scene::{
     LodSelector, ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
     activity_audio_requests,
 };
+use engine_scene_render::particle_emitter_desc;
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
 use engine_script::{
@@ -481,6 +481,8 @@ pub(crate) trait ExitRequester: Send + Sync {
 pub(crate) struct ScriptThreadConfig {
     pub scene_name: String,
     pub save_path: Option<PathBuf>,
+    /// Версия схемы сохранений и Lua-мигратор из `[save]` проекта.
+    pub save_schema: engine_script::SaveSchema,
     /// Включённые сцены проекта: только они принимаются `rve.scene.load`.
     pub enabled_scenes: Vec<String>,
     pub sources: std::collections::BTreeMap<String, String>,

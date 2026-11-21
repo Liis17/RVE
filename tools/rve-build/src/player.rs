@@ -1,4 +1,4 @@
-use crate::archives::build_project_archives;
+use crate::archives::{build_project_archives, open_pak_cache};
 use crate::error::BuildError;
 #[cfg(windows)]
 use crate::ico::png_to_ico;
@@ -179,7 +179,8 @@ pub(crate) fn build_distribution(
     #[cfg(windows)]
     copy_dlss_runtime(&project, &engine_dir)?;
     let assets_dir = resources_dir.join("Assets");
-    build_project_archives(&project, &assets_dir, compression)?;
+    let mut pak_cache = open_pak_cache(&project.project_dir);
+    build_project_archives(&project, &assets_dir, compression, pak_cache.as_mut())?;
     validate_staged_archives(&assets_dir)?;
 
     #[cfg(target_os = "macos")]

@@ -1,6 +1,6 @@
 [package]
 name = "engine-runtime"
-version = "0.36.0"
+version = "0.37.0"
 edition.workspace = true
 license.workspace = true
 
@@ -32,6 +32,7 @@ engine-project = { path = "../engine-project" }
 engine-render = { path = "../engine-render" }
 engine-resources = { path = "../engine-resources" }
 engine-scene = { path = "../engine-scene" }
+engine-scene-render = { path = "../engine-scene-render" }
 engine-script = { path = "../engine-script" }
 engine-window = { path = "../engine-window" }
 epaint = "=0.36.2"

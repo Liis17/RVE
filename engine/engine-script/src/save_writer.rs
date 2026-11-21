@@ -1,3 +1,4 @@
+use crate::SaveData;
 use engine_scene::ParamValue;
 use std::collections::BTreeMap;
 use std::fs;
@@ -34,8 +35,8 @@ pub(crate) struct SaveWriter {
 }
 
 impl SaveWriter {
-    pub(crate) fn open(path: &Path) -> Result<(Self, BTreeMap<String, ParamValue>), String> {
-        let values = read_values(path)?;
+    /// Starts the writer that stores every snapshot as save schema `version`.
+    pub(crate) fn start(path: &Path, version: u32) -> Result<Self, String> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let (ack_sender, acknowledgements) = mpsc::channel();
         let worker_path = path.to_owned();
@@ -45,7 +46,7 @@ impl SaveWriter {
                 while let Ok(message) = receiver.recv() {
                     match message {
                         SaveMessage::Snapshot { generation, values } => {
-                            let result = write_values(&worker_path, &values);
+                            let result = write_values(&worker_path, version, &values);
                             let _ = ack_sender.send(SaveAck { generation, result });
                         }
                         SaveMessage::Flush {
@@ -55,7 +56,7 @@ impl SaveWriter {
                         } => {
                             let _ = reply.send(SaveAck {
                                 generation,
-                                result: write_values(&worker_path, &values),
+                                result: write_values(&worker_path, version, &values),
                             });
                         }
                         SaveMessage::Shutdown => break,
@@ -63,15 +64,12 @@ impl SaveWriter {
                 }
             })
             .map_err(|error| format!("cannot start save writer: {error}"))?;
-        Ok((
-            Self {
-                path: path.to_owned(),
-                sender,
-                acknowledgements,
-                worker: Some(worker),
-            },
-            values,
-        ))
+        Ok(Self {
+            path: path.to_owned(),
+            sender,
+            acknowledgements,
+            worker: Some(worker),
+        })
     }
 
     /// Queues a snapshot without waiting. `false` means a previous snapshot is still queued.
@@ -153,10 +151,11 @@ impl Drop for SaveWriter {
     }
 }
 
-fn read_values(path: &Path) -> Result<BTreeMap<String, ParamValue>, String> {
+/// Reads the save file without starting persistence. A missing file is `None`.
+pub(crate) fn read_values(path: &Path) -> Result<Option<SaveData>, String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
     };
     if metadata.len() > MAX_SAVE_FILE_BYTES {
@@ -167,11 +166,16 @@ fn read_values(path: &Path) -> Result<BTreeMap<String, ParamValue>, String> {
     let source = String::from_utf8(bytes)
         .map_err(|error| format!("save file {} is not UTF-8: {error}", path.display()))?;
     crate::decode_save_data(&source)
+        .map(Some)
         .map_err(|error| format!("invalid save file {}: {error}", path.display()))
 }
 
-fn write_values(path: &Path, values: &BTreeMap<String, ParamValue>) -> Result<(), String> {
-    let source = crate::encode_save_data(values)?;
+fn write_values(
+    path: &Path,
+    version: u32,
+    values: &BTreeMap<String, ParamValue>,
+) -> Result<(), String> {
+    let source = crate::encode_save_data(version, values)?;
     engine_platform::write_user_data_atomically(path, source.as_bytes())
         .map_err(|error| format!("cannot atomically replace {}: {error}", path.display()))
 }
@@ -187,17 +191,19 @@ mod tests {
     fn isolated_save_writer_roundtrips_and_atomically_overwrites_data() {
         let directory = temp_dir();
         let path = directory.join("player-save").join("save.toml");
-        let (writer, initial) = SaveWriter::open(&path).unwrap();
-        assert!(initial.is_empty());
+        assert_eq!(read_values(&path).unwrap(), None);
+        let writer = SaveWriter::start(&path, 2).unwrap();
         let first = BTreeMap::from([("score".to_owned(), ParamValue::Int(12))]);
         writer.flush(1, first.clone()).unwrap();
         let second = BTreeMap::from([("score".to_owned(), ParamValue::Int(44))]);
         writer.finish(2, second.clone()).unwrap();
 
-        let (writer, loaded) = SaveWriter::open(&path).unwrap();
-        assert_eq!(loaded, second);
-        writer.finish(2, loaded.clone()).unwrap();
-        assert_eq!(read_values(&path).unwrap(), second);
+        let loaded = read_values(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.values, second);
+        let writer = SaveWriter::start(&path, 2).unwrap();
+        writer.finish(2, loaded.values).unwrap();
+        assert_eq!(read_values(&path).unwrap().unwrap().values, second);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -210,6 +216,7 @@ mod tests {
         fs::write(&sentinel, b"old data").unwrap();
         let result = write_values(
             &path,
+            0,
             &BTreeMap::from([("score".to_owned(), ParamValue::Int(1))]),
         );
         assert!(result.is_err());
@@ -224,8 +231,8 @@ mod tests {
         let blocked_parent = directory.join("blocked");
         fs::create_dir(&blocked_parent).unwrap();
         let path = blocked_parent.join("save.toml");
-        let (writer, initial) = SaveWriter::open(&path).unwrap();
-        assert!(initial.is_empty());
+        assert_eq!(read_values(&path).unwrap(), None);
+        let writer = SaveWriter::start(&path, 0).unwrap();
         fs::remove_dir(&blocked_parent).unwrap();
         fs::write(&blocked_parent, b"keep this file").unwrap();
         let values = BTreeMap::from([("score".to_owned(), ParamValue::Int(7))]);
@@ -250,7 +257,7 @@ mod tests {
             .expect("retry acknowledgement");
         assert!(retry_ack.result.is_ok());
         writer.finish(1, values.clone()).unwrap();
-        assert_eq!(read_values(&path).unwrap(), values);
+        assert_eq!(read_values(&path).unwrap().unwrap().values, values);
         fs::remove_dir_all(directory).unwrap();
     }
 

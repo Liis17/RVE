@@ -11,7 +11,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const WRITER_ZSTD_WINDOW_LOG: u32 = 23;
+pub(crate) const WRITER_ZSTD_WINDOW_LOG: u32 = 23;
+
+/// Encodes one decoded chunk: `(codec, decoded bytes, zstd level, BLAKE3 of decoded bytes)`.
+pub(crate) type ChunkEncoder<'a> = dyn FnMut(Codec, &[u8], i32, &[u8; 32]) -> Result<Vec<u8>> + 'a;
 
 #[derive(Clone, Debug)]
 pub struct WriterOptions {
@@ -200,9 +203,28 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     pub fn add_local_with_options<R: Read>(
         &mut self,
         path: VirtualPath,
+        source: R,
+        blob_options: BlobOptions,
+        expected_content_hash: Option<ContentHash>,
+    ) -> Result<BlobId> {
+        self.add_local_with_encoder(
+            path,
+            source,
+            blob_options,
+            expected_content_hash,
+            &mut |codec, decoded, level, _| encode_chunk(codec, decoded, level),
+        )
+    }
+
+    /// Like [`Self::add_local_with_options`], but stored chunk bytes come from `encoder`.
+    /// The encoder must return exactly what [`encode_chunk`] would produce.
+    pub(crate) fn add_local_with_encoder<R: Read>(
+        &mut self,
+        path: VirtualPath,
         mut source: R,
         blob_options: BlobOptions,
         expected_content_hash: Option<ContentHash>,
+        encoder: &mut ChunkEncoder<'_>,
     ) -> Result<BlobId> {
         self.ensure_writable()?;
         self.validate_path(&path)?;
@@ -221,7 +243,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             ));
         }
 
-        let write_result = self.write_local(&mut source, blob_options, expected_content_hash);
+        let write_result =
+            self.write_local(&mut source, blob_options, expected_content_hash, encoder);
         match write_result {
             Ok(blob) => {
                 let id = blob.id;
@@ -334,6 +357,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         source: &mut R,
         blob_options: BlobOptions,
         expected_content_hash: Option<ContentHash>,
+        encoder: &mut ChunkEncoder<'_>,
     ) -> Result<LocalBlob> {
         let chunk_size = usize::try_from(blob_options.chunk_size).map_err(|_| {
             PakError::InvalidConfiguration("chunk size does not fit address space".into())
@@ -363,7 +387,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             let decoded = &buffer[..read];
             content_hasher.update(decoded);
             let chunk_hash = *blake3::hash(decoded).as_bytes();
-            let stored = encode_chunk(blob_options.codec, decoded, blob_options.zstd_level)?;
+            let stored = encoder(
+                blob_options.codec,
+                decoded,
+                blob_options.zstd_level,
+                &chunk_hash,
+            )?;
             let offset = self
                 .spool
                 .file_mut()
@@ -474,7 +503,7 @@ fn read_up_to(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usiz
     Ok(filled)
 }
 
-fn encode_chunk(codec: Codec, decoded: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
+pub(crate) fn encode_chunk(codec: Codec, decoded: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
     match codec {
         Codec::None => Ok(decoded.to_vec()),
         Codec::Zstd => {

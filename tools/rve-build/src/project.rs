@@ -367,7 +367,20 @@ fn prepare_with_resources(
     if let Some(trace) = trace.as_deref_mut() {
         trace.icon = icon.clone();
     }
+    // Мигратор сохранений не достижим из сцен: runtime читает его до старта скриптов, поэтому он
+    // лежит в базовом архиве.
+    let save_migration = settings.save.migration_path();
+    if let Some(migration) = &save_migration {
+        read_asset_text(&sources, migration, "мигратор сохранений")?;
+        base_paths.insert(migration.clone());
+    }
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.save_migration = save_migration.clone();
+    }
     let mut base_reasons = BTreeMap::new();
+    if let Some(migration) = &save_migration {
+        base_reasons.insert(migration.clone(), ArchiveReason::SaveMigration);
+    }
     if let Some(icon_path) = &icon {
         base_reasons.insert(icon_path.clone(), ArchiveReason::AppIcon);
     }
@@ -1010,6 +1023,9 @@ fn assign_archives(
             }) {
                 let reason = match base_reason {
                     ArchiveReason::AppIcon => "AppIcon всегда должен находиться в base",
+                    ArchiveReason::SaveMigration => {
+                        "мигратор сохранений всегда должен находиться в base"
+                    }
                     ArchiveReason::StringTable { .. } => {
                         "таблица строк всегда должна находиться в base"
                     }
@@ -1570,6 +1586,33 @@ mod lite_params_tests {
             assert!(error.to_string().contains("\"camera\""), "{error}");
             assert!(error.to_string().contains("/scripts/rotate.lua"), "{error}");
         }
+    }
+
+    #[test]
+    fn save_migration_is_packed_even_though_no_scene_references_it() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-save").unwrap();
+        project(root.path(), "{ speed = 90 }");
+        let settings = root.path().join("project.rveproject");
+        let mut contents = fs::read_to_string(&settings).unwrap();
+        contents.push_str("[save]\nversion = 2\nmigration = \"/scripts/save_migration.lua\"\n");
+        fs::write(&settings, contents).unwrap();
+
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(
+            error.to_string().contains("/scripts/save_migration.lua"),
+            "{error}"
+        );
+
+        fs::write(
+            root.path().join("Assets/scripts/save_migration.lua"),
+            "return { migrate = function(_, values) return values end }\n",
+        )
+        .unwrap();
+        let build = prepare_project(root.path()).unwrap();
+        let migration = VirtualPath::parse("/scripts/save_migration.lua").unwrap();
+        assert!(build.files.contains_key(&migration));
+        assert_eq!(build.assignments[&migration], "base");
     }
 
     #[test]

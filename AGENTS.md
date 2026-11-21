@@ -98,7 +98,7 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
 
 - В engine-core, engine-window и engine-render проверяй публичный API и его использование в engine/sandbox. Sandbox также использует engine-assets, engine-files, engine-physics, engine-platform, engine-project, engine-resources и engine-scene.
 - Изменения engine-window, engine-render, engine-platform, engine-scene, engine-audio, engine-script, engine-resources, engine-project, engine-physics, engine-input, engine-network и engine-animation проверяй также на потребителях engine-runtime/rve-player и rve-build, если они используют изменённый крейт. Прямые workspace-зависимости:
-  - engine-runtime: engine-core, engine-animation, engine-assets, engine-files, engine-audio, engine-network, engine-input, engine-gui, engine-physics, engine-platform, engine-project, engine-render, engine-resources, engine-scene, engine-script, engine-window, engine-console, engine-ui, rve-crash-monitor; за feature `crash-dumps` на Windows x86_64 и macOS также crash-handler и minidumper, а getrandom нужен для имени IPC-каталога.
+  - engine-runtime: engine-core, engine-animation, engine-assets, engine-files, engine-audio, engine-network, engine-input, engine-gui, engine-physics, engine-platform, engine-project, engine-render, engine-resources, engine-scene, engine-scene-render, engine-script, engine-window, engine-console, engine-ui, rve-crash-monitor; за feature `crash-dumps` на Windows x86_64 и macOS также crash-handler и minidumper, а getrandom нужен для имени IPC-каталога.
   - rve-build: engine-render, engine-assets, engine-files, engine-pak, engine-project, engine-resources, engine-scene, engine-script, engine-gui, rve-sdk. Собирает и кладёт рядом с игроком и сервером `rve-crash-monitor`.
   - engine-script (потребители engine-runtime, rve-editor и rve-build): engine-console, engine-files, engine-platform, engine-project, engine-gui, engine-physics, engine-scene, rve-sdk.
   - engine-gui (потребители engine-script, engine-ui, engine-runtime, rve-editor и rve-build): engine-files, epaint, serde, toml, skrifa.
@@ -108,11 +108,12 @@ Vault: `Obsidian/RVEVault` — актуальное описание устро�
   - engine-network (потребители engine-runtime и rve-editor): engine-scene, blake3, chacha20poly1305, ed25519-dalek, x25519-dalek, getrandom, zeroize, engine-files, flume, glam, log. От скриптов, runtime, renderer и окна не зависит.
   - engine-input (потребители engine-runtime и rve-editor): gilrs, log, rve-sdk.
   - engine-mcp (потребитель rve-editor): tiny_http, base64, getrandom, flume, serde_json.
+  - engine-scene-render (потребители engine-runtime и rve-editor): engine-scene, engine-render.
   - engine-pak (потребители engine-resources, rve-build и утилита rvepak): engine-files.
   - rve-player: engine-runtime (feature `crash-dumps` включена по умолчанию).
   - rve-crash-monitor (потребители: engine-runtime как библиотека без зависимостей с именами и хранением файлов `crash-*`, rve-build как сборка бинарника): бинарник за feature `server`, зависит от minidumper, на Windows — от windows-sys, на macOS — от libc; только на Windows x86_64 и macOS.
   - rve-server: engine-runtime (headless-путь без окна и renderer; feature `crash-dumps` включена по умолчанию).
-  - rve-editor: engine-core, engine-platform, engine-animation, engine-assets, engine-files, engine-gui, engine-input, engine-network, engine-physics, engine-project, engine-render, engine-audio, engine-resources, engine-scene, engine-script, engine-window, engine-console, engine-ui, engine-mcp.
+  - rve-editor: engine-core, engine-platform, engine-animation, engine-assets, engine-files, engine-gui, engine-input, engine-network, engine-physics, engine-project, engine-render, engine-audio, engine-resources, engine-scene, engine-scene-render, engine-script, engine-window, engine-console, engine-ui, engine-mcp.
 - При изменении engine-platform проверяй общий интерфейс, адаптеры engine-platform-windows и engine-platform-macos и вызовы из renderer.
 - Контракты: учитывай WindowHandler, WindowConfig, RendererConfig, FrameStatus, ошибки библиотек, CLI sandbox и коды завершения. При их изменении проверяй производителей и потребителей.
 - Платформы: учитывай Windows с Vulkan-драйвером и macOS с Vulkan loader и MoltenVK. Меняй только затронутые платформы и явно указывай непроверенные.

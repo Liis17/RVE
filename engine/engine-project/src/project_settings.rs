@@ -39,6 +39,9 @@ pub struct ProjectSettings {
     /// Слои объектов: `[layers] names = [...]`. Индекс имени — значение `layer` объекта.
     #[serde(default, skip_serializing_if = "LayerSettings::is_default")]
     pub layers: LayerSettings,
+    /// Схема сохранений игры: `[save]`. Значения по умолчанию не сериализуются.
+    #[serde(default, skip_serializing_if = "SaveSettings::is_default")]
+    pub save: SaveSettings,
     /// Таблицы строк игрового UI: `[localization]`. Без секции ключи показываются как есть.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localization: Option<LocalizationSettings>,
@@ -211,6 +214,42 @@ impl Default for RuntimeSettings {
             dlss_application_id: None,
             dlss_engine_version: None,
         }
+    }
+}
+
+/// Версия схемы сохранений и необязательный Lua-мигратор: `[save] version = 2`,
+/// `migration = "/scripts/save_migration.lua"`. Файл сохранения без версии имеет версию 0.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SaveSettings {
+    pub version: u32,
+    /// Virtual path Lua-файла с функцией `migrate(from_version, values)`.
+    pub migration: Option<String>,
+}
+
+impl SaveSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Канонический virtual path Lua-мигратора.
+    pub fn migration_path(&self) -> Option<VirtualPath> {
+        self.migration
+            .as_deref()
+            .and_then(|path| VirtualPath::parse(path).ok())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let Some(path) = &self.migration
+            && !self
+                .migration_path()
+                .is_some_and(|path| path.as_str().ends_with(".lua"))
+        {
+            return Err(format!(
+                "save.migration {path:?} должен быть virtual path Lua-файла (.lua)"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -419,6 +458,7 @@ impl ProjectSettings {
         if let Some(localization) = &self.localization {
             localization.validate()?;
         }
+        self.save.validate()?;
         if let Some(path) = &self.heavy_scripts
             && !is_relative_project_path(path)
         {
@@ -581,7 +621,7 @@ fn default_background_tick_hz() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkSettings, PhysicsSettings, ProjectSettings, RuntimeSettings};
+    use super::{NetworkSettings, PhysicsSettings, ProjectSettings, RuntimeSettings, SaveSettings};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -860,6 +900,39 @@ mod tests {
             );
             let error = ProjectSettings::parse(&contents).unwrap_err();
             assert!(error.contains("physics"), "{field}={value}: {error}");
+        }
+    }
+
+    #[test]
+    fn save_section_parses_version_and_lua_migration_and_omits_defaults() {
+        let base = project("[[scenes]]\npath = \"scene.rvescene\"\n");
+        let settings = ProjectSettings::parse(&base).unwrap();
+        assert_eq!(settings.save, SaveSettings::default());
+        assert!(!settings.to_toml().unwrap().contains("[save]"));
+
+        let contents =
+            format!("{base}\n[save]\nversion = 2\nmigration = \"/scripts/save_migration.lua\"\n");
+        let settings = ProjectSettings::parse(&contents).unwrap();
+        assert_eq!(settings.save.version, 2);
+        assert_eq!(
+            settings.save.migration_path().unwrap().as_str(),
+            "scripts/save_migration.lua"
+        );
+        let reparsed = ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap();
+        assert_eq!(reparsed.save, settings.save);
+
+        for invalid in [
+            "migration = \"/scripts/save.txt\"",
+            "migration = \"../save.lua\"",
+            "version = -1",
+            "unknown = true",
+        ] {
+            let contents = format!("{base}\n[save]\n{invalid}\n");
+            let error = ProjectSettings::parse(&contents).unwrap_err();
+            assert!(
+                error.contains("save") || error.contains("unknown") || error.contains("version"),
+                "{invalid}: {error}"
+            );
         }
     }
 

@@ -43,10 +43,10 @@ pub use network::{
     NetworkIdentityComponent, NetworkTransformComponent, PeerId, SERVER_PEER_ID, scene_net_id,
 };
 pub use particles::{
-    MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, ParticleBlendMode,
-    ParticleBurstComponent, ParticleCollisionComponent, ParticleColorKeyComponent,
-    ParticleEmitterComponent, ParticleFlipbookComponent, ParticleShapeComponent,
-    ParticleSizeKeyComponent,
+    MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, MAX_PARTICLE_CURVE_KEYS,
+    ParticleBlendMode, ParticleBurstComponent, ParticleCollisionComponent,
+    ParticleColorKeyComponent, ParticleEmitterComponent, ParticleFlipbookComponent,
+    ParticleShapeComponent, ParticleSizeKeyComponent,
 };
 pub use physics_material::{CombineMode, PhysicsMaterialError, PhysicsMaterialSettings};
 pub use shader_asset::{

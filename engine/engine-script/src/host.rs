@@ -16,6 +16,7 @@ use crate::net::{
 };
 use crate::physics::PhysicsScriptState;
 use crate::platform::{PlatformRequest, SharedPlatformState};
+use crate::save_migration::SaveSchema;
 use crate::save_writer::SaveWriter;
 use crate::scene_state::{SceneState, SharedSceneState, canonical_scene_path};
 use crate::script_refs::{ScriptRefCapabilities, ScriptRefEntry, ScriptRefs};
@@ -217,6 +218,8 @@ pub struct ScriptHost {
     /// Spawn-объектов, уже созданных в текущем кадре; сбрасывается в начале update.
     frame_spawned: usize,
     _loaded_library: Option<SharedLibrary>,
+    /// `rve_save_migrate` of the loaded library; valid while `_loaded_library` is held.
+    save_migration: Option<rve_sdk::abi::RveSaveMigrateFn>,
     events: EventQueue,
     active_source: ActiveSource,
     active_call: ActiveCall,
@@ -472,6 +475,7 @@ impl ScriptHost {
         let loaded_library = library.and_then(ScriptLibrary::shared_library);
         let heavy = library.map(heavy_scripts).unwrap_or_default();
         let heavy_abi_version = library.map_or(0, ScriptLibrary::abi_version);
+        let save_migration = library.and_then(ScriptLibrary::save_migration);
         let script_refs = ScriptRefs::default();
         let mut transaction = ScriptTransaction::with_ui(ui.clone());
         transaction.attach_script_refs(script_refs.clone());
@@ -502,6 +506,7 @@ impl ScriptHost {
             lifecycle: Rc::new(RefCell::new(lifecycle)),
             frame_spawned: 0,
             _loaded_library: loaded_library,
+            save_migration,
             events,
             active_source,
             active_call,
@@ -808,12 +813,28 @@ impl ScriptHost {
         Ok(())
     }
 
-    /// Loads this project's save file and enables asynchronous persistence before callbacks start.
-    pub fn load_save_file(&mut self, path: &Path) -> Result<(), String> {
+    /// Loads this project's save file, migrates it to `schema.version` and enables asynchronous
+    /// persistence before callbacks start. A missing file starts empty at `schema.version`.
+    ///
+    /// On any error the file is left unchanged and scripts use in-memory data without persistence.
+    pub fn load_save_file(&mut self, path: &Path, schema: &SaveSchema) -> Result<(), String> {
         if self.started || self.destroyed || self.save_writer.is_some() {
             return Err("save file must be attached once before scripts start".to_owned());
         }
-        let (writer, values) = match SaveWriter::open(path) {
+        let opened = crate::save_writer::read_values(path).and_then(|data| {
+            let values = match data {
+                Some(data) => crate::save_migration::migrate_save_data(
+                    data,
+                    schema,
+                    self.save_migration,
+                    &self.call_deadline,
+                )
+                .map_err(|error| format!("cannot migrate {}: {error}", path.display()))?,
+                None => BTreeMap::new(),
+            };
+            Ok((SaveWriter::start(path, schema.version)?, values))
+        });
+        let (writer, values) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 self.report_save_failure(format!(
