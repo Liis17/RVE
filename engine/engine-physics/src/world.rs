@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use glam::{Mat3, Quat, Vec3};
 
 use crate::broad::{BroadItem, BroadPhase, BroadPhaseOutput, CandidatePair};
 use crate::material::PhysicsMaterial;
 use crate::narrow::{ManifoldCache, PairKey, collide};
-use crate::query::{QueryCollider, QueryColliderDesc, QueryError, QuerySnapshot};
+use crate::query::{ColliderTree, QueryCollider, QueryColliderDesc, QueryError, QuerySnapshot};
 use crate::{Aabb, BroadPhaseError, ContactManifold, GeometryError, NarrowphaseError, Pose, Shape};
 
 /// Число слоёв столкновений; слой тела — индекс в диапазоне `0..PHYSICS_LAYER_COUNT`.
@@ -540,6 +540,9 @@ pub struct PhysicsWorld {
     broadphase_degraded: bool,
     /// Маска слоёв для каждого слоя; по умолчанию все пары разрешены.
     collision_matrix: [u32; PHYSICS_LAYER_COUNT],
+    /// BVH static-коллайдеров последнего снимка запросов; `query_snapshot` переиспользует его,
+    /// пока static-коллайдеры не менялись. `Mutex`, потому что снимок строится по `&self`.
+    query_static_tree: Mutex<Option<Arc<ColliderTree>>>,
 }
 
 impl Default for PhysicsWorld {
@@ -564,6 +567,7 @@ impl PhysicsWorld {
             broadphase_truncations: 0,
             broadphase_degraded: false,
             collision_matrix: [u32::MAX; PHYSICS_LAYER_COUNT],
+            query_static_tree: Mutex::new(None),
         })
     }
 
@@ -682,12 +686,19 @@ impl PhysicsWorld {
             .filter(|(_, pair)| pair.kind == PairKind::Trigger)
             .map(|(key, _)| (BodyHandle(key.first), BodyHandle(key.second)))
             .collect();
-        Ok(Arc::new(QuerySnapshot::from_colliders(
+        let mut cached_static = self
+            .query_static_tree
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let snapshot = QuerySnapshot::from_colliders(
             colliders,
             trigger_pairs,
             self.gravity,
             self.collision_matrix,
-        )?))
+            cached_static.as_ref(),
+        )?;
+        *cached_static = Some(Arc::clone(snapshot.static_tree()));
+        Ok(Arc::new(snapshot))
     }
 
     pub fn body_velocity(&self, handle: BodyHandle) -> Option<Vec3> {
