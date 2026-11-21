@@ -932,13 +932,14 @@ impl WindowHandler for Sandbox {
                 let api_major = (capabilities.api_version >> 22) & 0x7f;
                 let api_minor = (capabilities.api_version >> 12) & 0x3ff;
                 println!(
-                    "GPU: {} (vendor 0x{:04x}), Vulkan {}.{}, discrete: {}, tessellation: {}",
+                    "GPU: {} (vendor 0x{:04x}), Vulkan {}.{}, discrete: {}, tessellation: {}, transfer queue: {}",
                     capabilities.device_name,
                     capabilities.vendor_id,
                     api_major,
                     api_minor,
                     capabilities.discrete,
-                    capabilities.tessellation_shader
+                    capabilities.tessellation_shader,
+                    capabilities.transfer_queue
                 );
                 if self.content.motion == Scene::Particles {
                     match create_particle_emitters(&mut renderer) {

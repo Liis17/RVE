@@ -106,7 +106,7 @@ impl Renderer {
                 &instance,
                 &device,
                 self.physical_device,
-                self.queue_family_index,
+                self.upload_queues(),
                 capacity,
                 capacity > DEFAULT_UPLOAD_BATCH_CAPACITY,
                 serial,
@@ -341,14 +341,32 @@ impl Renderer {
         result
     }
 
+    /// Семейства очередей для новой пачки загрузки.
+    pub(crate) fn upload_queues(&self) -> UploadQueues {
+        UploadQueues {
+            graphics_family: self.queue_family_index,
+            transfer_family: self.transfer_queue_family_index,
+        }
+    }
+
+    /// Отправляет текущую пачку: transfer-часть (если есть) сигналит семафор, graphics-часть
+    /// ждёт его и сигналит fence. После ошибки повтор не отправляет transfer-часть второй раз.
     pub(crate) fn flush_uploads(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
+        let transfer_queue = self.transfer_queue;
         let Some(batch) = self.pending_upload.as_mut() else {
             return Ok(());
         };
         if batch.cursor == 0 {
             self.pending_upload.take();
             return Ok(());
+        }
+        if let Some(transfer) = batch.transfer.as_mut()
+            && transfer.recording
+        {
+            // SAFETY: the transfer command buffer is recording on the renderer thread and has not been submitted.
+            unsafe { device.end_command_buffer(transfer.command_buffer) }?;
+            transfer.recording = false;
         }
         if batch.recording {
             // SAFETY: this batch's command buffer is recording on the renderer thread and has not been submitted.
@@ -360,10 +378,34 @@ impl Renderer {
             batch.fence =
                 Some(unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?);
         }
+        let mut wait_infos = Vec::new();
+        if let Some(transfer) = batch.transfer.as_mut() {
+            if !transfer.submitted {
+                let command_infos = [vk::CommandBufferSubmitInfo::default()
+                    .command_buffer(transfer.command_buffer)
+                    .device_mask(0)];
+                let signal_infos = [vk::SemaphoreSubmitInfo::default()
+                    .semaphore(transfer.semaphore)
+                    .stage_mask(OWNERSHIP_SEMAPHORE_STAGES)];
+                let submit_info = [vk::SubmitInfo2::default()
+                    .command_buffer_infos(&command_infos)
+                    .signal_semaphore_infos(&signal_infos)];
+                // SAFETY: the transfer queue is used only by this renderer thread; the semaphore is unsignaled.
+                unsafe { device.queue_submit2(transfer_queue, &submit_info, vk::Fence::null()) }?;
+                transfer.submitted = true;
+            }
+            wait_infos.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(transfer.semaphore)
+                    .stage_mask(OWNERSHIP_SEMAPHORE_STAGES),
+            );
+        }
         let command_infos = [vk::CommandBufferSubmitInfo::default()
             .command_buffer(batch.command_buffer)
             .device_mask(0)];
-        let submit_info = [vk::SubmitInfo2::default().command_buffer_infos(&command_infos)];
+        let submit_info = [vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&wait_infos)
+            .command_buffer_infos(&command_infos)];
         let fence = batch.fence.ok_or(RenderError::InvalidState(
             "upload fence отсутствует после создания",
         ))?;
@@ -538,11 +580,213 @@ pub(crate) fn mip_upload_plan(
     }
 }
 
+/// Семейства очередей, между которыми делится пачка загрузки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UploadQueues {
+    pub(crate) graphics_family: u32,
+    /// Отдельное семейство копирований; `None` — всё записывается в graphics queue.
+    pub(crate) transfer_family: Option<u32>,
+}
+
+impl UploadQueues {
+    /// Передача владения из семейства копирований в graphics; без отдельного семейства её нет.
+    pub(crate) fn ownership(self) -> Option<OwnershipTransfer> {
+        self.transfer_family
+            .filter(|&family| family != self.graphics_family)
+            .map(|family| OwnershipTransfer {
+                src_family: family,
+                dst_family: self.graphics_family,
+            })
+    }
+}
+
+/// Queue family ownership transfer ресурса после копирования.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnershipTransfer {
+    pub(crate) src_family: u32,
+    pub(crate) dst_family: u32,
+}
+
+/// Стадии сигнала и ожидания семафора между release и acquire.
+///
+/// Без `VK_KHR_maintenance8` операции release/acquire не принадлежат определённой стадии,
+/// и спецификация допускает для их синхронизации семафором только `ALL_COMMANDS`.
+pub(crate) const OWNERSHIP_SEMAPHORE_STAGES: vk::PipelineStageFlags2 =
+    vk::PipelineStageFlags2::ALL_COMMANDS;
+
+/// Делит барьер «копирование → потребитель» на release в очереди копирования и acquire в graphics.
+///
+/// Release сохраняет первую область синхронизации (dst игнорируется спецификацией и обнуляется),
+/// acquire — вторую (src покрывает ожидание семафора). Layout-переход записан в обоих одинаково.
+/// Без передачи владения исходный барьер возвращается как acquire.
+pub(crate) fn split_image_barrier(
+    barrier: vk::ImageMemoryBarrier2<'static>,
+    ownership: Option<OwnershipTransfer>,
+) -> (
+    Option<vk::ImageMemoryBarrier2<'static>>,
+    vk::ImageMemoryBarrier2<'static>,
+) {
+    let Some(ownership) = ownership else {
+        return (None, barrier);
+    };
+    let barrier = barrier
+        .src_queue_family_index(ownership.src_family)
+        .dst_queue_family_index(ownership.dst_family);
+    let release = barrier
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE);
+    let acquire = barrier
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE);
+    (Some(release), acquire)
+}
+
+/// Буферный вариант [`split_image_barrier`].
+pub(crate) fn split_buffer_barrier(
+    barrier: vk::BufferMemoryBarrier2<'static>,
+    ownership: Option<OwnershipTransfer>,
+) -> (
+    Option<vk::BufferMemoryBarrier2<'static>>,
+    vk::BufferMemoryBarrier2<'static>,
+) {
+    let Some(ownership) = ownership else {
+        return (None, barrier);
+    };
+    let barrier = barrier
+        .src_queue_family_index(ownership.src_family)
+        .dst_queue_family_index(ownership.dst_family);
+    let release = barrier
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE);
+    let acquire = barrier
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE);
+    (Some(release), acquire)
+}
+
+/// Барьеры «копия → вершинный/индексный вход» для буферов меша.
+///
+/// Исходные вершины skinned-меша дополнительно читает compute skinning.
+pub(crate) fn mesh_upload_barriers(
+    vertex_buffer: vk::Buffer,
+    vertex_size: usize,
+    index_buffer: vk::Buffer,
+    index_size: usize,
+    skinned: bool,
+) -> [vk::BufferMemoryBarrier2<'static>; 2] {
+    let (vertex_stage, vertex_access) = if skinned {
+        (
+            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::SHADER_STORAGE_READ,
+        )
+    } else {
+        (
+            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT,
+            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+        )
+    };
+    let copied = |buffer, size: usize, stage, access| {
+        vk::BufferMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(stage)
+            .dst_access_mask(access)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(buffer)
+            .offset(0)
+            .size(size as vk::DeviceSize)
+    };
+    [
+        copied(vertex_buffer, vertex_size, vertex_stage, vertex_access),
+        copied(
+            index_buffer,
+            index_size,
+            vk::PipelineStageFlags2::INDEX_INPUT,
+            vk::AccessFlags2::INDEX_READ,
+        ),
+    ]
+}
+
+/// Барьеры загрузки изображения по очередям.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImageUploadBarriers {
+    /// UNDEFINED → TRANSFER_DST на всю цепочку в очереди копирования.
+    pub(crate) before_copy: vk::ImageMemoryBarrier2<'static>,
+    /// Release в очереди копирования после копий.
+    pub(crate) release: Option<vk::ImageMemoryBarrier2<'static>>,
+    /// Первый барьер в graphics queue после копий.
+    ///
+    /// Для `Normal` переводит цепочку в SHADER_READ_ONLY; для `Color` с передачей владения
+    /// принимает цепочку в TRANSFER_DST перед blit-ами, без неё — `None`.
+    pub(crate) acquire: Option<vk::ImageMemoryBarrier2<'static>>,
+}
+
+pub(crate) fn image_upload_barriers(
+    image: vk::Image,
+    mip_levels: u32,
+    role: TextureRole,
+    ownership: Option<OwnershipTransfer>,
+) -> ImageUploadBarriers {
+    let range = color_mip_subresource_range(0, mip_levels);
+    let mut before_copy = texture_upload_barrier(image, mip_levels);
+    let mut published = texture_mip_destination_shader_barrier(image, range);
+    if ownership.is_some() {
+        // Очередь без GRAPHICS не выполняет blit: в её барьерах только стадия копирования.
+        before_copy = before_copy.dst_stage_mask(vk::PipelineStageFlags2::COPY);
+        published = published.src_stage_mask(vk::PipelineStageFlags2::COPY);
+    }
+    let (release, acquire) = match role {
+        TextureRole::Normal => {
+            let (release, acquire) = split_image_barrier(published, ownership);
+            (release, Some(acquire))
+        }
+        TextureRole::Color if ownership.is_some() => {
+            // Уровень 0 скопирован, остальные заполнят blit-ы graphics queue: layout не меняется.
+            let keep = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::BLIT)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(image)
+                .subresource_range(range);
+            let (release, acquire) = split_image_barrier(keep, ownership);
+            (release, Some(acquire))
+        }
+        TextureRole::Color => (None, None),
+    };
+    ImageUploadBarriers {
+        before_copy,
+        release,
+        acquire,
+    }
+}
+
+/// Command buffer и семафор части пачки в отдельной transfer queue.
+pub(crate) struct TransferCommands {
+    pub(crate) command_pool: vk::CommandPool,
+    pub(crate) command_buffer: vk::CommandBuffer,
+    /// Сигналится после release-барьеров; graphics-часть ждёт его перед acquire.
+    pub(crate) semaphore: vk::Semaphore,
+    pub(crate) recording: bool,
+    pub(crate) submitted: bool,
+}
+
 /// Записываемая пачка копирований и её staging память.
+///
+/// С отдельной transfer queue копии и release-барьеры пишутся в `transfer`, а acquire,
+/// blit-ы mip-цепочек `Color` и барьеры к шейдерам — в graphics `command_buffer`.
+/// Fence сигналит graphics-часть, которая ждёт семафор transfer-части, поэтому одного
+/// fence достаточно для освобождения staging и обоих command pool.
 pub(crate) struct UploadBatch {
     pub(crate) device: ash::Device,
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) command_buffer: vk::CommandBuffer,
+    pub(crate) transfer: Option<TransferCommands>,
+    pub(crate) ownership: Option<OwnershipTransfer>,
     pub(crate) staging: HostBuffer,
     pub(crate) capacity: usize,
     pub(crate) cursor: usize,
@@ -552,12 +796,44 @@ pub(crate) struct UploadBatch {
     pub(crate) fence: Option<vk::Fence>,
 }
 
+fn begin_upload_commands(
+    device: &ash::Device,
+    family: u32,
+) -> Result<(vk::CommandPool, vk::CommandBuffer), RenderError> {
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(family)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    // SAFETY: the family index was selected for this device and the pool is used by one batch.
+    let command_pool = unsafe { device.create_command_pool(&pool_info, None) }?;
+    let result = (|| {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: command pool belongs to this device and is not used elsewhere.
+        let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info) }?[0];
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: command buffer was just allocated and is in the initial state.
+        unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
+        Ok(command_buffer)
+    })();
+    match result {
+        Ok(command_buffer) => Ok((command_pool, command_buffer)),
+        Err(error) => {
+            // SAFETY: failed initialization did not submit work from this pool.
+            unsafe { device.destroy_command_pool(command_pool, None) };
+            Err(error)
+        }
+    }
+}
+
 impl UploadBatch {
     pub(crate) fn new(
         instance: &ash::Instance,
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
-        queue_family_index: u32,
+        queues: UploadQueues,
         capacity: usize,
         oversized: bool,
         serial: u64,
@@ -569,36 +845,14 @@ impl UploadBatch {
             vk::BufferUsageFlags::TRANSFER_SRC,
             capacity,
         )?;
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        // SAFETY: the upload pool uses this renderer's graphics queue family.
-        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }?;
-        let result = (|| {
-            let allocate_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            // SAFETY: command pool belongs to this device and is not used elsewhere.
-            let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info) }?[0];
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            // SAFETY: command buffer was just allocated and is in the initial state.
-            unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
-            Ok(command_buffer)
-        })();
-        let command_buffer = match result {
-            Ok(command_buffer) => command_buffer,
-            Err(error) => {
-                // SAFETY: failed initialization did not submit work from this pool.
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                return Err(error);
-            }
-        };
-        Ok(Self {
+        let (command_pool, command_buffer) = begin_upload_commands(device, queues.graphics_family)?;
+        // Дальше частично созданная пачка освобождается своим Drop.
+        let mut batch = Self {
             device: device.clone(),
             command_pool,
             command_buffer,
+            transfer: None,
+            ownership: queues.ownership(),
             staging,
             capacity,
             cursor: 0,
@@ -606,7 +860,32 @@ impl UploadBatch {
             oversized,
             recording: true,
             fence: None,
-        })
+        };
+        if let Some(ownership) = batch.ownership {
+            let (command_pool, command_buffer) =
+                begin_upload_commands(device, ownership.src_family)?;
+            batch.transfer = Some(TransferCommands {
+                command_pool,
+                command_buffer,
+                semaphore: vk::Semaphore::null(),
+                recording: true,
+                submitted: false,
+            });
+            // SAFETY: a default binary semaphore is unsignaled and owned by this batch.
+            let semaphore =
+                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+            if let Some(transfer) = batch.transfer.as_mut() {
+                transfer.semaphore = semaphore;
+            }
+        }
+        Ok(batch)
+    }
+
+    /// Command buffer для копий из staging: transfer-часть или graphics без отдельной очереди.
+    fn copy_command_buffer(&self) -> vk::CommandBuffer {
+        self.transfer
+            .as_ref()
+            .map_or(self.command_buffer, |transfer| transfer.command_buffer)
     }
 
     pub(crate) fn record_mesh_copies(
@@ -618,6 +897,7 @@ impl UploadBatch {
         index_size: usize,
         skinned: bool,
     ) {
+        let copy_buffer = self.copy_command_buffer();
         let vertex_regions = [vk::BufferCopy2::default()
             .src_offset(layout.vertex_offset as vk::DeviceSize)
             .dst_offset(0)
@@ -627,10 +907,7 @@ impl UploadBatch {
             .dst_buffer(vertex_buffer.buffer)
             .regions(&vertex_regions);
         // SAFETY: source and destination ranges were allocated for these exact byte counts.
-        unsafe {
-            self.device
-                .cmd_copy_buffer2(self.command_buffer, &vertex_copy)
-        };
+        unsafe { self.device.cmd_copy_buffer2(copy_buffer, &vertex_copy) };
         let index_regions = [vk::BufferCopy2::default()
             .src_offset(layout.index_offset as vk::DeviceSize)
             .dst_offset(0)
@@ -640,57 +917,31 @@ impl UploadBatch {
             .dst_buffer(index_buffer.buffer)
             .regions(&index_regions);
         // SAFETY: source and destination ranges were allocated for these exact byte counts.
-        unsafe {
-            self.device
-                .cmd_copy_buffer2(self.command_buffer, &index_copy)
-        };
-        let barriers = [
-            vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
-                .dst_access_mask(vk::AccessFlags2::VERTEX_ATTRIBUTE_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(vertex_buffer.buffer)
-                .offset(0)
-                .size(vertex_size as vk::DeviceSize),
-            vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
-                .dst_access_mask(vk::AccessFlags2::INDEX_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(index_buffer.buffer)
-                .offset(0)
-                .size(index_size as vk::DeviceSize),
-        ];
-        let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
-        // SAFETY: barriers make each copy visible to its subsequent vertex/index input access.
+        unsafe { self.device.cmd_copy_buffer2(copy_buffer, &index_copy) };
+        let mut releases = Vec::with_capacity(2);
+        let mut acquires = Vec::with_capacity(2);
+        for barrier in mesh_upload_barriers(
+            vertex_buffer.buffer,
+            vertex_size,
+            index_buffer.buffer,
+            index_size,
+            skinned,
+        ) {
+            let (release, acquire) = split_buffer_barrier(barrier, self.ownership);
+            releases.extend(release);
+            acquires.push(acquire);
+        }
+        if !releases.is_empty() {
+            let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&releases);
+            // SAFETY: release barriers hand the copied ranges from the transfer family to graphics.
+            unsafe { self.device.cmd_pipeline_barrier2(copy_buffer, &dependency) };
+        }
+        let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&acquires);
+        // SAFETY: barriers make each copy visible to its subsequent vertex/index/skinning access.
         unsafe {
             self.device
                 .cmd_pipeline_barrier2(self.command_buffer, &dependency)
         };
-        if skinned {
-            // Исходные вершины skinning читает compute, а не вершинный вход.
-            let skin_barriers = [vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(vertex_buffer.buffer)
-                .offset(0)
-                .size(vertex_size as vk::DeviceSize)];
-            let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&skin_barriers);
-            // SAFETY: the barrier orders the vertex copy before the skinning compute reads it.
-            unsafe {
-                self.device
-                    .cmd_pipeline_barrier2(self.command_buffer, &dependency)
-            };
-        }
     }
 
     /// Копирует один уровень из staging по абсолютному смещению буфера.
@@ -712,7 +963,7 @@ impl UploadBatch {
         // SAFETY: the staging range holds exactly this level's RGBA8 texels at an aligned offset.
         unsafe {
             self.device.cmd_copy_buffer_to_image(
-                self.command_buffer,
+                self.copy_command_buffer(),
                 self.staging.buffer,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -730,27 +981,35 @@ impl UploadBatch {
         buffer_offset: usize,
         role: TextureRole,
     ) {
-        pipeline_barrier(
-            &self.device,
-            self.command_buffer,
-            texture_upload_barrier(image, mip_levels),
-        );
+        let copy_buffer = self.copy_command_buffer();
+        let barriers = image_upload_barriers(image, mip_levels, role, self.ownership);
+        pipeline_barrier(&self.device, copy_buffer, barriers.before_copy);
         let plan = mip_upload_plan(role, buffer_offset, width, height, mip_levels);
-        if let MipUploadPlan::Copies(levels) = plan {
-            for (level, offset, extent) in levels {
-                self.record_level_copy(image, level, offset, extent);
+        let blit = match plan {
+            MipUploadPlan::Copies(levels) => {
+                for (level, offset, extent) in levels {
+                    self.record_level_copy(image, level, offset, extent);
+                }
+                false
             }
-            pipeline_barrier(
-                &self.device,
-                self.command_buffer,
-                texture_mip_destination_shader_barrier(
-                    image,
-                    color_mip_subresource_range(0, mip_levels),
-                ),
-            );
-            return;
+            MipUploadPlan::Blit => {
+                self.record_level_copy(image, 0, buffer_offset, vk::Extent2D { width, height });
+                true
+            }
+        };
+        if let Some(release) = barriers.release {
+            pipeline_barrier(&self.device, copy_buffer, release);
         }
-        self.record_level_copy(image, 0, buffer_offset, vk::Extent2D { width, height });
+        if let Some(acquire) = barriers.acquire {
+            pipeline_barrier(&self.device, self.command_buffer, acquire);
+        }
+        if blit {
+            self.record_mip_blits(image, width, height, mip_levels);
+        }
+    }
+
+    /// Строит уровни 1..N `Color` blit-ами в graphics queue и публикует цепочку шейдерам.
+    fn record_mip_blits(&self, image: vk::Image, width: u32, height: u32, mip_levels: u32) {
         let mut source_extent = vk::Extent2D { width, height };
         for mip_level in 1..mip_levels {
             let source_range = color_mip_subresource_range(mip_level - 1, 1);
@@ -800,6 +1059,15 @@ impl Drop for UploadBatch {
         if let Some(fence) = self.fence.take() {
             // SAFETY: submitted batches are dropped only after their fence signals or device idle.
             unsafe { self.device.destroy_fence(fence, None) };
+        }
+        if let Some(transfer) = self.transfer.take() {
+            // SAFETY: the transfer part completed before the graphics fence or device idle;
+            // null handles from a partially created batch are valid to destroy.
+            unsafe {
+                self.device.destroy_semaphore(transfer.semaphore, None);
+                self.device
+                    .destroy_command_pool(transfer.command_pool, None);
+            }
         }
         // SAFETY: this batch is either not submitted or its fence has completed.
         unsafe { self.device.destroy_command_pool(self.command_pool, None) };
