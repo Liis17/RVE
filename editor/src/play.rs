@@ -3116,6 +3116,50 @@ return Spawner
         }
     }
 
+    #[test]
+    fn play_loads_project_string_tables_after_ui() {
+        let assets = TempAssets::new(&[
+            ("locales/en.toml", "menu.title = \"Menu\"\n"),
+            ("locales/ru.toml", "menu.title = 1\n"),
+        ]);
+        let project_assets = Assets::with_resources(assets.handle());
+        let settings = |tables: &[(&str, &str)]| LocalizationSettings {
+            default_language: "en".to_owned(),
+            tables: tables
+                .iter()
+                .map(|(language, path)| ((*language).to_owned(), (*path).to_owned()))
+                .collect(),
+        };
+
+        let mut prefabs = PlayPrefabs::default().with_resources(assets.handle());
+        prefabs.prepare_localization(None, &project_assets).unwrap();
+        assert!(
+            prefabs.ui.localization.is_none(),
+            "без [localization] таблиц нет"
+        );
+
+        prefabs
+            .prepare_localization(
+                Some(&settings(&[("en", "/locales/en.toml")])),
+                &project_assets,
+            )
+            .unwrap();
+        let localization = prefabs.ui.localization.as_ref().unwrap();
+        assert_eq!(localization.language(), "en");
+        assert_eq!(localization.resolve("menu.title"), "Menu");
+
+        let error = prefabs
+            .prepare_localization(
+                Some(&settings(&[
+                    ("en", "/locales/en.toml"),
+                    ("ru", "/locales/ru.toml"),
+                ])),
+                &project_assets,
+            )
+            .unwrap_err();
+        assert!(error.contains("/locales/ru.toml"), "{error}");
+    }
+
     /// Запускает Play со сценой `source`; тяжёлые префабы из `catalog` грузятся из `assets`.
     fn start_heavy(source: &str, assets: &TempAssets, catalog: &PrefabCatalogFile) -> PlaySession {
         let document = document(source);

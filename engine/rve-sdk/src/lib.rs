@@ -4216,6 +4216,29 @@ impl Ui<'_> {
         // SAFETY: the host is valid for this callback and checks the handle itself.
         ui_status(unsafe { callback(self.host.call_ctx(), element.canvas.raw, element.index) })
     }
+
+    /// Current UI language code; `None` without project string tables or on hosts before ABI v27.
+    pub fn language(&self) -> Option<String> {
+        let callback = self.host.ui_language?;
+        let mut value = RveValue::integer(0);
+        // SAFETY: the host keeps the string alive until this guest callback ends.
+        if !unsafe { callback(self.host.call_ctx(), &mut value) } {
+            return None;
+        }
+        // SAFETY: the host keeps all nested buffers alive until the current guest callback ends.
+        match unsafe { value.into_owned() } {
+            Ok(Value::String(language)) => Some(language),
+            _ => None,
+        }
+    }
+
+    /// Switches the UI language of every canvas; keys missing in it fall back to the default
+    /// language, then to the key itself. Unknown languages are rejected.
+    pub fn set_language(&self, language: &str) -> Result<(), UiError> {
+        let callback = self.host.ui_set_language.ok_or(UiError::Unavailable)?;
+        // SAFETY: the host copies the borrowed code during this callback.
+        ui_status(unsafe { callback(self.host.call_ctx(), RveStr::from_str_ref(language)) })
+    }
 }
 
 #[doc(hidden)]

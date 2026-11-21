@@ -113,12 +113,35 @@ pub(crate) fn ui_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table
         })?,
     )?;
 
-    let pointer_active = active_call;
+    let pointer_active = active_call.clone();
     ui.set(
         "pointer_over",
         lua.create_function(move |_, ()| {
             with_active_call(&pointer_active, |transaction| {
                 Ok(transaction.ui_pointer_over())
+            })
+        })?,
+    )?;
+
+    let language_active = active_call.clone();
+    ui.set(
+        "language",
+        lua.create_function(move |_, ()| {
+            with_active_call(
+                &language_active,
+                |transaction| Ok(transaction.ui_language()),
+            )
+        })?,
+    )?;
+
+    let set_language_active = active_call;
+    ui.set(
+        "set_language",
+        lua.create_function(move |_, language: String| {
+            with_active_call(&set_language_active, |transaction| {
+                transaction
+                    .ui_set_language(&language)
+                    .map_err(|error| LuaError::runtime(format!("rve.ui.set_language: {error}")))
             })
         })?,
     )?;

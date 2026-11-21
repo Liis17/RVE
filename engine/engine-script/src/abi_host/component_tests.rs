@@ -571,3 +571,64 @@ fn environment_null_pointers_are_refused() {
         ));
     }
 }
+
+#[test]
+fn ui_language_callbacks_read_switch_and_reject_unknown_languages() {
+    use engine_gui::strings::{Localization, StringTable};
+    use rve_sdk::abi::{RVE_UI_OK, RVE_UI_REJECTED, RveValue};
+
+    let world = world(SKY_SCENE);
+    let events = EventQueue::default();
+    let mut transaction = writable_transaction(&world);
+    let read_language = |context: &mut AbiCallContext<'_>| {
+        let host = context.host(ScriptTime::default());
+        let mut out = RveValue::integer(0);
+        // SAFETY: the output slot and context are valid for this synchronous callback.
+        let found = unsafe { (host.ui_language.unwrap())(host.ctx, &mut out) };
+        // SAFETY: the context owns the returned string until it is dropped.
+        found.then(|| match unsafe { out.into_owned() } {
+            Ok(rve_sdk::Value::String(language)) => language,
+            other => panic!("{other:?}"),
+        })
+    };
+
+    {
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+        assert_eq!(read_language(&mut context), None, "без таблиц строк");
+        let host = context.host(ScriptTime::default());
+        // SAFETY: the code string outlives the synchronous callback.
+        let status =
+            unsafe { (host.ui_set_language.unwrap())(host.ctx, RveStr::from_str_ref("en")) };
+        assert_eq!(status, RVE_UI_REJECTED);
+    }
+
+    let table = |text: &str| StringTable::parse("strings.toml", text).unwrap();
+    let localization = Localization::new(
+        "en",
+        std::collections::BTreeMap::from([
+            ("en".to_owned(), table("a = \"A\"\n")),
+            ("ru".to_owned(), table("a = \"А\"\n")),
+        ]),
+    )
+    .unwrap();
+    transaction
+        .ui
+        .borrow_mut()
+        .system
+        .set_localization(localization);
+    let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+    assert_eq!(read_language(&mut context).as_deref(), Some("en"));
+    let host = context.host(ScriptTime::default());
+    // SAFETY: the code strings outlive the synchronous callbacks.
+    unsafe {
+        assert_eq!(
+            (host.ui_set_language.unwrap())(host.ctx, RveStr::from_str_ref("ru")),
+            RVE_UI_OK
+        );
+        assert_eq!(
+            (host.ui_set_language.unwrap())(host.ctx, RveStr::from_str_ref("de")),
+            RVE_UI_REJECTED
+        );
+    }
+    assert_eq!(read_language(&mut context).as_deref(), Some("ru"));
+}

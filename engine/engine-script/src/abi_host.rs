@@ -436,6 +436,8 @@ impl<'a> AbiCallContext<'a> {
             audio_play_clip_playback: Some(components::host_audio_play_clip_playback),
             audio_get_source_playback: Some(components::host_audio_get_source_playback),
             audio_set_source_playback: Some(components::host_audio_set_source_playback),
+            ui_language: Some(host_ui_language),
+            ui_set_language: Some(host_ui_set_language),
         }
     }
 
@@ -4442,6 +4444,41 @@ unsafe extern "C" fn host_ui_focus(ctx: *mut c_void, canvas: u64, element: u32) 
     guarded(ctx, RVE_UI_REJECTED, |context| {
         let result = ui_element(context, canvas, element)
             .and_then(|element| context.transaction.ui_focus(element));
+        ui_outcome(context, result)
+    })
+}
+
+unsafe extern "C" fn host_ui_language(ctx: *mut c_void, out: *mut RveValue) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            context.error = Some("ui_language received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(language) = context.transaction.ui_language() else {
+            return false;
+        };
+        let value = ParamValue::String(language);
+        let references = message_object_refs(&value, context.transaction);
+        context
+            .save_values
+            .push(OwnedAbiValue::new(&value, &references));
+        let value = context
+            .save_values
+            .last()
+            .expect("language value was just added");
+        // SAFETY: `save_values` owns all nested buffers until this ABI call context is dropped.
+        unsafe { *out = value.value };
+        true
+    })
+}
+
+unsafe extern "C" fn host_ui_set_language(ctx: *mut c_void, language: RveStr) -> u32 {
+    guarded(ctx, RVE_UI_REJECTED, |context| {
+        let language = match ui_text_arg(language) {
+            Ok(language) => language,
+            Err(message) => return ui_failure(context, message),
+        };
+        let result = context.transaction.ui_set_language(&language);
         ui_outcome(context, result)
     })
 }
