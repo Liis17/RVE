@@ -8,7 +8,9 @@ use crate::system::{
     UiCanvas, UiCanvasHandle, UiElementHandle, UiSystem, UiSystemError, clamp_slider, event_for,
     scroll_limit,
 };
+use crate::text;
 use epaint::{Pos2, Rect, Vec2, pos2, vec2};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Задержка перед первым повтором удержанного направления и интервал между повторами, секунды.
 const REPEAT_DELAY: f64 = 0.4;
@@ -453,7 +455,7 @@ impl UiSystem {
             Some(ElementKind::InputField(_)) => {
                 if let Ok((canvas, index)) = self.element_mut(hit.element) {
                     let length = match &canvas.elements[index].kind {
-                        ElementKind::InputField(spec) => spec.text.chars().count(),
+                        ElementKind::InputField(spec) => spec.text.len(),
                         _ => 0,
                     };
                     canvas.cursors[index] = length;
@@ -833,7 +835,8 @@ impl UiSystem {
         }
     }
 
-    /// Правка InputField: символы фильтруются по content и max_length, курсор считается в символах.
+    /// Правка InputField по графемам: курсор — байтовое смещение на границе графемы,
+    /// `max_length` и фильтр `content` проверяются для текста после вставки целой графемы.
     fn edit_text(&mut self, event: &TextInputEvent, events: &mut Vec<UiEvent>) {
         let Some(focus) = self.focus else {
             return;
@@ -845,44 +848,47 @@ impl UiSystem {
             return;
         };
         let cursor = &mut canvas.cursors[index];
+        *cursor = text::snap_boundary(&spec.text, *cursor);
         let mut changed = false;
         match event {
             TextInputEvent::Text(input) => {
-                for character in input.chars().filter(|c| !c.is_control()) {
+                let input: String = input.chars().filter(|c| !c.is_control()).collect();
+                for grapheme in input.graphemes(true) {
+                    let mut candidate = spec.text.clone();
+                    candidate.insert_str(*cursor, grapheme);
                     if spec
                         .max_length
-                        .is_some_and(|max| spec.text.chars().count() >= max)
+                        .is_some_and(|max| text::grapheme_count(&candidate) > max)
                     {
                         break;
                     }
-                    let mut candidate = spec.text.clone();
-                    candidate.insert(byte_index(&candidate, *cursor), character);
                     if accepts_text(spec.content, &candidate) {
+                        // Вставка может слиться с соседней графемой (комбинируемый знак, ZWJ).
+                        *cursor = text::snap_boundary(&candidate, *cursor + grapheme.len());
                         spec.text = candidate;
-                        *cursor += 1;
                         changed = true;
                     }
                 }
             }
             TextInputEvent::Backspace => {
                 if *cursor > 0 {
-                    *cursor -= 1;
-                    let at = byte_index(&spec.text, *cursor);
-                    spec.text.remove(at);
+                    let start = text::prev_boundary(&spec.text, *cursor);
+                    spec.text.replace_range(start..*cursor, "");
+                    *cursor = start;
                     changed = true;
                 }
             }
             TextInputEvent::Delete => {
-                if *cursor < spec.text.chars().count() {
-                    let at = byte_index(&spec.text, *cursor);
-                    spec.text.remove(at);
+                if *cursor < spec.text.len() {
+                    let end = text::next_boundary(&spec.text, *cursor);
+                    spec.text.replace_range(*cursor..end, "");
                     changed = true;
                 }
             }
-            TextInputEvent::Left => *cursor = cursor.saturating_sub(1),
-            TextInputEvent::Right => *cursor = (*cursor + 1).min(spec.text.chars().count()),
+            TextInputEvent::Left => *cursor = text::prev_boundary(&spec.text, *cursor),
+            TextInputEvent::Right => *cursor = text::next_boundary(&spec.text, *cursor),
             TextInputEvent::Home => *cursor = 0,
-            TextInputEvent::End => *cursor = spec.text.chars().count(),
+            TextInputEvent::End => *cursor = spec.text.len(),
             TextInputEvent::Enter => {
                 let value = UiValue::Text(spec.text.clone());
                 events.push(event_for(focus, UiEventKind::Submit, Some(value)));
@@ -955,12 +961,6 @@ fn dropdown_len(canvas: &UiCanvas, index: usize) -> usize {
         ElementKind::Dropdown(spec) => spec.options.len(),
         _ => 0,
     }
-}
-
-fn byte_index(text: &str, char_index: usize) -> usize {
-    text.char_indices()
-        .nth(char_index)
-        .map_or(text.len(), |(byte, _)| byte)
 }
 
 #[cfg(test)]
@@ -1318,7 +1318,7 @@ button = {{}}
     }
 
     #[test]
-    fn input_field_edits_by_character_and_respects_filter_and_length() {
+    fn input_field_edits_and_respects_filter_and_length() {
         let (mut system, canvas) = open(
             &format!(
                 "[[elements]]\nid = \"field\"\ninput_field = {{ text = \"\", content = \"integer\", max_length = 3 }}\n{}",
@@ -1373,6 +1373,194 @@ button = {{}}
                 .any(|event| event.kind == Kind::Submit
                     && event.value == Some(UiValue::Text("-1".into())))
         );
+    }
+
+    /// Поле ввода с фокусом, текстом `text` и курсором в начале.
+    fn focused_field(spec: &str, text: &str) -> (UiSystem, UiElementHandle) {
+        let (mut system, canvas) = open(
+            &format!(
+                "[[elements]]\nid = \"field\"\ninput_field = {{ {spec} }}\n{}",
+                at(10.0, 10.0, 200.0, 30.0)
+            ),
+            1,
+        );
+        let field = system.find(canvas, "field").unwrap();
+        system.focus(field).unwrap();
+        system.set_text(field, text).unwrap();
+        (system, field)
+    }
+
+    fn edit(system: &mut UiSystem, events: Vec<TextInputEvent>) -> UiUpdate {
+        step(
+            system,
+            UiInput {
+                text: events,
+                ..UiInput::default()
+            },
+            0.0,
+        )
+    }
+
+    fn field_text(system: &UiSystem, field: UiElementHandle) -> String {
+        match system.value(field).unwrap() {
+            Some(UiValue::Text(text)) => text,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const E_ACUTE: &str = "e\u{301}";
+    const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+
+    #[test]
+    fn backspace_and_delete_remove_whole_graphemes() {
+        let samples = [
+            ("abc", "ab", "bc"),
+            ("кот", "ко", "от"),
+            (&*format!("a{E_ACUTE}"), "a", E_ACUTE),
+            (&*format!("{E_ACUTE}b"), E_ACUTE, "b"),
+            (&*format!("x{FAMILY}"), "x", FAMILY),
+            (&*format!("{FAMILY}y"), FAMILY, "y"),
+        ];
+        for (text, after_backspace, after_delete) in samples {
+            let (mut system, field) = focused_field("", text);
+            edit(
+                &mut system,
+                vec![TextInputEvent::End, TextInputEvent::Backspace],
+            );
+            assert_eq!(field_text(&system, field), after_backspace, "{text:?}");
+
+            let (mut system, field) = focused_field("", text);
+            edit(
+                &mut system,
+                vec![TextInputEvent::Home, TextInputEvent::Delete],
+            );
+            assert_eq!(field_text(&system, field), after_delete, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn arrows_step_over_whole_graphemes() {
+        let text = format!("я{E_ACUTE}{FAMILY}z");
+        let (mut system, field) = focused_field("", &text);
+        // Из конца два шага влево встают перед эмодзи, вставка не разрывает графемы.
+        edit(
+            &mut system,
+            vec![
+                TextInputEvent::End,
+                TextInputEvent::Left,
+                TextInputEvent::Left,
+                TextInputEvent::Text("|".into()),
+            ],
+        );
+        assert_eq!(field_text(&system, field), format!("я{E_ACUTE}|{FAMILY}z"));
+        edit(
+            &mut system,
+            vec![
+                TextInputEvent::Home,
+                TextInputEvent::Right,
+                TextInputEvent::Right,
+                TextInputEvent::Backspace,
+            ],
+        );
+        assert_eq!(field_text(&system, field), format!("я|{FAMILY}z"));
+        // Влево в начале и вправо в конце остаются на месте.
+        edit(
+            &mut system,
+            vec![
+                TextInputEvent::Home,
+                TextInputEvent::Left,
+                TextInputEvent::Backspace,
+                TextInputEvent::End,
+                TextInputEvent::Right,
+                TextInputEvent::Delete,
+            ],
+        );
+        assert_eq!(field_text(&system, field), format!("я|{FAMILY}z"));
+    }
+
+    #[test]
+    fn combining_mark_typed_after_letter_joins_its_grapheme() {
+        let (mut system, field) = focused_field("", "");
+        edit(
+            &mut system,
+            vec![
+                TextInputEvent::Text("e".into()),
+                TextInputEvent::Text("\u{301}".into()),
+                TextInputEvent::Text("x".into()),
+            ],
+        );
+        assert_eq!(field_text(&system, field), format!("{E_ACUTE}x"));
+        edit(
+            &mut system,
+            vec![TextInputEvent::Left, TextInputEvent::Backspace],
+        );
+        assert_eq!(field_text(&system, field), "x");
+    }
+
+    #[test]
+    fn zwj_joining_neighbours_moves_caret_past_merged_grapheme() {
+        let (mut system, field) = focused_field("", "\u{1F468}\u{1F469}");
+        edit(
+            &mut system,
+            vec![
+                TextInputEvent::End,
+                TextInputEvent::Left,
+                TextInputEvent::Text("\u{200D}".into()),
+                TextInputEvent::Text("!".into()),
+            ],
+        );
+        assert_eq!(
+            field_text(&system, field),
+            "\u{1F468}\u{200D}\u{1F469}!",
+            "курсор после слияния стоит за всей графемой"
+        );
+    }
+
+    #[test]
+    fn max_length_counts_graphemes() {
+        let (mut system, field) = focused_field("max_length = 2", "");
+        let update = edit(
+            &mut system,
+            vec![TextInputEvent::Text(format!("{FAMILY}{E_ACUTE}abc"))],
+        );
+        assert_eq!(
+            value_events(&update),
+            vec![UiValue::Text(format!("{FAMILY}{E_ACUTE}"))]
+        );
+        // Комбинируемый знак к последней букве не увеличивает длину.
+        edit(&mut system, vec![TextInputEvent::Text("\u{308}".into())]);
+        assert_eq!(
+            field_text(&system, field),
+            format!("{FAMILY}{E_ACUTE}\u{308}")
+        );
+        edit(&mut system, vec![TextInputEvent::Text("z".into())]);
+        assert_eq!(
+            field_text(&system, field),
+            format!("{FAMILY}{E_ACUTE}\u{308}")
+        );
+        assert_eq!(system.set_text(field, &format!("{FAMILY}{FAMILY}")), Ok(()));
+        assert!(matches!(
+            system.set_text(field, "abc"),
+            Err(UiSystemError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn content_filter_rejects_combining_marks_in_numbers() {
+        let (mut system, field) = focused_field("content = \"integer\"", "");
+        edit(&mut system, vec![TextInputEvent::Text("1\u{301}2".into())]);
+        // «1́» — одна графема и не цифра: отклоняется целиком, без потери знака на полпути.
+        assert_eq!(field_text(&system, field), "2");
+    }
+
+    #[test]
+    fn set_text_keeps_caret_on_grapheme_boundary() {
+        let (mut system, field) = focused_field("", "abcdefgh");
+        edit(&mut system, vec![TextInputEvent::End]);
+        // Курсор в конце (байт 8) попадает внутрь эмодзи нового текста.
+        system.set_text(field, &format!("ab{FAMILY}")).unwrap();
+        edit(&mut system, vec![TextInputEvent::Backspace]);
+        assert_eq!(field_text(&system, field), "ab");
     }
 
     #[test]
