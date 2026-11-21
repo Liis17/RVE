@@ -15,7 +15,7 @@ pub struct UiError {
 }
 
 impl UiError {
-    fn new(source: &str, element: Option<&str>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(source: &str, element: Option<&str>, message: impl Into<String>) -> Self {
         Self {
             source: source.to_owned(),
             element: element.map(str::to_owned),
@@ -237,6 +237,31 @@ pub enum ContentType {
 
 /// Проверяет, что текст допустим для вида содержимого. Промежуточные значения (`-`, `1.`)
 /// допустимы, поэтому функция годится и для проверки редактирования по символам.
+/// Ключ таблицы строк: непустой после обрезки пробелов.
+fn check_key(key: &str, field: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err(format!("{field}: ключ не может быть пустым"));
+    }
+    Ok(())
+}
+
+/// Ключ и непустой литерал того же поля не задаются вместе.
+fn exclusive_key(
+    key: Option<&str>,
+    literal: &str,
+    field: &str,
+    literal_field: &str,
+) -> Result<(), String> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    check_key(key, field)?;
+    if !literal.is_empty() {
+        return Err(format!("{field} и {literal_field} взаимоисключающие"));
+    }
+    Ok(())
+}
+
 pub fn accepts_text(content: ContentType, text: &str) -> bool {
     let unsigned = text.strip_prefix('-').unwrap_or(text);
     match content {
@@ -286,6 +311,10 @@ pub struct ImageSpec {
 #[serde(deny_unknown_fields, default)]
 pub struct TextSpec {
     pub string: String,
+    /// Ключ таблицы строк вместо литерала `string`; строка подставляется при открытии канваса
+    /// и смене языка.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<UiPath>,
     pub size: f32,
@@ -299,6 +328,7 @@ impl Default for TextSpec {
     fn default() -> Self {
         Self {
             string: String::new(),
+            key: None,
             font: None,
             size: 16.0,
             color: [255; 4],
@@ -419,6 +449,9 @@ impl Default for ProgressBarSpec {
 pub struct InputFieldSpec {
     pub text: String,
     pub placeholder: String,
+    /// Ключ таблицы строк вместо литерала `placeholder`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_length: Option<usize>,
     pub content: ContentType,
@@ -434,6 +467,7 @@ impl Default for InputFieldSpec {
         Self {
             text: String::new(),
             placeholder: String::new(),
+            placeholder_key: None,
             max_length: None,
             content: ContentType::Standard,
             font: None,
@@ -467,6 +501,9 @@ impl Default for ScrollViewSpec {
 #[serde(deny_unknown_fields, default)]
 pub struct DropdownSpec {
     pub options: Vec<String>,
+    /// Ключи таблицы строк вместо литералов `options`, по одному на пункт.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub option_keys: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected: Option<usize>,
     pub popup_height: f32,
@@ -481,6 +518,7 @@ impl Default for DropdownSpec {
     fn default() -> Self {
         Self {
             options: Vec::new(),
+            option_keys: Vec::new(),
             selected: None,
             popup_height: 200.0,
             font: None,
@@ -981,7 +1019,8 @@ fn check_kind(kind: &ElementKind, assets: &HashMap<&str, AssetKind>) -> Result<(
         }
         ElementKind::Text(spec) => {
             positive(spec.size, "size")?;
-            optional_asset(&spec.font, AssetKind::Font)
+            optional_asset(&spec.font, AssetKind::Font)?;
+            exclusive_key(spec.key.as_deref(), &spec.string, "text: key", "string")
         }
         ElementKind::Button(spec) => {
             for path in [
@@ -1017,6 +1056,12 @@ fn check_kind(kind: &ElementKind, assets: &HashMap<&str, AssetKind>) -> Result<(
         ElementKind::InputField(spec) => {
             positive(spec.size, "size")?;
             optional_asset(&spec.font, AssetKind::Font)?;
+            exclusive_key(
+                spec.placeholder_key.as_deref(),
+                &spec.placeholder,
+                "input_field: placeholder_key",
+                "placeholder",
+            )?;
             if !accepts_text(spec.content, &spec.text) {
                 return Err("input_field: text не соответствует content".to_owned());
             }
@@ -1035,8 +1080,17 @@ fn check_kind(kind: &ElementKind, assets: &HashMap<&str, AssetKind>) -> Result<(
             positive(spec.popup_height, "popup_height")?;
             positive(spec.size, "size")?;
             optional_asset(&spec.font, AssetKind::Font)?;
+            if !spec.option_keys.is_empty() {
+                if !spec.options.is_empty() {
+                    return Err("dropdown: option_keys и options взаимоисключающие".to_owned());
+                }
+                for key in &spec.option_keys {
+                    check_key(key, "dropdown: option_keys")?;
+                }
+            }
+            let count = spec.options.len().max(spec.option_keys.len());
             match spec.selected {
-                Some(index) if index >= spec.options.len() => {
+                Some(index) if index >= count => {
                     Err("dropdown: selected вне списка options".to_owned())
                 }
                 _ => Ok(()),
@@ -1319,5 +1373,52 @@ colour = "red"
         let tree = document.tree();
         assert_eq!(tree.roots, vec![0]);
         assert_eq!(tree.children[0], vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn localization_keys_parse_round_trip_and_reject_conflicts() {
+        let source = "[[elements]]\nid = \"t\"\ntext = { key = \"menu.title\" }\n[[elements]]\nid = \"f\"\ninput_field = { placeholder_key = \"menu.name\" }\n[[elements]]\nid = \"d\"\ndropdown = { option_keys = [\"a\", \"b\"], selected = 1 }\n";
+        let document = UiDocument::parse("keys.rveui", source).unwrap();
+        let again = UiDocument::parse("keys.rveui", &document.to_toml().unwrap()).unwrap();
+        assert_eq!(again.elements(), document.elements());
+        match &document.elements()[0].kind {
+            ElementKind::Text(spec) => assert_eq!(spec.key.as_deref(), Some("menu.title")),
+            other => panic!("{other:?}"),
+        }
+
+        let rejected = [
+            ("text = { key = \"a\", string = \"b\" }", "string"),
+            ("text = { key = \"  \" }", "пуст"),
+            (
+                "input_field = { placeholder_key = \"a\", placeholder = \"b\" }",
+                "placeholder",
+            ),
+            (
+                "dropdown = { option_keys = [\"a\"], options = [\"b\"] }",
+                "options",
+            ),
+            ("dropdown = { option_keys = [\"\"] }", "пуст"),
+            (
+                "dropdown = { option_keys = [\"a\"], selected = 1 }",
+                "selected",
+            ),
+        ];
+        for (widget, needle) in rejected {
+            let error = UiDocument::parse(
+                "bad.rveui",
+                &format!("[[elements]]\nid = \"e\"\n{widget}\n"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(needle), "{widget}: {error}");
+        }
+        // Литералы продолжают работать без ключей.
+        assert!(
+            UiDocument::parse(
+                "ok.rveui",
+                "[[elements]]\nid = \"e\"\ntext = { string = \"Hi\" }\n"
+            )
+            .is_ok()
+        );
     }
 }
