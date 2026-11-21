@@ -59,6 +59,24 @@ fn player_save_path(project_root: &Path) -> PathBuf {
         .join("save.toml")
 }
 
+/// Схема сохранений Play из `[save]` проекта; Lua-мигратор читается как ресурс проекта.
+fn play_save_schema(
+    settings: &engine_project::SaveSettings,
+    read_text: impl Fn(&str) -> Result<String, String>,
+) -> Result<engine_script::SaveSchema, String> {
+    let lua_migration = match settings.migration_path() {
+        Some(path) => Some(engine_script::LuaSaveMigration {
+            source: read_text(&format!("/{path}"))?,
+            path: path.as_str().to_owned(),
+        }),
+        None => None,
+    };
+    Ok(engine_script::SaveSchema {
+        version: settings.version,
+        lua_migration,
+    })
+}
+
 fn load_project_starting_scene(project: &OpenProject) -> Result<EditorScene, String> {
     let starting_scene = project
         .settings
@@ -1705,7 +1723,9 @@ impl EditorApp {
                 },
                 animation,
             )?;
-            if let Err(error) = session.load_save_file(&player_save_path) {
+            let loaded = play_save_schema(&project.settings.save, |path| project.read_text(path))
+                .and_then(|schema| session.load_save_file(&player_save_path, &schema));
+            if let Err(error) = loaded {
                 save_warning = Some(error);
             }
             if let Some(plan) = network {
@@ -3211,6 +3231,31 @@ fn numpad_command(code: KeyCode, ctrl: bool) -> Option<ViewCommand> {
 mod tests {
     use super::*;
     use egui::{Event, Key, Modifiers, RawInput, Rect, pos2, vec2};
+
+    #[test]
+    fn play_save_schema_reads_the_lua_migration_from_project_resources() {
+        let settings = engine_project::SaveSettings {
+            version: 2,
+            migration: Some("/scripts/save_migration.lua".to_owned()),
+        };
+        let schema = play_save_schema(&settings, |path| {
+            assert_eq!(path, "/scripts/save_migration.lua");
+            Ok("return {}".to_owned())
+        })
+        .unwrap();
+        assert_eq!(schema.version, 2);
+        let migration = schema.lua_migration.unwrap();
+        assert_eq!(migration.path, "scripts/save_migration.lua");
+        assert_eq!(migration.source, "return {}");
+
+        let error = play_save_schema(&settings, |_| Err("missing".to_owned())).unwrap_err();
+        assert_eq!(error, "missing");
+        let plain = play_save_schema(&engine_project::SaveSettings::default(), |_| {
+            unreachable!("no migration is declared")
+        })
+        .unwrap();
+        assert_eq!(plain, engine_script::SaveSchema::default());
+    }
 
     #[test]
     fn editor_player_save_path_is_scoped_inside_the_project() {
