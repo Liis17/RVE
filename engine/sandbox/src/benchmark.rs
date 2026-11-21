@@ -105,6 +105,7 @@ impl BenchmarkRecorder {
                 fsr: capabilities.fsr,
                 dlss: capabilities.dlss,
                 low_latency: capabilities.low_latency,
+                transfer_queue: capabilities.transfer_queue,
             },
             reflex_requested,
             presented: 0,
@@ -234,6 +235,7 @@ impl BenchmarkRecorder {
                 vendor_id: gpu.vendor_id,
                 vulkan: vulkan_version(gpu.api_version),
                 discrete: gpu.discrete,
+                transfer_queue: gpu.transfer_queue,
             },
             frame_interval_ms: summarize(self.frame_interval),
             cpu_ms: CpuReport {
@@ -439,6 +441,8 @@ struct GpuReport {
     vendor_id: u32,
     vulkan: String,
     discrete: bool,
+    /// Загрузки шли в отдельной transfer-очереди (`Capabilities::transfer_queue`).
+    transfer_queue: bool,
 }
 
 /// Серия в миллисекундах; без замеров `median` и `p95` равны `null`.
@@ -498,6 +502,7 @@ mod tests {
             fsr: false,
             dlss: false,
             low_latency: false,
+            transfer_queue: false,
         }
     }
 
@@ -676,6 +681,7 @@ mod tests {
         assert_eq!(value["reflex"]["active"], false);
         assert_eq!(value["gpu"]["vulkan"], "1.3");
         assert_eq!(value["gpu"]["name"], "Test GPU");
+        assert_eq!(value["gpu"]["transfer_queue"], false);
     }
 
     #[test]

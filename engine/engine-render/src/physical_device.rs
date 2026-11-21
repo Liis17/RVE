@@ -85,6 +85,8 @@ pub fn probe_devices() -> Result<Vec<DeviceReport>, RenderError> {
 pub(crate) struct DeviceChoice {
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) queue_family_index: u32,
+    /// Отдельное семейство для загрузок; `None` — загрузки идут в graphics queue.
+    pub(crate) transfer_queue_family_index: Option<u32>,
     pub(crate) surface_format: vk::SurfaceFormatKHR,
     pub(crate) device_name: String,
     pub(crate) vendor_id: u32,
@@ -561,6 +563,9 @@ pub(crate) fn choose_device(
         }
         candidates.push(DeviceChoice {
             physical_device,
+            transfer_queue_family_index: queue_family_index.and_then(|graphics| {
+                select_transfer_queue_family(&inspection.queue_families, graphics)
+            }),
             queue_family_index: queue_family_index.ok_or(RenderError::InvalidState(
                 "не найдена очередь после проверки",
             ))?,
@@ -581,6 +586,40 @@ pub(crate) fn choose_device(
     best_device_index(&candidates, |_| true, |candidate| candidate.discrete)
         .map(|index| candidates.remove(index))
         .ok_or(RenderError::NoSuitableDevice(rejected))
+}
+
+/// Выбирает семейство очередей для загрузок, отличное от graphics.
+///
+/// Подходят семейства с явным `TRANSFER` и без `GRAPHICS`; семейство без `COMPUTE`
+/// (выделенный DMA) предпочтительнее async compute, при равенстве — меньший индекс.
+/// `minImageTransferGranularity` не проверяется: загрузка копирует только уровни целиком
+/// с нулевым смещением, а это допустимо при любой гранулярности.
+pub(crate) fn select_transfer_queue_family(
+    families: &[vk::QueueFamilyProperties],
+    graphics_family: u32,
+) -> Option<u32> {
+    families
+        .iter()
+        .enumerate()
+        .filter(|&(index, family)| {
+            index as u32 != graphics_family
+                && family.queue_count > 0
+                && family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        })
+        .min_by_key(|&(index, family)| {
+            (family.queue_flags.contains(vk::QueueFlags::COMPUTE), index)
+        })
+        .map(|(index, _)| index as u32)
+}
+
+/// Семейства, для которых создаётся по одной очереди: graphics и, если выбрано, transfer.
+pub(crate) fn device_queue_families(
+    graphics_family: u32,
+    transfer_family: Option<u32>,
+) -> impl Iterator<Item = u32> {
+    std::iter::once(graphics_family)
+        .chain(transfer_family.filter(|&family| family != graphics_family))
 }
 
 pub(crate) fn missing_texture_format_features(

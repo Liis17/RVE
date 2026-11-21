@@ -452,6 +452,7 @@ pub struct InputFieldSpec {
     /// Ключ таблицы строк вместо литерала `placeholder`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder_key: Option<String>,
+    /// Наибольшая длина текста в графемах (буква с комбинируемыми знаками или ZWJ-эмодзи — одна).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_length: Option<usize>,
     pub content: ContentType,
@@ -1069,7 +1070,7 @@ fn check_kind(kind: &ElementKind, assets: &HashMap<&str, AssetKind>) -> Result<(
                 if max == 0 {
                     return Err("input_field: max_length должен быть больше 0".to_owned());
                 }
-                if spec.text.chars().count() > max {
+                if crate::text::grapheme_count(&spec.text) > max {
                     return Err("input_field: text длиннее max_length".to_owned());
                 }
             }

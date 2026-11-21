@@ -13,6 +13,7 @@ use crate::document::{
 use crate::input::Part;
 use crate::layout::canvas_size;
 use crate::system::{UiCanvas, UiCanvasHandle, UiSystem, UiSystemError};
+use crate::text;
 use epaint::text::cursor::CCursor;
 use epaint::text::{FontDefinitions, FontFamily, FontId, Fonts, FontsView, TextOptions};
 use epaint::{
@@ -562,7 +563,12 @@ fn input_items(
     let galley = layout_text(view, &style, text, f32::INFINITY);
     let origin = aligned(rect, galley.size(), HAlign::Left, VAlign::Middle);
     if focused {
-        let caret = galley.pos_from_cursor(CCursor::new(cursor.min(spec.text.chars().count())));
+        // Курсор хранится в байтах на границе графемы, galley ожидает индекс символа.
+        let caret = galley.pos_from_cursor(CCursor::new(text::caret_index(
+            spec.content,
+            &spec.text,
+            cursor,
+        )));
         let x = origin.x + caret.min.x;
         let caret_rect = Rect::from_min_max(
             pos2(x, origin.y + caret.min.y),
@@ -624,10 +630,10 @@ fn push_galley(
     );
 }
 
-/// Текст для показа: пароль маскируется по одному знаку на символ.
+/// Текст для показа: пароль маскируется по одному знаку на графему.
 pub(crate) fn display_text(content: ContentType, text: &str) -> String {
     match content {
-        ContentType::Password => std::iter::repeat_n(MASK, text.chars().count()).collect(),
+        ContentType::Password => std::iter::repeat_n(MASK, text::grapheme_count(text)).collect(),
         ContentType::Standard | ContentType::Integer | ContentType::Decimal => text.to_owned(),
     }
 }
@@ -965,6 +971,11 @@ rect = { anchor_min = [0.0, 0.0], anchor_max = [0.0, 0.0], pivot = [0.0, 0.0], o
     #[test]
     fn password_content_is_masked_per_character() {
         assert_eq!(display_text(ContentType::Password, "p@s"), "•••");
+        assert_eq!(
+            display_text(ContentType::Password, "e\u{301}\u{1F468}\u{200D}\u{1F469}"),
+            "••",
+            "маска по графемам"
+        );
         assert_eq!(display_text(ContentType::Standard, "p@s"), "p@s");
     }
 
