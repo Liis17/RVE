@@ -2121,6 +2121,10 @@ fn show_particle_emitter(
                 .show(ui, |ui| {
                     let mut value = emitter.clone();
                     let mut responses = Vec::new();
+                    // Добавление и удаление элементов списков — отдельная запись истории;
+                    // выбор в палитре объединяется, пока нажата кнопка мыши.
+                    let mut discrete = false;
+                    let mut picked = false;
                     ui.label("Blend");
                     responses.push(
                         egui::ComboBox::from_id_salt("particle_blend")
@@ -2170,13 +2174,51 @@ fn show_particle_emitter(
                         ui.add(
                             egui::DragValue::new(&mut value.duration)
                                 .speed(0.05)
-                                .range(0.001..=f32::MAX),
+                                .range(particle_duration_min(&value.bursts)..=f32::MAX),
                         ),
                     );
                     ui.end_row();
                     ui.label("Loop");
                     responses.push(ui.checkbox(&mut value.looping, ""));
                     ui.end_row();
+                    ui.label("Bursts");
+                    if ui.small_button("+").on_hover_text("Add burst").clicked() {
+                        add_particle_burst(&mut value);
+                        discrete = true;
+                    }
+                    ui.end_row();
+                    let burst_time_max = particle_burst_time_max(value.duration);
+                    let mut removed_burst = None;
+                    for (index, burst) in value.bursts.iter_mut().enumerate() {
+                        ui.label(format!("  #{}", index + 1));
+                        ui.horizontal(|ui| {
+                            responses.push(
+                                ui.add(
+                                    egui::DragValue::new(&mut burst.time)
+                                        .speed(0.01)
+                                        .range(0.0..=burst_time_max)
+                                        .prefix("t "),
+                                )
+                                .on_hover_text("Time in cycle, s"),
+                            );
+                            responses.push(
+                                ui.add(
+                                    egui::DragValue::new(&mut burst.count)
+                                        .range(1..=u32::MAX)
+                                        .prefix("× "),
+                                )
+                                .on_hover_text("Particle count"),
+                            );
+                            if ui.small_button("×").on_hover_text("Remove burst").clicked() {
+                                removed_burst = Some(index);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    if let Some(index) = removed_burst {
+                        value.bursts.remove(index);
+                        discrete = true;
+                    }
                     responses.push(range_row(ui, "Lifetime", &mut value.lifetime, 0.05));
                     responses.push(range_row(ui, "Speed", &mut value.speed, 0.05));
                     responses.push(range_row(ui, "Size", &mut value.size, 0.01));
@@ -2187,6 +2229,68 @@ fn show_particle_emitter(
                         &mut value.angular_velocity,
                         0.05,
                     ));
+                    ui.label("Color over life");
+                    if ui
+                        .add_enabled(
+                            value.color_over_life.len() < engine_scene::MAX_PARTICLE_CURVE_KEYS,
+                            egui::Button::new("+").small(),
+                        )
+                        .on_hover_text("Add color key")
+                        .clicked()
+                        && add_particle_color_key(&mut value.color_over_life)
+                    {
+                        discrete = true;
+                    }
+                    ui.end_row();
+                    let mut removed_key = None;
+                    for index in 0..value.color_over_life.len() {
+                        let time_range =
+                            particle_color_key_time_range(&value.color_over_life, index);
+                        let key = &mut value.color_over_life[index];
+                        ui.label(format!("  #{}", index + 1));
+                        ui.horizontal(|ui| {
+                            responses.push(
+                                ui.add(
+                                    egui::DragValue::new(&mut key.time)
+                                        .speed(0.01)
+                                        .range(time_range)
+                                        .prefix("t "),
+                                )
+                                .on_hover_text("Normalized lifetime, 0..1"),
+                            );
+                            // Палитра получает копию: она не показывает HDR-значения выше 1.
+                            let mut shown = key.color;
+                            if ui.color_edit_button_rgba_unmultiplied(&mut shown).changed() {
+                                key.color = clamp_particle_color(shown);
+                                picked = true;
+                            }
+                            let [red, green, blue, alpha] = &mut key.color;
+                            for channel in [red, green, blue] {
+                                responses.push(
+                                    ui.add(
+                                        egui::DragValue::new(channel)
+                                            .speed(0.01)
+                                            .range(0.0..=f32::MAX),
+                                    ),
+                                );
+                            }
+                            responses.push(
+                                ui.add(egui::DragValue::new(alpha).speed(0.01).range(0.0..=1.0)),
+                            );
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Remove color key")
+                                .clicked()
+                            {
+                                removed_key = Some(index);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    if let Some(index) = removed_key {
+                        value.color_over_life.remove(index);
+                        discrete = true;
+                    }
                     ui.label("Gravity");
                     ui.horizontal(|ui| {
                         for axis in &mut value.gravity {
@@ -2327,9 +2431,15 @@ fn show_particle_emitter(
                         .into_iter()
                         .reduce(|left, right| left | right)
                         .expect("particle emitter has fields");
-                    commit(state, id, "particle_emitter", &response, |object| {
+                    let apply = |object: &mut SceneObject| {
                         object.particle_emitter = Some(value.clone());
-                    });
+                    };
+                    if discrete {
+                        commit_list_change(state, id, apply);
+                    } else {
+                        commit_picker(state, ui, id, "particle_emitter", picked, apply);
+                        commit(state, id, "particle_emitter", &response, apply);
+                    }
                 });
         },
     );
@@ -2355,6 +2465,119 @@ fn show_particle_emitter(
         state.edit_scene(|scene| scene.remove_particle_emitter(id));
     }
     run_menu_action(state, id, ComponentKind::ParticleEmitter, action);
+}
+
+/// Применяет добавление или удаление элемента отдельной записью истории: правка без ключа
+/// объединения не сливается с предыдущим перетаскиванием и завершает его.
+fn commit_list_change(state: &mut EditorState, id: &str, change: impl FnOnce(&mut SceneObject)) {
+    state.edit_scene(|scene| {
+        scene.edit_object(id, None, |object| {
+            change(object);
+            Ok(())
+        })
+    });
+}
+
+/// Наименьшая длительность цикла, при которой все выбросы остаются внутри него (`time < duration`).
+fn particle_duration_min(bursts: &[engine_scene::ParticleBurstComponent]) -> f32 {
+    bursts
+        .iter()
+        .map(|burst| burst.time.next_up())
+        .fold(0.001, f32::max)
+}
+
+/// Наибольшее время выброса: engine-scene требует `time < duration`.
+fn particle_burst_time_max(duration: f32) -> f32 {
+    duration.next_down().max(0.0)
+}
+
+/// Новый выброс в начале цикла.
+fn add_particle_burst(emitter: &mut engine_scene::ParticleEmitterComponent) {
+    emitter.bursts.push(engine_scene::ParticleBurstComponent {
+        time: 0.0,
+        count: 10,
+    });
+}
+
+/// Допустимое время ключа `index`: строго между соседями и внутри [0, 1].
+fn particle_color_key_time_range(
+    keys: &[engine_scene::ParticleColorKeyComponent],
+    index: usize,
+) -> std::ops::RangeInclusive<f32> {
+    let low = index
+        .checked_sub(1)
+        .map_or(0.0, |previous| keys[previous].time.next_up());
+    let high = keys
+        .get(index + 1)
+        .map_or(1.0, |next| next.time.next_down());
+    low..=high
+}
+
+/// Добавляет ключ цвета в самый широкий промежуток кривой: на край [0, 1] с цветом
+/// ближайшего ключа или в середину между ключами с их средним цветом. Пустая кривая получает
+/// белый непрозрачный ключ в 0. Возвращает `false`, если ключей уже максимум.
+fn add_particle_color_key(keys: &mut Vec<engine_scene::ParticleColorKeyComponent>) -> bool {
+    if keys.len() >= engine_scene::MAX_PARTICLE_CURVE_KEYS {
+        return false;
+    }
+    let (Some(first), Some(last)) = (keys.first().copied(), keys.last().copied()) else {
+        keys.push(engine_scene::ParticleColorKeyComponent {
+            time: 0.0,
+            color: [1.0; 4],
+        });
+        return true;
+    };
+    // (ширина промежутка, позиция вставки, ключ)
+    let mut best = (
+        first.time,
+        0,
+        engine_scene::ParticleColorKeyComponent {
+            time: 0.0,
+            color: first.color,
+        },
+    );
+    for (index, pair) in keys.windows(2).enumerate() {
+        let width = pair[1].time - pair[0].time;
+        if width > best.0 {
+            let mut color = [0.0; 4];
+            for (channel, value) in color.iter_mut().enumerate() {
+                *value = (pair[0].color[channel] + pair[1].color[channel]) * 0.5;
+            }
+            best = (
+                width,
+                index + 1,
+                engine_scene::ParticleColorKeyComponent {
+                    time: (pair[0].time + pair[1].time) * 0.5,
+                    color,
+                },
+            );
+        }
+    }
+    if 1.0 - last.time > best.0 {
+        best = (
+            1.0 - last.time,
+            keys.len(),
+            engine_scene::ParticleColorKeyComponent {
+                time: 1.0,
+                color: last.color,
+            },
+        );
+    }
+    // У проверенной кривой из ≤ 3 ключей в [0, 1] самый широкий промежуток не уже 1/3,
+    // поэтому новый ключ строго отделён от соседей.
+    let (_, index, key) = best;
+    keys.insert(index, key);
+    true
+}
+
+/// Цвет из палитры в пределах engine-scene: каналы не отрицательные, альфа в [0, 1].
+fn clamp_particle_color([red, green, blue, alpha]: [f32; 4]) -> [f32; 4] {
+    [
+        red.max(0.0),
+        green.max(0.0),
+        blue.max(0.0),
+        alpha.clamp(0.0, 1.0),
+    ]
 }
 
 /// Строка диапазона `[min, max]` в сетке инспектора.
@@ -4666,4 +4889,297 @@ fn drag_rgb(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod particle_emitter_tests {
+    use super::*;
+    use crate::scene_edit::{EditorScene, NewObject};
+    use engine_scene::{
+        MAX_PARTICLE_CURVE_KEYS, ParticleBurstComponent, ParticleColorKeyComponent,
+        ParticleEmitterComponent,
+    };
+
+    fn key(time: f32, color: [f32; 4]) -> ParticleColorKeyComponent {
+        ParticleColorKeyComponent { time, color }
+    }
+
+    fn state_with_emitter() -> (EditorState, String) {
+        let mut state = EditorState::new(None);
+        state.scene = Some(EditorScene::new_untitled().unwrap());
+        let id = state
+            .edit_scene(|scene| scene.create_object(&NewObject::Empty, None))
+            .unwrap();
+        state
+            .edit_scene(|scene| {
+                scene.set_component(
+                    &id,
+                    Component::ParticleEmitter(ParticleEmitterComponent::default()),
+                )
+            })
+            .unwrap();
+        (state, id)
+    }
+
+    fn emitter(state: &EditorState, id: &str) -> ParticleEmitterComponent {
+        state
+            .scene
+            .as_ref()
+            .unwrap()
+            .object(id)
+            .unwrap()
+            .particle_emitter
+            .clone()
+            .unwrap()
+    }
+
+    /// Правка через путь инспектора: копия компонента меняется и записывается целиком.
+    fn edit_emitter(
+        state: &mut EditorState,
+        id: &str,
+        coalesce: Option<&str>,
+        change: impl FnOnce(&mut ParticleEmitterComponent),
+    ) -> Result<(), String> {
+        let mut value = emitter(state, id);
+        change(&mut value);
+        state
+            .scene
+            .as_mut()
+            .unwrap()
+            .edit_object(id, coalesce, |object| {
+                object.particle_emitter = Some(value);
+                Ok(())
+            })
+    }
+
+    #[test]
+    fn color_keys_fill_the_widest_gap_up_to_the_scene_limit() {
+        let mut keys = Vec::new();
+        assert!(add_particle_color_key(&mut keys));
+        assert_eq!(keys, [key(0.0, [1.0; 4])]);
+        keys[0].color = [2.0, 0.0, 0.0, 1.0];
+        assert!(add_particle_color_key(&mut keys));
+        assert_eq!(
+            keys[1],
+            key(1.0, [2.0, 0.0, 0.0, 1.0]),
+            "edge copies the nearest key"
+        );
+        keys[1].color = [0.0, 0.0, 2.0, 0.0];
+        assert!(add_particle_color_key(&mut keys));
+        assert_eq!(
+            keys[1],
+            key(0.5, [1.0, 0.0, 1.0, 0.5]),
+            "middle averages neighbours"
+        );
+        assert!(add_particle_color_key(&mut keys));
+        assert_eq!(keys.len(), MAX_PARTICLE_CURVE_KEYS);
+        assert_eq!(keys[1].time, 0.25);
+
+        let full = keys.clone();
+        assert!(!add_particle_color_key(&mut keys));
+        assert_eq!(keys, full, "a full curve is left unchanged");
+    }
+
+    #[test]
+    fn color_key_is_added_before_the_first_key_when_that_gap_is_widest() {
+        let mut keys = vec![key(0.75, [0.5; 4])];
+        assert!(add_particle_color_key(&mut keys));
+        assert_eq!(keys, [key(0.0, [0.5; 4]), key(0.75, [0.5; 4])]);
+    }
+
+    #[test]
+    fn color_key_time_range_stays_strictly_between_neighbours() {
+        let keys = [key(0.0, [1.0; 4]), key(0.4, [1.0; 4]), key(0.6, [1.0; 4])];
+        assert_eq!(
+            particle_color_key_time_range(&keys, 0),
+            0.0..=0.4_f32.next_down()
+        );
+        let middle = particle_color_key_time_range(&keys, 1);
+        assert!(*middle.start() > 0.0 && *middle.end() < 0.6);
+        assert_eq!(
+            particle_color_key_time_range(&keys, 2),
+            0.4_f32.next_up()..=1.0
+        );
+    }
+
+    #[test]
+    fn burst_and_duration_bounds_keep_bursts_inside_the_cycle() {
+        assert!(particle_burst_time_max(2.0) < 2.0);
+        assert_eq!(particle_burst_time_max(0.0), 0.0);
+        let bursts = [ParticleBurstComponent {
+            time: 1.5,
+            count: 1,
+        }];
+        assert!(particle_duration_min(&bursts) > 1.5);
+        assert_eq!(particle_duration_min(&[]), 0.001);
+        assert_eq!(
+            clamp_particle_color([-1.0, 3.0, 0.5, 1.5]),
+            [0.0, 3.0, 0.5, 1.0]
+        );
+    }
+
+    #[test]
+    fn widget_bounds_produce_values_the_scene_accepts() {
+        let (mut state, id) = state_with_emitter();
+        edit_emitter(&mut state, &id, None, |value| {
+            value.duration = 2.0;
+            add_particle_burst(value);
+            value.bursts[0].time = particle_burst_time_max(value.duration);
+            for _ in 0..MAX_PARTICLE_CURVE_KEYS {
+                assert!(add_particle_color_key(&mut value.color_over_life));
+            }
+            let range = particle_color_key_time_range(&value.color_over_life, 1);
+            value.color_over_life[1].time = *range.end();
+            value.color_over_life[2].color = clamp_particle_color([5.0, -1.0, 0.0, 2.0]);
+        })
+        .expect("bounded widget values pass engine-scene validation");
+        let bursts = emitter(&state, &id).bursts;
+        edit_emitter(&mut state, &id, None, |value| {
+            value.duration = particle_duration_min(&bursts);
+        })
+        .expect("the shortest allowed duration keeps the burst inside the cycle");
+    }
+
+    #[test]
+    fn invalid_burst_and_color_edits_are_rejected_without_changing_the_scene() {
+        let (mut state, id) = state_with_emitter();
+        let before = emitter(&state, &id);
+        let duration = before.duration;
+        type Edit = Box<dyn FnOnce(&mut ParticleEmitterComponent)>;
+        let cases: [Edit; 4] = [
+            Box::new(move |value| {
+                value.bursts.push(ParticleBurstComponent {
+                    time: duration,
+                    count: 1,
+                })
+            }),
+            Box::new(|value| {
+                value.bursts.push(ParticleBurstComponent {
+                    time: 0.0,
+                    count: 0,
+                })
+            }),
+            Box::new(|value| {
+                value.color_over_life = (0..=MAX_PARTICLE_CURVE_KEYS)
+                    .map(|index| key(index as f32 * 0.2, [1.0; 4]))
+                    .collect()
+            }),
+            Box::new(|value| value.color_over_life = vec![key(0.5, [1.0; 4]), key(0.5, [1.0; 4])]),
+        ];
+        for case in cases {
+            assert!(edit_emitter(&mut state, &id, None, case).is_err());
+            assert_eq!(emitter(&state, &id), before);
+        }
+        assert!(
+            edit_emitter(&mut state, &id, None, |value| {
+                value.duration = 0.5;
+            })
+            .is_ok()
+        );
+        let shortened = emitter(&state, &id);
+        assert!(
+            edit_emitter(&mut state, &id, None, |value| {
+                value.bursts.push(ParticleBurstComponent {
+                    time: 0.4,
+                    count: 1,
+                });
+                value.duration = 0.4;
+            })
+            .is_err(),
+            "shortening the cycle below a burst is rejected"
+        );
+        assert_eq!(emitter(&state, &id), shortened);
+    }
+
+    #[test]
+    fn inspector_draws_bursts_and_color_keys_without_editing_the_scene() {
+        let (mut state, id) = state_with_emitter();
+        edit_emitter(&mut state, &id, None, |value| {
+            add_particle_burst(value);
+            assert!(add_particle_color_key(&mut value.color_over_life));
+            assert!(add_particle_color_key(&mut value.color_over_life));
+        })
+        .unwrap();
+        let before = emitter(&state, &id);
+        let revision = state.scene.as_ref().unwrap().revision();
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 1200.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                show_particle_emitter(ui, &mut state, &id, &before);
+            });
+            output.textures_delta.clear();
+        }
+        assert_eq!(emitter(&state, &id), before);
+        assert_eq!(state.scene.as_ref().unwrap().revision(), revision);
+    }
+
+    #[test]
+    fn burst_and_color_key_edits_undo_and_redo_one_step_each() {
+        let (mut state, id) = state_with_emitter();
+        let initial = emitter(&state, &id);
+
+        commit_list_change(&mut state, &id, |object| {
+            add_particle_burst(object.particle_emitter.as_mut().unwrap());
+        });
+        let added = emitter(&state, &id);
+        assert_eq!(added.bursts.len(), 1);
+        // Перетаскивание объединяется в одну запись, но не с добавлением.
+        let drag = format!("{id}/particle_emitter");
+        for count in [20, 30] {
+            edit_emitter(&mut state, &id, Some(&drag), |value| {
+                value.bursts[0].count = count;
+            })
+            .unwrap();
+        }
+        state.scene.as_mut().unwrap().end_continuous_edit();
+        commit_list_change(&mut state, &id, |object| {
+            let emitter = object.particle_emitter.as_mut().unwrap();
+            assert!(add_particle_color_key(&mut emitter.color_over_life));
+            assert!(add_particle_color_key(&mut emitter.color_over_life));
+        });
+        let with_keys = emitter(&state, &id);
+        assert_eq!(with_keys.bursts[0].count, 30);
+        assert_eq!(with_keys.color_over_life.len(), 2);
+        commit_list_change(&mut state, &id, |object| {
+            object
+                .particle_emitter
+                .as_mut()
+                .unwrap()
+                .color_over_life
+                .remove(0);
+        });
+        assert_eq!(emitter(&state, &id).color_over_life, [key(1.0, [1.0; 4])]);
+
+        let scene = state.scene.as_mut().unwrap();
+        assert!(scene.undo());
+        assert_eq!(
+            emitter(&state, &id),
+            with_keys,
+            "undo restores the removed key"
+        );
+        let scene = state.scene.as_mut().unwrap();
+        assert!(scene.undo());
+        assert_eq!(emitter(&state, &id).color_over_life, []);
+        assert_eq!(emitter(&state, &id).bursts[0].count, 30);
+        let scene = state.scene.as_mut().unwrap();
+        assert!(scene.undo());
+        assert_eq!(emitter(&state, &id), added, "the whole drag is one step");
+        let scene = state.scene.as_mut().unwrap();
+        assert!(scene.undo());
+        assert_eq!(emitter(&state, &id), initial);
+
+        for _ in 0..3 {
+            assert!(state.scene.as_mut().unwrap().redo());
+        }
+        assert_eq!(emitter(&state, &id), with_keys);
+        assert!(state.scene.as_mut().unwrap().redo());
+        assert_eq!(emitter(&state, &id).color_over_life, [key(1.0, [1.0; 4])]);
+    }
 }

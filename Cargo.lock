@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "blake3",
  "engine-files",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "base64",
  "blake3",
