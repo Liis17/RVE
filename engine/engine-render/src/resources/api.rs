@@ -66,7 +66,7 @@ impl Renderer {
                 &instance,
                 &device,
                 self.physical_device,
-                self.queue_family_index,
+                self.upload_queues(),
                 capacity,
                 capacity > DEFAULT_UPLOAD_BATCH_CAPACITY,
                 self.next_upload_serial,

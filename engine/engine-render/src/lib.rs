@@ -251,6 +251,9 @@ pub struct Renderer {
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
     queue_family_index: u32,
+    /// Очередь загрузок из отдельного семейства; null, если `transfer_queue_family_index` — `None`.
+    transfer_queue: vk::Queue,
+    transfer_queue_family_index: Option<u32>,
     upload_alignment: usize,
     capture_row_alignment: u64,
     next_upload_serial: u64,
@@ -567,3 +570,6 @@ mod tests;
 
 #[cfg(test)]
 mod fxaa_reference_tests;
+
+#[cfg(test)]
+mod transfer_tests;

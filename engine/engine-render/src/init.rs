@@ -26,6 +26,8 @@ impl Renderer {
             physical_device: vk::PhysicalDevice::null(),
             queue: vk::Queue::null(),
             queue_family_index: 0,
+            transfer_queue: vk::Queue::null(),
+            transfer_queue_family_index: None,
             upload_alignment: 16,
             capture_row_alignment: 4,
             next_upload_serial: 1,
@@ -155,6 +157,7 @@ impl Renderer {
                 fsr: false,
                 dlss: false,
                 low_latency: false,
+                transfer_queue: false,
             },
             window,
         };
@@ -369,6 +372,7 @@ impl Renderer {
         )?;
         self.physical_device = choice.physical_device;
         self.queue_family_index = choice.queue_family_index;
+        self.transfer_queue_family_index = choice.transfer_queue_family_index;
         self.surface_format = choice.surface_format;
         self.timestamp_valid_bits = choice.timestamp_valid_bits;
         self.timestamp_period = choice.timestamp_period;
@@ -384,6 +388,7 @@ impl Renderer {
             fsr: false,
             dlss: false,
             low_latency: false,
+            transfer_queue: choice.transfer_queue_family_index.is_some(),
         };
 
         #[allow(unused_mut)]
@@ -433,9 +438,14 @@ impl Renderer {
         let device_extensions = deduplicate_names(device_extensions);
 
         let queue_priority = [1.0_f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(self.queue_family_index)
-            .queue_priorities(&queue_priority)];
+        let queue_info =
+            device_queue_families(self.queue_family_index, self.transfer_queue_family_index)
+                .map(|family| {
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(family)
+                        .queue_priorities(&queue_priority)
+                })
+                .collect::<Vec<_>>();
         let extension_pointers = device_extensions
             .iter()
             .map(|name| name.as_ptr())
@@ -494,6 +504,10 @@ impl Renderer {
         self.queue =
             // SAFETY: queue family and index were checked during physical-device selection.
             unsafe { self.device()?.get_device_queue(self.queue_family_index, 0) };
+        if let Some(family) = self.transfer_queue_family_index {
+            // SAFETY: the transfer family was requested with one queue in DeviceCreateInfo above.
+            self.transfer_queue = unsafe { self.device()?.get_device_queue(family, 0) };
+        }
         #[cfg(windows)]
         self.load_fsr_runtime();
         self.swapchain_loader = Some(ash::khr::swapchain::Device::new(
