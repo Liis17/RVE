@@ -86,9 +86,14 @@ Object/component refs проверяются на существующую це�
 
 `build_project_archives` сериализует `ProjectSettings::to_toml`, `PrefabCatalogFile::to_toml`
 и `ArchiveSetRegistry::to_toml` во временный каталог, передаёт generated files вместе
-с проверенными исходными файлами как `BuildFileInput` в `build_archive_set`. Архивы
+с проверенными исходными файлами как `BuildFileInput` в `build_archive_set_with_cache`. Архивы
 собираются во временном sibling-каталоге output, затем публикуются атомарно без
-замены существующего каталога. `base.rvepak` содержит сцены, иконку,
+замены существующего каталога. Кеш сжатых блоков `build` хранится в каталоге сборки
+проекта `<project>/.rve/pak-cache` (`pak_cache_dir`); повторная сборка без изменений не
+вызывает кодер, изменённый ресурс пересжимается, а смена `--compression` даёт другие ключи
+([[Engine/EnginePak]]). После успешной упаковки кеш ограничивается `DEFAULT_BLOCK_CACHE_MAX_BYTES`.
+Кеш — только ускорение: недоступный каталог или ошибка ограничения размера печатают
+предупреждение на stderr, и сборка продолжается. `base.rvepak` содержит сцены, иконку,
 `/rve/project.toml`, `/rve/assets.toml` и `/rve/prefabs.toml`. Список тяжёлых префабов
 пишется всегда, даже пустым (`prefabs = []`), поэтому runtime читает один формат. Путь
 `/rve/prefabs.toml` зарезервирован: `Assets` не может его содержать. Runtime получает bootstrap из

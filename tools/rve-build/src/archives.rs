@@ -3,13 +3,14 @@ use crate::project::ProjectBuild;
 use crate::temporary::TempDir;
 use engine_files::VirtualPath;
 use engine_pak::{
-    ArchiveSetRegistry, BuildCompression, BuildFileInput, BuildOptions, ProgrammaticArchive,
-    build_archive_set,
+    ArchiveSetRegistry, BlockCache, BuildCompression, BuildFileInput, BuildOptions,
+    DEFAULT_BLOCK_CACHE_MAX_BYTES, ProgrammaticArchive, build_archive_set,
+    build_archive_set_with_cache,
 };
 use engine_project::PREFAB_CATALOG_RELEASE_PATH;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Генерируемые файлы релиза в `base`: `/rve/project.toml`, `/rve/assets.toml`, `/rve/prefabs.toml`.
 fn reserved_paths() -> [VirtualPath; 3] {
@@ -43,10 +44,32 @@ pub(crate) fn validate_project_archives(
         .map_err(|error| BuildError::input(format!("ошибка реестра ресурсов: {error}")))
 }
 
+/// Каталог кеша сжатых блоков RVEPAK внутри каталога сборки проекта.
+pub(crate) fn pak_cache_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".rve").join("pak-cache")
+}
+
+/// Открывает кеш сжатых блоков проекта. Кеш только ускоряет повторную упаковку, поэтому
+/// ошибка открытия — предупреждение на stderr, и сборка идёт без кеша.
+pub(crate) fn open_pak_cache(project_dir: &Path) -> Option<BlockCache> {
+    let directory = pak_cache_dir(project_dir);
+    match BlockCache::open(&directory, DEFAULT_BLOCK_CACHE_MAX_BYTES) {
+        Ok(cache) => Some(cache),
+        Err(error) => {
+            eprintln!(
+                "предупреждение: кеш сжатых блоков {} недоступен, архивы сжимаются заново: {error}",
+                directory.display()
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn build_project_archives(
     project: &ProjectBuild,
     output: &Path,
     compression: BuildCompression,
+    cache: Option<&mut BlockCache>,
 ) -> Result<ArchiveSetRegistry, BuildError> {
     let registry = validate_project_archives(project)?;
     let [project_settings_path, registry_path, prefabs_path] = reserved_paths();
@@ -143,7 +166,28 @@ pub(crate) fn build_project_archives(
             }
         })
         .collect();
-    build_archive_set(archives, output, compression, BuildOptions::default())
+    let built = match cache {
+        Some(cache) => {
+            let built = build_archive_set_with_cache(
+                archives,
+                output,
+                compression,
+                BuildOptions::default(),
+                cache,
+            );
+            if built.is_ok()
+                && let Err(error) = cache.prune()
+            {
+                eprintln!(
+                    "предупреждение: не удалось ограничить размер кеша {}: {error}",
+                    cache.root().display()
+                );
+            }
+            built
+        }
+        None => build_archive_set(archives, output, compression, BuildOptions::default()),
+    };
+    built
         .map_err(|error| BuildError::operational(format!("не удалось собрать архивы: {error}")))?;
 
     Ok(registry)
@@ -319,7 +363,8 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         let project = prepare_project(project_root.path()).unwrap();
         let archives_dir = project_root.path().join("out-assets");
         let registry =
-            build_project_archives(&project, &archives_dir, BuildCompression::default()).unwrap();
+            build_project_archives(&project, &archives_dir, BuildCompression::default(), None)
+                .unwrap();
         validate_staged_archives(&archives_dir).unwrap();
 
         assert_eq!(
@@ -435,7 +480,8 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         let project = prepare_project(project_root.path()).unwrap();
         let archives_dir = project_root.path().join("out-assets");
         let registry =
-            build_project_archives(&project, &archives_dir, BuildCompression::default()).unwrap();
+            build_project_archives(&project, &archives_dir, BuildCompression::default(), None)
+                .unwrap();
         let assignments = file_assignments(&registry);
         assert_eq!(
             assignments["/luts/film.cube"],
@@ -490,7 +536,7 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
                 codec,
                 ..BuildCompression::default()
             };
-            build_project_archives(&project, &archives_dir, compression).unwrap();
+            build_project_archives(&project, &archives_dir, compression, None).unwrap();
 
             for (archive, path) in [
                 ("base", "/rve/project.toml"),
@@ -504,6 +550,63 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
                 assert_eq!(stat.codec, codec, "{archive}: {path}");
             }
         }
+    }
+
+    fn read_archives(directory: &Path) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeated_build_takes_every_block_from_the_project_cache() {
+        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-pak-cache").unwrap();
+        create_demo_like_project(project_root.path());
+        let project = prepare_project(project_root.path()).unwrap();
+        let cache_dir = super::pak_cache_dir(&project.project_dir);
+        assert!(cache_dir.starts_with(project.project_dir.join(".rve")));
+
+        let uncached_dir = project_root.path().join("out-uncached");
+        build_project_archives(&project, &uncached_dir, BuildCompression::default(), None).unwrap();
+        let mut outputs = Vec::new();
+        for build in 0..2 {
+            let mut cache = super::open_pak_cache(&project.project_dir).unwrap();
+            let archives_dir = project_root.path().join(format!("out-{build}"));
+            build_project_archives(
+                &project,
+                &archives_dir,
+                BuildCompression::default(),
+                Some(&mut cache),
+            )
+            .unwrap();
+            validate_staged_archives(&archives_dir).unwrap();
+            outputs.push((read_archives(&archives_dir), cache.stats()));
+        }
+        let uncached = read_archives(&uncached_dir);
+        let (cold, cold_stats) = &outputs[0];
+        let (warm, warm_stats) = &outputs[1];
+        assert!(cold_stats.misses > 0);
+        assert_eq!(warm_stats.misses, 0, "{warm_stats:?}");
+        assert_eq!(warm_stats.hits, cold_stats.misses + cold_stats.hits);
+        assert_eq!(cold, &uncached);
+        assert_eq!(warm, &uncached);
+    }
+
+    #[test]
+    fn unavailable_project_cache_falls_back_to_an_uncached_build() {
+        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-pak-cache").unwrap();
+        fs::create_dir_all(project_root.path().join(".rve")).unwrap();
+        fs::write(
+            super::pak_cache_dir(project_root.path()),
+            b"not a directory",
+        )
+        .unwrap();
+        assert!(super::open_pak_cache(project_root.path()).is_none());
     }
 }
 
@@ -614,7 +717,8 @@ mod prefab_list_tests {
         let build = prepare_project(root.path()).unwrap();
         let archives_dir = root.path().join("out-assets");
         let registry =
-            build_project_archives(&build, &archives_dir, BuildCompression::default()).unwrap();
+            build_project_archives(&build, &archives_dir, BuildCompression::default(), None)
+                .unwrap();
 
         let text = base_text(&archives_dir, "/rve/prefabs.toml");
         assert_eq!(PrefabCatalogFile::parse(&text).unwrap(), build.prefabs);
@@ -628,7 +732,7 @@ mod prefab_list_tests {
         project(root.path(), None);
         let build = prepare_project(root.path()).unwrap();
         let archives_dir = root.path().join("out-assets");
-        build_project_archives(&build, &archives_dir, BuildCompression::default()).unwrap();
+        build_project_archives(&build, &archives_dir, BuildCompression::default(), None).unwrap();
 
         let text = base_text(&archives_dir, "/rve/prefabs.toml");
         assert!(PrefabCatalogFile::parse(&text).unwrap().prefabs.is_empty());
@@ -649,6 +753,7 @@ mod prefab_list_tests {
             &build,
             &root.path().join("out-assets"),
             BuildCompression::default(),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.exit_code(), 2);

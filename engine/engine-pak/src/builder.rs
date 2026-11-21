@@ -1,7 +1,7 @@
 use crate::archive_name::{ArchiveNameError, is_reserved_windows_device, validate_archive_stem};
 use crate::{
-    ArchiveCatalog, ArchiveId, ArchiveWriter, BlobId, BlobOptions, CatalogAsset, CatalogLimits,
-    Codec, ContentHash, PakError, WriterOptions,
+    ArchiveCatalog, ArchiveId, ArchiveWriter, BlobId, BlobOptions, BlockCache, CatalogAsset,
+    CatalogLimits, Codec, ContentHash, PakError, WriterOptions,
 };
 use engine_files::VirtualPath;
 use serde::Deserialize;
@@ -416,6 +416,31 @@ pub fn build_archive_set(
     defaults: BuildCompression,
     options: BuildOptions,
 ) -> Result<BuildReport, BuildError> {
+    build_programmatic_set(archives, output.as_ref(), defaults, options, None)
+}
+
+/// Like [`build_archive_set`], but compressed chunks are taken from and stored in `cache`.
+///
+/// The published archives are byte-identical to an uncached build; only the encoder calls
+/// for already cached chunks are skipped. Catalogs, deduplication and cross-archive
+/// references are always rebuilt. Call [`BlockCache::prune`] afterwards to apply its size limit.
+pub fn build_archive_set_with_cache(
+    archives: Vec<ProgrammaticArchive>,
+    output: impl AsRef<Path>,
+    defaults: BuildCompression,
+    options: BuildOptions,
+    cache: &mut BlockCache,
+) -> Result<BuildReport, BuildError> {
+    build_programmatic_set(archives, output.as_ref(), defaults, options, Some(cache))
+}
+
+fn build_programmatic_set(
+    archives: Vec<ProgrammaticArchive>,
+    output: &Path,
+    defaults: BuildCompression,
+    options: BuildOptions,
+    cache: Option<&mut BlockCache>,
+) -> Result<BuildReport, BuildError> {
     if archives.is_empty() {
         return Err(BuildError::input(
             "archive set must declare at least one archive",
@@ -423,7 +448,7 @@ pub fn build_archive_set(
     }
     validate_compression(defaults)?;
 
-    let destination = prepare_output_directory(output.as_ref())?;
+    let destination = prepare_output_directory(output)?;
 
     let mut folded_names = BTreeSet::new();
     let mut canonical_archives = Vec::with_capacity(archives.len());
@@ -450,7 +475,11 @@ pub fn build_archive_set(
         .into_iter()
         .map(|(name, files)| (format!("{name}.rvepak"), files))
         .collect();
-    execute(finalize_build_plan(destination, archives, options)?)
+    execute_with_publish_hook(
+        finalize_build_plan(destination, archives, options)?,
+        cache,
+        |_| Ok(()),
+    )
 }
 
 fn prepare_output_directory(output: &Path) -> Result<PathBuf, BuildError> {
@@ -550,11 +579,12 @@ fn finalize_build_plan(
 /// Streams every archive into a sibling staging directory, validates the complete catalog,
 /// then publishes the directory with an atomic no-replace rename.
 pub fn execute(plan: BuildPlan) -> Result<BuildReport, BuildError> {
-    execute_with_publish_hook(plan, |_| Ok(()))
+    execute_with_publish_hook(plan, None, |_| Ok(()))
 }
 
 fn execute_with_publish_hook(
     plan: BuildPlan,
+    mut cache: Option<&mut BlockCache>,
     before_publish: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<BuildReport, BuildError> {
     let parent = plan
@@ -665,7 +695,7 @@ fn execute_with_publish_hook(
                     );
                     continue;
                 }
-                let blob_id = add_local(&mut writer, input, Some(hash))?;
+                let blob_id = add_local(&mut writer, input, Some(hash), cache.as_deref_mut())?;
                 let pending = PendingOwner {
                     path: input.path.clone(),
                     blob_id,
@@ -675,7 +705,7 @@ fn execute_with_publish_hook(
                 new_owners.push((key, pending));
                 owners.push((archive.name.clone(), input.path.clone(), blob_id));
             } else {
-                let blob_id = add_local(&mut writer, input, None)?;
+                let blob_id = add_local(&mut writer, input, None, cache.as_deref_mut())?;
                 owners.push((archive.name.clone(), input.path.clone(), blob_id));
             }
         }
@@ -816,20 +846,29 @@ fn add_local(
     writer: &mut ArchiveWriter<File>,
     input: &PlannedInput,
     expected_hash: Option<ContentHash>,
+    cache: Option<&mut BlockCache>,
 ) -> Result<BlobId, BuildError> {
     let source = open_checked_source(&input.source_root, &input.source)?;
-    writer
-        .add_local_with_options(
+    let blob_options = BlobOptions {
+        codec: input.compression.codec,
+        chunk_size: input.compression.chunk_size,
+        zstd_level: input.compression.zstd_level,
+    };
+    let result = match cache {
+        Some(cache) => writer.add_local_with_encoder(
             input.path.clone(),
             source,
-            BlobOptions {
-                codec: input.compression.codec,
-                chunk_size: input.compression.chunk_size,
-                zstd_level: input.compression.zstd_level,
-            },
+            blob_options,
             expected_hash,
-        )
-        .map_err(|error| classify_writer_error(input.path.as_str(), error))
+            &mut |codec, decoded, level, chunk_hash| {
+                cache.encode(codec, decoded, level, chunk_hash)
+            },
+        ),
+        None => {
+            writer.add_local_with_options(input.path.clone(), source, blob_options, expected_hash)
+        }
+    };
+    result.map_err(|error| classify_writer_error(input.path.as_str(), error))
 }
 
 fn classify_writer_error(context: &str, error: PakError) -> BuildError {
@@ -1507,10 +1546,10 @@ fn platform_publish_noreplace(_source: &Path, _destination: &Path) -> io::Result
 mod tests {
     use super::{
         BuildCompression, BuildErrorKind, BuildFileInput, BuildOptions, ProgrammaticArchive,
-        build_archive_set, execute_with_publish_hook, parse_manifest, plan_programmatic_inputs,
-        preflight,
+        build_archive_set, build_archive_set_with_cache, execute_with_publish_hook, parse_manifest,
+        plan_programmatic_inputs, preflight,
     };
-    use crate::{ArchiveCatalog, Codec};
+    use crate::{ArchiveCatalog, BlockCache, BlockCacheStats, Codec};
     use engine_files::VirtualPath;
     use std::fs;
     use std::path::PathBuf;
@@ -1557,7 +1596,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = execute_with_publish_hook(plan, |destination| {
+        let error = execute_with_publish_hook(plan, None, |destination| {
             fs::create_dir(destination)?;
             fs::write(destination.join("preserved.txt"), b"existing destination")
         })
@@ -1597,7 +1636,8 @@ mod tests {
         .unwrap();
 
         let error =
-            execute_with_publish_hook(plan, |destination| fs::create_dir(destination)).unwrap_err();
+            execute_with_publish_hook(plan, None, |destination| fs::create_dir(destination))
+                .unwrap_err();
 
         assert_eq!(error.kind(), BuildErrorKind::Operational);
         assert!(base.join("output").is_dir());
@@ -1798,5 +1838,195 @@ mod tests {
         .unwrap();
         assert_eq!(report.owners[0].codec, Codec::None);
         let _ = fs::remove_dir_all(base);
+    }
+
+    /// Three resources of four 1 KiB chunks each; `b.bin` is shared with a second archive.
+    struct CacheFixture {
+        base: PathBuf,
+        cache: PathBuf,
+        builds: u32,
+    }
+
+    const CHUNK: u64 = 1024;
+
+    impl CacheFixture {
+        fn new(label: &str) -> Self {
+            let base = temp_dir(label);
+            for (name, seed) in [("a.bin", 1_u8), ("b.bin", 2), ("c.bin", 3)] {
+                fs::write(base.join(name), Self::content(seed)).unwrap();
+            }
+            Self {
+                cache: base.join("cache"),
+                base,
+                builds: 0,
+            }
+        }
+
+        fn content(seed: u8) -> Vec<u8> {
+            (0..CHUNK * 4)
+                .map(|index| (index as u8).wrapping_mul(seed) ^ (index / 97) as u8)
+                .collect()
+        }
+
+        fn archives(&self) -> Vec<ProgrammaticArchive> {
+            let input = |name: &str| BuildFileInput {
+                chunk_size: Some(CHUNK),
+                ..BuildFileInput::new(self.base.join(name), virtual_path(&format!("/{name}")))
+            };
+            vec![
+                ProgrammaticArchive {
+                    name: "base".into(),
+                    inputs: vec![input("a.bin"), input("b.bin")],
+                },
+                ProgrammaticArchive {
+                    name: "extra".into(),
+                    inputs: vec![
+                        input("c.bin"),
+                        BuildFileInput {
+                            chunk_size: Some(CHUNK),
+                            ..BuildFileInput::new(
+                                self.base.join("b.bin"),
+                                virtual_path("/copy.bin"),
+                            )
+                        },
+                    ],
+                },
+            ]
+        }
+
+        fn output(&mut self) -> PathBuf {
+            self.builds += 1;
+            self.base.join(format!("out-{}", self.builds))
+        }
+
+        fn build_cached(&mut self, codec: Codec, level: i32) -> (Vec<Vec<u8>>, BlockCacheStats) {
+            let output = self.output();
+            let mut cache = BlockCache::open(&self.cache, u64::MAX).unwrap();
+            build_archive_set_with_cache(
+                self.archives(),
+                &output,
+                BuildCompression {
+                    codec,
+                    zstd_level: level,
+                    ..BuildCompression::default()
+                },
+                BuildOptions::default(),
+                &mut cache,
+            )
+            .unwrap();
+            (Self::read(&output), cache.stats())
+        }
+
+        fn build_uncached(&mut self, codec: Codec, level: i32) -> Vec<Vec<u8>> {
+            let output = self.output();
+            build_archive_set(
+                self.archives(),
+                &output,
+                BuildCompression {
+                    codec,
+                    zstd_level: level,
+                    ..BuildCompression::default()
+                },
+                BuildOptions::default(),
+            )
+            .unwrap();
+            Self::read(&output)
+        }
+
+        fn read(output: &std::path::Path) -> Vec<Vec<u8>> {
+            ["base.rvepak", "extra.rvepak"]
+                .map(|name| fs::read(output.join(name)).unwrap())
+                .to_vec()
+        }
+
+        fn entries(&self) -> Vec<PathBuf> {
+            let mut entries = Vec::new();
+            for shard in fs::read_dir(&self.cache).unwrap() {
+                for file in fs::read_dir(shard.unwrap().path()).unwrap() {
+                    entries.push(file.unwrap().path());
+                }
+            }
+            entries
+        }
+    }
+
+    impl Drop for CacheFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn cached_rebuild_skips_compression_and_matches_uncached_bytes() {
+        for codec in [Codec::Zstd, Codec::Lz4] {
+            let mut fixture = CacheFixture::new("cache-rebuild");
+            let uncached = fixture.build_uncached(codec, 3);
+            let (cold, cold_stats) = fixture.build_cached(codec, 3);
+            // Two archives own three distinct blobs; /copy.bin references base's blob.
+            assert_eq!(cold_stats.misses, 12);
+            assert_eq!(cold_stats.hits, 0);
+            let (warm, warm_stats) = fixture.build_cached(codec, 3);
+            assert_eq!(
+                warm_stats,
+                BlockCacheStats {
+                    hits: 12,
+                    ..BlockCacheStats::default()
+                }
+            );
+            assert_eq!(cold, uncached, "{codec:?} cold cache output");
+            assert_eq!(warm, uncached, "{codec:?} warm cache output");
+        }
+    }
+
+    #[test]
+    fn cached_rebuild_recompresses_only_the_changed_resource() {
+        let mut fixture = CacheFixture::new("cache-change");
+        fixture.build_cached(Codec::Zstd, 3);
+        let mut changed = CacheFixture::content(3);
+        changed[0] ^= 0xff; // only the first chunk of c.bin differs
+        fs::write(fixture.base.join("c.bin"), changed).unwrap();
+        let (cached, stats) = fixture.build_cached(Codec::Zstd, 3);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 11);
+        assert_eq!(cached, fixture.build_uncached(Codec::Zstd, 3));
+    }
+
+    #[test]
+    fn compression_profile_change_invalidates_cached_blocks() {
+        let mut fixture = CacheFixture::new("cache-profile");
+        fixture.build_cached(Codec::Zstd, 3);
+        for (codec, level) in [(Codec::Zstd, 5), (Codec::Lz4, 3)] {
+            let (cached, stats) = fixture.build_cached(codec, level);
+            assert_eq!((stats.misses, stats.hits), (12, 0), "{codec:?} {level}");
+            assert_eq!(cached, fixture.build_uncached(codec, level));
+        }
+        let (_, stats) = fixture.build_cached(Codec::Zstd, 3);
+        assert_eq!(stats.misses, 0, "previous profile entries stay valid");
+    }
+
+    #[test]
+    fn corrupted_cache_entries_are_recompressed_with_identical_output() {
+        let mut fixture = CacheFixture::new("cache-corrupt");
+        fixture.build_cached(Codec::Zstd, 3);
+        let entries = fixture.entries();
+        assert_eq!(entries.len(), 12);
+        let mut bytes = fs::read(&entries[0]).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x55;
+        fs::write(&entries[0], bytes).unwrap();
+        fs::write(&entries[1], b"garbage").unwrap();
+        let (cached, stats) = fixture.build_cached(Codec::Zstd, 3);
+        assert_eq!((stats.rejected, stats.misses, stats.hits), (2, 2, 10));
+        assert_eq!(cached, fixture.build_uncached(Codec::Zstd, 3));
+        let (_, stats) = fixture.build_cached(Codec::Zstd, 3);
+        assert_eq!(stats.hits, 12, "rejected entries were rewritten");
+    }
+
+    #[test]
+    fn uncompressed_builds_do_not_use_the_cache() {
+        let mut fixture = CacheFixture::new("cache-none");
+        let (cached, stats) = fixture.build_cached(Codec::None, 3);
+        assert_eq!(stats, BlockCacheStats::default());
+        assert!(fixture.entries().is_empty());
+        assert_eq!(cached, fixture.build_uncached(Codec::None, 3));
     }
 }
