@@ -884,7 +884,7 @@ mod save_validation_tests {
             save_values_size(candidate.iter().map(|(key, value)| (key.as_str(), value)))
                 < MAX_SAVE_BYTES
         );
-        assert!(crate::encode_save_data(&candidate).is_err());
+        assert!(crate::encode_save_data(0, &candidate).is_err());
 
         assert!(
             transaction

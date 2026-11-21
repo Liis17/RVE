@@ -481,6 +481,8 @@ pub(crate) trait ExitRequester: Send + Sync {
 pub(crate) struct ScriptThreadConfig {
     pub scene_name: String,
     pub save_path: Option<PathBuf>,
+    /// Версия схемы сохранений и Lua-мигратор из `[save]` проекта.
+    pub save_schema: engine_script::SaveSchema,
     /// Включённые сцены проекта: только они принимаются `rve.scene.load`.
     pub enabled_scenes: Vec<String>,
     pub sources: std::collections::BTreeMap<String, String>,

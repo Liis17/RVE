@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const LUA_HOOK_INSTRUCTION_INTERVAL: u32 = 1_000;
-const LUA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const LUA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PROPERTY_ARRAY_DEPTH: usize = 4;
 
 pub(crate) const MAX_PENDING_LOG_EVENTS: usize = 1_024;
@@ -250,7 +250,7 @@ impl CallDeadline {
         })
     }
 
-    fn install_sparse_hook(&self, lua: &Lua) -> mlua::Result<()> {
+    pub(crate) fn install_sparse_hook(&self, lua: &Lua) -> mlua::Result<()> {
         let deadline = self.clone();
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(LUA_HOOK_INSTRUCTION_INTERVAL),
@@ -4435,9 +4435,14 @@ pub(crate) fn lua_boolean(value: Value, function: &str) -> mlua::Result<bool> {
     }
 }
 
-struct AssetUserData(VirtualPath);
+pub(crate) struct AssetUserData(pub(crate) VirtualPath);
 
 impl UserData for AssetUserData {}
+
+/// Object reference inside a save migration: the stored object id, opaque to Lua.
+pub(crate) struct SaveObjectUserData(pub(crate) String);
+
+impl UserData for SaveObjectUserData {}
 
 fn asset_function(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(|lua, path: LuaString| {
@@ -4823,7 +4828,7 @@ fn lua_message_name(value: LuaString) -> mlua::Result<String> {
         .map_err(|_| LuaError::runtime("message names must contain valid UTF-8"))
 }
 
-fn lua_param_value(value: Value) -> mlua::Result<ParamValue> {
+pub(crate) fn lua_param_value(value: Value) -> mlua::Result<ParamValue> {
     lua_param_value_with_size(value).map(|(value, _)| value)
 }
 
@@ -4867,6 +4872,12 @@ fn lua_param_value_inner(
                 .map_err(|_| LuaError::runtime("message strings must contain valid UTF-8"))
         }
         Value::UserData(value) => {
+            if let Ok(object) = value.borrow::<SaveObjectUserData>() {
+                budget
+                    .add_string(object.0.len())
+                    .map_err(LuaError::runtime)?;
+                return Ok(ParamValue::Object(object.0.clone()));
+            }
             let asset = value
                 .borrow::<AssetUserData>()
                 .map_err(|_| LuaError::runtime("save userdata values must be assets"))?;

@@ -39,6 +39,8 @@ pub(crate) enum ArchiveReason {
     SceneFile,
     /// AppIcon из `bootstrap.rves` всегда лежит в `base`.
     AppIcon,
+    /// Lua-мигратор `[save] migration` всегда лежит в `base`.
+    SaveMigration,
     /// Явный архив, заданный владельцем; источник ищется в трассе по владельцу и имени архива.
     Explicit { owner: Owner, archive: String },
     /// Явные архивы тяжёлых префабов расходятся: ресурс уходит в `shared`.
@@ -57,6 +59,8 @@ pub(crate) struct BuildTrace {
     pub(crate) roots: Vec<(Owner, VirtualPath)>,
     /// AppIcon из `bootstrap.rves`, если задан.
     pub(crate) icon: Option<VirtualPath>,
+    /// Lua-мигратор сохранений `[save] migration`, если задан.
+    pub(crate) save_migration: Option<VirtualPath>,
     pub(crate) reasons: BTreeMap<VirtualPath, ArchiveReason>,
     /// Рёбра по владельцу контекста раскрытия: одна и та же сцена или префаб может раскрываться
     /// по-разному в разных контекстах, поэтому обход идёт только по рёбрам своего владельца.

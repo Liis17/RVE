@@ -748,6 +748,42 @@ pub struct RveParams {
     pub len: usize,
 }
 
+/// Layout version of [`RveSaveMigration`]. It is independent of [`RVE_SCRIPT_ABI_VERSION`]: the
+/// save migration entry point is a separate optional export and does not change `RveHost`.
+pub const RVE_SAVE_MIGRATION_ABI_VERSION: u32 = 1;
+
+/// Writes one migrated save entry. Returns `false` when the host rejects the key or value.
+pub type RveSaveMigrationSetFn =
+    unsafe extern "C" fn(ctx: *mut c_void, key: RveStr, value: *const RveValue) -> bool;
+/// Reports why the migration step failed.
+pub type RveSaveMigrationErrorFn = unsafe extern "C" fn(ctx: *mut c_void, message: RveStr);
+
+/// One save migration step from `from_version` to `from_version + 1`.
+///
+/// `values` and every buffer reachable from it are valid only during the call. Object values carry
+/// handles that are meaningful only inside this migration: they can be copied to the output but
+/// not used with `RveHost`. The guest writes the complete migrated set through `set`; keys it
+/// does not write are removed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveSaveMigration {
+    /// [`RVE_SAVE_MIGRATION_ABI_VERSION`] of this layout.
+    pub abi_version: u32,
+    /// Save schema version of `values`.
+    pub from_version: u32,
+    /// Save values at `from_version`.
+    pub values: RveParams,
+    /// Host context for `set` and `error`.
+    pub ctx: *mut c_void,
+    /// Adds one entry to the migrated values.
+    pub set: RveSaveMigrationSetFn,
+    /// Records an error message for a failed step.
+    pub error: RveSaveMigrationErrorFn,
+}
+
+/// Optional `rve_save_migrate` export of a game library; returns [`RveStatus`] as a `u32`.
+pub type RveSaveMigrateFn = unsafe extern "C" fn(migration: *const RveSaveMigration) -> u32;
+
 /// Result of a guest callback.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

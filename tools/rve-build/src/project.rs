@@ -366,6 +366,16 @@ fn prepare_with_resources(
     if let Some(trace) = trace.as_deref_mut() {
         trace.icon = icon.clone();
     }
+    // Мигратор сохранений не достижим из сцен: runtime читает его до старта скриптов, поэтому он
+    // лежит в базовом архиве.
+    let save_migration = settings.save.migration_path();
+    if let Some(migration) = &save_migration {
+        read_asset_text(&sources, migration, "мигратор сохранений")?;
+        base_paths.insert(migration.clone());
+    }
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.save_migration = save_migration.clone();
+    }
 
     let files = usages
         .keys()
@@ -374,8 +384,13 @@ fn prepare_with_resources(
         .into_iter()
         .map(|path| Ok((path.clone(), require_asset_file(&assets_dir, path)?)))
         .collect::<Result<BTreeMap<_, _>, BuildError>>()?;
-    let (assignments, reasons) =
-        assign_archives(&enabled_scenes, &usages, &base_paths, icon.as_ref())?;
+    let (assignments, reasons) = assign_archives(
+        &enabled_scenes,
+        &usages,
+        &base_paths,
+        icon.as_ref(),
+        save_migration.as_ref(),
+    )?;
     if let Some(trace) = trace {
         trace.reasons = reasons;
     }
@@ -975,6 +990,7 @@ fn assign_archives(
     usages: &BTreeMap<VirtualPath, AssetUsage>,
     base_paths: &BTreeSet<VirtualPath>,
     icon: Option<&VirtualPath>,
+    save_migration: Option<&VirtualPath>,
 ) -> Result<Assignments, BuildError> {
     let mut assignments = BTreeMap::new();
     let mut reasons = BTreeMap::new();
@@ -993,6 +1009,8 @@ fn assign_archives(
             }) {
                 let reason = if icon == Some(path) {
                     "AppIcon всегда должен находиться в base"
+                } else if save_migration == Some(path) {
+                    "мигратор сохранений всегда должен находиться в base"
                 } else {
                     "файл включённой сцены всегда должен находиться в base"
                 };
@@ -1006,6 +1024,8 @@ fn assign_archives(
                 (*path).clone(),
                 if icon == Some(path) {
                     ArchiveReason::AppIcon
+                } else if save_migration == Some(path) {
+                    ArchiveReason::SaveMigration
                 } else {
                     ArchiveReason::SceneFile
                 },
@@ -1343,7 +1363,8 @@ mod tests {
                 explicit_archives: vec![(Owner::Scene(1), "props".to_owned())],
             },
         );
-        let (assignments, _) = assign_archives(&scenes(), &usages, &BTreeSet::new(), None).unwrap();
+        let (assignments, _) =
+            assign_archives(&scenes(), &usages, &BTreeSet::new(), None, None).unwrap();
         assert_eq!(assignments[&path("/models/one.fbx")], "scene-main");
         assert_eq!(assignments[&path("/models/shared.fbx")], "shared");
         assert_eq!(assignments[&path("/models/props.fbx")], "props");
@@ -1362,7 +1383,7 @@ mod tests {
                 ],
             },
         )]);
-        let error = assign_archives(&scenes(), &usages, &BTreeSet::new(), None).unwrap_err();
+        let error = assign_archives(&scenes(), &usages, &BTreeSet::new(), None, None).unwrap_err();
         assert!(error.to_string().contains("/scenes/main.rvescene"));
         assert!(error.to_string().contains("/scenes/second.rvescene"));
     }
@@ -1385,7 +1406,7 @@ mod tests {
                 },
             ),
         ]);
-        let error = assign_archives(&scenes(), &usages, &BTreeSet::new(), None).unwrap_err();
+        let error = assign_archives(&scenes(), &usages, &BTreeSet::new(), None, None).unwrap_err();
         assert!(error.to_string().contains("Props"));
         assert!(error.to_string().contains("props"));
     }
@@ -1405,6 +1426,7 @@ mod tests {
             &usages,
             &BTreeSet::from([icon.clone()]),
             Some(&icon),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("AppIcon"));
@@ -1424,7 +1446,7 @@ mod tests {
                 explicit_archives: Vec::new(),
             },
         )]);
-        let error = assign_archives(&[scene], &usages, &BTreeSet::new(), None).unwrap_err();
+        let error = assign_archives(&[scene], &usages, &BTreeSet::new(), None, None).unwrap_err();
         assert!(error.to_string().contains("scene-bad scene"));
         assert!(error.to_string().contains("имени сцены"));
     }
@@ -1531,6 +1553,33 @@ mod lite_params_tests {
             assert!(error.to_string().contains("\"camera\""), "{error}");
             assert!(error.to_string().contains("/scripts/rotate.lua"), "{error}");
         }
+    }
+
+    #[test]
+    fn save_migration_is_packed_even_though_no_scene_references_it() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-save").unwrap();
+        project(root.path(), "{ speed = 90 }");
+        let settings = root.path().join("project.rveproject");
+        let mut contents = fs::read_to_string(&settings).unwrap();
+        contents.push_str("[save]\nversion = 2\nmigration = \"/scripts/save_migration.lua\"\n");
+        fs::write(&settings, contents).unwrap();
+
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(
+            error.to_string().contains("/scripts/save_migration.lua"),
+            "{error}"
+        );
+
+        fs::write(
+            root.path().join("Assets/scripts/save_migration.lua"),
+            "return { migrate = function(_, values) return values end }\n",
+        )
+        .unwrap();
+        let build = prepare_project(root.path()).unwrap();
+        let migration = VirtualPath::parse("/scripts/save_migration.lua").unwrap();
+        assert!(build.files.contains_key(&migration));
+        assert_eq!(build.assignments[&migration], "base");
     }
 
     #[test]

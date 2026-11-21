@@ -55,6 +55,7 @@ pub(crate) fn scripts_thread(
     let ScriptThreadConfig {
         scene_name,
         save_path,
+        save_schema,
         enabled_scenes,
         sources,
         input_settings,
@@ -124,7 +125,7 @@ pub(crate) fn scripts_thread(
         }
     };
     if let Some(path) = save_path
-        && let Err(error) = scripts.load_save_file(&path)
+        && let Err(error) = scripts.load_save_file(&path, &save_schema)
     {
         log::warn!("save data is unavailable at {}: {error}", path.display());
     }

@@ -149,7 +149,7 @@ Inspector показывает `params` скрипта по его схеме ([
 
 ## Play
 
-Play начинает с первой включённой `[[scenes]]` записи проекта (`ProjectSettings::starting_scene`): editor читает её в отдельный `EditorScene`, не заменяя открытую edit-сцену или prefab. Сохранения этой сессии изолированы в `<project>/.rve/playersave/save.toml`; runtime-user path редактора не использует.
+Play начинает с первой включённой `[[scenes]]` записи проекта (`ProjectSettings::starting_scene`): editor читает её в отдельный `EditorScene`, не заменяя открытую edit-сцену или prefab. Сохранения этой сессии изолированы в `<project>/.rve/playersave/save.toml`; runtime-user path редактора не использует. Версию и Lua-мигратор `[save]` Play берёт из настроек проекта (`play_save_schema` в `editor/src/app.rs`); ошибка чтения мигратора или миграции пишет предупреждение в Console, и сессия идёт без persistence.
 
 `rve.app.quit()`/`Context::quit()` после Play шага останавливают `PlaySession` через обычный Stop: вызывается `on_destroy`, запрос логируется с уровнем Info, редактор возвращается в edit mode. Запрос не закрывает окно редактора.
 

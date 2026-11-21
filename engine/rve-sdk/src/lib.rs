@@ -4818,6 +4818,95 @@ macro_rules! export_scripts {
     };
 }
 
+/// Defines the optional `rve_save_migrate` C ABI export of a game library.
+///
+/// The host calls the function once per step, from the file's save version to the
+/// `[save] version` of `project.rveproject`, before any script starts. It receives the values of
+/// version `from_version` and returns the complete set for `from_version + 1`:
+///
+/// ```ignore
+/// fn migrate(from_version: u32, mut values: rve_sdk::Params) -> Result<rve_sdk::Params, String> {
+///     if from_version == 0 && let Some(score) = values.remove("points") {
+///         values.insert("score".to_owned(), score);
+///     }
+///     Ok(values)
+/// }
+/// rve_sdk::export_save_migration!(migrate);
+/// ```
+///
+/// Object values may be copied but not used with a context during migration.
+#[macro_export]
+macro_rules! export_save_migration {
+    ($migrate:path) => {
+        #[unsafe(no_mangle)]
+        #[doc = "Migrates this game's save values by one schema version."]
+        pub unsafe extern "C" fn rve_save_migrate(
+            migration: *const $crate::abi::RveSaveMigration,
+        ) -> u32 {
+            // SAFETY: the host passes a migration valid for this synchronous call.
+            unsafe { $crate::run_save_migration(migration, $migrate) }
+        }
+    };
+}
+
+/// Runs one save migration step for [`export_save_migration!`] and returns an `RveStatus`.
+///
+/// # Safety
+/// `migration` must be null or point to a valid [`abi::RveSaveMigration`] whose buffers and
+/// callbacks stay valid during this call.
+#[doc(hidden)]
+pub unsafe fn run_save_migration(
+    migration: *const abi::RveSaveMigration,
+    migrate: impl FnOnce(u32, Params) -> Result<Params, String>,
+) -> u32 {
+    use abi::RveStatus;
+    if migration.is_null() {
+        return RveStatus::Error as u32;
+    }
+    // SAFETY: non-null and valid per this function's contract. Only the leading version field is
+    // read before the layout is known.
+    let abi_version = unsafe { std::ptr::addr_of!((*migration).abi_version).read() };
+    if abi_version != abi::RVE_SAVE_MIGRATION_ABI_VERSION {
+        return RveStatus::Error as u32;
+    }
+    // SAFETY: the version matches this layout.
+    let migration = unsafe { *migration };
+    let report = |message: &str| {
+        // SAFETY: the host callback borrows the message for this synchronous call.
+        unsafe { (migration.error)(migration.ctx, RveStr::from_str_ref(message)) };
+    };
+    // SAFETY: the host keeps every input buffer alive during this call.
+    let values = match unsafe { migration.values.into_owned() } {
+        Ok(values) => values,
+        Err(error) => {
+            report(&format!("invalid save values: {error}"));
+            return RveStatus::Error as u32;
+        }
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        migrate(migration.from_version, values)
+    }));
+    let migrated = match result {
+        Ok(Ok(migrated)) => migrated,
+        Ok(Err(message)) => {
+            report(&message);
+            return RveStatus::Error as u32;
+        }
+        Err(_) => {
+            report("save migration panicked");
+            return RveStatus::Panicked as u32;
+        }
+    };
+    for (key, value) in &migrated {
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: key and value buffers live through this synchronous host callback.
+        if !unsafe { (migration.set)(migration.ctx, RveStr::from_str_ref(key), &value.value) } {
+            return RveStatus::Error as u32;
+        }
+    }
+    RveStatus::Ok as u32
+}
+
 /// Parses a parameter block into a process-lifetime `&[RveParamDesc]`.
 #[doc(hidden)]
 #[macro_export]
@@ -5178,3 +5267,6 @@ macro_rules! __rve_script_descriptor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod save_migration_tests;

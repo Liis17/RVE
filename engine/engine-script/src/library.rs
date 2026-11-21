@@ -9,7 +9,9 @@ use rve_sdk::abi::{
     RveScriptDescV15, RveScriptDescV16, RveScriptDescV17, RveScriptDescV19, RveScriptDescV20,
     RveStr, RveUiEventFn,
 };
-use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
+use rve_sdk::abi::{
+    RVE_SCRIPT_ABI_MIN_VERSION, RveSaveMigrateFn, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4,
+};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -25,6 +27,8 @@ pub struct ScriptLibrary {
     library: Option<SharedLibrary>,
     /// ABI версия заголовка модуля: от неё зависят callbacks, которые понимает гость.
     abi_version: u32,
+    /// Optional `rve_save_migrate` export, independent of the script module ABI version.
+    save_migration: Option<RveSaveMigrateFn>,
 }
 
 /// Failure while opening or validating an ABI script module.
@@ -163,6 +167,10 @@ impl ScriptLibrary {
         }
         // SAFETY: the entry point must return an immutable module valid while the library remains loaded.
         let mut scripts = unsafe { Self::from_module(module) }?;
+        // SAFETY: same trust contract as the entry point; the symbol is optional.
+        scripts.save_migration = unsafe { library.get::<RveSaveMigrateFn>(b"rve_save_migrate\0") }
+            .ok()
+            .map(|symbol| *symbol);
         scripts.library = Some(Arc::new(library));
         Ok(scripts)
     }
@@ -229,6 +237,7 @@ impl ScriptLibrary {
                 scripts: HashMap::new(),
                 library: None,
                 abi_version: header.abi_version,
+                save_migration: None,
             });
         }
         let descriptors_v15 = if header.abi_version == 15 {
@@ -568,6 +577,7 @@ impl ScriptLibrary {
             scripts,
             library: None,
             abi_version: header.abi_version,
+            save_migration: None,
         })
     }
 
@@ -577,6 +587,21 @@ impl ScriptLibrary {
 
     pub(crate) fn abi_version(&self) -> u32 {
         self.abi_version
+    }
+
+    pub(crate) fn save_migration(&self) -> Option<RveSaveMigrateFn> {
+        self.save_migration
+    }
+
+    /// Attaches an in-process save migrator, as a loaded library's `rve_save_migrate` export
+    /// would. Primarily useful for in-process integrations and tests.
+    ///
+    /// # Safety
+    /// `migrate` must obey the `rve_save_migrate` contract and stay callable while this library
+    /// or any script host using it exists.
+    pub unsafe fn with_save_migration(mut self, migrate: RveSaveMigrateFn) -> Self {
+        self.save_migration = Some(migrate);
+        self
     }
 
     pub(crate) fn shared_library(&self) -> Option<SharedLibrary> {
@@ -934,6 +959,7 @@ mod ownership_tests {
             scripts: HashMap::new(),
             library: Some(module),
             abi_version: 0,
+            save_migration: None,
         };
         let scene = engine_scene::SceneDocument::parse(
             "empty",
