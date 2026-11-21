@@ -100,7 +100,7 @@ pub(crate) struct UiCanvas {
     pub(crate) visible: bool,
     pub(crate) sequence: u64,
     pub(crate) elements: Vec<UiElement>,
-    /// Курсор InputField в символах или подсвеченный пункт открытого Dropdown.
+    /// Курсор InputField (байтовое смещение на границе графемы) или подсвеченный пункт открытого Dropdown.
     pub(crate) cursors: Vec<usize>,
     pub(crate) scroll: Vec<Vec2>,
     pub(crate) layout: Layout,
@@ -319,9 +319,8 @@ impl UiSystem {
                 check_input_text(spec.content, spec.max_length, text)
                     .map_err(UiSystemError::InvalidValue)?;
                 spec.text = text.to_owned();
-                let length = text.chars().count();
                 let cursor = &mut canvas.cursors[index];
-                *cursor = (*cursor).min(length);
+                *cursor = crate::text::snap_boundary(&spec.text, *cursor);
             }
             _ => return Err(unsupported(&id, "text")),
         }
@@ -370,10 +369,9 @@ impl UiSystem {
             (ElementKind::InputField(spec), UiValue::Text(text)) => {
                 check_input_text(spec.content, spec.max_length, &text)
                     .map_err(UiSystemError::InvalidValue)?;
-                let length = text.chars().count();
                 spec.text = text;
                 let cursor = &mut canvas.cursors[index];
-                *cursor = (*cursor).min(length);
+                *cursor = crate::text::snap_boundary(&spec.text, *cursor);
             }
             (ElementKind::Slider(_) | ElementKind::ProgressBar(_) | ElementKind::Toggle(_), _)
             | (ElementKind::Dropdown(_) | ElementKind::InputField(_), _) => return Err(mismatch()),
@@ -752,7 +750,7 @@ fn check_input_text(
     if !accepts_text(content, text) {
         return Err("текст не соответствует content поля ввода".to_owned());
     }
-    if max_length.is_some_and(|max| text.chars().count() > max) {
+    if max_length.is_some_and(|max| crate::text::grapheme_count(text) > max) {
         return Err("текст длиннее max_length поля ввода".to_owned());
     }
     Ok(())

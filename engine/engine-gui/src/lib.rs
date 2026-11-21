@@ -7,6 +7,7 @@ pub mod input;
 pub mod layout;
 pub mod paint;
 pub mod system;
+mod text;
 
 /// Версия крейта для проверки совместимости документов и ABI вызывающей стороны.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
