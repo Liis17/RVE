@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use glam::Vec3;
 
@@ -17,6 +18,8 @@ const CAST_DISTANCE_TOLERANCE: f32 = 1.0e-5;
 /// Минимальный косинус между смещением и нормалью, при котором касание в пределах skin считается
 /// попаданием. Меньший угол — скольжение вдоль поверхности.
 const GRAZING_APPROACH: f32 = 1.0e-3;
+/// Наибольшее число коллайдеров в листе BVH снимка.
+const COLLIDER_TREE_LEAF: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryFilter {
@@ -119,11 +122,22 @@ pub struct QuerySnapshot {
     colliders: Vec<QueryCollider>,
     /// Позиция тела в `colliders`; хендлы уникальны, поэтому поиск тела — O(1).
     body_index: HashMap<BodyHandle, usize>,
-    x_order: Vec<usize>,
+    /// BVH static-коллайдеров; следующий снимок переиспользует его, пока их хендлы и AABB
+    /// не менялись.
+    static_tree: Arc<ColliderTree>,
+    /// Позиция в `colliders` для каждого элемента `static_tree`.
+    static_slots: Vec<usize>,
+    /// BVH kinematic- и dynamic-коллайдеров, строится заново для каждого снимка.
+    dynamic_tree: ColliderTree,
+    /// Позиция в `colliders` для каждого элемента `dynamic_tree`.
+    dynamic_slots: Vec<usize>,
     /// Активные пары триггера с хотя бы одним trigger-коллайдером; порядок по хендлам.
     trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
     gravity: Vec3,
     collision_matrix: [u32; PHYSICS_LAYER_COUNT],
+    /// Эталон для тестов: кандидаты прежним линейным проходом по X-порядку.
+    #[cfg(test)]
+    linear_reference: bool,
 }
 
 #[derive(Clone)]
@@ -207,24 +221,37 @@ fn ray_bounds(ray: &Ray) -> Result<Aabb, QueryError> {
 }
 
 impl QuerySnapshot {
+    /// Строит снимок. `cached_static` — BVH static-коллайдеров прошлого снимка; он
+    /// переиспользуется, если последовательность их хендлов и AABB точно совпадает.
     pub(crate) fn from_colliders(
         colliders: Vec<QueryCollider>,
         trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
         gravity: Vec3,
         collision_matrix: [u32; PHYSICS_LAYER_COUNT],
+        cached_static: Option<&Arc<ColliderTree>>,
     ) -> Result<Self, QueryError> {
         if colliders.len() > MAX_QUERY_CANDIDATES {
             return Err(QueryError::CandidateLimit);
         }
-        let mut x_order = (0..colliders.len()).collect::<Vec<_>>();
-        x_order.sort_by(|&left, &right| {
-            colliders[left]
-                .bounds
-                .min
-                .x
-                .total_cmp(&colliders[right].bounds.min.x)
-                .then_with(|| colliders[left].body.cmp(&colliders[right].body))
-        });
+        let (static_slots, dynamic_slots): (Vec<usize>, Vec<usize>) =
+            (0..colliders.len()).partition(|&index| colliders[index].body_kind == BodyKind::Static);
+        let keys = |slots: &[usize]| {
+            slots
+                .iter()
+                .map(|&index| (colliders[index].body, colliders[index].bounds))
+                .collect::<Vec<_>>()
+        };
+        let static_tree = match cached_static {
+            Some(tree)
+                if tree.keys.iter().copied().eq(static_slots
+                    .iter()
+                    .map(|&index| (colliders[index].body, colliders[index].bounds))) =>
+            {
+                Arc::clone(tree)
+            }
+            _ => Arc::new(ColliderTree::build(keys(&static_slots))),
+        };
+        let dynamic_tree = ColliderTree::build(keys(&dynamic_slots));
         let mut body_index = HashMap::with_capacity(colliders.len());
         for (index, collider) in colliders.iter().enumerate() {
             let previous = body_index.insert(collider.body, index);
@@ -233,11 +260,21 @@ impl QuerySnapshot {
         Ok(Self {
             colliders,
             body_index,
-            x_order,
+            static_tree,
+            static_slots,
+            dynamic_tree,
+            dynamic_slots,
             trigger_pairs,
             gravity,
             collision_matrix,
+            #[cfg(test)]
+            linear_reference: false,
         })
+    }
+
+    /// BVH static-коллайдеров снимка; мир передаёт его следующему снимку для переиспользования.
+    pub(crate) fn static_tree(&self) -> &Arc<ColliderTree> {
+        &self.static_tree
     }
 
     /// Маска слоёв, с которыми тело `body` сталкивается по матрице мира. Пара фильтруется в обе
@@ -498,31 +535,59 @@ impl QuerySnapshot {
             })
     }
 
+    /// Подходящие под фильтр коллайдеры, чьи AABB пересекают `query`, по возрастанию
+    /// `(bounds.min.x, body)`. Порядок совпадает с прежним X-проходом, поэтому равные по глубине
+    /// проникновения и первая ошибка формы выбираются так же.
     fn candidates(
         &self,
         query: Aabb,
         filter: QueryFilter,
         overrides: QueryOverrides<'_>,
     ) -> Result<Vec<usize>, QueryError> {
+        #[cfg(test)]
+        if self.linear_reference {
+            return self.linear_candidates(query, filter, overrides);
+        }
         let mut candidates = Vec::new();
-        for &index in &self.x_order {
+        for (tree, slots) in [
+            (&*self.static_tree, &self.static_slots),
+            (&self.dynamic_tree, &self.dynamic_slots),
+        ] {
+            tree.query(query, |item| {
+                let index = slots[item as usize];
+                if accepts(&self.colliders[index], filter, overrides) {
+                    candidates.push(index);
+                }
+            });
+        }
+        if candidates.len() > MAX_QUERY_CANDIDATES {
+            return Err(QueryError::CandidateLimit);
+        }
+        candidates.sort_unstable_by(|&left, &right| {
+            x_order(&self.colliders[left], &self.colliders[right])
+        });
+        Ok(candidates)
+    }
+
+    /// Прежний линейный проход по X-порядку; эталон для тестов эквивалентности.
+    #[cfg(test)]
+    fn linear_candidates(
+        &self,
+        query: Aabb,
+        filter: QueryFilter,
+        overrides: QueryOverrides<'_>,
+    ) -> Result<Vec<usize>, QueryError> {
+        let mut order = (0..self.colliders.len()).collect::<Vec<_>>();
+        order.sort_by(|&left, &right| x_order(&self.colliders[left], &self.colliders[right]));
+        let mut candidates = Vec::new();
+        for index in order {
             let collider = &self.colliders[index];
             if collider.bounds.min.x > query.max.x {
                 break;
             }
-            let enabled = overrides
-                .enabled
-                .iter()
-                .rev()
-                .find_map(|(body, enabled)| (*body == collider.body).then_some(*enabled))
-                .unwrap_or(collider.enabled);
-            if enabled
-                && collider.bounds.max.x >= query.min.x
+            if collider.bounds.max.x >= query.min.x
                 && collider.bounds.overlaps(query)
-                && filter.ignore != Some(collider.body)
-                && !overrides.excluded.contains(&collider.body)
-                && (filter.include_triggers || !collider.trigger)
-                && (filter.layer_mask >> collider.layer) & 1 != 0
+                && accepts(collider, filter, overrides)
             {
                 if candidates.len() == MAX_QUERY_CANDIDATES {
                     return Err(QueryError::CandidateLimit);
@@ -531,6 +596,137 @@ impl QuerySnapshot {
             }
         }
         Ok(candidates)
+    }
+}
+
+/// Фильтры запроса без проверки границ: enabled с переопределениями, ignore, exclusions,
+/// trigger и маска слоёв.
+fn accepts(collider: &QueryCollider, filter: QueryFilter, overrides: QueryOverrides<'_>) -> bool {
+    let enabled = overrides
+        .enabled
+        .iter()
+        .rev()
+        .find_map(|(body, enabled)| (*body == collider.body).then_some(*enabled))
+        .unwrap_or(collider.enabled);
+    enabled
+        && filter.ignore != Some(collider.body)
+        && !overrides.excluded.contains(&collider.body)
+        && (filter.include_triggers || !collider.trigger)
+        && (filter.layer_mask >> collider.layer) & 1 != 0
+}
+
+fn x_order(left: &QueryCollider, right: &QueryCollider) -> std::cmp::Ordering {
+    left.bounds
+        .min
+        .x
+        .total_cmp(&right.bounds.min.x)
+        .then_with(|| left.body.cmp(&right.body))
+}
+
+/// BVH по AABB части коллайдеров снимка. Элемент дерева — позиция в `keys`; по `keys`
+/// (хендл и AABB) снимок решает, можно ли переиспользовать дерево.
+#[derive(Clone, Debug)]
+pub(crate) struct ColliderTree {
+    keys: Vec<(BodyHandle, Aabb)>,
+    nodes: Vec<ColliderTreeNode>,
+    items: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ColliderTreeNode {
+    bounds: Aabb,
+    /// Лист: начало диапазона в `items`. Внутренний узел: индекс правого потомка; левый
+    /// потомок следует сразу за узлом.
+    start: u32,
+    /// Число элементов листа; у внутреннего узла 0.
+    count: u32,
+}
+
+impl ColliderTree {
+    fn build(keys: Vec<(BodyHandle, Aabb)>) -> Self {
+        let mut tree = Self {
+            nodes: Vec::with_capacity(2 * keys.len().div_ceil(COLLIDER_TREE_LEAF)),
+            items: (0..keys.len() as u32).collect(),
+            keys,
+        };
+        if !tree.keys.is_empty() {
+            tree.build_node(0, tree.items.len());
+        }
+        tree
+    }
+
+    /// Делит элементы по медиане центров вдоль оси наибольшего разброса: глубина не больше
+    /// `log2(n)`, поэтому рекурсия ограничена лимитом коллайдеров снимка.
+    fn build_node(&mut self, start: usize, end: usize) {
+        let keys = &self.keys;
+        let items = &mut self.items[start..end];
+        let bounds = items
+            .iter()
+            .map(|&item| keys[item as usize].1)
+            .reduce(Aabb::union)
+            .expect("BVH node has at least one collider");
+        let node = self.nodes.len();
+        self.nodes.push(ColliderTreeNode {
+            bounds,
+            start: start as u32,
+            count: (end - start) as u32,
+        });
+        if end - start <= COLLIDER_TREE_LEAF {
+            return;
+        }
+        let (low, high) = items.iter().fold(
+            (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+            |(low, high), &item| {
+                let center = keys[item as usize].1.center();
+                (low.min(center), high.max(center))
+            },
+        );
+        let extent = high - low;
+        let axis = if extent.x >= extent.y && extent.x >= extent.z {
+            0
+        } else if extent.y >= extent.z {
+            1
+        } else {
+            2
+        };
+        let middle = (end - start) / 2;
+        items.select_nth_unstable_by(middle, |&left, &right| {
+            keys[left as usize].1.center()[axis]
+                .total_cmp(&keys[right as usize].1.center()[axis])
+                .then_with(|| left.cmp(&right))
+        });
+        self.build_node(start, start + middle);
+        let right = self.nodes.len() as u32;
+        self.build_node(start + middle, end);
+        self.nodes[node].start = right;
+        self.nodes[node].count = 0;
+    }
+
+    /// Передаёт `visit` элементы, чьи AABB пересекают `query`, в порядке обхода.
+    fn query(&self, query: Aabb, mut visit: impl FnMut(u32)) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        // Глубина дерева не больше log2(MAX_QUERY_CANDIDATES), стек не растёт сверх неё.
+        let mut stack = Vec::with_capacity(32);
+        stack.push(0_u32);
+        while let Some(index) = stack.pop() {
+            let node = self.nodes[index as usize];
+            if !node.bounds.overlaps(query) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.push(node.start);
+                stack.push(index + 1);
+                continue;
+            }
+            let leaf = &self.items[node.start as usize..(node.start + node.count) as usize];
+            for &item in leaf {
+                if self.keys[item as usize].1.overlaps(query) {
+                    visit(item);
+                }
+            }
+        }
     }
 }
 
@@ -658,9 +854,11 @@ fn query_hit_precedes(candidate: QueryHit, current: QueryHit) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::QueryFilter;
-    use crate::world::{BodyDesc, BodyHandle, PHYSICS_LAYER_COUNT, PhysicsWorld};
-    use crate::{DistanceResult, Pose, Ray, Shape, TriMesh};
+    use super::{QueryFilter, QueryOverrides, QuerySnapshot};
+    use crate::world::{
+        BodyDesc, BodyHandle, BodyKind, ColliderDesc, PHYSICS_LAYER_COUNT, PhysicsWorld,
+    };
+    use crate::{Aabb, DistanceResult, Hull, Pose, Ray, Shape, TriMesh};
     use glam::{Quat, Vec3};
     use std::sync::Arc;
 
@@ -922,5 +1120,441 @@ mod tests {
         let missing = BodyHandle(u64::MAX);
         assert!(snapshot.body_state(missing).is_none());
         assert_eq!(snapshot.collision_layer_mask(missing), u32::MAX);
+    }
+
+    /// xorshift64*: воспроизводимые случайные сцены без внешних зависимостей.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1_u64 << 24) as f32
+        }
+
+        fn range(&mut self, low: f32, high: f32) -> f32 {
+            low + (high - low) * self.unit()
+        }
+
+        fn below(&mut self, count: usize) -> usize {
+            (self.next() % count as u64) as usize
+        }
+
+        fn point(&mut self, extent: f32) -> Vec3 {
+            Vec3::new(
+                self.range(-extent, extent),
+                self.range(-extent, extent),
+                self.range(-extent, extent),
+            )
+        }
+
+        fn pose(&mut self, extent: f32) -> Pose {
+            let rotation = Quat::from_euler(
+                glam::EulerRot::XYZ,
+                self.range(-3.0, 3.0),
+                self.range(-3.0, 3.0),
+                self.range(-3.0, 3.0),
+            );
+            Pose::new(self.point(extent), rotation).unwrap()
+        }
+
+        fn convex_shape(&mut self) -> Shape {
+            match self.below(4) {
+                0 => Shape::sphere(self.range(0.2, 2.0)).unwrap(),
+                1 => Shape::cuboid(Vec3::new(
+                    self.range(0.2, 2.0),
+                    self.range(0.2, 2.0),
+                    self.range(0.2, 2.0),
+                ))
+                .unwrap(),
+                2 => Shape::capsule(self.range(0.2, 1.0), self.range(0.2, 2.0)).unwrap(),
+                _ => {
+                    let size = self.range(0.5, 2.0);
+                    let corners = Aabb {
+                        min: Vec3::splat(-size),
+                        max: Vec3::splat(size),
+                    }
+                    .corners()
+                    .map(|corner| corner + self.point(0.2 * size));
+                    Shape::ConvexHull(Arc::new(Hull::from_points(&corners).unwrap()))
+                }
+            }
+        }
+
+        fn quad_mesh(&mut self) -> Shape {
+            let half = self.range(1.0, 4.0);
+            Shape::TriMesh(Arc::new(
+                TriMesh::new(
+                    vec![
+                        Vec3::new(-half, 0.0, -half),
+                        Vec3::new(half, 0.0, -half),
+                        Vec3::new(half, 0.0, half),
+                        Vec3::new(-half, 0.0, half),
+                    ],
+                    vec![[0, 1, 2], [0, 2, 3]],
+                )
+                .unwrap(),
+            ))
+        }
+    }
+
+    const SCENE_EXTENT: f32 = 25.0;
+
+    /// Static, kinematic и dynamic тела всех форм, включая выключенные, trigger и разные слои.
+    fn random_world(rng: &mut Rng, bodies: usize) -> (PhysicsWorld, Vec<BodyHandle>) {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..bodies {
+            let pose = rng.pose(SCENE_EXTENT);
+            let kind = match rng.below(10) {
+                0..5 => BodyKind::Static,
+                5..7 => BodyKind::Kinematic,
+                _ => BodyKind::Dynamic,
+            };
+            let shape = if kind == BodyKind::Static && rng.below(5) == 0 {
+                rng.quad_mesh()
+            } else {
+                rng.convex_shape()
+            };
+            let mut desc = BodyDesc::new(kind, pose, ColliderDesc::new(shape));
+            desc.collider.enabled = rng.below(7) != 0;
+            desc.collider.trigger = rng.below(7) == 0;
+            desc.layer = rng.below(4) as u32;
+            handles.push(world.insert_body(desc).unwrap());
+        }
+        (world, handles)
+    }
+
+    fn random_filter(rng: &mut Rng, handles: &[BodyHandle]) -> QueryFilter {
+        QueryFilter {
+            ignore: (!handles.is_empty() && rng.below(3) == 0)
+                .then(|| handles[rng.below(handles.len())]),
+            include_triggers: rng.below(2) == 0,
+            layer_mask: if rng.below(2) == 0 {
+                u32::MAX
+            } else {
+                rng.next() as u32 & 0b1111
+            },
+        }
+    }
+
+    fn random_overrides(
+        rng: &mut Rng,
+        handles: &[BodyHandle],
+    ) -> (Vec<BodyHandle>, Vec<(BodyHandle, bool)>) {
+        if handles.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let excluded = (0..rng.below(4))
+            .map(|_| handles[rng.below(handles.len())])
+            .collect();
+        let enabled = (0..rng.below(6))
+            .map(|_| (handles[rng.below(handles.len())], rng.below(2) == 0))
+            .collect();
+        (excluded, enabled)
+    }
+
+    fn linear_reference(snapshot: &QuerySnapshot) -> QuerySnapshot {
+        let mut reference = snapshot.clone();
+        reference.linear_reference = true;
+        reference
+    }
+
+    /// Запросы всех типов через BVH и через прежний линейный проход дают одинаковые результаты,
+    /// включая ошибки; возвращает число непустых результатов по типам.
+    fn assert_queries_match_linear(
+        rng: &mut Rng,
+        snapshot: &QuerySnapshot,
+        handles: &[BodyHandle],
+        queries: usize,
+    ) -> [usize; 6] {
+        let reference = linear_reference(snapshot);
+        let mut nonempty = [0; 6];
+        for query in 0..queries {
+            let filter = random_filter(rng, handles);
+            let (excluded, enabled) = random_overrides(rng, handles);
+            let overrides = QueryOverrides {
+                excluded: &excluded,
+                enabled: &enabled,
+            };
+
+            let center = rng.point(SCENE_EXTENT);
+            let bounds = Aabb {
+                min: center - Vec3::splat(rng.range(0.0, 6.0)),
+                max: center + Vec3::splat(rng.range(0.0, 6.0)),
+            };
+            let candidates = snapshot.candidates(bounds, filter, overrides);
+            assert_eq!(
+                candidates,
+                reference.candidates(bounds, filter, overrides),
+                "candidates, query {query}"
+            );
+            nonempty[0] += candidates.is_ok_and(|found| !found.is_empty()) as usize;
+
+            let direction = rng.point(1.0).try_normalize().unwrap_or(Vec3::X);
+            // Короткие лучи у края сцены и длинные лучи через всю сцену.
+            let ray = Ray::new(
+                rng.point(SCENE_EXTENT),
+                direction,
+                rng.range(0.0, 2.5 * SCENE_EXTENT),
+            )
+            .unwrap();
+            let hit = snapshot.raycast_with_enabled_overrides(&ray, filter, &excluded, &enabled);
+            assert_eq!(
+                hit,
+                reference.raycast_with_enabled_overrides(&ray, filter, &excluded, &enabled),
+                "raycast, query {query}"
+            );
+            nonempty[1] += matches!(hit, Ok(Some(_))) as usize;
+            let hits = snapshot.raycast_all(&ray, filter, overrides);
+            assert_eq!(
+                hits,
+                reference.raycast_all(&ray, filter, overrides),
+                "raycast_all, query {query}"
+            );
+            nonempty[2] += hits.is_ok_and(|hits| !hits.is_empty()) as usize;
+
+            let shape = rng.convex_shape();
+            let pose = rng.pose(SCENE_EXTENT);
+            let overlap = snapshot.overlap(&shape, pose, filter, overrides);
+            assert_eq!(
+                overlap,
+                reference.overlap(&shape, pose, filter, overrides),
+                "overlap, query {query}"
+            );
+            nonempty[3] += overlap.is_ok_and(|bodies| !bodies.is_empty()) as usize;
+            let penetration = snapshot.deepest_static_penetration(&shape, pose, filter, overrides);
+            assert_eq!(
+                penetration,
+                reference.deepest_static_penetration(&shape, pose, filter, overrides),
+                "deepest_static_penetration, query {query}"
+            );
+            nonempty[4] += matches!(penetration, Ok(Some(_))) as usize;
+
+            let displacement = rng.point(10.0);
+            let skin = rng.range(0.0, 0.05);
+            let cast = snapshot.shape_cast_with_overrides(
+                &shape,
+                pose,
+                displacement,
+                skin,
+                filter,
+                overrides,
+            );
+            assert_eq!(
+                cast,
+                reference.shape_cast_with_overrides(
+                    &shape,
+                    pose,
+                    displacement,
+                    skin,
+                    filter,
+                    overrides
+                ),
+                "shape_cast, query {query}"
+            );
+            nonempty[5] += matches!(cast, Ok(Some(_))) as usize;
+        }
+        nonempty
+    }
+
+    #[test]
+    fn bvh_queries_match_linear_pass_on_random_scenes() {
+        let mut nonempty = [0; 6];
+        for seed in [1_u64, 7, 42, 2024] {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let (world, handles) = random_world(&mut rng, 160);
+            let snapshot = world.query_snapshot().unwrap();
+            let counts = assert_queries_match_linear(&mut rng, &snapshot, &handles, 40);
+            for (total, count) in nonempty.iter_mut().zip(counts) {
+                *total += count;
+            }
+        }
+        // Пустые результаты совпадают тривиально: каждый тип запроса должен что-то находить.
+        assert!(nonempty.iter().all(|&count| count > 0), "{nonempty:?}");
+    }
+
+    #[test]
+    fn queries_on_empty_and_single_kind_scenes_match_linear_pass() {
+        let mut rng = Rng(0x5EED);
+        let empty = PhysicsWorld::new(Vec3::ZERO)
+            .unwrap()
+            .query_snapshot()
+            .unwrap();
+        let counts = assert_queries_match_linear(&mut rng, &empty, &[], 10);
+        assert_eq!(counts, [0; 6]);
+
+        // Только dynamic (пустое static-дерево) и только static (пустое dynamic-дерево).
+        for kind in [BodyKind::Dynamic, BodyKind::Static] {
+            let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+            let handles = (0..40)
+                .map(|_| {
+                    let desc = BodyDesc::new(
+                        kind,
+                        rng.pose(SCENE_EXTENT),
+                        ColliderDesc::new(rng.convex_shape()),
+                    );
+                    world.insert_body(desc).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let snapshot = world.query_snapshot().unwrap();
+            let counts = assert_queries_match_linear(&mut rng, &snapshot, &handles, 20);
+            assert!(counts[0] > 0, "{kind:?}: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn short_ray_at_far_edge_of_long_row_hits_the_nearest_box() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let boxes = (0..2_000)
+            .map(|index| {
+                world
+                    .insert_body(BodyDesc::static_collider(
+                        Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                        Pose::new(Vec3::new(index as f32 * 2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                    ))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let snapshot = world.query_snapshot().unwrap();
+        let ray = Ray::new(Vec3::new(3_998.0, 2.0, 0.0), -Vec3::Y, 2.0).unwrap();
+
+        let hit = snapshot
+            .raycast(&ray, QueryFilter::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.body, boxes[1_999]);
+        assert!((hit.distance - 1.5).abs() < 1.0e-4, "{hit:?}");
+        let between = Ray::new(Vec3::new(3_997.0, 2.0, 0.0), -Vec3::Y, 2.0).unwrap();
+        assert!(
+            snapshot
+                .raycast(&between, QueryFilter::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn static_tree_is_reused_until_static_colliders_change() {
+        let mut world = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0)).unwrap();
+        let floor = world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(10.0, 0.5, 10.0)).unwrap(),
+                Pose::new(Vec3::new(0.0, -0.5, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let mut disabled = BodyDesc::static_collider(
+            Shape::sphere(0.5).unwrap(),
+            Pose::new(Vec3::new(5.0, 3.0, 0.0), Quat::IDENTITY).unwrap(),
+        );
+        disabled.collider.enabled = false;
+        let disabled = world.insert_body(disabled).unwrap();
+        let ball = world
+            .insert_body(BodyDesc::dynamic(
+                Shape::sphere(0.5).unwrap(),
+                Pose::new(Vec3::new(0.0, 5.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let first = world.query_snapshot().unwrap();
+        world.step_fixed(1.0 / 60.0).unwrap();
+        let second = world.query_snapshot().unwrap();
+
+        // Движется только dynamic-тело: static-дерево общее, dynamic-часть видит новую позу.
+        assert!(Arc::ptr_eq(first.static_tree(), second.static_tree()));
+        assert_ne!(
+            first.body_state(ball).unwrap().pose,
+            second.body_state(ball).unwrap().pose
+        );
+        let down = Ray::new(Vec3::new(0.0, 10.0, 0.0), -Vec3::Y, 20.0).unwrap();
+        let hit = second
+            .raycast(&down, QueryFilter::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.body, ball);
+        let expected = 10.0 - second.body_state(ball).unwrap().pose.position.y - 0.5;
+        assert!((hit.distance - expected).abs() < 1.0e-4, "{hit:?}");
+
+        // Выключенный static-коллайдер остаётся в дереве: override может включить его.
+        let side = Ray::new(Vec3::new(5.0, 10.0, 0.0), -Vec3::Y, 20.0).unwrap();
+        let default_hit = second
+            .raycast(&side, QueryFilter::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(default_hit.body, floor);
+        let enabled_hit = second
+            .raycast_with_enabled_overrides(&side, QueryFilter::default(), &[], &[(disabled, true)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(enabled_hit.body, disabled);
+
+        let wall = world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                Pose::new(Vec3::new(-5.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let inserted = world.query_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(second.static_tree(), inserted.static_tree()));
+        let left = Ray::new(Vec3::new(-5.0, 10.0, 0.0), -Vec3::Y, 20.0).unwrap();
+        assert_eq!(
+            inserted
+                .raycast(&left, QueryFilter::default())
+                .unwrap()
+                .unwrap()
+                .body,
+            wall
+        );
+
+        // Тот же хендл на новом месте: ключ дерева включает AABB, поэтому оно перестраивается.
+        world.remove_body(wall).unwrap();
+        world
+            .insert_body_with_handle(
+                wall,
+                BodyDesc::static_collider(
+                    Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                    Pose::new(Vec3::new(-8.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                ),
+            )
+            .unwrap();
+        let moved = world.query_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(inserted.static_tree(), moved.static_tree()));
+        let far_left = Ray::new(Vec3::new(-8.0, 10.0, 0.0), -Vec3::Y, 20.0).unwrap();
+        assert_eq!(
+            moved
+                .raycast(&far_left, QueryFilter::default())
+                .unwrap()
+                .unwrap()
+                .body,
+            wall
+        );
+        assert_eq!(
+            moved
+                .raycast(&left, QueryFilter::default())
+                .unwrap()
+                .unwrap()
+                .body,
+            floor
+        );
+
+        world.remove_body(wall).unwrap();
+        let removed = world.query_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(moved.static_tree(), removed.static_tree()));
+        assert_eq!(
+            removed
+                .raycast(&left, QueryFilter::default())
+                .unwrap()
+                .unwrap()
+                .body,
+            floor
+        );
+        let mut rng = Rng(0xB0D1E5);
+        let handles = [floor, disabled, ball];
+        assert_queries_match_linear(&mut rng, &removed, &handles, 20);
     }
 }
