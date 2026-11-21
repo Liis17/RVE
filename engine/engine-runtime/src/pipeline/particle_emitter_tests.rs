@@ -1,7 +1,7 @@
 use super::{ParticleRequest, apply_emitter_request, spawn_particle_requests};
-use crate::scene::particle_emitter_desc;
 use engine_render::ParticleEmitterDesc;
 use engine_scene::{ObjectHandle, ParticleEmitterComponent, SceneDocument, World};
+use engine_scene_render::particle_emitter_desc;
 use std::collections::HashMap;
 
 fn handles() -> [ObjectHandle; 3] {

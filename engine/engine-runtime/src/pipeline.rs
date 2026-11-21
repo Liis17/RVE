@@ -19,8 +19,7 @@ use crate::profiling::{
 };
 use crate::scene::{
     MaterialAssetView, MaterialUploadCaches, ObjectModel, ParticleSource, PreparedMaterialAssets,
-    PreparedPrefabs, PreparedRenderAssets, SceneParticles, particle_emitter_desc,
-    upload_object_levels, upload_scene,
+    PreparedPrefabs, PreparedRenderAssets, SceneParticles, upload_object_levels, upload_scene,
 };
 use crate::scene_switch::{
     SceneCommit, SceneGpuIds, SceneLoader, SceneSwitch, SceneUpload, SceneUploadReply,
@@ -59,6 +58,7 @@ use engine_scene::{
     LodSelector, ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
     activity_audio_requests,
 };
+use engine_scene_render::particle_emitter_desc;
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
 use engine_script::{

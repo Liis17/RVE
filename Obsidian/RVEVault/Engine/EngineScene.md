@@ -185,9 +185,11 @@ Parent: [[Index]]
 
 ## Эмиттер частиц
 
-Компонент `[objects.particle_emitter]` описан в `engine-scene/src/particles.rs`. Вложенные таблицы: `shape` (внутренне тегированный enum `point`, `sphere`, `cone`, `box`), `flipbook`, `collision`, массивы `bursts`, `color_over_life` (до четырёх ключей, альфа в [0, 1]) и `size_over_life`. Неизвестные поля отклоняются на каждом уровне. Пустые опциональные таблицы не сериализуются, поэтому сцены без частиц не меняются. Ёмкость проверяется по blend: `MAX_ADDITIVE_PARTICLE_CAPACITY = 262144`, `MAX_ALPHA_PARTICLE_CAPACITY = 65536`. Константы совпадают с `engine-render`, согласованность проверяет тест в engine-runtime. Текстура обязана быть PNG, объявленным в `[[assets]]`.
+Компонент `[objects.particle_emitter]` описан в `engine-scene/src/particles.rs`. Вложенные таблицы: `shape` (внутренне тегированный enum `point`, `sphere`, `cone`, `box`), `flipbook`, `collision`, массивы `bursts`, `color_over_life` (до четырёх ключей, альфа в [0, 1]) и `size_over_life`. Неизвестные поля отклоняются на каждом уровне. Пустые опциональные таблицы не сериализуются, поэтому сцены без частиц не меняются. Ёмкость проверяется по blend: `MAX_ADDITIVE_PARTICLE_CAPACITY = 262144`, `MAX_ALPHA_PARTICLE_CAPACITY = 65536`. Константы совпадают с `engine-render`, согласованность проверяет тест в `engine-scene-render`. Текстура обязана быть PNG, объявленным в `[[assets]]`.
 
 Контракты: `SceneObject.particle_emitter` и `WorldObject.particle_emitter` (accessor `World::particle_emitter`); `PrefabOverride.particle_emitter` (override заменяет компонент целиком); `SceneFrame.particle_emitters: Vec<ParticleEmitterInstance { object, model, emitting }>` в порядке объектов сцены. Spawn-объекты с эмиттером попадают в этот список наравне с объектами документа; компонент допустим в spawn-префабе.) Симуляции здесь нет: шаги и отрисовка — в [[Engine/EngineRuntime]] и [[Engine/EngineRender]].
+
+Перевод компонента в `ParticleEmitterDesc` — единственная функция `engine_scene_render::particle_emitter_desc` (крейт `engine/engine-scene-render`), её вызывают runtime и viewport редактора. Она копирует поля без проверки диапазонов и принимает уже созданный `TextureId`: PNG читает и загружает в GPU вызывающая сторона.
 
 ## Игровой UI canvas
 

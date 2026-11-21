@@ -31,6 +31,7 @@ engine-project = { path = "../engine/engine-project" }
 engine-render = { path = "../engine/engine-render" }
 engine-resources = { path = "../engine/engine-resources" }
 engine-scene = { path = "../engine/engine-scene" }
+engine-scene-render = { path = "../engine/engine-scene-render" }
 engine-script = { path = "../engine/engine-script" }
 engine-window = { path = "../engine/engine-window" }
 engine-mcp = { path = "../engine/engine-mcp" }

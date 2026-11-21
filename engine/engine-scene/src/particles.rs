@@ -1,5 +1,5 @@
 //! Компонент GPU-частиц сцены. Модуль описывает параметры эмиттера и проверяет их; симуляция и
-//! отрисовка выполняются в `engine-render`, связь с ним — в `engine-runtime`.
+//! отрисовка выполняются в `engine-render`, перевод в его описание — в `engine-scene-render`.
 
 use crate::document::{
     SceneError, option_virtual_path_serde, require_asset_path, require_extension,
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Наибольшая ёмкость эмиттера с аддитивным смешиванием. Совпадает с `engine_render::MAX_ADDITIVE_PARTICLE_CAPACITY`;
-/// согласованность проверяет тест в engine-runtime.
+/// согласованность проверяет тест в engine-scene-render.
 pub const MAX_ADDITIVE_PARTICLE_CAPACITY: u32 = 262_144;
 /// Наибольшая ёмкость эмиттера с альфа-смешиванием (ограничение bitonic-сортировки).
 pub const MAX_ALPHA_PARTICLE_CAPACITY: u32 = 65_536;

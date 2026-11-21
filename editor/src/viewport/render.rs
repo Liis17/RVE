@@ -18,11 +18,10 @@ use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, LocalLight,
     LocalLightShadow, LocalLightShadowMatrices, Material, MaterialId, MeshId, NormalMipChain,
-    ParticleBlend, ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc,
-    ParticleEmitterFrame, ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey,
-    PostProcess, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, ShaderId,
-    SkinBinding, SkinId, SkinVertex, SurfaceLighting, SurfaceShaderSource, TextureColorSpace,
-    TextureId, TextureRole, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
+    ParticleEmitterFrame, ParticleEmitterId, PostProcess, ProceduralSky, RenderError, Renderer,
+    SHADOW_MAP_RESOLUTION, ShaderId, SkinBinding, SkinId, SkinVertex, SurfaceLighting,
+    SurfaceShaderSource, TextureColorSpace, TextureId, TextureRole, Tonemapper as RenderTonemapper,
+    Vertex, ViewSettings, ViewportId,
 };
 use engine_render::{
     ColorLutId, SCREEN_SHADER_PARAM_COUNT, ScreenShaderId, ScreenShaderPass, ScreenShaderStage,
@@ -37,12 +36,13 @@ use engine_scene::world::ObjectHandle;
 use engine_scene::world::ParticleCommand;
 use engine_scene::{
     AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, LodSelector,
-    MaterialAlphaMode, MaterialAsset, MeshInstance, ParticleBlendMode, ParticleEmitterComponent,
-    ParticleShapeComponent, ResolvedMaterialAsset, SceneFrame, ShaderAsset, ShaderColorSpace,
-    ShaderPropertyKind, Tonemapper, World,
+    MaterialAlphaMode, MaterialAsset, MeshInstance, ParticleEmitterComponent,
+    ResolvedMaterialAsset, SceneFrame, ShaderAsset, ShaderColorSpace, ShaderPropertyKind,
+    Tonemapper, World,
 };
 use engine_scene::{CubeLut, PostProcessSettings};
 use engine_scene::{ScreenShaderRef, ScreenShaderStage as ScreenShaderStageDoc};
+use engine_scene_render::particle_emitter_desc;
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -291,73 +291,6 @@ fn replace_entry<K: Eq + Hash, V, E>(
 ) -> Result<Option<V>, E> {
     let value = create()?;
     Ok(entries.insert(key, value))
-}
-
-/// Переводит компонент сцены в описание эмиттера `engine-render`. Совпадает с сопоставлением в engine-runtime.
-fn editor_particle_desc(
-    component: &ParticleEmitterComponent,
-    texture: Option<TextureId>,
-) -> ParticleEmitterDesc {
-    ParticleEmitterDesc {
-        capacity: component.capacity,
-        blend: match component.blend {
-            ParticleBlendMode::Additive => ParticleBlend::Additive,
-            ParticleBlendMode::Alpha => ParticleBlend::Alpha,
-        },
-        shape: match component.shape {
-            ParticleShapeComponent::Point {} => ParticleShape::Point,
-            ParticleShapeComponent::Sphere { radius } => ParticleShape::Sphere { radius },
-            ParticleShapeComponent::Cone { angle, radius } => ParticleShape::Cone { angle, radius },
-            ParticleShapeComponent::Box { half_extents } => ParticleShape::Box { half_extents },
-        },
-        rate: component.rate,
-        bursts: component
-            .bursts
-            .iter()
-            .map(|burst| ParticleBurst {
-                time: burst.time,
-                count: burst.count,
-            })
-            .collect(),
-        duration: component.duration,
-        looping: component.looping,
-        lifetime: component.lifetime,
-        speed: component.speed,
-        size: component.size,
-        rotation: component.rotation,
-        angular_velocity: component.angular_velocity,
-        gravity: component.gravity,
-        drag: component.drag,
-        color_over_life: component
-            .color_over_life
-            .iter()
-            .map(|key| ParticleColorKey {
-                time: key.time,
-                color: key.color,
-            })
-            .collect(),
-        size_over_life: component
-            .size_over_life
-            .iter()
-            .map(|key| ParticleSizeKey {
-                time: key.time,
-                size: key.size,
-            })
-            .collect(),
-        texture,
-        flipbook: ParticleFlipbook {
-            columns: component.flipbook.columns,
-            rows: component.flipbook.rows,
-            frames_per_second: component.flipbook.frames_per_second,
-        },
-        soft_distance: component.soft_distance,
-        collision: component.collision.map(|collision| ParticleCollision {
-            restitution: collision.restitution,
-            friction: collision.friction,
-            thickness: collision.thickness,
-        }),
-        seed: component.seed,
-    }
 }
 
 impl SceneRenderer {
@@ -2278,7 +2211,7 @@ impl SceneRenderer {
                     instance.object,
                     || -> Result<EditorParticleEmitter, RenderError> {
                         let id = renderer
-                            .create_particle_emitter(editor_particle_desc(component, texture))?;
+                            .create_particle_emitter(particle_emitter_desc(component, texture))?;
                         Ok(EditorParticleEmitter {
                             id,
                             component: component.clone(),

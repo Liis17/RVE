@@ -10,9 +10,8 @@ use engine_physics::{
 };
 use engine_project::PhysicsSettings;
 use engine_render::{
-    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, NormalMipChain, ParticleBlend,
-    ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook,
-    ParticleShape, ParticleSizeKey, RenderError, Renderer, ShaderId, SkinVertex, SurfaceLighting,
+    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, NormalMipChain,
+    ParticleEmitterDesc, RenderError, Renderer, ShaderId, SkinVertex, SurfaceLighting,
     SurfaceProperty, SurfacePropertyKind, SurfaceShaderSource, SurfaceTextureFallback,
     TextureColorSpace, TextureId, TextureRole, Vertex,
 };
@@ -20,12 +19,12 @@ use engine_resources::ResourceHandle;
 use engine_scene::prefab::PREFAB_EXTENSION;
 use engine_scene::{
     AnimatorComponent, EnvironmentComponent, LiteScript, LodGroup, MaterialAlphaMode,
-    MaterialAsset, MaterialOverride, MeshRenderer, ObjectHandle, ParticleBlendMode,
-    ParticleEmitterComponent, ParticleShapeComponent, PrefabTemplate, SceneDocument, SceneError,
-    ShaderAsset, ShaderColorSpace, ShaderLighting, ShaderPropertyKind, TextureFallback, World,
-    expand,
+    MaterialAsset, MaterialOverride, MeshRenderer, ObjectHandle, ParticleEmitterComponent,
+    PrefabTemplate, SceneDocument, SceneError, ShaderAsset, ShaderColorSpace, ShaderLighting,
+    ShaderPropertyKind, TextureFallback, World, expand,
 };
 use engine_scene::{CameraSettings, CubeLut, PostProcessSettings, resolve_post_process};
+use engine_scene_render::particle_emitter_desc;
 use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
 use glam::Vec3;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2297,73 +2296,6 @@ fn particle_desc(
         None => None,
     };
     Ok(particle_emitter_desc(&source.emitter, texture))
-}
-
-/// Переводит компонент сцены в описание эмиттера `engine-render`; проверка диапазонов — в engine-scene.
-pub(crate) fn particle_emitter_desc(
-    component: &ParticleEmitterComponent,
-    texture: Option<TextureId>,
-) -> ParticleEmitterDesc {
-    ParticleEmitterDesc {
-        capacity: component.capacity,
-        blend: match component.blend {
-            ParticleBlendMode::Additive => ParticleBlend::Additive,
-            ParticleBlendMode::Alpha => ParticleBlend::Alpha,
-        },
-        shape: match component.shape {
-            ParticleShapeComponent::Point {} => ParticleShape::Point,
-            ParticleShapeComponent::Sphere { radius } => ParticleShape::Sphere { radius },
-            ParticleShapeComponent::Cone { angle, radius } => ParticleShape::Cone { angle, radius },
-            ParticleShapeComponent::Box { half_extents } => ParticleShape::Box { half_extents },
-        },
-        rate: component.rate,
-        bursts: component
-            .bursts
-            .iter()
-            .map(|burst| ParticleBurst {
-                time: burst.time,
-                count: burst.count,
-            })
-            .collect(),
-        duration: component.duration,
-        looping: component.looping,
-        lifetime: component.lifetime,
-        speed: component.speed,
-        size: component.size,
-        rotation: component.rotation,
-        angular_velocity: component.angular_velocity,
-        gravity: component.gravity,
-        drag: component.drag,
-        color_over_life: component
-            .color_over_life
-            .iter()
-            .map(|key| ParticleColorKey {
-                time: key.time,
-                color: key.color,
-            })
-            .collect(),
-        size_over_life: component
-            .size_over_life
-            .iter()
-            .map(|key| ParticleSizeKey {
-                time: key.time,
-                size: key.size,
-            })
-            .collect(),
-        texture,
-        flipbook: ParticleFlipbook {
-            columns: component.flipbook.columns,
-            rows: component.flipbook.rows,
-            frames_per_second: component.flipbook.frames_per_second,
-        },
-        soft_distance: component.soft_distance,
-        collision: component.collision.map(|collision| ParticleCollision {
-            restitution: collision.restitution,
-            friction: collision.friction,
-            thickness: collision.thickness,
-        }),
-        seed: component.seed,
-    }
 }
 
 /// Уровни LOD объекта. Без замены материала и текстуры переиспользуются меши модели; иначе для
@@ -4706,105 +4638,6 @@ id = "camera"
         assert!(prepared.render_assets.clips.is_empty());
         let levels = &prepared.render_assets.prefabs[prefab_path];
         assert!(!levels[0].as_ref().unwrap().animated);
-    }
-}
-
-#[cfg(test)]
-mod particle_mapping_tests {
-    use super::particle_emitter_desc;
-    use engine_render::{
-        MAX_ADDITIVE_PARTICLE_CAPACITY as RENDER_ADDITIVE,
-        MAX_ALPHA_PARTICLE_CAPACITY as RENDER_ALPHA, ParticleBlend, ParticleShape,
-    };
-    use engine_scene::{
-        MAX_ADDITIVE_PARTICLE_CAPACITY as SCENE_ADDITIVE,
-        MAX_ALPHA_PARTICLE_CAPACITY as SCENE_ALPHA, ParticleBlendMode, ParticleBurstComponent,
-        ParticleCollisionComponent, ParticleColorKeyComponent, ParticleEmitterComponent,
-        ParticleShapeComponent,
-    };
-
-    #[test]
-    fn capacity_limits_match_between_scene_and_render() {
-        assert_eq!(SCENE_ADDITIVE, RENDER_ADDITIVE);
-        assert_eq!(SCENE_ALPHA, RENDER_ALPHA);
-    }
-
-    #[test]
-    fn component_maps_every_field_into_render_description() {
-        let component = ParticleEmitterComponent {
-            capacity: 1024,
-            blend: ParticleBlendMode::Alpha,
-            shape: ParticleShapeComponent::Cone {
-                angle: 0.3,
-                radius: 0.5,
-            },
-            rate: 45.0,
-            bursts: vec![ParticleBurstComponent {
-                time: 0.2,
-                count: 9,
-            }],
-            duration: 2.0,
-            looping: false,
-            lifetime: [1.0, 3.0],
-            speed: [0.5, 1.5],
-            size: [0.2, 0.4],
-            rotation: [0.0, 1.0],
-            angular_velocity: [-1.0, 1.0],
-            gravity: [0.0, -9.8, 0.0],
-            drag: 0.25,
-            color_over_life: vec![ParticleColorKeyComponent {
-                time: 0.0,
-                color: [1.0, 0.5, 0.0, 1.0],
-            }],
-            size_over_life: Vec::new(),
-            texture: None,
-            flipbook: engine_scene::ParticleFlipbookComponent {
-                columns: 4,
-                rows: 2,
-                frames_per_second: 6.0,
-            },
-            soft_distance: 0.75,
-            collision: Some(ParticleCollisionComponent {
-                restitution: 0.3,
-                friction: 0.1,
-                thickness: 0.05,
-            }),
-            seed: 42,
-        };
-        let texture = None;
-        let desc = particle_emitter_desc(&component, texture);
-        assert_eq!(desc.capacity, 1024);
-        assert_eq!(desc.blend, ParticleBlend::Alpha);
-        assert_eq!(
-            desc.shape,
-            ParticleShape::Cone {
-                angle: 0.3,
-                radius: 0.5
-            }
-        );
-        assert_eq!(desc.bursts.len(), 1);
-        assert_eq!(desc.bursts[0].count, 9);
-        assert!(!desc.looping);
-        assert_eq!(desc.lifetime, [1.0, 3.0]);
-        assert_eq!(desc.color_over_life[0].color, [1.0, 0.5, 0.0, 1.0]);
-        assert_eq!(desc.flipbook.columns, 4);
-        assert_eq!(desc.flipbook.frames_per_second, 6.0);
-        assert_eq!(desc.soft_distance, 0.75);
-        assert_eq!(
-            desc.collision.map(|collision| collision.restitution),
-            Some(0.3)
-        );
-        assert_eq!(desc.seed, 42);
-        assert_eq!(desc.texture, texture);
-    }
-
-    #[test]
-    fn point_shape_without_texture_maps_to_procedural_point() {
-        let desc = particle_emitter_desc(&ParticleEmitterComponent::default(), None);
-        assert_eq!(desc.shape, ParticleShape::Point);
-        assert_eq!(desc.blend, ParticleBlend::Additive);
-        assert!(desc.collision.is_none());
-        assert!(desc.texture.is_none());
     }
 }
 

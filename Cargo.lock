@@ -1178,6 +1178,7 @@ dependencies = [
  "engine-render",
  "engine-resources",
  "engine-scene",
+ "engine-scene-render",
  "engine-script",
  "engine-ui",
  "engine-window",
@@ -1204,6 +1205,14 @@ dependencies = [
  "glam",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "engine-scene-render"
+version = "0.1.0"
+dependencies = [
+ "engine-render",
+ "engine-scene",
 ]
 
 [[package]]
@@ -3376,6 +3385,7 @@ dependencies = [
  "engine-render",
  "engine-resources",
  "engine-scene",
+ "engine-scene-render",
  "engine-script",
  "engine-ui",
  "engine-window",
