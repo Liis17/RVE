@@ -65,3 +65,12 @@ pub(crate) fn load_ui<'a>(
 ) -> Result<PreparedUi, String> {
     engine_script::load_ui(&ProjectUiAssets { resources, assets }, paths)
 }
+
+/// Таблицы строк `[localization]` проекта с ресурсов проекта. См. `engine_script::load_localization`.
+pub(crate) fn load_localization(
+    resources: &ResourceHandle,
+    assets: &Assets,
+    settings: &engine_project::LocalizationSettings,
+) -> Result<engine_gui::strings::Localization, String> {
+    engine_script::load_localization(&ProjectUiAssets { resources, assets }, settings)
+}

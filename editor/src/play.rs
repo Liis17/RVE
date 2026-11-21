@@ -16,7 +16,9 @@ use engine_physics::{
     PhysicsCommand, PhysicsInitialization, PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync,
     PhysicsServer, PhysicsServerError, ShapeCache,
 };
-use engine_project::{GamepadSettings, InputSettings, PhysicsSettings, PrefabCatalogFile};
+use engine_project::{
+    GamepadSettings, InputSettings, LocalizationSettings, PhysicsSettings, PrefabCatalogFile,
+};
 use engine_resources::ResourceHandle;
 use engine_scene::document::mesh_collider_model;
 use engine_scene::prefab::PREFAB_EXTENSION;
@@ -172,6 +174,27 @@ impl PlayPrefabs {
             return Err("ресурсы проекта недоступны для UI Canvas".to_owned());
         };
         self.ui = engine_script::load_ui(&ProjectUiAssets { resources, assets }, paths.iter())?;
+        Ok(())
+    }
+
+    /// Загружает таблицы строк проекта для Play; вызывать после [`Self::prepare_ui`].
+    /// Без `[localization]` ключи UI показываются как есть.
+    pub fn prepare_localization(
+        &mut self,
+        settings: Option<&LocalizationSettings>,
+        assets: &Assets,
+    ) -> Result<(), String> {
+        let Some(settings) = settings else {
+            return Ok(());
+        };
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or_else(|| "ресурсы проекта недоступны для таблиц строк".to_owned())?;
+        self.ui.localization = Some(engine_script::load_localization(
+            &ProjectUiAssets { resources, assets },
+            settings,
+        )?);
         Ok(())
     }
 

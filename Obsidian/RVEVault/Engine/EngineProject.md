@@ -13,7 +13,7 @@ Parent: [[Index]]
 | Файл | Значимые символы | Роль |
 |---|---|---|
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Формат начальных настроек, значения по умолчанию и проверки |
-| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings`, `PhysicsSettings`, `NetworkSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
+| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings`, `PhysicsSettings`, `NetworkSettings`, `LocalizationSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
 | `engine/engine-project/src/input_settings.rs` | `InputSettings`, `InputAction` | Схема игровых действий, проверка физических имён вводов и ограничений |
 | `engine/engine-project/src/prefab_catalog.rs` | `PrefabCatalogFile`, `PrefabCatalogEntry`, `PREFAB_CATALOG_FILE_NAME`, `PREFAB_CATALOG_RELEASE_PATH` | Список тяжёлых префабов проекта: разбор, проверка, сериализация |
 | `engine/engine-project/src/lib.rs` | публичные реэкспорты | API крейта |
@@ -82,6 +82,18 @@ max_substeps = 8
 ### Звук `[audio]`
 
 Секция `[audio]` необязательна. `mono_output = true` сводит весь звуковой вывод к моно в runtime и Play; значение по умолчанию (`false`) не сериализуется. Тип `AudioSettings` (`engine-project`) передаётся в `AudioConfig.mono_output` при запуске движка.
+
+### Локализация
+
+Необязательная секция `[localization]` (`LocalizationSettings`, `deny_unknown_fields`) перечисляет таблицы строк игрового UI ([[Engine/EngineGui#Локализация]]):
+
+```toml
+[localization]
+default_language = "en"
+tables = { en = "/locales/en.toml", ru = "/locales/ru.toml" }
+```
+
+`tables` — непустая карта «код языка → виртуальный путь в Assets»; код соответствует `[A-Za-z0-9_-]{1,32}`, путь проходит `VirtualPath::parse`, один файл не может принадлежать двум языкам. `default_language` обязателен и должен быть ключом `tables`: это язык при запуске и запасной язык для отсутствующих строк. Без секции поле равно `None` и не сериализуется, а ключи UI показываются как есть. Таблицы читает runtime при старте и Play редактора (`engine_script::load_localization`), `rve-build` проверяет их и кладёт в `base` ([[Engine/RveBuild]]).
 
 ### Сеть `[network]`
 

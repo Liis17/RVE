@@ -371,6 +371,12 @@ fn run_from_args(
         Ok(prepared) => prepared,
         Err(error) => return fail(2, format!("ошибка загрузки сцены: {error}")),
     };
+    if let Some(settings) = &project.localization {
+        match game_ui::load_localization(&resource_handle, &assets, settings) {
+            Ok(localization) => prepared.ui.localization = Some(localization),
+            Err(error) => return fail(2, format!("ошибка таблиц строк: {error}")),
+        }
+    }
     startup.record("scene load", phase_started.elapsed());
     phase_started = Instant::now();
     if let Err(error) = add_heavy_prefabs(&mut prepared.prefabs.catalog, &prefab_list) {

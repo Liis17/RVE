@@ -47,6 +47,7 @@ pub use types::{
     ScriptFrameTime, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
 pub use ui_assets::{
-    PreparedUi, UiAssetSource, UiRegistration, UiRegistry, is_ui_document, load_ui,
+    PreparedUi, UiAssetSource, UiRegistration, UiRegistry, is_ui_document, load_localization,
+    load_ui,
 };
 pub use ui_input::{UiInputBridge, UiTick};

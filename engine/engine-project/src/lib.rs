@@ -11,9 +11,9 @@ pub use prefab_catalog::{
     PREFAB_CATALOG_FILE_NAME, PREFAB_CATALOG_RELEASE_PATH, PrefabCatalogEntry, PrefabCatalogFile,
 };
 pub use project_settings::{
-    AudioSettings, LayerSettings, MAX_LAYERS, NetworkSettings, PhysicsSettings,
-    ProjectRequirements, ProjectScene, ProjectSettings, RuntimeSettings, TagSettings,
-    WindowSettings,
+    AudioSettings, LayerSettings, LocalizationSettings, MAX_LAYERS, NetworkSettings,
+    PhysicsSettings, ProjectRequirements, ProjectScene, ProjectSettings, RuntimeSettings,
+    TagSettings, WindowSettings,
 };
 
 /// Версия крейта `engine-project`.

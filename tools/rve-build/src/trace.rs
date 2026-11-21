@@ -39,6 +39,8 @@ pub(crate) enum ArchiveReason {
     SceneFile,
     /// AppIcon из `bootstrap.rves` всегда лежит в `base`.
     AppIcon,
+    /// Таблица строк языка из `[localization]` проекта всегда лежит в `base`.
+    StringTable { language: String },
     /// Явный архив, заданный владельцем; источник ищется в трассе по владельцу и имени архива.
     Explicit { owner: Owner, archive: String },
     /// Явные архивы тяжёлых префабов расходятся: ресурс уходит в `shared`.
@@ -57,6 +59,8 @@ pub(crate) struct BuildTrace {
     pub(crate) roots: Vec<(Owner, VirtualPath)>,
     /// AppIcon из `bootstrap.rves`, если задан.
     pub(crate) icon: Option<VirtualPath>,
+    /// Таблицы строк `[localization]`: язык и путь.
+    pub(crate) string_tables: Vec<(String, VirtualPath)>,
     pub(crate) reasons: BTreeMap<VirtualPath, ArchiveReason>,
     /// Рёбра по владельцу контекста раскрытия: одна и та же сцена или префаб может раскрываться
     /// по-разному в разных контекстах, поэтому обход идёт только по рёбрам своего владельца.

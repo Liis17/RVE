@@ -1685,6 +1685,8 @@ impl EditorApp {
             project.apply_camera_settings(&mut world)?;
             project.apply_physics_materials(&mut world)?;
             prefabs.prepare_ui(&world, &project.assets)?;
+            prefabs
+                .prepare_localization(project.settings.localization.as_ref(), &project.assets)?;
             ui_images = Some(prefabs.ui_images().clone());
             let model_geometry =
                 PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
