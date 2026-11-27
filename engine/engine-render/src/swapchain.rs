@@ -89,9 +89,6 @@ impl Renderer {
         self.flush_uploads()?;
         self.poll_uploads()?;
         let latency = self.latency.clone();
-        if let Some(latency) = latency.as_deref() {
-            latency.lock_swapchain().replace(vk::SwapchainKHR::null());
-        }
         let replacement_generation = self.swapchain_generation.saturating_add(1);
         let instance = self.instance()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
@@ -106,6 +103,23 @@ impl Renderer {
         recreate_swapchain(
             &mut self.swapchain,
             |bundle| bundle.handle,
+            || {
+                let plan = SwapchainBundle::prepare(
+                    &surface_loader,
+                    physical_device,
+                    surface,
+                    surface_format,
+                    output_extent,
+                    capabilities,
+                    requested_present_mode,
+                    latency.is_some(),
+                    replacement_generation,
+                )?;
+                if let Some(latency) = latency.as_deref() {
+                    latency.lock_swapchain().replace(vk::SwapchainKHR::null());
+                }
+                Ok(plan)
+            },
             |previous_swapchain| {
                 let old_image_count = previous_swapchain.images.len();
                 let previous_generation = previous_swapchain.generation;
@@ -149,22 +163,8 @@ impl Renderer {
                 }
                 Ok(())
             },
-            |old_swapchain| {
-                SwapchainBundle::new(
-                    &instance,
-                    &device,
-                    &swapchain_loader,
-                    &surface_loader,
-                    physical_device,
-                    surface,
-                    surface_format,
-                    output_extent,
-                    capabilities,
-                    old_swapchain,
-                    requested_present_mode,
-                    latency.is_some(),
-                    replacement_generation,
-                )
+            |plan, old_swapchain| {
+                SwapchainBundle::create(plan, &instance, &device, &swapchain_loader, old_swapchain)
             },
         )?;
         let new_swapchain = self
@@ -204,18 +204,20 @@ impl Renderer {
     }
 }
 
-fn recreate_swapchain<T, E>(
+fn recreate_swapchain<T, P, E>(
     active: &mut Option<T>,
     handle: impl FnOnce(&T) -> vk::SwapchainKHR,
+    prepare: impl FnOnce() -> Result<P, E>,
     retire: impl FnOnce(T) -> Result<(), E>,
-    create: impl FnOnce(vk::SwapchainKHR) -> Result<T, E>,
+    create: impl FnOnce(P, vk::SwapchainKHR) -> Result<T, E>,
 ) -> Result<(), E> {
+    let plan = prepare()?;
     let retired = active.take();
     let old_handle = retired.as_ref().map_or(vk::SwapchainKHR::null(), handle);
     if let Some(retired) = retired {
         retire(retired)?;
     }
-    *active = Some(create(old_handle)?);
+    *active = Some(create(plan, old_handle)?);
     Ok(())
 }
 
@@ -312,23 +314,33 @@ pub(crate) struct SwapchainBundle {
     pub(crate) transfer_src: bool,
 }
 
+struct SwapchainPlan {
+    surface: vk::SurfaceKHR,
+    surface_format: vk::SurfaceFormatKHR,
+    extent: vk::Extent2D,
+    image_count: u32,
+    composite_alpha: vk::CompositeAlphaFlagsKHR,
+    current_transform: vk::SurfaceTransformFlagsKHR,
+    selected_present_mode: vk::PresentModeKHR,
+    image_usage: vk::ImageUsageFlags,
+    transfer_src: bool,
+    low_latency: bool,
+    generation: u64,
+}
+
 impl SwapchainBundle {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        instance: &ash::Instance,
-        device: &ash::Device,
-        loader: &ash::khr::swapchain::Device,
+    fn prepare(
         surface_loader: &ash::khr::surface::Instance,
         physical_device: vk::PhysicalDevice,
         surface: vk::SurfaceKHR,
         surface_format: vk::SurfaceFormatKHR,
         requested_extent: vk::Extent2D,
         capabilities: vk::SurfaceCapabilitiesKHR,
-        old_swapchain: vk::SwapchainKHR,
         requested_present_mode: PresentMode,
         low_latency: bool,
         generation: u64,
-    ) -> Result<Self, RenderError> {
+    ) -> Result<SwapchainPlan, RenderError> {
         if !capabilities.supported_usage_flags.contains(SWAPCHAIN_USAGE) {
             return Err(RenderError::Unsupported(
                 "surface больше не поддерживает COLOR_ATTACHMENT".to_owned(),
@@ -358,6 +370,41 @@ impl SwapchainBundle {
         } else {
             SWAPCHAIN_USAGE
         };
+        Ok(SwapchainPlan {
+            surface,
+            surface_format,
+            extent,
+            image_count,
+            composite_alpha,
+            current_transform: capabilities.current_transform,
+            selected_present_mode,
+            image_usage,
+            transfer_src,
+            low_latency,
+            generation,
+        })
+    }
+
+    fn create(
+        plan: SwapchainPlan,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        loader: &ash::khr::swapchain::Device,
+        old_swapchain: vk::SwapchainKHR,
+    ) -> Result<Self, RenderError> {
+        let SwapchainPlan {
+            surface,
+            surface_format,
+            extent,
+            image_count,
+            composite_alpha,
+            current_transform,
+            selected_present_mode,
+            image_usage,
+            transfer_src,
+            low_latency,
+            generation,
+        } = plan;
         let mut create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -367,7 +414,7 @@ impl SwapchainBundle {
             .image_array_layers(1)
             .image_usage(image_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(capabilities.current_transform)
+            .pre_transform(current_transform)
             .composite_alpha(composite_alpha)
             .present_mode(selected_present_mode)
             .clipped(true)
@@ -526,6 +573,43 @@ mod tests {
     use ash::vk::{self, Handle as _};
 
     #[test]
+    fn preparation_failure_keeps_active_swapchain_and_next_attempt_uses_its_handle() {
+        let old_handle = vk::SwapchainKHR::from_raw(7);
+        let mut active = Some(old_handle);
+        let mut retired = Vec::new();
+        let first_attempt = recreate_swapchain(
+            &mut active,
+            |handle| *handle,
+            || Err::<(), _>("prepare failed"),
+            |handle| {
+                retired.push(handle);
+                Ok::<_, &'static str>(())
+            },
+            |_, _| panic!("create must not run after preparation fails"),
+        );
+        assert_eq!(first_attempt, Err("prepare failed"));
+        assert_eq!(active, Some(old_handle));
+        assert!(retired.is_empty());
+
+        let second_attempt = recreate_swapchain(
+            &mut active,
+            |handle| *handle,
+            || Ok::<_, &'static str>(()),
+            |handle| {
+                retired.push(handle);
+                Ok::<_, &'static str>(())
+            },
+            |(), handle| {
+                assert_eq!(handle, old_handle);
+                Ok(vk::SwapchainKHR::from_raw(8))
+            },
+        );
+        assert_eq!(second_attempt, Ok(()));
+        assert_eq!(retired, vec![old_handle]);
+        assert_eq!(active, Some(vk::SwapchainKHR::from_raw(8)));
+    }
+
+    #[test]
     fn failed_recreation_keeps_old_handle_retired_and_next_attempt_uses_null() {
         let old_handle = vk::SwapchainKHR::from_raw(7);
         let mut active = Some(old_handle);
@@ -533,11 +617,12 @@ mod tests {
         let first_attempt = recreate_swapchain(
             &mut active,
             |handle| *handle,
+            || Ok::<_, &'static str>(()),
             |handle| {
                 retired.push(handle);
                 Ok::<_, &'static str>(())
             },
-            |handle| {
+            |(), handle| {
                 assert_eq!(handle, old_handle);
                 Err("create failed")
             },
@@ -549,11 +634,12 @@ mod tests {
         let second_attempt = recreate_swapchain(
             &mut active,
             |handle| *handle,
+            || Ok::<_, &'static str>(()),
             |handle| {
                 retired.push(handle);
                 Ok::<_, &'static str>(())
             },
-            |handle| {
+            |(), handle| {
                 assert_eq!(handle, vk::SwapchainKHR::null());
                 Ok(vk::SwapchainKHR::from_raw(8))
             },
