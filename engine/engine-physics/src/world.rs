@@ -738,6 +738,24 @@ impl PhysicsWorld {
         self.step_substep(dt, 1)
     }
 
+    fn islands_for_step(&self) -> Vec<crate::island::Island> {
+        if !self
+            .bodies
+            .values()
+            .any(|body| body.kind == BodyKind::Dynamic && !body.sleeping)
+        {
+            return Vec::new();
+        }
+
+        crate::island::build(
+            self.bodies
+                .values()
+                .filter(|body| body.kind == BodyKind::Dynamic)
+                .map(|body| (body.handle, !body.sleeping)),
+            &self.active_pairs,
+        )
+    }
+
     fn step_substep(
         &mut self,
         dt: f32,
@@ -750,13 +768,10 @@ impl PhysicsWorld {
             body.advance_kinematic(dt, remaining_substeps);
         }
         let events = self.refresh_pairs()?;
-        let islands = crate::island::build(
-            self.bodies
-                .values()
-                .filter(|body| body.kind == BodyKind::Dynamic)
-                .map(|body| (body.handle, !body.sleeping)),
-            &self.active_pairs,
-        );
+        let islands = self.islands_for_step();
+        if islands.is_empty() {
+            return Ok(events);
+        }
         #[cfg(test)]
         let parallel_min_constraints = self.test_parallel_min_constraints;
         #[cfg(not(test))]
@@ -3072,6 +3087,7 @@ mod tests {
     fn all_sleeping_world_reports_no_poses_and_keeps_pairs_and_events() {
         let (mut driver, _) = sleeping_stack_driver();
         let pairs = driver.world().active_pair_count();
+        assert!(driver.world().islands_for_step().is_empty());
         let result = driver.advance_step(1.0 / 60.0, []).unwrap();
         assert_eq!(result.substeps, 1);
         assert!(result.poses.is_empty(), "{:?}", result.poses);
