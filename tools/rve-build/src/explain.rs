@@ -759,6 +759,10 @@ mod tests {
                 "{text}"
             );
         }
+        assert!(
+            !root.path().join(".rve/model-cache").exists(),
+            "explain does not create the model cache"
+        );
     }
 
     #[test]

@@ -352,8 +352,24 @@ impl Assets {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
         let bytes = self.read_model_asset(asset_path, &path)?;
+        self.convert_model_from_bytes(asset_path, &bytes)
+    }
+
+    /// Преобразует переданный снимок FBX в артефакт готовой модели.
+    ///
+    /// Метод позволяет сборщику хешировать и преобразовывать одни и те же байты, не перечитывая
+    /// исходный файл между этими операциями.
+    #[cfg(feature = "fbx")]
+    pub fn convert_model_from_bytes(
+        &self,
+        asset_path: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "fbx")?;
+        ensure_model_size(bytes.len() as u64, &path)?;
         let virtual_path = virtual_asset_path(asset_path);
-        let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
+        let scene = load_fbx_scene(bytes, &virtual_path, &path)?;
         let mut meshes = Vec::new();
         let prepared = prepare_fbx_parts(&scene, &path, &AtomicBool::new(false), |mesh, _| {
             meshes.push(mesh);
@@ -453,8 +469,20 @@ impl Assets {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
         let bytes = self.read_model_asset(asset_path, &path)?;
-        if prebuilt::is_prebuilt_model(&bytes) {
-            let model = decode_prebuilt(&bytes, &path)?;
+        self.model_dependencies_from_bytes(asset_path, &bytes)
+    }
+
+    /// Возвращает внешние текстурные зависимости для переданного снимка FBX или готовой модели.
+    pub fn model_dependencies_from_bytes(
+        &self,
+        asset_path: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<String>, AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "fbx")?;
+        ensure_model_size(bytes.len() as u64, &path)?;
+        if prebuilt::is_prebuilt_model(bytes) {
+            let model = decode_prebuilt(bytes, &path)?;
             if model.meshes.is_none() {
                 if model.has_animation_stacks {
                     return Ok(Vec::new());
@@ -469,7 +497,7 @@ impl Assets {
         #[cfg(feature = "fbx")]
         {
             let virtual_path = virtual_asset_path(asset_path);
-            let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
+            let scene = load_fbx_scene(bytes, &virtual_path, &path)?;
             if !scene_has_triangles(&scene) {
                 // Файл только с клипами (например, из Mixamo) не является моделью и зависимостей не имеет.
                 if !scene.anim_stacks.is_empty() {
@@ -532,6 +560,17 @@ impl Assets {
         }
     }
 
+    /// Проверяет структуру артефакта готовой модели без загрузки внешних текстур.
+    pub fn validate_prebuilt_model(
+        &self,
+        asset_path: &str,
+        bytes: &[u8],
+    ) -> Result<(), AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "fbx")?;
+        decode_prebuilt(bytes, &path).map(|_| ())
+    }
+
     fn read_asset(&self, asset_path: &str, path: &Path) -> Result<Vec<u8>, AssetError> {
         let Some(resources) = &self.resources else {
             return read_legacy(&self.root, path);
@@ -546,12 +585,7 @@ impl Assets {
 
     fn read_model_asset(&self, asset_path: &str, path: &Path) -> Result<Vec<u8>, AssetError> {
         let stat = self.stat_asset(asset_path, path)?;
-        if stat.size > PREBUILT_MODEL_MAX_BYTES as u64 {
-            return Err(AssetError::Decode {
-                path: path.to_owned(),
-                message: "FBX или готовая модель превышает предел размера 256 MiB".to_owned(),
-            });
-        }
+        ensure_model_size(stat.size, path)?;
         self.read_asset(asset_path, path)
     }
 
@@ -579,6 +613,16 @@ impl Assets {
             .wait()
             .map_err(|error| map_resource_error(path, error))
     }
+}
+
+fn ensure_model_size(size: u64, path: &Path) -> Result<(), AssetError> {
+    if size > PREBUILT_MODEL_MAX_BYTES as u64 {
+        return Err(AssetError::Decode {
+            path: path.to_owned(),
+            message: "FBX или готовая модель превышает предел размера 256 MiB".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn require_extension(path: &Path, expected: &'static str) -> Result<(), AssetError> {

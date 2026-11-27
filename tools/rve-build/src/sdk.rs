@@ -2,6 +2,7 @@ use crate::error::BuildError;
 use crate::platform;
 use crate::player;
 use crate::temporary::TempDir;
+use engine_assets::PREBUILT_MODEL_VERSION;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ pub(crate) struct SdkManifest {
     target: String,
     #[serde(default)]
     pub(crate) dlss_enabled: bool,
+    #[serde(default)]
+    pub(crate) prebuilt_model_version: u32,
 }
 
 /// Игрок и монитор, собранные cargo в checkout. Оба пути берутся из `compiler-artifact` в выводе cargo.
@@ -74,7 +77,7 @@ pub(crate) fn locate_player_in_with_dlss(
             marker.display()
         ))
     })?;
-    validate_sdk_manifest(&manifest)?;
+    validate_sdk_manifest(&manifest, flavor != player::PlayerFlavor::Dev)?;
     if requires_dlss && !manifest.dlss_enabled {
         return Err(BuildError::operational(
             "этот SDK player собран без DLSS; пересоберите SDK с RVE_DLSS_SDK, указывающим на NVIDIA DLSS SDK",
@@ -100,7 +103,10 @@ fn parse_sdk_manifest(contents: &str) -> Result<SdkManifest, String> {
     toml::from_str(contents).map_err(|error| error.to_string())
 }
 
-fn validate_sdk_manifest(manifest: &SdkManifest) -> Result<(), BuildError> {
+fn validate_sdk_manifest(
+    manifest: &SdkManifest,
+    require_prebuilt_models: bool,
+) -> Result<(), BuildError> {
     let expected_abi = rve_sdk::abi::RVE_SCRIPT_ABI_VERSION;
     if manifest.abi_version != expected_abi {
         return Err(BuildError::operational(format!(
@@ -113,6 +119,12 @@ fn validate_sdk_manifest(manifest: &SdkManifest) -> Result<(), BuildError> {
         return Err(BuildError::operational(format!(
             "SDK target {:?} не совпадает с текущей платформой {expected_target:?}",
             manifest.target
+        )));
+    }
+    if require_prebuilt_models && manifest.prebuilt_model_version != PREBUILT_MODEL_VERSION {
+        return Err(BuildError::operational(format!(
+            "SDK player не читает готовые модели формата v{}; обновите SDK",
+            manifest.prebuilt_model_version
         )));
     }
     Ok(())
@@ -250,6 +262,7 @@ pub(crate) fn build_sdk(
             abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
             target: &current_target(),
             dlss_enabled,
+            prebuilt_model_version: PREBUILT_MODEL_VERSION,
         },
     )?;
 
@@ -287,6 +300,7 @@ struct SdkSources<'a> {
     abi_version: u32,
     target: &'a str,
     dlss_enabled: bool,
+    prebuilt_model_version: u32,
 }
 
 fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), BuildError> {
@@ -322,8 +336,12 @@ fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), B
     copy_directory(&sources.rve_sdk.join("src"), &sdk_directory.join("src"))?;
 
     let marker = format!(
-        "engine_version = {:?}\nabi_version = {}\ntarget = {:?}\ndlss_enabled = {}\n",
-        sources.engine_version, sources.abi_version, sources.target, sources.dlss_enabled
+        "engine_version = {:?}\nabi_version = {}\ntarget = {:?}\ndlss_enabled = {}\nprebuilt_model_version = {}\n",
+        sources.engine_version,
+        sources.abi_version,
+        sources.target,
+        sources.dlss_enabled,
+        sources.prebuilt_model_version
     );
     fs::write(staging.join(SDK_MARKER), marker).map_err(|error| {
         BuildError::operational(format!("не удалось записать SDK-маркер: {error}"))
@@ -437,12 +455,13 @@ mod tests {
     use crate::error::BuildError;
     use crate::player::PlayerFlavor;
     use crate::temporary::TempDir;
+    use engine_assets::PREBUILT_MODEL_VERSION;
     use std::fs;
     use std::path::{Path, PathBuf};
 
     fn sdk_marker(abi_version: u32, target: &str) -> String {
         format!(
-            "engine_version = \"0.1.0\"\nabi_version = {abi_version}\ntarget = \"{target}\"\ndlss_enabled = false\n"
+            "engine_version = \"0.1.0\"\nabi_version = {abi_version}\ntarget = \"{target}\"\ndlss_enabled = false\nprebuilt_model_version = {PREBUILT_MODEL_VERSION}\n"
         )
     }
 
@@ -579,7 +598,9 @@ mod tests {
         assert!(matches!(
             found,
             PlayerLocation::Sdk { executable: path, manifest, .. }
-                if path == executable && manifest.engine_version == "0.1.0"
+                if path == executable
+                    && manifest.engine_version == "0.1.0"
+                    && manifest.prebuilt_model_version == PREBUILT_MODEL_VERSION
         ));
     }
 
@@ -601,6 +622,56 @@ mod tests {
         assert!(
             matches!(found, PlayerLocation::Sdk { executable: path, .. } if path == executable)
         );
+    }
+
+    #[test]
+    fn old_sdk_marker_is_accepted_for_dev_run_but_rejected_for_distribution_build() {
+        let root = temp_dir("rve-sdk-old-model-format");
+        fs::write(
+            root.path().join("rve-sdk.toml"),
+            format!(
+                "engine_version = \"0.1.0\"\nabi_version = {}\ntarget = {:?}\ndlss_enabled = false\n",
+                rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
+                current_target()
+            ),
+        )
+        .unwrap();
+        fs::write(root.path().join(dev_player_name()), b"dev player").unwrap();
+        fs::write(root.path().join(player_name()), b"release player").unwrap();
+
+        let dev = locate_player_in(root.path(), PlayerFlavor::Dev, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap();
+        assert!(matches!(
+            dev,
+            PlayerLocation::Sdk { manifest, .. } if manifest.prebuilt_model_version == 0
+        ));
+
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("готовые модели формата v0"));
+    }
+
+    #[test]
+    fn sdk_marker_rejects_a_different_prebuilt_model_version_for_build() {
+        let root = temp_dir("rve-sdk-wrong-model-format");
+        let marker = sdk_marker(rve_sdk::abi::RVE_SCRIPT_ABI_VERSION, &current_target()).replace(
+            &format!("prebuilt_model_version = {PREBUILT_MODEL_VERSION}"),
+            &format!("prebuilt_model_version = {}", PREBUILT_MODEL_VERSION + 1),
+        );
+        fs::write(root.path().join("rve-sdk.toml"), marker).unwrap();
+
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "готовые модели формата v{}",
+            PREBUILT_MODEL_VERSION + 1
+        )));
     }
 
     #[test]
@@ -659,6 +730,7 @@ mod tests {
                 abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
                 target: current_target(),
                 dlss_enabled: false,
+                prebuilt_model_version: PREBUILT_MODEL_VERSION,
             },
         })
         .unwrap_err();
@@ -832,6 +904,7 @@ mod tests {
                 abi_version: 42,
                 target: &target,
                 dlss_enabled: true,
+                prebuilt_model_version: PREBUILT_MODEL_VERSION,
             },
         )
         .unwrap();
@@ -882,5 +955,8 @@ mod tests {
         assert!(marker.contains("abi_version = 42"));
         assert!(marker.contains(&format!("target = \"{target}\"")));
         assert!(marker.contains("dlss_enabled = true"));
+        assert!(marker.contains(&format!(
+            "prebuilt_model_version = {PREBUILT_MODEL_VERSION}"
+        )));
     }
 }

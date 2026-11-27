@@ -3,7 +3,10 @@ use crate::error::BuildError;
 #[cfg(windows)]
 use crate::ico::png_to_ico;
 use crate::platform;
-use crate::project::{HeavyScriptUse, ProjectBuild, prepare_project, validate_script_references};
+use crate::project::{
+    HeavyScriptUse, ProjectBuild, prepare_project, prepare_project_for_build,
+    validate_script_references,
+};
 use crate::sdk::{self, PlayerLocation};
 use crate::temporary::TempDir;
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
@@ -89,7 +92,7 @@ pub(crate) fn build_distribution(
 ) -> Result<(), BuildError> {
     let output = absolute_output_path(output)?;
     ensure_output_missing(&output)?;
-    let project = prepare_project(project_dir)?;
+    let project = prepare_project_for_build(project_dir)?;
     let scripts_library = build_game_scripts(&project, true)?;
     let executable_name = player_file_name(&project.settings.name, &project.settings.id)?;
     #[cfg(target_os = "macos")]
@@ -1234,6 +1237,7 @@ mod tests {
         parse_cdylib_target, player_file_name, sdk_build_command, select_crash_monitor,
         select_library_file, stage_crash_monitor, validate_heavy_scripts, validate_staged_archives,
     };
+    use crate::archives::tests::create_demo_like_project;
     use crate::error::BuildError;
     use crate::project::{HeavyScriptUse, ProjectBuild, ScriptReferenceContext};
     use crate::sdk;
@@ -1587,7 +1591,21 @@ mod tests {
             #[cfg(windows)]
             icon: None,
             heavy_scripts: Vec::new(),
+            prepared_model_temp: None,
+            model_preparation_mode: crate::models::ModelPreparationMode::Direct,
         }
+    }
+
+    #[test]
+    fn scripts_keeps_direct_fbx_path_without_writing_the_model_cache() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-scripts-direct-fbx").unwrap();
+        create_demo_like_project(root.path());
+
+        assert!(super::scripts_project(root.path()).unwrap().is_none());
+        assert!(
+            !root.path().join(".rve/model-cache").exists(),
+            "scripts does not convert FBX or write the model cache"
+        );
     }
 
     #[test]
