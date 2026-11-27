@@ -10,7 +10,7 @@ use engine_files::VirtualPath;
 use engine_scene::ComponentKind as ScriptComponentKind;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    AntiAliasing, AudioGroup, AudioRolloff, AudioSourceComponent, CameraComponent,
+    AnimationMarker, AntiAliasing, AudioGroup, AudioRolloff, AudioSourceComponent, CameraComponent,
     CharacterControllerComponent, ColliderComponent, ColliderShape, EnvironmentComponent,
     HeavyScript, LAYER_COUNT, LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, NetAuthority,
     NetworkIdentityComponent, NetworkTransformComponent, ParamKind, ParamSchema, ParamSpec,
@@ -1577,6 +1577,46 @@ fn show_animator(
             ui.data_mut(|data| data.insert_temp(input_id, input));
 
             ui.separator();
+            ui.label("Markers");
+            ui.horizontal(|ui| {
+                ui.label("Marker min weight");
+                response |= ui.add(
+                    egui::DragValue::new(&mut value.marker_min_weight)
+                        .speed(0.01)
+                        .range(0.0..=1.0),
+                );
+            });
+            let mut remove_marker = None;
+            for (marker_index, marker) in value.markers.iter_mut().enumerate() {
+                ui.push_id(("animation_marker", marker_index), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Clip");
+                        response |= ui.text_edit_singleline(&mut marker.clip);
+                        ui.label("Name");
+                        response |= ui.text_edit_singleline(&mut marker.name);
+                        ui.label("Time");
+                        response |= ui.add(
+                            egui::DragValue::new(&mut marker.time)
+                                .speed(0.01)
+                                .range(0.0..=f32::MAX),
+                        );
+                        if ui.small_button("×").clicked() {
+                            remove_marker = Some(marker_index);
+                        }
+                    });
+                });
+            }
+            if let Some(index) = remove_marker {
+                value.markers.remove(index);
+                response.mark_changed();
+            }
+            if ui.button("Add marker").clicked() {
+                let marker = new_animation_marker(&value);
+                value.markers.push(marker);
+                response.mark_changed();
+            }
+
+            ui.separator();
             ui.label("Blend trees");
             let mut remove_tree = None;
             for (tree_index, tree) in value.blend_trees.iter_mut().enumerate() {
@@ -1651,6 +1691,32 @@ fn show_animator(
         state.edit_scene(|scene| scene.remove_animator(id));
     }
     run_menu_action(state, id, ComponentKind::Animator, action);
+}
+
+fn new_animation_marker(animator: &engine_scene::AnimatorComponent) -> AnimationMarker {
+    let clip = animator
+        .default_motion
+        .clone()
+        .or_else(|| {
+            animator
+                .clips
+                .first()
+                .map(|clip| engine_scene::animation::clip_stem(clip).to_owned())
+        })
+        .unwrap_or_else(|| "clip".to_owned());
+    let mut index = 1;
+    let name = loop {
+        let name = format!("marker{index}");
+        if !animator.markers.iter().any(|marker| marker.name == name) {
+            break name;
+        }
+        index += 1;
+    };
+    AnimationMarker {
+        clip,
+        name,
+        time: 0.0,
+    }
 }
 
 /// Превью аниматора выбранного объекта: проигрывание, выбор движения, перемотка и параметры
@@ -5181,5 +5247,185 @@ mod particle_emitter_tests {
         assert_eq!(emitter(&state, &id), with_keys);
         assert!(state.scene.as_mut().unwrap().redo());
         assert_eq!(emitter(&state, &id).color_over_life, [key(1.0, [1.0; 4])]);
+    }
+}
+
+#[cfg(test)]
+mod animation_marker_tests {
+    use super::*;
+    use crate::scene_edit::{EditorScene, NewObject};
+    use egui::{Event, PointerButton, RawInput, Rect, pos2, vec2};
+
+    fn marker(name: &str) -> AnimationMarker {
+        AnimationMarker {
+            clip: "Walk".to_owned(),
+            name: name.to_owned(),
+            time: 0.25,
+        }
+    }
+
+    fn render_animator(
+        ctx: &egui::Context,
+        state: &mut EditorState,
+        id: &str,
+        time: f64,
+        events: Vec<Event>,
+    ) -> egui::FullOutput {
+        let animator = state
+            .scene
+            .as_ref()
+            .unwrap()
+            .object(id)
+            .unwrap()
+            .animator
+            .clone()
+            .unwrap();
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0))),
+            time: Some(time),
+            events,
+            ..RawInput::default()
+        };
+        ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| show_animator(ui, state, id, &animator));
+        })
+    }
+
+    fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + text.galley.rect.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("text {label:?} not found in animator UI"))
+    }
+
+    fn click_add_marker(
+        ctx: &egui::Context,
+        state: &mut EditorState,
+        id: &str,
+        position: egui::Pos2,
+    ) {
+        let mut time = 1.0;
+        for events in [
+            vec![Event::PointerMoved(position)],
+            vec![Event::PointerButton {
+                pos: position,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![Event::PointerButton {
+                pos: position,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            Vec::new(),
+        ] {
+            let mut output = render_animator(ctx, state, id, time, events);
+            output.textures_delta.clear();
+            time += 0.1;
+        }
+    }
+
+    #[test]
+    fn new_marker_uses_default_motion_then_first_clip_and_first_free_name() {
+        let animator = engine_scene::AnimatorComponent {
+            default_motion: Some("Jump".to_owned()),
+            clips: vec![VirtualPath::parse("anims/walk.fbx").unwrap()],
+            markers: vec![marker("marker1"), marker("marker3")],
+            ..engine_scene::AnimatorComponent::new()
+        };
+        assert_eq!(
+            new_animation_marker(&animator),
+            AnimationMarker {
+                clip: "Jump".to_owned(),
+                name: "marker2".to_owned(),
+                time: 0.0,
+            }
+        );
+
+        let animator = engine_scene::AnimatorComponent {
+            clips: vec![VirtualPath::parse("anims/walk.fbx").unwrap()],
+            ..engine_scene::AnimatorComponent::new()
+        };
+        assert_eq!(new_animation_marker(&animator).clip, "walk");
+        assert_eq!(
+            new_animation_marker(&engine_scene::AnimatorComponent::new()).clip,
+            "clip"
+        );
+    }
+
+    #[test]
+    fn add_marker_form_creates_valid_marker_and_undo_restores_the_list() {
+        let mut state = EditorState::new(None);
+        state.scene = Some(EditorScene::new_untitled().unwrap());
+        let id = state
+            .scene
+            .as_mut()
+            .unwrap()
+            .create_object(
+                &NewObject::Mesh(VirtualPath::parse("models/hero.fbx").unwrap(), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        let original = engine_scene::AnimatorComponent {
+            clips: vec![VirtualPath::parse("anims/walk.fbx").unwrap()],
+            markers: vec![marker("marker1")],
+            ..engine_scene::AnimatorComponent::new()
+        };
+        state
+            .scene
+            .as_mut()
+            .unwrap()
+            .set_component(&id, Component::Animator(original.clone()))
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        let mut output = render_animator(&ctx, &mut state, &id, 0.0, Vec::new());
+        let position = text_position(&output, "Add marker");
+        output.textures_delta.clear();
+        click_add_marker(&ctx, &mut state, &id, position);
+
+        let added = state
+            .scene
+            .as_ref()
+            .unwrap()
+            .object(&id)
+            .unwrap()
+            .animator
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            added.markers,
+            [
+                marker("marker1"),
+                AnimationMarker {
+                    clip: "walk".to_owned(),
+                    name: "marker2".to_owned(),
+                    time: 0.0,
+                }
+            ]
+        );
+        assert!(state.scene.as_mut().unwrap().undo());
+        assert_eq!(
+            state
+                .scene
+                .as_ref()
+                .unwrap()
+                .object(&id)
+                .unwrap()
+                .animator
+                .as_ref()
+                .unwrap(),
+            &original
+        );
     }
 }
