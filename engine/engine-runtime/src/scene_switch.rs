@@ -22,10 +22,11 @@ use engine_script::{ScriptHost, ScriptTime};
 
 use crate::game_ui::{PreparedUi, UiRegistry};
 use crate::pipeline::{GpuSceneTable, SpawnPhysics, detach_object_render_data};
+use crate::prefabs::LoadError;
 use crate::prefabs::{ParticleRequest, PrefabLoads, RenderResourceRequest};
 use crate::scene::{
     PreparedPrefabs, PreparedRenderAssets, PreparedScene, color_lut_paths, load_color_luts,
-    load_scene, load_screen_shader_sources, screen_shader_paths,
+    load_scene_interruptible, load_screen_shader_sources, screen_shader_paths,
 };
 
 /// Загрузчик сцен проекта: читает `.rvescene` и ассеты тем же `ResourceHandle`, что и старт.
@@ -59,16 +60,40 @@ impl SceneLoader {
     fn prepare(
         &self,
         path: &str,
-    ) -> Result<(PreparedScene, Vec<engine_physics::ModelGeometry>), String> {
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<(PreparedScene, Vec<engine_physics::ModelGeometry>), LoadError> {
         let assets = Assets::with_resources(self.resources.clone());
-        let mut prepared = load_scene(&self.resources, &assets, path, self.normal_chains)?;
+        let mut prepared = load_scene_interruptible(
+            &self.resources,
+            &assets,
+            path,
+            self.normal_chains,
+            interrupted,
+        )?;
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
         if self.screen_shaders {
             prepared.render_assets.screen_shaders =
                 load_screen_shader_sources(&self.resources, &prepared.world);
+            if interrupted() {
+                return Err(LoadError::Interrupted);
+            }
             prepared.render_assets.color_luts = load_color_luts(&self.resources, &prepared.world);
         }
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
         let geometry = prepared.physics_geometry();
-        prepared.build_physics(&geometry, &self.physics)?;
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
+        prepared
+            .build_physics(&geometry, &self.physics)
+            .map_err(LoadError::Failed)?;
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
         Ok((prepared, geometry))
     }
 }
@@ -263,7 +288,13 @@ impl SceneSwitch {
         path: &str,
     ) -> Result<SceneUpload, String> {
         let loader = loader.ok_or_else(|| "загрузка сцен не подключена".to_owned())?;
-        let (prepared, physics_geometry) = loader.prepare(path)?;
+        let (prepared, physics_geometry) =
+            loader
+                .prepare(path, &|| false)
+                .map_err(|error| match error {
+                    LoadError::Interrupted => "подготовка сцены прервана".to_owned(),
+                    LoadError::Failed(message) => message,
+                })?;
         self.generation += 1;
         let PreparedScene {
             world,
@@ -778,7 +809,7 @@ return Script
             .unwrap();
             let loader =
                 SceneLoader::new(resources.handle(), PhysicsSettings::default(), false, false);
-            let (prepared, geometry) = loader.prepare(start).unwrap();
+            let (prepared, geometry) = loader.prepare(start, &|| false).unwrap();
             let (_, bindings) = prepared
                 .build_physics(&geometry, &PhysicsSettings::default())
                 .unwrap();

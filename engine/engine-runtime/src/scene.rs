@@ -1,5 +1,6 @@
 use crate::game_ui::{PreparedUi, UiImageData, load_ui};
 use crate::pipeline::{GpuSceneTable, SkinLevel};
+use crate::prefabs::LoadError;
 use engine_animation::PaletteRemap;
 use engine_assets::{
     Assets, Model, ModelAlphaMode, ModelAnimation, ModelMaterial, ModelSkin, TextureData,
@@ -318,27 +319,66 @@ pub(crate) fn load_scene(
     scene_path: &str,
     build_normal_chains: bool,
 ) -> Result<PreparedScene, String> {
-    let contents = read_utf8(resources, scene_path)?;
-    let document =
-        SceneDocument::parse(scene_path, &contents).map_err(|error| error.to_string())?;
-    let expansion = expand(&document, &mut |path| load_prefab(resources, path))
-        .map_err(|error| error.to_string())?;
+    load_scene_interruptible(resources, assets, scene_path, build_normal_chains, &|| {
+        false
+    })
+    .map_err(|error| match error {
+        LoadError::Interrupted => "подготовка сцены прервана".to_owned(),
+        LoadError::Failed(message) => message,
+    })
+}
+
+/// Синхронная CPU-фаза загрузки сцены с точками отмены между крупными операциями.
+pub(crate) fn load_scene_interruptible(
+    resources: &ResourceHandle,
+    assets: &Assets,
+    scene_path: &str,
+    build_normal_chains: bool,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<PreparedScene, LoadError> {
+    check_scene_interrupted(interrupted)?;
+    let contents = classify_scene_load(read_utf8(resources, scene_path), interrupted)?;
+    let document = classify_scene_load(
+        SceneDocument::parse(scene_path, &contents).map_err(|error| error.to_string()),
+        interrupted,
+    )?;
+    check_scene_interrupted(interrupted)?;
+    let expansion = classify_scene_load(
+        expand(&document, &mut |path| load_prefab(resources, path))
+            .map_err(|error| error.to_string()),
+        interrupted,
+    )?;
+    check_scene_interrupted(interrupted)?;
     let instanced = expansion.prefabs;
     let mut expanded = expansion.document;
     let scene_hash = engine_network::replication::scene_hash(&expanded);
-    let prefabs = load_fast_prefabs(resources, &mut expanded, &instanced)?;
-    let ui = load_ui(
-        resources,
-        assets,
-        expanded.assets.iter().map(|asset| &asset.path),
+    let prefabs = classify_scene_load(
+        load_fast_prefabs(resources, &mut expanded, &instanced),
+        interrupted,
     )?;
-    let mut world = World::from_document(&expanded).map_err(|error| error.to_string())?;
-    world
-        .resolve_physics_materials(&mut |path: &VirtualPath| {
-            read_utf8(resources, &format!("/{}", path.as_str()))
-        })
-        .map_err(|error| error.to_string())?;
-    let mut prepared = prepare_scene(
+    check_scene_interrupted(interrupted)?;
+    let ui = classify_scene_load(
+        load_ui(
+            resources,
+            assets,
+            expanded.assets.iter().map(|asset| &asset.path),
+        ),
+        interrupted,
+    )?;
+    check_scene_interrupted(interrupted)?;
+    let mut world = classify_scene_load(
+        World::from_document(&expanded).map_err(|error| error.to_string()),
+        interrupted,
+    )?;
+    classify_scene_load(
+        world
+            .resolve_physics_materials(&mut |path: &VirtualPath| {
+                read_utf8(resources, &format!("/{}", path.as_str()))
+            })
+            .map_err(|error| error.to_string()),
+        interrupted,
+    )?;
+    let mut prepared = prepare_scene_with_loaders_interruptible(
         resources,
         assets,
         scene_path,
@@ -346,10 +386,42 @@ pub(crate) fn load_scene(
         prefabs,
         scene_hash,
         build_normal_chains,
+        interrupted,
+        &mut |path: &str| assets.load_model(path).map_err(|error| error.to_string()),
+        &mut |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
     )?;
+    check_scene_interrupted(interrupted)?;
     prepared.render_assets.ui_images = ui.images.clone();
     prepared.ui = ui;
     Ok(prepared)
+}
+
+fn check_scene_interrupted(interrupted: &dyn Fn() -> bool) -> Result<(), LoadError> {
+    if interrupted() {
+        Err(LoadError::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+impl From<String> for LoadError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+fn classify_scene_load<T>(
+    result: Result<T, String>,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<T, LoadError> {
+    match result {
+        Ok(value) => {
+            check_scene_interrupted(interrupted)?;
+            Ok(value)
+        }
+        Err(_) if interrupted() => Err(LoadError::Interrupted),
+        Err(error) => Err(LoadError::Failed(error)),
+    }
 }
 
 /// Раскрывает каждый `.rveprefab` из `[[assets]]` сцены в шаблон для spawn. Ассеты шаблонов
@@ -421,27 +493,6 @@ fn load_prefab(
     SceneDocument::parse_prefab(label, &text)
 }
 
-fn prepare_scene(
-    resources: &ResourceHandle,
-    assets: &Assets,
-    scene_path: &str,
-    world: World,
-    prefabs: PreparedPrefabs,
-    scene_hash: [u8; 32],
-    build_normal_chains: bool,
-) -> Result<PreparedScene, String> {
-    prepare_scene_with_model_loader(
-        resources,
-        assets,
-        scene_path,
-        world,
-        prefabs,
-        scene_hash,
-        build_normal_chains,
-        |path| assets.load_model(path).map_err(|error| error.to_string()),
-    )
-}
-
 /// Ресурсы объектов сцены и шаблонов префабов, собранные за один проход. Модели и текстуры
 /// общие: объект сцены и префаб с одним FBX загружают его один раз.
 #[derive(Default)]
@@ -469,7 +520,37 @@ struct ObjectParts<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn prepare_scene_with_model_loader(
+    resources: &ResourceHandle,
+    assets: &Assets,
+    scene_path: &str,
+    world: World,
+    prefabs: PreparedPrefabs,
+    scene_hash: [u8; 32],
+    build_normal_chains: bool,
+    load_model: impl FnMut(&str) -> Result<Model, String>,
+) -> Result<PreparedScene, String> {
+    prepare_scene_with_loaders_interruptible(
+        resources,
+        assets,
+        scene_path,
+        world,
+        prefabs,
+        scene_hash,
+        build_normal_chains,
+        &|| false,
+        load_model,
+        |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
+    )
+    .map_err(|error| match error {
+        LoadError::Interrupted => "подготовка сцены прервана".to_owned(),
+        LoadError::Failed(message) => message,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_scene_with_loaders_interruptible(
     resources: &ResourceHandle,
     assets: &Assets,
     scene_path: &str,
@@ -477,8 +558,11 @@ fn prepare_scene_with_model_loader(
     prefabs: PreparedPrefabs,
     scene_hash: [u8; 32],
     build_normal_chains: bool,
+    interrupted: &dyn Fn() -> bool,
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
-) -> Result<PreparedScene, String> {
+    mut load_texture: impl FnMut(&str) -> Result<TextureData, String>,
+) -> Result<PreparedScene, LoadError> {
+    check_scene_interrupted(interrupted)?;
     // Пути файлов камер собираются до изменения мира; каждый файл читается один раз.
     let cameras = world
         .objects()
@@ -503,19 +587,25 @@ fn prepare_scene_with_model_loader(
         .iter()
         .filter_map(|(_, settings, _)| settings.as_ref())
     {
+        check_scene_interrupted(interrupted)?;
         if !loaded_settings.contains_key(path) {
-            let source = read_utf8(resources, path)?;
-            let settings =
-                CameraSettings::parse(path, &source).map_err(|error| error.to_string())?;
+            let source = classify_scene_load(read_utf8(resources, path), interrupted)?;
+            let settings = classify_scene_load(
+                CameraSettings::parse(path, &source).map_err(|error| error.to_string()),
+                interrupted,
+            )?;
             loaded_settings.insert(path.clone(), settings);
         }
     }
     let mut loaded_post_process = HashMap::<String, PostProcessSettings>::new();
     for path in cameras.iter().filter_map(|(_, _, post)| post.as_ref()) {
+        check_scene_interrupted(interrupted)?;
         if !loaded_post_process.contains_key(path) {
-            let source = read_utf8(resources, path)?;
-            let settings =
-                PostProcessSettings::parse(path, &source).map_err(|error| error.to_string())?;
+            let source = classify_scene_load(read_utf8(resources, path), interrupted)?;
+            let settings = classify_scene_load(
+                PostProcessSettings::parse(path, &source).map_err(|error| error.to_string()),
+                interrupted,
+            )?;
             loaded_post_process.insert(path.clone(), settings);
         }
     }
@@ -539,6 +629,7 @@ fn prepare_scene_with_model_loader(
     let mut objects = Vec::new();
     let mut particles = Vec::new();
     for object in world.objects() {
+        check_scene_interrupted(interrupted)?;
         let parts = ObjectParts {
             environment: object.environment.as_ref(),
             mesh_renderer: object.mesh_renderer.as_ref(),
@@ -546,12 +637,28 @@ fn prepare_scene_with_model_loader(
             animator: object.animator.as_ref(),
             lite_scripts: &object.lite_scripts,
         };
-        if let Some(model) = set.add_object(assets, scene_path, parts, &mut load_model)? {
+        if let Some(model) = classify_scene_load(
+            set.add_object_interruptible(
+                assets,
+                scene_path,
+                parts,
+                &mut load_model,
+                &mut load_texture,
+                interrupted,
+            ),
+            interrupted,
+        )? {
             objects.push((object.handle, model));
         }
-        if let Some(source) =
-            set.add_particle(assets, scene_path, object.particle_emitter.as_ref())?
-        {
+        if let Some(source) = classify_scene_load(
+            set.add_particle_interruptible(
+                scene_path,
+                object.particle_emitter.as_ref(),
+                &mut load_texture,
+                interrupted,
+            ),
+            interrupted,
+        )? {
             particles.push((object.handle, source));
         }
     }
@@ -562,6 +669,7 @@ fn prepare_scene_with_model_loader(
         let mut levels = Vec::with_capacity(template.objects().len());
         let mut emitters = Vec::with_capacity(template.objects().len());
         for object in template.objects() {
+            check_scene_interrupted(interrupted)?;
             let parts = ObjectParts {
                 environment: object.environment.as_ref(),
                 mesh_renderer: object.mesh_renderer.as_ref(),
@@ -569,11 +677,25 @@ fn prepare_scene_with_model_loader(
                 animator: None,
                 lite_scripts: &object.lite_scripts,
             };
-            levels.push(set.add_object(assets, scene_path, parts, &mut load_model)?);
-            emitters.push(set.add_particle(
-                assets,
-                scene_path,
-                object.particle_emitter.as_ref(),
+            levels.push(classify_scene_load(
+                set.add_object_interruptible(
+                    assets,
+                    scene_path,
+                    parts,
+                    &mut load_model,
+                    &mut load_texture,
+                    interrupted,
+                ),
+                interrupted,
+            )?);
+            emitters.push(classify_scene_load(
+                set.add_particle_interruptible(
+                    scene_path,
+                    object.particle_emitter.as_ref(),
+                    &mut load_texture,
+                    interrupted,
+                ),
+                interrupted,
             )?);
         }
         prefab_objects.insert(path.clone(), levels);
@@ -586,16 +708,30 @@ fn prepare_scene_with_model_loader(
             set.material_paths.insert(path.as_str().to_owned());
         }
     }
-    set.load_surface_assets(resources, assets, scene_path);
-    // Без `stop`: подготовка сцены не прерывается, `None` невозможен.
+    set.load_surface_assets_interruptible(
+        resources,
+        assets,
+        scene_path,
+        interrupted,
+        &mut load_texture,
+    )
+    .map_err(|error| {
+        if interrupted() {
+            LoadError::Interrupted
+        } else {
+            LoadError::Failed(error)
+        }
+    })?;
+    check_scene_interrupted(interrupted)?;
     let normal_chains = NormalChains::build(
         build_normal_chains,
         &set.models,
         &set.textures,
         &set.normal_scene_paths,
-        &|| false,
+        interrupted,
     )
-    .unwrap_or_default();
+    .ok_or(LoadError::Interrupted)?;
+    check_scene_interrupted(interrupted)?;
 
     let RenderAssetSet {
         models,
@@ -610,6 +746,7 @@ fn prepare_scene_with_model_loader(
     } = set;
     let mut sources = BTreeMap::new();
     for path in lite_paths {
+        check_scene_interrupted(interrupted)?;
         sources.insert(path.clone(), read_utf8(resources, &path)?);
     }
 
@@ -649,6 +786,28 @@ impl RenderAssetSet {
         parts: ObjectParts<'_>,
         load_model: &mut impl FnMut(&str) -> Result<Model, String>,
     ) -> Result<Option<ObjectModel>, String> {
+        self.add_object_interruptible(
+            assets,
+            scene_path,
+            parts,
+            load_model,
+            &mut |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
+            &|| false,
+        )
+    }
+
+    fn add_object_interruptible(
+        &mut self,
+        assets: &Assets,
+        scene_path: &str,
+        parts: ObjectParts<'_>,
+        load_model: &mut impl FnMut(&str) -> Result<Model, String>,
+        load_texture: &mut impl FnMut(&str) -> Result<TextureData, String>,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Option<ObjectModel>, String> {
+        if interrupted() {
+            return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+        }
         if let Some(path) = parts
             .environment
             .and_then(|environment| environment.hdr.as_ref())
@@ -667,6 +826,9 @@ impl RenderAssetSet {
         }
         if let Some(animator) = parts.animator {
             for path in &animator.clips {
+                if interrupted() {
+                    return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                }
                 if !self.clips.contains_key(path.as_str()) {
                     let animations = assets
                         .load_animations(&format!("/{}", path.as_str()))
@@ -713,9 +875,15 @@ impl RenderAssetSet {
                 self.material_paths.insert(path.as_str().to_owned());
             }
             for (model_path, _) in &levels {
+                if interrupted() {
+                    return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                }
                 if !self.models.contains_key(model_path) {
                     let model =
                         load_model(model_path).map_err(|error| format!("{scene_path}: {error}"))?;
+                    if interrupted() {
+                        return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                    }
                     self.models.insert(model_path.clone(), model);
                 }
             }
@@ -735,11 +903,16 @@ impl RenderAssetSet {
                 }))
                 .collect::<Vec<_>>();
             for path in scene_texture_paths {
+                if interrupted() {
+                    return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                }
                 if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(path)
                 {
-                    let texture = assets
-                        .load_texture(entry.key())
+                    let texture = load_texture(entry.key())
                         .map_err(|error| format!("{scene_path}: {error}"))?;
+                    if interrupted() {
+                        return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                    }
                     entry.insert(texture);
                 }
             }
@@ -767,9 +940,27 @@ impl RenderAssetSet {
         scene_path: &str,
         emitter: Option<&ParticleEmitterComponent>,
     ) -> Result<Option<ParticleSource>, String> {
+        self.add_particle_interruptible(
+            scene_path,
+            emitter,
+            &mut |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
+            &|| false,
+        )
+    }
+
+    fn add_particle_interruptible(
+        &mut self,
+        scene_path: &str,
+        emitter: Option<&ParticleEmitterComponent>,
+        load_texture: &mut impl FnMut(&str) -> Result<TextureData, String>,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Option<ParticleSource>, String> {
         let Some(emitter) = emitter else {
             return Ok(None);
         };
+        if interrupted() {
+            return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+        }
         let texture = emitter
             .texture
             .as_ref()
@@ -778,9 +969,11 @@ impl RenderAssetSet {
             && let std::collections::hash_map::Entry::Vacant(entry) =
                 self.textures.entry(path.clone())
         {
-            let data = assets
-                .load_texture(entry.key())
-                .map_err(|error| format!("{scene_path}: {error}"))?;
+            let data =
+                load_texture(entry.key()).map_err(|error| format!("{scene_path}: {error}"))?;
+            if interrupted() {
+                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            }
             entry.insert(data);
         }
         Ok(Some(ParticleSource {
@@ -790,14 +983,38 @@ impl RenderAssetSet {
     }
 
     fn load_surface_assets(&mut self, resources: &ResourceHandle, assets: &Assets, owner: &str) {
+        self.load_surface_assets_interruptible(
+            resources,
+            assets,
+            owner,
+            &|| false,
+            &mut |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
+        )
+        .expect("uninterruptible scene asset preparation cannot stop");
+    }
+
+    fn load_surface_assets_interruptible(
+        &mut self,
+        resources: &ResourceHandle,
+        _assets: &Assets,
+        owner: &str,
+        interrupted: &dyn Fn() -> bool,
+        load_texture: &mut impl FnMut(&str) -> Result<TextureData, String>,
+    ) -> Result<(), String> {
         let mut shader_paths = BTreeSet::new();
         for path in &self.material_paths {
+            if interrupted() {
+                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            }
             let parsed = read_utf8(resources, &format!("/{path}"))
                 .and_then(|source| {
                     MaterialAsset::parse(format!("/{path}"), &source)
                         .map_err(|error| error.to_string())
                 })
                 .map_err(|error| format!("{owner}: {error}"));
+            if interrupted() {
+                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            }
             if let Ok(material) = &parsed
                 && let Some(shader) = &material.shader
             {
@@ -806,12 +1023,18 @@ impl RenderAssetSet {
             self.material_assets.insert(path.clone(), parsed);
         }
         for path in &shader_paths {
+            if interrupted() {
+                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            }
             let parsed = read_utf8(resources, &format!("/{path}"))
                 .and_then(|source| {
                     ShaderAsset::parse(format!("/{path}"), &source)
                         .map_err(|error| error.to_string())
                 })
                 .map_err(|error| format!("{owner}: {error}"));
+            if interrupted() {
+                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            }
             self.shader_assets.insert(path.clone(), parsed);
         }
         let mut texture_paths = BTreeSet::new();
@@ -847,11 +1070,17 @@ impl RenderAssetSet {
             );
         }
         for path in texture_paths {
+            if interrupted() {
+                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            }
             if self.textures.contains_key(&path) {
                 continue;
             }
-            match assets.load_texture(&path) {
+            match load_texture(&path) {
                 Ok(texture) => {
+                    if interrupted() {
+                        return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                    }
                     self.textures.insert(path, texture);
                 }
                 Err(error) => {
@@ -859,8 +1088,11 @@ impl RenderAssetSet {
                 }
             }
         }
+        Ok(())
     }
 }
+
+const SCENE_PREPARATION_INTERRUPTED: &str = "подготовка сцены прервана";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MaterialTextureSource {
@@ -2697,12 +2929,13 @@ fn create_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorLutGpu, CubeLut, GpuTextureCache, MaterialAssetView, MaterialTextureSource,
+        ColorLutGpu, CubeLut, GpuTextureCache, LoadError, MaterialAssetView, MaterialTextureSource,
         NormalChains, PreparedMaterialAssets, PreparedPrefabs, PreparedScene, ScreenShaderGpu,
         color_lut_paths, get_or_insert_gpu, load_color_luts, load_scene,
         load_screen_shader_sources, material_cache_key, normal_texture_role,
-        prepare_scene_with_model_loader, resolve_material, resolve_material_asset,
-        screen_shader_paths, upload_color_luts, upload_screen_shaders,
+        prepare_scene_with_loaders_interruptible, prepare_scene_with_model_loader,
+        resolve_material, resolve_material_asset, screen_shader_paths, upload_color_luts,
+        upload_screen_shaders,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, TextureData};
     use engine_files::VirtualPath;
@@ -2726,7 +2959,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -3679,6 +3912,129 @@ id = "camera"
             prepared.sources.get("scripts/main.lua").unwrap(),
             "return {}\n"
         );
+    }
+
+    const INTERRUPTIBLE_ASSET_SCENE: &str = r#"
+[[assets]]
+path = "models/base.fbx"
+[[assets]]
+path = "models/lod.fbx"
+[[assets]]
+path = "textures/base.png"
+[[assets]]
+path = "textures/lod.png"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects]]
+id = "mesh"
+[objects.mesh_renderer]
+model = "models/base.fbx"
+texture = "textures/base.png"
+[objects.lod_group]
+[[objects.lod_group.levels]]
+model = "models/lod.fbx"
+texture = "textures/lod.png"
+distance = 10.0
+"#;
+
+    fn prepare_interruptible_asset_scene(
+        interrupted: &dyn Fn() -> bool,
+        load_model: impl FnMut(&str) -> Result<Model, String>,
+        load_texture: impl FnMut(&str) -> Result<TextureData, String>,
+    ) -> Result<PreparedScene, LoadError> {
+        let project = TempProject::new();
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", INTERRUPTIBLE_ASSET_SCENE).unwrap();
+        let world = World::from_document(&document).unwrap();
+        prepare_scene_with_loaders_interruptible(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            PreparedPrefabs::default(),
+            [0; 32],
+            false,
+            interrupted,
+            load_model,
+            load_texture,
+        )
+    }
+
+    fn empty_model() -> Model {
+        Model {
+            meshes: Vec::new(),
+            textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn interrupted_scene_preparation_stops_before_loading_any_model() {
+        let model_loads = Cell::new(0);
+        let error = prepare_interruptible_asset_scene(
+            &|| true,
+            |_| {
+                model_loads.set(model_loads.get() + 1);
+                Ok(empty_model())
+            },
+            |_| unreachable!("texture load must not start"),
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, LoadError::Interrupted));
+        assert_eq!(model_loads.get(), 0);
+    }
+
+    #[test]
+    fn interruption_after_a_model_stops_before_the_next_lod_model() {
+        let interrupted = AtomicBool::new(false);
+        let model_loads = Cell::new(0);
+        let error = prepare_interruptible_asset_scene(
+            &|| interrupted.load(Ordering::Relaxed),
+            |_| {
+                let count = model_loads.get() + 1;
+                model_loads.set(count);
+                if count == 1 {
+                    interrupted.store(true, Ordering::Relaxed);
+                }
+                Ok(empty_model())
+            },
+            |_| unreachable!("texture load must not start"),
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, LoadError::Interrupted));
+        assert_eq!(model_loads.get(), 1);
+    }
+
+    #[test]
+    fn interruption_after_a_texture_stops_before_the_next_lod_texture() {
+        let interrupted = AtomicBool::new(false);
+        let model_loads = Cell::new(0);
+        let texture_loads = Cell::new(0);
+        let error = prepare_interruptible_asset_scene(
+            &|| interrupted.load(Ordering::Relaxed),
+            |_| {
+                model_loads.set(model_loads.get() + 1);
+                Ok(empty_model())
+            },
+            |_| {
+                texture_loads.set(texture_loads.get() + 1);
+                interrupted.store(true, Ordering::Relaxed);
+                Ok(rgba_texture(1, 1))
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, LoadError::Interrupted));
+        assert_eq!(model_loads.get(), 2);
+        assert_eq!(texture_loads.get(), 1);
     }
 
     fn rgba_texture(width: u32, height: u32) -> TextureData {
