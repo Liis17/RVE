@@ -4679,6 +4679,119 @@ mod parallel_solver_tests {
             .collect()
     }
 
+    fn manifold_impulses_for_bodies(
+        world: &PhysicsWorld,
+        bodies: &[BodyHandle],
+    ) -> Vec<ManifoldImpulses> {
+        manifold_impulses(world)
+            .into_iter()
+            .filter(|(key, _, _, _)| {
+                bodies.contains(&BodyHandle(key.first)) || bodies.contains(&BodyHandle(key.second))
+            })
+            .collect()
+    }
+
+    type BodyMotion = (BodyHandle, Pose, Vec3, Vec3, bool, u32);
+
+    fn body_motion(world: &PhysicsWorld, bodies: &[BodyHandle]) -> Vec<BodyMotion> {
+        bodies
+            .iter()
+            .map(|handle| {
+                let body = &world.bodies[handle];
+                (
+                    *handle,
+                    body.pose,
+                    body.linear_velocity,
+                    body.angular_velocity,
+                    body.sleeping,
+                    body.sleep_time.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_body_motion_bits(world: &PhysicsWorld, expected: &[BodyMotion]) {
+        for (handle, pose, linear_velocity, angular_velocity, sleeping, sleep_time) in expected {
+            let body = &world.bodies[handle];
+            assert_pose_bits(*pose, body.pose);
+            assert_eq!(bits3(*linear_velocity), bits3(body.linear_velocity));
+            assert_eq!(bits3(*angular_velocity), bits3(body.angular_velocity));
+            assert_eq!(*sleeping, body.sleeping);
+            assert_eq!(*sleep_time, body.sleep_time.to_bits());
+        }
+    }
+
+    fn sleeping_with_two_awake_islands(
+        threads: usize,
+        threshold: usize,
+    ) -> (StepDriver, Vec<BodyHandle>, [BodyHandle; 2]) {
+        let mut world = PhysicsWorld::default();
+        add_floor(&mut world, Vec3::new(30.0, 0.5, 8.0));
+        let mut sleeping_bodies = Vec::new();
+        for index in 0..4 {
+            sleeping_bodies.push(
+                world
+                    .insert_body(BodyDesc::dynamic(
+                        Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                        Pose::new(
+                            Vec3::new(-10.0, 0.45 + index as f32 * 0.9, 0.0),
+                            Quat::IDENTITY,
+                        )
+                        .unwrap(),
+                        1.0,
+                    ))
+                    .unwrap(),
+            );
+        }
+        let awake_bodies = [0.0_f32, 10.0].map(|x| {
+            world
+                .insert_body(BodyDesc::dynamic(
+                    Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                    Pose::new(Vec3::new(x, 0.45, 0.0), Quat::IDENTITY).unwrap(),
+                    1.0,
+                ))
+                .unwrap()
+        });
+        configure(&mut world, threads, threshold);
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        for _ in 0..240 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+            if sleeping_bodies
+                .iter()
+                .all(|handle| driver.world().body_is_sleeping(*handle) == Some(true))
+            {
+                break;
+            }
+        }
+        assert!(
+            sleeping_bodies
+                .iter()
+                .all(|handle| driver.world().body_is_sleeping(*handle) == Some(true))
+        );
+        assert!(
+            awake_bodies
+                .iter()
+                .all(|handle| driver.world().body_is_sleeping(*handle) == Some(true))
+        );
+
+        driver
+            .advance_step(
+                1.0 / 60.0,
+                awake_bodies.map(|body| PhysicsCommand::AddImpulse {
+                    body,
+                    impulse: Vec3::X * 0.01,
+                    point: None,
+                }),
+            )
+            .unwrap();
+        assert!(
+            awake_bodies
+                .iter()
+                .all(|handle| driver.world().body_is_sleeping(*handle) == Some(false))
+        );
+        (driver, sleeping_bodies, awake_bodies)
+    }
+
     #[test]
     fn sleeping_islands_are_skipped_and_impulse_wakes_the_whole_stack_identically() {
         for threads in [2, 4, 7] {
@@ -4737,6 +4850,66 @@ mod parallel_solver_tests {
         }
     }
 
+    #[test]
+    fn parallel_awake_islands_leave_sleeping_island_untouched_and_wake_it_as_one() {
+        for threads in [2, 4, 7] {
+            let (mut baseline, baseline_sleeping, baseline_awake) =
+                sleeping_with_two_awake_islands(1, 0);
+            let (mut candidate, candidate_sleeping, candidate_awake) =
+                sleeping_with_two_awake_islands(threads, 0);
+            assert_eq!(baseline_sleeping, candidate_sleeping);
+            assert_eq!(baseline_awake, candidate_awake);
+            assert_eq!(active_island_count(candidate.world()), 3);
+            assert!(candidate.world().parallel_solver_runs > 0);
+
+            let sleeping_motion = body_motion(candidate.world(), &candidate_sleeping);
+            let sleeping_impulses =
+                manifold_impulses_for_bodies(candidate.world(), &candidate_sleeping);
+            let parallel_runs = candidate.world().parallel_solver_runs;
+            for _ in 0..8 {
+                let baseline_result = baseline.advance_step(1.0 / 60.0, []).unwrap();
+                let candidate_result = candidate.advance_step(1.0 / 60.0, []).unwrap();
+                assert_step_bits(&baseline_result, &candidate_result);
+                assert_world_bits(baseline.world(), candidate.world());
+                assert_body_motion_bits(candidate.world(), &sleeping_motion);
+                assert_eq!(
+                    manifold_impulses_for_bodies(candidate.world(), &candidate_sleeping),
+                    sleeping_impulses
+                );
+            }
+            assert!(candidate.world().parallel_solver_runs > parallel_runs);
+
+            let baseline_result = baseline
+                .advance_step(
+                    1.0 / 60.0,
+                    [PhysicsCommand::AddImpulse {
+                        body: baseline_sleeping[3],
+                        impulse: Vec3::Y * 0.5,
+                        point: None,
+                    }],
+                )
+                .unwrap();
+            let candidate_result = candidate
+                .advance_step(
+                    1.0 / 60.0,
+                    [PhysicsCommand::AddImpulse {
+                        body: candidate_sleeping[3],
+                        impulse: Vec3::Y * 0.5,
+                        point: None,
+                    }],
+                )
+                .unwrap();
+            assert_step_bits(&baseline_result, &candidate_result);
+            assert_world_bits(baseline.world(), candidate.world());
+            assert!(
+                candidate_sleeping
+                    .iter()
+                    .all(|handle| candidate.world().body_is_sleeping(*handle) == Some(false))
+            );
+            assert!(candidate.world().parallel_solver_runs > parallel_runs + 8);
+        }
+    }
+
     fn mixed_sleeping_world(
         threads: usize,
         threshold: usize,
@@ -4763,6 +4936,15 @@ mod parallel_solver_tests {
                 ColliderDesc::new(Shape::cuboid(Vec3::splat(0.5)).unwrap()),
             ))
             .unwrap();
+        for x in [20.0, 20.8] {
+            world
+                .insert_body(BodyDesc::dynamic(
+                    Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                    Pose::new(Vec3::new(x, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                    1.0,
+                ))
+                .unwrap();
+        }
         world.refresh_pairs().unwrap();
         for (handle, position) in [(first, Vec3::ZERO), (second, Vec3::new(0.8, 0.0, 0.0))] {
             let body = world.bodies.get_mut(&handle).unwrap();
@@ -4798,6 +4980,9 @@ mod parallel_solver_tests {
                 let candidate_events = candidate.step_fixed(1.0 / 60.0).unwrap();
                 assert_events_bits(&baseline_events, &candidate_events);
                 assert_world_bits(&baseline, &candidate);
+                if threshold == 0 {
+                    assert!(candidate.parallel_solver_runs > 0);
+                }
                 assert_eq!(candidate.body_is_sleeping(candidate_awake), Some(false));
                 assert_eq!(candidate.body_is_sleeping(candidate_sleeping), Some(true));
                 let mixed_pair = PairKey::new(candidate_awake.0, candidate_sleeping.0);
