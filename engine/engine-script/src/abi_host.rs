@@ -57,10 +57,11 @@ use rve_sdk::abi::{
     RVE_NET_TARGET_PEER, RVE_NET_TARGET_SERVER, RVE_QUERY_BOX, RVE_QUERY_CAPSULE, RVE_QUERY_SPHERE,
     RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY,
     RVE_VALUE_ASSET, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_OBJECT,
-    RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult, RveColliderValue,
-    RveCollisionEvent, RveControllerValue, RveCursorState, RveGamepadState, RveHost, RveNetEvent,
-    RveParamEntry, RveParams, RveQueryOptions, RveQueryShape, RveRaycastHit, RveRigidBodyValue,
-    RveScriptDesc, RveScriptTime, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_VALUE_STR, RveAnimationMarker, RveArray, RveCameraSettings, RveCharacterMoveResult,
+    RveColliderValue, RveCollisionEvent, RveControllerValue, RveCursorState, RveGamepadState,
+    RveHost, RveNetEvent, RveParamEntry, RveParams, RveQueryOptions, RveQueryShape, RveRaycastHit,
+    RveRigidBodyValue, RveScriptDesc, RveScriptTime, RveStatus, RveStr, RveTime, RveTransform,
+    RveValue, RveValueData,
 };
 use rve_sdk::abi::{
     RVE_AO_QUALITY_HIGH, RVE_AO_QUALITY_LOW, RVE_AO_QUALITY_MEDIUM, RVE_AUDIO_GROUP_AMBIENT,
@@ -661,6 +662,43 @@ impl AbiScriptInstance {
             let host = with_interrupt(context.host(time), call.interrupt);
             // SAFETY: message data, instance, and host remain live throughout the callback.
             unsafe { (self.descriptor.message)(self.instance, &host, sender, name, &value.value) }
+        };
+        context.callback_result(status)
+    }
+
+    pub(crate) fn invoke_animation_marker(
+        &mut self,
+        time: ScriptTime,
+        marker: &str,
+        motion: &str,
+        clip: &str,
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let Some(callback) = self.descriptor.animation_marker else {
+            return Ok(());
+        };
+        let event = RveAnimationMarker {
+            marker: RveStr::from_str_ref(marker),
+            motion: RveStr::from_str_ref(motion),
+            clip: RveStr::from_str_ref(clip),
+        };
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let status = {
+            let host = with_interrupt(context.host(time), call.interrupt);
+            // SAFETY: marker strings, event, instance, and host remain live throughout the call.
+            unsafe { callback(self.instance, &host, &event) }
         };
         context.callback_result(status)
     }

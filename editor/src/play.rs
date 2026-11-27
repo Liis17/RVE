@@ -1145,13 +1145,22 @@ impl PlaySession {
         self.rumble = self.host.take_rumble_requests();
         // Порядок как в runtime: запросы скриптов, затем время; события уйдут в следующий update.
         self.animation.apply(self.host.drain_animation_requests());
-        let finished = self.animation.advance(frame_time.dt);
-        self.host.queue_animation_events(
-            &self.world,
-            finished.into_iter().map(|event| match event {
-                AnimationEvent::Finished { object, motion } => (object, motion),
-            }),
-        );
+        let events = self.animation.advance(frame_time.dt);
+        let mut finished = Vec::new();
+        let mut markers = Vec::new();
+        for event in events {
+            match event {
+                AnimationEvent::Finished { object, motion } => finished.push((object, motion)),
+                AnimationEvent::Marker {
+                    object,
+                    motion,
+                    clip,
+                    marker,
+                } => markers.push((object, motion, clip, marker)),
+            }
+        }
+        self.host.queue_animation_events(&self.world, finished);
+        self.host.queue_animation_markers(&self.world, markers);
         if let Some(network) = &mut self.network {
             network.apply(&mut self.world, &mut self.host);
         }
@@ -2282,6 +2291,9 @@ end
 function Hero:on_message(sender, name, value)
   rve.log_info(name .. ":" .. value)
 end
+function Hero:on_animation_marker(marker, motion, clip)
+  rve.log_info("animation_marker:" .. marker .. ":" .. motion .. ":" .. clip)
+end
 return Hero
 "#;
 
@@ -2332,6 +2344,57 @@ return Hero
                 .any(|message| message == "animation_finished:Walk"),
             "{messages:?}"
         );
+        assert!(session.drain_animation_warnings().is_empty());
+    }
+
+    #[test]
+    fn animation_marker_reaches_play_script_before_animation_finished() {
+        let document = document(ANIMATED_SCENE);
+        let world = World::from_document(&document).unwrap();
+        let mut model = crate::viewport::animation::test_support::walk_model();
+        model.animations[0]
+            .markers
+            .push(engine_assets::ModelMarker {
+                name: "last_step".to_owned(),
+                time: 1.0,
+            });
+        let animation = AnimationBridge::build(
+            &world,
+            |_| Ok(std::sync::Arc::new(model.clone())),
+            |_| Ok(std::sync::Arc::new(Vec::new())),
+        );
+        let mut session = PlaySession::start_with_world_limit(
+            &document,
+            world,
+            None,
+            &InputSettings::default(),
+            |_| Ok(ANIMATED_HERO.to_owned()),
+            PlayPrefabs::default(),
+            Vec::new(),
+            &PhysicsSettings::default(),
+            SCRIPT_TIME_LIMIT,
+            AudioConfig::default(),
+            animation,
+        )
+        .unwrap();
+
+        for _ in 0..12 {
+            session.step(0.1).unwrap();
+        }
+        let messages: Vec<_> = session
+            .drain_events()
+            .into_iter()
+            .map(|event| event.message)
+            .collect();
+        let marker = messages
+            .iter()
+            .position(|message| message == "animation_marker:last_step:Walk:Walk")
+            .expect("the Lua marker hook runs in Play");
+        let finished = messages
+            .iter()
+            .position(|message| message == "animation_finished:Walk")
+            .expect("animation_finished remains a message in Play");
+        assert!(marker < finished, "{messages:?}");
         assert!(session.drain_animation_warnings().is_empty());
     }
 

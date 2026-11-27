@@ -25,7 +25,8 @@ pub mod world;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use animation::{
-    AnimationRequest, AnimatorComponent, BlendTree, BlendTreePoint, MAX_BLEND_TREE_POINTS,
+    AnimationMarker, AnimationRequest, AnimatorComponent, BlendTree, BlendTreePoint,
+    MAX_BLEND_TREE_POINTS,
 };
 pub use asset_kind::AssetKind;
 pub use audio::{

@@ -31,7 +31,8 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 25 appends the nullable `interrupt` flag after the v24 file dialog callbacks.
 /// Version 26 appends audio fade, group effect and streaming callbacks after the v25 interrupt flag.
 /// Version 27 appends the UI language callbacks after the v26 audio tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 27;
+/// Version 28 appends the nullable animation-marker callback after the v22 descriptor tail.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 28;
 
 /// Validate an external property write before any `Script::set_property` hook runs.
 pub const RVE_PROPERTY_PHASE_VALIDATE: u32 = 0;
@@ -2452,6 +2453,23 @@ pub type RveSetPropertyFn = unsafe extern "C" fn(
     value: *const RveValue,
     phase: u32,
 ) -> RveStatus;
+/// Named animation marker delivered to a guest script for one callback.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveAnimationMarker {
+    /// Marker name.
+    pub marker: RveStr,
+    /// Motion that crossed the marker.
+    pub motion: RveStr,
+    /// Clip containing the marker.
+    pub clip: RveStr,
+}
+/// Guest callback appended to the script descriptor in ABI v28.
+pub type RveAnimationMarkerFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    event: *const RveAnimationMarker,
+) -> RveStatus;
 /// Changes the transactional time scale for the current script callback.
 pub type RveSetTimeScaleFn = unsafe extern "C" fn(ctx: *mut c_void, scale: f32) -> bool;
 /// Schedules a script-owned timer. A zero repeat interval denotes a one-shot timer.
@@ -2723,9 +2741,9 @@ pub struct RveScriptDescV20 {
     pub on_timer: Option<RveTimerFn>,
 }
 
-/// Current script descriptor (ABI v22): the v20 layout plus the nullable property-write callback.
+/// Script descriptor layout shared by ABI versions 22 through 27.
 #[repr(C)]
-pub struct RveScriptDesc {
+pub struct RveScriptDescV22 {
     pub name: RveStr,
     pub create: RveCreateFn,
     pub start: RveStartFn,
@@ -2747,6 +2765,33 @@ pub struct RveScriptDesc {
     /// Applies a declared property written by another script before this instance's next
     /// callback. Appended in ABI v22; modules that predate it never receive writes.
     pub set_property: Option<RveSetPropertyFn>,
+}
+
+/// Current script descriptor (ABI v28): the v22 layout plus the animation-marker callback.
+#[repr(C)]
+pub struct RveScriptDesc {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+    pub ui_event: Option<RveUiEventFn>,
+    pub on_enable: Option<RveStartFn>,
+    pub on_disable: Option<RveStartFn>,
+    pub on_fixed_update: Option<RveUpdateFn>,
+    pub on_late_update: Option<RveUpdateFn>,
+    pub on_timer: Option<RveTimerFn>,
+    /// Applies a declared property written by another script; appended in ABI v22.
+    pub set_property: Option<RveSetPropertyFn>,
+    /// Receives a named animation marker; appended in ABI v28.
+    pub animation_marker: Option<RveAnimationMarkerFn>,
 }
 
 /// Parameter kind: boolean.
@@ -2855,6 +2900,7 @@ unsafe impl Sync for RveScriptDescV15 {}
 unsafe impl Sync for RveScriptDescV16 {}
 unsafe impl Sync for RveScriptDescV17 {}
 unsafe impl Sync for RveScriptDescV19 {}
+unsafe impl Sync for RveScriptDescV22 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
@@ -2986,7 +3032,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
@@ -3040,7 +3086,7 @@ mod tests {
     fn runtime_physics_callbacks_follow_the_hierarchy_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         assert_eq!(RVE_TRIGGER_STAY, 4);
         assert_eq!(
             offset_of!(RveHost, physics_get_collider),
@@ -3067,7 +3113,7 @@ mod tests {
     fn abi20_clock_and_script_callbacks_append_to_the_v19_prefixes() {
         use std::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(size_of::<super::RveScriptTime>(), 40);
         assert_eq!(align_of::<super::RveScriptTime>(), 8);
@@ -3122,9 +3168,18 @@ mod tests {
             offset_of!(super::RveScriptDesc, on_timer) + size_of::<Option<super::RveTimerFn>>()
         );
         assert_eq!(
-            size_of::<super::RveScriptDesc>(),
-            offset_of!(super::RveScriptDesc, set_property)
+            size_of::<super::RveScriptDescV22>(),
+            offset_of!(super::RveScriptDescV22, set_property)
                 + size_of::<Option<super::RveSetPropertyFn>>()
+        );
+        assert_eq!(
+            offset_of!(super::RveScriptDesc, animation_marker),
+            size_of::<super::RveScriptDescV22>()
+        );
+        assert_eq!(
+            size_of::<super::RveScriptDesc>(),
+            offset_of!(super::RveScriptDesc, animation_marker)
+                + size_of::<Option<super::RveAnimationMarkerFn>>()
         );
         assert_eq!(
             size_of::<super::RveScriptDescV20>(),
@@ -3136,7 +3191,7 @@ mod tests {
     fn abi21_callbacks_append_after_the_abi20_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         assert_eq!(
             offset_of!(super::RveHost, save_set),
             offset_of!(super::RveHost, save_get) + size_of::<Option<super::RveSaveGetFn>>()
@@ -3207,7 +3262,7 @@ mod tests {
     fn abi23_app_quit_callback_appends_after_the_scene_host_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         assert_eq!(super::RVE_SCRIPT_ABI_MIN_VERSION, 3);
         assert_eq!(
             offset_of!(super::RveHost, app_quit),
@@ -3224,7 +3279,7 @@ mod tests {
     fn abi24_window_and_dialog_callbacks_append_after_the_abi23_quit_callback() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         let pointer = size_of::<usize>();
         assert_eq!(size_of::<Option<super::RveWindowFullscreenFn>>(), pointer);
         assert_eq!(
@@ -3253,7 +3308,7 @@ mod tests {
     fn abi25_interrupt_flag_appends_after_the_abi24_dialog_callbacks() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         let pointer = size_of::<usize>();
         assert_eq!(
             offset_of!(super::RveHost, interrupt),
@@ -3269,7 +3324,7 @@ mod tests {
     fn abi26_audio_callbacks_append_after_the_abi25_interrupt_flag() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         let pointer = size_of::<usize>();
         let tail = [
             offset_of!(super::RveHost, audio_stop_source_fade),
@@ -3294,7 +3349,7 @@ mod tests {
     fn abi27_ui_language_callbacks_append_after_the_abi26_audio_tail() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
         let pointer = size_of::<usize>();
         assert_eq!(size_of::<Option<super::RveUiLanguageFn>>(), pointer);
         assert_eq!(
