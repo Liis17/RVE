@@ -358,6 +358,8 @@ fn random_animations(rng: &mut Lcg, model: &ModelSkeleton, count: usize) -> Vec<
             name: format!("clip{index}"),
             duration,
             tracks,
+            markers: Vec::new(),
+            marker_warnings: Vec::new(),
         });
     }
     animations
@@ -835,11 +837,15 @@ fn cached_duration_is_the_mean_of_tree_points_for_advance_and_seek() {
         name: "short".to_owned(),
         duration: 1.0,
         tracks: Vec::new(),
+        markers: Vec::new(),
+        marker_warnings: Vec::new(),
     };
     let long = ModelAnimation {
         name: "long".to_owned(),
         duration: 3.0,
         tracks: Vec::new(),
+        markers: Vec::new(),
+        marker_warnings: Vec::new(),
     };
     let clips = vec![Clip::bind(&short, &skeleton), Clip::bind(&long, &skeleton)];
     let tree = Motion {

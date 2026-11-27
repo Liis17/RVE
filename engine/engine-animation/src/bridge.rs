@@ -456,6 +456,8 @@ mod tests {
                     rotation: Vec::new(),
                     scale: Vec::new(),
                 }],
+                markers: Vec::new(),
+                marker_warnings: Vec::new(),
             }],
         }
     }

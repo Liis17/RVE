@@ -207,6 +207,8 @@ mod tests {
             name: "clip".to_owned(),
             duration: 1.0,
             tracks,
+            markers: Vec::new(),
+            marker_warnings: Vec::new(),
         }
     }
 

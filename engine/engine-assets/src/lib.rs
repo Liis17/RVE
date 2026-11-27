@@ -6,7 +6,7 @@
 mod animation;
 mod skin;
 
-pub use animation::{ModelAnimation, ModelKey, ModelTrack};
+pub use animation::{ModelAnimation, ModelKey, ModelMarker, ModelTrack};
 pub use skin::{ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelSkin, ModelTransform};
 
 use bevy_mikktspace::{Geometry, TangentSpace};

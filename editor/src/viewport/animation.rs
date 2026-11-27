@@ -390,6 +390,8 @@ pub(crate) mod test_support {
                     rotation: Vec::new(),
                     scale: Vec::new(),
                 }],
+                markers: Vec::new(),
+                marker_warnings: Vec::new(),
             }],
         }
     }

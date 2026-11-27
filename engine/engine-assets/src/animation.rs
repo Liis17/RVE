@@ -26,12 +26,41 @@ pub struct ModelTrack {
     pub scale: Vec<ModelKey<[f32; 3]>>,
 }
 
+/// Именованный маркер клипа с временем в секундах от начала клипа.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelMarker {
+    pub name: String,
+    pub time: f32,
+}
+
 /// Именованный клип с длительностью в секундах.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelAnimation {
     pub name: String,
     pub duration: f32,
     pub tracks: Vec<ModelTrack>,
+    pub markers: Vec<ModelMarker>,
+    pub marker_warnings: Vec<String>,
+}
+
+#[derive(Default)]
+struct ImportedMarkers {
+    stack_names: Vec<String>,
+    by_stack: Vec<Vec<ModelMarker>>,
+    warnings_by_stack: Vec<Vec<String>>,
+    file_warnings: Vec<String>,
+}
+
+struct ParsedMarker {
+    stack: Option<String>,
+    name: String,
+    time: f32,
+}
+
+#[derive(Debug)]
+struct MarkerParseError {
+    stack: Option<String>,
+    message: String,
 }
 
 /// Есть ли в файле стек с хотя бы одним ключом. Пустой стек, например `Take 001` статичной
@@ -53,8 +82,9 @@ pub(crate) fn bake_model_animations(
     scene: &ufbx::Scene,
 ) -> Result<Vec<ModelAnimation>, String> {
     let mut keys = KEY_LIMIT;
-    let mut animations = Vec::new();
-    for stack in scene.anim_stacks.iter() {
+    let imported = import_markers(scene);
+    let mut baked_stacks = Vec::new();
+    for (index, stack) in scene.anim_stacks.iter().enumerate() {
         let baked = bake_stack(
             scene,
             stack,
@@ -63,10 +93,10 @@ pub(crate) fn bake_model_animations(
             &mut keys,
         )?;
         if !baked.tracks.is_empty() {
-            animations.push(baked);
+            baked_stacks.push((index, baked));
         }
     }
-    Ok(animations)
+    Ok(attach_markers(baked_stacks, imported))
 }
 
 /// Запекает стеки файла с ключами как клипы; имена — stem файла, если стек один.
@@ -76,8 +106,9 @@ pub(crate) fn bake_clip_file(
 ) -> Result<Vec<ModelAnimation>, String> {
     let mut keys = KEY_LIMIT;
     let single = scene.anim_stacks.len() == 1;
-    let mut clips = Vec::new();
-    for stack in scene.anim_stacks.iter() {
+    let imported = import_markers(scene);
+    let mut baked_stacks = Vec::new();
+    for (index, stack) in scene.anim_stacks.iter().enumerate() {
         let name = if single {
             stem.to_owned()
         } else {
@@ -85,10 +116,233 @@ pub(crate) fn bake_clip_file(
         };
         let baked = bake_stack(scene, stack, name, &|_| true, &mut keys)?;
         if !baked.tracks.is_empty() {
-            clips.push(baked);
+            baked_stacks.push((index, baked));
         }
     }
-    Ok(clips)
+    Ok(attach_markers(baked_stacks, imported))
+}
+
+fn attach_markers(
+    mut baked_stacks: Vec<(usize, ModelAnimation)>,
+    mut imported: ImportedMarkers,
+) -> Vec<ModelAnimation> {
+    let retained: Vec<bool> = (0..imported.by_stack.len())
+        .map(|index| baked_stacks.iter().any(|(stack, _)| *stack == index))
+        .collect();
+
+    for (index, has_clip) in retained.iter().copied().enumerate() {
+        if has_clip {
+            continue;
+        }
+        imported
+            .file_warnings
+            .append(&mut imported.warnings_by_stack[index]);
+        if !imported.by_stack[index].is_empty() {
+            imported.file_warnings.push(format!(
+                "стек {:?} не содержит дорожек клипа; его маркеры отброшены",
+                imported.stack_names[index]
+            ));
+        }
+    }
+
+    for (index, animation) in &mut baked_stacks {
+        animation.markers = std::mem::take(&mut imported.by_stack[*index]);
+        animation.marker_warnings = std::mem::take(&mut imported.warnings_by_stack[*index]);
+        animation
+            .marker_warnings
+            .extend(imported.file_warnings.iter().cloned());
+    }
+    baked_stacks
+        .into_iter()
+        .map(|(_, animation)| animation)
+        .collect()
+}
+
+fn import_markers(scene: &ufbx::Scene) -> ImportedMarkers {
+    let stack_names: Vec<String> = scene
+        .anim_stacks
+        .iter()
+        .map(|stack| stack.element.name.to_string())
+        .collect();
+    let mut imported = ImportedMarkers {
+        stack_names: stack_names.clone(),
+        by_stack: vec![Vec::new(); stack_names.len()],
+        warnings_by_stack: vec![Vec::new(); stack_names.len()],
+        file_warnings: Vec::new(),
+    };
+
+    for (index, stack) in scene.anim_stacks.iter().enumerate() {
+        if let Some(prop) = stack.element.props.find_prop("rve_markers") {
+            import_marker_prop(prop, Some(index), &stack_names, &mut imported);
+        }
+    }
+    for node in scene.nodes.iter() {
+        if let Some(prop) = node.element.props.find_prop("rve_markers") {
+            import_marker_prop(prop, None, &stack_names, &mut imported);
+        }
+    }
+    imported
+}
+
+fn import_marker_prop(
+    prop: &ufbx::Prop,
+    source_stack: Option<usize>,
+    stack_names: &[String],
+    imported: &mut ImportedMarkers,
+) {
+    if prop.type_ != ufbx::PropType::String {
+        if let Some(index) = source_stack.or_else(|| (stack_names.len() == 1).then_some(0)) {
+            imported.warnings_by_stack[index]
+                .push("rve_markers должно быть строковым свойством".to_owned());
+        } else {
+            imported
+                .file_warnings
+                .push("rve_markers должно быть строковым свойством".to_owned());
+        }
+        return;
+    }
+    import_marker_property(&prop.value_str, source_stack, stack_names, imported);
+}
+
+fn import_marker_property(
+    value: &str,
+    source_stack: Option<usize>,
+    stack_names: &[String],
+    imported: &mut ImportedMarkers,
+) {
+    for record in marker_records(value) {
+        match parse_marker_record(record) {
+            Ok(marker) => {
+                if let Some(index) = marker_target(
+                    marker.stack.as_deref(),
+                    source_stack,
+                    stack_names,
+                    imported,
+                    record,
+                ) {
+                    imported.by_stack[index].push(ModelMarker {
+                        name: marker.name,
+                        time: marker.time,
+                    });
+                }
+            }
+            Err(error) => {
+                if let Some(index) = marker_target(
+                    error.stack.as_deref(),
+                    source_stack,
+                    stack_names,
+                    imported,
+                    record,
+                ) {
+                    imported.warnings_by_stack[index]
+                        .push(format!("rve_markers {:?}: {}", record, error.message));
+                }
+            }
+        }
+    }
+}
+
+fn marker_records(value: &str) -> impl Iterator<Item = &str> + '_ {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|record| !record.is_empty())
+}
+
+fn marker_target(
+    prefix: Option<&str>,
+    source_stack: Option<usize>,
+    stack_names: &[String],
+    imported: &mut ImportedMarkers,
+    record: &str,
+) -> Option<usize> {
+    if let Some(source) = source_stack {
+        let Some(prefix) = prefix else {
+            return Some(source);
+        };
+        if prefix == stack_names[source] {
+            return Some(source);
+        }
+        if stack_names.iter().all(|name| name != prefix) {
+            imported.file_warnings.push(format!(
+                "rve_markers {:?}: неизвестный стек {:?}",
+                record, prefix
+            ));
+        } else {
+            imported.warnings_by_stack[source].push(format!(
+                "rve_markers {:?}: префикс стека не совпадает с AnimStack {:?}",
+                record, stack_names[source]
+            ));
+        }
+        return None;
+    }
+
+    match prefix {
+        Some(prefix) => match stack_names.iter().position(|name| name == prefix) {
+            Some(index) => Some(index),
+            None => {
+                imported.file_warnings.push(format!(
+                    "rve_markers {:?}: неизвестный стек {:?}",
+                    record, prefix
+                ));
+                None
+            }
+        },
+        None if stack_names.len() == 1 => Some(0),
+        None => {
+            imported.file_warnings.push(format!(
+                "rve_markers {:?}: укажите имя стека, так как в файле несколько стеков",
+                record
+            ));
+            None
+        }
+    }
+}
+
+fn parse_marker_record(record: &str) -> Result<ParsedMarker, MarkerParseError> {
+    let stack_from_record = || {
+        record
+            .rsplit_once('@')
+            .and_then(|(left, _)| left.rsplit_once(':').map(|(stack, _)| stack.to_owned()))
+            .or_else(|| record.rsplit_once(':').map(|(stack, _)| stack.to_owned()))
+    };
+    let Some((left, time_text)) = record.rsplit_once('@') else {
+        return Err(MarkerParseError {
+            stack: stack_from_record(),
+            message: "ожидается формат [<stack>:]<marker>@<seconds>".to_owned(),
+        });
+    };
+    let (stack, name) = match left.rsplit_once(':') {
+        Some((stack, name)) => (Some(stack.to_owned()), name),
+        None => (None, left),
+    };
+    if !is_marker_identifier(name) {
+        return Err(MarkerParseError {
+            stack,
+            message: "имя маркера должно быть идентификатором ASCII".to_owned(),
+        });
+    }
+    let time = time_text
+        .parse::<f32>()
+        .ok()
+        .filter(|time| time.is_finite() && *time >= 0.0);
+    let Some(time) = time else {
+        return Err(MarkerParseError {
+            stack,
+            message: "время должно быть конечным числом не меньше нуля".to_owned(),
+        });
+    };
+    Ok(ParsedMarker {
+        stack,
+        name: name.to_owned(),
+        time,
+    })
+}
+
+fn is_marker_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
 }
 
 fn bake_stack(
@@ -150,6 +404,8 @@ fn bake_stack(
         name,
         duration: baked.playback_duration as f32,
         tracks,
+        markers: Vec::new(),
+        marker_warnings: Vec::new(),
     })
 }
 
@@ -159,4 +415,77 @@ fn key_time(time: f64, begin: f64) -> f32 {
 
 fn vec3(value: ufbx::Vec3) -> [f32; 3] {
     [value.x as f32, value.y as f32, value.z as f32]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{marker_records, parse_marker_record};
+
+    #[test]
+    fn parses_empty_and_whitespace_delimited_marker_properties() {
+        assert_eq!(
+            marker_records("  Start@0 ;  Hit@1.25  ").collect::<Vec<_>>(),
+            ["Start@0", "Hit@1.25"]
+        );
+        assert_eq!(marker_records("").count(), 0);
+        assert_eq!(marker_records("  ").count(), 0);
+    }
+
+    #[test]
+    fn parses_multiple_records_and_optional_stack_prefix() {
+        let first = parse_marker_record("Start@0").unwrap();
+        assert_eq!(first.stack, None);
+        assert_eq!(first.name, "Start");
+        assert_eq!(first.time, 0.0);
+
+        let second = parse_marker_record("Walk:FootDown@0.25").unwrap();
+        assert_eq!(second.stack.as_deref(), Some("Walk"));
+        assert_eq!(second.name, "FootDown");
+        assert_eq!(second.time, 0.25);
+
+        let records = "Start@0;Walk:FootDown@0.25"
+            .split(';')
+            .map(parse_marker_record)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn marker_stack_prefix_uses_last_colon() {
+        let marker = parse_marker_record("Rig:Walk:FootDown@0.25").unwrap();
+        assert_eq!(marker.stack.as_deref(), Some("Rig:Walk"));
+        assert_eq!(marker.name, "FootDown");
+    }
+
+    #[test]
+    fn rejects_invalid_marker_records() {
+        for record in ["Hit@NaN", "Hit@inf", "Hit@-0.1", "bad-name@1", "1Hit@1"] {
+            assert!(parse_marker_record(record).is_err(), "{record}");
+        }
+    }
+
+    #[test]
+    fn unknown_stack_prefix_is_a_file_warning() {
+        use super::{ImportedMarkers, marker_target};
+
+        let names = vec!["Walk".to_owned()];
+        let mut imported = ImportedMarkers {
+            stack_names: names.clone(),
+            by_stack: vec![Vec::new()],
+            warnings_by_stack: vec![Vec::new()],
+            file_warnings: Vec::new(),
+        };
+        assert_eq!(
+            marker_target(
+                Some("Missing"),
+                None,
+                &names,
+                &mut imported,
+                "Missing:Hit@0"
+            ),
+            None
+        );
+        assert_eq!(imported.file_warnings.len(), 1);
+    }
 }
