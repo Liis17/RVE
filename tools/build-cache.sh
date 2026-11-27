@@ -37,19 +37,28 @@ sync() {
             <(echo "$workspace") <(ls "$from/.fingerprint"))
         [ -n "$units" ] || continue
 
-        comm -23 \
+        while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            cp -l "$from/deps/$file" "$to/deps/"
+        done < <(comm -23 \
             <(ls "$from/deps" | grep -Ff <(echo "$units" | sed -E 's/.*-([0-9a-f]+)$/-\1./') | sort) \
-            <(ls "$to/deps" | sort) |
-            (cd "$from/deps" && xargs -r -d '\n' cp -l -t "$to/deps")
+            <(ls "$to/deps" | sort))
 
         # Cargo rewrites these small files in place, so they are copied, with
         # mtimes kept. Fingerprints go last: they mark the unit as complete.
         new=$(comm -23 <(echo "$units" | sort) <(ls "$to/.fingerprint" | sort))
         [ -n "$new" ] || continue
-        for unit in $new; do
+        while IFS= read -r unit; do
+            [ -n "$unit" ] || continue
             [ ! -d "$from/build/$unit" ] || echo "$unit"
-        done | (cd "$from/build" && xargs -r -d '\n' cp -a -t "$to/build")
-        echo "$new" | (cd "$from/.fingerprint" && xargs -r -d '\n' cp -a -t "$to/.fingerprint")
+        done <<< "$new" | while IFS= read -r unit; do
+            [ -n "$unit" ] || continue
+            cp -a "$from/build/$unit" "$to/build/"
+        done
+        while IFS= read -r unit; do
+            [ -n "$unit" ] || continue
+            cp -a "$from/.fingerprint/$unit" "$to/.fingerprint/"
+        done <<< "$new"
         echo "$profile: $(echo "$new" | wc -l) units -> $dst"
     done
 }

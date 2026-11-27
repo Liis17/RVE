@@ -4,9 +4,11 @@
 //! вида `/model/cube.fbx`: такой путь указывает на файл `assets/model/cube.fbx`.
 
 mod animation;
+mod prebuilt;
 mod skin;
 
 pub use animation::{ModelAnimation, ModelKey, ModelTrack};
+pub use prebuilt::{PREBUILT_MODEL_MAX_BYTES, PREBUILT_MODEL_VERSION};
 pub use skin::{ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelSkin, ModelTransform};
 
 use bevy_mikktspace::{Geometry, TangentSpace};
@@ -18,6 +20,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Возвращает `true`, если байты начинаются с сигнатуры готовой модели.
+pub fn is_prebuilt_model(bytes: &[u8]) -> bool {
+    prebuilt::is_prebuilt_model(bytes)
+}
 
 /// Версия крейта (SemVer).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -323,8 +330,65 @@ impl Assets {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
         check_cancel(cancel, &path)?;
-        let bytes = self.read_asset(asset_path, &path)?;
-        load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self, cancel)
+        let bytes = self.read_model_asset(asset_path, &path)?;
+        if prebuilt::is_prebuilt_model(&bytes) {
+            load_prebuilt_model(&bytes, &path, &virtual_asset_path(asset_path), self, cancel)
+        } else {
+            load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self, cancel)
+        }
+    }
+
+    /// Преобразует FBX в версионированный артефакт готовой модели.
+    pub fn convert_model(&self, asset_path: &str) -> Result<Vec<u8>, AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "fbx")?;
+        let bytes = self.read_model_asset(asset_path, &path)?;
+        let virtual_path = virtual_asset_path(asset_path);
+        let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
+        let mut meshes = Vec::new();
+        let prepared = prepare_fbx_parts(&scene, &path, &AtomicBool::new(false), |mesh, _| {
+            meshes.push(mesh);
+            Ok(())
+        })?;
+        if meshes.is_empty() && !prepared.has_animation_stacks {
+            return Err(AssetError::Decode {
+                path,
+                message: "в модели нет треугольников".to_owned(),
+            });
+        }
+        let (skeleton, model_animations) = if meshes.is_empty() {
+            (None, Vec::new())
+        } else if let Some(builder) = prepared.skeleton_builder {
+            let animations =
+                animation::bake_model_animations(&builder, &scene).map_err(|message| {
+                    AssetError::Decode {
+                        path: path.clone(),
+                        message,
+                    }
+                })?;
+            (Some(builder.finish()), animations)
+        } else {
+            (None, Vec::new())
+        };
+        let clips = animation::bake_clip_file(
+            &scene,
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("clip"),
+        )
+        .map_err(|message| AssetError::Decode {
+            path: path.clone(),
+            message,
+        })?;
+        prebuilt::encode(&prebuilt::PreparedModel {
+            texture_references: prepared.texture_references,
+            meshes: (!meshes.is_empty()).then_some(meshes),
+            skeleton,
+            model_animations,
+            has_animation_stacks: prepared.has_animation_stacks,
+            clips,
+        })
+        .map_err(|message| AssetError::Decode { path, message })
     }
 
     /// Загружает клипы из FBX, в котором нет мешей, например файл Mixamo только с анимацией.
@@ -334,7 +398,17 @@ impl Assets {
     pub fn load_animations(&self, asset_path: &str) -> Result<Vec<ModelAnimation>, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
-        let bytes = self.read_asset(asset_path, &path)?;
+        let bytes = self.read_model_asset(asset_path, &path)?;
+        if prebuilt::is_prebuilt_model(&bytes) {
+            let model = decode_prebuilt(&bytes, &path)?;
+            if model.clips.is_empty() {
+                return Err(AssetError::Decode {
+                    path,
+                    message: "нет анимационных стеков с ключами".to_owned(),
+                });
+            }
+            return Ok(model.clips);
+        }
         let virtual_path = virtual_asset_path(asset_path);
         let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
         let stem = path
@@ -362,7 +436,20 @@ impl Assets {
     pub fn model_dependencies(&self, asset_path: &str) -> Result<Vec<String>, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
-        let bytes = self.read_asset(asset_path, &path)?;
+        let bytes = self.read_model_asset(asset_path, &path)?;
+        if prebuilt::is_prebuilt_model(&bytes) {
+            let model = decode_prebuilt(&bytes, &path)?;
+            if model.meshes.is_none() {
+                if model.has_animation_stacks {
+                    return Ok(Vec::new());
+                }
+                return Err(AssetError::Decode {
+                    path,
+                    message: "в модели нет треугольников".to_owned(),
+                });
+            }
+            return prebuilt_dependencies(&model, &virtual_asset_path(asset_path), &path, self);
+        }
         let virtual_path = virtual_asset_path(asset_path);
         let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
         if !scene_has_triangles(&scene) {
@@ -432,6 +519,17 @@ impl Assets {
         request
             .wait()
             .map_err(|error| map_resource_error(path, error))
+    }
+
+    fn read_model_asset(&self, asset_path: &str, path: &Path) -> Result<Vec<u8>, AssetError> {
+        let stat = self.stat_asset(asset_path, path)?;
+        if stat.size > PREBUILT_MODEL_MAX_BYTES as u64 {
+            return Err(AssetError::Decode {
+                path: path.to_owned(),
+                message: "FBX или готовая модель превышает предел размера 256 MiB".to_owned(),
+            });
+        }
+        self.read_asset(asset_path, path)
     }
 
     fn stat_asset(&self, asset_path: &str, path: &Path) -> Result<ResourceStat, AssetError> {
@@ -905,16 +1003,7 @@ fn load_fbx(
     assets: &Assets,
     cancel: &AtomicBool,
 ) -> Result<Model, AssetError> {
-    let decode_error = |message: String| AssetError::Decode {
-        path: path.to_owned(),
-        message,
-    };
     let scene = load_fbx_scene_cancellable(bytes, virtual_path, path, cancel)?;
-    // Скелет нужен при skin или анимациях с ключами: тогда все части получают связи с костями.
-    let needs_skeleton = !scene.skin_deformers.is_empty()
-        || animation::has_animated_stack(&scene).map_err(decode_error)?;
-    let mut builder = needs_skeleton.then(skin::SkeletonBuilder::default);
-
     let mut model = Model {
         meshes: Vec::new(),
         textures: Vec::new(),
@@ -922,6 +1011,70 @@ fn load_fbx(
         animations: Vec::new(),
     };
     let mut texture_cache = ModelTextureCache::default();
+    let prepared = {
+        let mut material_loader = ModelMaterialLoader {
+            model_virtual_path: virtual_path,
+            model_path: path,
+            assets,
+            model: &mut model,
+            texture_cache: &mut texture_cache,
+            cancel,
+        };
+        prepare_fbx_parts(&scene, path, cancel, |mesh, references| {
+            check_cancel(cancel, path)?;
+            let material = material_loader.load_material(&mesh.material, references)?;
+            material_loader.model.meshes.push(ModelMesh {
+                vertices: mesh.vertices,
+                indices: mesh.indices,
+                material,
+                skin: mesh.skin,
+            });
+            Ok(())
+        })?
+    };
+    if model.meshes.is_empty() {
+        return Err(AssetError::Decode {
+            path: path.to_owned(),
+            message: "в модели нет треугольников".to_owned(),
+        });
+    }
+    if let Some(builder) = prepared.skeleton_builder {
+        model.animations =
+            animation::bake_model_animations(&builder, &scene).map_err(|message| {
+                AssetError::Decode {
+                    path: path.to_owned(),
+                    message,
+                }
+            })?;
+        model.skeleton = Some(builder.finish());
+    }
+    Ok(model)
+}
+
+struct FbxParts {
+    texture_references: Vec<prebuilt::TextureReference>,
+    skeleton_builder: Option<skin::SkeletonBuilder>,
+    has_animation_stacks: bool,
+}
+
+fn prepare_fbx_parts(
+    scene: &ufbx::Scene,
+    path: &Path,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(
+        prebuilt::PreparedMesh,
+        &[prebuilt::TextureReference],
+    ) -> Result<(), AssetError>,
+) -> Result<FbxParts, AssetError> {
+    let decode_error = |message: String| AssetError::Decode {
+        path: path.to_owned(),
+        message,
+    };
+    // Скелет нужен при skin или анимациях с ключами: тогда все части получают связи с костями.
+    let needs_skeleton = !scene.skin_deformers.is_empty()
+        || animation::has_animated_stack(scene).map_err(decode_error)?;
+    let mut builder = needs_skeleton.then(skin::SkeletonBuilder::default);
+    let mut texture_sources = prebuilt::TextureSources::default();
     let mut triangle = Vec::new();
     for node in scene.nodes.iter() {
         check_cancel(cancel, path)?;
@@ -954,6 +1107,7 @@ fn load_fbx(
         // Слои tangent и bitangent файла (оба) имеют приоритет над MikkTSpace.
         let file_tangents = mesh.vertex_tangent.exists && mesh.vertex_bitangent.exists;
         for part in mesh.material_parts.iter() {
+            check_cancel(cancel, path)?;
             let mut corners = Vec::with_capacity(part.num_triangles * 3);
             let mut influences = Vec::with_capacity(if rigid.is_some() {
                 part.num_triangles * 3
@@ -1034,28 +1188,140 @@ fn load_fbx(
                     .map_err(|message| decode_error(message.to_owned()))?;
             }
             let material = match materials.get(part.index as usize) {
-                Some(material) => load_model_material(
-                    material,
-                    virtual_path,
-                    path,
-                    assets,
-                    &mut model,
-                    &mut texture_cache,
-                )?,
-                None => ModelMaterial::default(),
+                Some(material) => material_recipe(material, &mut texture_sources)
+                    .map_err(|message| decode_error(message.to_owned()))?,
+                None => default_material_recipe(),
             };
-            model.meshes.push(builder.finish(material, mirrored));
+            let mesh = builder.finish(ModelMaterial::default(), mirrored);
+            emit(
+                prebuilt::PreparedMesh {
+                    vertices: mesh.vertices,
+                    indices: mesh.indices,
+                    skin: mesh.skin,
+                    material,
+                },
+                &texture_sources.references,
+            )?;
         }
     }
-    if model.meshes.is_empty() {
-        return Err(decode_error("в модели нет треугольников".to_owned()));
-    }
-    if let Some(builder) = builder {
-        model.animations =
-            animation::bake_model_animations(&builder, &scene).map_err(decode_error)?;
-        model.skeleton = Some(builder.finish());
+    Ok(FbxParts {
+        texture_references: texture_sources.references,
+        skeleton_builder: builder,
+        has_animation_stacks: !scene.anim_stacks.is_empty(),
+    })
+}
+
+fn decode_prebuilt(bytes: &[u8], path: &Path) -> Result<prebuilt::PreparedModel, AssetError> {
+    prebuilt::decode(bytes).map_err(|message| AssetError::Decode {
+        path: path.to_owned(),
+        message,
+    })
+}
+
+fn load_prebuilt_model(
+    bytes: &[u8],
+    path: &Path,
+    virtual_path: &str,
+    assets: &Assets,
+    cancel: &AtomicBool,
+) -> Result<Model, AssetError> {
+    let prepared = decode_prebuilt(bytes, path)?;
+    let Some(meshes) = prepared.meshes else {
+        return Err(AssetError::Decode {
+            path: path.to_owned(),
+            message: "в модели нет треугольников".to_owned(),
+        });
+    };
+    let mut model = Model {
+        meshes: Vec::new(),
+        textures: Vec::new(),
+        skeleton: prepared.skeleton,
+        animations: prepared.model_animations,
+    };
+    let mut texture_cache = ModelTextureCache::default();
+    {
+        let mut material_loader = ModelMaterialLoader {
+            model_virtual_path: virtual_path,
+            model_path: path,
+            assets,
+            model: &mut model,
+            texture_cache: &mut texture_cache,
+            cancel,
+        };
+        for mesh in meshes {
+            check_cancel(cancel, path)?;
+            let material =
+                material_loader.load_material(&mesh.material, &prepared.texture_references)?;
+            material_loader.model.meshes.push(ModelMesh {
+                vertices: mesh.vertices,
+                indices: mesh.indices,
+                material,
+                skin: mesh.skin,
+            });
+        }
     }
     Ok(model)
+}
+
+fn prebuilt_dependencies(
+    prepared: &prebuilt::PreparedModel,
+    virtual_path: &str,
+    path: &Path,
+    assets: &Assets,
+) -> Result<Vec<String>, AssetError> {
+    let Some(meshes) = &prepared.meshes else {
+        return Ok(Vec::new());
+    };
+    let mut dependencies = Vec::new();
+    let mut seen_sources = HashSet::new();
+    for mesh in meshes {
+        for source in [
+            mesh.material.base_color_source,
+            mesh.material.normal_source,
+            mesh.material.roughness_source,
+            mesh.material.metalness_source,
+            mesh.material.emissive_source,
+            mesh.material.occlusion_source,
+            mesh.material
+                .opacity_source
+                .as_ref()
+                .map(|opacity| opacity.source),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !seen_sources.insert(source) {
+                continue;
+            }
+            let Some(prebuilt::TextureReference::External {
+                name,
+                filename,
+                relative_filename,
+                absolute_filename,
+            }) = prepared.texture_references.get(source)
+            else {
+                continue;
+            };
+            let dependency = resolve_external_texture_source(
+                &TextureResolveContext {
+                    model_virtual_path: virtual_path,
+                    model_path: path,
+                    assets,
+                },
+                ExternalTextureSource {
+                    name,
+                    filename,
+                    relative_filename,
+                    absolute_filename,
+                },
+                |asset_path, _| Ok(asset_path.to_owned()),
+            )?;
+            if !dependencies.contains(&dependency) {
+                dependencies.push(dependency);
+            }
+        }
+    }
+    Ok(dependencies)
 }
 
 /// Битовый ключ вершины: позиция, нормаль, UV, tangent, веса и индексы суставов.
@@ -1236,9 +1502,18 @@ struct MaterialTextures<'a> {
 
 #[derive(Default)]
 struct ModelTextureCache {
-    loaded_textures: HashMap<u32, usize>,
-    loaded_metallic_roughness: HashMap<(Option<u32>, Option<u32>), usize>,
-    loaded_base_color_opacity: HashMap<(Option<u32>, u32, bool, u32), usize>,
+    loaded_textures: HashMap<usize, usize>,
+    loaded_metallic_roughness: HashMap<(Option<usize>, Option<usize>), usize>,
+    loaded_base_color_opacity: HashMap<(Option<usize>, usize, bool, u32), usize>,
+}
+
+struct ModelMaterialLoader<'a> {
+    model_virtual_path: &'a str,
+    model_path: &'a Path,
+    assets: &'a Assets,
+    model: &'a mut Model,
+    texture_cache: &'a mut ModelTextureCache,
+    cancel: &'a AtomicBool,
 }
 
 impl MaterialTextures<'_> {
@@ -1307,134 +1582,17 @@ fn supports_metallic_roughness(shader_type: ufbx::ShaderType) -> bool {
     )
 }
 
-fn load_model_material(
+fn material_recipe(
     material: &ufbx::Material,
-    model_virtual_path: &str,
-    model_path: &Path,
-    assets: &Assets,
-    model: &mut Model,
-    texture_cache: &mut ModelTextureCache,
-) -> Result<ModelMaterial, AssetError> {
-    let ModelTextureCache {
-        loaded_textures,
-        loaded_metallic_roughness,
-        loaded_base_color_opacity,
-    } = texture_cache;
-    let textures = material_textures(material).map_err(|message| AssetError::Decode {
-        path: model_path.to_owned(),
-        message: message.to_owned(),
-    })?;
-    let base_color_source = textures
-        .base_color
-        .map(|texture| {
-            load_model_texture(
-                model_virtual_path,
-                model_path,
-                texture,
-                assets,
-                model,
-                loaded_textures,
-            )
-        })
-        .transpose()?;
-    let normal_texture = textures
-        .normal
-        .map(|texture| {
-            load_model_texture(
-                model_virtual_path,
-                model_path,
-                texture,
-                assets,
-                model,
-                loaded_textures,
-            )
-        })
-        .transpose()?;
-    let metallic_roughness_texture = load_metallic_roughness_texture(
-        model_virtual_path,
-        model_path,
-        (textures.roughness, textures.metalness),
-        assets,
-        model,
-        loaded_textures,
-        loaded_metallic_roughness,
-    )?;
-    let opacity_texture = textures
-        .opacity
-        .map(|(texture, invert)| {
-            load_model_texture(
-                model_virtual_path,
-                model_path,
-                texture,
-                assets,
-                model,
-                loaded_textures,
-            )
-            .map(|index| (index, invert, texture.element.element_id))
-        })
-        .transpose()?;
-    let base_color_texture = if let Some((opacity_index, invert, opacity_id)) = opacity_texture {
-        let base_id = textures
-            .base_color
-            .map(|texture| texture.element.element_id);
-        // Invert classic FBX transparency after multiplying color and factor.
-        let transparency_scale = if !invert {
-            1.0
-        } else if material.fbx.transparency_factor.texture.is_some() {
-            map_scalar(&material.fbx.transparency_color)
-        } else {
-            map_scalar(&material.fbx.transparency_factor)
-        };
-        let key = (base_id, opacity_id, invert, transparency_scale.to_bits());
-        if let Some(&index) = loaded_base_color_opacity.get(&key) {
-            Some(index)
-        } else {
-            let combined = combine_base_color_opacity(
-                base_color_source.map(|index| &model.textures[index]),
-                &model.textures[opacity_index],
-                invert,
-                transparency_scale,
-            )
-            .map_err(|message| AssetError::Decode {
-                path: model_path.to_owned(),
-                message,
-            })?;
-            model.textures.push(combined);
-            let index = model.textures.len() - 1;
-            loaded_base_color_opacity.insert(key, index);
-            Some(index)
-        }
-    } else {
-        base_color_source
-    };
-    let emissive_texture = textures
-        .emissive
-        .map(|texture| {
-            load_model_texture(
-                model_virtual_path,
-                model_path,
-                texture,
-                assets,
-                model,
-                loaded_textures,
-            )
-        })
-        .transpose()?;
-    let occlusion_texture = textures
-        .occlusion
-        .map(|texture| {
-            load_model_texture(
-                model_virtual_path,
-                model_path,
-                texture,
-                assets,
-                model,
-                loaded_textures,
-            )
-        })
-        .transpose()?;
+    sources: &mut prebuilt::TextureSources,
+) -> Result<prebuilt::MaterialRecipe, &'static str> {
+    let textures = material_textures(material)?;
+    let mut ids = [None; 7];
+    for (index, texture) in textures.all().into_iter().enumerate() {
+        ids[index] = texture.map(|texture| sources.intern(texture));
+    }
     let has_metallic_roughness = supports_metallic_roughness(material.shader_type);
-    let base_color_factor = if base_color_source.is_some() {
+    let base_color = if ids[0].is_some() {
         [1.0; 3]
     } else if material.pbr.base_color.has_value {
         map_vec3(&material.pbr.base_color)
@@ -1448,55 +1606,239 @@ fn load_model_material(
     } else {
         [1.0; 3]
     };
-    let emissive = emissive_factor(material);
-    let opacity = opacity_factor(material);
-    let has_transparent_base_alpha = base_color_texture.is_some_and(|index| {
-        model.textures[index]
-            .rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|pixel| pixel[3] < 255)
-    });
-    Ok(ModelMaterial {
-        base_color: base_color_factor,
+    let transparency_scale = if let Some((_, invert)) = textures.opacity {
+        if !invert {
+            1.0
+        } else if material.fbx.transparency_factor.texture.is_some() {
+            map_scalar(&material.fbx.transparency_color)
+        } else {
+            map_scalar(&material.fbx.transparency_factor)
+        }
+    } else {
+        1.0
+    };
+    Ok(prebuilt::MaterialRecipe {
+        base_color,
         metallic: if !has_metallic_roughness {
             0.0
-        } else if textures.metalness.is_some() {
+        } else if ids[3].is_some() {
             1.0
         } else if material.pbr.metalness.has_value {
             map_scalar(&material.pbr.metalness)
         } else {
             0.0
         },
-        roughness: if has_metallic_roughness
-            && textures.roughness.is_none()
-            && material.pbr.roughness.has_value
+        roughness: if has_metallic_roughness && ids[2].is_none() && material.pbr.roughness.has_value
         {
             map_scalar(&material.pbr.roughness)
         } else {
             1.0
         },
-        emissive,
-        opacity,
-        alpha_mode: if opacity < 1.0 || opacity_texture.is_some() || has_transparent_base_alpha {
-            ModelAlphaMode::Blend
-        } else {
-            ModelAlphaMode::Opaque
-        },
+        emissive: emissive_factor(material),
+        opacity: opacity_factor(material),
         double_sided: material.features.double_sided.enabled,
-        base_color_texture,
-        metallic_roughness_texture,
-        normal_texture,
-        emissive_texture,
-        occlusion_texture,
-        normal_scale: 1.0,
         occlusion_strength: if material.pbr.ambient_occlusion.has_value {
             map_scalar(&material.pbr.ambient_occlusion)
         } else {
             1.0
         },
+        base_color_source: ids[0],
+        normal_source: ids[1],
+        roughness_source: ids[2],
+        metalness_source: ids[3],
+        emissive_source: ids[4],
+        occlusion_source: ids[5],
+        opacity_source: textures.opacity.map(|(_, invert)| prebuilt::OpacityRecipe {
+            source: ids[6].expect("opacity texture has a source"),
+            invert,
+            transparency_scale,
+        }),
     })
+}
+
+fn default_material_recipe() -> prebuilt::MaterialRecipe {
+    prebuilt::MaterialRecipe {
+        base_color: [1.0; 3],
+        metallic: 0.0,
+        roughness: 1.0,
+        emissive: [0.0; 3],
+        opacity: 1.0,
+        double_sided: false,
+        occlusion_strength: 1.0,
+        base_color_source: None,
+        normal_source: None,
+        roughness_source: None,
+        metalness_source: None,
+        emissive_source: None,
+        occlusion_source: None,
+        opacity_source: None,
+    }
+}
+
+impl ModelMaterialLoader<'_> {
+    fn load_material(
+        &mut self,
+        recipe: &prebuilt::MaterialRecipe,
+        texture_references: &[prebuilt::TextureReference],
+    ) -> Result<ModelMaterial, AssetError> {
+        let base_color_source = recipe
+            .base_color_source
+            .map(|source| self.load_texture(source, texture_references))
+            .transpose()?;
+        let normal_texture = recipe
+            .normal_source
+            .map(|source| self.load_texture(source, texture_references))
+            .transpose()?;
+        let metallic_roughness_texture = self.load_metallic_roughness(
+            recipe.roughness_source,
+            recipe.metalness_source,
+            texture_references,
+        )?;
+        let opacity_texture = recipe
+            .opacity_source
+            .as_ref()
+            .map(|opacity| {
+                self.load_texture(opacity.source, texture_references)
+                    .map(|index| (index, opacity))
+            })
+            .transpose()?;
+        let base_color_texture = if let Some((opacity_index, opacity)) = opacity_texture {
+            let key = (
+                recipe.base_color_source,
+                opacity.source,
+                opacity.invert,
+                opacity.transparency_scale.to_bits(),
+            );
+            if let Some(&index) = self.texture_cache.loaded_base_color_opacity.get(&key) {
+                Some(index)
+            } else {
+                let combined = combine_base_color_opacity(
+                    base_color_source.map(|index| &self.model.textures[index]),
+                    &self.model.textures[opacity_index],
+                    opacity.invert,
+                    opacity.transparency_scale,
+                )
+                .map_err(|message| AssetError::Decode {
+                    path: self.model_path.to_owned(),
+                    message,
+                })?;
+                self.model.textures.push(combined);
+                let index = self.model.textures.len() - 1;
+                self.texture_cache
+                    .loaded_base_color_opacity
+                    .insert(key, index);
+                Some(index)
+            }
+        } else {
+            base_color_source
+        };
+        let emissive_texture = recipe
+            .emissive_source
+            .map(|source| self.load_texture(source, texture_references))
+            .transpose()?;
+        let occlusion_texture = recipe
+            .occlusion_source
+            .map(|source| self.load_texture(source, texture_references))
+            .transpose()?;
+        let has_transparent_base_alpha = base_color_texture.is_some_and(|index| {
+            self.model.textures[index]
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] < 255)
+        });
+        Ok(ModelMaterial {
+            base_color: recipe.base_color,
+            metallic: recipe.metallic,
+            roughness: recipe.roughness,
+            emissive: recipe.emissive,
+            opacity: recipe.opacity,
+            alpha_mode: if recipe.opacity < 1.0
+                || recipe.opacity_source.is_some()
+                || has_transparent_base_alpha
+            {
+                ModelAlphaMode::Blend
+            } else {
+                ModelAlphaMode::Opaque
+            },
+            double_sided: recipe.double_sided,
+            base_color_texture,
+            metallic_roughness_texture,
+            normal_texture,
+            emissive_texture,
+            occlusion_texture,
+            normal_scale: 1.0,
+            occlusion_strength: recipe.occlusion_strength,
+        })
+    }
+
+    fn load_texture(
+        &mut self,
+        source_id: usize,
+        texture_references: &[prebuilt::TextureReference],
+    ) -> Result<usize, AssetError> {
+        check_cancel(self.cancel, self.model_path)?;
+        if let Some(&index) = self.texture_cache.loaded_textures.get(&source_id) {
+            return Ok(index);
+        }
+        let reference = texture_references
+            .get(source_id)
+            .ok_or_else(|| AssetError::Decode {
+                path: self.model_path.to_owned(),
+                message: "индекс текстурной ссылки выходит за пределы таблицы".to_owned(),
+            })?;
+        let texture = load_texture_reference(
+            self.model_virtual_path,
+            self.model_path,
+            reference,
+            self.assets,
+        )?;
+        self.model.textures.push(texture);
+        let index = self.model.textures.len() - 1;
+        self.texture_cache.loaded_textures.insert(source_id, index);
+        Ok(index)
+    }
+
+    fn load_metallic_roughness(
+        &mut self,
+        roughness: Option<usize>,
+        metalness: Option<usize>,
+        texture_references: &[prebuilt::TextureReference],
+    ) -> Result<Option<usize>, AssetError> {
+        if roughness.is_none() && metalness.is_none() {
+            return Ok(None);
+        }
+        if let (Some(roughness), Some(metalness)) = (roughness, metalness)
+            && roughness == metalness
+        {
+            return self.load_texture(roughness, texture_references).map(Some);
+        }
+        let ids = (roughness, metalness);
+        if let Some(&index) = self.texture_cache.loaded_metallic_roughness.get(&ids) {
+            return Ok(Some(index));
+        }
+        let roughness_index = roughness
+            .map(|source| self.load_texture(source, texture_references))
+            .transpose()?;
+        let metalness_index = metalness
+            .map(|source| self.load_texture(source, texture_references))
+            .transpose()?;
+        let packed = pack_metallic_roughness(
+            roughness_index.map(|index| &self.model.textures[index]),
+            metalness_index.map(|index| &self.model.textures[index]),
+        )
+        .map_err(|message| AssetError::Decode {
+            path: self.model_path.to_owned(),
+            message,
+        })?;
+        self.model.textures.push(packed);
+        let index = self.model.textures.len() - 1;
+        self.texture_cache
+            .loaded_metallic_roughness
+            .insert(ids, index);
+        Ok(Some(index))
+    }
 }
 
 fn map_scalar(map: &ufbx::MaterialMap) -> f32 {
@@ -1587,126 +1929,6 @@ fn combine_base_color_opacity(
     })
 }
 
-fn load_model_texture(
-    model_virtual_path: &str,
-    model_path: &Path,
-    texture: &ufbx::Texture,
-    assets: &Assets,
-    model: &mut Model,
-    loaded_textures: &mut HashMap<u32, usize>,
-) -> Result<usize, AssetError> {
-    let element_id = texture.element.element_id;
-    if let Some(&index) = loaded_textures.get(&element_id) {
-        return Ok(index);
-    }
-    model.textures.push(load_fbx_texture(
-        model_virtual_path,
-        model_path,
-        texture,
-        assets,
-    )?);
-    let index = model.textures.len() - 1;
-    loaded_textures.insert(element_id, index);
-    Ok(index)
-}
-
-fn load_metallic_roughness_texture(
-    model_virtual_path: &str,
-    model_path: &Path,
-    maps: (Option<&ufbx::Texture>, Option<&ufbx::Texture>),
-    assets: &Assets,
-    model: &mut Model,
-    loaded_textures: &mut HashMap<u32, usize>,
-    loaded_packed: &mut HashMap<(Option<u32>, Option<u32>), usize>,
-) -> Result<Option<usize>, AssetError> {
-    let (roughness, metalness) = maps;
-    let ids = (
-        roughness.map(|texture| texture.element.element_id),
-        metalness.map(|texture| texture.element.element_id),
-    );
-    if roughness.is_none() && metalness.is_none() {
-        return Ok(None);
-    }
-    if let (Some(roughness), Some(_)) = (roughness, metalness)
-        && ids.0 == ids.1
-    {
-        return load_model_texture(
-            model_virtual_path,
-            model_path,
-            roughness,
-            assets,
-            model,
-            loaded_textures,
-        )
-        .map(Some);
-    }
-    pack_metallic_roughness_texture(
-        model_virtual_path,
-        model_path,
-        maps,
-        assets,
-        model,
-        loaded_textures,
-        loaded_packed,
-    )
-    .map(Some)
-}
-
-fn pack_metallic_roughness_texture(
-    model_virtual_path: &str,
-    model_path: &Path,
-    maps: (Option<&ufbx::Texture>, Option<&ufbx::Texture>),
-    assets: &Assets,
-    model: &mut Model,
-    loaded_textures: &mut HashMap<u32, usize>,
-    loaded_packed: &mut HashMap<(Option<u32>, Option<u32>), usize>,
-) -> Result<usize, AssetError> {
-    let (roughness, metalness) = maps;
-    let ids = (
-        roughness.map(|texture| texture.element.element_id),
-        metalness.map(|texture| texture.element.element_id),
-    );
-    if let Some(&index) = loaded_packed.get(&ids) {
-        return Ok(index);
-    }
-    let roughness_index = roughness
-        .map(|texture| {
-            load_model_texture(
-                model_virtual_path,
-                model_path,
-                texture,
-                assets,
-                model,
-                loaded_textures,
-            )
-        })
-        .transpose()?;
-    let metalness_index = metalness
-        .map(|texture| {
-            load_model_texture(
-                model_virtual_path,
-                model_path,
-                texture,
-                assets,
-                model,
-                loaded_textures,
-            )
-        })
-        .transpose()?;
-    let packed = pack_metallic_roughness(
-        roughness_index.map(|index| &model.textures[index]),
-        metalness_index.map(|index| &model.textures[index]),
-    )
-    .map_err(|message| AssetError::Decode {
-        path: model_path.to_owned(),
-        message,
-    })?;
-    model.textures.push(packed);
-    let index = model.textures.len() - 1;
-    loaded_packed.insert(ids, index);
-    Ok(index)
-}
-
 fn pack_metallic_roughness(
     roughness: Option<&TextureData>,
     metalness: Option<&TextureData>,
@@ -1795,34 +2017,58 @@ fn scene_has_triangles(scene: &ufbx::Scene) -> bool {
     })
 }
 
-fn load_fbx_texture(
+struct TextureResolveContext<'a> {
+    model_virtual_path: &'a str,
+    model_path: &'a Path,
+    assets: &'a Assets,
+}
+
+struct ExternalTextureSource<'a> {
+    name: &'a str,
+    filename: &'a str,
+    relative_filename: &'a str,
+    absolute_filename: &'a str,
+}
+
+fn load_texture_reference(
     model_virtual_path: &str,
     model: &Path,
-    texture: &ufbx::Texture,
+    texture: &prebuilt::TextureReference,
     assets: &Assets,
 ) -> Result<TextureData, AssetError> {
-    if !texture.content.is_empty() {
-        return decode_png(&texture.content).map_err(|message| AssetError::Decode {
-            path: model.to_owned(),
-            message: format!(
-                "встроенная текстура {:?}: {message}",
-                texture.element.name.as_ref() as &str
-            ),
-        });
-    }
-    resolve_external_texture(
-        model_virtual_path,
-        model,
-        texture,
-        assets,
-        |asset_path, path| {
-            let bytes = assets.read_asset(asset_path, path)?;
-            decode_png(&bytes).map_err(|message| AssetError::Decode {
-                path: path.to_owned(),
-                message,
+    match texture {
+        prebuilt::TextureReference::Embedded { name, png } => {
+            decode_png(png).map_err(|message| AssetError::Decode {
+                path: model.to_owned(),
+                message: format!("встроенная текстура {name:?}: {message}"),
             })
-        },
-    )
+        }
+        prebuilt::TextureReference::External {
+            name,
+            filename,
+            relative_filename,
+            absolute_filename,
+        } => resolve_external_texture_source(
+            &TextureResolveContext {
+                model_virtual_path,
+                model_path: model,
+                assets,
+            },
+            ExternalTextureSource {
+                name,
+                filename,
+                relative_filename,
+                absolute_filename,
+            },
+            |asset_path, path| {
+                let bytes = assets.read_asset(asset_path, path)?;
+                decode_png(&bytes).map_err(|message| AssetError::Decode {
+                    path: path.to_owned(),
+                    message,
+                })
+            },
+        ),
+    }
 }
 
 fn resolve_external_texture<T>(
@@ -1830,22 +2076,43 @@ fn resolve_external_texture<T>(
     model: &Path,
     texture: &ufbx::Texture,
     assets: &Assets,
+    use_candidate: impl FnMut(&str, &Path) -> Result<T, AssetError>,
+) -> Result<T, AssetError> {
+    resolve_external_texture_source(
+        &TextureResolveContext {
+            model_virtual_path,
+            model_path: model,
+            assets,
+        },
+        ExternalTextureSource {
+            name: texture.element.name.as_ref(),
+            filename: texture.filename.as_ref(),
+            relative_filename: texture.relative_filename.as_ref(),
+            absolute_filename: texture.absolute_filename.as_ref(),
+        },
+        use_candidate,
+    )
+}
+
+fn resolve_external_texture_source<T>(
+    context: &TextureResolveContext<'_>,
+    source: ExternalTextureSource<'_>,
     mut use_candidate: impl FnMut(&str, &Path) -> Result<T, AssetError>,
 ) -> Result<T, AssetError> {
     let tried = texture_candidates(
-        model_virtual_path,
-        &texture.filename,
-        &texture.relative_filename,
-        &texture.absolute_filename,
+        context.model_virtual_path,
+        source.filename,
+        source.relative_filename,
+        source.absolute_filename,
     );
     let tried_paths = tried
         .iter()
-        .map(|candidate| assets.root.join(candidate))
+        .map(|candidate| context.assets.root.join(candidate))
         .collect::<Vec<_>>();
     for candidate in &tried {
         let asset_path = format!("/{candidate}");
-        let path = assets.root.join(candidate);
-        match assets.stat_asset(&asset_path, &path) {
+        let path = context.assets.root.join(candidate);
+        match context.assets.stat_asset(&asset_path, &path) {
             Err(error) if is_missing_texture_candidate(&error) => continue,
             Err(error) => return Err(error),
             Ok(_) => {}
@@ -1857,19 +2124,18 @@ fn resolve_external_texture<T>(
             Ok(value) => return Ok(value),
         }
     }
-    let name = [
-        &texture.relative_filename,
-        &texture.absolute_filename,
-        &texture.filename,
+    let texture_name = [
+        source.relative_filename,
+        source.absolute_filename,
+        source.filename,
     ]
     .into_iter()
-    .map(|name| name.as_ref() as &str)
-    .find(|name| !name.is_empty())
-    .unwrap_or_default()
+    .find(|candidate| !candidate.is_empty())
+    .unwrap_or(source.name)
     .to_owned();
     Err(AssetError::MissingTexture {
-        model: model.to_owned(),
-        texture: name,
+        model: context.model_path.to_owned(),
+        texture: texture_name,
         tried: tried_paths,
     })
 }
@@ -2016,6 +2282,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn convert_in_place(assets: &Assets, asset_path: &str) -> Model {
+        let expected = assets.load_model(asset_path).unwrap();
+        let ready = assets.convert_model(asset_path).unwrap();
+        fs::write(assets.resolve(asset_path).unwrap(), ready).unwrap();
+        let actual = assets.load_model(asset_path).unwrap();
+        assert_eq!(actual, expected, "{asset_path}");
+        actual
     }
 
     fn write_archive(
@@ -2678,6 +2953,48 @@ mod tests {
     }
 
     #[test]
+    fn prebuilt_dispatch_reports_decode_errors_and_honors_cancellation() {
+        use std::sync::atomic::AtomicBool;
+
+        let temp = TempAssets::new("prebuilt-dispatch-errors");
+        temp.write("model/quad.fbx", quad_fbx(None).as_bytes());
+        let assets = temp.assets();
+        let mut stale = assets.convert_model("/model/quad.fbx").unwrap();
+        stale[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        temp.write("model/stale.fbx", &stale);
+
+        let model_error = assets.load_model("/model/stale.fbx").unwrap_err();
+        assert!(matches!(model_error, AssetError::Decode { .. }));
+        assert!(model_error.to_string().contains("формата v0"));
+        for error in [
+            assets.load_animations("/model/stale.fbx").unwrap_err(),
+            assets.model_dependencies("/model/stale.fbx").unwrap_err(),
+        ] {
+            assert!(matches!(error, AssetError::Decode { .. }), "{error}");
+            assert!(error.to_string().contains("формата v0"), "{error}");
+        }
+
+        let mut foreign = stale;
+        foreign[0] = b'X';
+        temp.write("model/foreign.fbx", &foreign);
+        for error in [
+            assets.load_model("/model/foreign.fbx").unwrap_err(),
+            assets.load_animations("/model/foreign.fbx").unwrap_err(),
+            assets.model_dependencies("/model/foreign.fbx").unwrap_err(),
+        ] {
+            assert!(matches!(error, AssetError::Decode { .. }), "{error}");
+        }
+
+        let ready = assets.convert_model("/model/quad.fbx").unwrap();
+        temp.write("model/ready.fbx", &ready);
+        let cancel = AtomicBool::new(true);
+        let error = assets
+            .load_model_cancellable("/model/ready.fbx", &cancel)
+            .unwrap_err();
+        assert!(matches!(error, AssetError::Cancelled { .. }), "{error}");
+    }
+
+    #[test]
     fn fbx_quad_is_triangulated_with_normals_flipped_uv_and_meters() {
         let temp = TempAssets::new("quad");
         temp.write("model/quad.fbx", quad_fbx(None).as_bytes());
@@ -3137,6 +3454,185 @@ mod tests {
     }
 
     #[test]
+    fn prebuilt_round_trip_matches_fbx_for_fixtures_and_demo_game() {
+        fn collect_fbx(root: &Path, directory: &Path, result: &mut Vec<PathBuf>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    collect_fbx(root, &path, result);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("fbx"))
+                {
+                    result.push(path.strip_prefix(root).unwrap().to_owned());
+                }
+            }
+        }
+
+        fn assert_same<T: std::fmt::Debug + PartialEq>(
+            expected: Result<T, AssetError>,
+            actual: Result<T, AssetError>,
+            asset_path: &str,
+        ) {
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => assert_eq!(actual, expected, "{asset_path}"),
+                (Err(expected), Err(actual)) => {
+                    assert_eq!(actual.to_string(), expected.to_string(), "{asset_path}")
+                }
+                (expected, actual) => {
+                    panic!("{asset_path}: результат отличается: {expected:?} против {actual:?}")
+                }
+            }
+        }
+
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let demo_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-game/Assets");
+        let mut cases = Vec::new();
+        collect_fbx(&fixture_root, &fixture_root, &mut cases);
+        for relative in cases.iter_mut() {
+            *relative = PathBuf::from("fixtures").join(&*relative);
+        }
+        let mut demo_cases = Vec::new();
+        collect_fbx(&demo_root, &demo_root, &mut demo_cases);
+        for relative in demo_cases {
+            cases.push(PathBuf::from("demo").join(relative));
+        }
+
+        for relative in cases {
+            let (source_root, source_relative) = if relative.starts_with("fixtures") {
+                (&fixture_root, relative.strip_prefix("fixtures").unwrap())
+            } else {
+                (&demo_root, relative.strip_prefix("demo").unwrap())
+            };
+            let virtual_path = format!("/{}", source_relative.to_string_lossy().replace('\\', "/"));
+            let temp = TempAssets::new("prebuilt-round-trip");
+            let source_path = source_root.join(source_relative);
+            temp.write(
+                source_relative.to_str().unwrap(),
+                &fs::read(&source_path).unwrap(),
+            );
+            let original = Assets::new(source_root);
+            if let Ok(dependencies) = original.model_dependencies(&virtual_path) {
+                for dependency in dependencies {
+                    let relative_dependency = dependency.trim_start_matches('/');
+                    let dependency_bytes = fs::read(source_root.join(relative_dependency)).unwrap();
+                    temp.write(relative_dependency, &dependency_bytes);
+                }
+            }
+            let source = temp.assets();
+            let direct_model = source.load_model(&virtual_path);
+            let direct_animations = source.load_animations(&virtual_path);
+            let direct_dependencies = source.model_dependencies(&virtual_path);
+            let ready = source
+                .convert_model(&virtual_path)
+                .unwrap_or_else(|error| panic!("convert {virtual_path}: {error}"));
+            temp.write(source_relative.to_str().unwrap(), &ready);
+
+            let ready_assets = temp.assets();
+            assert_same(
+                direct_model,
+                ready_assets.load_model(&virtual_path),
+                &virtual_path,
+            );
+            assert_same(
+                direct_animations,
+                ready_assets.load_animations(&virtual_path),
+                &virtual_path,
+            );
+            assert_same(
+                direct_dependencies,
+                ready_assets.model_dependencies(&virtual_path),
+                &virtual_path,
+            );
+
+            let (mut resources, resource_assets) = temp.resource_assets();
+            assert_same(
+                ready_assets.load_model(&virtual_path),
+                resource_assets.load_model(&virtual_path),
+                &virtual_path,
+            );
+            assert_same(
+                ready_assets.load_animations(&virtual_path),
+                resource_assets.load_animations(&virtual_path),
+                &virtual_path,
+            );
+            assert_same(
+                ready_assets.model_dependencies(&virtual_path),
+                resource_assets.model_dependencies(&virtual_path),
+                &virtual_path,
+            );
+            resources.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn prebuilt_golden_artifacts_match_the_current_converter() {
+        let assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures"));
+        let golden_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden");
+        let update =
+            std::env::var_os("RVE_UPDATE_FIXTURES").as_deref() == Some(std::ffi::OsStr::new("1"));
+        if update {
+            fs::create_dir_all(&golden_dir).unwrap();
+        }
+        for (asset_path, golden_name) in [
+            ("/skin_chain_textured.fbx", "skin_chain_textured.rvemodel"),
+            ("/bend_clip.fbx", "bend_clip.rvemodel"),
+        ] {
+            let bytes = assets.convert_model(asset_path).unwrap();
+            let golden_path = golden_dir.join(golden_name);
+            if update {
+                fs::write(&golden_path, bytes).unwrap();
+            } else {
+                assert_eq!(
+                    fs::read(&golden_path).unwrap(),
+                    bytes,
+                    "{}",
+                    golden_path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_parts_texture_error_precedes_a_later_material_recipe_error() {
+        let mut fbx = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skin_chain_textured.fbx"),
+        )
+        .unwrap()
+        .replace("textures/golden_texture.png", "missing.png");
+        let second_material = "\tMaterial: 601, \"Material::Broken\", \"\" {\n\t\tVersion: 102\n\t\tShadingModel: \"lambert\"\n\t}\n\tLayeredTexture: 701, \"LayeredTexture::BrokenOpacity\", \"\" {\n\t}\n";
+        assert_eq!(fbx.matches("\n}\nConnections:  {\n").count(), 1);
+        fbx = fbx.replace(
+            "\n}\nConnections:  {\n",
+            &format!("\n{second_material}}}\nConnections:  {{\n"),
+        );
+        assert_eq!(fbx.matches("\tC: \"OO\",600,200\n").count(), 1);
+        fbx = fbx.replace(
+            "\tC: \"OO\",600,200\n",
+            "\tC: \"OO\",600,200\n\tC: \"OO\",601,201\n\tC: \"OP\",701,601, \"TransparencyFactor\"\n",
+        );
+        let temp = TempAssets::new("material-error-order");
+        temp.write("skin_chain_textured.fbx", fbx.as_bytes());
+
+        let error = temp
+            .assets()
+            .load_model("/skin_chain_textured.fbx")
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AssetError::MissingTexture { ref texture, .. } if texture == "missing.png"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn model_dependencies_preserves_missing_texture_error_and_returns_empty_without_textures() {
         let temp = TempAssets::new("model-dependencies-missing");
         temp.write("model/missing.fbx", quad_fbx(Some("lost.png")).as_bytes());
@@ -3400,6 +3896,8 @@ mod tests {
             );
         temp.write("model/embedded.fbx", fbx.as_bytes());
         let expected = temp.assets().load_model("/model/embedded.fbx").unwrap();
+        let ready = temp.assets().convert_model("/model/embedded.fbx").unwrap();
+        temp.write("model/embedded.fbx", &ready);
         let (_system, assets) = temp.resource_assets();
         let model = assets.load_model("/model/embedded.fbx").unwrap();
         assert_eq!(model, expected);
@@ -3538,6 +4036,8 @@ mod tests {
             assets.model_dependencies("/model/pbr.fbx").unwrap(),
             ["/model/emissive.png", "/model/opacity.png"]
         );
+        let ready = convert_in_place(&assets, "/model/pbr.fbx");
+        assert_eq!(ready, model);
     }
 
     #[test]
@@ -3727,6 +4227,7 @@ mod tests {
         let packed = &model.textures[first.metallic_roughness_texture.unwrap()];
         assert_eq!((packed.width, packed.height), (2, 1));
         assert_eq!(packed.rgba, [0, 64, 16, 255, 0, 192, 32, 255]);
+        assert_eq!(convert_in_place(&temp.assets(), "/model/pbr.fbx"), model);
     }
 
     #[test]
@@ -3756,6 +4257,69 @@ mod tests {
         assert_eq!(material.roughness, 1.0);
         assert_eq!(material.metallic_roughness_texture, Some(0));
         assert_eq!(model.textures[0].rgba, [9, 64, 192, 255]);
+        assert_eq!(convert_in_place(&temp.assets(), "/model/pbr.fbx"), model);
+    }
+
+    #[test]
+    fn prebuilt_keeps_distinct_texture_elements_that_reference_the_same_png() {
+        let temp = TempAssets::new("prebuilt-distinct-texture-elements");
+        let fbx = arnold_quad_fbx(
+            "",
+            &[("baseColor", "same.png"), ("normalCamera", "same.png")],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/same.png", &rgba_png());
+
+        let assets = temp.assets();
+        let model = assets.load_model("/model/pbr.fbx").unwrap();
+        assert_eq!(model.textures.len(), 2);
+        assert_eq!(model.meshes[0].material.base_color_texture, Some(0));
+        assert_eq!(model.meshes[0].material.normal_texture, Some(1));
+        assert_eq!(convert_in_place(&assets, "/model/pbr.fbx"), model);
+    }
+
+    #[test]
+    fn prebuilt_resolves_external_png_changes_when_loaded() {
+        let temp = TempAssets::new("prebuilt-changing-texture");
+        let fbx = quad_fbx(Some("paint.png"));
+        temp.write("model/quad.fbx", fbx.as_bytes());
+        let opaque = encode_png(
+            1,
+            1,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &[10, 20, 30, 255],
+        );
+        temp.write("model/paint.png", &opaque);
+        let assets = temp.assets();
+        let ready = assets.convert_model("/model/quad.fbx").unwrap();
+        temp.write("model/quad.fbx", &ready);
+        assert_eq!(
+            assets.load_model("/model/quad.fbx").unwrap().meshes[0]
+                .material
+                .alpha_mode,
+            ModelAlphaMode::Opaque
+        );
+
+        let transparent = encode_png(
+            1,
+            1,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &[10, 20, 30, 0],
+        );
+        temp.write("model/paint.png", &transparent);
+        let actual = assets.load_model("/model/quad.fbx").unwrap();
+        assert_eq!(actual.meshes[0].material.alpha_mode, ModelAlphaMode::Blend);
+
+        let direct = TempAssets::new("prebuilt-changing-texture-direct");
+        direct.write("model/quad.fbx", fbx.as_bytes());
+        direct.write("model/paint.png", &transparent);
+        assert_eq!(
+            actual,
+            direct.assets().load_model("/model/quad.fbx").unwrap()
+        );
     }
 
     #[test]
