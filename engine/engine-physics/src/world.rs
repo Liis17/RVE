@@ -414,16 +414,6 @@ impl Body {
         rotation * self.inverse_inertia_local * rotation.transpose()
     }
 
-    pub(crate) fn velocity_at(&self, point: Vec3) -> Vec3 {
-        if self.character_controller {
-            return Vec3::ZERO;
-        }
-        self.linear_velocity
-            + self
-                .angular_velocity
-                .cross(point - self.center_of_mass_world())
-    }
-
     pub(crate) fn apply_impulse(&mut self, point: Vec3, impulse: Vec3) {
         if self.kind != BodyKind::Dynamic {
             return;
@@ -745,6 +735,7 @@ impl PhysicsWorld {
             &mut self.bodies,
             &mut self.active_pairs,
             &mut self.manifolds,
+            &islands,
         );
         for body in self.bodies.values_mut() {
             body.integrate_position(dt);
