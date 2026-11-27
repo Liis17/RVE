@@ -734,6 +734,13 @@ impl PhysicsWorld {
             body.advance_kinematic(dt, remaining_substeps);
         }
         let events = self.refresh_pairs()?;
+        let islands = crate::island::build(
+            self.bodies
+                .values()
+                .filter(|body| body.kind == BodyKind::Dynamic)
+                .map(|body| body.handle),
+            &self.active_pairs,
+        );
         crate::solver::solve(
             &mut self.bodies,
             &mut self.active_pairs,
@@ -743,7 +750,7 @@ impl PhysicsWorld {
             body.integrate_position(dt);
         }
         crate::solver::correct_positions(&mut self.bodies, &self.active_pairs);
-        self.update_sleep(dt);
+        self.update_sleep(dt, &islands);
         Ok(events)
     }
 
@@ -1223,7 +1230,7 @@ impl PhysicsWorld {
 
     /// Засыпание островами: остров — компонента контактов между динамическими телами. Он засыпает
     /// целиком, когда каждое тело успокоилось и ни одно не касается движущегося kinematic.
-    fn update_sleep(&mut self, dt: f32) {
+    fn update_sleep(&mut self, dt: f32, islands: &[crate::island::Island]) {
         for body in self.bodies.values_mut() {
             if body.kind != BodyKind::Dynamic || body.sleeping {
                 continue;
@@ -1237,7 +1244,6 @@ impl PhysicsWorld {
             }
         }
 
-        let graph = self.dynamic_contact_graph();
         let mut held_awake = HashSet::new();
         for (key, pair) in &self.active_pairs {
             if pair.kind != PairKind::Collision {
@@ -1255,29 +1261,13 @@ impl PhysicsWorld {
             }
         }
 
-        let starts: Vec<BodyHandle> = self
-            .bodies
-            .values()
-            .filter(|body| body.kind == BodyKind::Dynamic && !body.sleeping)
-            .map(|body| body.handle)
-            .collect();
-        let mut visited = HashSet::new();
-        for start in starts {
-            if !visited.insert(start) {
+        for island in islands {
+            if !island.has_awake_body(|handle| {
+                self.bodies.get(&handle).is_some_and(|body| !body.sleeping)
+            }) {
                 continue;
             }
-            let mut island = vec![start];
-            let mut index = 0;
-            while index < island.len() {
-                let current = island[index];
-                index += 1;
-                for neighbor in graph.get(&current).into_iter().flatten() {
-                    if visited.insert(*neighbor) {
-                        island.push(*neighbor);
-                    }
-                }
-            }
-            let ready = island.iter().all(|handle| {
+            let ready = island.bodies.iter().all(|handle| {
                 !held_awake.contains(handle)
                     && self
                         .bodies
@@ -1285,8 +1275,8 @@ impl PhysicsWorld {
                         .is_some_and(|body| body.sleep_time >= SLEEP_DELAY_SECONDS)
             });
             if ready {
-                for handle in island {
-                    if let Some(body) = self.bodies.get_mut(&handle) {
+                for handle in &island.bodies {
+                    if let Some(body) = self.bodies.get_mut(handle) {
                         body.sleeping = true;
                         body.linear_velocity = Vec3::ZERO;
                         body.angular_velocity = Vec3::ZERO;
