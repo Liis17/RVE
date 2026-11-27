@@ -596,13 +596,22 @@ pub(crate) fn scripts_thread(
         }
         animation.apply(scripts.drain_animation_requests());
         particle_commands.extend(scripts.drain_particle_commands());
-        let finished = animation.advance(dt);
-        scripts.queue_animation_events(
-            &world,
-            finished.into_iter().map(|event| match event {
-                AnimationEvent::Finished { object, motion } => (object, motion),
-            }),
-        );
+        let events = animation.advance(dt);
+        let mut finished = Vec::new();
+        let mut markers = Vec::new();
+        for event in events {
+            match event {
+                AnimationEvent::Finished { object, motion } => finished.push((object, motion)),
+                AnimationEvent::Marker {
+                    object,
+                    motion,
+                    clip,
+                    marker,
+                } => markers.push((object, motion, clip, marker)),
+            }
+        }
+        scripts.queue_animation_events(&world, finished);
+        scripts.queue_animation_markers(&world, markers);
         log_animation_warnings(&mut animation);
         let world_changes_started = Instant::now();
         net::apply(&mut network, &mut world, &mut scripts);

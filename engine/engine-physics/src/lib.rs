@@ -8,6 +8,7 @@ pub mod bvh;
 pub mod character;
 mod error;
 pub mod hull;
+mod island;
 mod material;
 pub mod narrow;
 pub mod query;

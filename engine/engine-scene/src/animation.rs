@@ -30,6 +30,13 @@ pub struct AnimatorComponent {
     pub speed: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blend_trees: Vec<BlendTree>,
+    #[serde(
+        default = "default_marker_min_weight",
+        skip_serializing_if = "is_default_marker_min_weight"
+    )]
+    pub marker_min_weight: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<AnimationMarker>,
 }
 
 impl AnimatorComponent {
@@ -42,6 +49,8 @@ impl AnimatorComponent {
             looping: true,
             speed: 1.0,
             blend_trees: Vec::new(),
+            marker_min_weight: 0.5,
+            markers: Vec::new(),
         }
     }
 }
@@ -67,6 +76,15 @@ pub struct BlendTree {
 pub struct BlendTreePoint {
     pub clip: String,
     pub threshold: f32,
+}
+
+/// Именованный маркер клипа в секундах от начала клипа.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnimationMarker {
+    pub clip: String,
+    pub name: String,
+    pub time: f32,
 }
 
 /// Запрос к аниматору, накопленный скриптами за кадр.
@@ -130,6 +148,12 @@ pub(crate) fn validate_animator_fields(
     if !animator.speed.is_finite() || animator.speed < 0.0 {
         return Err(error(
             "animator.speed должен быть конечным и не меньше 0".to_owned(),
+        ));
+    }
+    if !animator.marker_min_weight.is_finite() || !(0.0..=1.0).contains(&animator.marker_min_weight)
+    {
+        return Err(error(
+            "animator.marker_min_weight должен быть конечным и лежать в [0, 1]".to_owned(),
         ));
     }
     let mut clip_names = HashSet::new();
@@ -202,6 +226,37 @@ pub(crate) fn validate_animator_fields(
             )));
         }
     }
+    let mut marker_keys = HashSet::new();
+    for marker in &animator.markers {
+        if marker.clip.is_empty() {
+            return Err(error(
+                "animator marker.clip не может быть пустым".to_owned(),
+            ));
+        }
+        if !is_identifier(&marker.name) {
+            return Err(error(format!(
+                "имя маркера `{}` должно быть идентификатором",
+                marker.name
+            )));
+        }
+        if !marker.time.is_finite() || marker.time < 0.0 {
+            return Err(error(format!(
+                "время маркера `{}` должно быть конечным и не меньше 0",
+                marker.name
+            )));
+        }
+        let time_bits = if marker.time == 0.0 {
+            0
+        } else {
+            marker.time.to_bits()
+        };
+        if !marker_keys.insert((marker.clip.as_str(), marker.name.as_str(), time_bits)) {
+            return Err(error(format!(
+                "маркер `{}` для клипа `{}` с временем {} повторяется",
+                marker.name, marker.clip, marker.time
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -233,6 +288,14 @@ fn default_speed() -> f32 {
 
 fn is_default_speed(value: &f32) -> bool {
     *value == 1.0
+}
+
+fn default_marker_min_weight() -> f32 {
+    0.5
+}
+
+fn is_default_marker_min_weight(value: &f32) -> bool {
+    *value == default_marker_min_weight()
 }
 
 /// Список виртуальных путей в TOML: строки с ведущим `/`.
@@ -290,9 +353,19 @@ mod tests {
         assert_eq!(animator, AnimatorComponent::new());
         assert!(animator.play_on_start && animator.looping);
         assert_eq!(animator.speed, 1.0);
+        assert_eq!(animator.marker_min_weight, 0.5);
+        assert!(animator.markers.is_empty());
         let text = document.to_toml().unwrap();
         assert!(text.contains("[objects.animator]"), "{text}");
-        for field in ["play_on_start", "looping", "speed", "clips", "blend_trees"] {
+        for field in [
+            "play_on_start",
+            "looping",
+            "speed",
+            "clips",
+            "blend_trees",
+            "marker_min_weight",
+            "markers",
+        ] {
             assert!(
                 !text.contains(field),
                 "{field} не должен сохраняться: {text}"
@@ -302,13 +375,17 @@ mod tests {
 
     #[test]
     fn full_component_round_trips_through_toml() {
-        let fields = "clips = [\"/anims/run.fbx\", \"/anims/walk.fbx\"]\ndefault_motion = \"locomotion\"\nplay_on_start = false\nlooping = false\nspeed = 0.5\n\n[[objects.animator.blend_trees]]\nname = \"locomotion\"\nparameter = \"speed\"\n\n[[objects.animator.blend_trees.points]]\nclip = \"walk\"\nthreshold = 1.0\n\n[[objects.animator.blend_trees.points]]\nclip = \"run\"\nthreshold = 4.0\n";
+        let fields = "clips = [\"/anims/run.fbx\", \"/anims/walk.fbx\"]\ndefault_motion = \"locomotion\"\nplay_on_start = false\nlooping = false\nspeed = 0.5\nmarker_min_weight = 0.75\n\n[[objects.animator.blend_trees]]\nname = \"locomotion\"\nparameter = \"speed\"\n\n[[objects.animator.blend_trees.points]]\nclip = \"walk\"\nthreshold = 1.0\n\n[[objects.animator.blend_trees.points]]\nclip = \"run\"\nthreshold = 4.0\n\n[[objects.animator.markers]]\nclip = \"walk\"\nname = \"FootDown\"\ntime = 0.0\n\n[[objects.animator.markers]]\nclip = \"walk\"\nname = \"FootDown\"\ntime = 0.5\n";
         let document = parse(&source(fields)).unwrap();
         let animator = document.objects[1].animator.clone().unwrap();
         assert_eq!(animator.clips.len(), 2);
         assert_eq!(animator.default_motion.as_deref(), Some("locomotion"));
         assert!(!animator.play_on_start && !animator.looping);
         assert_eq!(animator.speed, 0.5);
+        assert_eq!(animator.marker_min_weight, 0.75);
+        assert_eq!(animator.markers.len(), 2);
+        assert_eq!(animator.markers[0].name, "FootDown");
+        assert_eq!(animator.markers[0].time, 0.0);
         assert_eq!(animator.blend_trees[0].points[1].clip, "run");
 
         let text = document.to_toml().unwrap();
@@ -336,6 +413,46 @@ mod tests {
             ),
             ("speed = -1.0", "speed", "neg"),
             ("speed = nan", "speed", "nan speed"),
+            (
+                "marker_min_weight = -0.1",
+                "marker_min_weight",
+                "negative marker weight",
+            ),
+            (
+                "marker_min_weight = 1.1",
+                "marker_min_weight",
+                "large marker weight",
+            ),
+            (
+                "marker_min_weight = nan",
+                "marker_min_weight",
+                "nan marker weight",
+            ),
+            (
+                "[[objects.animator.markers]]\nclip = \"\"\nname = \"Hit\"\ntime = 0.0\n",
+                "clip не может быть пустым",
+                "empty marker clip",
+            ),
+            (
+                "[[objects.animator.markers]]\nclip = \"walk\"\nname = \"bad-name\"\ntime = 0.0\n",
+                "идентификатор",
+                "invalid marker name",
+            ),
+            (
+                "[[objects.animator.markers]]\nclip = \"walk\"\nname = \"Hit\"\ntime = -0.1\n",
+                "время маркера",
+                "negative marker time",
+            ),
+            (
+                "[[objects.animator.markers]]\nclip = \"walk\"\nname = \"Hit\"\ntime = nan\n",
+                "время маркера",
+                "non-finite marker time",
+            ),
+            (
+                "[[objects.animator.markers]]\nclip = \"walk\"\nname = \"Hit\"\ntime = 0.5\n\n[[objects.animator.markers]]\nclip = \"walk\"\nname = \"Hit\"\ntime = 0.5\n",
+                "повторяется",
+                "duplicate marker",
+            ),
             ("default_motion = \"\"", "default_motion", "empty default"),
             (
                 "clips = [\"/anims/run.fbx\"]\n\n[[objects.animator.blend_trees]]\nname = \"run\"\nparameter = \"speed\"\n\n[[objects.animator.blend_trees.points]]\nclip = \"run\"\nthreshold = 1.0\n",

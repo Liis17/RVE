@@ -1,4 +1,5 @@
 use crate::error::BuildError;
+use crate::models::{MODEL_CACHE_LIMIT_BYTES, ModelPreparationMode, prune_model_cache};
 use crate::project::ProjectBuild;
 use crate::temporary::TempDir;
 use engine_files::VirtualPath;
@@ -190,6 +191,15 @@ pub(crate) fn build_project_archives(
     built
         .map_err(|error| BuildError::operational(format!("не удалось собрать архивы: {error}")))?;
 
+    if project.model_preparation_mode == ModelPreparationMode::Build
+        && let Err(error) = prune_model_cache(&project.project_dir, MODEL_CACHE_LIMIT_BYTES)
+    {
+        eprintln!(
+            "предупреждение: не удалось ограничить размер кеша готовых моделей {}: {error}",
+            project.project_dir.join(".rve/model-cache").display()
+        );
+    }
+
     Ok(registry)
 }
 
@@ -197,13 +207,15 @@ pub(crate) fn build_project_archives(
 pub(crate) mod tests {
     use super::build_project_archives;
     use crate::player::validate_staged_archives;
-    use crate::project::prepare_project;
+    use crate::project::prepare_project_for_build as prepare_project;
     use crate::temporary::TempDir;
+    use engine_assets::{Assets, is_prebuilt_model};
     use engine_files::VirtualPath;
     use engine_pak::{
         Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, BuildCompression,
         CatalogLimits, Codec,
     };
+    use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use png::{BitDepth, ColorType, Encoder};
     use std::collections::BTreeMap;
     use std::fs;
@@ -419,6 +431,51 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn distribution_archive_contains_ready_model_at_its_original_path() {
+        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-ready-model").unwrap();
+        create_demo_like_project(project_root.path());
+        let source_assets = Assets::new(project_root.path().join("Assets"));
+        let expected = source_assets.load_model("/models/shared.fbx").unwrap();
+        let expected_dependencies = source_assets
+            .model_dependencies("/models/shared.fbx")
+            .unwrap();
+        let project = prepare_project(project_root.path()).unwrap();
+        let archives_dir = project_root.path().join("out-assets");
+        let registry =
+            build_project_archives(&project, &archives_dir, BuildCompression::default(), None)
+                .unwrap();
+
+        let shared = Archive::open_file(archives_dir.join("shared.rvepak")).unwrap();
+        let packed = shared
+            .read_all(&VirtualPath::parse("/models/shared.fbx").unwrap())
+            .unwrap();
+        assert!(is_prebuilt_model(&packed));
+        assert_eq!(
+            registry.assets()[&VirtualPath::parse("/models/shared.fbx").unwrap()],
+            "shared"
+        );
+
+        let mut resources = ResourceSystem::start(ResourceConfig {
+            root: archives_dir,
+            source_mode: SourceMode::Registry,
+            ..ResourceConfig::default()
+        })
+        .unwrap();
+        let runtime_assets = Assets::with_resources(resources.handle());
+        assert_eq!(
+            runtime_assets.load_model("/models/shared.fbx").unwrap(),
+            expected
+        );
+        assert_eq!(
+            runtime_assets
+                .model_dependencies("/models/shared.fbx")
+                .unwrap(),
+            expected_dependencies
+        );
+        resources.shutdown().unwrap();
     }
 
     /// Добавляет `[localization]` с таблицами `en` и `ru` в проект и пишет их файлы.

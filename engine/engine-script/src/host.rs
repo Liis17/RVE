@@ -56,6 +56,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+/// Максимум маркеров анимации, доставляемых скриптам за один кадр.
+pub const MAX_ANIMATION_MARKERS_PER_FRAME: usize = 1024;
+
 /// Script source compilation or heavy-factory failure during host creation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptLoadError {
@@ -247,6 +250,9 @@ pub struct ScriptHost {
     due_coroutines: Vec<ScriptCoroutine>,
     queued_messages: Vec<PendingMessage>,
     queued_bytes: usize,
+    queued_animation_markers: Vec<QueuedAnimationMarker>,
+    delivery_animation_markers: Vec<QueuedAnimationMarker>,
+    dropped_animation_markers: usize,
     audio_requests: Vec<AudioRequest>,
     animation_requests: Vec<AnimationRequest>,
     particle_requests: Vec<engine_scene::world::ParticleCommand>,
@@ -323,6 +329,7 @@ enum Phase {
     Message,
     Timer,
     Coroutine,
+    AnimationMarker,
     PhysicsEvent(ScriptPhysicsEvent),
     /// Сетевое событие; его данные передаются в `call_instance` отдельно.
     Net,
@@ -337,6 +344,13 @@ struct ScriptPhysicsEvent {
     other: ObjectHandle,
     point: glam::Vec3,
     normal: glam::Vec3,
+}
+
+struct QueuedAnimationMarker {
+    object: ObjectHandle,
+    marker: String,
+    motion: String,
+    clip: String,
 }
 
 #[derive(Clone, Copy)]
@@ -532,6 +546,9 @@ impl ScriptHost {
             due_coroutines: Vec::with_capacity(crate::timeline::MAX_SCRIPT_COROUTINES),
             queued_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             queued_bytes: 0,
+            queued_animation_markers: Vec::new(),
+            delivery_animation_markers: Vec::new(),
+            dropped_animation_markers: 0,
             audio_requests: Vec::new(),
             animation_requests: Vec::new(),
             particle_requests: Vec::new(),
@@ -1554,6 +1571,20 @@ impl ScriptHost {
         }
         std::mem::swap(&mut self.queued_messages, &mut self.delivery_messages);
         self.queued_bytes = 0;
+        std::mem::swap(
+            &mut self.queued_animation_markers,
+            &mut self.delivery_animation_markers,
+        );
+        let dropped_animation_markers = std::mem::take(&mut self.dropped_animation_markers);
+        if dropped_animation_markers > 0 {
+            self.events.borrow_mut().push(ScriptEvent {
+                level: ScriptEventLevel::Warn,
+                source: self.scene_name.clone(),
+                message: format!(
+                    "dropped {dropped_animation_markers} animation marker event(s); limit is {MAX_ANIMATION_MARKERS_PER_FRAME} per frame"
+                ),
+            });
+        }
         match self.fixed_step.advance(frame_time.dt) {
             Ok(substeps) => {
                 let fixed_dt = self.fixed_step.fixed_dt();
@@ -1570,6 +1601,8 @@ impl ScriptHost {
         self.run_phase(world, Phase::Update(frame_time.dt), time);
         self.sync_after_run_phase(world, time);
         self.resume_coroutines(world, time);
+        self.sync_phase_boundary(world, time);
+        self.deliver_animation_markers(world, time);
         self.sync_phase_boundary(world, time);
         self.deliver_messages(world, time);
         self.sync_phase_boundary(world, time);
@@ -1938,6 +1971,30 @@ impl ScriptHost {
         }
     }
 
+    /// Ставит маркеры анимации в очередь до следующего `update_frame`.
+    /// Переполнение отбрасывает хвост и выдаёт одно предупреждение с числом потерянных маркеров.
+    pub fn queue_animation_markers(
+        &mut self,
+        world: &World,
+        events: impl IntoIterator<Item = (ObjectHandle, String, String, String)>,
+    ) {
+        for (object, motion, clip, marker) in events {
+            if world.object(object).is_none() {
+                continue;
+            }
+            if self.queued_animation_markers.len() >= MAX_ANIMATION_MARKERS_PER_FRAME {
+                self.dropped_animation_markers = self.dropped_animation_markers.saturating_add(1);
+                continue;
+            }
+            self.queued_animation_markers.push(QueuedAnimationMarker {
+                object,
+                marker,
+                motion,
+                clip,
+            });
+        }
+    }
+
     pub fn command_catalog(&self) -> CommandCatalog {
         let mut catalog = CommandCatalog::default();
         for command in self.commands.borrow().values() {
@@ -2205,6 +2262,7 @@ impl ScriptHost {
                     time_error.as_deref(),
                     None,
                     None,
+                    None,
                 )
             };
             let elapsed = started.elapsed();
@@ -2344,6 +2402,7 @@ impl ScriptHost {
                 time_error,
                 None,
                 None,
+                None,
             ) {
                 CallOutcome::Committed => {}
                 outcome => return outcome,
@@ -2360,6 +2419,7 @@ impl ScriptHost {
             time_error,
             None,
             None,
+            None,
         )
     }
 
@@ -2372,7 +2432,7 @@ impl ScriptHost {
         time_error: Option<&str>,
     ) {
         match self.call_instance(
-            index, world, phase, time, None, None, None, time_error, None, None,
+            index, world, phase, time, None, None, None, time_error, None, None, None,
         ) {
             CallOutcome::Committed => {}
             CallOutcome::Interrupted => self.disable_instance(index),
@@ -2412,6 +2472,47 @@ impl ScriptHost {
                     time_error.as_deref(),
                     None,
                     None,
+                    None,
+                ) {
+                    CallOutcome::Committed => {}
+                    CallOutcome::Interrupted => self.disable_instance(index),
+                    CallOutcome::Failed(message) => self.fail_instance(index, message),
+                }
+            }
+        }
+    }
+
+    fn deliver_animation_markers(&mut self, world: &mut World, time: ScriptTime) {
+        if self.delivery_animation_markers.is_empty() {
+            return;
+        }
+        self.delivery_animation_markers.reverse();
+        let time_error = lite::set_time(&self.lua_time, self.frame_time)
+            .err()
+            .map(|error| error.to_string());
+        while let Some(marker) = self.delivery_animation_markers.pop() {
+            if world.object(marker.object).is_none() {
+                continue;
+            }
+            for index in 0..self.instances.len() {
+                let Some(instance) = self.instances[index].as_ref() else {
+                    continue;
+                };
+                if !instance.enabled || !instance.running || instance.handle != marker.object {
+                    continue;
+                }
+                match self.call_instance(
+                    index,
+                    world,
+                    Phase::AnimationMarker,
+                    time,
+                    None,
+                    None,
+                    None,
+                    time_error.as_deref(),
+                    None,
+                    None,
+                    Some(&marker),
                 ) {
                     CallOutcome::Committed => {}
                     CallOutcome::Interrupted => self.disable_instance(index),
@@ -2453,6 +2554,7 @@ impl ScriptHost {
                 time_error.as_deref(),
                 None,
                 Some(coroutine),
+                None,
             ) {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => self.disable_instance(index),
@@ -2498,6 +2600,7 @@ impl ScriptHost {
                 None,
                 time_error.as_deref(),
                 Some(timer),
+                None,
                 None,
             ) {
                 CallOutcome::Committed => {}
@@ -2560,6 +2663,7 @@ impl ScriptHost {
                     Some(&event),
                     None,
                     time_error.as_deref(),
+                    None,
                     None,
                     None,
                 ) {
@@ -2649,6 +2753,7 @@ impl ScriptHost {
                     None,
                     Some(&delivery),
                     time_error.as_deref(),
+                    None,
                     None,
                     None,
                 ) {
@@ -2899,6 +3004,7 @@ impl ScriptHost {
                 None,
                 None,
                 None,
+                None,
             ) {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => self.disable_instance(index),
@@ -2920,6 +3026,7 @@ impl ScriptHost {
         time_error: Option<&str>,
         timer: Option<&DueTimer>,
         coroutine: Option<&ScriptCoroutine>,
+        animation_marker: Option<&QueuedAnimationMarker>,
     ) -> CallOutcome {
         let mut callback_time = self.frame_time;
         match phase {
@@ -3062,6 +3169,7 @@ impl ScriptHost {
                 }
                 let has_callback = match phase {
                     Phase::Message => lite_instance.has_message_callback(),
+                    Phase::AnimationMarker => lite_instance.has_callback("on_animation_marker"),
                     Phase::Enable => lite_instance.has_callback("on_enable"),
                     Phase::Disable | Phase::TeardownDisable => {
                         lite_instance.has_callback("on_disable")
@@ -3099,6 +3207,16 @@ impl ScriptHost {
                                                 &message.value,
                                             ),
                                             None => Err(LuaError::runtime("missing message data")),
+                                        },
+                                        Phase::AnimationMarker => match animation_marker {
+                                            Some(marker) => lite_instance.invoke_animation_marker(
+                                                &marker.marker,
+                                                &marker.motion,
+                                                &marker.clip,
+                                            ),
+                                            None => Err(LuaError::runtime(
+                                                "missing animation marker data",
+                                            )),
                                         },
                                         Phase::PhysicsEvent(event) => lite_instance
                                             .invoke_physics_event(
@@ -3366,6 +3484,16 @@ impl ScriptHost {
                             call,
                         ),
                         None => Err("missing message data".to_owned()),
+                    },
+                    Phase::AnimationMarker => match animation_marker {
+                        Some(marker) => script.invoke_animation_marker(
+                            time,
+                            &marker.marker,
+                            &marker.motion,
+                            &marker.clip,
+                            call,
+                        ),
+                        None => Err("missing animation marker data".to_owned()),
                     },
                     Phase::Start => script.invoke(AbiPhase::Start, time, call),
                     Phase::Enable => script.invoke(AbiPhase::Enable, time, call),

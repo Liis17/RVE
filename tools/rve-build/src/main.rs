@@ -5,6 +5,7 @@ mod error;
 mod explain;
 #[cfg(windows)]
 mod ico;
+mod models;
 mod platform;
 mod player;
 mod project;
