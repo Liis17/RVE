@@ -115,12 +115,30 @@ struct PreparedMotion {
 /// Пересечение без строковых копий; список хранится и переиспользуется аниматором.
 #[derive(Clone, Copy, Debug)]
 struct MarkerIntersection {
-    fraction: f64,
+    fraction_key: u32,
     playback: usize,
     motion: usize,
     tree_point: usize,
     clip: usize,
     marker: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TickInterval {
+    before: f32,
+    after: f32,
+    unwrapped_after: f32,
+    wraps: f64,
+}
+
+struct MarkerCollection<'a> {
+    clips: &'a [Clip],
+    parameters: &'a HashMap<String, f32>,
+    playback: &'a Playback,
+    playback_order: usize,
+    marker_min_weight: f32,
+    interval: TickInterval,
+    output: &'a mut Vec<MarkerIntersection>,
 }
 
 impl PreparedMotion {
@@ -458,21 +476,21 @@ impl Animator {
             };
             playback.time = after;
             if advanced_by > 0.0 && unwrapped_after > before {
-                collect_marker_intersections(
-                    &motions[playback.motion],
-                    playback.motion,
-                    &prepared[playback.motion],
+                let mut collection = MarkerCollection {
                     clips,
                     parameters,
                     playback,
                     playback_order,
-                    *marker_min_weight,
-                    before,
-                    after,
-                    unwrapped_after,
-                    wraps,
-                    marker_intersections,
-                );
+                    marker_min_weight: *marker_min_weight,
+                    interval: TickInterval {
+                        before,
+                        after,
+                        unwrapped_after,
+                        wraps,
+                    },
+                    output: marker_intersections,
+                };
+                collection.collect(&motions[playback.motion], &prepared[playback.motion]);
             }
             if !playback.looping && unwrapped_after >= duration {
                 playback.time = duration;
@@ -493,8 +511,8 @@ impl Animator {
             finished_events
         } else {
             marker_intersections.sort_unstable_by(|left, right| {
-                left.fraction
-                    .total_cmp(&right.fraction)
+                left.fraction_key
+                    .cmp(&right.fraction_key)
                     .then_with(|| left.playback.cmp(&right.playback))
                     .then_with(|| left.tree_point.cmp(&right.tree_point))
                     .then_with(|| left.marker.cmp(&right.marker))
@@ -709,168 +727,119 @@ fn move_toward(current: f32, target: f32, step: f32) -> f32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_marker_intersections(
-    motion: &Motion,
-    motion_index: usize,
-    prepared: &PreparedMotion,
-    clips: &[Clip],
-    parameters: &HashMap<String, f32>,
-    playback: &Playback,
-    playback_order: usize,
-    marker_min_weight: f32,
-    before: f32,
-    after: f32,
-    unwrapped_after: f32,
-    wraps: f64,
-    output: &mut Vec<MarkerIntersection>,
-) {
-    if !prepared.has_markers
-        || playback.weight <= 0.0
-        || prepared.duration <= 0.0
-        || !prepared.duration.is_finite()
-    {
-        return;
-    }
-    match &motion.source {
-        MotionSource::Clip { clip } => add_clip_marker_intersections(
-            *clip,
-            playback.weight,
-            0,
-            motion_index,
-            clips,
-            prepared.duration,
-            playback.looping,
-            before,
-            after,
-            unwrapped_after,
-            wraps,
-            playback_order,
-            marker_min_weight,
-            output,
-        ),
-        MotionSource::Tree { parameter, points } => {
-            let value = parameters.get(parameter).copied().unwrap_or(0.0);
-            let weights = line_weights_inline(&prepared.thresholds, value);
-            // At most two neighboring points are active; repeated clip references are merged here.
-            let mut active = [(usize::MAX, 0.0_f32, usize::MAX); 2];
-            let mut active_len = 0;
-            for &(point_index, weight) in weights.as_slice() {
-                if weight <= 0.0 {
-                    continue;
+impl MarkerCollection<'_> {
+    fn collect(&mut self, motion: &Motion, prepared: &PreparedMotion) {
+        if !prepared.has_markers
+            || self.playback.weight <= 0.0
+            || prepared.duration <= 0.0
+            || !prepared.duration.is_finite()
+        {
+            return;
+        }
+        match &motion.source {
+            MotionSource::Clip { clip } => self.add_clip(
+                *clip,
+                self.playback.weight,
+                0,
+                prepared.duration,
+                self.playback.looping,
+            ),
+            MotionSource::Tree { parameter, points } => {
+                let value = self.parameters.get(parameter).copied().unwrap_or(0.0);
+                let weights = line_weights_inline(&prepared.thresholds, value);
+                // At most two neighboring points are active; repeated clip references are merged here.
+                let mut active = [(usize::MAX, 0.0_f32, usize::MAX); 2];
+                let mut active_len = 0;
+                for &(point_index, weight) in weights.as_slice() {
+                    if weight <= 0.0 {
+                        continue;
+                    }
+                    let clip = points[point_index].clip;
+                    if let Some(existing) = active[..active_len]
+                        .iter_mut()
+                        .find(|entry| entry.0 == clip)
+                    {
+                        existing.1 += weight;
+                    } else {
+                        let first_tree_point = points
+                            .iter()
+                            .position(|point| point.clip == clip)
+                            .unwrap_or(point_index);
+                        active[active_len] = (clip, weight, first_tree_point);
+                        active_len += 1;
+                    }
                 }
-                let clip = points[point_index].clip;
-                if let Some(existing) = active[..active_len]
-                    .iter_mut()
-                    .find(|entry| entry.0 == clip)
-                {
-                    existing.1 += weight;
-                } else {
-                    let first_tree_point = points
-                        .iter()
-                        .position(|point| point.clip == clip)
-                        .unwrap_or(point_index);
-                    active[active_len] = (clip, weight, first_tree_point);
-                    active_len += 1;
+                for &(clip, weight, first_tree_point) in &active[..active_len] {
+                    self.add_clip(
+                        clip,
+                        self.playback.weight * weight,
+                        first_tree_point,
+                        prepared.duration,
+                        self.playback.looping,
+                    );
                 }
-            }
-            for &(clip, weight, first_tree_point) in &active[..active_len] {
-                add_clip_marker_intersections(
-                    clip,
-                    playback.weight * weight,
-                    first_tree_point,
-                    motion_index,
-                    clips,
-                    prepared.duration,
-                    playback.looping,
-                    before,
-                    after,
-                    unwrapped_after,
-                    wraps,
-                    playback_order,
-                    marker_min_weight,
-                    output,
-                );
             }
         }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn add_clip_marker_intersections(
-    clip_index: usize,
-    weight: f32,
-    tree_point: usize,
-    motion_index: usize,
-    clips: &[Clip],
-    motion_duration: f32,
-    looping: bool,
-    before: f32,
-    after: f32,
-    unwrapped_after: f32,
-    wraps: f64,
-    playback_order: usize,
-    marker_min_weight: f32,
-    output: &mut Vec<MarkerIntersection>,
-) {
-    if weight <= 0.0 || weight < marker_min_weight {
-        return;
-    }
-    let clip = &clips[clip_index];
-    let clip_duration = clip.duration();
-    if clip_duration <= 0.0 || !clip_duration.is_finite() {
-        return;
-    }
-    for (marker_index, marker) in clip.markers().iter().enumerate() {
-        if !marker.time.is_finite() || marker.time < 0.0 || marker.time > clip_duration {
-            continue;
+    fn add_clip(
+        &mut self,
+        clip_index: usize,
+        weight: f32,
+        tree_point: usize,
+        motion_duration: f32,
+        looping: bool,
+    ) {
+        if weight <= 0.0 || weight < self.marker_min_weight {
+            return;
         }
-        let position = if motion_duration == clip_duration {
-            marker.time as f64
-        } else {
-            marker.time as f64 / clip_duration as f64 * motion_duration as f64
-        };
-        if let Some(fraction) = marker_crossing_fraction(
-            looping,
-            before,
-            after,
-            unwrapped_after,
-            wraps,
-            motion_duration,
-            position,
-        ) {
-            output.push(MarkerIntersection {
-                fraction,
-                playback: playback_order,
-                motion: motion_index,
-                tree_point,
-                clip: clip_index,
-                marker: marker_index,
-            });
+        let clip = &self.clips[clip_index];
+        let clip_duration = clip.duration();
+        if clip_duration <= 0.0 || !clip_duration.is_finite() {
+            return;
+        }
+        for (marker_index, marker) in clip.markers().iter().enumerate() {
+            if !marker.time.is_finite() || marker.time < 0.0 || marker.time > clip_duration {
+                continue;
+            }
+            let position = if motion_duration == clip_duration {
+                marker.time as f64
+            } else {
+                marker.time as f64 / clip_duration as f64 * motion_duration as f64
+            };
+            if let Some(fraction) =
+                marker_crossing_fraction(looping, self.interval, motion_duration, position)
+            {
+                self.output.push(MarkerIntersection {
+                    fraction_key: (fraction * 1_000_000.0).round() as u32,
+                    playback: self.playback_order,
+                    motion: self.playback.motion,
+                    tree_point,
+                    clip: clip_index,
+                    marker: marker_index,
+                });
+            }
         }
     }
 }
 
 fn marker_crossing_fraction(
     looping: bool,
-    before: f32,
-    after: f32,
-    unwrapped_after: f32,
-    wraps: f64,
+    interval: TickInterval,
     duration: f32,
     position: f64,
 ) -> Option<f64> {
     if !duration.is_finite() || duration <= 0.0 || !position.is_finite() {
         return None;
     }
-    let before = before as f64;
+    let before = interval.before as f64;
     let duration = duration as f64;
     if looping {
-        let after = after as f64;
-        let travel = if wraps < 1.0 {
+        let after = interval.after as f64;
+        let travel = if interval.wraps < 1.0 {
             after - before
         } else {
-            duration - before + (wraps - 1.0) * duration + after
+            duration - before + (interval.wraps - 1.0) * duration + after
         };
         if travel <= 0.0 {
             return None;
@@ -883,12 +852,12 @@ fn marker_crossing_fraction(
         };
         (travel >= duration || distance < travel).then_some(distance / travel)
     } else {
-        let travel = unwrapped_after as f64 - before;
+        let travel = interval.unwrapped_after as f64 - before;
         if travel <= 0.0 || before >= duration {
             return None;
         }
         if position == duration {
-            (unwrapped_after >= duration as f32).then_some((duration - before) / travel)
+            (interval.unwrapped_after >= duration as f32).then_some((duration - before) / travel)
         } else {
             let distance = position - before;
             (distance >= 0.0 && distance < travel).then_some(distance / travel)
@@ -1485,6 +1454,17 @@ mod tests {
     }
 
     #[test]
+    fn non_looping_end_marker_does_not_repeat_while_fading_at_duration() {
+        let mut animator = marker_animator(marker_clip("Walk", 1.0, &[("end", 1.0)]), false);
+        play(&mut animator, "motion", 0.0);
+
+        assert_eq!(markers(animator.advance(1.0)).len(), 1);
+        animator.stop(1.0).unwrap();
+        assert!(markers(animator.advance(0.25)).is_empty());
+        assert!(markers(animator.advance(0.25)).is_empty());
+    }
+
+    #[test]
     fn seek_skips_crossed_markers_and_fires_the_marker_at_its_new_time() {
         let clip = marker_clip(
             "Walk",
@@ -1684,6 +1664,48 @@ mod tests {
                 ("Long".to_owned(), "long".to_owned())
             ],
             "клипы разной длительности пересекают маркеры на одной фазе"
+        );
+    }
+
+    #[test]
+    fn blend_tree_markers_with_equal_phase_use_tree_order_after_fraction_quantization() {
+        let clips = vec![
+            marker_clip("A", 1.0, &[("a", 0.3)]),
+            marker_clip("B", 3.0, &[("b", 0.9)]),
+        ];
+        let mut tree = Animator::new(
+            clips,
+            vec![Motion {
+                name: "tree".to_owned(),
+                source: MotionSource::Tree {
+                    parameter: "speed".to_owned(),
+                    points: vec![
+                        TreePoint {
+                            threshold: 0.0,
+                            clip: 0,
+                        },
+                        TreePoint {
+                            threshold: 1.0,
+                            clip: 1,
+                        },
+                    ],
+                },
+            }],
+            false,
+        )
+        .unwrap();
+        tree.set_parameter("speed", 0.5).unwrap();
+        play(&mut tree, "tree", 0.0);
+
+        assert_eq!(
+            markers(tree.advance(1.5))
+                .into_iter()
+                .map(|(_, clip, marker)| (clip, marker))
+                .collect::<Vec<_>>(),
+            [
+                ("A".to_owned(), "a".to_owned()),
+                ("B".to_owned(), "b".to_owned())
+            ]
         );
     }
 
