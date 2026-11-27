@@ -2,7 +2,7 @@
 
 use crate::pose::{Pose, Transform};
 use crate::skeleton::Skeleton;
-use engine_assets::ModelAnimation;
+use engine_assets::{ModelAnimation, ModelMarker};
 use glam::{Quat, Vec3};
 use std::collections::{HashMap, HashSet};
 
@@ -28,6 +28,7 @@ pub struct Clip {
     name: String,
     duration: f32,
     tracks: Vec<Track>,
+    markers: Vec<ModelMarker>,
     unmatched: Vec<String>,
 }
 
@@ -36,6 +37,15 @@ impl Clip {
     ///
     /// Дорожка без узла и вторая дорожка на тот же узел попадают в [`Clip::unmatched`].
     pub fn bind(animation: &ModelAnimation, skeleton: &Skeleton) -> Self {
+        Self::bind_with_markers(animation, &animation.markers, skeleton)
+    }
+
+    /// Сопоставляет дорожки и задаёт объединённый список маркеров клипа.
+    pub fn bind_with_markers(
+        animation: &ModelAnimation,
+        markers: &[ModelMarker],
+        skeleton: &Skeleton,
+    ) -> Self {
         let mut node_by_name: HashMap<&str, usize> = HashMap::new();
         for (index, node) in skeleton.nodes().iter().enumerate() {
             node_by_name.entry(node.name.as_str()).or_insert(index);
@@ -76,10 +86,13 @@ impl Clip {
                 _ => unmatched.push(track.node.clone()),
             }
         }
+        let mut markers = markers.to_vec();
+        markers.sort_by(|left, right| left.time.total_cmp(&right.time));
         Self {
             name: animation.name.clone(),
             duration: animation.duration.max(0.0),
             tracks,
+            markers,
             unmatched,
         }
     }
@@ -95,6 +108,11 @@ impl Clip {
 
     pub fn tracks(&self) -> &[Track] {
         &self.tracks
+    }
+
+    /// Маркеры в порядке времени; при совпадении времени сохраняется порядок объявления.
+    pub fn markers(&self) -> &[ModelMarker] {
+        &self.markers
     }
 
     /// Имена дорожек, которые не сопоставились со скелетом.

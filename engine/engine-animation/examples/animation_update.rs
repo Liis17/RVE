@@ -4,10 +4,10 @@
 //! Для каждого скелета, числа персонажей и сценария печатаются медиана и p95 времени одного
 //! вызова `advance` после прогрева. Сцена и модели строятся в памяти через публичный API.
 
-use engine_animation::AnimationBridge;
+use engine_animation::{AnimationBridge, Animator, Clip, Motion, MotionSource, Skeleton};
 use engine_assets::{
-    Model, ModelAnimation, ModelInheritMode, ModelJoint, ModelKey, ModelNode, ModelSkeleton,
-    ModelTrack, ModelTransform,
+    Model, ModelAnimation, ModelInheritMode, ModelJoint, ModelKey, ModelMarker, ModelNode,
+    ModelSkeleton, ModelTrack, ModelTransform,
 };
 use engine_scene::ObjectHandle;
 use engine_scene::{AnimationRequest, SceneDocument, World};
@@ -18,6 +18,7 @@ const BONE_COUNTS: [usize; 2] = [32, 128];
 const CHARACTER_COUNTS: [usize; 3] = [1, 100, 500];
 const WARMUP_FRAMES: usize = 20;
 const MEASURED_FRAMES: usize = 120;
+const DENSE_MARKER_COUNT: usize = 2_000;
 const FRAME_TIME: f32 = 1.0 / 60.0;
 /// Дольше всего замера: оба веса кроссфейда остаются ненулевыми на протяжении всех кадров.
 const CROSSFADE_TIME: f32 = 60.0;
@@ -229,6 +230,44 @@ fn summarize(mut frames: Vec<Duration>) -> Timing {
     }
 }
 
+/// Замер пересечения плотных маркеров напрямую в `Animator::advance`, без поз и палитр.
+fn measure_dense_markers() -> Timing {
+    let source = model(1);
+    let skeleton = Skeleton::from_model(source.skeleton.as_ref().expect("скелет есть"));
+    let mut animation = source.animations[0].clone();
+    animation.name = "dense".to_owned();
+    animation.markers = (0..DENSE_MARKER_COUNT)
+        .map(|index| ModelMarker {
+            name: format!("marker{index}"),
+            time: index as f32 / DENSE_MARKER_COUNT as f32,
+        })
+        .collect();
+    let clip = Clip::bind(&animation, &skeleton);
+    let mut animator = Animator::new(
+        vec![clip],
+        vec![Motion {
+            name: "dense".to_owned(),
+            source: MotionSource::Clip { clip: 0 },
+        }],
+        true,
+    )
+    .expect("аниматор с одним движением собирается");
+    animator
+        .play("dense", Default::default())
+        .expect("движение запускается");
+
+    for _ in 0..WARMUP_FRAMES {
+        std::hint::black_box(animator.advance(FRAME_TIME));
+    }
+    let mut frames = Vec::with_capacity(MEASURED_FRAMES);
+    for _ in 0..MEASURED_FRAMES {
+        let start = Instant::now();
+        std::hint::black_box(animator.advance(FRAME_TIME));
+        frames.push(start.elapsed());
+    }
+    summarize(frames)
+}
+
 fn main() {
     println!(
         "animation_update: {MEASURED_FRAMES} кадров после {WARMUP_FRAMES} прогревочных, dt = 1/60 с"
@@ -251,4 +290,9 @@ fn main() {
             }
         }
     }
+    let dense = measure_dense_markers();
+    println!(
+        "dense_markers {DENSE_MARKER_COUNT:>5} {:>12.1} {:>12.1}",
+        dense.median_us, dense.p95_us
+    );
 }

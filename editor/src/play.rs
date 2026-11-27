@@ -1145,11 +1145,12 @@ impl PlaySession {
         self.rumble = self.host.take_rumble_requests();
         // Порядок как в runtime: запросы скриптов, затем время; события уйдут в следующий update.
         self.animation.apply(self.host.drain_animation_requests());
-        let finished = self.animation.advance(frame_time.dt);
+        let events = self.animation.advance(frame_time.dt);
         self.host.queue_animation_events(
             &self.world,
-            finished.into_iter().map(|event| match event {
-                AnimationEvent::Finished { object, motion } => (object, motion),
+            events.into_iter().filter_map(|event| match event {
+                AnimationEvent::Finished { object, motion } => Some((object, motion)),
+                AnimationEvent::Marker { .. } => None,
             }),
         );
         if let Some(network) = &mut self.network {
