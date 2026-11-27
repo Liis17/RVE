@@ -740,19 +740,11 @@ impl PhysicsWorld {
     }
 
     fn islands_for_step(&self) -> Vec<crate::island::Island> {
-        if !self
-            .bodies
-            .values()
-            .any(|body| body.kind == BodyKind::Dynamic && !body.sleeping)
-        {
-            return Vec::new();
-        }
-
         crate::island::build(
             self.bodies
                 .values()
                 .filter(|body| body.kind == BodyKind::Dynamic)
-                .map(|body| (body.handle, !body.sleeping)),
+                .map(|body| body.handle),
             &self.active_pairs,
         )
     }
@@ -769,10 +761,14 @@ impl PhysicsWorld {
             body.advance_kinematic(dt, remaining_substeps);
         }
         let events = self.refresh_pairs()?;
-        let islands = self.islands_for_step();
-        if islands.is_empty() {
+        if !self
+            .bodies
+            .values()
+            .any(|body| body.kind == BodyKind::Dynamic && !body.sleeping)
+        {
             return Ok(events);
         }
+        let islands = self.islands_for_step();
         #[cfg(test)]
         let parallel_min_constraints = self.test_parallel_min_constraints;
         #[cfg(not(test))]
@@ -1276,10 +1272,6 @@ impl PhysicsWorld {
     /// Засыпание островами: остров — компонента контактов между динамическими телами. Он засыпает
     /// целиком, когда каждое тело успокоилось и ни одно не касается движущегося kinematic.
     fn update_sleep(&mut self, dt: f32, islands: &[crate::island::Island]) {
-        if islands.is_empty() {
-            return;
-        }
-
         for body in self.bodies.values_mut() {
             if body.kind != BodyKind::Dynamic || body.sleeping {
                 continue;
@@ -3088,7 +3080,15 @@ mod tests {
     fn all_sleeping_world_reports_no_poses_and_keeps_pairs_and_events() {
         let (mut driver, _) = sleeping_stack_driver();
         let pairs = driver.world().active_pair_count();
-        assert!(driver.world().islands_for_step().is_empty());
+        let islands = driver.world().islands_for_step();
+        assert_eq!(islands.len(), 1);
+        assert!(!islands[0].has_awake_body(|handle| {
+            driver
+                .world()
+                .bodies
+                .get(&handle)
+                .is_some_and(|body| !body.sleeping)
+        }));
         let result = driver.advance_step(1.0 / 60.0, []).unwrap();
         assert_eq!(result.substeps, 1);
         assert!(result.poses.is_empty(), "{:?}", result.poses);
@@ -4527,7 +4527,7 @@ mod parallel_solver_tests {
                 .bodies
                 .values()
                 .filter(|body| body.kind == BodyKind::Dynamic)
-                .map(|body| (body.handle, !body.sleeping)),
+                .map(|body| body.handle),
             &world.active_pairs,
         )
         .iter()
@@ -5012,7 +5012,7 @@ mod parallel_solver_tests {
                             .bodies
                             .values()
                             .filter(|body| body.kind == BodyKind::Dynamic)
-                            .map(|body| (body.handle, !body.sleeping)),
+                            .map(|body| body.handle),
                         &candidate.active_pairs,
                     )
                     .iter()
