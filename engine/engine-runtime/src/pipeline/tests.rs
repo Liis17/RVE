@@ -4047,6 +4047,39 @@ fn next_step(scripts: &TestScripts, steps: &mpsc::Receiver<StepRecord>) -> StepR
     record
 }
 
+/// Предохранитель `step_until`: без результата за столько шагов тест падает, а не крутится дальше.
+const STEP_LIMIT: usize = 10_000;
+
+/// Забирает физические шаги и кадры, пока `poll` не вернёт значение. Ожидание идёт по шагам
+/// из канала; таймаут `next_step` и общий предел защищают от зависания при поломке.
+fn step_until<T>(
+    scripts: &TestScripts,
+    steps: &mpsc::Receiver<StepRecord>,
+    mut poll: impl FnMut(&StepRecord) -> Option<T>,
+) -> T {
+    for _ in 0..STEP_LIMIT {
+        let step = next_step(scripts, steps);
+        if let Some(value) = poll(&step) {
+            return value;
+        }
+    }
+    panic!("условие не наступило за {STEP_LIMIT} шагов");
+}
+
+fn has_insert(step: &StepRecord) -> bool {
+    step.changes
+        .iter()
+        .any(|change| matches!(change, BodyChange::Insert { .. }))
+}
+
+/// Скрипт текущей сцены сам по себе ставит скорость игрока: команда в шаге значит, что `on_update`
+/// этой сцены вызван в этом кадре.
+fn has_set_velocity(step: &StepRecord) -> bool {
+    step.commands
+        .iter()
+        .any(|command| matches!(command, PhysicsCommand::SetVelocity { .. }))
+}
+
 fn stop_test_scripts(mut scripts: TestScripts, worker: std::thread::JoinHandle<()>) {
     scripts.control.send(ScriptControl::Shutdown).unwrap();
     scripts
@@ -4081,6 +4114,25 @@ impl Drop for SceneDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Загрузчик сцен из каталога `dir` без GPU. Ресурсы возвращаются вызывающему: они должны жить
+/// дольше потока скриптов.
+fn scene_loader(dir: &SceneDir) -> (engine_resources::ResourceSystem, SceneLoader) {
+    let resources = engine_resources::ResourceSystem::start(engine_resources::ResourceConfig {
+        root: dir.0.clone(),
+        source_mode: engine_resources::SourceMode::Loose,
+        worker_count: 1,
+        ..engine_resources::ResourceConfig::default()
+    })
+    .unwrap();
+    let loader = SceneLoader::new(
+        resources.handle(),
+        engine_project::PhysicsSettings::default(),
+        false,
+        false,
+    );
+    (resources, loader)
 }
 
 #[test]
@@ -4166,18 +4218,15 @@ kind = \"dynamic\"
         .unwrap();
 
     let (mut inserted, mut removed) = (0, 0);
-    for _ in 0..20 {
-        let step = next_step(&scripts, &steps);
+    step_until(&scripts, &steps, |step| {
         for change in &step.changes {
             match change {
                 BodyChange::Insert { .. } => inserted += 1,
                 BodyChange::Remove { .. } => removed += 1,
             }
         }
-        if inserted > 0 {
-            break;
-        }
-    }
+        (inserted > 0).then_some(())
+    });
     assert_eq!(
         inserted, 1,
         "без render thread замена применяется на scripts thread"
@@ -4241,16 +4290,11 @@ return Switcher
         .unwrap();
 
     // Заявка приходит render thread, пока цикл крутит кадры; физические шаги и кадры забираем.
-    let upload = (0..20)
-        .find_map(|_| {
-            let _ = next_step(&scripts, &steps);
-            match render_rx.try_recv() {
-                Ok(RenderResourceRequest::Scene(upload)) => Some(upload),
-                Ok(_) => panic!("render thread получил не заявку сцены"),
-                Err(_) => None,
-            }
-        })
-        .expect("запрос rve.scene.load должен уйти на render thread");
+    let upload = step_until(&scripts, &steps, |_| match render_rx.try_recv() {
+        Ok(RenderResourceRequest::Scene(upload)) => Some(upload),
+        Ok(_) => panic!("render thread получил не заявку сцены"),
+        Err(_) => None,
+    });
     assert_eq!(upload.generation, 1);
 
     // До ответа render thread мир не меняется: физика не получает вставок новой сцены.
@@ -4277,18 +4321,15 @@ return Switcher
     // После ответа замена применяется: тело 'crate' снимается, тело 'boss' вставляется.
     let mut inserted = 0;
     let mut removed = 0;
-    for _ in 0..20 {
-        let step = next_step(&scripts, &steps);
+    step_until(&scripts, &steps, |step| {
         for change in &step.changes {
             match change {
                 BodyChange::Insert { .. } => inserted += 1,
                 BodyChange::Remove { .. } => removed += 1,
             }
         }
-        if inserted > 0 {
-            break;
-        }
-    }
+        (inserted > 0).then_some(())
+    });
     assert_eq!(inserted, 1, "вставлено тело новой сцены");
     assert_eq!(
         removed, 1,
@@ -4306,6 +4347,254 @@ return Switcher
         }
     }
     stop_test_scripts(scripts, worker);
+}
+
+/// Сцена для тестов подготовки: игрок с колайдером и скриптом, который ставит ему скорость каждый
+/// кадр; на втором кадре текущая сцена просит `levels/b.rvescene`.
+const TICK_SCRIPT: &str = r#"
+local Ticker = {}
+function Ticker:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 2 then
+    rve.scene.load("levels/b.rvescene")
+  end
+  self.object:set_velocity({ x = 1, y = 0, z = 0 })
+end
+return Ticker
+"#;
+/// То же, но на четвёртом кадре просит `levels/c.rvescene`: второй запрос приходит, пока B ждёт шлюза.
+const TICK_SCRIPT_TWICE: &str = r#"
+local Ticker = {}
+function Ticker:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 2 then
+    rve.scene.load("levels/b.rvescene")
+  end
+  if self.frames == 4 then
+    rve.scene.load("levels/c.rvescene")
+  end
+  self.object:set_velocity({ x = 1, y = 0, z = 0 })
+end
+return Ticker
+"#;
+const TICK_START: &str = "[[assets]]\npath = \"ticker.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"player\"\nkeep_on_load = true\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n[objects.rigid_body]\nkind = \"dynamic\"\n[[objects.lite_scripts]]\npath = \"ticker.lua\"\n[[objects]]\nid = \"crate\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+const TICK_BOSS: &str = "[[objects]]\nid = \"camera_b\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"boss\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+const TICK_GEM: &str = "[[objects]]\nid = \"camera_c\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"gem\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.1\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+
+/// Предохранитель остановки: зависший `ModuleHost::shutdown` должен упасть, а не висеть.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[test]
+fn scene_preparation_leaves_the_current_scene_ticking_until_its_result_arrives() {
+    let dir = SceneDir::new("gated-ticks");
+    dir.write("levels/b.rvescene", TICK_BOSS);
+    let (_resources, loader) = scene_loader(&dir);
+    let (loader, gate) = loader.gated();
+    let world =
+        World::from_document(&SceneDocument::parse("levels/a.rvescene", TICK_START).unwrap())
+            .unwrap();
+    let (render_tx, render_rx) = flume::unbounded();
+    let (client, initialization, steps, worker) = fake_physics(&world);
+    let scripts = start_test_scripts_wired(
+        world,
+        &[("ticker.lua", TICK_SCRIPT)],
+        PreparedPrefabs::default(),
+        Some((client, initialization)),
+        Arc::new(FakeClock::default()),
+        None,
+        false,
+        SceneWiring {
+            loader: Some(loader),
+            render_resources: Some(render_tx),
+            enabled_scenes: vec!["levels/b.rvescene".to_owned()],
+        },
+    );
+    scripts.thread.ready.recv().unwrap().unwrap();
+    scripts
+        .control
+        .send(ScriptControl::Go(Box::default()))
+        .unwrap();
+
+    // Подготовка B стоит в шлюзе: текущая сцена тикает, вставок и заявок нет.
+    step_until(&scripts, &steps, |_| gate.entered.try_recv().ok());
+    for _ in 0..3 {
+        let step = next_step(&scripts, &steps);
+        assert!(
+            has_set_velocity(&step),
+            "on_update текущей сцены вызывается во время подготовки: {:?}",
+            step.commands
+        );
+        assert!(
+            !has_insert(&step),
+            "вставок новой сцены до результата нет: {:?}",
+            step.changes
+        );
+    }
+    assert!(
+        render_rx.try_recv().is_err(),
+        "заявка render thread появляется только после подготовки"
+    );
+
+    gate.release.send(()).unwrap();
+    let upload = step_until(&scripts, &steps, |_| match render_rx.try_recv() {
+        Ok(RenderResourceRequest::Scene(upload)) => Some(upload),
+        Ok(_) => panic!("render thread получил не заявку сцены"),
+        Err(_) => None,
+    });
+    assert_eq!(upload.generation, 1);
+
+    // До ответа render thread мир не меняется, тики продолжаются.
+    for _ in 0..3 {
+        let step = next_step(&scripts, &steps);
+        assert!(
+            has_set_velocity(&step) && !has_insert(&step),
+            "{:?}",
+            step.changes
+        );
+    }
+    scripts
+        .control
+        .send(ScriptControl::Scene(Box::new(SceneUploadReply {
+            generation: upload.generation,
+            result: Ok(Box::default()),
+        })))
+        .unwrap();
+
+    let (mut inserted, mut removed) = (0, 0);
+    step_until(&scripts, &steps, |step| {
+        for change in &step.changes {
+            match change {
+                BodyChange::Insert { .. } => inserted += 1,
+                BodyChange::Remove { .. } => removed += 1,
+            }
+        }
+        (inserted > 0).then_some(())
+    });
+    assert_eq!(inserted, 1, "вставлено тело новой сцены");
+    assert_eq!(removed, 1, "снято тело старой сцены");
+    stop_test_scripts(scripts, worker);
+}
+
+#[test]
+fn newer_scene_request_replaces_a_scene_that_is_still_being_prepared() {
+    let dir = SceneDir::new("gated-replace");
+    dir.write("levels/b.rvescene", TICK_BOSS);
+    dir.write("levels/c.rvescene", TICK_GEM);
+    let (_resources, loader) = scene_loader(&dir);
+    let (loader, gate) = loader.gated();
+    let world =
+        World::from_document(&SceneDocument::parse("levels/a.rvescene", TICK_START).unwrap())
+            .unwrap();
+    let (render_tx, render_rx) = flume::unbounded();
+    let (client, initialization, steps, worker) = fake_physics(&world);
+    let scripts = start_test_scripts_wired(
+        world,
+        &[("ticker.lua", TICK_SCRIPT_TWICE)],
+        PreparedPrefabs::default(),
+        Some((client, initialization)),
+        Arc::new(FakeClock::default()),
+        None,
+        false,
+        SceneWiring {
+            loader: Some(loader),
+            render_resources: Some(render_tx),
+            enabled_scenes: vec![
+                "levels/b.rvescene".to_owned(),
+                "levels/c.rvescene".to_owned(),
+            ],
+        },
+    );
+    scripts.thread.ready.recv().unwrap().unwrap();
+    scripts
+        .control
+        .send(ScriptControl::Go(Box::default()))
+        .unwrap();
+
+    // B входит в шлюз на втором кадре; запрос C на четвёртом прерывает B и тоже ждёт того же шлюза.
+    step_until(&scripts, &steps, |_| gate.entered.try_recv().ok());
+    step_until(&scripts, &steps, |_| gate.entered.try_recv().ok());
+    gate.release.send(()).unwrap();
+
+    let upload = step_until(&scripts, &steps, |_| match render_rx.try_recv() {
+        Ok(RenderResourceRequest::Scene(upload)) => Some(upload),
+        Ok(_) => panic!("render thread получил не заявку сцены"),
+        Err(_) => None,
+    });
+    assert_eq!(
+        upload.generation, 2,
+        "на render thread уходит только поколение C"
+    );
+    scripts
+        .control
+        .send(ScriptControl::Scene(Box::new(SceneUploadReply {
+            generation: upload.generation,
+            result: Ok(Box::default()),
+        })))
+        .unwrap();
+
+    let mut inserted = 0;
+    step_until(&scripts, &steps, |step| {
+        inserted += step
+            .changes
+            .iter()
+            .filter(|change| matches!(change, BodyChange::Insert { .. }))
+            .count();
+        (inserted > 0).then_some(())
+    });
+    assert_eq!(inserted, 1, "применена только сцена C");
+    assert!(
+        render_rx
+            .try_iter()
+            .all(|request| !matches!(request, RenderResourceRequest::Scene(_))),
+        "поколение B на render thread не уходит"
+    );
+    stop_test_scripts(scripts, worker);
+}
+
+#[test]
+fn shutdown_during_scene_preparation_stops_without_an_upload() {
+    let dir = SceneDir::new("gated-shutdown");
+    dir.write("levels/b.rvescene", TICK_BOSS);
+    let (_resources, loader) = scene_loader(&dir);
+    let (loader, gate) = loader.gated();
+    let world =
+        World::from_document(&SceneDocument::parse("levels/a.rvescene", TICK_START).unwrap())
+            .unwrap();
+    let (render_tx, render_rx) = flume::unbounded();
+    let (client, initialization, steps, worker) = fake_physics(&world);
+    let scripts = start_test_scripts_wired(
+        world,
+        &[("ticker.lua", TICK_SCRIPT)],
+        PreparedPrefabs::default(),
+        Some((client, initialization)),
+        Arc::new(FakeClock::default()),
+        None,
+        false,
+        SceneWiring {
+            loader: Some(loader),
+            render_resources: Some(render_tx),
+            enabled_scenes: vec!["levels/b.rvescene".to_owned()],
+        },
+    );
+    scripts.thread.ready.recv().unwrap().unwrap();
+    scripts
+        .control
+        .send(ScriptControl::Go(Box::default()))
+        .unwrap();
+    step_until(&scripts, &steps, |_| gate.entered.try_recv().ok());
+
+    // Шлюз не открыт: остановка должна разбудить загрузчик сама. `gate` живёт до конца теста, поэтому
+    // при зависании падение теста отбрасывает `release` и открывает шлюз.
+    let (done_tx, done_rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        stop_test_scripts(scripts, worker);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(STOP_TIMEOUT)
+        .expect("остановка не зависает на подготовке сцены");
+    assert!(render_rx.try_recv().is_err(), "при остановке заявки нет");
+    drop(gate);
 }
 
 #[test]

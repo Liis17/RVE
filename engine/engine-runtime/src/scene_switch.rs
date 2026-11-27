@@ -1,12 +1,14 @@
 //! Замена сцены во время игры на scripts thread.
 //!
-//! Путь запроса: `request` загружает и проверяет новую сцену (включая пробную сборку физики)
-//! до каких-либо изменений мира и отправляет GPU-заявку. Ответ render thread принимается только
-//! для текущего поколения; `commit` вызывает `ScriptHost::replace_scene`, который проверяет
-//! совпадение id и параметров до разрушения мира. Тела добавленных объектов привязываются к физике
-//! сразу после замены в том же `commit`; удалённые объекты и звук добавленных идут дальше по
-//! `apply_world_changes`. GPU-ресурсы, которыми больше не
-//! владеет ни один живой объект, освобождаются render thread после снимка с этого кадра.
+//! Путь запроса: `begin` выдаёт поколение, а CPU-подготовка (`SceneLoader::prepare`: чтение,
+//! префабы, модели, текстуры, пробная сборка физики) идёт на потоке `rve-scene-loader` через
+//! [`ScenePreparer`]. Scripts thread на границе кадра принимает готовый результат через `prepared`
+//! и отправляет GPU-заявку; до замены текущая сцена продолжает тикать. Ответ render thread
+//! принимается только для текущего поколения; `commit` вызывает `ScriptHost::replace_scene`, который
+//! проверяет совпадение id и параметров до разрушения мира. Тела добавленных объектов привязываются
+//! к физике сразу после замены в том же `commit`; удалённые объекты и звук добавленных идут дальше
+//! по `apply_world_changes`. GPU-ресурсы, которыми больше не владеет ни один живой объект,
+//! освобождаются render thread после снимка с этого кадра.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
@@ -36,8 +38,6 @@ use flume::Selector;
 use flume::{Receiver, Sender};
 
 /// Имя потока CPU-подготовки сцен.
-// Подключается к scripts thread на следующем шаге; до тех пор вне тестов не используется.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SCENE_LOADER_THREAD: &str = "rve-scene-loader";
 
 /// Загрузчик сцен проекта: читает `.rvescene` и ассеты тем же `ResourceHandle`, что и старт.
@@ -70,10 +70,24 @@ impl SceneLoader {
         }
     }
 
+    /// Копия загрузчика со шлюзом: подготовка входит в шлюз и ждёт [`SceneGate::release`] или
+    /// прерывания новым поколением.
     #[cfg(test)]
-    fn with_gate(mut self, gate: ScenePrepareGate) -> Self {
-        self.gate = Some(gate);
-        self
+    pub(crate) fn gated(&self) -> (Self, SceneGate) {
+        let (entered_tx, entered_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        let mut loader = self.clone();
+        loader.gate = Some(ScenePrepareGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (
+            loader,
+            SceneGate {
+                entered: entered_rx,
+                release: release_tx,
+            },
+        )
     }
 
     /// Готовит сцену и пробно строит её физику, как при старте. Возвращает геометрию моделей для
@@ -141,7 +155,16 @@ impl SceneLoader {
     }
 }
 
-/// Test-only gate that holds scene preparation until explicitly released or interrupted.
+/// Сторона теста у шлюза подготовки. `entered` получает сигнал о входе подготовки в шлюз,
+/// отправка в `release` её пропускает. Отброшенный `release` тоже открывает шлюз, поэтому падение
+/// теста не блокирует `ModuleHost::shutdown`.
+#[cfg(test)]
+pub(crate) struct SceneGate {
+    pub(crate) entered: Receiver<()>,
+    pub(crate) release: Sender<()>,
+}
+
+/// Шлюз на стороне рабочего потока.
 #[cfg(test)]
 #[derive(Clone)]
 struct ScenePrepareGate {
@@ -175,7 +198,6 @@ impl ScenePrepared {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn failed(request: SceneRequest, error: String) -> Self {
         Self {
             generation: request.generation,
@@ -185,7 +207,6 @@ impl ScenePrepared {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct ScenePreparerState {
     latest: AtomicU64,
     stopping: AtomicBool,
@@ -196,7 +217,6 @@ struct ScenePreparerState {
 }
 
 /// One-slot CPU scene preparation worker. New requests replace queued work and interrupt active work.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ScenePreparer {
     state: Arc<ScenePreparerState>,
     wake_tx: Sender<()>,
@@ -205,7 +225,6 @@ pub(crate) struct ScenePreparer {
 }
 
 impl ScenePreparer {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn submit(&self, request: SceneRequest) {
         self.state
             .latest
@@ -218,7 +237,6 @@ impl ScenePreparer {
         let _ = self.wake_tx.try_send(());
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_result(&self) -> Option<ScenePrepared> {
         self.state
             .result
@@ -234,7 +252,6 @@ impl ScenePreparer {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn start_scene_preparer(
     modules: &mut ModuleHost,
     loader: SceneLoader,
@@ -269,7 +286,6 @@ pub(crate) fn start_scene_preparer(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn scene_preparer_loop(loader: SceneLoader, state: Arc<ScenePreparerState>, wake_rx: Receiver<()>) {
     loop {
         if state.stopping.load(Ordering::Acquire) {
@@ -521,28 +537,8 @@ impl SceneSwitch {
         })
     }
 
-    /// Синхронный путь: подготовка и приём результата на вызывающем потоке scripts thread. Фоновый
-    /// worker [`ScenePreparer`] подключается к pipeline отдельно.
-    pub(crate) fn request(
-        &mut self,
-        loader: Option<&SceneLoader>,
-        path: &str,
-    ) -> Result<SceneUpload, String> {
-        let request = self.begin(loader, path)?;
-        let loader = loader.expect("begin checks that a scene loader is attached");
-        let (scene, geometry) =
-            loader
-                .prepare(path, &|| false, None)
-                .map_err(|error| match error {
-                    LoadError::Interrupted => "подготовка сцены прервана".to_owned(),
-                    LoadError::Failed(error) => error,
-                })?;
-        self.prepared(ScenePrepared::ready(request, scene, geometry))
-            .map_err(|(_, error)| error)?
-            .ok_or_else(|| "подготовка сцены устарела".to_owned())
-    }
-
-    /// Принимает результат CPU-подготовки. Ошибка и устаревшее поколение не заменяют `awaiting`.
+    /// Принимает результат CPU-подготовки текущего поколения; он вытесняет ждущую GPU-ответа сцену.
+    /// Ошибка и устаревшее поколение не заменяют `awaiting`.
     pub(crate) fn prepared(
         &mut self,
         prepared: ScenePrepared,
@@ -1886,18 +1882,6 @@ return Script
     /// тесту зависнуть при поломке.
     const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// Загрузчик со шлюзом: `entered` сообщает о входе подготовки в шлюз, `release` открывает его.
-    /// Отключённый `release` тоже открывает шлюз, поэтому упавший тест не блокирует `shutdown`.
-    fn gated_loader(loader: &SceneLoader) -> (SceneLoader, Receiver<()>, Sender<()>) {
-        let (entered_tx, entered_rx) = flume::unbounded();
-        let (release_tx, release_rx) = flume::unbounded();
-        let gate = ScenePrepareGate {
-            entered: entered_tx,
-            release: release_rx,
-        };
-        (loader.clone().with_gate(gate), entered_rx, release_tx)
-    }
-
     #[test]
     fn worker_delivers_the_current_generation_to_the_switch() {
         let mut rig = Rig::new();
@@ -1937,7 +1921,7 @@ return Script
     fn interrupted_preparation_of_a_stale_request_never_reaches_the_switch() {
         let mut rig = Rig::new();
         let mut modules = ModuleHost::new();
-        let (gated, entered, release) = gated_loader(&rig.loader);
+        let (gated, gate) = rig.loader.gated();
         let preparer = start_scene_preparer(&mut modules, gated).unwrap();
 
         let request_a = rig
@@ -1945,7 +1929,7 @@ return Script
             .begin(Some(&rig.loader), "levels/b.rvescene")
             .unwrap();
         preparer.submit(request_a);
-        entered
+        gate.entered
             .recv_timeout(SIGNAL_TIMEOUT)
             .expect("подготовка A вошла в шлюз");
 
@@ -1957,10 +1941,10 @@ return Script
             .unwrap();
         let generation_b = request_b.generation;
         preparer.submit(request_b);
-        entered
+        gate.entered
             .recv_timeout(SIGNAL_TIMEOUT)
             .expect("после прерывания A поток берёт B");
-        release.send(()).unwrap();
+        gate.release.send(()).unwrap();
 
         preparer
             .wait_ready()
@@ -1989,17 +1973,45 @@ return Script
     }
 
     #[test]
+    fn worker_reports_a_failed_current_preparation_without_touching_the_world() {
+        let mut rig = Rig::new();
+        let mut modules = ModuleHost::new();
+        let preparer = start_scene_preparer(&mut modules, rig.loader.clone()).unwrap();
+
+        let request = rig
+            .switch
+            .begin(Some(&rig.loader), "levels/missing.rvescene")
+            .unwrap();
+        preparer.submit(request);
+        preparer
+            .wait_ready()
+            .expect("рабочий поток публикует ошибку");
+        let prepared = preparer.take_result().expect("ошибка текущего поколения");
+        let (path, error) = rig
+            .switch
+            .prepared(prepared)
+            .err()
+            .expect("ошибка передаётся наверх");
+        assert_eq!(path, "levels/missing.rvescene");
+        assert!(!error.is_empty());
+
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
     fn shutdown_during_preparation_stops_the_worker_without_publishing() {
         let rig = Rig::new();
         let mut modules = ModuleHost::new();
-        let (gated, entered, _release) = gated_loader(&rig.loader);
+        let (gated, gate) = rig.loader.gated();
         let preparer = start_scene_preparer(&mut modules, gated).unwrap();
         let mut switch = SceneSwitch::default();
         let request = switch
             .begin(Some(&rig.loader), "levels/b.rvescene")
             .unwrap();
         preparer.submit(request);
-        entered
+        gate.entered
             .recv_timeout(SIGNAL_TIMEOUT)
             .expect("подготовка вошла в шлюз");
 
