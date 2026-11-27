@@ -431,13 +431,31 @@ impl LogRing {
 
 pub struct ConsoleLogger {
     sink: Option<Arc<Mutex<ConsoleBuffer>>>,
+    output: Option<LogOutputCallback>,
     tail: Mutex<LogRing>,
 }
 
+pub type LogOutputCallback = Arc<dyn Fn(&ConsoleLine) + Send + Sync + 'static>;
+
 impl ConsoleLogger {
     pub fn new(sink: Option<Arc<Mutex<ConsoleBuffer>>>) -> Self {
+        Self::with_output(sink, None)
+    }
+
+    pub fn new_with_output(
+        sink: Option<Arc<Mutex<ConsoleBuffer>>>,
+        output: LogOutputCallback,
+    ) -> Self {
+        Self::with_output(sink, Some(output))
+    }
+
+    fn with_output(
+        sink: Option<Arc<Mutex<ConsoleBuffer>>>,
+        output: Option<LogOutputCallback>,
+    ) -> Self {
         Self {
             sink,
+            output,
             tail: Mutex::new(LogRing {
                 lines: VecDeque::with_capacity(LOG_TAIL_CAPACITY),
             }),
@@ -464,24 +482,31 @@ impl ConsoleLogger {
             Level::Info => ConsoleLevel::Info,
             Level::Debug | Level::Trace => return,
         };
-        let text = record.args().to_string();
-        match level {
-            ConsoleLevel::Info => {
-                let _ = writeln!(io::stdout().lock(), "{text}");
-            }
-            ConsoleLevel::Warn | ConsoleLevel::Error => {
-                let _ = writeln!(io::stderr().lock(), "{text}");
-            }
-        }
         let line = ConsoleLine {
             level,
             source: record.target().to_owned(),
-            text,
+            text: record.args().to_string(),
         };
+        if let Some(output) = &self.output {
+            output(&line);
+        } else {
+            let _ = write_default_output(&mut io::stdout().lock(), &mut io::stderr().lock(), &line);
+        }
         if let Some(sink) = &self.sink {
             lock_buffer(sink).push(line.clone());
         }
         lock_tail(&self.tail).push(line);
+    }
+}
+
+fn write_default_output(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    line: &ConsoleLine,
+) -> io::Result<()> {
+    match line.level {
+        ConsoleLevel::Info => writeln!(stdout, "{}", line.text),
+        ConsoleLevel::Warn | ConsoleLevel::Error => writeln!(stderr, "{}", line.text),
     }
 }
 
@@ -507,6 +532,20 @@ static LOGGER: OnceLock<ConsoleLogger> = OnceLock::new();
 /// Installs the process logger once, forwarding Info to stdout and Warn/Error to stderr.
 pub fn install_logger(sink: Option<Arc<Mutex<ConsoleBuffer>>>) -> Result<(), log::SetLoggerError> {
     let logger = LOGGER.get_or_init(|| ConsoleLogger::new(sink));
+    log::set_logger(logger)?;
+    log::set_max_level(Level::Info.to_level_filter());
+    Ok(())
+}
+
+/// Installs the process logger with an output callback instead of writing log lines to stdout/stderr.
+pub fn install_logger_with_output<F>(
+    sink: Option<Arc<Mutex<ConsoleBuffer>>>,
+    output: F,
+) -> Result<(), log::SetLoggerError>
+where
+    F: Fn(&ConsoleLine) + Send + Sync + 'static,
+{
+    let logger = LOGGER.get_or_init(|| ConsoleLogger::new_with_output(sink, Arc::new(output)));
     log::set_logger(logger)?;
     log::set_max_level(Level::Info.to_level_filter());
     Ok(())
@@ -803,6 +842,84 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["[script] event", "[script] event", "[script] event"]
         );
+    }
+
+    #[test]
+    fn default_output_keeps_info_on_stdout_and_warnings_on_stderr() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_default_output(
+            &mut stdout,
+            &mut stderr,
+            &line(ConsoleLevel::Info, "info-target", "info line"),
+        )
+        .unwrap();
+        write_default_output(
+            &mut stdout,
+            &mut stderr,
+            &line(ConsoleLevel::Warn, "warn-target", "warn line"),
+        )
+        .unwrap();
+        write_default_output(
+            &mut stdout,
+            &mut stderr,
+            &line(ConsoleLevel::Error, "error-target", "error line"),
+        )
+        .unwrap();
+        assert_eq!(stdout, b"info line\n");
+        assert_eq!(stderr, b"warn line\nerror line\n");
+    }
+
+    #[test]
+    fn output_callback_receives_log_fields_and_does_not_change_the_tail() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let logger = ConsoleLogger::new_with_output(
+            None,
+            Arc::new(move |line| captured.lock().unwrap().push(line.clone())),
+        );
+        for (level, expected) in [
+            (Level::Info, ConsoleLevel::Info),
+            (Level::Warn, ConsoleLevel::Warn),
+            (Level::Error, ConsoleLevel::Error),
+        ] {
+            let args = format_args!("message");
+            let record = Record::builder()
+                .args(args)
+                .level(level)
+                .target("ipc-test")
+                .build();
+            logger.log_record(&record);
+            assert_eq!(logger.tail_snapshot().last().unwrap().level, expected);
+        }
+        let tail = logger.tail_snapshot();
+        assert_eq!(tail.len(), 3);
+        assert!(tail.iter().all(|line| line.source == "ipc-test"));
+        assert!(tail.iter().all(|line| line.text == "message"));
+        assert_eq!(
+            output
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|line| (line.level, line.source.as_str(), line.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (ConsoleLevel::Info, "ipc-test", "message"),
+                (ConsoleLevel::Warn, "ipc-test", "message"),
+                (ConsoleLevel::Error, "ipc-test", "message"),
+            ]
+        );
+        for index in 0..LOG_TAIL_CAPACITY + 5 {
+            log_record_at(&logger, Level::Info, &format!("line {index}"));
+        }
+        let tail = logger.tail_snapshot();
+        assert_eq!(tail.len(), LOG_TAIL_CAPACITY);
+        assert_eq!(tail.first().unwrap().text, "line 5");
+        assert_eq!(
+            tail.last().unwrap().text,
+            format!("line {}", LOG_TAIL_CAPACITY + 4)
+        );
+        assert_eq!(output.lock().unwrap().len(), LOG_TAIL_CAPACITY + 8);
     }
 
     fn log_record_at(logger: &ConsoleLogger, level: Level, text: &str) {
