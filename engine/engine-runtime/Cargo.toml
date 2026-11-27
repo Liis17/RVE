@@ -1,6 +1,6 @@
 [package]
 name = "engine-runtime"
-version = "0.38.0"
+version = "0.39.0"
 edition.workspace = true
 license.workspace = true
 
@@ -11,6 +11,7 @@ path = "src/lib.rs"
 dev-console = ["dep:egui", "dep:egui-winit", "dep:winit", "engine-ui/egui"]
 dlss = ["engine-render/dlss"]
 crash-dumps = ["dep:crash-handler", "dep:minidumper", "dep:getrandom"]
+fbx = ["engine-assets/fbx"]
 
 [dependencies]
 engine-core = { path = "../engine-core" }
@@ -19,7 +20,7 @@ rve-crash-monitor = { path = "../rve-crash-monitor", default-features = false }
 engine-input = { path = "../engine-input" }
 egui = { workspace = true, optional = true }
 egui-winit = { workspace = true, optional = true }
-engine-assets = { path = "../engine-assets" }
+engine-assets = { path = "../engine-assets", default-features = false }
 engine-ui = { path = "../engine-ui", default-features = false }
 engine-files = { path = "../engine-files" }
 engine-gui = { path = "../engine-gui" }
@@ -45,6 +46,7 @@ sysinfo.workspace = true
 winit = { workspace = true, optional = true }
 
 [dev-dependencies]
+engine-assets = { path = "../engine-assets", features = ["fbx"] }
 rve-sdk = { path = "../rve-sdk" }
 
 [target.'cfg(any(all(windows, target_arch = "x86_64"), target_os = "macos"))'.dependencies]

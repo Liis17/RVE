@@ -3,9 +3,11 @@
 //! Ключи хранят время в секундах от начала клипа и имена узлов. Сопоставление
 //! с костями скелета выполняется в `engine-animation`.
 
+#[cfg(feature = "fbx")]
 use crate::skin::SkeletonBuilder;
 
 /// Предел числа ключей на все клипы модели, чтобы не допустить неограниченного роста памяти.
+#[cfg(feature = "fbx")]
 pub(crate) const KEY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Ключ дорожки: время в секундах и значение.
@@ -47,6 +49,7 @@ pub struct ModelAnimation {
 }
 
 #[derive(Default)]
+#[cfg(feature = "fbx")]
 struct ImportedMarkers {
     stack_names: Vec<String>,
     by_stack: Vec<Vec<ModelMarker>>,
@@ -55,6 +58,7 @@ struct ImportedMarkers {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "fbx")]
 struct ParsedMarker {
     stack: Option<String>,
     name: String,
@@ -62,6 +66,7 @@ struct ParsedMarker {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "fbx")]
 struct MarkerParseError {
     stack: Option<String>,
     message: String,
@@ -69,6 +74,7 @@ struct MarkerParseError {
 
 /// Есть ли в файле стек с хотя бы одним ключом. Пустой стек, например `Take 001` статичной
 /// модели, анимацией не считается.
+#[cfg(feature = "fbx")]
 pub(crate) fn has_animated_stack(scene: &ufbx::Scene) -> Result<bool, String> {
     let mut keys = usize::MAX;
     for stack in scene.anim_stacks.iter() {
@@ -81,6 +87,7 @@ pub(crate) fn has_animated_stack(scene: &ufbx::Scene) -> Result<bool, String> {
 }
 
 /// Запекает стеки модели с ключами; в клип попадают только узлы скелета.
+#[cfg(feature = "fbx")]
 pub(crate) fn bake_model_animations(
     builder: &SkeletonBuilder,
     scene: &ufbx::Scene,
@@ -104,6 +111,7 @@ pub(crate) fn bake_model_animations(
 }
 
 /// Запекает стеки файла с ключами как клипы; имена — stem файла, если стек один.
+#[cfg(feature = "fbx")]
 pub(crate) fn bake_clip_file(
     scene: &ufbx::Scene,
     stem: &str,
@@ -126,6 +134,7 @@ pub(crate) fn bake_clip_file(
     Ok(attach_markers(baked_stacks, imported))
 }
 
+#[cfg(feature = "fbx")]
 fn attach_markers(
     mut baked_stacks: Vec<(usize, ModelAnimation)>,
     mut imported: ImportedMarkers,
@@ -160,6 +169,7 @@ fn attach_markers(
         .collect()
 }
 
+#[cfg(feature = "fbx")]
 fn import_markers(scene: &ufbx::Scene) -> ImportedMarkers {
     let stack_names: Vec<String> = scene
         .anim_stacks
@@ -186,6 +196,7 @@ fn import_markers(scene: &ufbx::Scene) -> ImportedMarkers {
     imported
 }
 
+#[cfg(feature = "fbx")]
 fn import_marker_prop(
     prop: &ufbx::Prop,
     source_stack: Option<usize>,
@@ -206,6 +217,7 @@ fn import_marker_prop(
     import_marker_property(&prop.value_str, source_stack, stack_names, imported);
 }
 
+#[cfg(feature = "fbx")]
 fn import_marker_property(
     value: &str,
     source_stack: Option<usize>,
@@ -253,6 +265,7 @@ fn import_marker_property(
     }
 }
 
+#[cfg(feature = "fbx")]
 fn marker_records(value: &str) -> impl Iterator<Item = &str> + '_ {
     value
         .split(';')
@@ -260,6 +273,7 @@ fn marker_records(value: &str) -> impl Iterator<Item = &str> + '_ {
         .filter(|record| !record.is_empty())
 }
 
+#[cfg(feature = "fbx")]
 fn marker_target(
     prefix: Option<&str>,
     source_stack: Option<usize>,
@@ -310,6 +324,7 @@ fn marker_target(
     }
 }
 
+#[cfg(feature = "fbx")]
 fn parse_marker_record(record: &str) -> Result<ParsedMarker, MarkerParseError> {
     let Some((left, time_text)) = record.rsplit_once('@') else {
         return Err(MarkerParseError {
@@ -344,12 +359,13 @@ fn parse_marker_record(record: &str) -> Result<ParsedMarker, MarkerParseError> {
     })
 }
 
-fn is_marker_identifier(name: &str) -> bool {
+pub(crate) fn is_marker_identifier(name: &str) -> bool {
     let mut bytes = name.bytes();
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
         && bytes.all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
 }
 
+#[cfg(feature = "fbx")]
 fn bake_stack(
     scene: &ufbx::Scene,
     stack: &ufbx::AnimStack,
@@ -415,15 +431,17 @@ fn bake_stack(
     })
 }
 
+#[cfg(feature = "fbx")]
 fn key_time(time: f64, begin: f64) -> f32 {
     (time - begin).max(0.0) as f32
 }
 
+#[cfg(feature = "fbx")]
 fn vec3(value: ufbx::Vec3) -> [f32; 3] {
     [value.x as f32, value.y as f32, value.z as f32]
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fbx"))]
 mod tests {
     use super::{marker_records, parse_marker_record};
 

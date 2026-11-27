@@ -86,6 +86,10 @@ jobs:
         if: ${{ contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
         working-directory: build
         run: cargo clippy -p rve-player --no-default-features --all-targets --locked -- -D warnings
+      - name: Test engine-assets without FBX support
+        if: ${{ contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
+        working-directory: build
+        run: cargo test -p engine-assets --no-default-features --locked
 
   test:
     name: Build and test (${{ matrix.os }})

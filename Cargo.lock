@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "engine-animation"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "engine-assets"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bevy_mikktspace",
  "engine-files",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "crash-handler",
  "egui",
@@ -3331,8 +3331,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
+ "blake3",
  "engine-assets",
  "engine-files",
  "engine-gui",
@@ -3409,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "rve-player"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "engine-runtime",
 ]
@@ -3420,7 +3421,7 @@ version = "0.26.0"
 
 [[package]]
 name = "rve-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-runtime",
 ]

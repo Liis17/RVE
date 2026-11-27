@@ -1,6 +1,6 @@
 [package]
 name = "engine-animation"
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 license.workspace = true
 
@@ -8,10 +8,11 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-engine-assets = { path = "../engine-assets" }
+engine-assets = { path = "../engine-assets", default-features = false }
 engine-files = { path = "../engine-files" }
 engine-scene = { path = "../engine-scene" }
 glam.workspace = true
 
 [dev-dependencies]
+engine-assets = { path = "../engine-assets", features = ["fbx"] }
 ufbx.workspace = true

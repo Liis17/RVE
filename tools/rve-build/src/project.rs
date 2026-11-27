@@ -1,4 +1,6 @@
 use crate::error::BuildError;
+use crate::models::{ModelPreparationMode, ModelPreparer};
+use crate::temporary::TempDir;
 use crate::trace::{ArchiveReason, BuildTrace};
 use engine_assets::{AssetError, Assets};
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
@@ -41,6 +43,9 @@ pub(crate) struct ProjectBuild {
     #[cfg(windows)]
     pub(crate) icon: Option<VirtualPath>,
     pub(crate) heavy_scripts: Vec<HeavyScriptUse>,
+    /// Keeps staged ready models alive until `build_project_archives` has consumed them.
+    pub(crate) _prepared_model_temp: Option<Arc<TempDir>>,
+    pub(crate) model_preparation_mode: ModelPreparationMode,
 }
 
 /// Heavy-скрипт объекта сцены или префаба.
@@ -91,6 +96,11 @@ struct AssetSources<'a> {
     assets_dir: &'a Path,
 }
 
+struct AssetWalk<'trace, 'models> {
+    trace: Option<&'trace mut BuildTrace>,
+    model_preparer: &'models mut ModelPreparer,
+}
+
 #[derive(Clone)]
 struct EnabledScene {
     path: VirtualPath,
@@ -98,7 +108,15 @@ struct EnabledScene {
 }
 
 pub(crate) fn prepare_project(project_dir: &Path) -> Result<ProjectBuild, BuildError> {
-    prepare_project_with_trace(project_dir, None)
+    prepare_project_with_trace(project_dir, None, ModelPreparationMode::Direct)
+}
+
+pub(crate) fn prepare_project_for_build(project_dir: &Path) -> Result<ProjectBuild, BuildError> {
+    prepare_project_with_trace(project_dir, None, ModelPreparationMode::Build)
+}
+
+pub(crate) fn prepare_project_for_check(project_dir: &Path) -> Result<ProjectBuild, BuildError> {
+    prepare_project_with_trace(project_dir, None, ModelPreparationMode::ReadOnly)
 }
 
 /// Как [`prepare_project`], но дополнительно собирает трассу ссылок и причин архивов для `explain`.
@@ -106,13 +124,18 @@ pub(crate) fn prepare_project_traced(
     project_dir: &Path,
 ) -> Result<(ProjectBuild, BuildTrace), BuildError> {
     let mut trace = BuildTrace::default();
-    let project = prepare_project_with_trace(project_dir, Some(&mut trace))?;
+    let project = prepare_project_with_trace(
+        project_dir,
+        Some(&mut trace),
+        ModelPreparationMode::ReadOnly,
+    )?;
     Ok((project, trace))
 }
 
 fn prepare_project_with_trace(
     project_dir: &Path,
     trace: Option<&mut BuildTrace>,
+    model_mode: ModelPreparationMode,
 ) -> Result<ProjectBuild, BuildError> {
     let project_dir = fs::canonicalize(project_dir).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -161,6 +184,7 @@ fn prepare_project_with_trace(
         bootstrap,
         &mut resources,
         trace,
+        model_mode,
     );
     let shutdown = resources.shutdown().map_err(|error| {
         BuildError::operational(format!("не удалось остановить ResourceSystem: {error}"))
@@ -179,6 +203,7 @@ fn prepare_with_resources(
     bootstrap: BootstrapConfig,
     resources: &mut ResourceSystem,
     mut trace: Option<&mut BuildTrace>,
+    model_mode: ModelPreparationMode,
 ) -> Result<ProjectBuild, BuildError> {
     let assets_dir = project_dir.join("Assets");
     let bootstrap_path = project_dir.join("bootstrap.rves");
@@ -189,6 +214,7 @@ fn prepare_with_resources(
         assets: &assets,
         assets_dir: &assets_dir,
     };
+    let mut model_preparer = ModelPreparer::new(&project_dir, model_mode);
     let mut enabled_scenes = Vec::new();
     let mut heavy_scripts = Vec::new();
     let mut usages = BTreeMap::<VirtualPath, AssetUsage>::new();
@@ -289,6 +315,7 @@ fn prepare_with_resources(
                 &owner,
                 None,
                 trace.as_deref_mut(),
+                &mut model_preparer,
             )?;
         }
         for asset in scene_assets {
@@ -299,6 +326,7 @@ fn prepare_with_resources(
                 &owner,
                 None,
                 trace.as_deref_mut(),
+                &mut model_preparer,
             )?;
             if let Some(archive) = asset.archive {
                 add_explicit_archive(&mut usages, &asset.path, &owner, archive);
@@ -339,6 +367,7 @@ fn prepare_with_resources(
                 &owner,
                 entry.archive.as_deref(),
                 trace.as_deref_mut(),
+                &mut model_preparer,
             )?;
             if let Some(archive) = &asset.archive {
                 add_explicit_archive(&mut usages, &asset.path, &owner, archive.clone());
@@ -397,7 +426,14 @@ fn prepare_with_resources(
         .chain(base_paths.iter())
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(|path| Ok((path.clone(), require_asset_file(&assets_dir, path)?)))
+        .map(|path| {
+            let source = if let Some(source) = model_preparer.file_for(path) {
+                source.to_path_buf()
+            } else {
+                require_asset_file(&assets_dir, path)?
+            };
+            Ok((path.clone(), source))
+        })
         .collect::<Result<BTreeMap<_, _>, BuildError>>()?;
     let (assignments, reasons) =
         assign_archives(&enabled_scenes, &usages, &base_paths, &base_reasons)?;
@@ -419,6 +455,8 @@ fn prepare_with_resources(
         #[cfg(windows)]
         icon,
         heavy_scripts,
+        _prepared_model_temp: model_preparer.into_temp_dir(),
+        model_preparation_mode: model_mode,
     })
 }
 
@@ -523,7 +561,12 @@ fn record_asset(
     owner: &Owner,
     list_archive: Option<&str>,
     trace: Option<&mut BuildTrace>,
+    model_preparer: &mut ModelPreparer,
 ) -> Result<(), BuildError> {
+    let mut walk = AssetWalk {
+        trace,
+        model_preparer,
+    };
     record_asset_recursive(
         usages,
         sources,
@@ -531,7 +574,7 @@ fn record_asset(
         owner,
         list_archive,
         &mut BTreeSet::new(),
-        trace,
+        &mut walk,
     )
 }
 
@@ -555,12 +598,12 @@ fn record_asset_recursive(
     owner: &Owner,
     list_archive: Option<&str>,
     visited: &mut BTreeSet<VirtualPath>,
-    mut trace: Option<&mut BuildTrace>,
+    walk: &mut AssetWalk<'_, '_>,
 ) -> Result<(), BuildError> {
     usages.entry(path.clone()).or_default().add_owner(owner);
     if let Some(archive) = list_archive {
         add_explicit_archive(usages, path, owner, archive.to_owned());
-        if let Some(trace) = trace.as_deref_mut() {
+        if let Some(trace) = walk.trace.as_deref_mut() {
             trace.record_list_archive(path, owner, archive);
         }
     }
@@ -603,21 +646,13 @@ fn record_asset_recursive(
         // LUT цветокоррекции — зависимость файла постобработки: тот же владелец и архив.
         if let Some(lut) = settings.color_grading.lut_path() {
             note_dependency(
-                trace.as_deref_mut(),
+                walk.trace.as_deref_mut(),
                 owner,
                 path,
                 &lut,
                 "LUT цветокоррекции",
             );
-            record_asset_recursive(
-                usages,
-                sources,
-                &lut,
-                owner,
-                list_archive,
-                visited,
-                trace.as_deref_mut(),
-            )?;
+            record_asset_recursive(usages, sources, &lut, owner, list_archive, visited, walk)?;
         }
     }
 
@@ -684,7 +719,7 @@ fn record_asset_recursive(
                 .and_then(|request| request.wait())
                 .map_err(|error| resource_error(&format!("UI-ассет /{dependency}"), error))?;
             require_asset_file(sources.assets_dir, &dependency)?;
-            if let Some(trace) = trace.as_deref_mut() {
+            if let Some(trace) = walk.trace.as_deref_mut() {
                 trace.add_dependency(owner, path, &dependency, "картинка или шрифт UI");
             }
             usages
@@ -693,7 +728,7 @@ fn record_asset_recursive(
                 .add_owner(owner);
             if let Some(archive) = list_archive {
                 add_explicit_archive(usages, &dependency, owner, archive.to_owned());
-                if let Some(trace) = trace.as_deref_mut() {
+                if let Some(trace) = walk.trace.as_deref_mut() {
                     trace.record_list_archive(&dependency, owner, archive);
                 }
             }
@@ -706,7 +741,7 @@ fn record_asset_recursive(
             .map_err(|error| BuildError::input(error.to_string()))?;
         for dependency in material.dependencies() {
             note_dependency(
-                trace.as_deref_mut(),
+                walk.trace.as_deref_mut(),
                 owner,
                 path,
                 &dependency,
@@ -719,7 +754,7 @@ fn record_asset_recursive(
                 owner,
                 list_archive,
                 visited,
-                trace.as_deref_mut(),
+                walk,
             )?;
         }
     }
@@ -731,7 +766,7 @@ fn record_asset_recursive(
         for property in shader.properties {
             if let ShaderPropertyDefault::Texture(Some(dependency)) = property.default {
                 note_dependency(
-                    trace.as_deref_mut(),
+                    walk.trace.as_deref_mut(),
                     owner,
                     path,
                     &dependency,
@@ -744,23 +779,46 @@ fn record_asset_recursive(
                     owner,
                     list_archive,
                     visited,
-                    trace.as_deref_mut(),
+                    walk,
                 )?;
             }
         }
     }
 
     if extension_is(path.as_str(), "fbx") {
-        let dependencies = sources
-            .assets
-            .model_dependencies(&format!("/{path}"))
-            .map_err(|error| asset_error(&format!("модель /{path}"), error))?;
+        let dependencies = if walk.model_preparer.converts_models() {
+            if let Some(dependencies) = walk.model_preparer.dependencies_for(path) {
+                dependencies
+            } else {
+                let asset_path = format!("/{path}");
+                let fbx_bytes = sources
+                    .handle
+                    .read_all(asset_path.clone())
+                    .and_then(|request| request.wait())
+                    .map_err(|error| resource_error(&format!("модель {asset_path}"), error))?;
+                let prepared = walk
+                    .model_preparer
+                    .prepare(sources.assets, path, &fbx_bytes)?;
+                let dependencies = sources
+                    .assets
+                    .model_dependencies_from_bytes(&asset_path, &prepared)
+                    .map_err(|error| asset_error(&format!("модель /{path}"), error))?;
+                walk.model_preparer
+                    .remember_dependencies(path, &dependencies);
+                dependencies
+            }
+        } else {
+            sources
+                .assets
+                .model_dependencies(&format!("/{path}"))
+                .map_err(|error| asset_error(&format!("модель /{path}"), error))?
+        };
         for dependency in dependencies {
             let dependency = VirtualPath::parse(&dependency).map_err(|error| {
                 BuildError::input(format!("модель /{path} вернула неверную текстуру: {error}"))
             })?;
             note_dependency(
-                trace.as_deref_mut(),
+                walk.trace.as_deref_mut(),
                 owner,
                 path,
                 &dependency,
@@ -773,7 +831,7 @@ fn record_asset_recursive(
                 owner,
                 list_archive,
                 visited,
-                trace.as_deref_mut(),
+                walk,
             )?;
         }
     }

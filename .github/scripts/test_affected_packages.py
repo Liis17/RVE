@@ -230,6 +230,15 @@ class PackageSelectionTests(unittest.TestCase):
             "cargo clippy -p rve-player --no-default-features --all-targets --locked -- -D warnings",
             feature_off_clippy_step,
         )
+        feature_off_test = next(
+            index for index, line in enumerate(workflow_lines)
+            if "- name: Test engine-assets without FBX support" in line
+        )
+        feature_off_test_step = "\n".join(workflow_lines[feature_off_test:feature_off_test + 4])
+        self.assertIn("contains(needs.changes.outputs.packages, 'rve-player')", feature_off_test_step)
+        self.assertIn("contains(needs.changes.outputs.packages, 'engine-runtime')", feature_off_test_step)
+        self.assertIn("working-directory: build", feature_off_test_step)
+        self.assertIn("cargo test -p engine-assets --no-default-features --locked", feature_off_test_step)
         self.assertTrue("rve-build" in build_changes)
         self.assertTrue("engine-runtime" in runtime_changes)
         self.assertEqual(self.select(["engine/rve-sdk/src/lib.rs"]),

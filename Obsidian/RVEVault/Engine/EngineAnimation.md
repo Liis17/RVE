@@ -12,7 +12,7 @@ Parent: [[Index]]
 
 | Файл | Значимый символ | Роль |
 |---|---|---|
-| `engine/engine-animation/src/lib.rs` | `VERSION` | Публичные реэкспорты, версия крейта `0.4.0` |
+| `engine/engine-animation/src/lib.rs` | `VERSION` | Публичные реэкспорты, версия крейта `0.4.1` |
 | `engine/engine-animation/src/skeleton.rs` | `Skeleton`, `SkeletonNode`, `Joint` | Узлы в порядке родитель-первым и палитры joints |
 | `engine/engine-animation/src/clip.rs` | `Clip`, `Track`, `Key` | Привязка треков FBX к узлам по имени и сэмплинг времени |
 | `engine/engine-animation/src/pose.rs` | `Pose`, `Transform`, `skin_matrices`, `world_matrices` | Локальные TRS, композиция world с inherit modes и `inverse_bind` |

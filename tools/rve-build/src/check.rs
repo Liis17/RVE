@@ -1,7 +1,7 @@
 use crate::archives::validate_project_archives;
 use crate::error::BuildError;
 use crate::player::player_file_name;
-use crate::project::{ProjectBuild, prepare_project};
+use crate::project::{ProjectBuild, prepare_project_for_check};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
@@ -18,7 +18,7 @@ pub(crate) struct CheckSummary {
 /// Проверяет проект тем же разбором, что и `build`, но без сборки архивов, player и скриптов.
 /// Ничего не записывает на диск и не запускает Cargo.
 pub(crate) fn check_project(project_dir: &Path) -> Result<CheckSummary, BuildError> {
-    let project = prepare_project(project_dir)?;
+    let project = prepare_project_for_check(project_dir)?;
     validate_project_archives(&project)?;
     player_file_name(&project.settings.name, &project.settings.id)?;
     Ok(CheckSummary::new(&project))
@@ -143,6 +143,17 @@ mod tests {
         for archive in ["base", "shared", "props", "scene-main"] {
             assert!(text.contains(&format!("архив {archive}:")), "{text}");
         }
+    }
+
+    #[test]
+    fn invalid_fbx_is_a_project_error_with_its_virtual_path() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-check-invalid-fbx").unwrap();
+        create_demo_like_project(root.path());
+        fs::write(root.path().join("Assets/models/shared.fbx"), b"not an FBX").unwrap();
+
+        let error = check_project(root.path()).err().unwrap();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("/models/shared.fbx"), "{error}");
     }
 
     #[test]
