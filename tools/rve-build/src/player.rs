@@ -1648,7 +1648,8 @@ mod tests {
     fn fbx_with_too_many_clip_keys() -> Vec<u8> {
         use std::fmt::Write as _;
 
-        let fixture = include_str!("../../../engine/engine-assets/tests/fixtures/bend_clip.fbx");
+        let fixture = include_str!("../../../engine/engine-assets/tests/fixtures/bend_clip.fbx")
+            .replace("\r\n", "\n");
         let key_count = 4 * 1024 * 1024 + 1;
         let mut times = String::with_capacity(key_count * 9);
         let mut values = String::with_capacity(key_count * 2);

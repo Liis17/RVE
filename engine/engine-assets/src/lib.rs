@@ -3888,6 +3888,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skin_chain_textured.fbx"),
         )
         .unwrap()
+        .replace("\r\n", "\n")
         .replace("textures/golden_texture.png", "missing.png");
         let second_material = "\tMaterial: 601, \"Material::Broken\", \"\" {\n\t\tVersion: 102\n\t\tShadingModel: \"lambert\"\n\t}\n\tLayeredTexture: 701, \"LayeredTexture::BrokenOpacity\", \"\" {\n\t}\n";
         assert_eq!(fbx.matches("\n}\nConnections:  {\n").count(), 1);
