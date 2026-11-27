@@ -118,6 +118,7 @@ impl Renderer {
             particles: ParticleSystem::default(),
             retired: RetireQueue::new(FRAMES_IN_FLIGHT),
             retired_swapchains: RetiredSwapchains::new(FRAMES_IN_FLIGHT),
+            present_fences: PresentFences::new(),
             latency: None,
             latency_semaphore: vk::Semaphore::null(),
             latency_frame: 0,
@@ -139,6 +140,7 @@ impl Renderer {
             fsr_warning_emitted: false,
             dlss_warning_emitted: false,
             swapchain: None,
+            swapchain_maintenance: None,
             surface_format: vk::SurfaceFormatKHR::default(),
             present_mode: config.present_mode,
             last_warned_present_mode: None,
@@ -157,6 +159,7 @@ impl Renderer {
                 fsr: false,
                 dlss: false,
                 low_latency: false,
+                present_fence: false,
                 transfer_queue: false,
             },
             window,
@@ -295,6 +298,9 @@ impl Renderer {
                 Err(error) => self.dlss_load_error = Some(error),
             }
         }
+        requested_instance_extensions.extend(swapchain_maintenance_instance_extensions(
+            &available_instance_extensions,
+        ));
         let requested_instance_extensions = deduplicate_names(requested_instance_extensions);
         check_extensions(
             &requested_instance_extensions,
@@ -378,6 +384,42 @@ impl Renderer {
         self.timestamp_period = choice.timestamp_period;
         self.texture_sampler_anisotropy = choice.texture_sampler_anisotropy;
         self.indirect_instancing = choice.indirect_instancing;
+        let instance_extension_names = requested_instance_extensions
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect::<HashSet<_>>();
+        let available_device_extensions = unsafe {
+            self.instance()?
+                .enumerate_device_extension_properties(self.physical_device)
+        }?;
+        let device_extension_names = extension_property_names(&available_device_extensions);
+        let has_maintenance_candidate =
+            select_swapchain_maintenance(&instance_extension_names, &device_extension_names, true)
+                .is_some();
+        let maintenance_feature_supported = if has_maintenance_candidate {
+            let mut maintenance_features =
+                vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+            let mut features =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance_features);
+            // SAFETY: the selected device advertises a matching maintenance extension and the feature is queried through its alias struct.
+            unsafe {
+                self.instance()?
+                    .get_physical_device_features2(self.physical_device, &mut features)
+            };
+            maintenance_features.swapchain_maintenance1 == vk::TRUE
+        } else {
+            false
+        };
+        self.swapchain_maintenance = select_swapchain_maintenance(
+            &instance_extension_names,
+            &device_extension_names,
+            maintenance_feature_supported,
+        );
+        self.retired_swapchains = if self.swapchain_maintenance.is_some() {
+            RetiredSwapchains::new_present_fence(FRAMES_IN_FLIGHT)
+        } else {
+            RetiredSwapchains::new(FRAMES_IN_FLIGHT)
+        };
         self.capabilities = Capabilities {
             device_name: choice.device_name,
             vendor_id: choice.vendor_id,
@@ -388,11 +430,21 @@ impl Renderer {
             fsr: false,
             dlss: false,
             low_latency: false,
+            present_fence: self.swapchain_maintenance.is_some(),
             transfer_queue: choice.transfer_queue_family_index.is_some(),
         };
+        if let Some(maintenance) = self.swapchain_maintenance {
+            log::debug!(
+                "swapchain present fences enabled with VK_{}_swapchain_maintenance1",
+                maintenance.variant_name()
+            );
+        }
 
         #[allow(unused_mut)]
         let mut device_extensions = base_device_extensions;
+        if let Some(maintenance) = self.swapchain_maintenance {
+            device_extensions.push(maintenance.device_extension_name().to_owned());
+        }
         #[cfg(all(windows, feature = "dlss"))]
         let mut dlss_device_ready = false;
         #[cfg(all(windows, feature = "dlss"))]
@@ -467,6 +519,9 @@ impl Renderer {
             vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
         let mut timeline_features =
             vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+        let mut swapchain_maintenance_features =
+            vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+                .swapchain_maintenance1(self.swapchain_maintenance.is_some());
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&extension_pointers)
@@ -478,12 +533,25 @@ impl Renderer {
                 .push_next(&mut present_id_features)
                 .push_next(&mut timeline_features);
         }
+        if self.swapchain_maintenance.is_some() {
+            device_info = device_info.push_next(&mut swapchain_maintenance_features);
+        }
         // SAFETY: the selected physical device reported every requested feature and extension.
         let device = unsafe {
             self.instance()?
                 .create_device(self.physical_device, &device_info, None)
         }?;
         self.device = Some(device);
+        if self.capabilities.present_fence {
+            for _ in 0..PRESENT_FENCE_CAPACITY {
+                // SAFETY: each pool fence starts unsignaled and is used by one present at a time.
+                let fence = unsafe {
+                    self.device()?
+                        .create_fence(&vk::FenceCreateInfo::default(), None)
+                }?;
+                debug_assert!(self.present_fences.add(fence));
+            }
+        }
         if low_latency_ready {
             self.init_low_latency()?;
         }

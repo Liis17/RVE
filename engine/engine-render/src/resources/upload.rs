@@ -1,6 +1,9 @@
 //! Пакетная загрузка сеток, текстур и изображений через staging-буферы.
 
 use crate::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static TRANSFER_SUBMISSION_LOGGED: AtomicBool = AtomicBool::new(false);
 
 impl Renderer {
     /// Записывает пиксели через batch staging-буфер в device-local image.
@@ -392,6 +395,11 @@ impl Renderer {
                     .signal_semaphore_infos(&signal_infos)];
                 // SAFETY: the transfer queue is used only by this renderer thread; the semaphore is unsignaled.
                 unsafe { device.queue_submit2(transfer_queue, &submit_info, vk::Fence::null()) }?;
+                if !TRANSFER_SUBMISSION_LOGGED.swap(true, Ordering::Relaxed)
+                    && let Some(family) = self.transfer_queue_family_index
+                {
+                    log::info!("first upload batch submitted to transfer queue family {family}");
+                }
                 transfer.submitted = true;
             }
             wait_infos.push(

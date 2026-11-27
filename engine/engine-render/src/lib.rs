@@ -111,6 +111,7 @@ mod math;
 mod passes;
 mod physical_device;
 mod pipelines;
+mod present_fence;
 mod profile;
 mod resources;
 mod swapchain;
@@ -128,6 +129,9 @@ use math::*;
 use passes::*;
 pub use physical_device::*;
 use pipelines::*;
+use present_fence::{
+    PRESENT_FENCE_CAPACITY, PresentFences, PresentResultDisposition, classify_present_result,
+};
 pub use profile::*;
 use resources::*;
 use swapchain::*;
@@ -365,6 +369,7 @@ pub struct Renderer {
     retired: RetireQueue<RetiredResource>,
     retired_swapchains: RetiredSwapchains<SwapchainBundle>,
     pending_swapchain_drop: Option<SwapchainBundle>,
+    present_fences: PresentFences<vk::Fence>,
     frames: Vec<FrameResources>,
     captures: Vec<CaptureRecord>,
     next_capture_ticket: u64,
@@ -382,6 +387,7 @@ pub struct Renderer {
     fsr_warning_emitted: bool,
     dlss_warning_emitted: bool,
     swapchain: Option<SwapchainBundle>,
+    swapchain_maintenance: Option<SwapchainMaintenance>,
     latency: Option<Arc<Shared>>,
     latency_semaphore: vk::Semaphore,
     latency_frame: u64,

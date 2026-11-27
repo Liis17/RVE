@@ -105,6 +105,7 @@ impl BenchmarkRecorder {
                 fsr: capabilities.fsr,
                 dlss: capabilities.dlss,
                 low_latency: capabilities.low_latency,
+                present_fence: capabilities.present_fence,
                 transfer_queue: capabilities.transfer_queue,
             },
             reflex_requested,
@@ -235,6 +236,7 @@ impl BenchmarkRecorder {
                 vendor_id: gpu.vendor_id,
                 vulkan: vulkan_version(gpu.api_version),
                 discrete: gpu.discrete,
+                present_fence: gpu.present_fence,
                 transfer_queue: gpu.transfer_queue,
             },
             frame_interval_ms: summarize(self.frame_interval),
@@ -441,6 +443,7 @@ struct GpuReport {
     vendor_id: u32,
     vulkan: String,
     discrete: bool,
+    present_fence: bool,
     /// Загрузки шли в отдельной transfer-очереди (`Capabilities::transfer_queue`).
     transfer_queue: bool,
 }
@@ -502,6 +505,7 @@ mod tests {
             fsr: false,
             dlss: false,
             low_latency: false,
+            present_fence: false,
             transfer_queue: false,
         }
     }
@@ -681,7 +685,20 @@ mod tests {
         assert_eq!(value["reflex"]["active"], false);
         assert_eq!(value["gpu"]["vulkan"], "1.3");
         assert_eq!(value["gpu"]["name"], "Test GPU");
+        assert_eq!(value["gpu"]["present_fence"], false);
         assert_eq!(value["gpu"]["transfer_queue"], false);
+    }
+
+    #[test]
+    fn benchmark_json_reports_present_fence_support() {
+        let base = Instant::now();
+        let mut gpu = capabilities();
+        gpu.present_fence = true;
+        let mut recorder = BenchmarkRecorder::new(1, 0, &gpu, None);
+        recorder.observe(observation(base, 0, true, None));
+
+        let value = report_value(recorder);
+        assert_eq!(value["gpu"]["present_fence"], true);
     }
 
     #[test]

@@ -18,6 +18,7 @@ impl Renderer {
                 "ресурсы синхронизации кадровых слотов потеряны",
             ));
         }
+        self.poll_swapchain_retirement()?;
         validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         self.validate_skin_draws(frame)?;

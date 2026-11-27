@@ -20,6 +20,7 @@ impl Renderer {
                 "ресурсы синхронизации кадровых слотов потеряны",
             ));
         }
+        self.poll_swapchain_retirement()?;
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
         self.screen_temporal.state.missed();
         self.miss_unlisted_viewports(scenes);

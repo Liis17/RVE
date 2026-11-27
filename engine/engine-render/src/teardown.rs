@@ -9,8 +9,22 @@ impl Drop for Renderer {
             latency.deactivate();
         }
         if let Some(device) = self.device.as_ref() {
-            // SAFETY: teardown waits for renderer submissions before destroying owned Vulkan resources.
-            let _ = unsafe { device.device_wait_idle() };
+            // SAFETY: teardown waits for graphics and transfer submissions before destruction.
+            if let Err(error) = unsafe { device.device_wait_idle() }
+                && error != vk::Result::ERROR_DEVICE_LOST
+            {
+                log::error!("device_wait_idle failed during renderer teardown: {error:?}");
+            }
+            let present_fences = self.present_fences.waiting_fences();
+            if !present_fences.is_empty()
+                // SAFETY: every listed fence is owned by this device and tracks a queued present.
+                && let Err(error) = unsafe {
+                    device.wait_for_fences(&present_fences, true, u64::MAX)
+                }
+                && error != vk::Result::ERROR_DEVICE_LOST
+            {
+                log::error!("waiting for present fences failed during teardown: {error:?}");
+            }
             if self.latency_semaphore != vk::Semaphore::null() {
                 // SAFETY: device idle and Reflex deactivated: no sleep, marker or submit references the semaphore.
                 unsafe { device.destroy_semaphore(self.latency_semaphore, None) };
@@ -24,6 +38,12 @@ impl Drop for Renderer {
         self.swapchain.take();
         self.pending_swapchain_drop.take();
         self.retired_swapchains.clear();
+        if let Some(device) = self.device.as_ref() {
+            for fence in self.present_fences.all_fences() {
+                // SAFETY: present fences were waited above, or the device is lost.
+                unsafe { device.destroy_fence(fence, None) };
+            }
+        }
         self.frames.clear();
         self.retired.clear();
         self.environments.clear();

@@ -175,9 +175,40 @@ impl Renderer {
             present_id,
         } = acquired;
         let submit_started = Instant::now();
+        let present_fence = if self.capabilities.present_fence {
+            match self.present_fences.reserve() {
+                Some(fence) => Some(fence),
+                None => {
+                    self.fail_capture_submissions(
+                        &capture_submissions,
+                        "frame submission failed before viewport capture",
+                    );
+                    return Err(SubmitAndPresentError::BeforeSubmit(
+                        RenderError::InvalidState("present fence pool исчерпан"),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(present_fence) = present_fence
+            && let Err(error) = unsafe { device.reset_fences(&[present_fence]) }
+        {
+            self.present_fences.cancel();
+            self.fail_capture_submissions(
+                &capture_submissions,
+                "frame submission failed before viewport capture",
+            );
+            return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
+                error,
+            )));
+        }
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
         // SAFETY: эта точка — непосредственно перед submit, которому принадлежит fence.
         if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
+            if present_fence.is_some() {
+                self.present_fences.cancel();
+            }
             self.fail_capture_submissions(
                 &capture_submissions,
                 "frame submission failed before viewport capture",
@@ -210,6 +241,9 @@ impl Renderer {
         let submit_info = [submit_info];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
         if let Err(error) = unsafe { device.queue_submit2(queue, &submit_info, fence) } {
+            if present_fence.is_some() {
+                self.present_fences.cancel();
+            }
             self.fail_capture_submissions(
                 &capture_submissions,
                 "frame submission failed before viewport capture",
@@ -236,13 +270,19 @@ impl Renderer {
         let swapchains = [swapchain_handle];
         let image_indices = [image_index as u32];
         let present_ids = [present_id];
+        let present_fence_handles = [present_fence.unwrap_or(vk::Fence::null())];
         let mut present_id_info = vk::PresentIdKHR::default().present_ids(&present_ids);
+        let mut present_fence_info = present_fence
+            .map(|_| vk::SwapchainPresentFenceInfoEXT::default().fences(&present_fence_handles));
         let mut present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&wait_semaphores)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
         if present_id != 0 {
             present_info = present_info.push_next(&mut present_id_info);
+        }
+        if let Some(present_fence_info) = present_fence_info.as_mut() {
+            present_info = present_info.push_next(present_fence_info);
         }
         self.latency_marker(present_id, vk::LatencyMarkerNV::PRESENT_START);
         // SAFETY: present waits on the semaphore signaled by the preceding queue submission.
@@ -251,6 +291,22 @@ impl Renderer {
         self.latency_marker(present_id, vk::LatencyMarkerNV::PRESENT_END);
         timings.present = present_started.elapsed();
         self.frame_slot = (self.frame_slot + 1) % self.frames.len();
+        if present_fence.is_some() {
+            match classify_present_result(present_result) {
+                PresentResultDisposition::Enqueued => {
+                    debug_assert!(self.present_fences.commit(self.swapchain_generation));
+                }
+                PresentResultDisposition::NotEnqueued => {
+                    debug_assert!(self.present_fences.cancel());
+                }
+                PresentResultDisposition::Uncertain => {
+                    debug_assert!(
+                        self.present_fences
+                            .mark_uncertain(self.swapchain_generation)
+                    );
+                }
+            }
+        }
         match present_result {
             Ok(present_suboptimal) => {
                 self.retired_swapchains.presented(self.swapchain_generation);
