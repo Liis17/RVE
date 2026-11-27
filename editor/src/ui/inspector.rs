@@ -1589,21 +1589,28 @@ fn show_animator(
             let mut remove_marker = None;
             for (marker_index, marker) in value.markers.iter_mut().enumerate() {
                 ui.push_id(("animation_marker", marker_index), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Clip");
-                        response |= ui.text_edit_singleline(&mut marker.clip);
-                        ui.label("Name");
-                        response |= ui.text_edit_singleline(&mut marker.name);
-                        ui.label("Time");
-                        response |= ui.add(
-                            egui::DragValue::new(&mut marker.time)
-                                .speed(0.01)
-                                .range(0.0..=f32::MAX),
-                        );
-                        if ui.small_button("×").clicked() {
-                            remove_marker = Some(marker_index);
-                        }
-                    });
+                    egui::Grid::new("animation_marker_fields")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Clip");
+                            response |= ui.text_edit_singleline(&mut marker.clip);
+                            ui.end_row();
+                            ui.label("Name");
+                            response |= ui.text_edit_singleline(&mut marker.name);
+                            ui.end_row();
+                            ui.label("Time");
+                            ui.horizontal(|ui| {
+                                response |= ui.add(
+                                    egui::DragValue::new(&mut marker.time)
+                                        .speed(0.01)
+                                        .range(0.0..=f32::MAX),
+                                );
+                                if ui.small_button("×").clicked() {
+                                    remove_marker = Some(marker_index);
+                                }
+                            });
+                            ui.end_row();
+                        });
                 });
             }
             if let Some(index) = remove_marker {
@@ -1696,7 +1703,15 @@ fn show_animator(
 fn new_animation_marker(animator: &engine_scene::AnimatorComponent) -> AnimationMarker {
     let clip = animator
         .default_motion
-        .clone()
+        .as_deref()
+        .and_then(|motion| {
+            animator
+                .blend_trees
+                .iter()
+                .find(|tree| tree.name == motion)
+                .map(|tree| tree.points.first().map(|point| point.clip.clone()))
+                .unwrap_or_else(|| Some(motion.to_owned()))
+        })
         .or_else(|| {
             animator
                 .clips
@@ -5268,6 +5283,7 @@ mod animation_marker_tests {
         ctx: &egui::Context,
         state: &mut EditorState,
         id: &str,
+        width: f32,
         time: f64,
         events: Vec<Event>,
     ) -> egui::FullOutput {
@@ -5281,7 +5297,7 @@ mod animation_marker_tests {
             .clone()
             .unwrap();
         let input = RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 700.0))),
             time: Some(time),
             events,
             ..RawInput::default()
@@ -5304,6 +5320,19 @@ mod animation_marker_tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("text {label:?} not found in animator UI"))
+    }
+
+    fn text_rects(output: &egui::FullOutput, value: &str) -> Vec<Rect> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == value => {
+                    Some(Rect::from_min_size(text.pos, text.galley.rect.size()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn click_add_marker(
@@ -5329,7 +5358,7 @@ mod animation_marker_tests {
             }],
             Vec::new(),
         ] {
-            let mut output = render_animator(ctx, state, id, time, events);
+            let mut output = render_animator(ctx, state, id, 900.0, time, events);
             output.textures_delta.clear();
             time += 0.1;
         }
@@ -5361,6 +5390,67 @@ mod animation_marker_tests {
             new_animation_marker(&engine_scene::AnimatorComponent::new()).clip,
             "clip"
         );
+
+        let animator = engine_scene::AnimatorComponent {
+            default_motion: Some("locomotion".to_owned()),
+            clips: vec![VirtualPath::parse("anims/walk.fbx").unwrap()],
+            blend_trees: vec![engine_scene::animation::BlendTree {
+                name: "locomotion".to_owned(),
+                parameter: "speed".to_owned(),
+                points: vec![
+                    engine_scene::animation::BlendTreePoint {
+                        clip: "walk".to_owned(),
+                        threshold: 0.0,
+                    },
+                    engine_scene::animation::BlendTreePoint {
+                        clip: "run".to_owned(),
+                        threshold: 1.0,
+                    },
+                ],
+            }],
+            ..engine_scene::AnimatorComponent::new()
+        };
+        assert_eq!(new_animation_marker(&animator).clip, "walk");
+    }
+
+    #[test]
+    fn marker_fields_and_remove_button_fit_a_350_pixel_inspector() {
+        let mut state = EditorState::new(None);
+        state.scene = Some(EditorScene::new_untitled().unwrap());
+        let id = state
+            .scene
+            .as_mut()
+            .unwrap()
+            .create_object(
+                &NewObject::Mesh(VirtualPath::parse("models/hero.fbx").unwrap(), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        let animator = engine_scene::AnimatorComponent {
+            clips: vec![VirtualPath::parse("anims/walk.fbx").unwrap()],
+            markers: vec![marker("marker1")],
+            ..engine_scene::AnimatorComponent::new()
+        };
+        state
+            .scene
+            .as_mut()
+            .unwrap()
+            .set_component(&id, Component::Animator(animator))
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        let mut output = render_animator(&ctx, &mut state, &id, 350.0, 0.0, Vec::new());
+        for value in ["Clip", "Walk", "Name", "marker1", "Time", "×"] {
+            let rects = text_rects(&output, value);
+            assert!(!rects.is_empty(), "marker UI text {value:?} is visible");
+            assert!(
+                rects
+                    .iter()
+                    .all(|rect| rect.left() >= 0.0 && rect.right() <= 350.0),
+                "marker UI text {value:?} stays inside the 350 px panel: {rects:?}"
+            );
+        }
+        output.textures_delta.clear();
     }
 
     #[test]
@@ -5389,7 +5479,7 @@ mod animation_marker_tests {
             .unwrap();
 
         let ctx = egui::Context::default();
-        let mut output = render_animator(&ctx, &mut state, &id, 0.0, Vec::new());
+        let mut output = render_animator(&ctx, &mut state, &id, 900.0, 0.0, Vec::new());
         let position = text_position(&output, "Add marker");
         output.textures_delta.clear();
         click_add_marker(&ctx, &mut state, &id, position);
