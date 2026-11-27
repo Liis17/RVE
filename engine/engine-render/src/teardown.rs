@@ -8,9 +8,29 @@ impl Drop for Renderer {
         if let Some(latency) = self.latency.take() {
             latency.deactivate();
         }
-        if let Some(device) = self.device.as_ref() {
-            // SAFETY: teardown waits for renderer submissions before destroying owned Vulkan resources.
-            let _ = unsafe { device.device_wait_idle() };
+        let mut device_lost = false;
+        if let Some(device) = self.device.as_ref().cloned() {
+            // SAFETY: the renderer owns this device and waits before destroying its child objects.
+            match unsafe { device.device_wait_idle() } {
+                Ok(()) => {}
+                Err(vk::Result::ERROR_DEVICE_LOST) => device_lost = true,
+                Err(error) => {
+                    self.leak_after_wait_failure("device_wait_idle", error);
+                    return;
+                }
+            }
+            let present_fences = self.present_fences.waiting_fences();
+            if !device_lost && !present_fences.is_empty() {
+                // SAFETY: every listed fence is owned by this device and tracks a queued present.
+                match unsafe { device.wait_for_fences(&present_fences, true, u64::MAX) } {
+                    Ok(()) => {}
+                    Err(vk::Result::ERROR_DEVICE_LOST) => {}
+                    Err(error) => {
+                        self.leak_after_wait_failure("wait_for_fences", error);
+                        return;
+                    }
+                }
+            }
             if self.latency_semaphore != vk::Semaphore::null() {
                 // SAFETY: device idle and Reflex deactivated: no sleep, marker or submit references the semaphore.
                 unsafe { device.destroy_semaphore(self.latency_semaphore, None) };
@@ -24,6 +44,12 @@ impl Drop for Renderer {
         self.swapchain.take();
         self.pending_swapchain_drop.take();
         self.retired_swapchains.clear();
+        if let Some(device) = self.device.as_ref() {
+            for fence in self.present_fences.all_fences() {
+                // SAFETY: present fences were waited above, or the device is lost.
+                unsafe { device.destroy_fence(fence, None) };
+            }
+        }
         self.frames.clear();
         self.retired.clear();
         self.environments.clear();
@@ -260,5 +286,60 @@ impl Drop for Renderer {
             unsafe { instance.destroy_instance(None) };
         }
         // Entry and the Arc-owned window remain fields until after the destructor body completes.
+    }
+}
+
+impl Renderer {
+    fn leak_after_wait_failure(&mut self, operation: &str, error: vk::Result) {
+        log::error!(
+            "{operation} failed during renderer teardown ({error:?}); leaking Vulkan resources"
+        );
+        // SAFETY: a failed wait leaves GPU and presentation completion unknown. Leak every
+        // resource owner and keep the loader and native window alive so implicit field drops
+        // cannot destroy children or unload the Vulkan entry points beneath live objects.
+        std::mem::forget(self.entry.clone());
+        std::mem::forget(std::sync::Arc::clone(&self.window));
+
+        macro_rules! leak_option {
+            ($field:ident) => {
+                std::mem::forget(self.$field.take());
+            };
+        }
+        macro_rules! leak_vec {
+            ($field:ident) => {
+                std::mem::forget(std::mem::take(&mut self.$field));
+            };
+        }
+
+        leak_option!(pending_upload);
+        leak_vec!(in_flight_uploads);
+        leak_vec!(skin_instances);
+        leak_vec!(screen_shaders);
+        leak_vec!(color_luts);
+        leak_option!(screen_shader_layout);
+        leak_vec!(frame_uniforms);
+        leak_option!(builtin_user_uniform);
+        leak_option!(brdf_image);
+        leak_vec!(environments);
+        leak_option!(shadow_image);
+        leak_option!(local_shadow_image);
+        leak_vec!(meshes);
+        leak_vec!(textures);
+        leak_vec!(materials);
+        leak_vec!(surface_shaders);
+        leak_vec!(ui_textures);
+        leak_vec!(viewports);
+        std::mem::forget(std::mem::take(&mut self.screen_temporal));
+        self.retired.leak_entries();
+        self.retired_swapchains.leak_entries();
+        leak_option!(pending_swapchain_drop);
+        leak_vec!(frames);
+        leak_vec!(captures);
+        std::mem::forget(std::mem::take(&mut self.particles));
+        #[cfg(windows)]
+        leak_option!(fsr_api);
+        #[cfg(all(windows, feature = "dlss"))]
+        leak_option!(dlss_api);
+        leak_option!(swapchain);
     }
 }

@@ -237,13 +237,28 @@ pub(crate) struct RetireQueue<T> {
 
 /// Swapchains retired while older submissions and presentations may still reference them.
 ///
-/// The release condition is a conservative heuristic: all frame slots must wait for a
-/// submission made after retirement, and at least one successful present per old image must
-/// follow. Vulkan does not guarantee that this proves presentation-engine completion; a
-/// swapchain present-fence extension would provide an exact signal.
+/// The heuristic mode requires a successful present per old image and a newer submission in
+/// every frame slot. Present-fence mode waits for every present fence from that generation and
+/// for each frame-slot fence to signal; that signal also completes every earlier submit on the slot.
 pub(crate) struct RetiredSwapchains<T> {
     all_slots: u32,
-    entries: VecDeque<(u32, u64, u64, usize, T)>,
+    mode: RetiredSwapchainMode,
+    entries: VecDeque<RetiredSwapchain<T>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetiredSwapchainMode {
+    Heuristic,
+    PresentFence,
+}
+
+struct RetiredSwapchain<T> {
+    pending_slots: u32,
+    retired_at_submission_generation: u64,
+    replacement_generation: u64,
+    pending_presents: usize,
+    generation: u64,
+    swapchain: T,
 }
 
 impl<T> RetiredSwapchains<T> {
@@ -252,6 +267,15 @@ impl<T> RetiredSwapchains<T> {
     pub fn new(slot_count: usize) -> Self {
         Self {
             all_slots: (1_u32 << slot_count) - 1,
+            mode: RetiredSwapchainMode::Heuristic,
+            entries: VecDeque::new(),
+        }
+    }
+
+    pub fn new_present_fence(slot_count: usize) -> Self {
+        Self {
+            all_slots: (1_u32 << slot_count) - 1,
+            mode: RetiredSwapchainMode::PresentFence,
             entries: VecDeque::new(),
         }
     }
@@ -264,28 +288,53 @@ impl<T> RetiredSwapchains<T> {
         replacement_generation: u64,
         old_image_count: usize,
     ) -> Option<T> {
-        self.entries.push_back((
-            self.all_slots,
+        self.entries.push_back(RetiredSwapchain {
+            pending_slots: self.all_slots,
             retired_at_submission_generation,
             replacement_generation,
-            old_image_count,
+            pending_presents: old_image_count,
+            generation: 0,
             swapchain,
-        ));
+        });
         self.collect();
         if self.entries.len() > Self::CAPACITY {
-            self.entries
-                .pop_front()
-                .map(|(_, _, _, _, swapchain)| swapchain)
+            self.entries.pop_front().map(|entry| entry.swapchain)
         } else {
             None
         }
     }
 
-    /// A slot counts only after waiting for a submission generation newer than retirement.
+    /// Retires a swapchain while keeping its exact present-fence generation.
+    pub fn retire_present_fence(
+        &mut self,
+        swapchain: T,
+        retired_at_submission_generation: u64,
+        generation: u64,
+        outstanding_present_fences: usize,
+    ) -> Option<T> {
+        self.entries.push_back(RetiredSwapchain {
+            pending_slots: self.all_slots,
+            retired_at_submission_generation,
+            replacement_generation: 0,
+            pending_presents: outstanding_present_fences,
+            generation,
+            swapchain,
+        });
+        self.collect();
+        if self.entries.len() > Self::CAPACITY {
+            self.entries.pop_front().map(|entry| entry.swapchain)
+        } else {
+            None
+        }
+    }
+
+    /// Present-fence mode accepts any signaled slot fence; heuristic mode requires a newer submit.
     pub fn slot_completed(&mut self, slot: usize, submission_generation: u64) {
-        for (pending_slots, retired_at, _, _, _) in &mut self.entries {
-            if submission_generation > *retired_at {
-                *pending_slots &= !(1_u32 << slot);
+        for entry in &mut self.entries {
+            if self.mode == RetiredSwapchainMode::PresentFence
+                || submission_generation > entry.retired_at_submission_generation
+            {
+                entry.pending_slots &= !(1_u32 << slot);
             }
         }
         self.collect();
@@ -293,9 +342,22 @@ impl<T> RetiredSwapchains<T> {
 
     /// Counts only successful presents of the replacement swapchain.
     pub fn presented(&mut self, replacement_generation: u64) {
-        for (_, _, item_replacement_generation, pending_presents, _) in &mut self.entries {
-            if *item_replacement_generation == replacement_generation {
-                *pending_presents = pending_presents.saturating_sub(1);
+        if self.mode == RetiredSwapchainMode::Heuristic {
+            for entry in &mut self.entries {
+                if entry.replacement_generation == replacement_generation {
+                    entry.pending_presents = entry.pending_presents.saturating_sub(1);
+                }
+            }
+        }
+        self.collect();
+    }
+
+    pub fn present_fence_completed(&mut self, generation: u64) {
+        if self.mode == RetiredSwapchainMode::PresentFence {
+            for entry in &mut self.entries {
+                if entry.generation == generation {
+                    entry.pending_presents = entry.pending_presents.saturating_sub(1);
+                }
             }
         }
         self.collect();
@@ -307,21 +369,28 @@ impl<T> RetiredSwapchains<T> {
 
     /// Removes the oldest swapchain; the caller must first wait for device idle.
     pub fn remove_oldest_after_idle(&mut self) -> Option<T> {
-        self.entries
-            .pop_front()
-            .map(|(_, _, _, _, swapchain)| swapchain)
+        self.entries.pop_front().map(|entry| entry.swapchain)
+    }
+
+    pub fn oldest_generation(&self) -> Option<u64> {
+        (self.mode == RetiredSwapchainMode::PresentFence)
+            .then(|| self.entries.front().map(|entry| entry.generation))
+            .flatten()
     }
 
     fn collect(&mut self) {
         self.entries
-            .retain(|(pending_slots, _, _, pending_presents, _)| {
-                *pending_slots != 0 || *pending_presents != 0
-            });
+            .retain(|entry| entry.pending_slots != 0 || entry.pending_presents != 0);
     }
 
     /// Destroys all retired swapchains; valid only after `device_wait_idle`.
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Leaves retired swapchain bundles allocated after a wait error during teardown.
+    pub fn leak_entries(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.entries));
     }
 }
 
@@ -362,6 +431,11 @@ impl<T> RetireQueue<T> {
     /// Уничтожает всё сразу; допустимо только после `device_wait_idle`.
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Leaves retired GPU resources allocated after a wait error during teardown.
+    pub fn leak_entries(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.entries));
     }
 }
 
@@ -633,6 +707,89 @@ mod tests {
         let mut queue = RetiredSwapchains::new(2);
         queue.retire(Rc::clone(&first), 0, 1, 1);
         queue.retire(Rc::clone(&second), 0, 1, 1);
+        queue.clear();
+        assert_eq!(Rc::strong_count(&first), 1);
+        assert_eq!(Rc::strong_count(&second), 1);
+    }
+
+    #[test]
+    fn present_fence_retirement_waits_for_all_fences_from_its_generation() {
+        let swapchain = Rc::new(());
+        let mut queue = RetiredSwapchains::new_present_fence(2);
+        queue.retire_present_fence(Rc::clone(&swapchain), 10, 4, 2);
+
+        queue.slot_completed(0, 11);
+        queue.slot_completed(1, 11);
+        queue.present_fence_completed(5);
+        assert_eq!(Rc::strong_count(&swapchain), 2);
+
+        queue.present_fence_completed(4);
+        assert_eq!(Rc::strong_count(&swapchain), 2);
+        queue.present_fence_completed(4);
+        assert_eq!(Rc::strong_count(&swapchain), 1);
+    }
+
+    #[test]
+    fn present_fence_retirement_without_presents_releases_after_slot_fences_signal() {
+        let swapchain = Rc::new(());
+        let mut queue = RetiredSwapchains::new_present_fence(2);
+        queue.retire_present_fence(Rc::clone(&swapchain), 10, 4, 0);
+
+        queue.slot_completed(0, 10);
+        queue.slot_completed(1, 10);
+        assert_eq!(Rc::strong_count(&swapchain), 1);
+    }
+
+    #[test]
+    fn present_fence_retirement_overflow_returns_the_oldest_bundle() {
+        let swapchains = (0..5).map(|_| Rc::new(())).collect::<Vec<_>>();
+        let mut queue = RetiredSwapchains::new_present_fence(2);
+        for (generation, swapchain) in (1..=4).zip(&swapchains[..4]) {
+            assert!(
+                queue
+                    .retire_present_fence(Rc::clone(swapchain), 0, generation, 1)
+                    .is_none()
+            );
+        }
+
+        let oldest = queue
+            .retire_present_fence(Rc::clone(&swapchains[4]), 0, 5, 1)
+            .expect("overflow returns the oldest retired bundle");
+        assert!(Rc::ptr_eq(&oldest, &swapchains[0]));
+        assert!(queue.is_full());
+        assert_eq!(queue.oldest_generation(), Some(2));
+    }
+
+    #[test]
+    fn present_fence_retirement_keeps_several_resize_generations_independent() {
+        let swapchains = (0..3).map(|_| Rc::new(())).collect::<Vec<_>>();
+        let mut queue = RetiredSwapchains::new_present_fence(1);
+        for (generation, swapchain) in (1..=3).zip(&swapchains) {
+            queue.retire_present_fence(Rc::clone(swapchain), 0, generation, 1);
+            queue.slot_completed(0, 1);
+        }
+
+        queue.present_fence_completed(2);
+        queue.present_fence_completed(3);
+        assert_eq!(queue.oldest_generation(), Some(1));
+        assert_eq!(Rc::strong_count(&swapchains[0]), 2);
+        assert_eq!(Rc::strong_count(&swapchains[1]), 1);
+        assert_eq!(Rc::strong_count(&swapchains[2]), 1);
+
+        queue.present_fence_completed(1);
+        assert!(queue.entries.is_empty());
+        for swapchain in &swapchains {
+            assert_eq!(Rc::strong_count(swapchain), 1);
+        }
+    }
+
+    #[test]
+    fn present_fence_retirement_clear_drops_every_entry() {
+        let first = Rc::new(());
+        let second = Rc::new(());
+        let mut queue = RetiredSwapchains::new_present_fence(2);
+        queue.retire_present_fence(Rc::clone(&first), 0, 1, 1);
+        queue.retire_present_fence(Rc::clone(&second), 0, 2, 1);
         queue.clear();
         assert_eq!(Rc::strong_count(&first), 1);
         assert_eq!(Rc::strong_count(&second), 1);

@@ -175,9 +175,81 @@ impl Renderer {
             present_id,
         } = acquired;
         let submit_started = Instant::now();
+        let present_fence = if self.capabilities.present_fence {
+            let mut reserved = self.present_fences.reserve();
+            if reserved.is_none() {
+                if let Err(error) = self.poll_swapchain_retirement() {
+                    self.fail_capture_submissions(
+                        &capture_submissions,
+                        "present fence polling failed before viewport capture",
+                    );
+                    return Err(SubmitAndPresentError::BeforeSubmit(error));
+                }
+                reserved = self.present_fences.reserve();
+            }
+            if reserved.is_none() {
+                let Some(generation) = self.present_fences.oldest_pending_generation() else {
+                    self.fail_capture_submissions(
+                        &capture_submissions,
+                        "present fence wait failed before viewport capture",
+                    );
+                    return Err(SubmitAndPresentError::BeforeSubmit(
+                        RenderError::InvalidState("нет ожидающего present fence для освобождения"),
+                    ));
+                };
+                if let Err(error) = self.wait_present_fences_for_generation(device, generation) {
+                    self.fail_capture_submissions(
+                        &capture_submissions,
+                        "present fence wait failed before viewport capture",
+                    );
+                    return Err(SubmitAndPresentError::BeforeSubmit(error));
+                }
+                reserved = self.present_fences.reserve();
+            }
+            match reserved {
+                Some(fence) => Some(fence),
+                None => {
+                    self.fail_capture_submissions(
+                        &capture_submissions,
+                        "frame submission failed before viewport capture",
+                    );
+                    return Err(SubmitAndPresentError::BeforeSubmit(
+                        RenderError::InvalidState(
+                            "present fence pool исчерпан без ожидающих fence",
+                        ),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(present_fence) = present_fence
+            // SAFETY: reserve returns only a new or completed fence, never one used by an in-flight present.
+            && let Err(error) = unsafe { device.reset_fences(&[present_fence]) }
+        {
+            let finished = self.present_fences.finish(
+                PresentResultDisposition::NotEnqueued,
+                self.swapchain_generation,
+            );
+            debug_assert!(finished);
+            self.fail_capture_submissions(
+                &capture_submissions,
+                "frame submission failed before viewport capture",
+            );
+            return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
+                error,
+            )));
+        }
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
         // SAFETY: эта точка — непосредственно перед submit, которому принадлежит fence.
         if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
+            if present_fence.is_some() {
+                let finished = self.present_fences.finish(
+                    PresentResultDisposition::NotEnqueued,
+                    self.swapchain_generation,
+                );
+                debug_assert!(finished);
+            }
             self.fail_capture_submissions(
                 &capture_submissions,
                 "frame submission failed before viewport capture",
@@ -210,6 +282,13 @@ impl Renderer {
         let submit_info = [submit_info];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
         if let Err(error) = unsafe { device.queue_submit2(queue, &submit_info, fence) } {
+            if present_fence.is_some() {
+                let finished = self.present_fences.finish(
+                    PresentResultDisposition::NotEnqueued,
+                    self.swapchain_generation,
+                );
+                debug_assert!(finished);
+            }
             self.fail_capture_submissions(
                 &capture_submissions,
                 "frame submission failed before viewport capture",
@@ -236,13 +315,19 @@ impl Renderer {
         let swapchains = [swapchain_handle];
         let image_indices = [image_index as u32];
         let present_ids = [present_id];
+        let present_fence_handles = [present_fence.unwrap_or(vk::Fence::null())];
         let mut present_id_info = vk::PresentIdKHR::default().present_ids(&present_ids);
+        let mut present_fence_info = present_fence
+            .map(|_| vk::SwapchainPresentFenceInfoEXT::default().fences(&present_fence_handles));
         let mut present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&wait_semaphores)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
         if present_id != 0 {
             present_info = present_info.push_next(&mut present_id_info);
+        }
+        if let Some(present_fence_info) = present_fence_info.as_mut() {
+            present_info = present_info.push_next(present_fence_info);
         }
         self.latency_marker(present_id, vk::LatencyMarkerNV::PRESENT_START);
         // SAFETY: present waits on the semaphore signaled by the preceding queue submission.
@@ -251,6 +336,16 @@ impl Renderer {
         self.latency_marker(present_id, vk::LatencyMarkerNV::PRESENT_END);
         timings.present = present_started.elapsed();
         self.frame_slot = (self.frame_slot + 1) % self.frames.len();
+        if present_fence.is_some()
+            && !self.present_fences.finish(
+                classify_present_result(present_result),
+                self.swapchain_generation,
+            )
+        {
+            return Err(SubmitAndPresentError::AfterSubmit(
+                RenderError::InvalidState("present fence не был зарезервирован"),
+            ));
+        }
         match present_result {
             Ok(present_suboptimal) => {
                 self.retired_swapchains.presented(self.swapchain_generation);

@@ -42,6 +42,8 @@ pub struct Capabilities {
     pub dlss: bool,
     /// Включён ли NVIDIA Reflex: расширения, features и timeline semaphore поддержаны и созданы.
     pub low_latency: bool,
+    /// Используется ли maintenance1 present fence для подтверждённого освобождения swapchain.
+    pub present_fence: bool,
     /// Загрузки ресурсов идут в отдельной transfer-очереди с передачей владения graphics queue.
     pub transfer_queue: bool,
 }

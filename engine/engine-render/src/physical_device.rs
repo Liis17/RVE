@@ -2,6 +2,99 @@
 
 use crate::*;
 
+const KHR_GET_SURFACE_CAPABILITIES2_NAME: &CStr = c"VK_KHR_get_surface_capabilities2";
+const KHR_SURFACE_MAINTENANCE1_NAME: &CStr = c"VK_KHR_surface_maintenance1";
+const EXT_SURFACE_MAINTENANCE1_NAME: &CStr = c"VK_EXT_surface_maintenance1";
+const KHR_SWAPCHAIN_MAINTENANCE1_NAME: &CStr = c"VK_KHR_swapchain_maintenance1";
+const EXT_SWAPCHAIN_MAINTENANCE1_NAME: &CStr = c"VK_EXT_swapchain_maintenance1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SwapchainMaintenance {
+    Khr,
+    Ext,
+}
+
+impl SwapchainMaintenance {
+    pub(crate) fn device_extension_name(self) -> &'static CStr {
+        match self {
+            Self::Khr => KHR_SWAPCHAIN_MAINTENANCE1_NAME,
+            Self::Ext => EXT_SWAPCHAIN_MAINTENANCE1_NAME,
+        }
+    }
+
+    pub(crate) fn variant_name(self) -> &'static str {
+        match self {
+            Self::Khr => "KHR",
+            Self::Ext => "EXT",
+        }
+    }
+}
+
+/// Returns optional instance extensions that can satisfy maintenance1 dependencies.
+pub(crate) fn swapchain_maintenance_instance_extensions(
+    available: &[vk::ExtensionProperties],
+) -> Vec<CString> {
+    let available = extension_property_names(available);
+    let has_surface_maintenance = available
+        .contains(&extension_name(KHR_SURFACE_MAINTENANCE1_NAME))
+        || available.contains(&extension_name(EXT_SURFACE_MAINTENANCE1_NAME));
+    if !has_surface_maintenance
+        || !available.contains(&extension_name(KHR_GET_SURFACE_CAPABILITIES2_NAME))
+    {
+        return Vec::new();
+    }
+
+    [
+        KHR_GET_SURFACE_CAPABILITIES2_NAME,
+        KHR_SURFACE_MAINTENANCE1_NAME,
+        EXT_SURFACE_MAINTENANCE1_NAME,
+    ]
+    .into_iter()
+    .filter(|name| available.contains(&extension_name(name)))
+    .map(CStr::to_owned)
+    .collect()
+}
+
+/// Chooses a matching instance/device variant, preferring KHR after promotion.
+pub(crate) fn select_swapchain_maintenance(
+    instance_extensions: &HashSet<String>,
+    device_extensions: &HashSet<String>,
+    feature_supported: bool,
+) -> Option<SwapchainMaintenance> {
+    if !feature_supported
+        || !instance_extensions.contains(KHR_GET_SURFACE_CAPABILITIES2_NAME.to_str().ok()?)
+    {
+        return None;
+    }
+    if instance_extensions.contains(KHR_SURFACE_MAINTENANCE1_NAME.to_str().ok()?)
+        && device_extensions.contains(KHR_SWAPCHAIN_MAINTENANCE1_NAME.to_str().ok()?)
+    {
+        return Some(SwapchainMaintenance::Khr);
+    }
+    if instance_extensions.contains(EXT_SURFACE_MAINTENANCE1_NAME.to_str().ok()?)
+        && device_extensions.contains(EXT_SWAPCHAIN_MAINTENANCE1_NAME.to_str().ok()?)
+    {
+        return Some(SwapchainMaintenance::Ext);
+    }
+    None
+}
+
+pub(crate) fn extension_property_names(extensions: &[vk::ExtensionProperties]) -> HashSet<String> {
+    extensions
+        .iter()
+        .map(|extension| {
+            // SAFETY: Vulkan extension property names are fixed-size null-terminated strings.
+            unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+fn extension_name(name: &CStr) -> String {
+    name.to_string_lossy().into_owned()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeInstanceFailure {
     NoDriver,
@@ -761,4 +854,84 @@ pub(crate) fn missing_extensions(
         .filter(|name| !available_names.contains(name.as_bytes()))
         .map(|name| format!("{} extension недоступен: {}", kind, name.to_string_lossy()))
         .collect()
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::{SwapchainMaintenance, select_swapchain_maintenance};
+    use std::collections::HashSet;
+
+    fn extensions(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn selects_khr_variant_when_available() {
+        let instance = extensions(&[
+            "VK_KHR_get_surface_capabilities2",
+            "VK_KHR_surface_maintenance1",
+        ]);
+        let device = extensions(&["VK_KHR_swapchain_maintenance1"]);
+        assert_eq!(
+            select_swapchain_maintenance(&instance, &device, true),
+            Some(SwapchainMaintenance::Khr)
+        );
+    }
+
+    #[test]
+    fn selects_ext_variant_when_only_ext_pair_is_available() {
+        let instance = extensions(&[
+            "VK_KHR_get_surface_capabilities2",
+            "VK_EXT_surface_maintenance1",
+        ]);
+        let device = extensions(&["VK_EXT_swapchain_maintenance1"]);
+        assert_eq!(
+            select_swapchain_maintenance(&instance, &device, true),
+            Some(SwapchainMaintenance::Ext)
+        );
+    }
+
+    #[test]
+    fn prefers_khr_when_both_variants_are_available() {
+        let instance = extensions(&[
+            "VK_KHR_get_surface_capabilities2",
+            "VK_KHR_surface_maintenance1",
+            "VK_EXT_surface_maintenance1",
+        ]);
+        let device = extensions(&[
+            "VK_KHR_swapchain_maintenance1",
+            "VK_EXT_swapchain_maintenance1",
+        ]);
+        assert_eq!(
+            select_swapchain_maintenance(&instance, &device, true),
+            Some(SwapchainMaintenance::Khr)
+        );
+    }
+
+    #[test]
+    fn does_not_select_without_a_matching_instance_extension_pair() {
+        let instance = extensions(&["VK_KHR_get_surface_capabilities2"]);
+        let device = extensions(&["VK_KHR_swapchain_maintenance1"]);
+        assert_eq!(select_swapchain_maintenance(&instance, &device, true), None);
+    }
+
+    #[test]
+    fn does_not_select_without_get_surface_capabilities2() {
+        let instance = extensions(&["VK_KHR_surface_maintenance1"]);
+        let device = extensions(&["VK_KHR_swapchain_maintenance1"]);
+        assert_eq!(select_swapchain_maintenance(&instance, &device, true), None);
+    }
+
+    #[test]
+    fn does_not_select_without_the_device_feature() {
+        let instance = extensions(&[
+            "VK_KHR_get_surface_capabilities2",
+            "VK_KHR_surface_maintenance1",
+        ]);
+        let device = extensions(&["VK_KHR_swapchain_maintenance1"]);
+        assert_eq!(
+            select_swapchain_maintenance(&instance, &device, false),
+            None
+        );
+    }
 }
