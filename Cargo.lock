@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "engine-animation"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "crash-handler",
  "egui",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "rve-player"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "engine-runtime",
 ]
@@ -3420,7 +3420,7 @@ version = "0.25.0"
 
 [[package]]
 name = "rve-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-runtime",
 ]

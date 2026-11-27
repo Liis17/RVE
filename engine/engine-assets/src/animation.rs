@@ -3,9 +3,11 @@
 //! Ключи хранят время в секундах от начала клипа и имена узлов. Сопоставление
 //! с костями скелета выполняется в `engine-animation`.
 
+#[cfg(feature = "fbx")]
 use crate::skin::SkeletonBuilder;
 
 /// Предел числа ключей на все клипы модели, чтобы не допустить неограниченного роста памяти.
+#[cfg(feature = "fbx")]
 pub(crate) const KEY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Ключ дорожки: время в секундах и значение.
@@ -36,6 +38,7 @@ pub struct ModelAnimation {
 
 /// Есть ли в файле стек с хотя бы одним ключом. Пустой стек, например `Take 001` статичной
 /// модели, анимацией не считается.
+#[cfg(feature = "fbx")]
 pub(crate) fn has_animated_stack(scene: &ufbx::Scene) -> Result<bool, String> {
     let mut keys = usize::MAX;
     for stack in scene.anim_stacks.iter() {
@@ -48,6 +51,7 @@ pub(crate) fn has_animated_stack(scene: &ufbx::Scene) -> Result<bool, String> {
 }
 
 /// Запекает стеки модели с ключами; в клип попадают только узлы скелета.
+#[cfg(feature = "fbx")]
 pub(crate) fn bake_model_animations(
     builder: &SkeletonBuilder,
     scene: &ufbx::Scene,
@@ -70,6 +74,7 @@ pub(crate) fn bake_model_animations(
 }
 
 /// Запекает стеки файла с ключами как клипы; имена — stem файла, если стек один.
+#[cfg(feature = "fbx")]
 pub(crate) fn bake_clip_file(
     scene: &ufbx::Scene,
     stem: &str,
@@ -91,6 +96,7 @@ pub(crate) fn bake_clip_file(
     Ok(clips)
 }
 
+#[cfg(feature = "fbx")]
 fn bake_stack(
     scene: &ufbx::Scene,
     stack: &ufbx::AnimStack,
@@ -153,10 +159,12 @@ fn bake_stack(
     })
 }
 
+#[cfg(feature = "fbx")]
 fn key_time(time: f64, begin: f64) -> f32 {
     (time - begin).max(0.0) as f32
 }
 
+#[cfg(feature = "fbx")]
 fn vec3(value: ufbx::Vec3) -> [f32; 3] {
     [value.x as f32, value.y as f32, value.z as f32]
 }

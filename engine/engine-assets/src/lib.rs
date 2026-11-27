@@ -11,6 +11,7 @@ pub use animation::{ModelAnimation, ModelKey, ModelTrack};
 pub use prebuilt::{PREBUILT_MODEL_MAX_BYTES, PREBUILT_MODEL_VERSION};
 pub use skin::{ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelSkin, ModelTransform};
 
+#[cfg(feature = "fbx")]
 use bevy_mikktspace::{Geometry, TangentSpace};
 use engine_resources::{ResourceError, ResourceErrorKind, ResourceHandle, ResourceStat};
 use std::collections::{HashMap, HashSet};
@@ -334,11 +335,19 @@ impl Assets {
         if prebuilt::is_prebuilt_model(&bytes) {
             load_prebuilt_model(&bytes, &path, &virtual_asset_path(asset_path), self, cancel)
         } else {
-            load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self, cancel)
+            #[cfg(feature = "fbx")]
+            {
+                load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self, cancel)
+            }
+            #[cfg(not(feature = "fbx"))]
+            {
+                Err(unsupported_fbx(&path))
+            }
         }
     }
 
     /// Преобразует FBX в версионированный артефакт готовой модели.
+    #[cfg(feature = "fbx")]
     pub fn convert_model(&self, asset_path: &str) -> Result<Vec<u8>, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
@@ -409,24 +418,31 @@ impl Assets {
             }
             return Ok(model.clips);
         }
-        let virtual_path = virtual_asset_path(asset_path);
-        let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
-        let stem = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("clip");
-        let clips =
-            animation::bake_clip_file(&scene, stem).map_err(|message| AssetError::Decode {
-                path: path.clone(),
-                message,
-            })?;
-        if clips.is_empty() {
-            return Err(AssetError::Decode {
-                path,
-                message: "нет анимационных стеков с ключами".to_owned(),
-            });
+        #[cfg(feature = "fbx")]
+        {
+            let virtual_path = virtual_asset_path(asset_path);
+            let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("clip");
+            let clips =
+                animation::bake_clip_file(&scene, stem).map_err(|message| AssetError::Decode {
+                    path: path.clone(),
+                    message,
+                })?;
+            if clips.is_empty() {
+                return Err(AssetError::Decode {
+                    path,
+                    message: "нет анимационных стеков с ключами".to_owned(),
+                });
+            }
+            Ok(clips)
         }
-        Ok(clips)
+        #[cfg(not(feature = "fbx"))]
+        {
+            Err(unsupported_fbx(&path))
+        }
     }
 
     /// Возвращает внешние PNG-зависимости FBX без декодирования изображений.
@@ -450,63 +466,70 @@ impl Assets {
             }
             return prebuilt_dependencies(&model, &virtual_asset_path(asset_path), &path, self);
         }
-        let virtual_path = virtual_asset_path(asset_path);
-        let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
-        if !scene_has_triangles(&scene) {
-            // Файл только с клипами (например, из Mixamo) не является моделью и зависимостей не имеет.
-            if !scene.anim_stacks.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Err(AssetError::Decode {
-                path,
-                message: "в модели нет треугольников".to_owned(),
-            });
-        }
-        let mut dependencies = Vec::new();
-        let mut seen_textures = HashSet::new();
-
-        for node in scene.nodes.iter() {
-            let Some(mesh) = node.mesh.as_ref() else {
-                continue;
-            };
-            let materials = if node.materials.is_empty() {
-                &mesh.materials
-            } else {
-                &node.materials
-            };
-            for part in mesh.material_parts.iter() {
-                if part.num_triangles == 0 {
-                    continue;
+        #[cfg(feature = "fbx")]
+        {
+            let virtual_path = virtual_asset_path(asset_path);
+            let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
+            if !scene_has_triangles(&scene) {
+                // Файл только с клипами (например, из Mixamo) не является моделью и зависимостей не имеет.
+                if !scene.anim_stacks.is_empty() {
+                    return Ok(Vec::new());
                 }
-                let Some(material) = materials.get(part.index as usize) else {
+                return Err(AssetError::Decode {
+                    path,
+                    message: "в модели нет треугольников".to_owned(),
+                });
+            }
+            let mut dependencies = Vec::new();
+            let mut seen_textures = HashSet::new();
+
+            for node in scene.nodes.iter() {
+                let Some(mesh) = node.mesh.as_ref() else {
                     continue;
                 };
-                let textures =
-                    material_textures(material).map_err(|message| AssetError::Decode {
-                        path: path.to_owned(),
-                        message: message.to_owned(),
-                    })?;
-                for texture in textures.all().into_iter().flatten() {
-                    if !seen_textures.insert(texture.element.element_id)
-                        || !texture.content.is_empty()
-                    {
+                let materials = if node.materials.is_empty() {
+                    &mesh.materials
+                } else {
+                    &node.materials
+                };
+                for part in mesh.material_parts.iter() {
+                    if part.num_triangles == 0 {
                         continue;
                     }
-                    let dependency = resolve_external_texture(
-                        &virtual_path,
-                        &path,
-                        texture,
-                        self,
-                        |asset_path, _| Ok(asset_path.to_owned()),
-                    )?;
-                    if !dependencies.contains(&dependency) {
-                        dependencies.push(dependency);
+                    let Some(material) = materials.get(part.index as usize) else {
+                        continue;
+                    };
+                    let textures =
+                        material_textures(material).map_err(|message| AssetError::Decode {
+                            path: path.to_owned(),
+                            message: message.to_owned(),
+                        })?;
+                    for texture in textures.all().into_iter().flatten() {
+                        if !seen_textures.insert(texture.element.element_id)
+                            || !texture.content.is_empty()
+                        {
+                            continue;
+                        }
+                        let dependency = resolve_external_texture(
+                            &virtual_path,
+                            &path,
+                            texture,
+                            self,
+                            |asset_path, _| Ok(asset_path.to_owned()),
+                        )?;
+                        if !dependencies.contains(&dependency) {
+                            dependencies.push(dependency);
+                        }
                     }
                 }
             }
-        }
 
-        Ok(dependencies)
+            Ok(dependencies)
+        }
+        #[cfg(not(feature = "fbx"))]
+        {
+            Err(unsupported_fbx(&path))
+        }
     }
 
     fn read_asset(&self, asset_path: &str, path: &Path) -> Result<Vec<u8>, AssetError> {
@@ -996,6 +1019,7 @@ fn check_cancel(cancel: &AtomicBool, path: &Path) -> Result<(), AssetError> {
     }
 }
 
+#[cfg(feature = "fbx")]
 fn load_fbx(
     bytes: &[u8],
     virtual_path: &str,
@@ -1051,12 +1075,14 @@ fn load_fbx(
     Ok(model)
 }
 
+#[cfg(feature = "fbx")]
 struct FbxParts {
     texture_references: Vec<prebuilt::TextureReference>,
     skeleton_builder: Option<skin::SkeletonBuilder>,
     has_animation_stacks: bool,
 }
 
+#[cfg(feature = "fbx")]
 fn prepare_fbx_parts(
     scene: &ufbx::Scene,
     path: &Path,
@@ -1218,6 +1244,14 @@ fn decode_prebuilt(bytes: &[u8], path: &Path) -> Result<prebuilt::PreparedModel,
     })
 }
 
+#[cfg(not(feature = "fbx"))]
+fn unsupported_fbx(path: &Path) -> AssetError {
+    AssetError::Decode {
+        path: path.to_owned(),
+        message: "FBX не поддерживается этой сборкой; соберите релиз через rve-build".to_owned(),
+    }
+}
+
 fn load_prebuilt_model(
     bytes: &[u8],
     path: &Path,
@@ -1325,11 +1359,13 @@ fn prebuilt_dependencies(
 }
 
 /// Битовый ключ вершины: позиция, нормаль, UV, tangent, веса и индексы суставов.
+#[cfg(feature = "fbx")]
 type VertexKey = [u32; 20];
 
 /// Собирает часть меша из углов треугольников, объединяя углы с побитово равными
 /// итоговыми атрибутами. Порядок треугольников и вершин в них сохраняется, поэтому
 /// швы UV/нормалей и skinning остаются отдельными вершинами.
+#[cfg(feature = "fbx")]
 struct MeshPartBuilder {
     vertices: Vec<ModelVertex>,
     skin: Option<ModelSkin>,
@@ -1337,6 +1373,7 @@ struct MeshPartBuilder {
     lookup: HashMap<VertexKey, u32>,
 }
 
+#[cfg(feature = "fbx")]
 impl MeshPartBuilder {
     fn new(corner_capacity: usize, skinned: bool) -> Self {
         Self {
@@ -1408,11 +1445,13 @@ impl MeshPartBuilder {
 ///
 /// Зеркальный узел переставляет вершины грани так же, как [`MeshPartBuilder::finish`],
 /// поэтому знак `w` соответствует winding, который увидит renderer.
+#[cfg(feature = "fbx")]
 struct MikkGeometry<'a> {
     corners: &'a mut [ModelVertex],
     mirrored: bool,
 }
 
+#[cfg(feature = "fbx")]
 impl MikkGeometry<'_> {
     /// Индекс угла части для вершины `vert` грани `face` в итоговом порядке.
     fn corner(&self, face: usize, vert: usize) -> usize {
@@ -1425,6 +1464,7 @@ impl MikkGeometry<'_> {
     }
 }
 
+#[cfg(feature = "fbx")]
 impl Geometry for MikkGeometry<'_> {
     fn num_faces(&self) -> usize {
         self.corners.len() / 3
@@ -1458,6 +1498,7 @@ impl Geometry for MikkGeometry<'_> {
 /// Tangent из слоёв файла: `tangent` ортогонализуется к нормали, `w` выбирает сторону `bitangent`.
 ///
 /// Нулевой tangent или bitangent, лежащий в плоскости tangent и нормали, даёт `[0, 0, 0, 0]`.
+#[cfg(feature = "fbx")]
 fn tangent_from_layers(normal: [f32; 3], tangent: [f32; 3], bitangent: [f32; 3]) -> [f32; 4] {
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     let along_normal = dot(tangent, normal);
@@ -1483,6 +1524,7 @@ fn tangent_from_layers(normal: [f32; 3], tangent: [f32; 3], bitangent: [f32; 3])
 }
 
 /// Файловая текстура основного цвета: классический diffuse FBX или base color PBR.
+#[cfg(feature = "fbx")]
 fn diffuse_texture(material: &ufbx::Material) -> Option<&ufbx::Texture> {
     [&material.fbx.diffuse_color, &material.pbr.base_color]
         .into_iter()
@@ -1490,6 +1532,7 @@ fn diffuse_texture(material: &ufbx::Material) -> Option<&ufbx::Texture> {
         .find(|texture| texture.type_ == ufbx::TextureType::File)
 }
 
+#[cfg(feature = "fbx")]
 struct MaterialTextures<'a> {
     base_color: Option<&'a ufbx::Texture>,
     normal: Option<&'a ufbx::Texture>,
@@ -1516,6 +1559,7 @@ struct ModelMaterialLoader<'a> {
     cancel: &'a AtomicBool,
 }
 
+#[cfg(feature = "fbx")]
 impl MaterialTextures<'_> {
     fn all(&self) -> [Option<&ufbx::Texture>; 7] {
         [
@@ -1530,6 +1574,7 @@ impl MaterialTextures<'_> {
     }
 }
 
+#[cfg(feature = "fbx")]
 fn material_textures(material: &ufbx::Material) -> Result<MaterialTextures<'_>, &'static str> {
     let pbr = supports_metallic_roughness(material.shader_type);
     let opacity_map = if material.pbr.opacity.texture.is_some() {
@@ -1562,12 +1607,14 @@ fn material_textures(material: &ufbx::Material) -> Result<MaterialTextures<'_>, 
     })
 }
 
+#[cfg(feature = "fbx")]
 fn file_texture(map: &ufbx::MaterialMap) -> Option<&ufbx::Texture> {
     map.texture
         .as_deref()
         .filter(|texture| texture.type_ == ufbx::TextureType::File)
 }
 
+#[cfg(feature = "fbx")]
 fn supports_metallic_roughness(shader_type: ufbx::ShaderType) -> bool {
     matches!(
         shader_type,
@@ -1582,6 +1629,7 @@ fn supports_metallic_roughness(shader_type: ufbx::ShaderType) -> bool {
     )
 }
 
+#[cfg(feature = "fbx")]
 fn material_recipe(
     material: &ufbx::Material,
     sources: &mut prebuilt::TextureSources,
@@ -1656,6 +1704,7 @@ fn material_recipe(
     })
 }
 
+#[cfg(feature = "fbx")]
 fn default_material_recipe() -> prebuilt::MaterialRecipe {
     prebuilt::MaterialRecipe {
         base_color: [1.0; 3],
@@ -1841,10 +1890,12 @@ impl ModelMaterialLoader<'_> {
     }
 }
 
+#[cfg(feature = "fbx")]
 fn map_scalar(map: &ufbx::MaterialMap) -> f32 {
     map.value_vec4.x as f32
 }
 
+#[cfg(feature = "fbx")]
 fn map_vec3(map: &ufbx::MaterialMap) -> [f32; 3] {
     [
         map.value_vec4.x as f32,
@@ -1853,6 +1904,7 @@ fn map_vec3(map: &ufbx::MaterialMap) -> [f32; 3] {
     ]
 }
 
+#[cfg(feature = "fbx")]
 fn emissive_factor(material: &ufbx::Material) -> [f32; 3] {
     let (color, factor) = if material.pbr.emission_color.has_value
         || material.pbr.emission_color.texture.is_some()
@@ -1878,6 +1930,7 @@ fn emissive_factor(material: &ufbx::Material) -> [f32; 3] {
     color_factor.map(|channel| channel * scalar)
 }
 
+#[cfg(feature = "fbx")]
 fn opacity_factor(material: &ufbx::Material) -> f32 {
     if material.pbr.opacity.has_value || material.pbr.opacity.texture.is_some() {
         if material.pbr.opacity.has_value {
@@ -1961,6 +2014,7 @@ fn pack_metallic_roughness(
     })
 }
 
+#[cfg(feature = "fbx")]
 fn load_fbx_scene(
     bytes: &[u8],
     virtual_path: &str,
@@ -1969,6 +2023,7 @@ fn load_fbx_scene(
     load_fbx_scene_cancellable(bytes, virtual_path, path, &AtomicBool::new(false))
 }
 
+#[cfg(feature = "fbx")]
 fn load_fbx_scene_cancellable(
     bytes: &[u8],
     virtual_path: &str,
@@ -2007,6 +2062,7 @@ fn load_fbx_scene_cancellable(
     })
 }
 
+#[cfg(feature = "fbx")]
 fn scene_has_triangles(scene: &ufbx::Scene) -> bool {
     scene.nodes.iter().any(|node| {
         node.mesh.as_ref().is_some_and(|mesh| {
@@ -2071,6 +2127,7 @@ fn load_texture_reference(
     }
 }
 
+#[cfg(feature = "fbx")]
 fn resolve_external_texture<T>(
     model_virtual_path: &str,
     model: &Path,
@@ -2215,6 +2272,7 @@ fn normalize_texture_reference(model: &str, reference: &str, rooted: bool) -> Op
     Some(components.join("/"))
 }
 
+#[cfg(feature = "fbx")]
 fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
     let length = (x * x + y * y + z * z).sqrt();
     if length > 0.0 && length.is_finite() {
@@ -2228,10 +2286,14 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, HdrImageData, MeshPartBuilder, Model, ModelAlphaMode, ModelMaterial,
-        ModelMesh, ModelVertex, TextureData, decode_hdr, decode_png, is_missing_texture_candidate,
-        map_resource_error, normalize, pack_metallic_roughness, supports_metallic_roughness,
-        tangent_from_layers, texture_candidates,
+        AssetError, Assets, HdrImageData, Model, ModelMaterial, ModelMesh, ModelVertex,
+        TextureData, decode_hdr, decode_png, is_missing_texture_candidate, map_resource_error,
+        pack_metallic_roughness, texture_candidates,
+    };
+    #[cfg(feature = "fbx")]
+    use super::{
+        MeshPartBuilder, ModelAlphaMode, normalize, supports_metallic_roughness,
+        tangent_from_layers,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
@@ -2284,6 +2346,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     fn convert_in_place(assets: &Assets, asset_path: &str) -> Model {
         let expected = assets.load_model(asset_path).unwrap();
         let ready = assets.convert_model(asset_path).unwrap();
@@ -2635,6 +2698,7 @@ mod tests {
     }
 
     /// Квадрат 2x2 в плоскости XY с нормалью +Z и UV на весь квадрат.
+    #[cfg(feature = "fbx")]
     fn quad_fbx(texture: Option<&str>) -> String {
         let mut objects = String::from(
             r#"	Geometry: 1000, "Geometry::Quad", "Mesh" {
@@ -2716,6 +2780,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "fbx")]
     fn arnold_quad_fbx(
         properties: &str,
         texture_connections: &[(&str, &str)],
@@ -2916,6 +2981,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn cancelled_fbx_load_stops_with_a_cancelled_error() {
         let temp = TempAssets::new("cancel");
@@ -2952,6 +3018,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn prebuilt_dispatch_reports_decode_errors_and_honors_cancellation() {
         use std::sync::atomic::AtomicBool;
@@ -2994,6 +3061,7 @@ mod tests {
         assert!(matches!(error, AssetError::Cancelled { .. }), "{error}");
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_quad_is_triangulated_with_normals_flipped_uv_and_meters() {
         let temp = TempAssets::new("quad");
@@ -3031,6 +3099,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_double_sided_material_and_mirrored_node_preserve_triangle_winding() {
         let temp = TempAssets::new("double-sided-mirrored");
@@ -3067,6 +3136,7 @@ mod tests {
     }
 
     /// Квадрат из двух треугольных полигонов; углы второго получают UV `second_uvs`.
+    #[cfg(feature = "fbx")]
     fn two_triangle_fbx(second_uvs: &str) -> String {
         quad_fbx(None)
             .replace("a: 0,1,2,-4", "a: 0,1,-3,0,2,-4")
@@ -3084,6 +3154,7 @@ mod tests {
             )
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_corners_with_equal_attributes_share_vertices_but_uv_seams_stay_split() {
         let temp = TempAssets::new("uv-seam");
@@ -3111,6 +3182,7 @@ mod tests {
         assert_ne!(mesh.vertices[0].uv, mesh.vertices[3].uv);
     }
 
+    #[cfg(feature = "fbx")]
     fn corner(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> ModelVertex {
         ModelVertex {
             position,
@@ -3122,6 +3194,7 @@ mod tests {
 
     /// Углы треугольников куба ±1: 12 треугольников, наружный winding.
     /// `smooth` даёт общую нормаль в каждой вершине, иначе нормаль грани.
+    #[cfg(feature = "fbx")]
     fn cube_corners(smooth: bool) -> Vec<ModelVertex> {
         let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
             ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
@@ -3151,6 +3224,7 @@ mod tests {
         corners
     }
 
+    #[cfg(feature = "fbx")]
     fn build_part(
         corners: &[ModelVertex],
         influences: Option<&[([u32; 4], [f32; 4])]>,
@@ -3166,6 +3240,7 @@ mod tests {
     }
 
     /// Треугольники части как последовательность углов: то, что увидит rasterizer.
+    #[cfg(feature = "fbx")]
     fn expanded_corners(mesh: &ModelMesh) -> Vec<ModelVertex> {
         mesh.indices
             .iter()
@@ -3173,6 +3248,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn mesh_part_builder_shares_cube_corners_and_keeps_the_same_triangles() {
         let smooth = cube_corners(true);
@@ -3189,6 +3265,7 @@ mod tests {
         assert_eq!(expanded_corners(&mesh), flat);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn mesh_part_builder_keeps_uv_seams_and_compares_exact_bits() {
         let a = corner([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
@@ -3208,6 +3285,7 @@ mod tests {
         assert_eq!(expanded_corners(&mesh), corners);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn mesh_part_builder_splits_vertices_with_different_skin_influences() {
         let a = corner([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
@@ -3243,6 +3321,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn mesh_part_builder_reverses_winding_of_mirrored_parts() {
         let corners = cube_corners(true);
@@ -3259,12 +3338,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     fn assert_tangent_close(actual: [f32; 4], expected: [f32; 4]) {
         for (a, e) in actual.iter().zip(expected) {
             assert!((a - e).abs() < 1e-5, "{actual:?} != {expected:?}");
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_quad_uv_tangent_follows_u_with_positive_handedness() {
         let temp = TempAssets::new("tangent-quad");
@@ -3277,6 +3358,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_mirrored_node_tangent_follows_mirrored_u_and_flips_handedness() {
         let temp = TempAssets::new("tangent-mirrored");
@@ -3293,6 +3375,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_tangent_and_bitangent_layers_take_precedence_over_uv_tangent() {
         let temp = TempAssets::new("tangent-layers");
@@ -3315,6 +3398,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_without_uv_layer_has_zero_tangent() {
         let temp = TempAssets::new("tangent-no-uv");
@@ -3337,6 +3421,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_degenerate_uv_gives_zero_tangent_without_failing_the_load() {
         let temp = TempAssets::new("tangent-degenerate-uv");
@@ -3355,6 +3440,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn mesh_part_builder_keeps_tangent_seams_apart() {
         let base = corner([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
@@ -3373,6 +3459,7 @@ mod tests {
         assert_eq!(expanded_corners(&mesh), corners);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn tangent_from_layers_orthogonalizes_and_takes_sign_from_bitangent() {
         assert_tangent_close(
@@ -3385,6 +3472,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn tangent_from_layers_degenerate_bases_have_zero_tangent() {
         // Tangent вдоль нормали, нулевой bitangent и bitangent вдоль tangent не задают базис.
@@ -3402,6 +3490,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_texture_is_loaded_relative_to_the_model_or_by_file_name() {
         let temp = TempAssets::new("textured");
@@ -3432,6 +3521,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn model_dependencies_returns_external_paths_for_legacy_and_resource_sources() {
         let temp = TempAssets::new("model-dependencies");
@@ -3453,6 +3543,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn prebuilt_round_trip_matches_fbx_for_fixtures_and_demo_game() {
         fn collect_fbx(root: &Path, directory: &Path, result: &mut Vec<PathBuf>) {
@@ -3570,6 +3661,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn prebuilt_golden_artifacts_match_the_current_converter() {
         let assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures"));
@@ -3598,6 +3690,80 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "fbx"))]
+    #[test]
+    fn prebuilt_golden_artifacts_load_without_fbx() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let golden_dir = fixture_dir.join("golden");
+        let temp = TempAssets::new("prebuilt-no-fbx");
+        temp.write(
+            "skin_chain_textured.fbx",
+            &fs::read(golden_dir.join("skin_chain_textured.rvemodel")).unwrap(),
+        );
+        temp.write(
+            "bend_clip.fbx",
+            &fs::read(golden_dir.join("bend_clip.rvemodel")).unwrap(),
+        );
+        temp.write(
+            "textures/golden_texture.png",
+            &fs::read(fixture_dir.join("golden_texture.png")).unwrap(),
+        );
+        let assets = temp.assets();
+
+        let model = assets.load_model("/skin_chain_textured.fbx").unwrap();
+        assert!(!model.meshes.is_empty());
+        assert!(model.skeleton.is_some());
+        assert!(model.meshes.iter().any(|mesh| mesh.skin.is_some()));
+        assert!(!model.textures.is_empty());
+        assert_eq!(
+            assets
+                .model_dependencies("/skin_chain_textured.fbx")
+                .unwrap(),
+            ["/textures/golden_texture.png"]
+        );
+
+        assert!(matches!(
+            assets.load_model("/bend_clip.fbx"),
+            Err(AssetError::Decode { message, .. }) if message.contains("нет треугольников")
+        ));
+        let clips = assets.load_animations("/bend_clip.fbx").unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].name, "bend_clip");
+        assert!(!clips[0].tracks.is_empty());
+        assert!(
+            assets
+                .model_dependencies("/bend_clip.fbx")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(not(feature = "fbx"))]
+    #[test]
+    fn fbx_bytes_report_a_clear_error_without_the_feature() {
+        let temp = TempAssets::new("no-fbx");
+        temp.write("model/unsupported.fbx", b"FBX source bytes");
+        let assets = temp.assets();
+
+        for error in [
+            assets.load_model("/model/unsupported.fbx").unwrap_err(),
+            assets
+                .load_animations("/model/unsupported.fbx")
+                .unwrap_err(),
+            assets
+                .model_dependencies("/model/unsupported.fbx")
+                .unwrap_err(),
+        ] {
+            assert!(matches!(error, AssetError::Decode { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("FBX не поддерживается этой сборкой")
+            );
+        }
+    }
+
+    #[cfg(feature = "fbx")]
     #[test]
     fn first_parts_texture_error_precedes_a_later_material_recipe_error() {
         let mut fbx = fs::read_to_string(
@@ -3632,6 +3798,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn model_dependencies_preserves_missing_texture_error_and_returns_empty_without_textures() {
         let temp = TempAssets::new("model-dependencies-missing");
@@ -3689,6 +3856,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn legacy_loose_resource_loose_and_packed_paths_return_same_cpu_assets() {
         let model_bytes = quad_fbx(Some("../texture/paint.png")).into_bytes();
@@ -3730,6 +3898,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn packed_external_texture_reference_reads_its_owner_archive() {
         let model_bytes = quad_fbx(Some("paint.png")).into_bytes();
@@ -3767,6 +3936,7 @@ mod tests {
         assert_eq!(model.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn external_host_texture_path_never_reads_outside_the_assets_root() {
         let nonce = std::time::SystemTime::now()
@@ -3789,6 +3959,7 @@ mod tests {
         assert!(matches!(result, Err(AssetError::MissingTexture { .. })));
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn external_texture_decode_error_does_not_fall_back_to_the_basename() {
         let temp = TempAssets::new("external-texture-error");
@@ -3830,6 +4001,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn texture_directory_candidate_stops_search_for_legacy_and_service_assets() {
         let temp = TempAssets::new("texture-directory-candidate");
@@ -3852,6 +4024,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_z_up_axes_are_converted_to_y_up() {
         let temp = TempAssets::new("z-up");
@@ -3881,6 +4054,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_embedded_png_is_decoded_without_external_file() {
         let temp = TempAssets::new("embedded");
@@ -3905,6 +4079,7 @@ mod tests {
         assert_eq!(model.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
+    #[cfg(feature = "fbx")]
     fn base64(bytes: &[u8]) -> String {
         const ALPHABET: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -3927,6 +4102,7 @@ mod tests {
         text
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn fbx_with_missing_texture_lists_searched_paths() {
         let temp = TempAssets::new("missing-texture");
@@ -3940,6 +4116,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn model_loading_reports_missing_unsupported_and_corrupt_files() {
         let temp = TempAssets::new("bad-models");
@@ -3978,6 +4155,7 @@ mod tests {
         assert!(texture_candidates(model, "", "", "").is_empty());
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn arnold_pbr_factors_are_read_from_ufbx_material_maps_without_gamma_conversion() {
         let temp = TempAssets::new("pbr-factors");
@@ -4000,6 +4178,7 @@ mod tests {
         assert!(model.textures.is_empty());
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn pbr_emissive_and_opacity_maps_load_and_join_opacity_into_base_color_alpha() {
         let temp = TempAssets::new("pbr-emissive-opacity");
@@ -4040,6 +4219,7 @@ mod tests {
         assert_eq!(ready, model);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn pbr_occlusion_map_uses_linear_red_channel_and_is_a_builder_dependency() {
         let temp = TempAssets::new("pbr-occlusion");
@@ -4064,6 +4244,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn opacity_maps_with_incompatible_dimensions_fail_instead_of_being_ignored() {
         let temp = TempAssets::new("pbr-opacity-size-mismatch");
@@ -4090,6 +4271,7 @@ mod tests {
         assert!(error.to_string().contains("разные размеры"));
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn pbr_base_and_normal_maps_load_with_white_base_factor_and_default_normal_scale() {
         let temp = TempAssets::new("pbr-base-normal-maps");
@@ -4120,6 +4302,7 @@ mod tests {
         assert_eq!(model.textures.len(), 2);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn classic_transparency_multiplies_color_and_factor_before_inverting() {
         let temp = TempAssets::new("classic-transparency");
@@ -4135,6 +4318,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn classic_transparency_maps_invert_the_combined_scalar_and_map() {
         let temp = TempAssets::new("classic-transparency-map");
@@ -4164,6 +4348,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn classic_phong_reflection_and_shininess_never_become_metallic_roughness() {
         let temp = TempAssets::new("classic-phong-pbr-regression");
@@ -4180,6 +4365,7 @@ mod tests {
         assert!(material.metallic_roughness_texture.is_none());
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn separate_metallic_roughness_maps_pack_red_channels_and_reuse_the_packed_pair() {
         let temp = TempAssets::new("pbr-packed-maps");
@@ -4230,6 +4416,7 @@ mod tests {
         assert_eq!(convert_in_place(&temp.assets(), "/model/pbr.fbx"), model);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn one_shared_metallic_roughness_texture_keeps_gltf_g_and_b_channels() {
         let temp = TempAssets::new("pbr-shared-map");
@@ -4260,6 +4447,7 @@ mod tests {
         assert_eq!(convert_in_place(&temp.assets(), "/model/pbr.fbx"), model);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn prebuilt_keeps_distinct_texture_elements_that_reference_the_same_png() {
         let temp = TempAssets::new("prebuilt-distinct-texture-elements");
@@ -4279,6 +4467,7 @@ mod tests {
         assert_eq!(convert_in_place(&assets, "/model/pbr.fbx"), model);
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn prebuilt_resolves_external_png_changes_when_loaded() {
         let temp = TempAssets::new("prebuilt-changing-texture");
@@ -4322,6 +4511,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn metallic_roughness_maps_require_matching_dimensions() {
         let temp = TempAssets::new("pbr-size-mismatch");
@@ -4379,6 +4569,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn metallic_roughness_is_enabled_only_for_supported_shader_types() {
         for shader_type in [
@@ -4404,6 +4595,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn pbr_dependencies_follow_base_normal_roughness_metalness_usage_without_decoding() {
         let temp = TempAssets::new("pbr-dependencies");
@@ -4433,6 +4625,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn pbr_missing_external_texture_preserves_missing_texture_error() {
         let temp = TempAssets::new("pbr-missing-texture");
@@ -4457,6 +4650,7 @@ mod tests {
         assert_eq!(dependency_missing.0, "lost.png");
     }
 
+    #[cfg(feature = "fbx")]
     #[test]
     fn classic_phong_reflection_texture_is_not_a_model_dependency() {
         let temp = TempAssets::new("classic-phong-reflection-dependency");

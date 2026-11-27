@@ -4,6 +4,7 @@ use crate::{
     ModelAnimation, ModelInheritMode, ModelJoint, ModelKey, ModelNode, ModelSkin, ModelTrack,
     ModelTransform, ModelVertex,
 };
+#[cfg(feature = "fbx")]
 use std::collections::HashMap;
 use std::mem::size_of;
 
@@ -69,12 +70,14 @@ pub(crate) struct PreparedModel {
     pub(crate) clips: Vec<ModelAnimation>,
 }
 
+#[cfg(feature = "fbx")]
 #[derive(Default)]
 pub(crate) struct TextureSources {
     indices: HashMap<u32, usize>,
     pub(crate) references: Vec<TextureReference>,
 }
 
+#[cfg(feature = "fbx")]
 impl TextureSources {
     pub(crate) fn intern(&mut self, texture: &ufbx::Texture) -> usize {
         let id = texture.element.element_id;
@@ -106,6 +109,7 @@ pub(crate) fn is_prebuilt_model(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
 }
 
+#[cfg(any(feature = "fbx", test))]
 pub(crate) fn encode(model: &PreparedModel) -> Result<Vec<u8>, String> {
     let mut writer = Writer::new(PREBUILT_MODEL_MAX_BYTES);
     writer.bytes(MAGIC)?;
@@ -384,6 +388,7 @@ fn decode_with_limits(
     Ok(model)
 }
 
+#[cfg(any(feature = "fbx", test))]
 fn encode_material(writer: &mut Writer, material: &MaterialRecipe) -> Result<(), String> {
     for value in material
         .base_color
@@ -456,6 +461,7 @@ fn decode_material(reader: &mut Reader<'_>) -> Result<MaterialRecipe, String> {
     })
 }
 
+#[cfg(any(feature = "fbx", test))]
 fn encode_transform(writer: &mut Writer, transform: ModelTransform) -> Result<(), String> {
     for value in transform
         .translation
@@ -476,6 +482,7 @@ fn decode_transform(reader: &mut Reader<'_>) -> Result<ModelTransform, String> {
     })
 }
 
+#[cfg(any(feature = "fbx", test))]
 fn encode_animations(writer: &mut Writer, animations: &[ModelAnimation]) -> Result<(), String> {
     writer.count(animations.len())?;
     for animation in animations {
@@ -492,6 +499,7 @@ fn encode_animations(writer: &mut Writer, animations: &[ModelAnimation]) -> Resu
     Ok(())
 }
 
+#[cfg(any(feature = "fbx", test))]
 fn encode_keys<const N: usize>(
     writer: &mut Writer,
     keys: &[ModelKey<[f32; N]>],
@@ -659,11 +667,13 @@ fn same_bounds(
     }
 }
 
+#[cfg(any(feature = "fbx", test))]
 struct Writer {
     bytes: Vec<u8>,
     limit: usize,
 }
 
+#[cfg(any(feature = "fbx", test))]
 impl Writer {
     fn new(limit: usize) -> Self {
         Self {

@@ -4,6 +4,7 @@
 //! выполняется в `engine-animation`. Порядок узлов гарантирует, что родитель
 //! всегда стоит раньше потомка.
 
+#[cfg(feature = "fbx")]
 use std::collections::HashMap;
 
 /// Способ наследования масштаба родителя; значения совпадают с `ufbx::InheritMode`.
@@ -64,12 +65,14 @@ pub struct ModelSkin {
 }
 
 /// Строит скелет, добавляя узлы по требованию вместе с предками.
+#[cfg(feature = "fbx")]
 #[derive(Default)]
 pub(crate) struct SkeletonBuilder {
     skeleton: ModelSkeleton,
     nodes: HashMap<u32, usize>,
 }
 
+#[cfg(feature = "fbx")]
 impl SkeletonBuilder {
     /// Возвращает индекс узла скелета, предварительно добавив его предков.
     pub(crate) fn node(&mut self, node: &ufbx::Node) -> usize {
@@ -148,6 +151,7 @@ impl SkeletonBuilder {
 /// во фиксированном массиве вставкой без аллокаций: при равных весах более ранний
 /// кандидат остаётся впереди, как при стабильной сортировке по убыванию с обрезкой до четырёх.
 /// Вершина без положительных весов привязывается к `rigid` с весом 1.
+#[cfg(any(feature = "fbx", test))]
 pub(crate) fn influences(
     candidates: impl IntoIterator<Item = (u32, f32)>,
     rigid: u32,
@@ -186,6 +190,7 @@ pub(crate) fn influences(
 }
 
 /// Веса угла меша по его контрольной точке (`mesh.vertex_indices`).
+#[cfg(feature = "fbx")]
 pub(crate) fn corner_influences(
     deformer: &ufbx::SkinDeformer,
     joints: &[Option<u32>],
@@ -212,6 +217,7 @@ pub(crate) fn corner_influences(
     )
 }
 
+#[cfg(feature = "fbx")]
 fn inherit_mode(mode: ufbx::InheritMode) -> ModelInheritMode {
     match mode {
         ufbx::InheritMode::Normal => ModelInheritMode::Normal,
@@ -220,6 +226,7 @@ fn inherit_mode(mode: ufbx::InheritMode) -> ModelInheritMode {
     }
 }
 
+#[cfg(feature = "fbx")]
 fn rest_transform(transform: &ufbx::Transform) -> ModelTransform {
     let t = transform.translation;
     let r = transform.rotation;
@@ -232,6 +239,7 @@ fn rest_transform(transform: &ufbx::Transform) -> ModelTransform {
 }
 
 /// Переводит матрицу ufbx (3×4, по столбцам базиса) в 4×4 по столбцам.
+#[cfg(feature = "fbx")]
 fn matrix_columns(matrix: &ufbx::Matrix) -> [[f32; 4]; 4] {
     [
         [matrix.m00 as f32, matrix.m10 as f32, matrix.m20 as f32, 0.0],
