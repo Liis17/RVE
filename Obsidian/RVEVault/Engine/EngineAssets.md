@@ -4,16 +4,18 @@ Parent: [[Index]]
 
 ## Назначение
 
-`engine-assets` загружает модели FBX, текстуры PNG и environment panoramas Radiance HDR в память CPU. `Assets::with_resources` читает байты через [[Engine/EngineResources]] из loose files или RVEPAK; `Assets::new(root)` сохраняет совместимый файловый API. Крейт не зависит от renderer; `engine-runtime`, редактор и [[Engine/Sandbox]] переводят CPU-данные в ресурсы [[Engine/EngineRender]].
+`engine-assets` загружает FBX, [[Glossary#Готовая модель|готовые модели]], текстуры PNG и environment panoramas Radiance HDR в память CPU. `Assets::with_resources` читает байты через [[Engine/EngineResources]] из loose files или RVEPAK; `Assets::new(root)` сохраняет совместимый файловый API. Крейт не зависит от renderer; `engine-runtime`, редактор и [[Engine/Sandbox]] переводят CPU-данные в ресурсы [[Engine/EngineRender]].
 
 ## Источники
 
 | Файл | Значимый символ | Роль |
 |---|---|---|
-| `engine/engine-assets/src/lib.rs` | `ASSETS_DIR`, `Assets`, `Model`, `ModelMesh`, `ModelMaterial`, `ModelVertex`, `TextureData`, `HdrImageData`, `AssetError`, `decode_png`, `decode_hdr` | Пути ресурсов, загрузка FBX через ufbx, PNG через png и Radiance HDR RGBE |
+| `engine/engine-assets/src/lib.rs` | `ASSETS_DIR`, `Assets`, `Model`, `ModelMesh`, `ModelMaterial`, `ModelVertex`, `TextureData`, `HdrImageData`, `AssetError`, `decode_png`, `decode_hdr` | Пути ресурсов, загрузка FBX и готовых моделей, PNG через png и Radiance HDR RGBE |
+| `engine/engine-assets/src/prebuilt.rs` | `PREBUILT_MODEL_VERSION`, `PREBUILT_MODEL_MAX_BYTES`, `is_prebuilt_model` | Версионированный кодек готовой модели и проверка её структуры |
 | `engine/engine-assets/src/skin.rs` | `ModelSkeleton`, `ModelNode`, `ModelJoint`, `ModelSkin`, `ModelInheritMode`, `ModelTransform`, `influences` | Скелет, веса вершин, inherit modes и rigid-привязка частей |
 | `engine/engine-assets/src/animation.rs` | `ModelAnimation`, `ModelTrack`, `ModelKey`, `bake_clip_file` | Клипы: TRS-ключи узлов по именам, запечённые из stacks ufbx |
-| `engine/engine-assets/Cargo.toml` | `engine-resources`, `ufbx`, `png`, `bevy_mikktspace` | Чтение и stat ресурсов, разбор FBX и PNG, MikkTSpace для tangent без слоёв файла; Radiance RGBE декодируется встроенным кодом без новой зависимости |
+| `engine/engine-assets/Cargo.toml` | feature `fbx`, `engine-resources`, опциональные `ufbx` и `bevy_mikktspace`, `png` | Разбор FBX и MikkTSpace включаются feature `fbx` (по умолчанию); готовый формат, PNG и Radiance RGBE доступны без неё |
+| `engine/engine-assets/examples/model_load_bench.rs` | `model_load_bench` | Сравнение медианы загрузки FBX и готовых моделей demo-game |
 
 ## Публичные контракты
 
@@ -24,10 +26,12 @@ Parent: [[Index]]
 | `Assets::resolve(&self, asset_path: &str) -> Result<PathBuf, AssetError>` | `/model/cube.fbx` → `<root>/model/cube.fbx`; ведущий `/` необязателен. Разделитель — `/`. Пустой путь, пустые компоненты, `.`, `..`, `\` и `:` дают `InvalidPath`, поэтому путь не выходит за пределы каталога ресурсов |
 | `Assets::load_texture(&self, asset_path) -> Result<TextureData, AssetError>` | Требует расширение `.png` (регистр не важен), читает resource bytes и декодирует их |
 | `Assets::load_hdr(&self, asset_path) -> Result<HdrImageData, AssetError>` | Требует расширение `.hdr` (регистр не важен), использует тот же loose/packed resource source и декодирует Radiance RGBE |
-| `Assets::load_model(&self, asset_path) -> Result<Model, AssetError>` | Требует расширение `.fbx`, читает FBX в память и загружает используемые FBX-текстуры PNG |
-| `Assets::load_model_cancellable(&self, asset_path, cancel: &AtomicBool)` | Как `load_model`, но при `cancel = true` возвращает `Cancelled`: флаг проверяется до чтения, в `progress_cb` ufbx во время разбора и перед каждым узлом при сборке мешей |
-| `Assets::model_dependencies(&self, asset_path) -> Result<Vec<String>, AssetError>` | Возвращает уникальные внешние PNG как ведущие `/` virtual paths в порядке base-color, normal, roughness, metallic, emissive, occlusion и opacity. Проверяет кандидаты через общий с `load_model` resolver и `stat` того же loose/packed источника, не читая и не декодируя PNG. Embedded-текстуры и metallic/roughness-карты классических шейдеров пропускаются; отсутствующая внешняя текстура даёт тот же `MissingTexture`. FBX без треугольников, но с анимационными stacks (клип-only файл), возвращает пустой список; сборка вызывает эту функцию для каждого объявленного FBX |
-| `Assets::load_animations(&self, asset_path) -> Result<Vec<ModelAnimation>, AssetError>` | Требует расширение `.fbx` и хотя бы один stack с ключами, иначе `Decode` («в FBX нет анимационных стеков»). Имя клипа — stem файла, если stack один; иначе `stem:stack`. Ключи запекаются через `bake_anim` |
+| `Assets::load_model(&self, asset_path) -> Result<Model, AssetError>` | Требует расширение `.fbx`; по magic читает готовую модель или, при feature `fbx`, разбирает FBX и загружает его PNG-текстуры. Без `fbx` обычный FBX даёт понятный `Decode`; форматная версия готовой модели проверяется отдельно |
+| `Assets::convert_model(&self, asset_path) -> Result<Vec<u8>, AssetError>` | При feature `fbx` преобразует один FBX-снимок в готовый формат; `convert_model_from_bytes` использует переданные байты, чтобы сборщик хешировал и конвертировал один и тот же снимок |
+| `PREBUILT_MODEL_VERSION`, `PREBUILT_MODEL_MAX_BYTES`, `is_prebuilt_model(bytes)` | Версия формата, проверка magic `RVEMODEL` и предел размера 256 МиБ для входа и результата |
+| `Assets::load_model_cancellable(&self, asset_path, cancel: &AtomicBool)` | Как `load_model`; проверяет флаг до чтения, во время разбора ufbx и перед частями и текстурами готовой модели |
+| `Assets::model_dependencies(&self, asset_path) -> Result<Vec<String>, AssetError>` | Возвращает уникальные внешние PNG как ведущие `/` virtual paths в порядке base-color, normal, roughness, metallic, emissive, occlusion и opacity. Работает для FBX и готовой модели, проверяет кандидаты через общий resolver и `stat` того же loose/packed источника, не декодируя PNG. Clip-only файл с stacks возвращает пустой список; сборщик вызывает функцию для каждого объявленного FBX |
+| `Assets::load_animations(&self, asset_path) -> Result<Vec<ModelAnimation>, AssetError>` | Читает готовую модель либо FBX при feature `fbx`; требует хотя бы один stack с ключами, иначе `Decode`. Имя клипа — stem файла, если stack один; иначе `stem:stack`. Ключи запекаются через `bake_anim` |
 | `Model::skeleton: Option<ModelSkeleton>` | Узлы (имя, родитель, `rest` TRS, `inherit_mode`, `inherit_scale_node`) в порядке родитель-первым и `joints` (индекс узла и `inverse_bind` по столбцам). Один узел может быть joint несколько раз с разными `inverse_bind` |
 | `ModelMesh::skin: Option<ModelSkin>` | Для каждой вершины по четыре `joints` и `weights`, выровненные по `vertices`. Веса берутся по control point, поэтому развёрнутые грани одной вершины получают одинаковые веса. Четыре крупнейших веса отбираются вставкой в фиксированный массив без аллокаций (`skin::influences`); при равных весах раньше остаётся кандидат, который раньше встретился в записях деформера. Веса нормализуются, нулевые и не конечные отбрасываются; вершина без положительных весов привязывается к узлу меша с весом 1 |
 | `Model::animations: Vec<ModelAnimation>` | Клипы из stacks самой модели: `name`, `duration`, `tracks` (узел по имени и ключи translation/rotation/scale) |
@@ -39,7 +43,15 @@ Parent: [[Index]]
 | `ModelMesh` | Часть модели с одним материалом: `vertices`, `indices` (каждые три — треугольник) и `material`. Вершины FBX уникальны внутри части, индексы ссылаются на общие вершины |
 | `ModelMaterial` | Линейный `base_color`, HDR `emissive`, `opacity`, `alpha_mode` (`Opaque`/`Blend`), `double_sided`, `occlusion_strength`, metallic/roughness, scale нормали и необязательные индексы base-color, metallic-roughness, normal, emissive и occlusion PNG в `Model::textures`; default — белый opaque dielectric с roughness 1, чёрным emissive, `double_sided = false` и AO strength 1 |
 | `ModelVertex` | `position` в метрах, единичная `normal`, `uv` от левого верхнего угла текстуры и `tangent` (`[x, y, z, w]`): единичное направление ∂P/∂u в пространстве модели и знак `w` ±1; bitangent = `cross(normal, tangent.xyz) * w` указывает в сторону роста исходного FBX `v`. `[0, 0, 0, 0]` — tangent отсутствует (нет UV или вырожденный базис). Renderer передаёт его в `Vertex.tangent` ([[Engine/EngineRender]], раздел «Tangent-space normal map»). Оси +X вправо, +Y вверх, +Z к зрителю |
-| `AssetError` | `InvalidPath`, `UnsupportedFormat` (не то расширение), `Io` (ошибка чтения, в том числе отсутствие файла), `Decode` (повреждённый PNG или FBX, модель без треугольников), `MissingTexture` со списком проверенных путей и `Cancelled` (загрузка прервана флагом отмены); реализует `Display` и `Error` |
+| `AssetError` | `InvalidPath`, `UnsupportedFormat` (не то расширение), `Io` (ошибка чтения, в том числе отсутствие файла), `Decode` (повреждённый PNG, FBX или готовая модель, неподдерживаемая версия, модель без треугольников), `MissingTexture` со списком проверенных путей и `Cancelled` (загрузка прервана флагом отмены); реализует `Display` и `Error` |
+
+## Готовая модель
+
+Файл начинается с magic `RVEMODEL` и номера формата `u32` (сейчас 1). `load_model`, `load_animations` и `model_dependencies` проверяют magic до FBX-пути: готовая модель загружается без `fbx`; байты без magic требуют feature `fbx`, иначе возвращается `Decode` с просьбой собрать релиз через `rve-build`. Неизвестная версия и повреждённая структура также дают `Decode` с путём ресурса.
+
+Формат хранит геометрию, skin, запечённые клипы, ссылки на внешние текстуры и рецепты материалов. PNG разрешаются и декодируются при загрузке модели тем же способом, что и для FBX; внешний файл остаётся актуальным, и `alpha_mode` пересчитывается по его пикселям. Встроенный PNG хранится в готовой модели. Счётчики и ссылки проверяются до выделения массивов, индексы и AABB валидируются, хвостовые байты запрещены; вход, декодирование и результат ограничены 256 МиБ.
+
+Для замера из каталога `build/`: `cargo run --release -p engine-assets --example model_load_bench`. Пример сравнивает медиану 31 вызова `load_model`, `load_animations` и `model_dependencies` на FBX и готовой модели из `examples/demo-game`.
 
 ## Загрузка FBX
 
@@ -65,9 +77,9 @@ Parent: [[Index]]
 
 ## Зависимости и взаимодействия
 
-- ufbx 0.11.5 — Rust-обёртка C-библиотеки ufbx; её исходник собирается крейтом `cc` при `cargo build`, поэтому нужен C-компилятор (MSVC на Windows, clang на macOS). Поддерживает двоичный и ASCII FBX.
+- ufbx 0.11.5 — Rust-обёртка C-библиотеки ufbx; используется только с feature `fbx`, её исходник собирается крейтом `cc`, поэтому для FBX-сборки нужен C-компилятор (MSVC на Windows, clang на macOS). Поддерживает двоичный и ASCII FBX.
 - png 0.18.1 — чистый Rust-декодер PNG.
-- bevy_mikktspace 1.0.0 — безопасный Rust-порт MikkTSpace без собственных зависимостей; используется только при отсутствии слоёв tangent и bitangent в FBX. Лицензия `Zlib AND (MIT OR Apache-2.0)`. Знак `w` берётся из `TangentSpace::tangent_encoded` (`is_orientation_preserving` → +1), то есть из знака площади треугольника в UV на итоговом winding.
+- bevy_mikktspace 1.0.0 — безопасный Rust-порт MikkTSpace без собственных зависимостей; включается feature `fbx` и используется только при отсутствии слоёв tangent и bitangent в FBX. Лицензия `Zlib AND (MIT OR Apache-2.0)`. Знак `w` берётся из `TangentSpace::tangent_encoded` (`is_orientation_preserving` → +1), то есть из знака площади треугольника в UV на итоговом winding.
 - Используется в `engine-runtime` и [[Engine/Sandbox]]; service-backed чтение и startup порядок описаны в [[Engine/EngineResources]], [[Engine/EngineRuntime]] и [[Engine/Sandbox]].
 
 ## Ограничения
@@ -76,4 +88,4 @@ Parent: [[Index]]
 - Из FBX читаются скелет, веса, TRS-клипы узлов и геометрия. Камеры и источники света из FBX по-прежнему игнорируются; морф-таргеты не поддерживаются.
 - Части модели со скелетом, не привязанные к костям, получают rigid-привязку к своему узлу (вес 1, `inverse_bind = inverse(node_to_world)`), поэтому узлы без skin (например, оружие в руке) анимируются клипом. Модели без скелета и клипов загружаются прежним путём.
 - Поддерживаются base color, metallic-roughness, tangent-space normal, emissive, occlusion и opacity для описанных выше ufbx map fields; остальные PBR-свойства, bump и normal-map mip filtering не реализованы. Alpha mask не выводится из FBX: загрузчик задаёт Opaque или Blend, а cutoff mask задаётся сценой.
-- Загрузка синхронная и без кэша между вызовами.
+- `engine-assets` загружает ресурсы синхронно и не хранит кэш между вызовами. Готовая модель в release RVEPAK пропускает разбор FBX при запуске; её генерация и дисковый кэш относятся к [[Engine/RveBuild]].

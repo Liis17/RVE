@@ -30,3 +30,8 @@ required-features = ["fbx"]
 name = "skinned_fbx"
 path = "tests/skinned_fbx.rs"
 required-features = ["fbx"]
+
+[[example]]
+name = "model_load_bench"
+path = "examples/model_load_bench.rs"
+required-features = ["fbx"]

@@ -3,7 +3,7 @@
 `tools/rve-build` собирает игровой релиз из каталога проекта или запускает его в
 dev-режиме. Инструмент является внешним crate workspace и зависит от
 `engine-project`, `engine-scene`, `engine-assets`, `engine-render`, `engine-resources`,
-`engine-pak`, `engine-files`, `engine-gui`, `engine-script` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
+`engine-pak`, `engine-files`, `engine-gui`, `engine-script`, `blake3` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
 Подробности runtime layout проекта и релиза находятся в
 [[Engine/EngineRuntime]], формат сцены — в [[Engine/EngineScene]], а формат архива и
 реестр — в [[Engine/EnginePak]].
@@ -33,6 +33,12 @@ asset `.camerasettings` проверяется как UTF-8/TOML с диапаз
 Иконка должна
 иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
 Неиспользуемые файлы каталога Assets не копируются.
+
+Перед упаковкой `build` преобразует каждый включённый FBX в [[Glossary#Готовая модель|готовую модель]] и помещает её в архив под прежним виртуальным путём `.fbx`; назначение архива и внешние PNG-зависимости остаются прежними. FBX читается один раз, а этот снимок одновременно хешируется и преобразуется. На вход и результат действует предел 256 МиБ.
+
+Дисковый кеш готовых моделей лежит в `<project>/.rve/model-cache/<2 hex>/<64 hex>.rvemodel`. Ключ BLAKE3 включает схему кеша, версию формата и revision конвертера (`engine-assets`, закреплённые `ufbx` и `bevy_mikktspace`), виртуальный путь и байты FBX. Запись содержит схему, ключ, длину и BLAKE3 результата; перед использованием её проверяет декодер. Повреждённая или чужая запись отклоняется, модель конвертируется заново, а запись заменяется атомарно. Ошибка чтения или записи кеша печатает предупреждение и продолжает сборку. После успешной упаковки старейшие записи удаляются, если общий размер превышает 1 ГиБ.
+
+`check` и `explain` читают кеш без записи: при промахе FBX преобразуется в памяти. `run` и `scripts` используют обычный FBX-путь и не конвертируют модели. Подробности загрузчика — в [[Engine/EngineAssets]].
 
 `--compression` задаёт кодек всех архивов релиза: `none`, `lz4` или `zstd`. Уровень zstd и
 размер чанка берутся из `BuildCompression::default()` engine-pak, поэтому без флага сборка
@@ -127,7 +133,7 @@ Dev-player использует библиотеку из проекта. При
 ## Проверка без сборки
 
 `rve-build check <project-dir>` выполняет тот же разбор проекта, что и `build`
-(`prepare_project`), и проверку назначений и реестра архивов (`validate_project_archives`):
+(`prepare_project`): включённые FBX преобразуются либо проверяются как готовые модели через кеш в режиме чтения. Затем проверяются назначения и реестр архивов (`validate_project_archives`):
 зарезервированные пути `/rve/project.toml`, `/rve/assets.toml` и `/rve/prefabs.toml`,
 имя исполняемого файла. Проверяются сцены, префабы и их ресурсы, lite-скрипты с их схемой
 и `params`, ссылки объектов и ресурсов, а также наличие `heavy_scripts` при heavy-ссылках.
@@ -149,7 +155,7 @@ Dev-player использует библиотеку из проекта. При
 Корни: включённые сцены, записи `prefabs.rveprefabs`, AppIcon из `bootstrap.rves`, Lua-мигратор
 сохранений `[save] migration` (цепочка `project.rveproject → <путь> ([save] migration)`) и таблицы строк `[localization]` (`project.rveproject → /путь ([localization] язык)`). Путь
 разбирается как виртуальный, с ведущим `/` или без; ошибка разбора — код 2 на этапе CLI.
-Ресурс, которого нет в сборке, — ошибка проекта с кодом 2. Команда не пишет файлы.
+Ресурс, которого нет в сборке, — ошибка проекта с кодом 2. Команда не пишет файлы и не меняет кеш готовых моделей.
 
 Ссылки трёх видов: объявлен в `[[assets]]` документа, экземпляр префаба и зависимость
 ресурса (текстура FBX, shader или текстура материала, текстура шейдера по умолчанию, LUT
@@ -204,7 +210,7 @@ Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to d
 Выделенный сервер `rve-server` собирается тем же механизмом командой `cargo build --release --locked -p rve-server -p rve-crash-monitor --no-default-features --features rve-server/crash-dumps,rve-crash-monitor/server` в `build/server`. Сборка без dev-console и DLSS; при сборке SDK он копируется как соседний executable `rve-server` (`rve-server.exe` на Windows), монитор — рядом с ним.
 
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
-`engine_version`, `abi_version`, `target` и `dlss_enabled`. Последнее поле по
+`engine_version`, `abi_version`, `target`, `dlss_enabled` и `prebuilt_model_version`. `dlss_enabled` по
 умолчанию false для старых SDK и отражает DLSS feature prebuilt player. Маркер
 распространяемого SDK должен
 указывать текущий `RVE_SCRIPT_ABI_VERSION`; player принимает heavy-script ABI версии
@@ -212,7 +218,7 @@ Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to d
 таблицей скриптов предыдущей версии. `target` должен совпадать с парой `ARCH-OS`, например
 `x86_64-windows` или `aarch64-macos`. Команды `run` и `build` выбирают соответственно
 соседний `rve-player-dev[.exe]` и `rve-player[.exe]`. Отсутствующий player,
-ошибка TOML, несовпадение ABI или платформы завершают команду операционной ошибкой.
+ошибка TOML, несовпадение ABI, платформы или версии готовой модели завершают команду операционной ошибкой. `sdk` записывает текущую версию формата; SDK player без поля (версия 0) или с другой версией нельзя использовать для `build`. `run` не проверяет эту версию, потому что dev-player читает FBX.
 SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходникам checkout.
 
 `rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain)
@@ -328,7 +334,7 @@ MoltenVK (Apache-2.0).
 сцена, поэтому она лежит в `shared`. F6 (`SceneCycle`) переключает `physics` и `second`; корневой `scene-tour-guide` с `keep_on_load` переносит Lua и Rust ScriptRef демонстрацию между ними, а `second` раскрывает экземпляр `satellite.rveprefab`. CI собирает проект без графического запуска; фактический Vulkan runtime
 требует совместимое устройство.
 
-Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
+Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`, `models.rs`,
 `archives.rs`, `check.rs`, `explain.rs`, `trace.rs`, `player.rs`, `sdk.rs`, `ico.rs`,
 `platform.rs`, `temporary.rs`.
 
