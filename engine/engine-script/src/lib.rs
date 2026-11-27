@@ -33,8 +33,8 @@ mod ui_input;
 pub use engine_gui::{document::UiDocument, events::UiEvent, paint::UiImageData, system::UiSystem};
 pub use engine_scene::{ParamKind, ParamSchema, ParamSpec, ParamValue};
 pub use host::{
-    CommandError, ScenePrefabs, ScriptHost, ScriptInterruptHandle, ScriptLoadError,
-    ScriptLoadOptions, ScriptUpdateProfile, lite_properties,
+    CommandError, MAX_ANIMATION_MARKERS_PER_FRAME, ScenePrefabs, ScriptHost, ScriptInterruptHandle,
+    ScriptLoadError, ScriptLoadOptions, ScriptUpdateProfile, lite_properties,
 };
 pub use library::{ScriptLibrary, ScriptLibraryError};
 pub use lifecycle::{

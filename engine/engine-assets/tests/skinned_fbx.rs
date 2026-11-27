@@ -174,6 +174,86 @@ fn clip_only_file_loads_named_clip_without_meshes() {
 }
 
 #[test]
+fn marker_clip_routes_stack_and_node_properties_to_named_clips() {
+    let clips = fixtures().load_animations("/marker_clip.fbx").unwrap();
+    assert_eq!(
+        clips
+            .iter()
+            .map(|clip| clip.name.as_str())
+            .collect::<Vec<_>>(),
+        ["marker_clip:Bend", "marker_clip:Run"]
+    );
+
+    let bend = &clips[0];
+    assert!(
+        bend.markers
+            .iter()
+            .any(|marker| marker.name == "StackStart" && marker.time == 0.0)
+    );
+    assert!(
+        bend.markers
+            .iter()
+            .any(|marker| marker.name == "StackQualified" && marker.time == 0.25)
+    );
+    assert!(
+        bend.markers
+            .iter()
+            .any(|marker| marker.name == "NodeBend" && marker.time == 0.75)
+    );
+    assert!(
+        bend.markers
+            .iter()
+            .any(|marker| marker.name == "Beyond" && marker.time == 3.0)
+    );
+    assert!(
+        bend.file_marker_warnings
+            .iter()
+            .any(|warning| warning.contains("неизвестный стек"))
+    );
+    assert!(
+        bend.file_marker_warnings
+            .iter()
+            .any(|warning| warning.contains("несколько стеков"))
+    );
+    assert!(
+        bend.file_marker_warnings
+            .iter()
+            .any(|warning| warning.contains("Empty") && warning.contains("отброшены"))
+    );
+
+    let run = &clips[1];
+    assert!(
+        run.markers
+            .iter()
+            .any(|marker| marker.name == "RunStart" && marker.time == 0.5)
+    );
+    assert!(
+        run.markers
+            .iter()
+            .any(|marker| marker.name == "NodeRun" && marker.time == 1.25)
+    );
+}
+
+#[test]
+fn model_loading_keeps_fbx_markers_on_skeleton_animations() {
+    let model = fixtures().load_model("/marker_clip.fbx").unwrap();
+    assert_eq!(
+        model
+            .animations
+            .iter()
+            .map(|clip| clip.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Bend", "Run"]
+    );
+    assert!(
+        model.animations[0]
+            .markers
+            .iter()
+            .any(|marker| marker.name == "NodeBend" && marker.time == 0.75)
+    );
+}
+
+#[test]
 fn clip_only_file_has_no_model_dependencies_so_builds_can_declare_it() {
     // Сборка вызывает model_dependencies для каждого объявленного FBX, в том числе клип-only.
     assert_eq!(

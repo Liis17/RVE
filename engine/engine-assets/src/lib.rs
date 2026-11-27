@@ -7,7 +7,7 @@ mod animation;
 mod prebuilt;
 mod skin;
 
-pub use animation::{ModelAnimation, ModelKey, ModelTrack};
+pub use animation::{ModelAnimation, ModelKey, ModelMarker, ModelTrack};
 /// Возвращает `true`, если байты начинаются с сигнатуры готовой модели.
 pub use prebuilt::{PREBUILT_MODEL_MAX_BYTES, PREBUILT_MODEL_VERSION, is_prebuilt_model};
 pub use skin::{ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelSkin, ModelTransform};

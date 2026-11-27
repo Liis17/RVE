@@ -644,6 +644,7 @@ pub(crate) fn compile_class(
         "on_fixed_update",
         "on_late_update",
         "on_message",
+        "on_animation_marker",
         "on_destroy",
         "on_collision_enter",
         "on_collision_exit",
@@ -1147,6 +1148,18 @@ impl LuaInstance {
                 name,
                 param_value(lua, value, &self.active_call, None)?,
             ),
+        )
+    }
+
+    pub(crate) fn invoke_animation_marker(
+        &self,
+        marker: &str,
+        motion: &str,
+        clip: &str,
+    ) -> mlua::Result<()> {
+        self.invoke(
+            "on_animation_marker",
+            (self.instance.clone(), marker, motion, clip),
         )
     }
 

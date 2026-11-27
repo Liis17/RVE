@@ -3588,6 +3588,68 @@ mod tests {
     }
 
     #[test]
+    fn animator_marker_edits_are_undoable_and_invalid_markers_are_rejected() {
+        let mut scene = scene();
+        let model = VirtualPath::parse("models/hero.fbx").unwrap();
+        let id = scene
+            .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+            .unwrap();
+        let original = AnimatorComponent {
+            markers: vec![engine_scene::AnimationMarker {
+                clip: "Walk".to_owned(),
+                name: "FootDown".to_owned(),
+                time: 0.25,
+            }],
+            ..AnimatorComponent::new()
+        };
+        scene
+            .set_component(&id, Component::Animator(original.clone()))
+            .unwrap();
+
+        let changed_markers = vec![
+            engine_scene::AnimationMarker {
+                clip: "Walk".to_owned(),
+                name: "FootDown".to_owned(),
+                time: 0.5,
+            },
+            engine_scene::AnimationMarker {
+                clip: "Walk".to_owned(),
+                name: "FootUp".to_owned(),
+                time: 0.75,
+            },
+        ];
+        scene
+            .edit_object(&id, Some("hero/animator"), |object| {
+                let animator = object.animator.as_mut().unwrap();
+                animator.marker_min_weight = 0.8;
+                animator.markers = changed_markers.clone();
+                Ok(())
+            })
+            .unwrap();
+        let changed = scene.object(&id).unwrap().animator.as_ref().unwrap();
+        assert_eq!(changed.marker_min_weight, 0.8);
+        assert_eq!(changed.markers, changed_markers);
+
+        assert!(scene.undo());
+        assert_eq!(
+            scene.object(&id).unwrap().animator.as_ref().unwrap(),
+            &original
+        );
+
+        let error = scene
+            .edit_object(&id, Some("hero/animator"), |object| {
+                object.animator.as_mut().unwrap().markers[0].name.clear();
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("имя маркера"), "{error}");
+        assert_eq!(
+            scene.object(&id).unwrap().animator.as_ref().unwrap(),
+            &original
+        );
+    }
+
+    #[test]
     fn particle_emitter_adds_registers_texture_and_undoes_removal() {
         let mut scene = scene();
         let id = scene.create_object(&NewObject::Empty, None).unwrap();

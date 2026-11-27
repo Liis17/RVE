@@ -982,7 +982,7 @@ fn animator_prefab_override_replaces_the_whole_component_and_checks_its_clips() 
     let library = Library::new(&[("prefabs/hero.rveprefab", prefab)]);
     let assets = "[[assets]]\npath = \"/prefabs/hero.rveprefab\"\n[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anims/run.fbx\"\n[[assets]]\npath = \"/anims/jump.fbx\"\n";
     let overridden = format!(
-        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n[[instances.overrides]]\ntarget = \"hero\"\nanimator = {{ looping = false, clips = [\"/anims/jump.fbx\"] }}\n"
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n[[instances.overrides]]\ntarget = \"hero\"\nanimator = {{ looping = false, clips = [\"/anims/jump.fbx\"], marker_min_weight = 0.75, markers = [{{ clip = \"jump\", name = \"Impact\", time = 0.25 }}] }}\n"
     );
     let expanded = library.expand(&scene(&overridden)).unwrap().document;
     let animator = object(&expanded, "h").animator.clone().unwrap();
@@ -992,6 +992,9 @@ fn animator_prefab_override_replaces_the_whole_component_and_checks_its_clips() 
         "замена не сохраняет унаследованную скорость"
     );
     assert_eq!(animator.clips[0].as_str(), "anims/jump.fbx");
+    assert_eq!(animator.marker_min_weight, 0.75);
+    assert_eq!(animator.markers.len(), 1);
+    assert_eq!(animator.markers[0].name, "Impact");
 
     let inherited = format!(
         "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n"
@@ -1012,6 +1015,12 @@ fn animator_prefab_override_replaces_the_whole_component_and_checks_its_clips() 
     );
     let error = other.expand(&scene(&bad)).unwrap_err();
     assert!(error.message.contains("animator"), "{error}");
+
+    let bad_marker = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n[[instances.overrides]]\ntarget = \"hero\"\nanimator = {{ markers = [{{ clip = \"run\", name = \"bad-name\", time = 0.25 }}] }}\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &bad_marker).unwrap_err();
+    assert!(error.message.contains("идентификатор"), "{error}");
 }
 
 fn load_template(library: &Library, path: &str) -> Result<PrefabTemplate, SceneError> {

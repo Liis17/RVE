@@ -1,5 +1,5 @@
 //! Мост между `World` и аниматорами объектов: создание состояния, запросы скриптов,
-//! события окончания и палитры skinning для каждого кадра.
+//! события маркеров и окончания, а также палитры skinning для каждого кадра.
 //!
 //! Мост не владеет GPU-ресурсами и не читает файлы сам: модели и клипы приходят через
 //! замыкания, поэтому тот же код работает в runtime и в редакторе.
@@ -10,7 +10,7 @@ use crate::animator::{
 use crate::clip::Clip;
 use crate::pose::Pose;
 use crate::skeleton::Skeleton;
-use engine_assets::{Model, ModelAnimation};
+use engine_assets::{Model, ModelAnimation, ModelMarker};
 use engine_files::VirtualPath;
 use engine_scene::{AnimationRequest, AnimatorComponent, ObjectHandle, World};
 use std::collections::{HashMap, HashSet};
@@ -26,6 +26,13 @@ pub enum AnimationEvent {
     Finished {
         object: ObjectHandle,
         motion: String,
+    },
+    /// Движение пересекло именованный маркер клипа.
+    Marker {
+        object: ObjectHandle,
+        motion: String,
+        clip: String,
+        marker: String,
     },
 }
 
@@ -44,6 +51,17 @@ fn state_id(objects: &HashMap<ObjectHandle, ObjectAnimation>, object: ObjectHand
         || format!("объект #{}", object.index()),
         |state| state.id.clone(),
     )
+}
+
+fn add_marker(markers: &mut Vec<ModelMarker>, marker: ModelMarker) -> bool {
+    if markers
+        .iter()
+        .any(|existing| existing.name == marker.name && existing.time == marker.time)
+    {
+        return false;
+    }
+    markers.push(marker);
+    true
 }
 
 /// Аниматоры объектов сцены и их палитры skinning.
@@ -219,8 +237,21 @@ impl AnimationBridge {
                 continue;
             };
             for event in state.animator.advance(dt) {
-                let MotionEvent::Finished { motion } = event;
-                events.push(AnimationEvent::Finished { object, motion });
+                match event {
+                    MotionEvent::Finished { motion } => {
+                        events.push(AnimationEvent::Finished { object, motion });
+                    }
+                    MotionEvent::Marker {
+                        motion,
+                        clip,
+                        marker,
+                    } => events.push(AnimationEvent::Marker {
+                        object,
+                        motion,
+                        clip,
+                        marker,
+                    }),
+                }
             }
             state
                 .animator
@@ -291,7 +322,52 @@ impl AnimationBridge {
                 ));
                 continue;
             }
-            let clip = Clip::bind(animation, &skeleton);
+            for warning in &animation.file_marker_warnings {
+                self.warn(format!("{id}: {warning}"));
+            }
+            for warning in &animation.marker_warnings {
+                self.warn(format!("{id}: клип `{}`: {warning}", animation.name));
+            }
+            let mut markers = Vec::new();
+            let mut linked_marker_count = 0;
+            let fbx_markers = animation
+                .markers
+                .iter()
+                .map(|marker| (marker.name.as_str(), marker.time));
+            let scene_markers = component
+                .markers
+                .iter()
+                .filter(|marker| marker.clip == animation.name)
+                .map(|marker| (marker.name.as_str(), marker.time));
+            for (name, time) in fbx_markers.chain(scene_markers) {
+                linked_marker_count += 1;
+                if time > animation.duration {
+                    self.warn(format!(
+                        "{id}: клип `{}`: маркер `{}` позже конца клипа; пропущен",
+                        animation.name, name
+                    ));
+                    continue;
+                }
+                if !add_marker(
+                    &mut markers,
+                    ModelMarker {
+                        name: name.to_owned(),
+                        time,
+                    },
+                ) {
+                    self.warn(format!(
+                        "{id}: клип `{}`: дубликат маркера `{}` пропущен",
+                        animation.name, name
+                    ));
+                }
+            }
+            if animation.duration <= 0.0 && linked_marker_count > 0 {
+                self.warn(format!(
+                    "{id}: клип `{}` имеет нулевую длительность; маркеры не выдаются",
+                    animation.name
+                ));
+            }
+            let clip = Clip::bind_with_markers(animation, &markers, &skeleton);
             if !clip.unmatched().is_empty() {
                 self.warn(format!(
                     "{id}: клип `{}`: дорожки без костей: {}",
@@ -301,6 +377,15 @@ impl AnimationBridge {
             }
             clip_names.insert(animation.name.clone(), clips.len());
             clips.push(clip);
+        }
+
+        for marker in &component.markers {
+            if !clip_names.contains_key(&marker.clip) {
+                self.warn(format!(
+                    "{id}: маркер `{}` ссылается на неизвестный клип `{}`; пропущен",
+                    marker.name, marker.clip
+                ));
+            }
         }
 
         let tree_names: HashSet<&str> = component
@@ -361,6 +446,9 @@ impl AnimationBridge {
         animator
             .set_speed(component.speed)
             .map_err(|error| error.to_string())?;
+        animator
+            .set_marker_min_weight(component.marker_min_weight)
+            .map_err(|error| error.to_string())?;
         if component.play_on_start {
             let motion = component
                 .default_motion
@@ -397,8 +485,8 @@ impl AnimationBridge {
 mod tests {
     use super::{AnimationBridge, AnimationEvent};
     use engine_assets::{
-        Model, ModelAnimation, ModelInheritMode, ModelJoint, ModelKey, ModelNode, ModelSkeleton,
-        ModelTrack, ModelTransform,
+        Model, ModelAnimation, ModelInheritMode, ModelJoint, ModelKey, ModelMarker, ModelNode,
+        ModelSkeleton, ModelTrack, ModelTransform,
     };
     use engine_scene::{AnimationRequest, SceneDocument, World};
     use std::sync::Arc;
@@ -456,6 +544,9 @@ mod tests {
                     rotation: Vec::new(),
                     scale: Vec::new(),
                 }],
+                markers: Vec::new(),
+                file_marker_warnings: Vec::new(),
+                marker_warnings: Vec::new(),
             }],
         }
     }
@@ -463,6 +554,18 @@ mod tests {
     fn build(world: &World) -> AnimationBridge {
         let model = Arc::new(walk_model());
         AnimationBridge::build(world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())))
+    }
+
+    fn model_with_markers(markers: &[(&str, f32)]) -> Model {
+        let mut model = walk_model();
+        model.animations[0].markers = markers
+            .iter()
+            .map(|(name, time)| ModelMarker {
+                name: (*name).to_owned(),
+                time: *time,
+            })
+            .collect();
+        model
     }
 
     /// Мир с `hero` и, если `npc`, вторым аниматором. Порядок объектов совпадает в обоих вариантах.
@@ -564,6 +667,137 @@ model = \"/models/hero.fbx\"
             }]
         );
         assert!(bridge.advance(1.0).is_empty());
+    }
+
+    #[test]
+    fn scene_and_fbx_markers_merge_with_duplicate_and_invalid_reference_warnings() {
+        let world = world(
+            "looping = false\nmarkers = [\n  { clip = \"Walk\", name = \"same\", time = 0.25 },\n  { clip = \"Walk\", name = \"scene\", time = 0.5 },\n  { clip = \"Walk\", name = \"late\", time = 1.25 },\n  { clip = \"Missing\", name = \"unknown\", time = 0.1 },\n]",
+        );
+        let mut model = model_with_markers(&[("same", 0.25), ("fbx", 0.75)]);
+        model.animations[0].marker_warnings = vec!["invalid FBX record".to_owned()];
+        let model = Arc::new(model);
+        let mut bridge =
+            AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())));
+        let warnings = bridge.take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("invalid FBX record"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("дубликат маркера `same`"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("маркер `late` позже конца"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("неизвестный клип `Missing`"))
+        );
+
+        let events = bridge.advance(0.8);
+        assert_eq!(
+            events,
+            [
+                AnimationEvent::Marker {
+                    object: world.handle("hero").unwrap(),
+                    motion: "Walk".to_owned(),
+                    clip: "Walk".to_owned(),
+                    marker: "same".to_owned(),
+                },
+                AnimationEvent::Marker {
+                    object: world.handle("hero").unwrap(),
+                    motion: "Walk".to_owned(),
+                    clip: "Walk".to_owned(),
+                    marker: "scene".to_owned(),
+                },
+                AnimationEvent::Marker {
+                    object: world.handle("hero").unwrap(),
+                    motion: "Walk".to_owned(),
+                    clip: "Walk".to_owned(),
+                    marker: "fbx".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn file_marker_warnings_from_multiple_clips_are_reported_once_without_clip_names() {
+        let scene = format!(
+            "{SCENE}[[assets]]\npath = \"/clips/extra.fbx\"\n[objects.animator]\nclips = [\"/clips/extra.fbx\"]\n"
+        );
+        let world =
+            World::from_document(&SceneDocument::parse("scene.rvescene", &scene).unwrap()).unwrap();
+        let file_warnings = vec!["неизвестный стек \"Missing\"".to_owned()];
+        let clips = Arc::new(vec![
+            ModelAnimation {
+                name: "TakeA".to_owned(),
+                duration: 1.0,
+                tracks: Vec::new(),
+                markers: Vec::new(),
+                file_marker_warnings: file_warnings.clone(),
+                marker_warnings: Vec::new(),
+            },
+            ModelAnimation {
+                name: "TakeB".to_owned(),
+                duration: 1.0,
+                tracks: Vec::new(),
+                markers: Vec::new(),
+                file_marker_warnings: file_warnings,
+                marker_warnings: Vec::new(),
+            },
+        ]);
+        let model = Arc::new(walk_model());
+        let mut bridge =
+            AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(clips.clone()));
+
+        assert_eq!(
+            bridge.take_warnings(),
+            ["hero: неизвестный стек \"Missing\""]
+        );
+    }
+
+    #[test]
+    fn marker_events_follow_scene_object_order() {
+        let world = scene_with_npc(true);
+        let model = Arc::new(model_with_markers(&[("start", 0.0)]));
+        let mut bridge =
+            AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())));
+        let objects = bridge
+            .advance(0.01)
+            .into_iter()
+            .map(|event| match event {
+                AnimationEvent::Marker { object, .. } => object,
+                AnimationEvent::Finished { .. } => panic!("looping marker motion does not finish"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            objects,
+            [world.handle("hero").unwrap(), world.handle("npc").unwrap()]
+        );
+    }
+
+    #[test]
+    fn zero_duration_clip_warns_and_does_not_emit_its_markers() {
+        let world = world("looping = true");
+        let mut model = model_with_markers(&[("start", 0.0)]);
+        model.animations[0].duration = 0.0;
+        let model = Arc::new(model);
+        let mut bridge =
+            AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())));
+        assert!(
+            bridge
+                .take_warnings()
+                .iter()
+                .any(|warning| warning.contains("нулевую длительность"))
+        );
+        assert!(bridge.advance(0.1).is_empty());
     }
 
     #[test]

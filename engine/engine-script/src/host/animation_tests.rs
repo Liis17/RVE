@@ -200,3 +200,191 @@ return Script
         "чужой объект сообщения не получает"
     );
 }
+
+#[test]
+fn animation_markers_reach_lua_before_animation_finished() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_animation_marker(marker, motion, clip)
+  assert(marker == "footstep" and motion == "walk" and clip == "walk.fbx")
+  rve.log_info("marker")
+end
+function Script:on_message(sender, name, value)
+  if name == "animation_finished" and sender == "hero" and value == "walk" then
+    rve.log_info("finished")
+  end
+end
+return Script
+"#,
+    );
+    let hero = world.handle("hero").unwrap();
+    host.queue_animation_markers(
+        &world,
+        [(
+            hero,
+            "walk".to_owned(),
+            "walk.fbx".to_owned(),
+            "footstep".to_owned(),
+        )],
+    );
+    host.queue_animation_events(&world, [(hero, "walk".to_owned())]);
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let messages: Vec<_> = host
+        .drain_events()
+        .into_iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message)
+        .collect();
+    assert_eq!(messages, ["marker", "finished"]);
+}
+
+#[test]
+fn animation_marker_errors_roll_back_script_requests() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_animation_marker()
+  rve.find("hero"):set_animation_speed(3)
+  error("marker failed")
+end
+return Script
+"#,
+    );
+    let hero = world.handle("hero").unwrap();
+    host.queue_animation_markers(
+        &world,
+        [(
+            hero,
+            "walk".to_owned(),
+            "walk.fbx".to_owned(),
+            "footstep".to_owned(),
+        )],
+    );
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(host.drain_animation_requests().is_empty());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("marker failed"))
+    );
+}
+
+#[test]
+fn animation_marker_queue_drops_only_the_tail_and_reports_once() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {count = 0}
+function Script:on_animation_marker() self.count = self.count + 1 end
+function Script:on_update() rve.log_info("count=" .. self.count) end
+return Script
+"#,
+    );
+    let hero = world.handle("hero").unwrap();
+    host.queue_animation_markers(
+        &world,
+        (0..=crate::MAX_ANIMATION_MARKERS_PER_FRAME).map(|_| {
+            (
+                hero,
+                "walk".to_owned(),
+                "walk.fbx".to_owned(),
+                "footstep".to_owned(),
+            )
+        }),
+    );
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let first_events = host.drain_events();
+    let warnings: Vec<_> = first_events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{first_events:?}");
+    assert!(
+        warnings[0]
+            .message
+            .contains("dropped 1 animation marker event(s)")
+    );
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "count=1024")
+    );
+}
+
+#[test]
+fn animation_marker_delivery_skips_objects_removed_after_queueing() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_animation_marker() rve.log_info("marker") end
+return Script
+"#,
+    );
+    let hero = world.handle("hero").unwrap();
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    host.drain_events();
+    host.queue_animation_markers(
+        &world,
+        [(
+            hero,
+            "walk".to_owned(),
+            "walk.fbx".to_owned(),
+            "footstep".to_owned(),
+        )],
+    );
+    world.despawn_many(&[hero]).unwrap();
+    host.queue_animation_markers(
+        &world,
+        [(
+            hero,
+            "walk".to_owned(),
+            "walk.fbx".to_owned(),
+            "stale".to_owned(),
+        )],
+    );
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.message != "marker")
+    );
+}
+
+#[test]
+fn animation_marker_without_lua_hook_is_silent() {
+    let (mut world, mut host) = load("return {}");
+    let silent = world.handle("silent").unwrap();
+    let camera = world.handle("camera").unwrap();
+    host.queue_animation_markers(
+        &world,
+        [
+            (
+                silent,
+                "walk".to_owned(),
+                "walk.fbx".to_owned(),
+                "footstep".to_owned(),
+            ),
+            (
+                camera,
+                "walk".to_owned(),
+                "walk.fbx".to_owned(),
+                "footstep".to_owned(),
+            ),
+        ],
+    );
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(host.drain_events().is_empty());
+}

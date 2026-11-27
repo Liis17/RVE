@@ -19,8 +19,8 @@ use rve_sdk::abi::{
     RVE_SPAWN_HAS_PARENT, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCreateFn, RveHeader, RveHost,
     RveModule, RveParamDescV13, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3,
     RveScriptDescV4, RveScriptDescV6, RveScriptDescV13, RveScriptDescV15, RveScriptDescV16,
-    RveScriptDescV17, RveScriptDescV19, RveScriptDescV20, RveSpawnOptions, RveStatus, RveStr,
-    RveTransform, RveUpdateFn, RveValue,
+    RveScriptDescV17, RveScriptDescV19, RveScriptDescV20, RveScriptDescV22, RveSpawnOptions,
+    RveStatus, RveStr, RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
@@ -38,6 +38,7 @@ static PROPERTY_SETTER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CREATE_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static ERROR_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static BULK_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+static ANIMATION_MARKER_MESSAGE_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK
@@ -74,6 +75,8 @@ struct CameraControl {
     panic_update: bool,
 }
 
+struct AnimationMarkerProbe;
+
 struct AbiConsoleCommand {
     panic_update: bool,
 }
@@ -87,6 +90,25 @@ fn camera_control_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(CameraControl {
         panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
     }))
+}
+
+fn animation_marker_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AnimationMarkerProbe))
+}
+
+impl Script for AnimationMarkerProbe {
+    fn on_animation_marker(&mut self, ctx: &mut Context<'_>, marker: &rve_sdk::AnimationMarker) {
+        ctx.log_info(format!(
+            "marker {} {} {}",
+            marker.marker, marker.motion, marker.clip
+        ));
+    }
+
+    fn on_message(&mut self, _: &mut Context<'_>, _: &str, name: &str, _: &Value) {
+        if name == "animation_finished" {
+            ANIMATION_MARKER_MESSAGE_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 fn quit_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
@@ -1018,6 +1040,7 @@ impl Script for ClockProbe {
 fn sdk_module() -> &'static RveModule {
     rve_sdk::script_module! {
         "Probe" => probe_factory,
+        "AnimationMarkerProbe" => animation_marker_probe_factory,
         "Error" => error_factory,
         "Panic" => panic_factory,
         "DoubleWrite" => double_write_factory,
@@ -1070,6 +1093,50 @@ fn sdk_module() -> &'static RveModule {
             later: f64 = 2.5,
         },
     }
+}
+
+fn legacy_v27_two_marker_module() -> &'static RveModule {
+    let current = rve_sdk::script_module! {
+        "FirstMarkerProbe" => animation_marker_probe_factory,
+        "SecondMarkerProbe" => animation_marker_probe_factory,
+    };
+    // SAFETY: the SDK macro owns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV22] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV22 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+                ui_event: descriptor.ui_event,
+                on_enable: descriptor.on_enable,
+                on_disable: descriptor.on_disable,
+                on_fixed_update: descriptor.on_fixed_update,
+                on_late_update: descriptor.on_late_update,
+                on_timer: descriptor.on_timer,
+                set_property: descriptor.set_property,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 27,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
 }
 
 fn library() -> crate::ScriptLibrary {
@@ -1167,6 +1234,67 @@ fn message_list(host: &mut ScriptHost) -> Vec<String> {
         .into_iter()
         .map(|event| event.message)
         .collect()
+}
+
+#[test]
+fn rust_guest_receives_animation_marker_fields() {
+    let _lock = test_lock();
+    let mut world = scripted_world("AnimationMarkerProbe", "{}");
+    let library = library();
+    let mut host = load_host(&world, &library);
+    let camera = world.handle("camera").unwrap();
+    host.queue_animation_markers(
+        &world,
+        [(
+            camera,
+            "walk".to_owned(),
+            "walk.fbx".to_owned(),
+            "footstep".to_owned(),
+        )],
+    );
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert_eq!(message_list(&mut host), ["marker footstep walk walk.fbx"]);
+}
+
+#[test]
+fn abi_v27_reads_both_historical_descriptors_and_skips_marker_callbacks() {
+    let _lock = test_lock();
+    ANIMATION_MARKER_MESSAGE_CALLBACKS.store(0, Ordering::SeqCst);
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "FirstMarkerProbe"
+[[objects.heavy_scripts]]
+name = "SecondMarkerProbe"
+"#,
+    );
+    // SAFETY: the helper constructs process-lifetime historical v27 descriptors.
+    let library = unsafe {
+        crate::ScriptLibrary::from_module(std::ptr::from_ref(legacy_v27_two_marker_module()))
+    }
+    .unwrap();
+    let mut host = load_host(&world, &library);
+    let camera = world.handle("camera").unwrap();
+    host.queue_animation_markers(
+        &world,
+        [(
+            camera,
+            "walk".to_owned(),
+            "walk.fbx".to_owned(),
+            "footstep".to_owned(),
+        )],
+    );
+    host.queue_animation_events(&world, [(camera, "walk".to_owned())]);
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert_eq!(ANIMATION_MARKER_MESSAGE_CALLBACKS.load(Ordering::SeqCst), 2);
+    assert!(message_list(&mut host).is_empty());
 }
 
 #[test]
@@ -2907,6 +3035,7 @@ fn null_module() -> &'static RveModule {
         on_late_update: None,
         on_timer: None,
         set_property: None,
+        animation_marker: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2936,6 +3065,7 @@ fn null_name_module() -> &'static RveModule {
         on_late_update: None,
         on_timer: None,
         set_property: None,
+        animation_marker: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2966,6 +3096,7 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         on_late_update: None,
         on_timer: None,
         set_property: None,
+        animation_marker: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3376,6 +3507,7 @@ fn error_message_module() -> &'static RveModule {
             on_late_update: None,
             on_timer: None,
             set_property: None,
+            animation_marker: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -3397,6 +3529,7 @@ fn error_message_module() -> &'static RveModule {
             on_late_update: None,
             on_timer: None,
             set_property: None,
+            animation_marker: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -3434,6 +3567,7 @@ fn set_local_during_create_module() -> &'static RveModule {
         on_late_update: None,
         on_timer: None,
         set_property: None,
+        animation_marker: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3460,6 +3594,7 @@ fn poisoned_create_module() -> &'static RveModule {
         on_late_update: None,
         on_timer: None,
         set_property: None,
+        animation_marker: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -4115,6 +4250,7 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         on_late_update: None,
         on_timer: None,
         set_property: None,
+        animation_marker: None,
     }]));
     RveModule::new(scripts)
 }
@@ -4201,6 +4337,7 @@ fn malformed_parameter_tables_are_rejected() {
             on_late_update: None,
             on_timer: None,
             set_property: None,
+            animation_marker: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -4444,6 +4581,7 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         on_late_update: None,
         on_timer: None,
         set_property: None,
+        animation_marker: None,
     }]));
     Box::leak(Box::new(RveModule::new(scripts)))
 }

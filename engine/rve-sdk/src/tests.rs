@@ -2809,7 +2809,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -3084,7 +3084,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
 }
 
 #[test]
@@ -3106,7 +3106,7 @@ fn screen_shader_callbacks_are_appended_in_v14() {
     );
     assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
     assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
 }
 
 #[test]
@@ -3130,7 +3130,7 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV15>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
 }
 
 #[test]
@@ -3166,7 +3166,7 @@ fn ui_callbacks_are_appended_in_abi_v16_and_lifecycle_callbacks_in_v17() {
         offset_of!(crate::abi::RveScriptDesc, on_enable)
             + size_of::<Option<crate::abi::RveStartFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
 }
 
 #[test]
@@ -3212,7 +3212,7 @@ fn hierarchy_callbacks_are_appended_after_the_abi_v16_ui_tail() {
 fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
     assert_eq!(RVE_TRIGGER_STAY, 4);
     assert_eq!(
         offset_of!(RveHost, physics_get_collider),
@@ -3229,7 +3229,7 @@ fn runtime_physics_callbacks_append_after_the_hierarchy_tail_in_v18() {
 fn component_callbacks_follow_the_v18_physics_tail_in_abi_v19() {
     use std::mem::{offset_of, size_of};
 
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
     assert_eq!(
         offset_of!(RveHost, light_get),
         offset_of!(RveHost, physics_shape_cast)
@@ -3265,7 +3265,7 @@ fn runtime_physics_value_types_are_c_layout_in_v18() {
         RveColliderValue, RveControllerValue, RveQueryOptions, RveQueryShape, RveRigidBodyValue,
     };
     use std::mem::{offset_of, size_of};
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 27);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 28);
     assert_eq!(size_of::<RveColliderValue>(), 40);
     assert_eq!(offset_of!(RveColliderValue, size), 8);
     assert_eq!(offset_of!(RveColliderValue, offset), 28);
