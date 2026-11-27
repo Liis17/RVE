@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use glam::{Mat3, Quat, Vec3};
@@ -20,6 +21,11 @@ pub(crate) const POSITIONAL_SLOP: f32 = 0.005;
 pub(crate) const POSITIONAL_CORRECTION: f32 = 0.2;
 pub(crate) const RESTITUTION_THRESHOLD: f32 = 1.0;
 const WAKE_SPEED_SQUARED: f32 = 1.0e-6;
+
+fn default_solver_threads() -> NonZeroUsize {
+    let count = std::thread::available_parallelism().map_or(1, |available| available.get().min(4));
+    NonZeroUsize::new(count).expect("solver thread count is nonzero")
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BodyHandle(pub u64);
@@ -533,6 +539,11 @@ pub struct PhysicsWorld {
     /// BVH static-коллайдеров последнего снимка запросов; `query_snapshot` переиспользует его,
     /// пока static-коллайдеры не менялись. `Mutex`, потому что снимок строится по `&self`.
     query_static_tree: Mutex<Option<Arc<ColliderTree>>>,
+    solver_threads: NonZeroUsize,
+    #[cfg(test)]
+    test_parallel_min_constraints: usize,
+    #[cfg(test)]
+    parallel_solver_runs: usize,
 }
 
 impl Default for PhysicsWorld {
@@ -558,7 +569,22 @@ impl PhysicsWorld {
             broadphase_degraded: false,
             collision_matrix: [u32::MAX; PHYSICS_LAYER_COUNT],
             query_static_tree: Mutex::new(None),
+            solver_threads: default_solver_threads(),
+            #[cfg(test)]
+            test_parallel_min_constraints: crate::solver::PARALLEL_MIN_CONSTRAINTS,
+            #[cfg(test)]
+            parallel_solver_runs: 0,
         })
+    }
+
+    /// Задаёт число рабочих потоков островного решателя.
+    pub fn set_solver_threads(&mut self, threads: NonZeroUsize) {
+        self.solver_threads = threads;
+    }
+
+    /// Возвращает число потоков, настроенное для островного решателя.
+    pub fn solver_threads(&self) -> NonZeroUsize {
+        self.solver_threads
     }
 
     /// Задаёт маски слоёв до вставки тел; пары, запрещённые матрицей, не создаются.
@@ -731,12 +757,24 @@ impl PhysicsWorld {
                 .map(|body| body.handle),
             &self.active_pairs,
         );
-        crate::solver::solve(
+        #[cfg(test)]
+        let parallel_min_constraints = self.test_parallel_min_constraints;
+        #[cfg(not(test))]
+        let parallel_min_constraints = crate::solver::PARALLEL_MIN_CONSTRAINTS;
+        let ran_parallel = crate::solver::solve(
             &mut self.bodies,
             &mut self.active_pairs,
             &mut self.manifolds,
             &islands,
+            self.solver_threads,
+            parallel_min_constraints,
         );
+        #[cfg(test)]
+        if ran_parallel {
+            self.parallel_solver_runs += 1;
+        }
+        #[cfg(not(test))]
+        let _ = ran_parallel;
         for body in self.bodies.values_mut() {
             body.integrate_position(dt);
         }
@@ -4124,5 +4162,705 @@ mod script_physics_tests {
             .body_state(ball)
             .unwrap();
         assert_eq!(state.body_kind, BodyKind::Static);
+    }
+}
+
+#[cfg(test)]
+mod parallel_solver_tests {
+    use super::*;
+    use crate::material::PhysicsMaterial;
+    use crate::query::QueryFilter;
+    use crate::ray::Ray;
+    use glam::Quat;
+    use std::num::NonZeroUsize;
+
+    const TEST_PARALLEL_MIN_CONSTRAINTS: usize = crate::solver::PARALLEL_MIN_CONSTRAINTS;
+
+    fn configure(world: &mut PhysicsWorld, threads: usize, threshold: usize) {
+        world.set_solver_threads(NonZeroUsize::new(threads).unwrap());
+        world.test_parallel_min_constraints = threshold;
+    }
+
+    fn bits3(value: Vec3) -> [u32; 3] {
+        value.to_array().map(f32::to_bits)
+    }
+
+    fn assert_pose_bits(first: Pose, second: Pose) {
+        assert_eq!(bits3(first.position), bits3(second.position));
+        assert_eq!(
+            first.rotation.to_array().map(f32::to_bits),
+            second.rotation.to_array().map(f32::to_bits)
+        );
+    }
+
+    fn assert_events_bits(first: &[PhysicsEvent], second: &[PhysicsEvent]) {
+        assert_eq!(first.len(), second.len());
+        for (first, second) in first.iter().zip(second) {
+            match (first, second) {
+                (
+                    PhysicsEvent::CollisionEnter {
+                        first: first_a,
+                        second: first_b,
+                        point: first_point,
+                        normal: first_normal,
+                    },
+                    PhysicsEvent::CollisionEnter {
+                        first: second_a,
+                        second: second_b,
+                        point: second_point,
+                        normal: second_normal,
+                    },
+                ) => {
+                    assert_eq!((first_a, first_b), (second_a, second_b));
+                    assert_eq!(bits3(*first_point), bits3(*second_point));
+                    assert_eq!(bits3(*first_normal), bits3(*second_normal));
+                }
+                (
+                    PhysicsEvent::CollisionExit {
+                        first: first_a,
+                        second: first_b,
+                    },
+                    PhysicsEvent::CollisionExit {
+                        first: second_a,
+                        second: second_b,
+                    },
+                )
+                | (
+                    PhysicsEvent::TriggerEnter {
+                        first: first_a,
+                        second: first_b,
+                    },
+                    PhysicsEvent::TriggerEnter {
+                        first: second_a,
+                        second: second_b,
+                    },
+                )
+                | (
+                    PhysicsEvent::TriggerExit {
+                        first: first_a,
+                        second: first_b,
+                    },
+                    PhysicsEvent::TriggerExit {
+                        first: second_a,
+                        second: second_b,
+                    },
+                ) => assert_eq!((first_a, first_b), (second_a, second_b)),
+                _ => panic!("event kinds differ: {first:?} != {second:?}"),
+            }
+        }
+    }
+
+    fn assert_step_bits(first: &StepResult, second: &StepResult) {
+        assert_eq!(first.substeps, second.substeps);
+        assert_eq!(first.skipped_pairs, second.skipped_pairs);
+        assert_eq!(first.skipped_commands, second.skipped_commands);
+        assert_eq!(first.broadphase_truncated, second.broadphase_truncated);
+        assert_eq!(first.poses.len(), second.poses.len());
+        for ((first_handle, first_pose), (second_handle, second_pose)) in
+            first.poses.iter().zip(&second.poses)
+        {
+            assert_eq!(first_handle, second_handle);
+            assert_pose_bits(*first_pose, *second_pose);
+        }
+        assert_events_bits(&first.events, &second.events);
+    }
+
+    fn assert_world_bits(first: &PhysicsWorld, second: &PhysicsWorld) {
+        assert_eq!(
+            first.bodies.keys().collect::<Vec<_>>(),
+            second.bodies.keys().collect::<Vec<_>>()
+        );
+        for (handle, first_body) in &first.bodies {
+            let second_body = &second.bodies[handle];
+            assert_pose_bits(first_body.pose, second_body.pose);
+            assert_eq!(
+                bits3(first_body.linear_velocity),
+                bits3(second_body.linear_velocity)
+            );
+            assert_eq!(
+                bits3(first_body.angular_velocity),
+                bits3(second_body.angular_velocity)
+            );
+            assert_eq!(first_body.sleeping, second_body.sleeping);
+            assert_eq!(
+                first_body.sleep_time.to_bits(),
+                second_body.sleep_time.to_bits()
+            );
+        }
+        assert_eq!(
+            first.active_pairs.keys().collect::<Vec<_>>(),
+            second.active_pairs.keys().collect::<Vec<_>>()
+        );
+        for (key, first_pair) in &first.active_pairs {
+            let second_pair = &second.active_pairs[key];
+            assert_eq!(first_pair.kind, second_pair.kind);
+            match (&first_pair.manifold, &second_pair.manifold) {
+                (Some(first), Some(second)) => {
+                    assert_eq!(bits3(first.normal), bits3(second.normal));
+                    assert_eq!(first.contacts.len(), second.contacts.len());
+                    for (first, second) in first.contacts.iter().zip(&second.contacts) {
+                        assert_eq!(bits3(first.point_a), bits3(second.point_a));
+                        assert_eq!(bits3(first.point_b), bits3(second.point_b));
+                        assert_eq!(bits3(first.position), bits3(second.position));
+                        assert_eq!(first.penetration.to_bits(), second.penetration.to_bits());
+                        assert_eq!(first.feature_id, second.feature_id);
+                        assert_eq!(
+                            first.normal_impulse.to_bits(),
+                            second.normal_impulse.to_bits()
+                        );
+                        assert_eq!(bits3(first.tangent_impulse), bits3(second.tangent_impulse));
+                        assert_eq!(first.sliding, second.sliding);
+                    }
+                }
+                (None, None) => {}
+                _ => panic!("manifold presence differs for {key:?}"),
+            }
+        }
+    }
+
+    fn assert_snapshots_bits(first: &PhysicsWorld, second: &PhysicsWorld) {
+        let handles: Vec<_> = first.bodies.keys().copied().collect();
+        let first = first.query_snapshot().unwrap();
+        let second = second.query_snapshot().unwrap();
+        for handle in handles {
+            let first_state = first.body_state(handle).unwrap();
+            let second_state = second.body_state(handle).unwrap();
+            assert_pose_bits(first_state.pose, second_state.pose);
+            assert_eq!(first_state.enabled, second_state.enabled);
+            assert_eq!(first_state.trigger, second_state.trigger);
+            assert_eq!(first_state.body_kind, second_state.body_kind);
+            assert_eq!(
+                bits3(first_state.body_velocity),
+                bits3(second_state.body_velocity)
+            );
+            assert_eq!(first_state.mass.to_bits(), second_state.mass.to_bits());
+        }
+        let ray = Ray::new(Vec3::new(0.0, 20.0, 0.0), -Vec3::Y, 50.0).unwrap();
+        let first_hit = first.raycast(&ray, QueryFilter::default()).unwrap();
+        let second_hit = second.raycast(&ray, QueryFilter::default()).unwrap();
+        match (first_hit, second_hit) {
+            (Some(first), Some(second)) => {
+                assert_eq!(first.body, second.body);
+                assert_eq!(bits3(first.point), bits3(second.point));
+                assert_eq!(bits3(first.normal), bits3(second.normal));
+                assert_eq!(first.distance.to_bits(), second.distance.to_bits());
+                assert_eq!(first.fraction.to_bits(), second.fraction.to_bits());
+            }
+            (None, None) => {}
+            _ => panic!("query snapshot raycast results differ"),
+        }
+    }
+
+    fn add_floor(world: &mut PhysicsWorld, half_extents: Vec3) {
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(half_extents).unwrap(),
+                Pose::new(Vec3::new(0.0, -half_extents.y, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+    }
+
+    fn grid_driver(threads: usize, threshold: usize) -> StepDriver {
+        let mut world = PhysicsWorld::default();
+        add_floor(&mut world, Vec3::new(8.0, 0.5, 8.0));
+        for row in 0..10 {
+            for column in 0..10 {
+                world
+                    .insert_body(BodyDesc::dynamic(
+                        Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                        Pose::new(
+                            Vec3::new(column as f32 * 1.2 - 5.4, 0.45, row as f32 * 1.2 - 5.4),
+                            Quat::IDENTITY,
+                        )
+                        .unwrap(),
+                        1.0,
+                    ))
+                    .unwrap();
+            }
+        }
+        configure(&mut world, threads, threshold);
+        StepDriver::new(world, 60, 8).unwrap()
+    }
+
+    fn composite_driver(
+        threads: usize,
+        threshold: usize,
+    ) -> (StepDriver, BodyHandle, Vec<BodyHandle>) {
+        let mut world = PhysicsWorld::default();
+        add_floor(&mut world, Vec3::new(24.0, 0.5, 24.0));
+        let mut dynamics = Vec::new();
+        for (x, y, z) in [
+            (-8.0, 0.5, 0.0),
+            (-8.0, 1.5, 0.0),
+            (8.0, 0.5, 0.0),
+            (8.0, 1.5, 0.0),
+            (0.8, 0.5, 4.0),
+        ] {
+            let mut collider = ColliderDesc::new(Shape::cuboid(Vec3::splat(0.5)).unwrap());
+            collider.material = PhysicsMaterial {
+                static_friction: 0.7,
+                dynamic_friction: 0.2,
+                bounciness: 0.35,
+                ..PhysicsMaterial::from_friction_restitution(0.5, 0.0)
+            };
+            dynamics.push(
+                world
+                    .insert_body(BodyDesc::new(
+                        BodyKind::Dynamic,
+                        Pose::new(Vec3::new(x, y, z), Quat::IDENTITY).unwrap(),
+                        collider,
+                    ))
+                    .unwrap(),
+            );
+        }
+        let pusher = world
+            .insert_body(BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::new(Vec3::new(0.0, 0.5, 4.0), Quat::IDENTITY).unwrap(),
+                ColliderDesc::new(Shape::cuboid(Vec3::splat(0.5)).unwrap()),
+            ))
+            .unwrap();
+        let mut character = BodyDesc::new(
+            BodyKind::Kinematic,
+            Pose::new(Vec3::new(-2.0, 0.8, 5.0), Quat::IDENTITY).unwrap(),
+            ColliderDesc::new(Shape::capsule(0.4, 1.0).unwrap()),
+        );
+        character.character_controller = true;
+        world.insert_body(character).unwrap();
+        dynamics.push(
+            world
+                .insert_body(BodyDesc::dynamic(
+                    Shape::sphere(0.45).unwrap(),
+                    Pose::new(Vec3::new(-1.55, 0.8, 5.0), Quat::IDENTITY).unwrap(),
+                    1.0,
+                ))
+                .unwrap(),
+        );
+        configure(&mut world, threads, threshold);
+        (StepDriver::new(world, 60, 8).unwrap(), pusher, dynamics)
+    }
+
+    fn truncated_driver(threads: usize, threshold: usize) -> (StepDriver, PairKey) {
+        let mut world = PhysicsWorld::default();
+        add_floor(&mut world, Vec3::new(10.0, 0.5, 5.0));
+        let mut boxes = Vec::new();
+        for x in [-4.0, -3.2, 4.0, 4.8] {
+            boxes.push(
+                world
+                    .insert_body(BodyDesc::dynamic(
+                        Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                        Pose::new(Vec3::new(x, 0.45, 0.0), Quat::IDENTITY).unwrap(),
+                        1.0,
+                    ))
+                    .unwrap(),
+            );
+        }
+        world.refresh_pairs().unwrap();
+        let tail = PairKey::new(boxes[2].0, boxes[3].0);
+        assert!(world.active_pairs.contains_key(&tail));
+        world.broad.comparison_limit = 1;
+        configure(&mut world, threads, threshold);
+        (StepDriver::new(world, 60, 8).unwrap(), tail)
+    }
+
+    fn compare_steps(
+        baseline: &mut StepDriver,
+        candidate: &mut StepDriver,
+        steps: usize,
+        pusher: Option<BodyHandle>,
+        initial_impulses: &[BodyHandle],
+    ) {
+        for frame in 0..steps {
+            let mut commands = Vec::new();
+            if frame == 0 {
+                for (index, handle) in initial_impulses.iter().enumerate() {
+                    commands.push(PhysicsCommand::AddImpulse {
+                        body: *handle,
+                        impulse: if index == 0 {
+                            Vec3::new(0.0, 0.0, 1.5)
+                        } else {
+                            Vec3::new(0.0, -1.5, 0.0)
+                        },
+                        point: None,
+                    });
+                }
+            }
+            if let Some(pusher) = pusher {
+                commands.push(PhysicsCommand::KinematicTarget {
+                    body: pusher,
+                    pose: Pose::new(Vec3::new(frame as f32 * 0.002, 0.5, 4.0), Quat::IDENTITY)
+                        .unwrap(),
+                });
+            }
+            let baseline_result = baseline.advance_step(1.0 / 60.0, commands.clone()).unwrap();
+            let candidate_result = candidate.advance_step(1.0 / 60.0, commands).unwrap();
+            assert_step_bits(&baseline_result, &candidate_result);
+            assert_world_bits(baseline.world(), candidate.world());
+        }
+        assert_snapshots_bits(baseline.world(), candidate.world());
+    }
+
+    fn active_island_count(world: &PhysicsWorld) -> usize {
+        crate::island::build(
+            world
+                .bodies
+                .values()
+                .filter(|body| body.kind == BodyKind::Dynamic)
+                .map(|body| body.handle),
+            &world.active_pairs,
+        )
+        .iter()
+        .filter(|island| !island.pairs.is_empty())
+        .count()
+    }
+
+    #[test]
+    fn default_solver_thread_count_is_bounded_and_setting_is_observed() {
+        let mut world = PhysicsWorld::default();
+        assert!((1..=4).contains(&world.solver_threads().get()));
+        for threads in [1, 2, 4, 7] {
+            world.set_solver_threads(NonZeroUsize::new(threads).unwrap());
+            assert_eq!(world.solver_threads().get(), threads);
+        }
+    }
+
+    #[test]
+    fn one_two_four_and_seven_threads_match_across_contact_scenes() {
+        for threshold in [0, TEST_PARALLEL_MIN_CONSTRAINTS] {
+            for threads in [2, 4, 7] {
+                let mut baseline = grid_driver(1, threshold);
+                let mut candidate = grid_driver(threads, threshold);
+                compare_steps(&mut baseline, &mut candidate, 5, None, &[]);
+                assert!(candidate.world().active_pair_count() >= 100);
+                assert!(active_island_count(candidate.world()) >= 2);
+                assert!(candidate.world().parallel_solver_runs > 0);
+
+                let (mut baseline, pusher, bodies) = composite_driver(1, threshold);
+                let (mut candidate, candidate_pusher, candidate_bodies) =
+                    composite_driver(threads, threshold);
+                assert_eq!(pusher, candidate_pusher);
+                assert_eq!(bodies, candidate_bodies);
+                compare_steps(
+                    &mut baseline,
+                    &mut candidate,
+                    12,
+                    Some(pusher),
+                    &[bodies[4], bodies[1]],
+                );
+                assert!(candidate.world().active_pairs.values().any(|pair| {
+                    pair.manifold.as_ref().is_some_and(|manifold| {
+                        manifold.contacts.iter().any(|contact| contact.sliding)
+                    })
+                }));
+                if threshold == 0 {
+                    assert!(candidate.world().parallel_solver_runs > 0);
+                }
+
+                let (mut baseline, baseline_tail) = truncated_driver(1, threshold);
+                let (mut candidate, candidate_tail) = truncated_driver(threads, threshold);
+                assert_eq!(baseline_tail, candidate_tail);
+                for _ in 0..5 {
+                    let baseline_result = baseline.advance_step(1.0 / 60.0, []).unwrap();
+                    let candidate_result = candidate.advance_step(1.0 / 60.0, []).unwrap();
+                    assert!(baseline_result.broadphase_truncated > 0);
+                    assert!(candidate_result.broadphase_truncated > 0);
+                    assert_step_bits(&baseline_result, &candidate_result);
+                    assert_world_bits(baseline.world(), candidate.world());
+                }
+                assert_snapshots_bits(baseline.world(), candidate.world());
+                if threshold == 0 {
+                    assert!(candidate.world().parallel_solver_runs > 0);
+                }
+                assert!(candidate.world().active_pairs.contains_key(&candidate_tail));
+                assert!(active_island_count(candidate.world()) >= 2);
+            }
+        }
+    }
+
+    fn deep_stacks_driver(threads: usize, threshold: usize) -> StepDriver {
+        let mut world = PhysicsWorld::default();
+        add_floor(&mut world, Vec3::new(30.0, 0.5, 8.0));
+        for x in [-10.0, 10.0] {
+            for index in 0..40 {
+                world
+                    .insert_body(BodyDesc::dynamic(
+                        Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                        Pose::new(Vec3::new(x, 0.45 + index as f32 * 0.9, 0.0), Quat::IDENTITY)
+                            .unwrap(),
+                        1.0,
+                    ))
+                    .unwrap();
+            }
+        }
+        configure(&mut world, threads, threshold);
+        StepDriver::new(world, 60, 8).unwrap()
+    }
+
+    #[test]
+    fn more_threads_than_large_contact_islands_are_supported() {
+        let mut baseline = deep_stacks_driver(1, TEST_PARALLEL_MIN_CONSTRAINTS);
+        let mut candidate = deep_stacks_driver(7, TEST_PARALLEL_MIN_CONSTRAINTS);
+        compare_steps(&mut baseline, &mut candidate, 4, None, &[]);
+        assert_eq!(active_island_count(candidate.world()), 2);
+        assert!(candidate.world().parallel_solver_runs > 0);
+    }
+
+    fn sleeping_stack(threads: usize, threshold: usize) -> (StepDriver, Vec<BodyHandle>) {
+        let mut world = PhysicsWorld::default();
+        add_floor(&mut world, Vec3::new(8.0, 0.5, 8.0));
+        let mut bodies = Vec::new();
+        for index in 0..4 {
+            bodies.push(
+                world
+                    .insert_body(BodyDesc::dynamic(
+                        Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                        Pose::new(
+                            Vec3::new(0.0, 0.45 + index as f32 * 0.9, 0.0),
+                            Quat::IDENTITY,
+                        )
+                        .unwrap(),
+                        1.0,
+                    ))
+                    .unwrap(),
+            );
+        }
+        configure(&mut world, threads, threshold);
+        (StepDriver::new(world, 60, 8).unwrap(), bodies)
+    }
+
+    type ManifoldImpulses = (PairKey, Vec<u32>, Vec<[u32; 3]>, Vec<bool>);
+
+    fn manifold_impulses(world: &PhysicsWorld) -> Vec<ManifoldImpulses> {
+        world
+            .active_pairs
+            .iter()
+            .filter_map(|(key, pair)| {
+                pair.manifold.as_ref().map(|manifold| {
+                    (
+                        *key,
+                        manifold
+                            .contacts
+                            .iter()
+                            .map(|contact| contact.normal_impulse.to_bits())
+                            .collect(),
+                        manifold
+                            .contacts
+                            .iter()
+                            .map(|contact| bits3(contact.tangent_impulse))
+                            .collect(),
+                        manifold
+                            .contacts
+                            .iter()
+                            .map(|contact| contact.sliding)
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sleeping_islands_are_skipped_and_impulse_wakes_the_whole_stack_identically() {
+        for threads in [2, 4, 7] {
+            let (mut baseline, baseline_bodies) = sleeping_stack(1, TEST_PARALLEL_MIN_CONSTRAINTS);
+            let (mut candidate, candidate_bodies) =
+                sleeping_stack(threads, TEST_PARALLEL_MIN_CONSTRAINTS);
+            assert_eq!(baseline_bodies, candidate_bodies);
+            for _ in 0..240 {
+                let baseline_result = baseline.advance_step(1.0 / 60.0, []).unwrap();
+                let candidate_result = candidate.advance_step(1.0 / 60.0, []).unwrap();
+                assert_step_bits(&baseline_result, &candidate_result);
+                assert_world_bits(baseline.world(), candidate.world());
+            }
+            assert!(
+                baseline_bodies
+                    .iter()
+                    .all(|handle| baseline.world().body_is_sleeping(*handle) == Some(true))
+            );
+            assert!(
+                candidate_bodies
+                    .iter()
+                    .all(|handle| candidate.world().body_is_sleeping(*handle) == Some(true))
+            );
+            assert_eq!(candidate.world().parallel_solver_runs, 0);
+            let old_impulses = manifold_impulses(candidate.world());
+            let baseline_result = baseline.advance_step(1.0 / 60.0, []).unwrap();
+            let candidate_result = candidate.advance_step(1.0 / 60.0, []).unwrap();
+            assert_step_bits(&baseline_result, &candidate_result);
+            assert_world_bits(baseline.world(), candidate.world());
+            assert_eq!(manifold_impulses(candidate.world()), old_impulses);
+
+            let command = PhysicsCommand::AddImpulse {
+                body: candidate_bodies[3],
+                impulse: Vec3::Y * 0.5,
+                point: None,
+            };
+            let baseline_result = baseline
+                .advance_step(
+                    1.0 / 60.0,
+                    [PhysicsCommand::AddImpulse {
+                        body: baseline_bodies[3],
+                        impulse: Vec3::Y * 0.5,
+                        point: None,
+                    }],
+                )
+                .unwrap();
+            let candidate_result = candidate.advance_step(1.0 / 60.0, [command]).unwrap();
+            assert_step_bits(&baseline_result, &candidate_result);
+            assert_world_bits(baseline.world(), candidate.world());
+            assert!(
+                candidate_bodies
+                    .iter()
+                    .all(|handle| candidate.world().body_is_sleeping(*handle) == Some(false))
+            );
+            assert_ne!(manifold_impulses(candidate.world()), old_impulses);
+        }
+    }
+
+    fn mixed_sleeping_world(
+        threads: usize,
+        threshold: usize,
+    ) -> (PhysicsWorld, BodyHandle, BodyHandle) {
+        let mut world = PhysicsWorld::default();
+        let first = world
+            .insert_body(BodyDesc::dynamic(
+                Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                Pose::new(Vec3::new(-10.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let second = world
+            .insert_body(BodyDesc::dynamic(
+                Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                Pose::new(Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let kinematic = world
+            .insert_body(BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::new(Vec3::new(-30.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                ColliderDesc::new(Shape::cuboid(Vec3::splat(0.5)).unwrap()),
+            ))
+            .unwrap();
+        world.refresh_pairs().unwrap();
+        for (handle, position) in [(first, Vec3::ZERO), (second, Vec3::new(0.8, 0.0, 0.0))] {
+            let body = world.bodies.get_mut(&handle).unwrap();
+            body.pose.position = position;
+            body.sleeping = true;
+            body.sleep_time = SLEEP_DELAY_SECONDS;
+            body.linear_velocity = Vec3::ZERO;
+            body.angular_velocity = Vec3::ZERO;
+            body.mark_pose_changed();
+        }
+        world
+            .apply_command(
+                PhysicsCommand::KinematicTarget {
+                    body: kinematic,
+                    pose: Pose::new(Vec3::new(-0.7, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                },
+                1.0 / 60.0,
+            )
+            .unwrap();
+        configure(&mut world, threads, threshold);
+        (world, first, second)
+    }
+
+    #[test]
+    fn mixed_awake_sleeping_islands_match_and_wake_as_one_after_impulse() {
+        for threshold in [0, TEST_PARALLEL_MIN_CONSTRAINTS] {
+            for threads in [2, 4, 7] {
+                let (mut baseline, awake, sleeping) = mixed_sleeping_world(1, threshold);
+                let (mut candidate, candidate_awake, candidate_sleeping) =
+                    mixed_sleeping_world(threads, threshold);
+                assert_eq!((awake, sleeping), (candidate_awake, candidate_sleeping));
+                let baseline_events = baseline.step_fixed(1.0 / 60.0).unwrap();
+                let candidate_events = candidate.step_fixed(1.0 / 60.0).unwrap();
+                assert_events_bits(&baseline_events, &candidate_events);
+                assert_world_bits(&baseline, &candidate);
+                assert_eq!(candidate.body_is_sleeping(candidate_awake), Some(false));
+                assert_eq!(candidate.body_is_sleeping(candidate_sleeping), Some(true));
+                let mixed_pair = PairKey::new(candidate_awake.0, candidate_sleeping.0);
+                assert!(
+                    candidate
+                        .active_pairs
+                        .get(&mixed_pair)
+                        .and_then(|pair| pair.manifold.as_ref())
+                        .is_some()
+                );
+                assert!(
+                    crate::island::build(
+                        candidate
+                            .bodies
+                            .values()
+                            .filter(|body| body.kind == BodyKind::Dynamic)
+                            .map(|body| body.handle),
+                        &candidate.active_pairs,
+                    )
+                    .iter()
+                    .any(|island| island.bodies.contains(&candidate_awake)
+                        && island.bodies.contains(&candidate_sleeping))
+                );
+
+                let mut baseline = StepDriver::new(baseline, 60, 8).unwrap();
+                let mut candidate = StepDriver::new(candidate, 60, 8).unwrap();
+                compare_steps(&mut baseline, &mut candidate, 1, None, &[]);
+                let baseline_result = baseline
+                    .advance_step(
+                        1.0 / 60.0,
+                        [PhysicsCommand::AddImpulse {
+                            body: sleeping,
+                            impulse: Vec3::Y * 0.5,
+                            point: None,
+                        }],
+                    )
+                    .unwrap();
+                let candidate_result = candidate
+                    .advance_step(
+                        1.0 / 60.0,
+                        [PhysicsCommand::AddImpulse {
+                            body: candidate_sleeping,
+                            impulse: Vec3::Y * 0.5,
+                            point: None,
+                        }],
+                    )
+                    .unwrap();
+                assert_step_bits(&baseline_result, &candidate_result);
+                assert_world_bits(baseline.world(), candidate.world());
+                assert_eq!(
+                    candidate.world().body_is_sleeping(candidate_awake),
+                    Some(false)
+                );
+                assert_eq!(
+                    candidate.world().body_is_sleeping(candidate_sleeping),
+                    Some(false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_threshold_keeps_a_small_scene_on_the_calling_thread() {
+        let mut world = PhysicsWorld::default();
+        add_floor(&mut world, Vec3::new(8.0, 0.5, 8.0));
+        for index in 0..16 {
+            world
+                .insert_body(BodyDesc::dynamic(
+                    Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+                    Pose::new(
+                        Vec3::new(index as f32 * 1.2 - 9.0, 0.45, 0.0),
+                        Quat::IDENTITY,
+                    )
+                    .unwrap(),
+                    1.0,
+                ))
+                .unwrap();
+        }
+        configure(&mut world, 4, TEST_PARALLEL_MIN_CONSTRAINTS);
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        for _ in 0..6 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+        }
+        assert_eq!(driver.world().parallel_solver_runs, 0);
     }
 }

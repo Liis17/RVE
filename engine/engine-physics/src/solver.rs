@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
 use glam::{Mat3, Vec3};
 
@@ -14,6 +15,7 @@ use crate::world::{
 const SLIDING_SPEED: f32 = 0.05;
 /// Относительный допуск, по которому касательный импульс считается упёршимся в конус трения.
 const FRICTION_CLAMP_TOLERANCE: f32 = 1.0e-3;
+pub(crate) const PARALLEL_MIN_CONSTRAINTS: usize = 256;
 
 #[derive(Clone, Copy)]
 struct ContactConstraint {
@@ -87,6 +89,12 @@ struct IslandSolver {
     body_indices: BTreeMap<BodyHandle, usize>,
     pairs: Vec<SolverPair>,
     constraints: Vec<ContactConstraint>,
+}
+
+struct IslandWork {
+    order: usize,
+    constraint_count: usize,
+    solver: IslandSolver,
 }
 
 impl IslandSolver {
@@ -322,17 +330,78 @@ pub(crate) fn solve(
     pairs: &mut BTreeMap<PairKey, ActivePair>,
     manifolds: &mut ManifoldCache,
     islands: &[Island],
-) {
-    for island in islands {
+    threads: NonZeroUsize,
+    parallel_min_constraints: usize,
+) -> bool {
+    let mut work = Vec::new();
+    let mut total_constraints = 0;
+    for (order, island) in islands.iter().enumerate() {
         if !island.has_awake_body(|handle| bodies.get(&handle).is_some_and(is_awake_dynamic)) {
             continue;
         }
-        let mut solver = IslandSolver::build(island, bodies, pairs);
-        if solver.constraints.is_empty() {
+        let solver = IslandSolver::build(island, bodies, pairs);
+        let constraint_count = solver.constraints.len();
+        if constraint_count == 0 {
             continue;
         }
-        solver.solve();
-        solver.write_back(bodies, pairs);
+        total_constraints += constraint_count;
+        work.push(IslandWork {
+            order,
+            constraint_count,
+            solver,
+        });
+    }
+
+    let use_parallel =
+        threads.get() > 1 && work.len() >= 2 && total_constraints >= parallel_min_constraints;
+    if use_parallel {
+        let worker_count = threads.get().min(work.len());
+        let mut sorted_indices: Vec<_> = (0..work.len()).collect();
+        sorted_indices.sort_unstable_by(|first, second| {
+            work[*second]
+                .constraint_count
+                .cmp(&work[*first].constraint_count)
+                .then(work[*first].order.cmp(&work[*second].order))
+        });
+        let mut assignments: Vec<Vec<IslandWork>> = (0..worker_count).map(|_| Vec::new()).collect();
+        let mut loads = vec![0; worker_count];
+        let mut remaining: Vec<_> = work.into_iter().map(Some).collect();
+        for index in sorted_indices {
+            let worker = (0..worker_count)
+                .min_by_key(|worker| (loads[*worker], *worker))
+                .expect("at least two workers are assigned");
+            let task = remaining[index]
+                .take()
+                .expect("each island is assigned once");
+            loads[worker] += task.constraint_count;
+            assignments[worker].push(task);
+        }
+
+        let mut assignments = assignments.into_iter();
+        let current_worker = assignments.next().expect("a current worker is assigned");
+        let (mut current_result, worker_results) = std::thread::scope(|scope| {
+            let handles: Vec<_> = assignments
+                .map(|work| scope.spawn(move || solve_worker(work)))
+                .collect();
+            let current_result = solve_worker(current_worker);
+            let worker_results = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("island solver worker panicked"))
+                .collect::<Vec<_>>();
+            (current_result, worker_results)
+        });
+        current_result.extend(worker_results.into_iter().flatten());
+        current_result.sort_unstable_by_key(|work| work.order);
+        for work in current_result {
+            work.solver.write_back(bodies, pairs);
+        }
+    } else {
+        for work in &mut work {
+            work.solver.solve();
+        }
+        for work in work {
+            work.solver.write_back(bodies, pairs);
+        }
     }
     for (key, pair) in pairs.iter() {
         if pair.kind == PairKind::Collision
@@ -341,6 +410,14 @@ pub(crate) fn solve(
             manifolds.store_impulses(*key, manifold);
         }
     }
+    use_parallel
+}
+
+fn solve_worker(mut work: Vec<IslandWork>) -> Vec<IslandWork> {
+    for task in &mut work {
+        task.solver.solve();
+    }
+    work
 }
 
 /// Ограничивает касательный импульс конусом трения радиуса `maximum` (`μ·λn`).
