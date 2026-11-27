@@ -577,7 +577,8 @@ impl PhysicsWorld {
         })
     }
 
-    /// Задаёт число рабочих потоков островного решателя.
+    /// Сохраняет число потоков островного решателя; за шаг используется не более 64 потоков и не
+    /// больше числа островов с ограничениями.
     pub fn set_solver_threads(&mut self, threads: NonZeroUsize) {
         self.solver_threads = threads;
     }
@@ -4542,6 +4543,18 @@ mod parallel_solver_tests {
             world.set_solver_threads(NonZeroUsize::new(threads).unwrap());
             assert_eq!(world.solver_threads().get(), threads);
         }
+    }
+
+    #[test]
+    fn very_large_thread_setting_matches_one_thread_across_many_islands() {
+        let mut baseline = grid_driver(1, 0);
+        let mut candidate = grid_driver(10_000, 0);
+        assert_eq!(candidate.world().solver_threads().get(), 10_000);
+
+        compare_steps(&mut baseline, &mut candidate, 1, None, &[]);
+
+        assert!(active_island_count(candidate.world()) > crate::solver::MAX_SOLVER_THREADS);
+        assert!(candidate.world().parallel_solver_runs > 0);
     }
 
     #[test]

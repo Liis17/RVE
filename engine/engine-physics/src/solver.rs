@@ -16,6 +16,7 @@ const SLIDING_SPEED: f32 = 0.05;
 /// Относительный допуск, по которому касательный импульс считается упёршимся в конус трения.
 const FRICTION_CLAMP_TOLERANCE: f32 = 1.0e-3;
 pub(crate) const PARALLEL_MIN_CONSTRAINTS: usize = 256;
+pub(crate) const MAX_SOLVER_THREADS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct ContactConstraint {
@@ -359,7 +360,7 @@ pub(crate) fn solve(
     let use_parallel =
         threads.get() > 1 && work.len() >= 2 && total_constraints >= parallel_min_constraints;
     if use_parallel {
-        let worker_count = threads.get().min(work.len());
+        let worker_count = threads.get().min(work.len()).min(MAX_SOLVER_THREADS);
         let mut sorted_indices: Vec<_> = (0..work.len()).collect();
         sorted_indices.sort_unstable_by(|first, second| {
             work[*second]
