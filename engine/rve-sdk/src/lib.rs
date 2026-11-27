@@ -412,6 +412,8 @@ pub trait Script: 'static {
     }
     /// Called when a message is delivered to this script.
     fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
+    /// Called when a named animation marker reaches this object's script.
+    fn on_animation_marker(&mut self, _ctx: &mut Context<'_>, _marker: &AnimationMarker) {}
     /// Called when this object begins touching another collider.
     fn on_collision_enter(
         &mut self,
@@ -897,6 +899,17 @@ pub struct CollisionContact {
     pub point: [f32; 3],
     /// Points from this script object's collider toward the other collider.
     pub normal: [f32; 3],
+}
+
+/// Owned animation marker data delivered by the script host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnimationMarker {
+    /// Marker name.
+    pub marker: String,
+    /// Motion that crossed the marker.
+    pub motion: String,
+    /// Clip containing the marker.
+    pub clip: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4244,16 +4257,17 @@ impl Ui<'_> {
 #[doc(hidden)]
 pub mod __private {
     use super::{
-        Canvas, CollisionContact, Context, Element, Object, Params, Script, UiEvent, ValueError,
-        ui_event_kind, ui_value_from_abi,
+        AnimationMarker, Canvas, CollisionContact, Context, Element, Object, Params, Script,
+        UiEvent, ValueError, ui_event_kind, ui_value_from_abi,
     };
     use crate::abi::{
         RVE_COLLISION_ENTER, RVE_COLLISION_EXIT, RVE_NET_EVENT_MESSAGE,
         RVE_NET_EVENT_PEER_CONNECTED, RVE_NET_EVENT_PEER_DISCONNECTED, RVE_PARAM_HAS_MAX,
         RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RVE_TRIGGER_STAY,
-        RveCollisionEvent, RveCollisionFn, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
-        RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc, RveParams, RveSetPropertyFn,
-        RveStartFn, RveStatus, RveStr, RveTimerFn, RveUiEvent, RveUiEventFn, RveUpdateFn, RveValue,
+        RveAnimationMarker, RveAnimationMarkerFn, RveCollisionEvent, RveCollisionFn, RveCommandFn,
+        RveCreateFn, RveDropFn, RveHost, RveMessageFn, RveNetEvent, RveNetEventFn, RveParamDesc,
+        RveParams, RveSetPropertyFn, RveStartFn, RveStatus, RveStr, RveTimerFn, RveUiEvent,
+        RveUiEventFn, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -4287,6 +4301,7 @@ pub mod __private {
         enable: RveStartFn,
         disable: RveStartFn,
         set_property: RveSetPropertyFn,
+        animation_marker: RveAnimationMarkerFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -4309,6 +4324,7 @@ pub mod __private {
             on_late_update: Some(late_update),
             on_timer: Some(timer),
             set_property: Some(set_property),
+            animation_marker: Some(animation_marker),
         }
     }
 
@@ -4479,6 +4495,49 @@ pub mod __private {
                 _ => return Err("unknown property callback phase".to_owned()),
             }
             Ok(())
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn animation_marker(
+        instance: *mut c_void,
+        host: *const RveHost,
+        event: *const RveAnimationMarker,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() || event.is_null() {
+            return report(
+                host,
+                "null animation-marker callback argument",
+                RveStatus::Error,
+            );
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: event strings and the event pointer are valid for this ABI callback.
+            let event = unsafe { &*event };
+            let marker = unsafe { event.marker.to_str() }
+                .map_err(|error| error.to_string())?
+                .to_owned();
+            let motion = unsafe { event.motion.to_str() }
+                .map_err(|error| error.to_string())?
+                .to_owned();
+            let clip = unsafe { event.clip.to_str() }
+                .map_err(|error| error.to_string())?
+                .to_owned();
+            let event = AnimationMarker {
+                marker,
+                motion,
+                clip,
+            };
+            // SAFETY: instance and host are valid for this synchronous ABI callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new_with_declared_properties(
+                unsafe { &*host },
+                &mut instance.properties,
+                &instance.declared_properties,
+            )?;
+            instance.script.on_animation_marker(&mut context, &event);
+            context.sync_script_properties(instance.script.as_ref())?;
+            context.commit()
         }));
         status_from_result(host, result)
     }
@@ -5259,6 +5318,14 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped name and value pointers.
             unsafe { $crate::__private::set_property(instance, host, name, value, phase) }
         }
+        unsafe extern "C" fn __rve_animation_marker(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            event: *const $crate::abi::RveAnimationMarker,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped event pointer.
+            unsafe { $crate::__private::animation_marker(instance, host, event) }
+        }
         unsafe extern "C" fn __rve_drop_instance(
             instance: *mut ::std::ffi::c_void,
         ) -> $crate::abi::RveStatus {
@@ -5283,6 +5350,7 @@ macro_rules! __rve_script_descriptor {
             __rve_enable,
             __rve_disable,
             __rve_set_property,
+            __rve_animation_marker,
             __RVE_PARAMS,
         )
     }};
