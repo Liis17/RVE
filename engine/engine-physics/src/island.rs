@@ -17,17 +17,23 @@ impl Island {
 }
 
 /// Строит острова по всем динамическим телам и collision-парам между ними.
+/// Если бодрствующих dynamic-тел нет, возвращает пустой список работы.
 /// Пары, связывающие dynamic со static или kinematic, принадлежат острову dynamic.
 pub(crate) fn build(
-    dynamic_bodies: impl IntoIterator<Item = BodyHandle>,
+    dynamic_bodies: impl IntoIterator<Item = (BodyHandle, bool)>,
     pairs: &BTreeMap<PairKey, ActivePair>,
 ) -> Vec<Island> {
-    let mut handles: Vec<_> = dynamic_bodies.into_iter().collect();
-    handles.sort_unstable();
-    handles.dedup();
-    if handles.is_empty() {
+    let mut handles = Vec::new();
+    let mut has_awake_body = false;
+    for (handle, is_awake) in dynamic_bodies {
+        handles.push(handle);
+        has_awake_body |= is_awake;
+    }
+    if !has_awake_body {
         return Vec::new();
     }
+    handles.sort_unstable();
+    handles.dedup();
 
     let indices: BTreeMap<_, _> = handles
         .iter()
@@ -158,7 +164,10 @@ mod tests {
     fn empty_and_isolated_dynamic_bodies_make_expected_islands() {
         assert!(build([], &BTreeMap::new()).is_empty());
 
-        let islands = build([BodyHandle(9), BodyHandle(2)], &BTreeMap::new());
+        let islands = build(
+            [(BodyHandle(9), true), (BodyHandle(2), true)],
+            &BTreeMap::new(),
+        );
         assert_eq!(
             body_handles(&islands),
             vec![vec![BodyHandle(2)], vec![BodyHandle(9)]]
@@ -172,7 +181,7 @@ mod tests {
             (2, 3, PairKind::Collision),
             (3, 4, PairKind::Collision),
         ]);
-        let islands = build((1..=4).map(BodyHandle), &contacts);
+        let islands = build((1..=4).map(|handle| (BodyHandle(handle), true)), &contacts);
         assert_eq!(
             body_handles(&islands),
             vec![(1..=4).map(BodyHandle).collect::<Vec<_>>()]
@@ -189,7 +198,9 @@ mod tests {
             (4, 5, PairKind::Collision),
         ]);
         let islands = build(
-            (1..=5).filter(|handle| *handle != 100).map(BodyHandle),
+            (1..=5)
+                .filter(|handle| *handle != 100)
+                .map(|handle| (BodyHandle(handle), true)),
             &contacts,
         );
         assert_eq!(
@@ -209,7 +220,7 @@ mod tests {
             (2, 60, PairKind::Collision),
             (1, 2, PairKind::Trigger),
         ]);
-        let islands = build([BodyHandle(2), BodyHandle(1)], &contacts);
+        let islands = build([(BodyHandle(2), true), (BodyHandle(1), true)], &contacts);
         assert_eq!(
             body_handles(&islands),
             vec![vec![BodyHandle(1)], vec![BodyHandle(2)]]
@@ -224,10 +235,35 @@ mod tests {
     #[test]
     fn sleeping_members_stay_in_the_island_and_awake_state_is_detected() {
         let contacts = pairs(&[(1, 2, PairKind::Collision)]);
-        let islands = build([BodyHandle(1), BodyHandle(2)], &contacts);
+        let islands = build([(BodyHandle(1), false), (BodyHandle(2), true)], &contacts);
         assert_eq!(islands[0].bodies, vec![BodyHandle(1), BodyHandle(2)]);
         assert!(!islands[0].has_awake_body(|_| false));
         assert!(islands[0].has_awake_body(|handle| handle == BodyHandle(2)));
+    }
+
+    #[test]
+    fn all_sleeping_dynamic_bodies_produce_no_islands() {
+        let contacts = pairs(&[(1, 2, PairKind::Collision)]);
+        let islands = build([(BodyHandle(1), false), (BodyHandle(2), false)], &contacts);
+        assert!(islands.is_empty());
+    }
+
+    #[test]
+    fn awake_island_keeps_separate_fully_sleeping_islands_in_the_partition() {
+        let contacts = pairs(&[(2, 3, PairKind::Collision)]);
+        let islands = build(
+            [
+                (BodyHandle(1), true),
+                (BodyHandle(2), false),
+                (BodyHandle(3), false),
+            ],
+            &contacts,
+        );
+        assert_eq!(
+            body_handles(&islands),
+            vec![vec![BodyHandle(1)], vec![BodyHandle(2), BodyHandle(3)]]
+        );
+        assert!(!islands[1].has_awake_body(|handle| handle == BodyHandle(1)));
     }
 
     #[test]
@@ -242,8 +278,14 @@ mod tests {
             (1, 2, PairKind::Collision),
             (8, 9, PairKind::Collision),
         ]);
-        let first = build([9, 8, 3, 2, 1].map(BodyHandle), &first_pairs);
-        let second = build([1, 2, 3, 8, 9].map(BodyHandle), &second_pairs);
+        let first = build(
+            [9, 8, 3, 2, 1].map(|handle| (BodyHandle(handle), true)),
+            &first_pairs,
+        );
+        let second = build(
+            [1, 2, 3, 8, 9].map(|handle| (BodyHandle(handle), true)),
+            &second_pairs,
+        );
         assert_eq!(first, second);
         assert_eq!(first[0].pairs, vec![PairKey::new(1, 2), PairKey::new(2, 3)]);
     }

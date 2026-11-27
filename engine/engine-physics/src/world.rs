@@ -754,7 +754,7 @@ impl PhysicsWorld {
             self.bodies
                 .values()
                 .filter(|body| body.kind == BodyKind::Dynamic)
-                .map(|body| body.handle),
+                .map(|body| (body.handle, !body.sleeping)),
             &self.active_pairs,
         );
         #[cfg(test)]
@@ -1260,6 +1260,10 @@ impl PhysicsWorld {
     /// Засыпание островами: остров — компонента контактов между динамическими телами. Он засыпает
     /// целиком, когда каждое тело успокоилось и ни одно не касается движущегося kinematic.
     fn update_sleep(&mut self, dt: f32, islands: &[crate::island::Island]) {
+        if islands.is_empty() {
+            return;
+        }
+
         for body in self.bodies.values_mut() {
             if body.kind != BodyKind::Dynamic || body.sleeping {
                 continue;
@@ -4506,7 +4510,7 @@ mod parallel_solver_tests {
                 .bodies
                 .values()
                 .filter(|body| body.kind == BodyKind::Dynamic)
-                .map(|body| body.handle),
+                .map(|body| (body.handle, !body.sleeping)),
             &world.active_pairs,
         )
         .iter()
@@ -4794,7 +4798,7 @@ mod parallel_solver_tests {
                             .bodies
                             .values()
                             .filter(|body| body.kind == BodyKind::Dynamic)
-                            .map(|body| body.handle),
+                            .map(|body| (body.handle, !body.sleeping)),
                         &candidate.active_pairs,
                     )
                     .iter()

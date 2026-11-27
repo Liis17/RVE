@@ -333,6 +333,10 @@ pub(crate) fn solve(
     threads: NonZeroUsize,
     parallel_min_constraints: usize,
 ) -> bool {
+    if islands.is_empty() {
+        return false;
+    }
+
     let mut work = Vec::new();
     let mut total_constraints = 0;
     for (order, island) in islands.iter().enumerate() {
