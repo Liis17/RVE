@@ -8,11 +8,13 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 const CACHE_MAGIC: &[u8; 8] = b"RVEMCACH";
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CACHE_HEADER_BYTES: usize = 8 + 4 + 32 + 8 + 32;
-const MODEL_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MODEL_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+const STALE_MODEL_CACHE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 const UFBX_VERSION: &str = "0.11.5";
 const MIKKTSPACE_VERSION: &str = "1.0.0";
 const CACHE_KEY_CONTEXT: &str = "RVE rve-build prepared model cache key v1";
@@ -135,56 +137,105 @@ pub(crate) fn model_cache_dir(project_dir: &Path) -> PathBuf {
 }
 
 /// Удаляет старые записи модели после успешной упаковки, не затрагивая временные и чужие файлы.
-pub(crate) fn prune_model_cache(project_dir: &Path) -> io::Result<()> {
-    let root = model_cache_dir(project_dir);
-    let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+pub(crate) fn prune_model_cache(project_dir: &Path, max_bytes: u64) -> io::Result<()> {
+    prune_cache_at(&model_cache_dir(project_dir), max_bytes, |path| {
+        fs::remove_file(path)
+    })
+}
+
+fn prune_cache_at(
+    root: &Path,
+    max_bytes: u64,
+    mut remove_file: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let Some(entries) = read_dir_if_exists(root)? else {
+        return Ok(());
     };
+    let now = SystemTime::now();
     let mut records = Vec::new();
     let mut total = 0_u64;
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let directory = entry.path();
-        if !is_hex_name(&entry.file_name().to_string_lossy(), 2) {
+        let shard = entry.file_name();
+        let shard = shard.to_string_lossy();
+        if !is_hex_name(&shard, 2) {
             continue;
         }
-        let metadata = fs::symlink_metadata(&directory)?;
+        let Some(metadata) = symlink_metadata_if_exists(&directory)? else {
+            continue;
+        };
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             continue;
         }
-        let nested = fs::read_dir(directory)?;
+        let Some(nested) = read_dir_if_exists(&directory)? else {
+            continue;
+        };
         for nested_entry in nested {
-            let nested_entry = nested_entry?;
+            let nested_entry = match nested_entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             let name = nested_entry.file_name();
-            if !is_cache_filename(&name.to_string_lossy()) {
-                continue;
-            }
             let path = nested_entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
+            let name = name.to_string_lossy();
+            let Some(metadata) = symlink_metadata_if_exists(&path)? else {
+                continue;
+            };
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 continue;
             }
-            let modified = metadata
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            total = total.saturating_add(metadata.len());
-            records.push((modified, metadata.len(), path));
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if is_cache_filename(&name) {
+                total = total.saturating_add(metadata.len());
+                records.push((modified, metadata.len(), path));
+            } else if is_cache_temp_filename(&name)
+                && now
+                    .duration_since(modified)
+                    .is_ok_and(|age| age >= STALE_MODEL_CACHE_TEMP_AGE)
+            {
+                let _ = remove_file(&path);
+            }
         }
     }
-    if total <= MODEL_CACHE_LIMIT_BYTES {
+    if total <= max_bytes {
         return Ok(());
     }
     records.sort_by_key(|(modified, _, _)| *modified);
     for (_, size, path) in records {
-        if total <= MODEL_CACHE_LIMIT_BYTES {
+        if total <= max_bytes {
             break;
         }
-        fs::remove_file(path)?;
-        total = total.saturating_sub(size);
+        match remove_file(&path) {
+            Ok(()) => total = total.saturating_sub(size),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                total = total.saturating_sub(size);
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
+}
+
+fn read_dir_if_exists(path: &Path) -> io::Result<Option<fs::ReadDir>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn symlink_metadata_if_exists(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 struct ModelCache {
@@ -286,15 +337,7 @@ impl ModelCache {
             file.write_all(blake3::hash(payload).as_bytes())?;
             file.write_all(payload)?;
             file.sync_all()?;
-            match fs::rename(&temp, path) {
-                Ok(()) => Ok(()),
-                Err(error) if path.exists() => {
-                    // Some platforms do not replace an existing file on rename.
-                    fs::remove_file(path)?;
-                    fs::rename(&temp, path).map_err(|_| error)
-                }
-                Err(error) => Err(error),
-            }
+            fs::rename(&temp, path)
         })();
         if result.is_err() {
             let _ = fs::remove_file(temp);
@@ -413,6 +456,23 @@ fn is_cache_filename(name: &str) -> bool {
         .is_some_and(|key| is_hex_name(key, 64))
 }
 
+fn is_cache_temp_filename(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((key, suffix)) = name.split_once(".tmp-") else {
+        return false;
+    };
+    let Some((process, counter)) = suffix.split_once('-') else {
+        return false;
+    };
+    is_hex_name(key, 64)
+        && !process.is_empty()
+        && !counter.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn is_hex_name(name: &str, length: usize) -> bool {
     name.len() == length && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -421,10 +481,12 @@ fn is_hex_name(name: &str, length: usize) -> bool {
 mod tests {
     use super::{
         CACHE_HEADER_BYTES, CACHE_MAGIC, CACHE_SCHEMA_VERSION, MIKKTSPACE_VERSION, ModelCache,
-        UFBX_VERSION, cache_key, decode_cache_record, model_cache_dir,
+        STALE_MODEL_CACHE_TEMP_AGE, UFBX_VERSION, cache_key, decode_cache_record,
+        is_cache_temp_filename, model_cache_dir, prune_cache_at, prune_model_cache,
     };
     use engine_assets::{Assets, PREBUILT_MODEL_MAX_BYTES};
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::time::{Duration, SystemTime};
 
     const FIXTURE: &[u8] =
         include_bytes!("../../../engine/engine-assets/tests/fixtures/skin_chain.fbx");
@@ -529,6 +591,115 @@ mod tests {
         let (bytes, outcome) = cache.prepare(&assets, "/models/skin.fbx", FIXTURE).unwrap();
         assert_eq!(outcome, super::CacheOutcome::Miss);
         assert!(engine_assets::is_prebuilt_model(&bytes));
+    }
+
+    #[test]
+    fn model_cache_prune_evicts_oldest_entries_and_cleans_only_stale_temps() {
+        let root = temp_dir("rve-model-cache-prune");
+        let cache_root = model_cache_dir(root.path());
+        let shard = cache_root.join("aa");
+        fs::create_dir_all(&shard).unwrap();
+        let oldest = shard.join(format!("{}.rvemodel", "a".repeat(64)));
+        let newest = shard.join(format!("{}.rvemodel", "b".repeat(64)));
+        fs::write(&oldest, b"old").unwrap();
+        fs::write(&newest, b"new").unwrap();
+        let base = SystemTime::now() - Duration::from_secs(10_000);
+        for (path, time) in [(&oldest, base), (&newest, base + Duration::from_secs(10))] {
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        }
+
+        let stale_temp = shard.join(format!(".{}.tmp-123-1", "c".repeat(64)));
+        fs::write(&stale_temp, b"stale partial").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&stale_temp)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_MODEL_CACHE_TEMP_AGE * 2)
+            .unwrap();
+        let fresh_temp = shard.join(format!(".{}.tmp-123-2", "d".repeat(64)));
+        fs::write(&fresh_temp, b"writer in progress").unwrap();
+        let foreign_temp = shard.join(format!(".{}.tmp-foreign", "e".repeat(64)));
+        fs::write(&foreign_temp, b"foreign file").unwrap();
+        let foreign = cache_root.join("notes.txt");
+        fs::write(&foreign, b"foreign data larger than cache limit").unwrap();
+
+        assert!(is_cache_temp_filename(
+            stale_temp.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(!is_cache_temp_filename(
+            foreign_temp.file_name().unwrap().to_str().unwrap()
+        ));
+        prune_cache_at(&cache_root, 3, |path| fs::remove_file(path)).unwrap();
+
+        assert!(!oldest.exists());
+        assert!(newest.exists());
+        assert!(!stale_temp.exists());
+        assert!(fresh_temp.exists());
+        assert!(foreign_temp.exists());
+        assert!(foreign.exists());
+    }
+
+    #[test]
+    fn model_cache_prune_ignores_not_found_during_walk_and_eviction() {
+        let root = temp_dir("rve-model-cache-prune-not-found");
+        let cache_root = model_cache_dir(root.path());
+        let shard = cache_root.join("aa");
+        fs::create_dir_all(&shard).unwrap();
+        let first = shard.join(format!("{}.rvemodel", "a".repeat(64)));
+        let second = shard.join(format!("{}.rvemodel", "b".repeat(64)));
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        assert!(
+            super::read_dir_if_exists(&cache_root.join("missing"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::symlink_metadata_if_exists(&shard.join("missing"))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut removed_before_race = false;
+        prune_cache_at(&cache_root, 0, |path| {
+            if !removed_before_race {
+                removed_before_race = true;
+                fs::remove_file(path)?;
+            }
+            fs::remove_file(path)
+        })
+        .unwrap();
+        assert!(!first.exists());
+        assert!(!second.exists());
+
+        prune_model_cache(root.path(), 0).unwrap();
+        assert!(prune_model_cache(&root.path().join("missing-project"), 0).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_cache_prune_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("rve-model-cache-prune-symlink");
+        let cache_root = model_cache_dir(root.path());
+        let shard = cache_root.join("aa");
+        fs::create_dir_all(&shard).unwrap();
+        let target = root.path().join("target");
+        fs::write(&target, b"target").unwrap();
+        let link = shard.join(format!("{}.rvemodel", "a".repeat(64)));
+        symlink(&target, &link).unwrap();
+
+        prune_cache_at(&cache_root, 0, |path| fs::remove_file(path)).unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"target");
     }
 
     #[test]

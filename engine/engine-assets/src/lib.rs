@@ -8,7 +8,8 @@ mod prebuilt;
 mod skin;
 
 pub use animation::{ModelAnimation, ModelKey, ModelTrack};
-pub use prebuilt::{PREBUILT_MODEL_MAX_BYTES, PREBUILT_MODEL_VERSION};
+/// Возвращает `true`, если байты начинаются с сигнатуры готовой модели.
+pub use prebuilt::{PREBUILT_MODEL_MAX_BYTES, PREBUILT_MODEL_VERSION, is_prebuilt_model};
 pub use skin::{ModelInheritMode, ModelJoint, ModelNode, ModelSkeleton, ModelSkin, ModelTransform};
 
 #[cfg(feature = "fbx")]
@@ -18,14 +19,9 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Возвращает `true`, если байты начинаются с сигнатуры готовой модели.
-pub fn is_prebuilt_model(bytes: &[u8]) -> bool {
-    prebuilt::is_prebuilt_model(bytes)
-}
 
 /// Версия крейта (SemVer).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -149,19 +145,26 @@ pub struct Model {
 impl Model {
     /// Минимальный и максимальный углы bounding box всех вершин.
     pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
-        let mut positions = self
-            .meshes
-            .iter()
-            .flat_map(|mesh| &mesh.vertices)
-            .map(|vertex| vertex.position);
-        let first = positions.next()?;
-        Some(positions.fold((first, first), |(min, max), position| {
-            (
-                std::array::from_fn(|axis| min[axis].min(position[axis])),
-                std::array::from_fn(|axis| max[axis].max(position[axis])),
-            )
-        }))
+        bounds_from_positions(
+            self.meshes
+                .iter()
+                .flat_map(|mesh| &mesh.vertices)
+                .map(|vertex| vertex.position),
+        )
     }
+}
+
+fn bounds_from_positions(
+    positions: impl IntoIterator<Item = [f32; 3]>,
+) -> Option<([f32; 3], [f32; 3])> {
+    let mut positions = positions.into_iter();
+    let first = positions.next()?;
+    Some(positions.fold((first, first), |(min, max), position| {
+        (
+            std::array::from_fn(|axis| min[axis].min(position[axis])),
+            std::array::from_fn(|axis| max[axis].max(position[axis])),
+        )
+    }))
 }
 
 /// Ошибка поиска или загрузки ресурса.
@@ -367,7 +370,6 @@ impl Assets {
     ) -> Result<Vec<u8>, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
-        ensure_model_size(bytes.len() as u64, &path)?;
         let virtual_path = virtual_asset_path(asset_path);
         let scene = load_fbx_scene(bytes, &virtual_path, &path)?;
         let mut meshes = Vec::new();
@@ -480,7 +482,7 @@ impl Assets {
     ) -> Result<Vec<String>, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
-        ensure_model_size(bytes.len() as u64, &path)?;
+        ensure_model_data_size(bytes, &path, PREBUILT_MODEL_MAX_BYTES)?;
         if prebuilt::is_prebuilt_model(bytes) {
             let model = decode_prebuilt(bytes, &path)?;
             if model.meshes.is_none() {
@@ -585,8 +587,43 @@ impl Assets {
 
     fn read_model_asset(&self, asset_path: &str, path: &Path) -> Result<Vec<u8>, AssetError> {
         let stat = self.stat_asset(asset_path, path)?;
-        ensure_model_size(stat.size, path)?;
-        self.read_asset(asset_path, path)
+        if stat.size > PREBUILT_MODEL_MAX_BYTES as u64 {
+            let prefix = self.read_asset_prefix(
+                asset_path,
+                path,
+                stat.size.min(prebuilt::MAGIC.len() as u64),
+            )?;
+            ensure_model_size_if_prebuilt(stat.size, &prefix, path, PREBUILT_MODEL_MAX_BYTES)?;
+        }
+        let bytes = self.read_asset(asset_path, path)?;
+        ensure_model_data_size(&bytes, path, PREBUILT_MODEL_MAX_BYTES)?;
+        Ok(bytes)
+    }
+
+    fn read_asset_prefix(
+        &self,
+        asset_path: &str,
+        path: &Path,
+        length: u64,
+    ) -> Result<Vec<u8>, AssetError> {
+        if let Some(resources) = &self.resources {
+            let request = resources
+                .read_range(asset_path, 0..length)
+                .map_err(|error| map_resource_error(path, error))?;
+            return request
+                .wait()
+                .map_err(|error| map_resource_error(path, error));
+        }
+        let path = legacy_path(&self.root, path)?;
+        let file = fs::File::open(&path).map_err(|error| AssetError::Io {
+            path: path.clone(),
+            error,
+        })?;
+        let mut prefix = Vec::new();
+        file.take(length)
+            .read_to_end(&mut prefix)
+            .map_err(|error| AssetError::Io { path, error })?;
+        Ok(prefix)
     }
 
     fn stat_asset(&self, asset_path: &str, path: &Path) -> Result<ResourceStat, AssetError> {
@@ -615,12 +652,34 @@ impl Assets {
     }
 }
 
-fn ensure_model_size(size: u64, path: &Path) -> Result<(), AssetError> {
-    if size > PREBUILT_MODEL_MAX_BYTES as u64 {
+fn ensure_model_size(size: u64, path: &Path, limit: usize) -> Result<(), AssetError> {
+    if size > limit as u64 {
         return Err(AssetError::Decode {
             path: path.to_owned(),
-            message: "FBX или готовая модель превышает предел размера 256 MiB".to_owned(),
+            message: format!(
+                "готовая модель превышает предел размера {} MiB",
+                limit / (1024 * 1024)
+            ),
         });
+    }
+    Ok(())
+}
+
+fn ensure_model_size_if_prebuilt(
+    size: u64,
+    prefix: &[u8],
+    path: &Path,
+    limit: usize,
+) -> Result<(), AssetError> {
+    if prebuilt::is_prebuilt_model(prefix) {
+        ensure_model_size(size, path, limit)?;
+    }
+    Ok(())
+}
+
+fn ensure_model_data_size(bytes: &[u8], path: &Path, limit: usize) -> Result<(), AssetError> {
+    if prebuilt::is_prebuilt_model(bytes) {
+        ensure_model_size(bytes.len() as u64, path, limit)?;
     }
     Ok(())
 }
@@ -1063,6 +1122,19 @@ fn check_cancel(cancel: &AtomicBool, path: &Path) -> Result<(), AssetError> {
     }
 }
 
+fn for_each_cancellable<T>(
+    items: impl IntoIterator<Item = T>,
+    cancel: &AtomicBool,
+    path: &Path,
+    mut visit: impl FnMut(T) -> Result<(), AssetError>,
+) -> Result<(), AssetError> {
+    for item in items {
+        check_cancel(cancel, path)?;
+        visit(item)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "fbx")]
 fn load_fbx(
     bytes: &[u8],
@@ -1326,8 +1398,7 @@ fn load_prebuilt_model(
             texture_cache: &mut texture_cache,
             cancel,
         };
-        for mesh in meshes {
-            check_cancel(cancel, path)?;
+        for_each_cancellable(meshes, cancel, path, |mesh| {
             let material =
                 material_loader.load_material(&mesh.material, &prepared.texture_references)?;
             material_loader.model.meshes.push(ModelMesh {
@@ -1336,7 +1407,8 @@ fn load_prebuilt_model(
                 material,
                 skin: mesh.skin,
             });
-        }
+            Ok(())
+        })?;
     }
     Ok(model)
 }
@@ -1353,29 +1425,15 @@ fn prebuilt_dependencies(
     let mut dependencies = Vec::new();
     let mut seen_sources = HashSet::new();
     for mesh in meshes {
-        for source in [
-            mesh.material.base_color_source,
-            mesh.material.normal_source,
-            mesh.material.roughness_source,
-            mesh.material.metalness_source,
-            mesh.material.emissive_source,
-            mesh.material.occlusion_source,
-            mesh.material
-                .opacity_source
-                .as_ref()
-                .map(|opacity| opacity.source),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for source in mesh.material.sources() {
             if !seen_sources.insert(source) {
                 continue;
             }
             let Some(prebuilt::TextureReference::External {
-                name,
                 filename,
                 relative_filename,
                 absolute_filename,
+                ..
             }) = prepared.texture_references.get(source)
             else {
                 continue;
@@ -1387,7 +1445,6 @@ fn prebuilt_dependencies(
                     assets,
                 },
                 ExternalTextureSource {
-                    name,
                     filename,
                     relative_filename,
                     absolute_filename,
@@ -1679,12 +1736,17 @@ fn material_recipe(
     sources: &mut prebuilt::TextureSources,
 ) -> Result<prebuilt::MaterialRecipe, &'static str> {
     let textures = material_textures(material)?;
-    let mut ids = [None; 7];
-    for (index, texture) in textures.all().into_iter().enumerate() {
-        ids[index] = texture.map(|texture| sources.intern(texture));
-    }
+    let ids = MaterialTextureIds {
+        base_color: textures.base_color.map(|texture| sources.intern(texture)),
+        normal: textures.normal.map(|texture| sources.intern(texture)),
+        roughness: textures.roughness.map(|texture| sources.intern(texture)),
+        metalness: textures.metalness.map(|texture| sources.intern(texture)),
+        emissive: textures.emissive.map(|texture| sources.intern(texture)),
+        occlusion: textures.occlusion.map(|texture| sources.intern(texture)),
+        opacity: textures.opacity.map(|(texture, _)| sources.intern(texture)),
+    };
     let has_metallic_roughness = supports_metallic_roughness(material.shader_type);
-    let base_color = if ids[0].is_some() {
+    let base_color = if ids.base_color.is_some() {
         [1.0; 3]
     } else if material.pbr.base_color.has_value {
         map_vec3(&material.pbr.base_color)
@@ -1713,14 +1775,16 @@ fn material_recipe(
         base_color,
         metallic: if !has_metallic_roughness {
             0.0
-        } else if ids[3].is_some() {
+        } else if ids.metalness.is_some() {
             1.0
         } else if material.pbr.metalness.has_value {
             map_scalar(&material.pbr.metalness)
         } else {
             0.0
         },
-        roughness: if has_metallic_roughness && ids[2].is_none() && material.pbr.roughness.has_value
+        roughness: if has_metallic_roughness
+            && ids.roughness.is_none()
+            && material.pbr.roughness.has_value
         {
             map_scalar(&material.pbr.roughness)
         } else {
@@ -1734,18 +1798,29 @@ fn material_recipe(
         } else {
             1.0
         },
-        base_color_source: ids[0],
-        normal_source: ids[1],
-        roughness_source: ids[2],
-        metalness_source: ids[3],
-        emissive_source: ids[4],
-        occlusion_source: ids[5],
+        base_color_source: ids.base_color,
+        normal_source: ids.normal,
+        roughness_source: ids.roughness,
+        metalness_source: ids.metalness,
+        emissive_source: ids.emissive,
+        occlusion_source: ids.occlusion,
         opacity_source: textures.opacity.map(|(_, invert)| prebuilt::OpacityRecipe {
-            source: ids[6].expect("opacity texture has a source"),
+            source: ids.opacity.expect("opacity texture has a source"),
             invert,
             transparency_scale,
         }),
     })
+}
+
+#[cfg(feature = "fbx")]
+struct MaterialTextureIds {
+    base_color: Option<usize>,
+    normal: Option<usize>,
+    roughness: Option<usize>,
+    metalness: Option<usize>,
+    emissive: Option<usize>,
+    occlusion: Option<usize>,
+    opacity: Option<usize>,
 }
 
 #[cfg(feature = "fbx")]
@@ -2124,7 +2199,6 @@ struct TextureResolveContext<'a> {
 }
 
 struct ExternalTextureSource<'a> {
-    name: &'a str,
     filename: &'a str,
     relative_filename: &'a str,
     absolute_filename: &'a str,
@@ -2144,10 +2218,10 @@ fn load_texture_reference(
             })
         }
         prebuilt::TextureReference::External {
-            name,
             filename,
             relative_filename,
             absolute_filename,
+            ..
         } => resolve_external_texture_source(
             &TextureResolveContext {
                 model_virtual_path,
@@ -2155,7 +2229,6 @@ fn load_texture_reference(
                 assets,
             },
             ExternalTextureSource {
-                name,
                 filename,
                 relative_filename,
                 absolute_filename,
@@ -2186,7 +2259,6 @@ fn resolve_external_texture<T>(
             assets,
         },
         ExternalTextureSource {
-            name: texture.element.name.as_ref(),
             filename: texture.filename.as_ref(),
             relative_filename: texture.relative_filename.as_ref(),
             absolute_filename: texture.absolute_filename.as_ref(),
@@ -2232,7 +2304,7 @@ fn resolve_external_texture_source<T>(
     ]
     .into_iter()
     .find(|candidate| !candidate.is_empty())
-    .unwrap_or(source.name)
+    .unwrap_or_default()
     .to_owned();
     Err(AssetError::MissingTexture {
         model: context.model_path.to_owned(),
@@ -2330,9 +2402,11 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, HdrImageData, Model, ModelMaterial, ModelMesh, ModelVertex,
-        TextureData, decode_hdr, decode_png, is_missing_texture_candidate, map_resource_error,
-        pack_metallic_roughness, texture_candidates,
+        AssetError, Assets, ExternalTextureSource, HdrImageData, Model, ModelMaterial, ModelMesh,
+        ModelVertex, TextureData, TextureResolveContext, decode_hdr, decode_png,
+        ensure_model_data_size, ensure_model_size_if_prebuilt, for_each_cancellable,
+        is_missing_texture_candidate, map_resource_error, pack_metallic_roughness,
+        resolve_external_texture_source, texture_candidates,
     };
     #[cfg(feature = "fbx")]
     use super::{
@@ -4761,5 +4835,88 @@ mod tests {
             animations: Vec::new(),
         };
         assert_eq!(empty.bounds(), None);
+    }
+
+    #[test]
+    fn source_fbx_is_not_subject_to_the_prebuilt_model_size_limit() {
+        let path = Path::new("/model/large.fbx");
+        assert!(ensure_model_size_if_prebuilt(1024, b"source FBX", path, 0).is_ok());
+        assert!(ensure_model_data_size(b"source FBX", path, 0).is_ok());
+        assert!(matches!(
+            ensure_model_size_if_prebuilt(1024, b"RVEMODEL", path, 0),
+            Err(AssetError::Decode { .. })
+        ));
+        assert!(matches!(
+            ensure_model_data_size(b"RVEMODEL", path, 0),
+            Err(AssetError::Decode { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_texture_without_filename_keeps_an_empty_error_name() {
+        let temp = TempAssets::new("missing-texture-name");
+        let assets = temp.assets();
+        let error = resolve_external_texture_source(
+            &TextureResolveContext {
+                model_virtual_path: "/model/test.fbx",
+                model_path: Path::new("test.fbx"),
+                assets: &assets,
+            },
+            ExternalTextureSource {
+                filename: "",
+                relative_filename: "",
+                absolute_filename: "",
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AssetError::MissingTexture { ref texture, .. } if texture.is_empty()
+        ));
+    }
+
+    #[test]
+    fn cancellation_is_checked_between_prebuilt_parts_and_before_textures() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let path = Path::new("ready.fbx");
+        let cancel = AtomicBool::new(false);
+        let mut visited = Vec::new();
+        let error = for_each_cancellable([0, 1], &cancel, path, |part| {
+            visited.push(part);
+            if part == 0 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(visited, [0]);
+        assert!(matches!(error, AssetError::Cancelled { .. }));
+
+        let temp = TempAssets::new("prebuilt-texture-cancel");
+        let assets = temp.assets();
+        let cancel = AtomicBool::new(true);
+        let mut model = Model {
+            meshes: Vec::new(),
+            textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
+        };
+        let mut texture_cache = super::ModelTextureCache::default();
+        let mut loader = super::ModelMaterialLoader {
+            model_virtual_path: "/model/ready.fbx",
+            model_path: path,
+            assets: &assets,
+            model: &mut model,
+            texture_cache: &mut texture_cache,
+            cancel: &cancel,
+        };
+        let references = [super::prebuilt::TextureReference::Embedded {
+            name: "texture.png".to_owned(),
+            png: Vec::new(),
+        }];
+        let error = loader.load_texture(0, &references).unwrap_err();
+        assert!(matches!(error, AssetError::Cancelled { .. }));
     }
 }

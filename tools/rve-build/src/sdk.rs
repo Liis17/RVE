@@ -122,9 +122,16 @@ fn validate_sdk_manifest(
         )));
     }
     if require_prebuilt_models && manifest.prebuilt_model_version != PREBUILT_MODEL_VERSION {
+        let sdk_model_format = if manifest.prebuilt_model_version == 0 {
+            "маркер SDK не содержит версию формата готовой модели".to_owned()
+        } else {
+            format!(
+                "SDK player читает готовые модели формата v{}",
+                manifest.prebuilt_model_version
+            )
+        };
         return Err(BuildError::operational(format!(
-            "SDK player не читает готовые модели формата v{}; обновите SDK",
-            manifest.prebuilt_model_version
+            "{sdk_model_format}; rve-build требует формат v{PREBUILT_MODEL_VERSION}; обновите SDK"
         )));
     }
     Ok(())
@@ -195,10 +202,10 @@ pub(crate) fn build_sdk(
     let checkout = checkout_player_for_sdk(location)?;
     let rve_player = checkout.executable;
     let rve_crash_monitor = checkout.crash_monitor;
-    let rve_player_dev = player::build_sdk_binary("rve-player", false, dlss_enabled)?;
-    let rve_server = player::build_sdk_binary("rve-server", true, false)?;
-    let rve_editor = player::build_sdk_binary("rve-editor", false, false)?;
-    let rve_build = player::build_sdk_binary("rve-build", false, false)?;
+    let rve_player_dev = player::build_sdk_binary("rve-player", false, dlss_enabled, false)?;
+    let rve_server = player::build_sdk_binary("rve-server", true, false, true)?;
+    let rve_editor = player::build_sdk_binary("rve-editor", false, false, false)?;
+    let rve_build = player::build_sdk_binary("rve-build", false, false, false)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -652,7 +659,12 @@ mod tests {
             panic!("checkout must not be used")
         })
         .unwrap_err();
-        assert!(error.to_string().contains("готовые модели формата v0"));
+        let message = error.to_string();
+        assert!(message.contains("не содержит версию формата готовой модели"));
+        assert!(message.contains(&format!(
+            "rve-build требует формат v{PREBUILT_MODEL_VERSION}"
+        )));
+        assert!(message.contains("обновите SDK"));
     }
 
     #[test]
@@ -668,10 +680,15 @@ mod tests {
             panic!("checkout must not be used")
         })
         .unwrap_err();
-        assert!(error.to_string().contains(&format!(
-            "готовые модели формата v{}",
+        let message = error.to_string();
+        assert!(message.contains(&format!(
+            "SDK player читает готовые модели формата v{}",
             PREBUILT_MODEL_VERSION + 1
         )));
+        assert!(message.contains(&format!(
+            "rve-build требует формат v{PREBUILT_MODEL_VERSION}"
+        )));
+        assert!(message.contains("обновите SDK"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::error::BuildError;
-use crate::models::{ModelPreparationMode, prune_model_cache};
+use crate::models::{MODEL_CACHE_LIMIT_BYTES, ModelPreparationMode, prune_model_cache};
 use crate::project::ProjectBuild;
 use crate::temporary::TempDir;
 use engine_files::VirtualPath;
@@ -72,7 +72,6 @@ pub(crate) fn build_project_archives(
     compression: BuildCompression,
     cache: Option<&mut BlockCache>,
 ) -> Result<ArchiveSetRegistry, BuildError> {
-    let _prepared_model_temp = project.prepared_model_temp.as_ref();
     let registry = validate_project_archives(project)?;
     let [project_settings_path, registry_path, prefabs_path] = reserved_paths();
 
@@ -193,7 +192,7 @@ pub(crate) fn build_project_archives(
         .map_err(|error| BuildError::operational(format!("не удалось собрать архивы: {error}")))?;
 
     if project.model_preparation_mode == ModelPreparationMode::Build
-        && let Err(error) = prune_model_cache(&project.project_dir)
+        && let Err(error) = prune_model_cache(&project.project_dir, MODEL_CACHE_LIMIT_BYTES)
     {
         eprintln!(
             "предупреждение: не удалось ограничить размер кеша готовых моделей {}: {error}",

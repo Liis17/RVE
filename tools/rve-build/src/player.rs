@@ -785,8 +785,8 @@ pub(crate) fn build_sdk_player(
     distribution: bool,
     dlss: bool,
 ) -> Result<sdk::CheckoutPlayer, BuildError> {
-    let executable = build_sdk_binary("rve-player", distribution, dlss)?;
-    let crash_monitor = build_sdk_binary(CRASH_MONITOR_PACKAGE, false, false)?;
+    let executable = build_sdk_binary("rve-player", distribution, dlss, false)?;
+    let crash_monitor = build_sdk_binary(CRASH_MONITOR_PACKAGE, false, false, false)?;
     Ok(sdk::CheckoutPlayer {
         executable,
         crash_monitor,
@@ -837,8 +837,9 @@ pub(crate) fn build_sdk_binary(
     package: &str,
     distribution_player: bool,
     dlss: bool,
+    fbx: bool,
 ) -> Result<PathBuf, BuildError> {
-    let mut command = sdk_build_command(package, distribution_player, dlss)?;
+    let mut command = sdk_build_command(package, distribution_player, dlss, fbx)?;
     let stdout = run_cargo(&mut command, "SDK build", CargoFailure::Operational)?;
     let artifact =
         parse_cargo_output(&stdout, package, "bin", None).map_err(BuildError::operational)?;
@@ -852,6 +853,7 @@ fn sdk_build_command(
     package: &str,
     distribution_player: bool,
     dlss: bool,
+    fbx: bool,
 ) -> Result<Command, BuildError> {
     let root = repo_root()?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
@@ -881,6 +883,9 @@ fn sdk_build_command(
     }
     if dlss {
         features.push(format!("{package}/dlss"));
+    }
+    if fbx {
+        features.push(format!("{package}/fbx"));
     }
     if !features.is_empty() {
         command.args(["--features", &features.join(",")]);
@@ -1239,7 +1244,7 @@ mod tests {
     };
     use crate::archives::tests::create_demo_like_project;
     use crate::error::BuildError;
-    use crate::project::{HeavyScriptUse, ProjectBuild, ScriptReferenceContext};
+    use crate::project::{HeavyScriptUse, ProjectBuild, ScriptReferenceContext, prepare_project};
     use crate::sdk;
     use crate::temporary::TempDir;
     use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
@@ -1383,7 +1388,7 @@ mod tests {
     fn sdk_player_builds_preserve_dlss_and_distribution_settings() {
         for distribution in [false, true] {
             for dlss in [false, true] {
-                let command = sdk_build_command("rve-player", distribution, dlss).unwrap();
+                let command = sdk_build_command("rve-player", distribution, dlss, false).unwrap();
                 let arguments: Vec<_> = command
                     .get_args()
                     .map(|arg| arg.to_str().unwrap())
@@ -1419,6 +1424,15 @@ mod tests {
                 }
             }
         }
+
+        let server = sdk_build_command("rve-server", true, false, true).unwrap();
+        let arguments: Vec<_> = server.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        let features = arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--features")
+            .map(|pair| pair[1]);
+        assert_eq!(features, Some("rve-server/crash-dumps,rve-server/fbx"));
+        assert!(arguments.contains(&"--no-default-features"));
     }
 
     #[test]
@@ -1591,21 +1605,80 @@ mod tests {
             #[cfg(windows)]
             icon: None,
             heavy_scripts: Vec::new(),
-            prepared_model_temp: None,
+            _prepared_model_temp: None,
             model_preparation_mode: crate::models::ModelPreparationMode::Direct,
         }
     }
 
     #[test]
-    fn scripts_keeps_direct_fbx_path_without_writing_the_model_cache() {
+    fn run_preparation_and_scripts_skip_conversion_of_an_unbakeable_fbx() {
         let root = TempDir::create(&std::env::temp_dir(), "rve-scripts-direct-fbx").unwrap();
         create_demo_like_project(root.path());
+        let bytes = fbx_with_too_many_clip_keys();
+        let assets = engine_assets::Assets::new(root.path().join("Assets"));
+        assert!(
+            assets
+                .model_dependencies_from_bytes("/models/shared.fbx", &bytes)
+                .unwrap()
+                .is_empty()
+        );
+        let conversion_error = assets
+            .convert_model_from_bytes("/models/shared.fbx", &bytes)
+            .unwrap_err();
+        assert!(
+            conversion_error
+                .to_string()
+                .contains("анимации превышают предел памяти"),
+            "{conversion_error}"
+        );
+        fs::write(root.path().join("Assets/models/shared.fbx"), &bytes).unwrap();
 
+        let run_preparation = prepare_project(root.path()).unwrap();
+        assert_eq!(
+            run_preparation.model_preparation_mode,
+            crate::models::ModelPreparationMode::Direct
+        );
         assert!(super::scripts_project(root.path()).unwrap().is_none());
         assert!(
             !root.path().join(".rve/model-cache").exists(),
-            "scripts does not convert FBX or write the model cache"
+            "run preparation and scripts do not convert FBX or write the model cache"
         );
+    }
+
+    fn fbx_with_too_many_clip_keys() -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let fixture = include_str!("../../../engine/engine-assets/tests/fixtures/bend_clip.fbx");
+        let key_count = 4 * 1024 * 1024 + 1;
+        let mut times = String::with_capacity(key_count * 9);
+        let mut values = String::with_capacity(key_count * 2);
+        for index in 0..key_count {
+            if index > 0 {
+                if index % 1000 == 0 {
+                    times.push_str(",\n\t\t\t");
+                    values.push_str(",\n\t\t\t");
+                } else {
+                    times.push(',');
+                    values.push(',');
+                }
+            }
+            write!(times, "{index}").unwrap();
+            values.push(if index % 2 == 0 { '0' } else { '1' });
+        }
+        fixture
+            .replace(
+                "KeyTime: *3 {\n\t\t\ta: 0,23093079000,46186158000",
+                &format!("KeyTime: *{key_count} {{\n\t\t\ta: {times}"),
+            )
+            .replace(
+                "KeyValueFloat: *3 {\n\t\t\ta: 0,30,60",
+                &format!("KeyValueFloat: *{key_count} {{\n\t\t\ta: {values}"),
+            )
+            .replace(
+                "KeyAttrRefCount: *1 {\n\t\t\ta: 3",
+                &format!("KeyAttrRefCount: *1 {{\n\t\t\ta: {key_count}"),
+            )
+            .into_bytes()
     }
 
     #[test]

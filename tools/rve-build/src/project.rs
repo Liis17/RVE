@@ -44,7 +44,7 @@ pub(crate) struct ProjectBuild {
     pub(crate) icon: Option<VirtualPath>,
     pub(crate) heavy_scripts: Vec<HeavyScriptUse>,
     /// Keeps staged ready models alive until `build_project_archives` has consumed them.
-    pub(crate) prepared_model_temp: Option<Arc<TempDir>>,
+    pub(crate) _prepared_model_temp: Option<Arc<TempDir>>,
     pub(crate) model_preparation_mode: ModelPreparationMode,
 }
 
@@ -455,7 +455,7 @@ fn prepare_with_resources(
         #[cfg(windows)]
         icon,
         heavy_scripts,
-        prepared_model_temp: model_preparer.into_temp_dir(),
+        _prepared_model_temp: model_preparer.into_temp_dir(),
         model_preparation_mode: model_mode,
     })
 }

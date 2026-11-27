@@ -51,6 +51,22 @@ pub(crate) struct MaterialRecipe {
     pub(crate) opacity_source: Option<OpacityRecipe>,
 }
 
+impl MaterialRecipe {
+    pub(crate) fn sources(&self) -> impl Iterator<Item = usize> + '_ {
+        [
+            self.base_color_source,
+            self.normal_source,
+            self.roughness_source,
+            self.metalness_source,
+            self.emissive_source,
+            self.occlusion_source,
+            self.opacity_source.as_ref().map(|opacity| opacity.source),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PreparedMesh {
     pub(crate) vertices: Vec<ModelVertex>,
@@ -105,13 +121,18 @@ impl TextureSources {
     }
 }
 
-pub(crate) fn is_prebuilt_model(bytes: &[u8]) -> bool {
+pub fn is_prebuilt_model(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
 }
 
 #[cfg(any(feature = "fbx", test))]
 pub(crate) fn encode(model: &PreparedModel) -> Result<Vec<u8>, String> {
-    let mut writer = Writer::new(PREBUILT_MODEL_MAX_BYTES);
+    encode_with_limit(model, PREBUILT_MODEL_MAX_BYTES)
+}
+
+#[cfg(any(feature = "fbx", test))]
+fn encode_with_limit(model: &PreparedModel, limit: usize) -> Result<Vec<u8>, String> {
+    let mut writer = Writer::new(limit);
     writer.bytes(MAGIC)?;
     writer.u32(PREBUILT_MODEL_VERSION)?;
     let bounds = model_bounds(model.meshes.as_deref());
@@ -594,21 +615,7 @@ fn validate(model: &PreparedModel) -> Result<(), String> {
                     return Err("индекс сустава skin выходит за пределы палитры".to_owned());
                 }
             }
-            for source in [
-                mesh.material.base_color_source,
-                mesh.material.normal_source,
-                mesh.material.roughness_source,
-                mesh.material.metalness_source,
-                mesh.material.emissive_source,
-                mesh.material.occlusion_source,
-                mesh.material
-                    .opacity_source
-                    .as_ref()
-                    .map(|opacity| opacity.source),
-            ]
-            .into_iter()
-            .flatten()
-            {
+            for source in mesh.material.sources() {
                 if source >= model.texture_references.len() {
                     return Err("индекс текстурной ссылки выходит за пределы таблицы".to_owned());
                 }
@@ -639,17 +646,12 @@ fn validate(model: &PreparedModel) -> Result<(), String> {
 }
 
 fn model_bounds(meshes: Option<&[PreparedMesh]>) -> Option<([f32; 3], [f32; 3])> {
-    let mut positions = meshes?
-        .iter()
-        .flat_map(|mesh| &mesh.vertices)
-        .map(|vertex| vertex.position);
-    let first = positions.next()?;
-    Some(positions.fold((first, first), |(min, max), position| {
-        (
-            std::array::from_fn(|axis| min[axis].min(position[axis])),
-            std::array::from_fn(|axis| max[axis].max(position[axis])),
-        )
-    }))
+    crate::bounds_from_positions(
+        meshes?
+            .iter()
+            .flat_map(|mesh| &mesh.vertices)
+            .map(|vertex| vertex.position),
+    )
 }
 
 fn same_bounds(
@@ -880,7 +882,7 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::{
         MaterialRecipe, PREBUILT_MODEL_MAX_BYTES, PreparedMesh, PreparedModel, TextureReference,
-        decode, decode_with_limits, encode, is_prebuilt_model,
+        decode, decode_with_limits, encode, encode_with_limit, is_prebuilt_model,
     };
     use crate::ModelVertex;
 
@@ -941,6 +943,48 @@ mod tests {
         }
     }
 
+    fn model_with_skeleton_skin_and_clips() -> PreparedModel {
+        let mut model = model();
+        model.meshes.as_mut().unwrap()[0].skin = Some(crate::ModelSkin {
+            joints: vec![[0; 4]],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]],
+        });
+        model.skeleton = Some(crate::ModelSkeleton {
+            nodes: vec![skeleton_node("root", None, None)],
+            joints: vec![crate::ModelJoint {
+                node: 0,
+                inverse_bind: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+            }],
+        });
+        let clip = crate::ModelAnimation {
+            name: "move".to_owned(),
+            duration: 1.0,
+            tracks: vec![crate::ModelTrack {
+                node: "root".to_owned(),
+                translation: vec![
+                    crate::ModelKey {
+                        time: 0.0,
+                        value: [0.0; 3],
+                    },
+                    crate::ModelKey {
+                        time: 1.0,
+                        value: [1.0, 0.0, 0.0],
+                    },
+                ],
+                rotation: Vec::new(),
+                scale: Vec::new(),
+            }],
+        };
+        model.model_animations = vec![clip.clone()];
+        model.clips = vec![clip];
+        model
+    }
+
     #[test]
     fn round_trips_le_fields_and_float_bits() {
         let input = model();
@@ -991,6 +1035,25 @@ mod tests {
         // Magic + version + bounds flag and six f32 bounds fields.
         huge_count[37..41].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode(&huge_count).unwrap_err().contains("счётчик"));
+    }
+
+    #[test]
+    fn rejects_every_truncated_prefix_with_skeleton_skin_and_clips() {
+        let bytes = encode(&model_with_skeleton_skin_and_clips()).unwrap();
+        for end in 0..bytes.len() {
+            assert!(
+                decode(&bytes[..end]).is_err(),
+                "accepted rich artifact prefix length {end}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_obeys_a_reduced_size_limit() {
+        let input = model();
+        let bytes = encode(&input).unwrap();
+        let error = encode_with_limit(&input, bytes.len() - 1).unwrap_err();
+        assert!(error.contains("предел"), "{error}");
     }
 
     #[test]
