@@ -1,5 +1,5 @@
 //! Мост между `World` и аниматорами объектов: создание состояния, запросы скриптов,
-//! события окончания и палитры skinning для каждого кадра.
+//! события маркеров и окончания, а также палитры skinning для каждого кадра.
 //!
 //! Мост не владеет GPU-ресурсами и не читает файлы сам: модели и клипы приходят через
 //! замыкания, поэтому тот же код работает в runtime и в редакторе.
@@ -322,50 +322,42 @@ impl AnimationBridge {
                 ));
                 continue;
             }
+            for warning in &animation.file_marker_warnings {
+                self.warn(format!("{id}: {warning}"));
+            }
             for warning in &animation.marker_warnings {
                 self.warn(format!("{id}: клип `{}`: {warning}", animation.name));
             }
             let mut markers = Vec::new();
             let mut linked_marker_count = 0;
-            for marker in &animation.markers {
-                linked_marker_count += 1;
-                if marker.time > animation.duration {
-                    self.warn(format!(
-                        "{id}: клип `{}`: маркер `{}` позже конца клипа; пропущен",
-                        animation.name, marker.name
-                    ));
-                    continue;
-                }
-                if !add_marker(&mut markers, marker.clone()) {
-                    self.warn(format!(
-                        "{id}: клип `{}`: дубликат маркера `{}` пропущен",
-                        animation.name, marker.name
-                    ));
-                }
-            }
-            for marker in component
+            let fbx_markers = animation
+                .markers
+                .iter()
+                .map(|marker| (marker.name.as_str(), marker.time));
+            let scene_markers = component
                 .markers
                 .iter()
                 .filter(|marker| marker.clip == animation.name)
-            {
+                .map(|marker| (marker.name.as_str(), marker.time));
+            for (name, time) in fbx_markers.chain(scene_markers) {
                 linked_marker_count += 1;
-                if marker.time > animation.duration {
+                if time > animation.duration {
                     self.warn(format!(
                         "{id}: клип `{}`: маркер `{}` позже конца клипа; пропущен",
-                        animation.name, marker.name
+                        animation.name, name
                     ));
                     continue;
                 }
                 if !add_marker(
                     &mut markers,
                     ModelMarker {
-                        name: marker.name.clone(),
-                        time: marker.time,
+                        name: name.to_owned(),
+                        time,
                     },
                 ) {
                     self.warn(format!(
                         "{id}: клип `{}`: дубликат маркера `{}` пропущен",
-                        animation.name, marker.name
+                        animation.name, name
                     ));
                 }
             }
@@ -553,6 +545,7 @@ mod tests {
                     scale: Vec::new(),
                 }],
                 markers: Vec::new(),
+                file_marker_warnings: Vec::new(),
                 marker_warnings: Vec::new(),
             }],
         }
@@ -731,6 +724,42 @@ model = \"/models/hero.fbx\"
                     marker: "fbx".to_owned(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn file_marker_warnings_from_multiple_clips_are_reported_once_without_clip_names() {
+        let scene = format!(
+            "{SCENE}[[assets]]\npath = \"/clips/extra.fbx\"\n[objects.animator]\nclips = [\"/clips/extra.fbx\"]\n"
+        );
+        let world =
+            World::from_document(&SceneDocument::parse("scene.rvescene", &scene).unwrap()).unwrap();
+        let file_warnings = vec!["неизвестный стек \"Missing\"".to_owned()];
+        let clips = Arc::new(vec![
+            ModelAnimation {
+                name: "TakeA".to_owned(),
+                duration: 1.0,
+                tracks: Vec::new(),
+                markers: Vec::new(),
+                file_marker_warnings: file_warnings.clone(),
+                marker_warnings: Vec::new(),
+            },
+            ModelAnimation {
+                name: "TakeB".to_owned(),
+                duration: 1.0,
+                tracks: Vec::new(),
+                markers: Vec::new(),
+                file_marker_warnings: file_warnings,
+                marker_warnings: Vec::new(),
+            },
+        ]);
+        let model = Arc::new(walk_model());
+        let mut bridge =
+            AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(clips.clone()));
+
+        assert_eq!(
+            bridge.take_warnings(),
+            ["hero: неизвестный стек \"Missing\""]
         );
     }
 

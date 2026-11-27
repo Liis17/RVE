@@ -40,6 +40,9 @@ pub struct ModelAnimation {
     pub duration: f32,
     pub tracks: Vec<ModelTrack>,
     pub markers: Vec<ModelMarker>,
+    /// Предупреждения уровня FBX-файла, общие для его клипов.
+    pub file_marker_warnings: Vec<String>,
+    /// Предупреждения, относящиеся к этому клипу.
     pub marker_warnings: Vec<String>,
 }
 
@@ -51,6 +54,7 @@ struct ImportedMarkers {
     file_warnings: Vec<String>,
 }
 
+#[derive(Debug)]
 struct ParsedMarker {
     stack: Option<String>,
     name: String,
@@ -148,9 +152,7 @@ fn attach_markers(
     for (index, animation) in &mut baked_stacks {
         animation.markers = std::mem::take(&mut imported.by_stack[*index]);
         animation.marker_warnings = std::mem::take(&mut imported.warnings_by_stack[*index]);
-        animation
-            .marker_warnings
-            .extend(imported.file_warnings.iter().cloned());
+        animation.file_marker_warnings = imported.file_warnings.clone();
     }
     baked_stacks
         .into_iter()
@@ -227,15 +229,24 @@ fn import_marker_property(
                 }
             }
             Err(error) => {
-                if let Some(index) = marker_target(
-                    error.stack.as_deref(),
-                    source_stack,
-                    stack_names,
-                    imported,
-                    record,
-                ) {
-                    imported.warnings_by_stack[index]
-                        .push(format!("rve_markers {:?}: {}", record, error.message));
+                let warning = format!("rve_markers {:?}: {}", record, error.message);
+                if let Some(index) = source_stack {
+                    imported.warnings_by_stack[index].push(warning);
+                } else {
+                    let file_warning_count = imported.file_warnings.len();
+                    if let Some(index) =
+                        marker_target(error.stack.as_deref(), None, stack_names, imported, record)
+                    {
+                        imported.warnings_by_stack[index].push(warning);
+                    } else if imported.file_warnings.len() > file_warning_count {
+                        imported
+                            .file_warnings
+                            .last_mut()
+                            .expect("marker_target added a file warning")
+                            .push_str(&format!("; {}", error.message));
+                    } else {
+                        imported.file_warnings.push(warning);
+                    }
                 }
             }
         }
@@ -300,15 +311,9 @@ fn marker_target(
 }
 
 fn parse_marker_record(record: &str) -> Result<ParsedMarker, MarkerParseError> {
-    let stack_from_record = || {
-        record
-            .rsplit_once('@')
-            .and_then(|(left, _)| left.rsplit_once(':').map(|(stack, _)| stack.to_owned()))
-            .or_else(|| record.rsplit_once(':').map(|(stack, _)| stack.to_owned()))
-    };
     let Some((left, time_text)) = record.rsplit_once('@') else {
         return Err(MarkerParseError {
-            stack: stack_from_record(),
+            stack: None,
             message: "ожидается формат [<stack>:]<marker>@<seconds>".to_owned(),
         });
     };
@@ -405,6 +410,7 @@ fn bake_stack(
         duration: baked.playback_duration as f32,
         tracks,
         markers: Vec::new(),
+        file_marker_warnings: Vec::new(),
         marker_warnings: Vec::new(),
     })
 }
@@ -443,8 +449,7 @@ mod tests {
         assert_eq!(second.name, "FootDown");
         assert_eq!(second.time, 0.25);
 
-        let records = "Start@0;Walk:FootDown@0.25"
-            .split(';')
+        let records = marker_records("Start@0;Walk:FootDown@0.25")
             .map(parse_marker_record)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -460,9 +465,67 @@ mod tests {
 
     #[test]
     fn rejects_invalid_marker_records() {
-        for record in ["Hit@NaN", "Hit@inf", "Hit@-0.1", "bad-name@1", "1Hit@1"] {
+        for record in [
+            "Hit@NaN",
+            "Hit@inf",
+            "Hit@abc",
+            "Hit@-0.1",
+            "Hit:0.5",
+            "bad-name@1",
+            "1Hit@1",
+        ] {
             assert!(parse_marker_record(record).is_err(), "{record}");
         }
+    }
+
+    #[test]
+    fn malformed_records_explain_non_numeric_time_and_missing_separator() {
+        let non_numeric = parse_marker_record("Hit@abc").unwrap_err();
+        assert!(
+            non_numeric
+                .message
+                .contains("время должно быть конечным числом")
+        );
+
+        let missing_separator = parse_marker_record("Hit:0.5").unwrap_err();
+        assert!(missing_separator.message.contains("ожидается формат"));
+    }
+
+    #[test]
+    fn malformed_stack_record_keeps_parse_reason_on_its_stack() {
+        use super::{ImportedMarkers, import_marker_property};
+
+        let names = vec!["Bend".to_owned()];
+        let mut imported = ImportedMarkers {
+            stack_names: names.clone(),
+            by_stack: vec![Vec::new()],
+            warnings_by_stack: vec![Vec::new()],
+            file_warnings: Vec::new(),
+        };
+        import_marker_property("Hit:0.5", Some(0), &names, &mut imported);
+
+        assert!(imported.file_warnings.is_empty());
+        assert_eq!(imported.warnings_by_stack[0].len(), 1);
+        assert!(imported.warnings_by_stack[0][0].contains("ожидается формат"));
+        assert!(!imported.warnings_by_stack[0][0].contains("неизвестный стек"));
+    }
+
+    #[test]
+    fn malformed_node_record_keeps_parse_reason_without_a_false_unknown_stack() {
+        use super::{ImportedMarkers, import_marker_property};
+
+        let names = vec!["Bend".to_owned(), "Walk".to_owned()];
+        let mut imported = ImportedMarkers {
+            stack_names: names.clone(),
+            by_stack: vec![Vec::new(); names.len()],
+            warnings_by_stack: vec![Vec::new(); names.len()],
+            file_warnings: Vec::new(),
+        };
+        import_marker_property("Hit@abc", None, &names, &mut imported);
+
+        assert_eq!(imported.file_warnings.len(), 1);
+        assert!(imported.file_warnings[0].contains("время должно быть конечным числом"));
+        assert!(!imported.file_warnings[0].contains("неизвестный стек"));
     }
 
     #[test]

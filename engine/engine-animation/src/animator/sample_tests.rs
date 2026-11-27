@@ -359,6 +359,7 @@ fn random_animations(rng: &mut Lcg, model: &ModelSkeleton, count: usize) -> Vec<
             duration,
             tracks,
             markers: Vec::new(),
+            file_marker_warnings: Vec::new(),
             marker_warnings: Vec::new(),
         });
     }
@@ -838,6 +839,7 @@ fn cached_duration_is_the_mean_of_tree_points_for_advance_and_seek() {
         duration: 1.0,
         tracks: Vec::new(),
         markers: Vec::new(),
+        file_marker_warnings: Vec::new(),
         marker_warnings: Vec::new(),
     };
     let long = ModelAnimation {
@@ -845,6 +847,7 @@ fn cached_duration_is_the_mean_of_tree_points_for_advance_and_seek() {
         duration: 3.0,
         tracks: Vec::new(),
         markers: Vec::new(),
+        file_marker_warnings: Vec::new(),
         marker_warnings: Vec::new(),
     };
     let clips = vec![Clip::bind(&short, &skeleton), Clip::bind(&long, &skeleton)];

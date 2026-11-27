@@ -226,6 +226,7 @@ mod tests {
             duration: 1.0,
             tracks,
             markers: Vec::new(),
+            file_marker_warnings: Vec::new(),
             marker_warnings: Vec::new(),
         }
     }

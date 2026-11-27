@@ -962,6 +962,7 @@ mod tests {
                 scale: Vec::new(),
             }],
             markers: Vec::new(),
+            file_marker_warnings: Vec::new(),
             marker_warnings: Vec::new(),
         };
         Clip::bind(&animation, &skeleton)
@@ -979,6 +980,7 @@ mod tests {
                     time: *time,
                 })
                 .collect(),
+            file_marker_warnings: Vec::new(),
             marker_warnings: Vec::new(),
         };
         Clip::bind(&animation, &skeleton())

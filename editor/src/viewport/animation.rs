@@ -391,6 +391,7 @@ pub(crate) mod test_support {
                     scale: Vec::new(),
                 }],
                 markers: Vec::new(),
+                file_marker_warnings: Vec::new(),
                 marker_warnings: Vec::new(),
             }],
         }

@@ -206,17 +206,17 @@ fn marker_clip_routes_stack_and_node_properties_to_named_clips() {
             .any(|marker| marker.name == "Beyond" && marker.time == 3.0)
     );
     assert!(
-        bend.marker_warnings
+        bend.file_marker_warnings
             .iter()
             .any(|warning| warning.contains("неизвестный стек"))
     );
     assert!(
-        bend.marker_warnings
+        bend.file_marker_warnings
             .iter()
             .any(|warning| warning.contains("несколько стеков"))
     );
     assert!(
-        bend.marker_warnings
+        bend.file_marker_warnings
             .iter()
             .any(|warning| warning.contains("Empty") && warning.contains("отброшены"))
     );

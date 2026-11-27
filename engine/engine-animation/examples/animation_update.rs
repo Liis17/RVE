@@ -153,6 +153,7 @@ fn clip_animation(name: &str, clip: usize, bones: usize) -> ModelAnimation {
         duration: 1.0,
         tracks,
         markers: Vec::new(),
+        file_marker_warnings: Vec::new(),
         marker_warnings: Vec::new(),
     }
 }
