@@ -29,7 +29,7 @@ impl Renderer {
         Ok(())
     }
 
-    fn wait_present_fences_for_generation(
+    pub(crate) fn wait_present_fences_for_generation(
         &mut self,
         device: &ash::Device,
         generation: u64,
@@ -48,7 +48,10 @@ impl Renderer {
     }
 
     pub(crate) fn recreate_swapchain(&mut self) -> Result<(), RenderError> {
-        self.poll_swapchain_retirement()?;
+        if let Err(error) = self.poll_swapchain_retirement() {
+            self.fail_all_queued_captures("swapchain retirement polling failed");
+            return Err(error);
+        }
         let capabilities = unsafe {
             self.surface_loader()?
                 .get_physical_device_surface_capabilities(self.physical_device, self.surface()?)
@@ -85,62 +88,89 @@ impl Renderer {
         }
         self.flush_uploads()?;
         self.poll_uploads()?;
-        let (old_swapchain, previous_swapchain) =
-            detach_swapchain_for_recreate(&mut self.swapchain, |bundle| bundle.handle);
         let latency = self.latency.clone();
         if let Some(latency) = latency.as_deref() {
             latency.lock_swapchain().replace(vk::SwapchainKHR::null());
         }
         let replacement_generation = self.swapchain_generation.saturating_add(1);
-        if let Some(previous_swapchain) = previous_swapchain {
-            let old_image_count = previous_swapchain.images.len();
-            let previous_generation = previous_swapchain.generation;
-            let overflow = if self.capabilities.present_fence {
-                self.retired_swapchains.retire_present_fence(
-                    previous_swapchain,
-                    self.submission_generation,
-                    previous_generation,
-                    self.present_fences.outstanding(previous_generation),
-                )
-            } else {
-                self.retired_swapchains.retire(
-                    previous_swapchain,
-                    self.submission_generation,
-                    replacement_generation,
-                    old_image_count,
-                )
-            };
-            if let Some(oldest) = overflow {
-                self.pending_swapchain_drop = Some(oldest);
-                // SAFETY: the old generation is retained while its submissions and presents are waited.
-                unsafe { device.device_wait_idle() }?;
-                if self.capabilities.present_fence {
-                    let generation = self
-                        .pending_swapchain_drop
-                        .as_ref()
-                        .map(|bundle| bundle.generation)
-                        .ok_or(RenderError::InvalidState(
-                            "pending retired swapchain отсутствует",
-                        ))?;
-                    self.wait_present_fences_for_generation(&device, generation)?;
+        let instance = self.instance()?.clone();
+        let swapchain_loader = self.swapchain_loader()?.clone();
+        let surface_loader = self.surface_loader()?.clone();
+        let physical_device = self.physical_device;
+        let surface = self.surface()?;
+        let surface_format = self.surface_format;
+        let output_extent = self.output_extent;
+        let requested_present_mode = self.config.present_mode;
+        let present_fence_mode = self.capabilities.present_fence;
+        let submission_generation = self.submission_generation;
+        recreate_swapchain(
+            &mut self.swapchain,
+            |bundle| bundle.handle,
+            |previous_swapchain| {
+                let old_image_count = previous_swapchain.images.len();
+                let previous_generation = previous_swapchain.generation;
+                let overflow = if present_fence_mode {
+                    self.retired_swapchains.retire_present_fence(
+                        previous_swapchain,
+                        submission_generation,
+                        previous_generation,
+                        self.present_fences.outstanding(previous_generation),
+                    )
+                } else {
+                    self.retired_swapchains.retire(
+                        previous_swapchain,
+                        submission_generation,
+                        replacement_generation,
+                        old_image_count,
+                    )
+                };
+                if let Some(oldest) = overflow {
+                    self.pending_swapchain_drop = Some(oldest);
+                    // SAFETY: the old generation remains owned while submissions are waited.
+                    unsafe { device.device_wait_idle() }?;
+                    if present_fence_mode {
+                        let generation = self
+                            .pending_swapchain_drop
+                            .as_ref()
+                            .map(|bundle| bundle.generation)
+                            .ok_or(RenderError::InvalidState(
+                                "pending retired swapchain отсутствует",
+                            ))?;
+                        let fences = self.present_fences.generation_fences(generation);
+                        if !fences.is_empty() {
+                            // SAFETY: these fences belong to this device and track this generation's queued presents.
+                            unsafe { device.wait_for_fences(&fences, true, u64::MAX) }?;
+                            let completed = self.present_fences.complete_generation(generation);
+                            for _ in 0..completed {
+                                self.retired_swapchains.present_fence_completed(generation);
+                            }
+                        }
+                    }
                 }
-            }
-        }
-        let new_swapchain = SwapchainBundle::new(
-            self.instance()?,
-            &device,
-            self.swapchain_loader()?,
-            self.surface_loader()?,
-            self.physical_device,
-            self.surface()?,
-            self.surface_format,
-            self.output_extent,
-            capabilities,
-            old_swapchain,
-            self.config.present_mode,
-            latency.is_some(),
-            replacement_generation,
+                Ok(())
+            },
+            |old_swapchain| {
+                SwapchainBundle::new(
+                    &instance,
+                    &device,
+                    &swapchain_loader,
+                    &surface_loader,
+                    physical_device,
+                    surface,
+                    surface_format,
+                    output_extent,
+                    capabilities,
+                    old_swapchain,
+                    requested_present_mode,
+                    latency.is_some(),
+                    replacement_generation,
+                )
+            },
         )?;
+        let new_swapchain = self
+            .swapchain
+            .as_ref()
+            .ok_or(RenderError::InvalidState("новый swapchain отсутствует"))?;
         // Reflex now points at the new swapchain; retired handles remain outside its lock.
         if let Some(latency) = latency.as_deref() {
             latency.lock_swapchain().replace(new_swapchain.handle);
@@ -155,7 +185,6 @@ impl Renderer {
             );
             self.last_warned_present_mode = Some(self.present_mode);
         }
-        self.swapchain = Some(new_swapchain);
         self.swapchain_generation = replacement_generation;
         self.swapchain_dirty = false;
         if self.pending_swapchain_drop.is_some() {
@@ -175,13 +204,19 @@ impl Renderer {
     }
 }
 
-fn detach_swapchain_for_recreate<T>(
+fn recreate_swapchain<T, E>(
     active: &mut Option<T>,
     handle: impl FnOnce(&T) -> vk::SwapchainKHR,
-) -> (vk::SwapchainKHR, Option<T>) {
+    retire: impl FnOnce(T) -> Result<(), E>,
+    create: impl FnOnce(vk::SwapchainKHR) -> Result<T, E>,
+) -> Result<(), E> {
     let retired = active.take();
     let old_handle = retired.as_ref().map_or(vk::SwapchainKHR::null(), handle);
-    (old_handle, retired)
+    if let Some(retired) = retired {
+        retire(retired)?;
+    }
+    *active = Some(create(old_handle)?);
+    Ok(())
 }
 
 pub(crate) fn select_present_mode(
@@ -487,26 +522,44 @@ pub(crate) fn select_composite_alpha(
 
 #[cfg(test)]
 mod tests {
-    use super::detach_swapchain_for_recreate;
+    use super::recreate_swapchain;
     use ash::vk::{self, Handle as _};
 
     #[test]
     fn failed_recreation_keeps_old_handle_retired_and_next_attempt_uses_null() {
         let old_handle = vk::SwapchainKHR::from_raw(7);
         let mut active = Some(old_handle);
-        let (create_old_handle, retired) =
-            detach_swapchain_for_recreate(&mut active, |handle| *handle);
-
-        assert_eq!(create_old_handle, old_handle);
-        assert_eq!(retired, Some(old_handle));
+        let mut retired = Vec::new();
+        let first_attempt = recreate_swapchain(
+            &mut active,
+            |handle| *handle,
+            |handle| {
+                retired.push(handle);
+                Ok::<_, &'static str>(())
+            },
+            |handle| {
+                assert_eq!(handle, old_handle);
+                Err("create failed")
+            },
+        );
+        assert_eq!(first_attempt, Err("create failed"));
+        assert_eq!(retired, vec![old_handle]);
         assert_eq!(active, None);
 
-        let failed_create: Result<vk::SwapchainKHR, vk::Result> =
-            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
-        assert!(failed_create.is_err());
-        assert_eq!(
-            active.unwrap_or(vk::SwapchainKHR::null()),
-            vk::SwapchainKHR::null()
+        let second_attempt = recreate_swapchain(
+            &mut active,
+            |handle| *handle,
+            |handle| {
+                retired.push(handle);
+                Ok::<_, &'static str>(())
+            },
+            |handle| {
+                assert_eq!(handle, vk::SwapchainKHR::null());
+                Ok(vk::SwapchainKHR::from_raw(8))
+            },
         );
+        assert_eq!(second_attempt, Ok(()));
+        assert_eq!(retired, vec![old_handle]);
+        assert_eq!(active, Some(vk::SwapchainKHR::from_raw(8)));
     }
 }

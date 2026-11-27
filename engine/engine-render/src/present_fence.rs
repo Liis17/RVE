@@ -54,27 +54,19 @@ impl<F: Copy> PresentFences<F> {
         Some(self.slots[index].fence)
     }
 
-    pub(crate) fn commit(&mut self, generation: u64) -> bool {
+    pub(crate) fn finish(
+        &mut self,
+        disposition: PresentResultDisposition,
+        generation: u64,
+    ) -> bool {
         let Some(index) = self.reserved.take() else {
             return false;
         };
-        self.slots[index].state = FenceState::Pending(generation);
-        true
-    }
-
-    pub(crate) fn cancel(&mut self) -> bool {
-        let Some(index) = self.reserved.take() else {
-            return false;
+        self.slots[index].state = match disposition {
+            PresentResultDisposition::Enqueued => FenceState::Pending(generation),
+            PresentResultDisposition::NotEnqueued => FenceState::Available,
+            PresentResultDisposition::Uncertain => FenceState::Uncertain(generation),
         };
-        self.slots[index].state = FenceState::Available;
-        true
-    }
-
-    pub(crate) fn mark_uncertain(&mut self, generation: u64) -> bool {
-        let Some(index) = self.reserved.take() else {
-            return false;
-        };
-        self.slots[index].state = FenceState::Uncertain(generation);
         true
     }
 
@@ -129,6 +121,18 @@ impl<F: Copy> PresentFences<F> {
             .collect()
     }
 
+    pub(crate) fn oldest_pending_generation(&self) -> Option<u64> {
+        self.slots
+            .iter()
+            .filter_map(|slot| match slot.state {
+                FenceState::Pending(generation) | FenceState::Uncertain(generation) => {
+                    Some(generation)
+                }
+                FenceState::Available | FenceState::Reserved => None,
+            })
+            .min()
+    }
+
     /// Records completion after a successful `vkWaitForFences` for this generation.
     pub(crate) fn complete_generation(&mut self, generation: u64) -> usize {
         let mut completed = 0;
@@ -151,7 +155,7 @@ impl<F: Copy> PresentFences<F> {
             .filter_map(|slot| {
                 matches!(
                     slot.state,
-                    FenceState::Reserved | FenceState::Pending(_) | FenceState::Uncertain(_)
+                    FenceState::Pending(_) | FenceState::Uncertain(_)
                 )
                 .then_some(slot.fence)
             })
@@ -201,7 +205,7 @@ mod tests {
         let mut fences = PresentFences::new();
         assert!(fences.add(7_u32));
         assert_eq!(fences.reserve(), Some(7));
-        assert!(fences.cancel());
+        assert!(fences.finish(PresentResultDisposition::NotEnqueued, 0));
         assert_eq!(fences.reserve(), Some(7));
     }
 
@@ -210,7 +214,7 @@ mod tests {
         let mut fences = PresentFences::new();
         assert!(fences.add(11_u32));
         assert_eq!(fences.reserve(), Some(11));
-        assert!(fences.commit(4));
+        assert!(fences.finish(PresentResultDisposition::Enqueued, 4));
         assert_eq!(fences.outstanding(4), 1);
         assert_eq!(fences.outstanding(5), 0);
 
@@ -229,6 +233,73 @@ mod tests {
             assert!(fences.add(fence));
         }
         assert!(!fences.add(PRESENT_FENCE_CAPACITY));
+    }
+
+    #[test]
+    fn a_full_present_fence_pool_can_wait_for_its_oldest_generation() {
+        let mut fences = PresentFences::new();
+        for generation in 1..=PRESENT_FENCE_CAPACITY as u64 {
+            let fence = generation as u32;
+            assert!(fences.add(fence));
+            assert_eq!(fences.reserve(), Some(fence));
+            assert!(fences.finish(PresentResultDisposition::Enqueued, generation));
+        }
+
+        assert_eq!(fences.reserve(), None);
+        assert_eq!(fences.oldest_pending_generation(), Some(1));
+        assert_eq!(fences.complete_generation(1), 1);
+        assert_eq!(fences.reserve(), Some(1));
+    }
+
+    #[test]
+    fn finishing_present_results_transitions_reserved_fences() {
+        let mut fences = PresentFences::new();
+        for fence in 1..=3 {
+            assert!(fences.add(fence));
+        }
+
+        assert_eq!(fences.reserve(), Some(1));
+        assert!(fences.finish(PresentResultDisposition::Enqueued, 4));
+        assert_eq!(fences.reserve(), Some(2));
+        assert!(fences.finish(PresentResultDisposition::NotEnqueued, 5));
+        assert_eq!(fences.reserve(), Some(2));
+        assert!(fences.finish(PresentResultDisposition::Uncertain, 6));
+
+        assert_eq!(fences.outstanding(4), 1);
+        assert_eq!(fences.outstanding(5), 0);
+        assert_eq!(fences.outstanding(6), 1);
+        assert_eq!(fences.waiting_fences(), vec![1, 2]);
+    }
+
+    #[test]
+    fn complete_generation_releases_only_pending_and_uncertain_fences_for_that_generation() {
+        let mut fences = PresentFences::new();
+        for fence in 1..=2 {
+            assert!(fences.add(fence));
+            assert_eq!(fences.reserve(), Some(fence));
+            let disposition = if fence == 1 {
+                PresentResultDisposition::Enqueued
+            } else {
+                PresentResultDisposition::Uncertain
+            };
+            assert!(fences.finish(disposition, fence as u64));
+        }
+
+        assert_eq!(fences.complete_generation(1), 1);
+        assert_eq!(fences.outstanding(1), 0);
+        assert_eq!(fences.outstanding(2), 1);
+    }
+
+    #[test]
+    fn waiting_fences_omits_reserved_fences() {
+        let mut fences = PresentFences::new();
+        assert!(fences.add(1_u32));
+        assert!(fences.add(2_u32));
+        assert_eq!(fences.reserve(), Some(1));
+        assert!(fences.finish(PresentResultDisposition::Enqueued, 9));
+        assert_eq!(fences.reserve(), Some(2));
+
+        assert_eq!(fences.waiting_fences(), vec![1]);
     }
 
     #[test]
@@ -263,5 +334,29 @@ mod tests {
             classify_present_result(Err(vk::Result::ERROR_UNKNOWN)),
             PresentResultDisposition::Uncertain
         );
+    }
+
+    #[test]
+    fn classified_present_result_is_applied_to_the_reserved_fence() {
+        for (result, expected_outstanding) in [
+            (Ok(false), 1),
+            (Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY), 0),
+            (Err(vk::Result::ERROR_DEVICE_LOST), 1),
+        ] {
+            let mut fences = PresentFences::new();
+            assert!(fences.add(1_u32));
+            assert_eq!(fences.reserve(), Some(1));
+            let disposition = classify_present_result(result);
+            assert!(fences.finish(disposition, 3));
+            assert_eq!(fences.outstanding(3), expected_outstanding);
+            assert_eq!(
+                fences.waiting_fences(),
+                if expected_outstanding == 0 {
+                    vec![]
+                } else {
+                    vec![1]
+                }
+            );
+        }
     }
 }

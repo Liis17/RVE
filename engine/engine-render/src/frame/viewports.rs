@@ -20,7 +20,10 @@ impl Renderer {
                 "ресурсы синхронизации кадровых слотов потеряны",
             ));
         }
-        self.poll_swapchain_retirement()?;
+        if let Err(error) = self.poll_swapchain_retirement() {
+            self.fail_all_queued_captures("swapchain retirement polling failed");
+            return Err(error);
+        }
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
         self.screen_temporal.state.missed();
         self.miss_unlisted_viewports(scenes);

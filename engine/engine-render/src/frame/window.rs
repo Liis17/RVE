@@ -18,7 +18,10 @@ impl Renderer {
                 "ресурсы синхронизации кадровых слотов потеряны",
             ));
         }
-        self.poll_swapchain_retirement()?;
+        if let Err(error) = self.poll_swapchain_retirement() {
+            self.fail_all_queued_captures("swapchain retirement polling failed");
+            return Err(error);
+        }
         validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         self.validate_skin_draws(frame)?;

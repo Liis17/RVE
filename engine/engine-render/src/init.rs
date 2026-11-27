@@ -388,6 +388,7 @@ impl Renderer {
             .iter()
             .map(|name| name.to_string_lossy().into_owned())
             .collect::<HashSet<_>>();
+        // SAFETY: the selected physical device was enumerated from this live instance.
         let available_device_extensions = unsafe {
             self.instance()?
                 .enumerate_device_extension_properties(self.physical_device)
@@ -549,7 +550,13 @@ impl Renderer {
                     self.device()?
                         .create_fence(&vk::FenceCreateInfo::default(), None)
                 }?;
-                debug_assert!(self.present_fences.add(fence));
+                if !self.present_fences.add(fence) {
+                    // SAFETY: this newly created fence has not been submitted to a queue.
+                    unsafe { self.device()?.destroy_fence(fence, None) };
+                    return Err(RenderError::InvalidState(
+                        "не удалось добавить present fence в пул",
+                    ));
+                }
             }
         }
         if low_latency_ready {
