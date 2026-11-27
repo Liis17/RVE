@@ -3781,6 +3781,58 @@ mod tests {
 
     #[cfg(feature = "fbx")]
     #[test]
+    fn prebuilt_marker_data_matches_direct_fbx_model_and_file_clips() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/marker_clip.fbx");
+        let fbx = fs::read_to_string(fixture).unwrap();
+        let fbx = fbx.replace("Beyond@3", "Beyond@3;Invalid@-1");
+        assert_ne!(
+            fbx,
+            fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/marker_clip.fbx")
+            )
+            .unwrap()
+        );
+
+        let temp = TempAssets::new("prebuilt-markers");
+        temp.write("marker_clip.fbx", fbx.as_bytes());
+        let source = temp.assets();
+        let direct_model = source.load_model("/marker_clip.fbx").unwrap();
+        let direct_file_clips = source.load_animations("/marker_clip.fbx").unwrap();
+
+        assert!(
+            direct_model
+                .animations
+                .iter()
+                .any(|clip| !clip.markers.is_empty())
+        );
+        assert!(
+            direct_model
+                .animations
+                .iter()
+                .any(|clip| !clip.marker_warnings.is_empty())
+        );
+        assert!(
+            direct_model
+                .animations
+                .iter()
+                .any(|clip| !clip.file_marker_warnings.is_empty())
+        );
+
+        let ready = source.convert_model("/marker_clip.fbx").unwrap();
+        temp.write("marker_clip.fbx", &ready);
+        let prebuilt = temp.assets();
+        assert_eq!(
+            prebuilt.load_model("/marker_clip.fbx").unwrap().animations,
+            direct_model.animations
+        );
+        assert_eq!(
+            prebuilt.load_animations("/marker_clip.fbx").unwrap(),
+            direct_file_clips
+        );
+    }
+
+    #[cfg(feature = "fbx")]
+    #[test]
     fn prebuilt_golden_artifacts_match_the_current_converter() {
         let assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures"));
         let golden_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden");

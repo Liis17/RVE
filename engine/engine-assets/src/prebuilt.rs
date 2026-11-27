@@ -1,8 +1,8 @@
 //! Versioned, pointer-free representation of a prepared FBX model.
 
 use crate::{
-    ModelAnimation, ModelInheritMode, ModelJoint, ModelKey, ModelNode, ModelSkin, ModelTrack,
-    ModelTransform, ModelVertex,
+    ModelAnimation, ModelInheritMode, ModelJoint, ModelKey, ModelMarker, ModelNode, ModelSkin,
+    ModelTrack, ModelTransform, ModelVertex,
 };
 #[cfg(feature = "fbx")]
 use std::collections::HashMap;
@@ -516,6 +516,22 @@ fn encode_animations(writer: &mut Writer, animations: &[ModelAnimation]) -> Resu
             encode_keys(writer, &track.rotation, |value| value.into_iter())?;
             encode_keys(writer, &track.scale, |value| value.into_iter())?;
         }
+        writer.count(animation.markers.len())?;
+        for marker in &animation.markers {
+            writer.string(&marker.name)?;
+            writer.f32(marker.time)?;
+        }
+        encode_strings(writer, &animation.file_marker_warnings)?;
+        encode_strings(writer, &animation.marker_warnings)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "fbx", test))]
+fn encode_strings(writer: &mut Writer, values: &[String]) -> Result<(), String> {
+    writer.count(values.len())?;
+    for value in values {
+        writer.string(value)?;
     }
     Ok(())
 }
@@ -537,12 +553,12 @@ fn encode_keys<const N: usize>(
 }
 
 fn decode_animations(reader: &mut Reader<'_>) -> Result<Vec<ModelAnimation>, String> {
-    let count = reader.count(8, "анимаций")?;
+    let count = reader.count(24, "анимаций")?;
     let mut animations = reader.vector::<ModelAnimation>(count)?;
     for _ in 0..count {
         let name = reader.string()?;
         let duration = reader.f32()?;
-        let track_count = reader.count(4, "дорожек анимации")?;
+        let track_count = reader.count(16, "дорожек анимации")?;
         let mut tracks = reader.vector::<ModelTrack>(track_count)?;
         for _ in 0..track_count {
             let node = reader.string()?;
@@ -553,13 +569,35 @@ fn decode_animations(reader: &mut Reader<'_>) -> Result<Vec<ModelAnimation>, Str
                 scale: decode_keys::<3>(reader)?,
             });
         }
+        let marker_count = reader.count(8, "маркеров анимации")?;
+        let mut markers = reader.vector::<ModelMarker>(marker_count)?;
+        for _ in 0..marker_count {
+            markers.push(ModelMarker {
+                name: reader.string()?,
+                time: reader.f32()?,
+            });
+        }
+        let file_marker_warnings = decode_strings(reader, "предупреждений маркеров файла")?;
+        let marker_warnings = decode_strings(reader, "предупреждений маркеров клипа")?;
         animations.push(ModelAnimation {
             name,
             duration,
             tracks,
+            markers,
+            file_marker_warnings,
+            marker_warnings,
         });
     }
     Ok(animations)
+}
+
+fn decode_strings(reader: &mut Reader<'_>, what: &str) -> Result<Vec<String>, String> {
+    let count = reader.count(4, what)?;
+    let mut values = reader.vector::<String>(count)?;
+    for _ in 0..count {
+        values.push(reader.string()?);
+    }
+    Ok(values)
 }
 
 fn decode_keys<const N: usize>(reader: &mut Reader<'_>) -> Result<Vec<ModelKey<[f32; N]>>, String> {
@@ -640,6 +678,25 @@ fn validate(model: &PreparedModel) -> Result<(), String> {
             .any(|joint| joint.node >= skeleton.nodes.len())
         {
             return Err("индекс узла сустава выходит за пределы скелета".to_owned());
+        }
+    }
+    validate_animations(&model.model_animations)?;
+    validate_animations(&model.clips)?;
+    Ok(())
+}
+
+fn validate_animations(animations: &[ModelAnimation]) -> Result<(), String> {
+    for animation in animations {
+        for marker in &animation.markers {
+            if !crate::animation::is_marker_identifier(&marker.name) {
+                return Err("готовая модель содержит некорректное имя маркера".to_owned());
+            }
+            if !marker.time.is_finite() || marker.time < 0.0 {
+                return Err(
+                    "время маркера готовой модели должно быть конечным числом не меньше нуля"
+                        .to_owned(),
+                );
+            }
         }
     }
     Ok(())
@@ -884,7 +941,7 @@ mod tests {
         MaterialRecipe, PREBUILT_MODEL_MAX_BYTES, PreparedMesh, PreparedModel, TextureReference,
         decode, decode_with_limits, encode, encode_with_limit, is_prebuilt_model,
     };
-    use crate::ModelVertex;
+    use crate::{ModelMarker, ModelVertex};
 
     fn skeleton_node(
         name: &str,
@@ -979,6 +1036,12 @@ mod tests {
                 rotation: Vec::new(),
                 scale: Vec::new(),
             }],
+            markers: vec![ModelMarker {
+                name: "FootDown".to_owned(),
+                time: 0.25,
+            }],
+            file_marker_warnings: vec!["file marker warning".to_owned()],
+            marker_warnings: vec!["clip marker warning".to_owned()],
         };
         model.model_animations = vec![clip.clone()];
         model.clips = vec![clip];
@@ -1046,6 +1109,27 @@ mod tests {
                 "accepted rich artifact prefix length {end}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_non_finite_or_negative_marker_times_and_invalid_names() {
+        for time in [f32::NAN, f32::INFINITY, -0.1] {
+            let mut invalid = model_with_skeleton_skin_and_clips();
+            invalid.model_animations[0].markers[0].time = time;
+            assert!(
+                decode(&encode(&invalid).unwrap())
+                    .unwrap_err()
+                    .contains("время маркера")
+            );
+        }
+
+        let mut invalid = model_with_skeleton_skin_and_clips();
+        invalid.model_animations[0].markers[0].name = "not-valid".to_owned();
+        assert!(
+            decode(&encode(&invalid).unwrap())
+                .unwrap_err()
+                .contains("некорректное имя маркера")
+        );
     }
 
     #[test]

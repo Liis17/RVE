@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "engine-animation"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "engine-assets"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bevy_mikktspace",
  "engine-files",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "crash-handler",
  "egui",
