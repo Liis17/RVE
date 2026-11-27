@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "crash-handler",
  "egui",
@@ -1192,6 +1192,7 @@ dependencies = [
  "png",
  "rfd",
  "rve-crash-monitor",
+ "rve-play-ipc",
  "rve-sdk",
  "sysinfo",
  "winit",

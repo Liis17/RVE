@@ -107,6 +107,12 @@ fn password(args: &NetworkArgs) -> Result<Option<Password>, String> {
             .map_err(|error| format!("файл пароля {}: {error}", path.display()))?;
         return password_from_bytes(bytes, "файл пароля").map(Some);
     }
+    if let Some(password) = &args.editor_password {
+        if password.is_empty() {
+            return Ok(None);
+        }
+        return password_from_bytes(password.as_bytes().to_vec(), "пароль редактора").map(Some);
+    }
     match std::env::var_os(PASSWORD_ENV) {
         Some(value) => password_from_bytes(value.into_encoded_bytes(), PASSWORD_ENV).map(Some),
         None => Ok(None),

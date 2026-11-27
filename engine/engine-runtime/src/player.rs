@@ -4,6 +4,7 @@ use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame, ConsoleUiSlot, snap
 use crate::cursor::CursorControl;
 #[cfg(feature = "dev-console")]
 use crate::dev_overlays::DevOverlays;
+use crate::editor_ipc::EditorIpc;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::ModuleHost;
 use crate::pipeline::{
@@ -34,6 +35,7 @@ use engine_window::{
     Key, MouseButton, TextInputEvent, Window, WindowConfig, WindowHandler, WindowProxy, run,
 };
 use flume::{Receiver, Sender};
+use rve_play_ipc::PlayerStatus;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,6 +81,8 @@ pub(crate) struct PlayerConfig {
     pub prefab_loader_stopped_rx: std::sync::mpsc::Receiver<()>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
+    /// Связь с редактором (`--editor-ipc`): статус, журнал и запрос остановки.
+    pub editor_ipc: Option<Arc<EditorIpc>>,
     pub resource_stats: ResourceHandle,
     pub startup: StartupProfile,
     pub input: Arc<Mutex<InputAccumulator>>,
@@ -120,6 +124,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         prefab_loader_stopped_rx,
         interrupt,
         status,
+        editor_ipc,
         resource_stats,
         startup,
         input,
@@ -161,6 +166,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         prefab_loader_stopped_rx: Some(prefab_loader_stopped_rx),
         interrupt,
         status: Arc::clone(&status),
+        editor_ipc,
         resource_stats,
         startup,
         render_stopped_rx: None,
@@ -233,6 +239,7 @@ struct PlayerWindow<'a> {
     prefab_loader_stopped_rx: Option<std::sync::mpsc::Receiver<()>>,
     interrupt: ScriptInterruptHandle,
     status: Arc<RuntimeStatus>,
+    editor_ipc: Option<Arc<EditorIpc>>,
     resource_stats: ResourceHandle,
     startup: StartupProfile,
     render_stopped_rx: Option<Receiver<()>>,
@@ -769,6 +776,10 @@ fn wait_for_render_or_detach(
 
 impl WindowHandler for PlayerWindow<'_> {
     fn attach_proxy(&mut self, proxy: WindowProxy) {
+        if let Some(ipc) = &self.editor_ipc {
+            let waker = proxy.clone();
+            ipc.attach_waker(move || waker.wake());
+        }
         self.activation.attach(proxy.clone());
         self.cursor.attach(proxy.clone());
         self.platform.attach(&proxy);
@@ -806,16 +817,20 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn next_wakeup(&mut self) -> Option<Instant> {
+        let emergency = self
+            .editor_ipc
+            .as_ref()
+            .and_then(|ipc| ipc.emergency_deadline());
         #[cfg(feature = "dev-console")]
         if self.overlays.visible()
             && let Some(console_wakeup) = self.console_repaint_at
         {
-            return Some(
-                self.close_deadline
-                    .map_or(console_wakeup, |current| current.min(console_wakeup)),
-            );
+            let window = self
+                .close_deadline
+                .map_or(console_wakeup, |current| current.min(console_wakeup));
+            return earliest_deadline(Some(window), emergency);
         }
-        self.close_deadline
+        earliest_deadline(self.close_deadline, emergency)
     }
 
     fn init(&mut self, window: Arc<Window>) -> bool {
@@ -954,6 +969,9 @@ impl WindowHandler for PlayerWindow<'_> {
             let _ = self.render_tx.send(RenderControl::Shutdown);
             return false;
         }
+        if let Some(ipc) = &self.editor_ipc {
+            ipc.send_status(PlayerStatus::Running);
+        }
         true
     }
 
@@ -962,6 +980,21 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn update(&mut self, window: &Window) -> bool {
+        if self
+            .editor_ipc
+            .as_ref()
+            .is_some_and(|ipc| ipc.emergency_exit_due(Instant::now()))
+        {
+            // Редактор не вернулся за дедлайн после обрыва связи: процесс не ждёт закрытия окна.
+            std::process::exit(1);
+        }
+        let stop_requested = self
+            .editor_ipc
+            .as_ref()
+            .is_some_and(|ipc| ipc.stop_requested());
+        if editor_stop_begins_close(stop_requested, self.close_deadline.is_some()) {
+            self.close_requested();
+        }
         if close_timed_out(
             Instant::now(),
             self.close_deadline,
@@ -989,8 +1022,12 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn close_requested(&mut self) -> bool {
-        self.close_deadline
-            .get_or_insert_with(|| Instant::now() + CLOSE_TIMEOUT);
+        if self.close_deadline.is_none() {
+            self.close_deadline = Some(Instant::now() + CLOSE_TIMEOUT);
+            if let Some(ipc) = &self.editor_ipc {
+                ipc.send_status(PlayerStatus::Stopping);
+            }
+        }
         let _ = self.script_tx.send(ScriptControl::Shutdown);
         let _ = self.render_tx.send(RenderControl::Shutdown);
         false
@@ -1087,6 +1124,20 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 }
 
+/// Stop из редактора начинает закрытие окна тем же путём, что запрос закрытия; повторный запрос ничего не меняет.
+fn editor_stop_begins_close(stop_requested: bool, closing: bool) -> bool {
+    stop_requested && !closing
+}
+
+/// Ближайший из двух дедлайнов ожидания; `None` значит, что дедлайна нет.
+fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (first, None) => first,
+        (None, second) => second,
+    }
+}
+
 fn close_timed_out(now: Instant, deadline: Option<Instant>, render_stopped: bool) -> bool {
     !render_stopped && deadline.is_some_and(|deadline| now >= deadline)
 }
@@ -1153,8 +1204,9 @@ mod debug_view_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeThreads, cleanup_threads, close_timed_out, wait_for_prefab_loader_or_detach,
-        wait_for_render_or_detach, wait_for_scripts_or_detach,
+        RuntimeThreads, cleanup_threads, close_timed_out, earliest_deadline,
+        editor_stop_begins_close, wait_for_prefab_loader_or_detach, wait_for_render_or_detach,
+        wait_for_scripts_or_detach,
     };
     use crate::module_host::ModuleHost;
     use crate::pipeline::RuntimeStatus;
@@ -1174,6 +1226,23 @@ mod tests {
         ));
         assert!(close_timed_out(now, Some(now), false));
         assert!(!close_timed_out(now, Some(now), true));
+    }
+
+    #[test]
+    fn editor_stop_begins_closing_once() {
+        assert!(!editor_stop_begins_close(false, false));
+        assert!(editor_stop_begins_close(true, false));
+        assert!(!editor_stop_begins_close(true, true));
+    }
+
+    #[test]
+    fn earliest_deadline_keeps_the_nearest_wakeup() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(5);
+        assert_eq!(earliest_deadline(Some(later), Some(now)), Some(now));
+        assert_eq!(earliest_deadline(None, Some(now)), Some(now));
+        assert_eq!(earliest_deadline(Some(now), None), Some(now));
+        assert_eq!(earliest_deadline(None, None), None);
     }
 
     #[derive(Default)]
