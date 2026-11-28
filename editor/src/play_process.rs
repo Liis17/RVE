@@ -1055,6 +1055,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_process_never_inherits_the_network_password_variable() {
+        let mut launch = test_stub_launch("env", Vec::new());
+        // Переменная редактора не должна дойти до игрока; пароль идёт только сообщением `start`.
+        launch
+            .env
+            .push((NETWORK_PASSWORD_ENV.into(), "leaked".into()));
+        let mut process =
+            PlayProcess::spawn(launch, now(), Arc::new(|| {})).expect("spawn test stub");
+        let events = drive_until(&mut process, |_, events| {
+            events.iter().any(|event| {
+                matches!(event, PlayEvent::Log { text, .. } if text.contains("password env present"))
+            })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayEvent::Log { text, .. } if text == "stub: password env present: false"
+            )),
+            "{events:?}"
+        );
+        process.request_stop(Instant::now());
+        drive_until(&mut process, |process, _| process.is_finished());
+    }
+
+    #[test]
+    fn journal_keeps_a_bounded_window_wakes_per_record_and_counts_what_it_drops() {
+        let (control, _control_rx) = mpsc::channel();
+        let (logs, log_rx) = mpsc::sync_channel(LOG_CAPACITY);
+        let skipped = Arc::new(AtomicU64::new(0));
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&wakes);
+        let reader = Reader {
+            control,
+            logs,
+            skipped: Arc::clone(&skipped),
+            wake: Arc::new(move || {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }),
+        };
+        // Никто не читает журнал, поэтому всё сверх ёмкости считается пропущенным.
+        let records = LOG_CAPACITY + 10;
+        for index in 0..records {
+            dispatch_record(
+                Ok(DecodedPlayerMessage::Raw(format!("line {index}"))),
+                &reader,
+            );
+        }
+        assert_eq!(log_rx.try_iter().count(), LOG_CAPACITY);
+        assert_eq!(skipped.load(Ordering::Acquire), 10);
+        assert_eq!(wakes.load(Ordering::Acquire), records as u64);
+    }
+
     fn finished(events: &[PlayEvent]) -> Option<(LogLevel, String)> {
         events.iter().find_map(|event| match event {
             PlayEvent::Finished { level, message } => Some((*level, message.clone())),
@@ -1160,6 +1213,15 @@ mod tests {
             std::process::exit(7);
         }
         write_record(&PlayerMessage::Status(PlayerStatus::Running));
+        if mode == "env" {
+            // Режим `env`: игрок сообщает, видит ли он переменную пароля сети из окружения.
+            let present = std::env::var_os("RVE_NET_PASSWORD").is_some();
+            write_record(&PlayerMessage::Log {
+                level: PlayerLogLevel::Info,
+                target: "stub".to_owned(),
+                text: format!("password env present: {present}"),
+            });
+        }
         if mode == "hang" {
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
