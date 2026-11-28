@@ -27,7 +27,8 @@ Parent: [[Index]]
 | `editor/src/toml_preserve.rs` | `preserve_formatting` | Перенос комментариев и оформления прежнего файла в сохраняемый TOML |
 | `editor/src/asset_refs.rs` | `PathRemap`, `scan`, `rename_with_references` | Поиск ссылок сцен, префабов и `prefabs.rveprefabs` и переименование в Project вместе с их переписыванием без частичного состояния |
 | `editor/src/asset_watch.rs` | `AssetWatcher`, `AssetChanges`, `ChangeBatch` | Watcher `Assets/`, классификация путей, debounce и выборочная обработка изменений |
-| `editor/src/play_network.rs` | `PlayNetwork`, `PlayNetworkForm`, `PlayNetworkPlan`, `PlayNetworkMode` | Сетевой Play: выбор Offline/Host/Client, проверка полей и мост к миру сессии |
+| `editor/src/play_network.rs` | `PlayNetwork`, `PlayNetworkForm`, `PlayNetworkPlan`, `PlayNetworkMode`, `ProcessNetwork` | Сетевой Play: выбор Offline/Host/Client, проверка полей и мост к миру сессии; для Play в отдельном процессе те же проверки дают флаги `rve-player` |
+| `editor/src/play_process.rs` | `PlayProcess`, `PlayMachine`, `PlayEvent`, `PlayerLaunch`, `player_program`, `player_args` | Play в отдельном процессе `rve-player --editor-ipc`: поиск бинаря, аргументы, протокол stdin/stdout, машина состояний с таймаутами и завершение дерева процессов |
 | `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` |
 | `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` и `.postprocess`; создание, сохранение и загрузка `.rvephysmat` для Play |
 | `editor/src/new_project.rs` | `create_project` | Встроенный starter template и атомарное создание нового проекта |
@@ -36,7 +37,7 @@ Parent: [[Index]]
 | editor/src/ui/asset_inspector.rs, editor/src/ui/material_preview.rs | material/shader inspector и Material Preview tab | Редактирование свойств, open in system editor и preview controls для plane/cube/sphere |
 | `editor/src/icons.rs` | `IconCache`, `folder_icon`, `file_icon`, `component_icon`, `object_icon` | Иконки из `IconsPack`: выбор для папок, файлов Project, заголовков компонентов Inspector и строк Hierarchy, загрузка UI-текстур один раз |
 | `editor/build.rs` | — | Растеризация `IconsPack/**/*.svg` через resvg в RGBA 128×128 на этапе сборки |
-| `editor/src/build.rs` | `BuildJob`, `ScriptsJob`, `ScriptGeneration`, `locate_build_tool` | File → Build Player и автоматическая сборка heavy scripts через дочерний `rve-build`; вывод идёт в Console |
+| `editor/src/build.rs` | `BuildJob`, `ScriptsJob`, `ScriptGeneration`, `locate_build_tool`, `ProcessTree` | File → Build Player и автоматическая сборка heavy scripts через дочерний `rve-build`; вывод идёт в Console |
 | `editor/src/play.rs` | `PlaySession`, `PlayPhysics`, `PlayAudio`, `HeavyLoads`, `Watchdog` | Копия мира, скрипты, per-Play physics thread, звуковой поток, фоновая загрузка тяжёлых префабов, прерывание зависшего Lua и мост анимации Play |
 | `editor/src/viewport/animation.rs` | `EditorAnimation`, `AnimationPreview`, `PreviewStatus`, `project_bridge`, `project_preview_bridge` | Мост превью выбранного аниматора, его настройки и сведения для инспектора; Play-мост строится через `project_bridge` |
 | `editor/src/play_cursor.rs` | `PlayCursor`, `play_cursor_captured`, `sync`, `focus_game_tab` | Захват курсора панелью Game во время Play и состояние, отправляемое в окно |
@@ -188,6 +189,22 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 `Watchdog` прерывает скрипты, если загрузка, кадр или `on_destroy` выполняются дольше 5 секунд. Для Lua прерывание постоянно и отключает все lite-скрипты сессии. Выполняющийся Rust-скрипт останавливается на ближайшем вызове API движка и отключается; прочие Rust-скрипты продолжают работу. Пока участок не закрыт, watchdog после срабатывания снова взводит срок, поэтому каждый следующий зависший Rust-вызов того же кадра тоже прерывается через 5 секунд. Цикл Rust-скрипта без обращений к движку и без `Context::is_interrupted` по-прежнему останавливает весь редактор ([[Engine/RveSdk]]).
 
 Сетка редактора рисуется с `casts_shadow = false`: иначе её линии попадают в shadow map и ложатся тенями на объекты.
+
+### Play в отдельном процессе
+
+Настройка `play_in_process` (`UserSettings`, по умолчанию выключена; переключатель Process в тулбаре рядом с Play) переводит следующий Play из встроенной `PlaySession` в дочерний процесс `rve-player --editor-ipc`. Встроенный Play без этой настройки работает как раньше. Протокол — [[Engine/RvePlayIpc]], сторона игрока — [[Engine/EngineRuntime#Режим редактора]].
+
+- Бинарь ищется рядом с редактором. При `rve-sdk.toml` берётся `rve-player-dev[.exe]`, иначе `rve-player[.exe]` (в checkout — `build/debug`). Если файла нет, Console получает ошибку с подсказкой `cargo build -p rve-player`.
+- Аргументы: `--project`, `--editor-ipc`, `--save-path <project>/.rve/playersave/save.toml`; `--scripts` указывает на копию библиотеки (`.rve/editor/scripts/`) или на явный `--scripts`; `--prefab-catalog` передаётся только для несохранённого открытого списка префабов. Снимок этого списка пишется в `.rve/editor/play/` и удаляется после выхода процесса. Сетевые флаги: `--host [--host-addr 0.0.0.0:<порт>]` или `--connect` с `--server-fingerprint` либо `--insecure-no-pin`. Проверки формы сети совпадают с встроенным Play.
+- Пароль комнаты не попадает в аргументы: он уходит сообщением `start`, переменная `RVE_NET_PASSWORD` из окружения редактора у дочернего процесса удаляется. Пароль с переводом строки отклоняется до запуска.
+- Редактор не загружает библиотеку скриптов на пути Play: `start_play_now` для этого режима её не требует и не вызывает `load_manual_library`. Библиотека для Inspector по-прежнему загружается после autobuild и при явном `--scripts`. Остаточный риск: зависание при загрузке библиотеки внутри самого редактора не покрыто изоляцией.
+- Порядок старта: `write_autosave` как у встроенного Play, затем `spawn`. `hello` должен прийти за 10 с, иначе процесс завершается. После `hello` редактор отправляет `start`; `running` приходит, когда окно игры работает. Машина состояний `PlayMachine`: `Launching` → `Loading` → `Running` → `Stopping` → `Killing` → `Exited`. Версия протокола, которую редактор не поддерживает, статус до `hello` или повторный `hello` завершают процесс.
+- Stop посылает `stop` и ставит срок 10 с. Если процесс не вышел, `ProcessTree` (общий с `BuildJob`) завершает всё дерево: на Unix — SIGKILL группе процессов до `wait`, на Windows — `TerminateJobObject` для Job Object с kill-on-close. В дереве только игрок и его `rve-crash-monitor`; поиска по имени нет. Срок действует и тогда, когда игрок сам перешёл в `stopping`.
+- Опрос без кадров: потоки читателей stdout и stderr складывают сообщения в каналы и будят окно через `WindowProxy::wake`. Управляющие сообщения (`hello`, `status`) не ограничены, журнал ограничен 8192 записями (пропуски пишутся в Console), в один опрос переносится до 512 записей. `next_wakeup` ставит опрос каждые 100 мс, пока процесс жив, и ближайший срок машины или дочитывания (1 с после выхода).
+- Итог после выхода и дочитывания потоков: код 0 — `Play stopped`; если выход был до запуска окна, то предупреждение (возможно, игра уже запущена при `AllowMultipleInstances=false`). Коды 1–4 — ошибка с расшифровкой из [[Engine/EngineRuntime]], прочие коды и сигнал — ошибка. Завершение редактором — предупреждение с причиной. Редактор возвращается в edit mode, временные файлы удаляются.
+- Пока процесс жив, `EditorState::is_playing` истинно и правки запрещены. Выход из редактора и смена проекта откладываются до выхода процесса: сначала запускается Stop, а действие выполняется в кадре после итога. При закрытии редактора `shutdown` ждёт 2 с после `stop`, затем завершает дерево.
+- MCP: `play_start` возвращает `starting`, `play_stop` — `stopping`, пока процесс не вышел, и `stopped` без процесса. `play_pause`, `play_resume` и `console_command` возвращают ошибку. Консоль редактора в процессе тоже недоступна. Панель Game показывает подпись «Play идёт в отдельном окне rve-player».
+- Не входит: пауза, консоль редактора, кадры игры в панели Game, геймпады и звук в редакторе (их ведёт игрок), автосборка `rve-player`.
 
 ### Курсор в Game
 

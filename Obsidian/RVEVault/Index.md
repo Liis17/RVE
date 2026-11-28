@@ -34,6 +34,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineConsole]] | Ограниченный буфер лога, кольцо последних строк для отчётов о падении, упорядоченный каталог команд с поиском по ссылкам и общий egui developer console |
 | [[Engine/RveSdk]] | C ABI и гостевой API для игровых Rust-скриптов в `cdylib` |
 | [[Engine/EngineRuntime]] | Runtime игры: layout проекта, потоки сцены, скриптов и рендера, быстрые и тяжёлые префабы, сетевой режим и выделенный сервер `rve-server`, отчёты о падении (текстовые и minidump через `rve-crash-monitor`), завершение и коды выхода |
+| [[Engine/RvePlayIpc]] | Протокол Play в отдельном процессе: строки stdin/stdout с маркером, сообщения `hello`/`status`/`log`/`exit` и `start`/`stop`, версия протокола |
 | [[Engine/RveBuild]] | Сборка релиза проекта в player, сервер и монитор падений `rve-crash-monitor` и набор RVEPAK |
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 | [[Engine/RveEditor]] | Графический редактор сцен на egui: панели, правки с undo, вьюпорт и Play |
