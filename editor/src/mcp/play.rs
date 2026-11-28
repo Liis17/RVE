@@ -50,11 +50,14 @@ pub(super) fn call(
             Ok(json!({"status": status}))
         }
         "play_stop" => {
-            app.mcp_stop_play();
-            Ok(json!({"status": "stopped"}))
+            let status = app.mcp_stop_play();
+            Ok(json!({"status": status}))
         }
         "play_pause" | "play_resume" => {
             let paused = tool == "play_pause";
+            if app.mcp_state_mut().play_process.is_some() {
+                return Err("pause is not available for Play in a separate process".to_owned());
+            }
             let play = app
                 .mcp_state_mut()
                 .play
@@ -65,6 +68,11 @@ pub(super) fn call(
         }
         "console_command" => {
             let command = required_string(arguments, "command")?;
+            if app.mcp_state_mut().play_process.is_some() {
+                return Err(
+                    "console commands are not available for Play in a separate process".to_owned(),
+                );
+            }
             if !app.mcp_state_mut().is_playing() {
                 return Err("console commands are available only during Play".to_owned());
             }
@@ -139,5 +147,39 @@ mod tests {
         assert!(!app.mcp_state_mut().is_playing());
         drop(app);
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn separate_play_process_refuses_pause_and_console_and_reports_stopping() {
+        let mut app = EditorApp::new_for_mcp_tests_with_state(EditorState::new(None));
+        let process = crate::play_process::PlayProcess::spawn(
+            crate::play_process::test_stub_launch("exit", Vec::new()),
+            std::time::Instant::now(),
+            std::sync::Arc::new(|| {}),
+        )
+        .unwrap();
+        app.mcp_state_mut().play_process = Some(process);
+        let play_permission = || Permissions {
+            play: true,
+            ..Permissions::default()
+        };
+
+        let pause = call(&mut app, "play_pause", &json!({}), play_permission()).unwrap_err();
+        assert!(pause.contains("separate process"), "{pause}");
+        let resume = call(&mut app, "play_resume", &json!({}), play_permission()).unwrap_err();
+        assert!(resume.contains("separate process"), "{resume}");
+        let console = call(
+            &mut app,
+            "console_command",
+            &json!({"command": "help"}),
+            play_permission(),
+        )
+        .unwrap_err();
+        assert!(console.contains("separate process"), "{console}");
+
+        let stopped = call(&mut app, "play_stop", &json!({}), play_permission()).unwrap();
+        assert_eq!(stopped, json!({"status": "stopping"}));
+        assert!(app.mcp_state_mut().is_playing());
+        // Тестовый стаб выходит по `stop`; при удалении редактора процесс дождётся выхода.
     }
 }

@@ -3365,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.42.0"
+version = "0.43.0"
 dependencies = [
  "base64",
  "blake3",
@@ -3400,6 +3400,7 @@ dependencies = [
  "png",
  "resvg",
  "rfd",
+ "rve-play-ipc",
  "rve-sdk",
  "serde",
  "serde_json",

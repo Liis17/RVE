@@ -7,6 +7,7 @@ use crate::layout::Tab;
 use crate::mcp::{McpHost, capture};
 use crate::play::{PlayPrefabs, PlayScene, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
+use crate::play_process::{self, PlayEvent, PlayProcess, PlayerLaunch, Waker};
 use crate::project::OpenProject;
 use crate::project_prefabs::{ProjectPrefabs, play_catalog};
 use crate::scene_edit::EditorScene;
@@ -326,6 +327,7 @@ impl EditorApp {
         }
         let dock = user.layout_or_default();
         state.scroll_navigation = user.scroll_navigation;
+        state.play_in_process = user.play_in_process;
         state.recent_projects = user.recent_projects.clone();
         let preferences = Preferences::default();
         Self {
@@ -589,7 +591,9 @@ impl EditorApp {
             }
         }
         self.start_play();
-        if self.state.is_playing() {
+        if self.state.play_process.is_some() {
+            Ok("starting".to_owned())
+        } else if self.state.is_playing() {
             Ok("running".to_owned())
         } else if self.state.pending_play {
             Ok("building_scripts".to_owned())
@@ -598,8 +602,15 @@ impl EditorApp {
         }
     }
 
-    pub(crate) fn mcp_stop_play(&mut self) {
+    /// Статус для MCP: `stopping`, пока отдельный процесс ещё не вышел, иначе `stopped`.
+    pub(crate) fn mcp_stop_play(&mut self) -> &'static str {
+        let separate_process = self.state.play_process.is_some();
         self.stop_play();
+        if separate_process {
+            "stopping"
+        } else {
+            "stopped"
+        }
     }
 
     pub(crate) fn mcp_console_command(&mut self, command: &str) {
@@ -799,6 +810,7 @@ impl EditorApp {
         self.user_settings.recent_projects = self.state.recent_projects.clone();
         self.user_settings.layout = Some(self.dock.clone());
         self.user_settings.scroll_navigation = self.state.scroll_navigation;
+        self.user_settings.play_in_process = self.state.play_in_process;
         let runtime_enabled = self.user_settings.mcp.enabled;
         if self.mcp_cli_enabled {
             self.user_settings.mcp.enabled = self.stored_mcp_enabled;
@@ -1438,7 +1450,7 @@ impl EditorApp {
     }
 
     fn reload_generated_library(&mut self, source: &Path) -> Result<(), String> {
-        if self.state.play.is_some() {
+        if self.state.is_playing() {
             return Err("scripts cannot be reloaded during Play".to_owned());
         }
         let project = self
@@ -1605,6 +1617,9 @@ impl EditorApp {
     }
 
     fn start_play(&mut self) {
+        if self.state.is_playing() {
+            return;
+        }
         let Some(scene) = &self.state.scene else {
             return;
         };
@@ -1628,6 +1643,10 @@ impl EditorApp {
             return;
         }
         self.write_autosave();
+        if self.state.play_in_process {
+            self.start_player_process();
+            return;
+        }
         let Some(project) = &self.state.project else {
             return;
         };
@@ -1764,6 +1783,142 @@ impl EditorApp {
         }
     }
 
+    /// Play в отдельном процессе: `rve-player --editor-ipc` читает проект с диска. Библиотека скриптов
+    /// передаётся путём к копии, несохранённый список тяжёлых префабов — временным файлом. Редактор
+    /// библиотеку на этом пути не загружает: её грузит только Inspector.
+    fn start_player_process(&mut self) {
+        let Some(project) = &self.state.project else {
+            return;
+        };
+        let root = project.root.clone();
+        let network = match self
+            .state
+            .play_network
+            .process_arguments(&project.settings.network)
+        {
+            Ok(network) => network,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let (network_args, network_summary, password) = match network {
+            Some(network) => (network.args, Some(network.summary), network.password),
+            None => (Vec::new(), None, None),
+        };
+        let program = match std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_owned))
+            .ok_or_else(|| "не удалось определить каталог редактора".to_owned())
+            .and_then(|dir| play_process::player_program(&dir))
+        {
+            Ok(program) => program,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let scripts = self.state.scripts_path.clone().or_else(|| {
+            self.state
+                .script_generation
+                .as_ref()
+                .map(|generation| generation.path.clone())
+        });
+        let mut temp_files = Vec::new();
+        let unsaved = self
+            .state
+            .project_prefabs
+            .as_ref()
+            .is_some_and(|list| list.is_dirty() && list.root() == root);
+        if unsaved {
+            match write_play_catalog(&root, self.state.project_prefabs.as_ref()) {
+                Ok(path) => temp_files.push(path),
+                Err(error) => {
+                    self.state.log.error(error);
+                    return;
+                }
+            }
+        }
+        let save_path = player_save_path(&root);
+        let launch = PlayerLaunch {
+            program,
+            args: play_process::player_args(
+                &root,
+                &save_path,
+                scripts.as_deref(),
+                temp_files.first().map(PathBuf::as_path),
+                &network_args,
+            ),
+            password,
+            temp_files: temp_files.clone(),
+            env: Vec::new(),
+        };
+        let waker: Waker = match self.proxy.clone() {
+            Some(proxy) => Arc::new(move || proxy.wake()),
+            None => Arc::new(|| {}),
+        };
+        match PlayProcess::spawn(launch, Instant::now(), waker) {
+            Ok(process) => {
+                self.state.play_process = Some(process);
+                self.state.play_cursor.reset();
+                self.state.log.info("Play в отдельном процессе");
+                if let Some(summary) = network_summary {
+                    self.state.log.info(summary);
+                }
+            }
+            Err(error) => {
+                for path in &temp_files {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.state
+                    .log
+                    .error(format!("не удалось запустить rve-player: {error}"));
+            }
+        }
+    }
+
+    /// Переносит события Play-процесса в Console. Возвращает `true`, если процесс завершился.
+    fn take_play_events(&mut self, events: Vec<PlayEvent>) -> bool {
+        let mut finished = false;
+        for event in events {
+            match event {
+                PlayEvent::Log { level, text } => self.state.log.push(level, text),
+                PlayEvent::Finished { level, message } => {
+                    self.state.log.push(level, message);
+                    finished = true;
+                }
+            }
+        }
+        finished
+    }
+
+    /// Опрос из кадра: при завершении процесса редактор возвращается в edit mode, а действие,
+    /// отложенное выходом или сменой проекта, выполняется. `true`, если было событие.
+    fn poll_play_process(&mut self, now: Instant) -> bool {
+        let Some(process) = self.state.play_process.as_mut() else {
+            return false;
+        };
+        let events = process.poll(now);
+        if events.is_empty() {
+            return false;
+        }
+        if self.take_play_events(events) {
+            self.state.play_process = None;
+            if let Some(action) = self.state.play_deferred.take() {
+                self.state.action(action);
+                self.run_actions();
+            }
+        }
+        true
+    }
+
+    /// Выход или смена проекта во время Play-процесса: процесс останавливается, действие выполнится
+    /// после его выхода, поэтому окно редактора не закрывается раньше времени.
+    fn defer_until_play_process_exits(&mut self, action: Action) {
+        self.stop_play();
+        self.state.play_deferred = Some(action);
+    }
+
     /// Loads the explicit `--scripts` library used for Inspector schemas and Play.
     fn load_manual_library(&mut self) -> bool {
         if self.state.library.is_some() {
@@ -1786,6 +1941,11 @@ impl EditorApp {
     }
 
     fn stop_play(&mut self) {
+        if let Some(process) = self.state.play_process.as_mut() {
+            let events = process.request_stop(Instant::now());
+            self.take_play_events(events);
+            return;
+        }
         Self::stop_play_session(&mut self.state, self.gpu.as_mut());
     }
 
@@ -1922,13 +2082,17 @@ impl EditorApp {
                 | Action::OpenProject
                 | Action::OpenProjectAt(_)
                 | Action::Exit) => {
-                    if action == Action::Exit {
-                        self.stop_play();
-                    }
-                    if self.state.is_playing() {
-                        self.state.log.error("Сначала остановите Play-режим");
+                    if self.state.play_process.is_some() {
+                        self.defer_until_play_process_exits(action);
                     } else {
-                        self.run_guarded(action);
+                        if action == Action::Exit {
+                            self.stop_play();
+                        }
+                        if self.state.is_playing() {
+                            self.state.log.error("Сначала остановите Play-режим");
+                        } else {
+                            self.run_guarded(action);
+                        }
                     }
                 }
             }
@@ -2294,7 +2458,12 @@ fn submit_console_command(state: &mut EditorState, text: &str) {
     }
 
     let Some(play) = &mut state.play else {
-        state.log.error("доступно только в Play");
+        let message = if state.play_process.is_some() {
+            "консоль недоступна для Play в отдельном процессе"
+        } else {
+            "доступно только в Play"
+        };
+        state.log.error(message);
         return;
     };
     let result = play.execute_command(&command);
@@ -2302,6 +2471,20 @@ fn submit_console_command(state: &mut EditorState, text: &str) {
     if let Err(error) = result {
         state.log.error(error.to_string());
     }
+}
+
+/// Снимок несохранённого списка тяжёлых префабов для `--prefab-catalog`. Файл живёт в каталоге
+/// `.rve/editor/play` и удаляется, когда процесс Play завершился.
+fn write_play_catalog(root: &Path, edited: Option<&ProjectPrefabs>) -> Result<PathBuf, String> {
+    let text = play_catalog(root, edited)?.to_toml()?;
+    let dir = root.join(".rve/editor/play");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos());
+    let path = dir.join(format!("prefabs-{}-{nanos}.rveprefabs", std::process::id()));
+    std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(path)
 }
 
 fn editor_log_buffer() -> Arc<Mutex<ConsoleBuffer>> {
@@ -3047,13 +3230,19 @@ impl WindowHandler for EditorApp {
         let previews_pending = self.state.previews.has_pending();
         let build_output = self.poll_build();
         let scripts_output = self.poll_scripts_build();
+        let play_output = self.poll_play_process(now);
         let background_pending = self.background_pending();
         if let Some(deadline) = self.repaint_at
             && Instant::now() >= deadline
         {
             self.repaint_at = None;
             window.request_redraw();
-        } else if previews_pending || build_output || scripts_output || background_pending {
+        } else if previews_pending
+            || build_output
+            || scripts_output
+            || play_output
+            || background_pending
+        {
             window.request_redraw();
         }
         !self.exit
@@ -3080,6 +3269,17 @@ impl WindowHandler for EditorApp {
             .mcp_capture
             .is_some()
             .then(|| Instant::now() + CAPTURE_POLL);
+        // Процесс Play не даёт кадров: опрос идёт по таймеру, пока он жив, и к его срокам.
+        let play_process = self
+            .state
+            .play_process
+            .is_some()
+            .then(|| Instant::now() + play_process::POLL_INTERVAL);
+        let play_deadline = self
+            .state
+            .play_process
+            .as_ref()
+            .and_then(PlayProcess::next_deadline);
         [
             self.repaint_at,
             preview,
@@ -3087,6 +3287,8 @@ impl WindowHandler for EditorApp {
             scripts,
             idle_pads,
             capture,
+            play_process,
+            play_deadline,
             self.mcp_host.next_wakeup(),
             self.autosave_deadline(),
             self.asset_changes.deadline(),
@@ -3106,6 +3308,9 @@ impl WindowHandler for EditorApp {
     }
 
     fn exiting(&mut self) {
+        if let Some(mut process) = self.state.play_process.take() {
+            process.shutdown(play_process::SHUTDOWN_GRACE);
+        }
         self.stop_play();
         capture::cancel_active(self, "editor is shutting down");
         self.mcp_host.shutdown();
@@ -3917,5 +4122,94 @@ return S
             delivered[1],
             engine_scene::world::ParticleCommand::Restart { .. }
         ));
+    }
+
+    /// Ждёт завершения Play-процесса через события читателей, а не опросом по таймеру.
+    fn wait_for_play_process_exit(app: &mut EditorApp) {
+        let started = Instant::now();
+        while app.state.play_process.is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "Play process did not finish"
+            );
+            app.poll_play_process(Instant::now());
+            if let Some(process) = app.state.play_process.as_mut() {
+                process.wait_event(Duration::from_millis(100));
+            }
+        }
+    }
+
+    fn separate_play(app: &mut EditorApp, mode: &str) {
+        let launch = crate::play_process::test_stub_launch(mode, Vec::new());
+        let process = PlayProcess::spawn(launch, Instant::now(), Arc::new(|| {})).unwrap();
+        app.state.play_process = Some(process);
+    }
+
+    #[test]
+    fn separate_play_process_blocks_edits_logs_its_output_and_returns_to_edit_mode() {
+        let mut app = EditorApp::new_for_mcp_tests_with_state(EditorState::new(None));
+        separate_play(&mut app, "hang");
+        assert!(app.state.is_playing());
+
+        // Журнал процесса попадает в Console до остановки: hang-стаб сообщает pid потомка.
+        let started = Instant::now();
+        while !app
+            .state
+            .log
+            .entries()
+            .any(|entry| entry.level == LogLevel::Info && entry.message.contains("descendant"))
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "no log line from the process"
+            );
+            app.poll_play_process(Instant::now());
+            if let Some(process) = app.state.play_process.as_mut() {
+                process.wait_event(Duration::from_millis(100));
+            }
+        }
+
+        // Hang-стаб не выходит по `stop`: срок остановки проверяется синтетическим временем.
+        assert_eq!(app.mcp_stop_play(), "stopping");
+        let deadline = app
+            .state
+            .play_process
+            .as_ref()
+            .and_then(PlayProcess::next_deadline)
+            .expect("stop deadline");
+        app.poll_play_process(deadline);
+        wait_for_play_process_exit(&mut app);
+
+        assert!(
+            !app.state.is_playing(),
+            "after exit the editor is back in edit mode"
+        );
+        assert!(app.state.log.entries().any(|entry| {
+            entry.level == LogLevel::Warn && entry.message.contains("завершён редактором")
+        }));
+    }
+
+    #[test]
+    fn exit_waits_for_the_separate_play_process_before_closing_the_editor() {
+        let mut app = EditorApp::new_for_mcp_tests_with_state(EditorState::new(None));
+        separate_play(&mut app, "exit");
+        app.state.action(Action::Exit);
+        app.run_actions();
+        assert!(!app.exit, "the window stays open while rve-player runs");
+        assert!(app.state.play_process.is_some());
+        assert_eq!(app.state.play_deferred, Some(Action::Exit));
+
+        wait_for_play_process_exit(&mut app);
+        assert!(
+            app.exit,
+            "the deferred exit runs after the process has finished"
+        );
+        assert!(app.state.play_deferred.is_none());
+        assert!(
+            app.state
+                .log
+                .entries()
+                .any(|entry| { entry.level == LogLevel::Info && entry.message == "Play stopped" })
+        );
     }
 }

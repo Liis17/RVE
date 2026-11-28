@@ -51,6 +51,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.label("Game недоступен для префаба");
         return;
     }
+    if state.play_process.is_some() {
+        ui.label("Play идёт в отдельном окне rve-player");
+        return;
+    }
     let Some(scene) = state.scene.as_ref() else {
         ui.label("Сцена не открыта");
         return;

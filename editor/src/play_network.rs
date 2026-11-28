@@ -181,6 +181,76 @@ impl PlayNetworkForm {
     }
 }
 
+/// Сетевые флаги `rve-player --editor-ipc` для одного Play в отдельном процессе.
+pub struct ProcessNetwork {
+    /// Флаги сети без пароля: пароль передаётся сообщением `start`, а не аргументом.
+    pub args: Vec<String>,
+    /// Строка для Console: режим и порт или адрес. Отпечаток Host печатает сам player.
+    pub summary: String,
+    /// Пароль комнаты; `None`, если поле пусто.
+    pub password: Option<String>,
+}
+
+impl PlayNetworkForm {
+    /// Проверяет форму теми же правилами, что `plan`, и выбирает флаги `rve-player`.
+    /// Сокеты и ключи не создаются: их открывает уже дочерний процесс. `Offline` даёт `None`.
+    pub fn process_arguments(
+        &self,
+        settings: &NetworkSettings,
+    ) -> Result<Option<ProcessNetwork>, String> {
+        if self.password.contains(['\r', '\n']) {
+            return Err("пароль не может содержать перевода строки".to_owned());
+        }
+        let password = (!self.password.is_empty()).then(|| self.password.clone());
+        match self.mode {
+            PlayNetworkMode::Offline => Ok(None),
+            _ if !settings.enabled => Err(NETWORK_DISABLED_HINT.to_owned()),
+            PlayNetworkMode::Host => {
+                let port = parse_port(&self.port, settings.port)?;
+                let mut args = vec!["--host".to_owned()];
+                if !self.port.trim().is_empty() {
+                    args.extend(["--host-addr".to_owned(), format!("0.0.0.0:{port}")]);
+                }
+                Ok(Some(ProcessNetwork {
+                    args,
+                    summary: format!("Сеть: Host, порт {port}"),
+                    password,
+                }))
+            }
+            PlayNetworkMode::Client => {
+                let server_addr = self.address.trim().parse::<SocketAddr>().map_err(|_| {
+                    "адрес сервера должен быть в виде адрес:порт, например 127.0.0.1:7777"
+                        .to_owned()
+                })?;
+                let fingerprint = self.fingerprint.trim();
+                let mut args = vec!["--connect".to_owned(), server_addr.to_string()];
+                match (fingerprint.is_empty(), self.insecure_no_pin) {
+                    (false, true) => {
+                        return Err("отпечаток и insecure-no-pin взаимоисключающие".to_owned());
+                    }
+                    (true, false) => {
+                        return Err(
+                            "укажите отпечаток сервера или включите insecure-no-pin".to_owned()
+                        );
+                    }
+                    (false, false) => {
+                        if engine_network::parse_fingerprint(fingerprint).is_none() {
+                            return Err("отпечаток должен содержать 64 hex-символа".to_owned());
+                        }
+                        args.extend(["--server-fingerprint".to_owned(), fingerprint.to_owned()]);
+                    }
+                    (true, true) => args.push("--insecure-no-pin".to_owned()),
+                }
+                Ok(Some(ProcessNetwork {
+                    args,
+                    summary: format!("Сеть: Client к {server_addr}"),
+                    password,
+                }))
+            }
+        }
+    }
+}
+
 /// Порт Host: пустое поле — порт из `[network]`, иначе число в диапазоне 1..=65535.
 fn parse_port(text: &str, default: u16) -> Result<u16, String> {
     let text = text.trim();
@@ -511,5 +581,121 @@ mod tests {
             NetRole::Server { password, .. } => assert!(password.is_none()),
             NetRole::Client { .. } => panic!("Host должен быть сервером"),
         }
+    }
+
+    fn process_error(form: &PlayNetworkForm, settings: &NetworkSettings) -> String {
+        match form.process_arguments(settings) {
+            Ok(_) => panic!("аргументы должны быть отклонены"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn offline_process_has_no_network_arguments_even_when_the_project_disables_network() {
+        assert!(
+            form(PlayNetworkMode::Offline)
+                .process_arguments(&settings(false))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn process_host_uses_the_port_field_or_the_project_port() {
+        let typed = PlayNetworkForm {
+            port: " 9000 ".to_owned(),
+            ..form(PlayNetworkMode::Host)
+        };
+        let network = typed.process_arguments(&settings(true)).unwrap().unwrap();
+        assert_eq!(network.args, ["--host", "--host-addr", "0.0.0.0:9000"]);
+        assert_eq!(network.summary, "Сеть: Host, порт 9000");
+
+        let project = form(PlayNetworkMode::Host)
+            .process_arguments(&settings(true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.args, ["--host"]);
+        assert_eq!(project.summary, "Сеть: Host, порт 9100");
+        assert!(project.password.is_none());
+    }
+
+    #[test]
+    fn process_host_refuses_invalid_port_and_disabled_network() {
+        let zero = PlayNetworkForm {
+            port: "0".to_owned(),
+            ..form(PlayNetworkMode::Host)
+        };
+        assert!(process_error(&zero, &settings(true)).contains("порт"));
+        assert_eq!(
+            process_error(&form(PlayNetworkMode::Host), &settings(false)),
+            super::NETWORK_DISABLED_HINT
+        );
+    }
+
+    #[test]
+    fn process_client_passes_fingerprint_or_insecure_flag_and_not_both() {
+        let pinned = client("127.0.0.1:7777", FINGERPRINT, false)
+            .process_arguments(&settings(true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pinned.args,
+            [
+                "--connect",
+                "127.0.0.1:7777",
+                "--server-fingerprint",
+                FINGERPRINT
+            ]
+        );
+
+        let insecure = client("127.0.0.1:7777", "", true)
+            .process_arguments(&settings(true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            insecure.args,
+            ["--connect", "127.0.0.1:7777", "--insecure-no-pin"]
+        );
+
+        assert!(
+            process_error(&client("127.0.0.1:7777", "", false), &settings(true))
+                .contains("отпечаток")
+        );
+        assert!(
+            process_error(
+                &client("127.0.0.1:7777", FINGERPRINT, true),
+                &settings(true)
+            )
+            .contains("взаимоисключающие")
+        );
+        assert!(
+            process_error(&client("host", FINGERPRINT, false), &settings(true)).contains("адрес")
+        );
+        assert!(
+            process_error(&client("127.0.0.1:7777", "abc", false), &settings(true))
+                .contains("64 hex")
+        );
+    }
+
+    #[test]
+    fn process_password_is_separate_from_arguments_and_rejects_line_breaks() {
+        let secured = PlayNetworkForm {
+            password: "hunter2".to_owned(),
+            ..form(PlayNetworkMode::Host)
+        };
+        let network = secured.process_arguments(&settings(true)).unwrap().unwrap();
+        assert_eq!(network.password.as_deref(), Some("hunter2"));
+        assert!(network.args.iter().all(|arg| !arg.contains("hunter2")));
+
+        let multiline = PlayNetworkForm {
+            password: "one\ntwo".to_owned(),
+            ..form(PlayNetworkMode::Host)
+        };
+        assert!(process_error(&multiline, &settings(true)).contains("перевода строки"));
+        let offline_multiline = PlayNetworkForm {
+            password: "one\r".to_owned(),
+            ..form(PlayNetworkMode::Offline)
+        };
+        assert!(process_error(&offline_multiline, &settings(true)).contains("перевода строки"));
     }
 }
