@@ -22,7 +22,8 @@ use crate::scene::{
     PreparedPrefabs, PreparedRenderAssets, SceneParticles, upload_object_levels, upload_scene,
 };
 use crate::scene_switch::{
-    SceneCommit, SceneGpuIds, SceneLoader, SceneSwitch, SceneUpload, SceneUploadReply,
+    SceneCommit, SceneGpuIds, SceneLoader, ScenePreparer, SceneSwitch, SceneUpload,
+    SceneUploadReply, start_scene_preparer,
 };
 use engine_animation::{AnimationBridge, AnimationEvent, PaletteRemap};
 use engine_assets::{Model, ModelAnimation, TextureData};

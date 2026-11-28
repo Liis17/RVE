@@ -1,16 +1,21 @@
 //! Замена сцены во время игры на scripts thread.
 //!
-//! Путь запроса: `request` загружает и проверяет новую сцену (включая пробную сборку физики)
-//! до каких-либо изменений мира и отправляет GPU-заявку. Ответ render thread принимается только
-//! для текущего поколения; `commit` вызывает `ScriptHost::replace_scene`, который проверяет
-//! совпадение id и параметров до разрушения мира. Тела добавленных объектов привязываются к физике
-//! сразу после замены в том же `commit`; удалённые объекты и звук добавленных идут дальше по
-//! `apply_world_changes`. GPU-ресурсы, которыми больше не
-//! владеет ни один живой объект, освобождаются render thread после снимка с этого кадра.
+//! Путь запроса: `begin` выдаёт поколение, а CPU-подготовка (`SceneLoader::prepare`: чтение,
+//! префабы, модели, текстуры, пробная сборка физики) идёт на потоке `rve-scene-loader` через
+//! [`ScenePreparer`]. Scripts thread на границе кадра принимает готовый результат через `prepared`
+//! и отправляет GPU-заявку; до замены текущая сцена продолжает тикать. Ответ render thread
+//! принимается только для текущего поколения; `commit` вызывает `ScriptHost::replace_scene`, который
+//! проверяет совпадение id и параметров до разрушения мира. Тела добавленных объектов привязываются
+//! к физике сразу после замены в том же `commit`; удалённые объекты и звук добавленных идут дальше
+//! по `apply_world_changes`. GPU-ресурсы, которыми больше не владеет ни один живой объект,
+//! освобождаются render thread после снимка с этого кадра.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use engine_animation::AnimationBridge;
 use engine_assets::Assets;
@@ -21,12 +26,20 @@ use engine_scene::{ObjectHandle, World};
 use engine_script::{ScriptHost, ScriptTime};
 
 use crate::game_ui::{PreparedUi, UiRegistry};
+use crate::module_host::{ModuleHost, panic_message};
 use crate::pipeline::{GpuSceneTable, SpawnPhysics, detach_object_render_data};
+use crate::prefabs::LoadError;
 use crate::prefabs::{ParticleRequest, PrefabLoads, RenderResourceRequest};
 use crate::scene::{
     PreparedPrefabs, PreparedRenderAssets, PreparedScene, color_lut_paths, load_color_luts,
-    load_scene, load_screen_shader_sources, screen_shader_paths,
+    load_scene_interruptible, load_screen_shader_sources, screen_shader_paths,
 };
+#[cfg(test)]
+use flume::Selector;
+use flume::{Receiver, Sender};
+
+/// Имя потока CPU-подготовки сцен.
+pub(crate) const SCENE_LOADER_THREAD: &str = "rve-scene-loader";
 
 /// Загрузчик сцен проекта: читает `.rvescene` и ассеты тем же `ResourceHandle`, что и старт.
 #[derive(Clone)]
@@ -37,6 +50,8 @@ pub(crate) struct SceneLoader {
     screen_shaders: bool,
     /// Mip-цепочки normal map нужны только GPU-клиенту, как при старте.
     normal_chains: bool,
+    #[cfg(test)]
+    gate: Option<ScenePrepareGate>,
 }
 
 impl SceneLoader {
@@ -51,7 +66,29 @@ impl SceneLoader {
             physics,
             screen_shaders,
             normal_chains,
+            #[cfg(test)]
+            gate: None,
         }
+    }
+
+    /// Копия загрузчика со шлюзом: подготовка входит в шлюз и ждёт [`SceneGate::release`] или
+    /// прерывания новым поколением.
+    #[cfg(test)]
+    pub(crate) fn gated(&self) -> (Self, SceneGate) {
+        let (entered_tx, entered_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        let mut loader = self.clone();
+        loader.gate = Some(ScenePrepareGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (
+            loader,
+            SceneGate {
+                entered: entered_rx,
+                release: release_tx,
+            },
+        )
     }
 
     /// Готовит сцену и пробно строит её физику, как при старте. Возвращает геометрию моделей для
@@ -59,17 +96,282 @@ impl SceneLoader {
     fn prepare(
         &self,
         path: &str,
-    ) -> Result<(PreparedScene, Vec<engine_physics::ModelGeometry>), String> {
+        interrupted: &dyn Fn() -> bool,
+        wake_rx: Option<&Receiver<()>>,
+    ) -> Result<(PreparedScene, Vec<engine_physics::ModelGeometry>), LoadError> {
+        #[cfg(test)]
+        if let Some(gate) = &self.gate {
+            if interrupted() {
+                return Err(LoadError::Interrupted);
+            }
+            let _ = gate.entered.send(());
+            // Будильник (новое поколение или остановка) открывает шлюз только если подготовка уже
+            // прервана; запоздавший будильник, пришедший при текущем поколении, ждём дальше.
+            // Отключённый `release` открывает шлюз, поэтому упавший тест не вешает `ModuleHost::shutdown`.
+            let release = loop {
+                let release = match wake_rx {
+                    Some(wake_rx) => Selector::new()
+                        .recv(&gate.release, |release| {
+                            Some(release.unwrap_or(GateRelease::Proceed))
+                        })
+                        .recv(wake_rx, |woken| {
+                            (woken.is_err() || interrupted()).then_some(GateRelease::Proceed)
+                        })
+                        .wait(),
+                    None => Some(gate.release.recv().unwrap_or(GateRelease::Proceed)),
+                };
+                if let Some(release) = release {
+                    break release;
+                }
+            };
+            if matches!(release, GateRelease::Panic) {
+                panic!("тестовая паника загрузчика сцены");
+            }
+        }
+        #[cfg(not(test))]
+        let _ = wake_rx;
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
         let assets = Assets::with_resources(self.resources.clone());
-        let mut prepared = load_scene(&self.resources, &assets, path, self.normal_chains)?;
+        let mut prepared = load_scene_interruptible(
+            &self.resources,
+            &assets,
+            path,
+            self.normal_chains,
+            interrupted,
+        )?;
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
         if self.screen_shaders {
             prepared.render_assets.screen_shaders =
                 load_screen_shader_sources(&self.resources, &prepared.world);
+            if interrupted() {
+                return Err(LoadError::Interrupted);
+            }
             prepared.render_assets.color_luts = load_color_luts(&self.resources, &prepared.world);
         }
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
         let geometry = prepared.physics_geometry();
-        prepared.build_physics(&geometry, &self.physics)?;
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
+        prepared
+            .build_physics(&geometry, &self.physics)
+            .map_err(LoadError::Failed)?;
+        if interrupted() {
+            return Err(LoadError::Interrupted);
+        }
         Ok((prepared, geometry))
+    }
+}
+
+/// Сторона теста у шлюза подготовки. `entered` получает сигнал о входе подготовки в шлюз,
+/// отправка в `release` её пропускает. Отброшенный `release` тоже открывает шлюз, поэтому падение
+/// теста не блокирует `ModuleHost::shutdown`.
+#[cfg(test)]
+pub(crate) struct SceneGate {
+    pub(crate) entered: Receiver<()>,
+    pub(crate) release: Sender<GateRelease>,
+}
+
+/// Что сделает подготовка, выйдя из шлюза теста.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum GateRelease {
+    Proceed,
+    /// Паника загрузчика: проверяет, что рабочий поток превращает её в ошибку поколения.
+    Panic,
+}
+
+/// Шлюз на стороне рабочего потока.
+#[cfg(test)]
+#[derive(Clone)]
+struct ScenePrepareGate {
+    entered: Sender<()>,
+    release: Receiver<GateRelease>,
+}
+
+/// One accepted scene request with its monotonically increasing generation.
+pub(crate) struct SceneRequest {
+    pub generation: u64,
+    pub path: String,
+}
+
+/// CPU-prepared result delivered to the scripts thread at a frame boundary.
+pub(crate) struct ScenePrepared {
+    pub generation: u64,
+    pub path: String,
+    result: Result<(PreparedScene, Vec<engine_physics::ModelGeometry>), String>,
+}
+
+impl ScenePrepared {
+    fn ready(
+        request: SceneRequest,
+        prepared: PreparedScene,
+        geometry: Vec<engine_physics::ModelGeometry>,
+    ) -> Self {
+        Self {
+            generation: request.generation,
+            path: request.path,
+            result: Ok((prepared, geometry)),
+        }
+    }
+
+    fn failed(request: SceneRequest, error: String) -> Self {
+        Self {
+            generation: request.generation,
+            path: request.path,
+            result: Err(error),
+        }
+    }
+}
+
+struct ScenePreparerState {
+    latest: AtomicU64,
+    stopping: AtomicBool,
+    job: Mutex<Option<SceneRequest>>,
+    result: Mutex<Option<ScenePrepared>>,
+    #[cfg(test)]
+    ready_tx: Sender<()>,
+}
+
+/// One-slot CPU scene preparation worker. New requests replace queued work and interrupt active work.
+pub(crate) struct ScenePreparer {
+    state: Arc<ScenePreparerState>,
+    wake_tx: Sender<()>,
+    #[cfg(test)]
+    ready_rx: Receiver<()>,
+}
+
+impl ScenePreparer {
+    pub(crate) fn submit(&self, request: SceneRequest) {
+        self.state
+            .latest
+            .store(request.generation, Ordering::Release);
+        *self
+            .state
+            .job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(request);
+        let _ = self.wake_tx.try_send(());
+    }
+
+    pub(crate) fn take_result(&self) -> Option<ScenePrepared> {
+        self.state
+            .result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    #[cfg(test)]
+    fn wait_ready(&self) -> Result<(), flume::RecvTimeoutError> {
+        self.ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+    }
+}
+
+pub(crate) fn start_scene_preparer(
+    modules: &mut ModuleHost,
+    loader: SceneLoader,
+) -> io::Result<ScenePreparer> {
+    #[cfg(test)]
+    let (ready_tx, ready_rx) = flume::bounded(1);
+    let state = Arc::new(ScenePreparerState {
+        latest: AtomicU64::new(0),
+        stopping: AtomicBool::new(false),
+        job: Mutex::new(None),
+        result: Mutex::new(None),
+        #[cfg(test)]
+        ready_tx,
+    });
+    let (wake_tx, wake_rx) = flume::bounded(1);
+    let stop_state = Arc::clone(&state);
+    let stop_wake = wake_tx.clone();
+    let worker_state = Arc::clone(&state);
+    modules.spawn(
+        SCENE_LOADER_THREAD,
+        move || {
+            stop_state.stopping.store(true, Ordering::Release);
+            let _ = stop_wake.try_send(());
+        },
+        move || scene_preparer_loop(loader, worker_state, wake_rx),
+    )?;
+    Ok(ScenePreparer {
+        state,
+        wake_tx,
+        #[cfg(test)]
+        ready_rx,
+    })
+}
+
+fn scene_preparer_loop(loader: SceneLoader, state: Arc<ScenePreparerState>, wake_rx: Receiver<()>) {
+    loop {
+        if state.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let request = state
+            .job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(request) = request else {
+            if wake_rx.recv().is_err() {
+                return;
+            }
+            continue;
+        };
+        // `submit` leaves a wake token for the worker while it owns the job. Drain that token
+        // before preparation so a test gate observes only later requests or shutdown.
+        while wake_rx.try_recv().is_ok() {}
+        let generation = request.generation;
+        let path = request.path.clone();
+        let interrupted = || {
+            state.stopping.load(Ordering::Acquire)
+                || state.latest.load(Ordering::Acquire) != generation
+        };
+        if interrupted() {
+            continue;
+        }
+        // Паника загрузчика становится ошибкой этого поколения: поток не умирает, текущая сцена не
+        // меняется, а scripts thread сообщает ошибку через `report_scene_failure`.
+        let result = match catch_unwind(AssertUnwindSafe(|| {
+            loader.prepare(&path, &interrupted, Some(&wake_rx))
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let panic = panic_message(payload);
+                log::error!("подготовка сцены {path} завершилась паникой: {panic}");
+                Err(LoadError::Failed(format!(
+                    "подготовка сцены завершилась паникой: {panic}"
+                )))
+            }
+        };
+        if interrupted() {
+            log::debug!("отброшена устаревшая подготовка сцены {path}");
+            continue;
+        }
+        let prepared = match result {
+            Ok((scene, geometry)) => ScenePrepared::ready(request, scene, geometry),
+            Err(LoadError::Interrupted) => continue,
+            Err(LoadError::Failed(error)) => ScenePrepared::failed(request, error),
+        };
+        if state.stopping.load(Ordering::Acquire)
+            || state.latest.load(Ordering::Acquire) != generation
+        {
+            log::debug!(
+                "отброшен устаревший результат подготовки сцены {}",
+                prepared.path
+            );
+            continue;
+        }
+        *state.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(prepared);
+        #[cfg(test)]
+        let _ = state.ready_tx.try_send(());
     }
 }
 
@@ -254,17 +556,37 @@ impl SceneSwitch {
         }
     }
 
-    /// Принимает запрос `rve.scene.load` на загрузку `path`. Успешная новая заявка отменяет
-    /// ожидающую замену: её ответ придёт с устаревшим поколением. Ошибка подготовки оставляет
-    /// предыдущую ожидающую замену и текущую сцену без изменений.
-    pub(crate) fn request(
-        &mut self,
-        loader: Option<&SceneLoader>,
-        path: &str,
-    ) -> Result<SceneUpload, String> {
-        let loader = loader.ok_or_else(|| "загрузка сцен не подключена".to_owned())?;
-        let (prepared, physics_geometry) = loader.prepare(path)?;
+    /// Регистрирует поколение запроса до CPU-подготовки, чтобы она могла выполняться вне потока
+    /// скриптов. Результат принимается отдельным вызовом [`Self::prepared`].
+    pub(crate) fn begin(&mut self, path: &str) -> SceneRequest {
         self.generation += 1;
+        SceneRequest {
+            generation: self.generation,
+            path: path.to_owned(),
+        }
+    }
+
+    /// Принимает результат CPU-подготовки текущего поколения; он вытесняет ждущую GPU-ответа сцену.
+    /// Ошибка и устаревшее поколение не заменяют `awaiting`.
+    pub(crate) fn prepared(
+        &mut self,
+        prepared: ScenePrepared,
+    ) -> Result<Option<SceneUpload>, (String, String)> {
+        let ScenePrepared {
+            generation,
+            path,
+            result,
+        } = prepared;
+        if generation != self.generation {
+            log::debug!(
+                "отброшен результат подготовки устаревшей сцены {} (поколение {}, текущее {})",
+                path,
+                generation,
+                self.generation
+            );
+            return Ok(None);
+        }
+        let (prepared, physics_geometry) = result.map_err(|error| (path.clone(), error))?;
         let PreparedScene {
             world,
             sources,
@@ -274,9 +596,9 @@ impl SceneSwitch {
             ..
         } = prepared;
         self.awaiting = Some((
-            self.generation,
+            generation,
             PendingScene {
-                path: path.to_owned(),
+                path,
                 world,
                 sources,
                 prefabs,
@@ -284,10 +606,10 @@ impl SceneSwitch {
                 physics_geometry,
             },
         ));
-        Ok(SceneUpload {
-            generation: self.generation,
+        Ok(Some(SceneUpload {
+            generation,
             assets: Arc::new(render_assets),
-        })
+        }))
     }
 
     /// Принимает ответ render thread; применяется в [`Self::apply`].
@@ -778,7 +1100,7 @@ return Script
             .unwrap();
             let loader =
                 SceneLoader::new(resources.handle(), PhysicsSettings::default(), false, false);
-            let (prepared, geometry) = loader.prepare(start).unwrap();
+            let (prepared, geometry) = loader.prepare(start, &|| false, None).unwrap();
             let (_, bindings) = prepared
                 .build_physics(&geometry, &PhysicsSettings::default())
                 .unwrap();
@@ -830,7 +1152,8 @@ return Script
 
         /// Запрос и ответ render thread без GPU: поведение headless-пути.
         fn load(&mut self, path: &str) -> Result<(), String> {
-            let upload = self.switch.request(Some(&self.loader), path)?;
+            let request = self.switch.begin(path);
+            let upload = self.complete_request(request)?;
             self.switch.accept(SceneUploadReply {
                 generation: upload.generation,
                 result: Ok(Box::default()),
@@ -840,12 +1163,31 @@ return Script
 
         /// Ответ render thread с таблицей `table` вместо пустой.
         fn load_with_table(&mut self, path: &str, table: GpuSceneTable) -> Result<(), String> {
-            let upload = self.switch.request(Some(&self.loader), path)?;
+            let request = self.switch.begin(path);
+            let upload = self.complete_request(request)?;
             self.switch.accept(SceneUploadReply {
                 generation: upload.generation,
                 result: Ok(Box::new(table)),
             });
             Ok(())
+        }
+
+        fn cpu_result(&self, request: SceneRequest) -> ScenePrepared {
+            match self.loader.prepare(&request.path, &|| false, None) {
+                Ok((scene, geometry)) => ScenePrepared::ready(request, scene, geometry),
+                Err(LoadError::Interrupted) => {
+                    ScenePrepared::failed(request, "подготовка сцены прервана".to_owned())
+                }
+                Err(LoadError::Failed(error)) => ScenePrepared::failed(request, error),
+            }
+        }
+
+        fn complete_request(&mut self, request: SceneRequest) -> Result<SceneUpload, String> {
+            let prepared = self.cpu_result(request);
+            self.switch
+                .prepared(prepared)
+                .map_err(|(_, error)| error)?
+                .ok_or_else(|| "подготовка сцены устарела".to_owned())
         }
 
         fn commit(&mut self) -> Vec<(String, String)> {
@@ -1001,10 +1343,8 @@ return Script
     #[test]
     fn missing_scene_fails_the_request_and_keeps_the_current_world() {
         let mut rig = Rig::new();
-        let error = rig
-            .switch
-            .request(Some(&rig.loader), "levels/missing.rvescene");
-        assert!(error.is_err());
+        let error = rig.load("levels/missing.rvescene").unwrap_err();
+        assert!(!error.is_empty());
         assert!(rig.commit().is_empty());
         assert_eq!(rig.names(), sorted(&["camera", "enemy", "player"]));
         assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
@@ -1020,13 +1360,13 @@ return Script
         );
         rig.adopt_gpu(active);
 
+        let stale_request = rig.switch.begin("levels/b.rvescene");
         let stale = rig
-            .switch
-            .request(Some(&rig.loader), "levels/b.rvescene")
-            .unwrap();
-        rig.switch
-            .request(Some(&rig.loader), "levels/c.rvescene")
-            .unwrap();
+            .complete_request(stale_request)
+            .expect("first scene CPU preparation");
+        let current_request = rig.switch.begin("levels/c.rvescene");
+        rig.complete_request(current_request)
+            .expect("second scene CPU preparation");
         let mut uploaded = GpuSceneTable::default();
         uploaded.prefabs.insert(
             "prefabs/stale.rveprefab".to_owned(),
@@ -1042,6 +1382,8 @@ return Script
             generation: stale.generation,
             result: Ok(Box::new(uploaded)),
         });
+        // Ответ текущего поколения не принимается: тест проверяет только освобождение устаревшей
+        // выгрузки. Коммит текущей сцены освободил бы и ресурсы адоптированной камеры.
 
         assert!(rig.commit().is_empty());
         let releases = rig.released();
@@ -1095,69 +1437,121 @@ return Script
     }
 
     #[test]
-    fn requests_without_a_loader_are_refused() {
-        let mut switch = SceneSwitch::default();
-        let error = switch.request(None, "levels/b.rvescene").err().unwrap();
-        assert!(error.contains("не подключена"), "{error}");
+    fn queued_gpu_reply_for_a_is_released_when_cpu_result_b_succeeds() {
+        let mut rig = Rig::new();
+        let request_a = rig.switch.begin("levels/b.rvescene");
+        let upload_a = rig.complete_request(request_a).unwrap();
+        let mut stale_table = GpuSceneTable::default();
+        stale_table.ui_scene_owners.insert(upload_a.generation);
+        rig.switch.accept(SceneUploadReply {
+            generation: upload_a.generation,
+            result: Ok(Box::new(stale_table)),
+        });
+
+        let request_b = rig.switch.begin("levels/c.rvescene");
+        let upload_b = rig.complete_request(request_b).unwrap();
+        let mut current_table = GpuSceneTable::default();
+        current_table.ui_scene_owners.insert(upload_b.generation);
+        rig.switch.accept(SceneUploadReply {
+            generation: upload_b.generation,
+            result: Ok(Box::new(current_table)),
+        });
+
+        assert!(rig.commit().is_empty());
+        assert_eq!(
+            rig.released()[0].ui_scene_owners,
+            HashSet::from([upload_a.generation]),
+            "запоздавшая GPU-таблица A освобождается при применении B"
+        );
+        assert_eq!(rig.names(), sorted(&["crate", "camera_c", "player"]));
+        assert_eq!(rig.host.current_scene(), "levels/c.rvescene");
+        assert!(rig.gpu.ui_scene_owners.contains(&upload_b.generation));
     }
 
     #[test]
-    fn newer_request_supersedes_the_pending_one_and_its_stale_reply_changes_nothing() {
+    fn queued_gpu_reply_for_a_commits_when_cpu_preparation_b_fails() {
         let mut rig = Rig::new();
-        let first = rig
-            .switch
-            .request(Some(&rig.loader), "levels/b.rvescene")
-            .unwrap();
-        let second = rig
-            .switch
-            .request(Some(&rig.loader), "levels/c.rvescene")
-            .unwrap();
-        assert!(second.generation > first.generation);
-
-        let mut stale_table = GpuSceneTable::default();
-        stale_table.ui_scene_owners.insert(first.generation);
+        let request_a = rig.switch.begin("levels/b.rvescene");
+        let upload_a = rig.complete_request(request_a).unwrap();
         rig.switch.accept(SceneUploadReply {
-            generation: first.generation,
-            result: Ok(Box::new(stale_table)),
+            generation: upload_a.generation,
+            result: Ok(Box::default()),
         });
-        assert!(
-            rig.commit().is_empty(),
-            "ответ устаревшего поколения молчит"
-        );
-        assert_eq!(rig.names(), sorted(&["camera", "enemy", "player"]));
+
+        let request_b = rig.switch.begin("levels/c.rvescene");
+        let failed_b = ScenePrepared::failed(request_b, "ошибка CPU-подготовки B".to_owned());
         assert_eq!(
-            rig.released()[0].ui_scene_owners,
-            HashSet::from([first.generation]),
-            "устаревший ответ снимает UI-владение своего поколения"
+            rig.switch
+                .prepared(failed_b)
+                .err()
+                .expect("ошибка B передаётся наверх"),
+            (
+                "levels/c.rvescene".to_owned(),
+                "ошибка CPU-подготовки B".to_owned()
+            )
         );
 
-        let mut current_table = GpuSceneTable::default();
-        current_table.ui_scene_owners.insert(second.generation);
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/b.rvescene");
+    }
+
+    #[test]
+    fn queued_gpu_reply_for_a_commits_before_cpu_result_b_arrives() {
+        let mut rig = Rig::new();
+        let request_a = rig.switch.begin("levels/b.rvescene");
+        let upload_a = rig.complete_request(request_a).unwrap();
         rig.switch.accept(SceneUploadReply {
-            generation: second.generation,
-            result: Ok(Box::new(current_table)),
+            generation: upload_a.generation,
+            result: Ok(Box::default()),
+        });
+        let request_b = rig.switch.begin("levels/c.rvescene");
+
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/b.rvescene");
+
+        let upload_b = rig.complete_request(request_b).unwrap();
+        rig.switch.accept(SceneUploadReply {
+            generation: upload_b.generation,
+            result: Ok(Box::default()),
         });
         assert!(rig.commit().is_empty());
-        assert_eq!(rig.names(), sorted(&["crate", "camera_c", "player"]));
         assert_eq!(rig.host.current_scene(), "levels/c.rvescene");
-        assert!(rig.gpu.ui_scene_owners.contains(&second.generation));
+    }
+
+    #[test]
+    fn late_successful_cpu_result_a_is_discarded_after_request_b() {
+        let mut rig = Rig::new();
+        let request_a = rig.switch.begin("levels/b.rvescene");
+        let request_b = rig.switch.begin("levels/c.rvescene");
+
+        assert!(
+            rig.switch
+                .prepared(rig.cpu_result(request_a))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            rig.switch
+                .prepared(ScenePrepared::failed(request_b, "B failed".to_owned()))
+                .err()
+                .expect("ошибка B передаётся наверх")
+                .0,
+            "levels/c.rvescene"
+        );
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
     }
 
     #[test]
     fn invalid_later_request_keeps_the_previous_pending_scene() {
         let mut rig = Rig::new();
-        let pending = rig
-            .switch
-            .request(Some(&rig.loader), "levels/b.rvescene")
-            .unwrap();
+        let request_a = rig.switch.begin("levels/b.rvescene");
+        let upload_a = rig.complete_request(request_a).unwrap();
 
-        assert!(
-            rig.switch
-                .request(Some(&rig.loader), "levels/missing.rvescene")
-                .is_err()
-        );
+        let request_b = rig.switch.begin("levels/missing.rvescene");
+        assert!(rig.switch.prepared(rig.cpu_result(request_b)).is_err());
         rig.switch.accept(SceneUploadReply {
-            generation: pending.generation,
+            generation: upload_a.generation,
             result: Ok(Box::default()),
         });
 
@@ -1168,10 +1562,8 @@ return Script
     #[test]
     fn gpu_error_reply_is_reported_and_keeps_the_current_world() {
         let mut rig = Rig::new();
-        let upload = rig
-            .switch
-            .request(Some(&rig.loader), "levels/b.rvescene")
-            .unwrap();
+        let upload = rig.switch.begin("levels/b.rvescene");
+        let upload = rig.complete_request(upload).unwrap();
         rig.switch.accept(SceneUploadReply {
             generation: upload.generation,
             result: Err("ошибка загрузки GPU-ресурсов: test".to_owned()),
@@ -1461,15 +1853,209 @@ return Script
     #[test]
     fn invalid_ui_document_rejects_the_switch_before_anything_changes() {
         let mut rig = Rig::new();
-        let error = rig
-            .switch
-            .request(Some(&rig.loader), "levels/bad_ui.rvescene")
-            .err()
-            .unwrap();
+        let error = rig.load("levels/bad_ui.rvescene").unwrap_err();
         assert!(error.contains("ui/bad.rveui"), "{error}");
         assert!(rig.commit().is_empty());
         assert_eq!(rig.names(), sorted(&["camera", "enemy", "player"]));
         assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
         assert!(rig.released().is_empty());
+    }
+
+    /// Предохранитель ожидания: порядок событий задают каналы и шлюз, таймаут только не даёт
+    /// тесту зависнуть при поломке.
+    const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn worker_delivers_the_current_generation_to_the_switch() {
+        let mut rig = Rig::new();
+        let mut modules = ModuleHost::new();
+        let preparer = start_scene_preparer(&mut modules, rig.loader.clone()).unwrap();
+
+        let request = rig.switch.begin("levels/b.rvescene");
+        let generation = request.generation;
+        preparer.submit(request);
+        preparer
+            .wait_ready()
+            .expect("рабочий поток публикует результат");
+        let prepared = preparer
+            .take_result()
+            .expect("результат текущего поколения");
+        let upload = rig
+            .switch
+            .prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("текущее поколение принимается");
+        assert_eq!(upload.generation, generation);
+
+        rig.switch.accept(SceneUploadReply {
+            generation,
+            result: Ok(Box::default()),
+        });
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/b.rvescene");
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn interrupted_preparation_of_a_stale_request_never_reaches_the_switch() {
+        let mut rig = Rig::new();
+        let mut modules = ModuleHost::new();
+        let (gated, gate) = rig.loader.gated();
+        let preparer = start_scene_preparer(&mut modules, gated).unwrap();
+
+        let request_a = rig.switch.begin("levels/b.rvescene");
+        preparer.submit(request_a);
+        gate.entered
+            .recv_timeout(SIGNAL_TIMEOUT)
+            .expect("подготовка A вошла в шлюз");
+
+        // Новое поколение прерывает A; рабочий поток не застревает и берёт B. Следующий вход в
+        // шлюз — уже подготовка B, так что A завершилась прерыванием, а не разрешением.
+        let request_b = rig.switch.begin("levels/c.rvescene");
+        let generation_b = request_b.generation;
+        preparer.submit(request_b);
+        gate.entered
+            .recv_timeout(SIGNAL_TIMEOUT)
+            .expect("после прерывания A поток берёт B");
+        gate.release.send(GateRelease::Proceed).unwrap();
+
+        preparer
+            .wait_ready()
+            .expect("рабочий поток публикует результат B");
+        let prepared = preparer.take_result().expect("результат B сохранён");
+        assert_eq!(prepared.generation, generation_b);
+        assert_eq!(prepared.path, "levels/c.rvescene");
+        assert!(
+            preparer.take_result().is_none(),
+            "результат прерванной A не публикуется"
+        );
+
+        let upload = rig
+            .switch
+            .prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("текущее поколение B принимается");
+        rig.switch.accept(SceneUploadReply {
+            generation: upload.generation,
+            result: Ok(Box::default()),
+        });
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/c.rvescene");
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn worker_reports_a_failed_current_preparation_without_touching_the_world() {
+        let mut rig = Rig::new();
+        let mut modules = ModuleHost::new();
+        let preparer = start_scene_preparer(&mut modules, rig.loader.clone()).unwrap();
+
+        let request = rig.switch.begin("levels/missing.rvescene");
+        preparer.submit(request);
+        preparer
+            .wait_ready()
+            .expect("рабочий поток публикует ошибку");
+        let prepared = preparer.take_result().expect("ошибка текущего поколения");
+        let (path, error) = rig
+            .switch
+            .prepared(prepared)
+            .err()
+            .expect("ошибка передаётся наверх");
+        assert_eq!(path, "levels/missing.rvescene");
+        assert!(!error.is_empty());
+
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn panicking_preparation_fails_its_generation_and_the_worker_keeps_serving() {
+        let mut rig = Rig::new();
+        let mut modules = ModuleHost::new();
+        let (gated, gate) = rig.loader.gated();
+        let preparer = start_scene_preparer(&mut modules, gated).unwrap();
+
+        let request_b = rig.switch.begin("levels/b.rvescene");
+        let generation_b = request_b.generation;
+        preparer.submit(request_b);
+        gate.entered
+            .recv_timeout(SIGNAL_TIMEOUT)
+            .expect("подготовка B вошла в шлюз");
+        gate.release.send(GateRelease::Panic).unwrap();
+
+        preparer
+            .wait_ready()
+            .expect("паника публикуется как результат поколения");
+        let prepared = preparer.take_result().expect("результат паники");
+        assert_eq!(prepared.generation, generation_b);
+        let (path, error) = rig
+            .switch
+            .prepared(prepared)
+            .err()
+            .expect("паника передаётся как ошибка текущего поколения");
+        assert_eq!(path, "levels/b.rvescene");
+        assert!(error.contains("завершилась паникой"), "{error}");
+        // Текущая сцена не трогается, ждущей GPU-сцены нет.
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/a.rvescene");
+
+        // Поток не умер: следующий запрос проходит подготовку и применяется.
+        let request_c = rig.switch.begin("levels/c.rvescene");
+        let generation_c = request_c.generation;
+        preparer.submit(request_c);
+        gate.entered
+            .recv_timeout(SIGNAL_TIMEOUT)
+            .expect("после паники поток берёт следующий запрос");
+        gate.release.send(GateRelease::Proceed).unwrap();
+
+        preparer
+            .wait_ready()
+            .expect("рабочий поток публикует результат C");
+        let prepared = preparer.take_result().expect("результат C сохранён");
+        let upload = rig
+            .switch
+            .prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("текущее поколение C принимается");
+        assert_eq!(upload.generation, generation_c);
+        rig.switch.accept(SceneUploadReply {
+            generation: upload.generation,
+            result: Ok(Box::default()),
+        });
+        assert!(rig.commit().is_empty());
+        assert_eq!(rig.host.current_scene(), "levels/c.rvescene");
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn shutdown_during_preparation_stops_the_worker_without_publishing() {
+        let rig = Rig::new();
+        let mut modules = ModuleHost::new();
+        let (gated, gate) = rig.loader.gated();
+        let preparer = start_scene_preparer(&mut modules, gated).unwrap();
+        let mut switch = SceneSwitch::default();
+        let request = switch.begin("levels/b.rvescene");
+        preparer.submit(request);
+        gate.entered
+            .recv_timeout(SIGNAL_TIMEOUT)
+            .expect("подготовка вошла в шлюз");
+
+        // Остановка будит шлюз, хотя `gate.release` жив и разрешения не выдаёт. Остановку выполняем
+        // в отдельном потоке: если join зависнет, тест упадёт по таймауту, а не повиснет. Падение
+        // теста отбрасывает `gate`, и шлюз открывается.
+        let (done_tx, done_rx) = flume::bounded(1);
+        std::thread::spawn(move || {
+            let errors = modules.shutdown();
+            let _ = done_tx.send(errors);
+        });
+        let errors = done_rx
+            .recv_timeout(SIGNAL_TIMEOUT)
+            .expect("остановка не зависает на подготовке сцены");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(preparer.take_result().is_none());
     }
 }

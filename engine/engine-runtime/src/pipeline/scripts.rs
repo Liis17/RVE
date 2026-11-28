@@ -14,6 +14,12 @@ pub(crate) fn start_scripts(
     let status = Arc::clone(&config.status);
     let panic_interrupt = config.interrupt.clone();
     let panic_render_tx = config.render_tx.clone();
+    // Подготовка сцен идёт на собственном потоке, созданном раньше scripts thread: при остановке
+    // ModuleHost сначала останавливает scripts thread, затем загрузчик.
+    let scene_preparer = match config.scene_loader.clone() {
+        Some(loader) => Some(start_scene_preparer(modules, loader)?),
+        None => None,
+    };
     modules.spawn(
         SCRIPTS_THREAD,
         move || {
@@ -23,7 +29,7 @@ pub(crate) fn start_scripts(
         move || {
             let mut ready_tx = Some(ready_tx);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                scripts_thread(world, config, &mut ready_tx);
+                scripts_thread(world, config, &mut ready_tx, scene_preparer);
             }));
             if let Err(payload) = result {
                 let message = format!(
@@ -51,6 +57,7 @@ pub(crate) fn scripts_thread(
     mut world: World,
     config: ScriptThreadConfig,
     ready_tx: &mut Option<mpsc::SyncSender<Result<(), ScriptStartupError>>>,
+    scene_preparer: Option<ScenePreparer>,
 ) {
     let ScriptThreadConfig {
         scene_name,
@@ -85,7 +92,6 @@ pub(crate) fn scripts_thread(
         frame_limit,
         ui,
         ui_text_focus,
-        scene_loader,
         gpu_render,
         platform,
         ..
@@ -563,16 +569,29 @@ pub(crate) fn scripts_thread(
                     "смена сцены при активной сети пока не поддерживается",
                 );
             } else {
-                match scene_switch.request(scene_loader.as_ref(), &path) {
-                    Ok(upload) if gpu_render => {
-                        prefab_loads.send_render(RenderResourceRequest::Scene(Box::new(upload)));
-                    }
-                    Ok(upload) => scene_switch.accept(SceneUploadReply {
-                        generation: upload.generation,
-                        result: Ok(Box::default()),
-                    }),
-                    Err(error) => scripts.report_scene_failure(&path, &error),
+                // Подготовка уходит рабочему потоку; текущая сцена тикает до её результата.
+                match scene_preparer.as_ref() {
+                    Some(preparer) => preparer.submit(scene_switch.begin(&path)),
+                    None => scripts.report_scene_failure(&path, "загрузка сцен не подключена"),
                 }
+            }
+        }
+        // Готовый результат принимается на границе кадра: до `apply` GPU-ответ уже лежит в очереди.
+        if let Some(prepared) = scene_preparer
+            .as_ref()
+            .and_then(|preparer| preparer.take_result())
+        {
+            match scene_switch.prepared(prepared) {
+                Ok(Some(upload)) if gpu_render => {
+                    prefab_loads.send_render(RenderResourceRequest::Scene(Box::new(upload)));
+                }
+                Ok(Some(upload)) => scene_switch.accept(SceneUploadReply {
+                    generation: upload.generation,
+                    result: Ok(Box::default()),
+                }),
+                // Устаревшее поколение уже заменено более новым запросом; его результат отброшен.
+                Ok(None) => {}
+                Err((path, error)) => scripts.report_scene_failure(&path, &error),
             }
         }
         let rumble = scripts.take_rumble_requests();
