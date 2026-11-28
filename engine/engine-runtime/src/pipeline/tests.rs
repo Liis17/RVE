@@ -36,7 +36,7 @@ use crate::prefabs::{
 use crate::prefabs::{MaterialLevels, MaterialReply, MaterialRequest};
 use crate::profiling::{PhaseWindow, SOURCE_RENDER, render_groups, render_phase};
 use crate::scene::{ObjectModel, PreparedMaterialAssets, PreparedPrefabs};
-use crate::scene_switch::{SceneLoader, SceneUploadReply};
+use crate::scene_switch::{GateRelease, SceneLoader, SceneUploadReply};
 use engine_animation::AnimationBridge;
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
@@ -74,7 +74,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn test_input() -> Arc<Mutex<InputAccumulator>> {
     Arc::new(Mutex::new(InputAccumulator::default()))
@@ -4047,21 +4047,30 @@ fn next_step(scripts: &TestScripts, steps: &mpsc::Receiver<StepRecord>) -> StepR
     record
 }
 
-/// Предохранитель `step_until`: без результата за столько шагов тест падает, а не крутится дальше.
+/// Предохранители `step_until`: без результата за столько шагов или за столько времени тест падает.
+/// Шаги и кадры забираются, пока цикл идёт, поэтому предел по времени срабатывает только при поломке.
 const STEP_LIMIT: usize = 10_000;
+const STEP_DEADLINE: Duration = Duration::from_secs(10);
+/// Предохранитель ожидания сигнала из канала: порядок задают каналы, таймаут не даёт зависнуть.
+const SIGNAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Забирает физические шаги и кадры, пока `poll` не вернёт значение. Ожидание идёт по шагам
-/// из канала; таймаут `next_step` и общий предел защищают от зависания при поломке.
+/// из канала; таймаут `next_step`, предел шагов и дедлайн защищают от зависания при поломке.
 fn step_until<T>(
     scripts: &TestScripts,
     steps: &mpsc::Receiver<StepRecord>,
     mut poll: impl FnMut(&StepRecord) -> Option<T>,
 ) -> T {
+    let deadline = Instant::now() + STEP_DEADLINE;
     for _ in 0..STEP_LIMIT {
         let step = next_step(scripts, steps);
         if let Some(value) = poll(&step) {
             return value;
         }
+        assert!(
+            Instant::now() < deadline,
+            "условие не наступило за {STEP_DEADLINE:?}"
+        );
     }
     panic!("условие не наступило за {STEP_LIMIT} шагов");
 }
@@ -4435,7 +4444,7 @@ fn scene_preparation_leaves_the_current_scene_ticking_until_its_result_arrives()
         "заявка render thread появляется только после подготовки"
     );
 
-    gate.release.send(()).unwrap();
+    gate.release.send(GateRelease::Proceed).unwrap();
     let upload = step_until(&scripts, &steps, |_| match render_rx.try_recv() {
         Ok(RenderResourceRequest::Scene(upload)) => Some(upload),
         Ok(_) => panic!("render thread получил не заявку сцены"),
@@ -4510,10 +4519,19 @@ fn newer_scene_request_replaces_a_scene_that_is_still_being_prepared() {
         .send(ScriptControl::Go(Box::default()))
         .unwrap();
 
-    // B входит в шлюз на втором кадре; запрос C на четвёртом прерывает B и тоже ждёт того же шлюза.
-    step_until(&scripts, &steps, |_| gate.entered.try_recv().ok());
-    step_until(&scripts, &steps, |_| gate.entered.try_recv().ok());
-    gate.release.send(()).unwrap();
+    // Счёт кадров закреплён: кадр 2 просит B, кадр 4 просит C. Снимок каждого кадра уходит через
+    // канал на одно место. После забора кадра 1 поток скриптов делает кадр 2 (запрос B) и встаёт
+    // на отправке снимка кадра 3, так что кадр 4 не начат. Ждём, пока B войдёт в шлюз, и только
+    // потом забираем кадр 2: это освобождает кадр 3 и запускает кадр 4 с запросом C.
+    next_step(&scripts, &steps);
+    gate.entered
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("подготовка B вошла в шлюз до запроса C");
+    next_step(&scripts, &steps);
+    gate.entered
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("запрос C прерывает B и входит в шлюз");
+    gate.release.send(GateRelease::Proceed).unwrap();
 
     let upload = step_until(&scripts, &steps, |_| match render_rx.try_recv() {
         Ok(RenderResourceRequest::Scene(upload)) => Some(upload),
@@ -4547,6 +4565,78 @@ fn newer_scene_request_replaces_a_scene_that_is_still_being_prepared() {
             .try_iter()
             .all(|request| !matches!(request, RenderResourceRequest::Scene(_))),
         "поколение B на render thread не уходит"
+    );
+    stop_test_scripts(scripts, worker);
+}
+
+/// Сцена, которая на кадре 2 просит включённую, но отсутствующую на диске сцену.
+const MISSING_SCRIPT: &str = r#"
+local Requester = {}
+function Requester:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 2 then
+    rve.scene.load("levels/missing.rvescene")
+  end
+  self.object:set_velocity({ x = 1, y = 0, z = 0 })
+end
+return Requester
+"#;
+
+#[test]
+fn enabled_scene_without_a_file_keeps_the_current_scene_ticking() {
+    // Файла сцены в каталоге нет: подготовка должна завершиться ошибкой, а не применить что-то.
+    let dir = SceneDir::new("missing-scene");
+    let (_resources, loader) = scene_loader(&dir);
+    let (loader, gate) = loader.gated();
+    let world =
+        World::from_document(&SceneDocument::parse("levels/a.rvescene", TICK_START).unwrap())
+            .unwrap();
+    let (render_tx, render_rx) = flume::unbounded();
+    let (client, initialization, steps, worker) = fake_physics(&world);
+    let scripts = start_test_scripts_wired(
+        world,
+        &[("ticker.lua", MISSING_SCRIPT)],
+        PreparedPrefabs::default(),
+        Some((client, initialization)),
+        Arc::new(FakeClock::default()),
+        None,
+        false,
+        SceneWiring {
+            loader: Some(loader),
+            render_resources: Some(render_tx),
+            // Сцена включена, поэтому запрос доходит до загрузчика (а не отклоняется скриптом).
+            enabled_scenes: vec!["levels/missing.rvescene".to_owned()],
+        },
+    );
+    scripts.thread.ready.recv().unwrap().unwrap();
+    scripts
+        .control
+        .send(ScriptControl::Go(Box::default()))
+        .unwrap();
+
+    // Запрос дошёл до загрузчика и стоит в шлюзе; текущая сцена тикает.
+    next_step(&scripts, &steps);
+    gate.entered
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("запрос несуществующей сцены дошёл до подготовки");
+    for _ in 0..3 {
+        let step = next_step(&scripts, &steps);
+        assert!(has_set_velocity(&step), "{:?}", step.commands);
+        assert!(!has_insert(&step), "{:?}", step.changes);
+    }
+
+    // Ошибка подготовки уходит в события скриптов; тики и мир остаются прежними.
+    gate.release.send(GateRelease::Proceed).unwrap();
+    for _ in 0..5 {
+        let step = next_step(&scripts, &steps);
+        assert!(has_set_velocity(&step), "{:?}", step.commands);
+        assert!(!has_insert(&step), "{:?}", step.changes);
+    }
+    assert!(
+        render_rx
+            .try_iter()
+            .all(|request| !matches!(request, RenderResourceRequest::Scene(_))),
+        "заявки сцены на render thread нет"
     );
     stop_test_scripts(scripts, worker);
 }

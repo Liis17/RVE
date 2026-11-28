@@ -92,7 +92,6 @@ pub(crate) fn scripts_thread(
         frame_limit,
         ui,
         ui_text_focus,
-        scene_loader,
         gpu_render,
         platform,
         ..
@@ -571,15 +570,9 @@ pub(crate) fn scripts_thread(
                 );
             } else {
                 // Подготовка уходит рабочему потоку; текущая сцена тикает до её результата.
-                match (
-                    scene_switch.begin(scene_loader.as_ref(), &path),
-                    scene_preparer.as_ref(),
-                ) {
-                    (Ok(request), Some(preparer)) => preparer.submit(request),
-                    (Ok(_), None) => {
-                        scripts.report_scene_failure(&path, "загрузка сцен не подключена")
-                    }
-                    (Err(error), _) => scripts.report_scene_failure(&path, &error),
+                match scene_preparer.as_ref() {
+                    Some(preparer) => preparer.submit(scene_switch.begin(&path)),
+                    None => scripts.report_scene_failure(&path, "загрузка сцен не подключена"),
                 }
             }
         }

@@ -322,10 +322,15 @@ pub(crate) fn load_scene(
     load_scene_interruptible(resources, assets, scene_path, build_normal_chains, &|| {
         false
     })
-    .map_err(|error| match error {
+    .map_err(load_error_text)
+}
+
+/// Текст ошибки для вызовов без прерывания: их `interrupted` всегда ложный.
+fn load_error_text(error: LoadError) -> String {
+    match error {
         LoadError::Interrupted => "подготовка сцены прервана".to_owned(),
         LoadError::Failed(message) => message,
-    })
+    }
 }
 
 /// Синхронная CPU-фаза загрузки сцены с точками отмены между крупными операциями.
@@ -401,12 +406,6 @@ fn check_scene_interrupted(interrupted: &dyn Fn() -> bool) -> Result<(), LoadErr
         Err(LoadError::Interrupted)
     } else {
         Ok(())
-    }
-}
-
-impl From<String> for LoadError {
-    fn from(message: String) -> Self {
-        Self::Failed(message)
     }
 }
 
@@ -543,10 +542,7 @@ fn prepare_scene_with_model_loader(
         load_model,
         |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
     )
-    .map_err(|error| match error {
-        LoadError::Interrupted => "подготовка сцены прервана".to_owned(),
-        LoadError::Failed(message) => message,
-    })
+    .map_err(load_error_text)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -613,7 +609,7 @@ fn prepare_scene_with_loaders_interruptible(
         if let Some(path) = settings_path {
             world
                 .set_camera_settings(*handle, loaded_settings[path])
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| LoadError::Failed(error.to_string()))?;
         }
     }
     for (handle, _, post_path) in &cameras {
@@ -622,7 +618,7 @@ fn prepare_scene_with_loaders_interruptible(
         let post_file = post_path.as_ref().map(|path| &loaded_post_process[path]);
         world
             .set_post_process(*handle, resolve_post_process(&camera_settings, post_file))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| LoadError::Failed(error.to_string()))?;
     }
 
     let mut set = RenderAssetSet::default();
@@ -637,26 +633,20 @@ fn prepare_scene_with_loaders_interruptible(
             animator: object.animator.as_ref(),
             lite_scripts: &object.lite_scripts,
         };
-        if let Some(model) = classify_scene_load(
-            set.add_object_interruptible(
-                assets,
-                scene_path,
-                parts,
-                &mut load_model,
-                &mut load_texture,
-                interrupted,
-            ),
+        if let Some(model) = set.add_object_interruptible(
+            assets,
+            scene_path,
+            parts,
+            &mut load_model,
+            &mut load_texture,
             interrupted,
         )? {
             objects.push((object.handle, model));
         }
-        if let Some(source) = classify_scene_load(
-            set.add_particle_interruptible(
-                scene_path,
-                object.particle_emitter.as_ref(),
-                &mut load_texture,
-                interrupted,
-            ),
+        if let Some(source) = set.add_particle_interruptible(
+            scene_path,
+            object.particle_emitter.as_ref(),
+            &mut load_texture,
             interrupted,
         )? {
             particles.push((object.handle, source));
@@ -677,24 +667,18 @@ fn prepare_scene_with_loaders_interruptible(
                 animator: None,
                 lite_scripts: &object.lite_scripts,
             };
-            levels.push(classify_scene_load(
-                set.add_object_interruptible(
-                    assets,
-                    scene_path,
-                    parts,
-                    &mut load_model,
-                    &mut load_texture,
-                    interrupted,
-                ),
+            levels.push(set.add_object_interruptible(
+                assets,
+                scene_path,
+                parts,
+                &mut load_model,
+                &mut load_texture,
                 interrupted,
             )?);
-            emitters.push(classify_scene_load(
-                set.add_particle_interruptible(
-                    scene_path,
-                    object.particle_emitter.as_ref(),
-                    &mut load_texture,
-                    interrupted,
-                ),
+            emitters.push(set.add_particle_interruptible(
+                scene_path,
+                object.particle_emitter.as_ref(),
+                &mut load_texture,
                 interrupted,
             )?);
         }
@@ -708,20 +692,7 @@ fn prepare_scene_with_loaders_interruptible(
             set.material_paths.insert(path.as_str().to_owned());
         }
     }
-    set.load_surface_assets_interruptible(
-        resources,
-        assets,
-        scene_path,
-        interrupted,
-        &mut load_texture,
-    )
-    .map_err(|error| {
-        if interrupted() {
-            LoadError::Interrupted
-        } else {
-            LoadError::Failed(error)
-        }
-    })?;
+    set.load_surface_assets_interruptible(resources, scene_path, interrupted, &mut load_texture)?;
     check_scene_interrupted(interrupted)?;
     let normal_chains = NormalChains::build(
         build_normal_chains,
@@ -747,7 +718,10 @@ fn prepare_scene_with_loaders_interruptible(
     let mut sources = BTreeMap::new();
     for path in lite_paths {
         check_scene_interrupted(interrupted)?;
-        sources.insert(path.clone(), read_utf8(resources, &path)?);
+        sources.insert(
+            path.clone(),
+            classify_scene_load(read_utf8(resources, &path), interrupted)?,
+        );
     }
 
     Ok(PreparedScene {
@@ -794,6 +768,7 @@ impl RenderAssetSet {
             &mut |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
             &|| false,
         )
+        .map_err(load_error_text)
     }
 
     fn add_object_interruptible(
@@ -804,9 +779,9 @@ impl RenderAssetSet {
         load_model: &mut impl FnMut(&str) -> Result<Model, String>,
         load_texture: &mut impl FnMut(&str) -> Result<TextureData, String>,
         interrupted: &dyn Fn() -> bool,
-    ) -> Result<Option<ObjectModel>, String> {
+    ) -> Result<Option<ObjectModel>, LoadError> {
         if interrupted() {
-            return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            return Err(LoadError::Interrupted);
         }
         if let Some(path) = parts
             .environment
@@ -816,7 +791,7 @@ impl RenderAssetSet {
             if let std::collections::hash_map::Entry::Vacant(entry) = self.environments.entry(key) {
                 let image = assets
                     .load_hdr(entry.key())
-                    .map_err(|error| format!("{scene_path}: {error}"))?;
+                    .map_err(|error| LoadError::Failed(format!("{scene_path}: {error}")))?;
                 entry.insert(Arc::new(EnvironmentSource::Equirect {
                     width: image.width,
                     height: image.height,
@@ -827,12 +802,12 @@ impl RenderAssetSet {
         if let Some(animator) = parts.animator {
             for path in &animator.clips {
                 if interrupted() {
-                    return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                    return Err(LoadError::Interrupted);
                 }
                 if !self.clips.contains_key(path.as_str()) {
                     let animations = assets
                         .load_animations(&format!("/{}", path.as_str()))
-                        .map_err(|error| format!("{scene_path}: {error}"))?;
+                        .map_err(|error| LoadError::Failed(format!("{scene_path}: {error}")))?;
                     self.clips
                         .insert(path.as_str().to_owned(), Arc::new(animations));
                 }
@@ -847,7 +822,7 @@ impl RenderAssetSet {
             if let Some(group) = parts.lod_group {
                 for level in &group.levels {
                     let model_path = VirtualPath::parse(&level.model)
-                        .map_err(|error| format!("{scene_path}: {error}"))?
+                        .map_err(|error| LoadError::Failed(format!("{scene_path}: {error}")))?
                         .as_str()
                         .to_owned();
                     let texture_path = level
@@ -858,7 +833,9 @@ impl RenderAssetSet {
                         .map(|path| {
                             VirtualPath::parse(path)
                                 .map(|path| path.as_str().to_owned())
-                                .map_err(|error| format!("{scene_path}: {error}"))
+                                .map_err(|error| {
+                                    LoadError::Failed(format!("{scene_path}: {error}"))
+                                })
                         })
                         .transpose()?;
                     levels.push((model_path, replacement_texture));
@@ -876,13 +853,13 @@ impl RenderAssetSet {
             }
             for (model_path, _) in &levels {
                 if interrupted() {
-                    return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                    return Err(LoadError::Interrupted);
                 }
                 if !self.models.contains_key(model_path) {
-                    let model =
-                        load_model(model_path).map_err(|error| format!("{scene_path}: {error}"))?;
+                    let model = load_model(model_path)
+                        .map_err(|error| LoadError::Failed(format!("{scene_path}: {error}")))?;
                     if interrupted() {
-                        return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                        return Err(LoadError::Interrupted);
                     }
                     self.models.insert(model_path.clone(), model);
                 }
@@ -904,14 +881,14 @@ impl RenderAssetSet {
                 .collect::<Vec<_>>();
             for path in scene_texture_paths {
                 if interrupted() {
-                    return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                    return Err(LoadError::Interrupted);
                 }
                 if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(path)
                 {
                     let texture = load_texture(entry.key())
-                        .map_err(|error| format!("{scene_path}: {error}"))?;
+                        .map_err(|error| LoadError::Failed(format!("{scene_path}: {error}")))?;
                     if interrupted() {
-                        return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                        return Err(LoadError::Interrupted);
                     }
                     entry.insert(texture);
                 }
@@ -946,6 +923,7 @@ impl RenderAssetSet {
             &mut |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
             &|| false,
         )
+        .map_err(load_error_text)
     }
 
     fn add_particle_interruptible(
@@ -954,12 +932,12 @@ impl RenderAssetSet {
         emitter: Option<&ParticleEmitterComponent>,
         load_texture: &mut impl FnMut(&str) -> Result<TextureData, String>,
         interrupted: &dyn Fn() -> bool,
-    ) -> Result<Option<ParticleSource>, String> {
+    ) -> Result<Option<ParticleSource>, LoadError> {
         let Some(emitter) = emitter else {
             return Ok(None);
         };
         if interrupted() {
-            return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+            return Err(LoadError::Interrupted);
         }
         let texture = emitter
             .texture
@@ -969,10 +947,10 @@ impl RenderAssetSet {
             && let std::collections::hash_map::Entry::Vacant(entry) =
                 self.textures.entry(path.clone())
         {
-            let data =
-                load_texture(entry.key()).map_err(|error| format!("{scene_path}: {error}"))?;
+            let data = load_texture(entry.key())
+                .map_err(|error| LoadError::Failed(format!("{scene_path}: {error}")))?;
             if interrupted() {
-                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                return Err(LoadError::Interrupted);
             }
             entry.insert(data);
         }
@@ -983,28 +961,23 @@ impl RenderAssetSet {
     }
 
     fn load_surface_assets(&mut self, resources: &ResourceHandle, assets: &Assets, owner: &str) {
-        self.load_surface_assets_interruptible(
-            resources,
-            assets,
-            owner,
-            &|| false,
-            &mut |path: &str| assets.load_texture(path).map_err(|error| error.to_string()),
-        )
+        self.load_surface_assets_interruptible(resources, owner, &|| false, &mut |path: &str| {
+            assets.load_texture(path).map_err(|error| error.to_string())
+        })
         .expect("uninterruptible scene asset preparation cannot stop");
     }
 
     fn load_surface_assets_interruptible(
         &mut self,
         resources: &ResourceHandle,
-        _assets: &Assets,
         owner: &str,
         interrupted: &dyn Fn() -> bool,
         load_texture: &mut impl FnMut(&str) -> Result<TextureData, String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), LoadError> {
         let mut shader_paths = BTreeSet::new();
         for path in &self.material_paths {
             if interrupted() {
-                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                return Err(LoadError::Interrupted);
             }
             let parsed = read_utf8(resources, &format!("/{path}"))
                 .and_then(|source| {
@@ -1013,7 +986,7 @@ impl RenderAssetSet {
                 })
                 .map_err(|error| format!("{owner}: {error}"));
             if interrupted() {
-                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                return Err(LoadError::Interrupted);
             }
             if let Ok(material) = &parsed
                 && let Some(shader) = &material.shader
@@ -1024,7 +997,7 @@ impl RenderAssetSet {
         }
         for path in &shader_paths {
             if interrupted() {
-                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                return Err(LoadError::Interrupted);
             }
             let parsed = read_utf8(resources, &format!("/{path}"))
                 .and_then(|source| {
@@ -1033,7 +1006,7 @@ impl RenderAssetSet {
                 })
                 .map_err(|error| format!("{owner}: {error}"));
             if interrupted() {
-                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                return Err(LoadError::Interrupted);
             }
             self.shader_assets.insert(path.clone(), parsed);
         }
@@ -1071,7 +1044,7 @@ impl RenderAssetSet {
         }
         for path in texture_paths {
             if interrupted() {
-                return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                return Err(LoadError::Interrupted);
             }
             if self.textures.contains_key(&path) {
                 continue;
@@ -1079,7 +1052,7 @@ impl RenderAssetSet {
             match load_texture(&path) {
                 Ok(texture) => {
                     if interrupted() {
-                        return Err(SCENE_PREPARATION_INTERRUPTED.to_owned());
+                        return Err(LoadError::Interrupted);
                     }
                     self.textures.insert(path, texture);
                 }
@@ -1091,8 +1064,6 @@ impl RenderAssetSet {
         Ok(())
     }
 }
-
-const SCENE_PREPARATION_INTERRUPTED: &str = "подготовка сцены прервана";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MaterialTextureSource {
