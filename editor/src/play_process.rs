@@ -5,8 +5,9 @@
 use crate::build::ProcessTree;
 use crate::console::LogLevel;
 use rve_play_ipc::{
-    DecodedPlayerMessage, EditorMessage, PROTOCOL_VERSION, PlayerLogLevel, PlayerMessage,
-    PlayerStatus, PlayerStreamDecoder, encode_editor_message, is_supported_protocol_version,
+    DecodedPlayerMessage, EditorMessage, MAX_RECORD_BYTES, PROTOCOL_VERSION, PlayerLogLevel,
+    PlayerMessage, PlayerStatus, PlayerStreamDecoder, encode_editor_message,
+    is_supported_protocol_version,
 };
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -15,8 +16,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 /// Сколько ждать `hello` после запуска процесса.
@@ -31,6 +32,8 @@ const READERS_GRACE: Duration = Duration::from_secs(1);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Записи журнала, которые читатели держат между опросами; лишние считаются пропущенными.
 const LOG_CAPACITY: usize = 8192;
+/// Пометка строки stderr, которую обрезали по `MAX_RECORD_BYTES`.
+const LINE_TRUNCATED_MARKER: &str = " [line truncated]";
 /// Не больше стольких записей журнала переносится в Console за один опрос.
 const LOG_PER_POLL: usize = 512;
 /// Переменная пароля сети, которую player читает сам; редактор её не передаёт дочернему процессу.
@@ -369,6 +372,9 @@ pub struct PlayProcess {
     pending: VecDeque<Control>,
     logs: Receiver<PlayLog>,
     skipped: Arc<AtomicU64>,
+    /// Поднят, пока окно уже разбужено и не опросило каналы; читатели будят окно только при
+    /// переходе из `false` в `true`.
+    wake_pending: Arc<AtomicBool>,
     readers_open: usize,
     machine: PlayMachine,
     killed: Option<String>,
@@ -415,11 +421,13 @@ impl PlayProcess {
             let _ = child.kill();
             return Err(io::Error::other("у rve-player нет stdout или stderr"));
         };
+        let wake_pending = Arc::new(AtomicBool::new(false));
         let reader = Reader {
             control: control_keepalive.clone(),
             logs: log_sender,
             skipped: Arc::clone(&skipped),
             wake,
+            wake_pending: Arc::clone(&wake_pending),
         };
         let stdout_reader = reader.clone();
         let spawned = std::thread::Builder::new()
@@ -448,6 +456,7 @@ impl PlayProcess {
             pending: VecDeque::new(),
             logs,
             skipped,
+            wake_pending,
             readers_open: 2,
             machine: PlayMachine::new(now),
             killed: None,
@@ -496,6 +505,8 @@ impl PlayProcess {
         if self.finished {
             return events;
         }
+        // Сброс до чтения каналов: сообщение, пришедшее позже, снова поднимет флаг и разбудит окно.
+        self.wake_pending.store(false, Ordering::Release);
         // Выход наблюдается раньше сообщений: ошибка протокола, пришедшая после выхода, не должна
         // подменять реальный код завершения.
         self.observe_exit(now);
@@ -503,7 +514,7 @@ impl PlayProcess {
         let commands = self.machine.poll(now);
         self.apply(commands, &mut events);
         self.drain_logs(LOG_PER_POLL, &mut events);
-        self.finish_if_done(&mut events);
+        self.finish_if_done(now, &mut events);
         events
     }
 
@@ -653,17 +664,21 @@ impl PlayProcess {
         }
     }
 
-    fn finish_if_done(&mut self, events: &mut Vec<PlayEvent>) {
+    fn finish_if_done(&mut self, now: Instant, events: &mut Vec<PlayEvent>) {
         let Some(exited_at) = self.exited_at else {
             return;
         };
-        let closed = self.readers_open == 0 || Instant::now() >= exited_at + READERS_GRACE;
-        if !closed {
-            return;
+        if self.readers_open > 0 {
+            if now < exited_at + READERS_GRACE {
+                return;
+            }
+            // Вывод не закрылся за grace: оставшиеся потомки держат stdout или stderr. Дерево
+            // убивается, иначе редактор ждал бы их вечно.
+            self.kill_leftover_tree(events);
         }
         // Итог публикуется только после последних строк: иначе причина выхода окажется раньше
-        // сообщения, которое её объясняет.
-        self.drain_logs(usize::MAX, events);
+        // сообщения, которое её объясняет. Канал ограничен, поэтому дочитывание тоже ограничено.
+        self.drain_logs(LOG_CAPACITY, events);
         let skipped = self.skipped.swap(0, Ordering::AcqRel);
         if skipped > 0 {
             events.push(log(
@@ -681,6 +696,21 @@ impl PlayProcess {
         events.push(PlayEvent::Finished { level, message });
         self.finished = true;
         self.remove_temp_files();
+    }
+
+    /// Потомки, которые остались после выхода `rve-player`. Процесс уже собран, поэтому обычный
+    /// `kill` его не тронет; дерево убивается по группе, пока её идентификатор занят.
+    fn kill_leftover_tree(&mut self, events: &mut Vec<PlayEvent>) {
+        if self.killed.is_some() {
+            return;
+        }
+        if let Err(error) = self.tree.terminate() {
+            events.push(log(
+                LogLevel::Error,
+                format!("не удалось завершить дерево Play: {error}"),
+            ));
+        }
+        self.killed = Some("потомки rve-player не завершились после его выхода".to_owned());
     }
 
     fn remove_temp_files(&mut self) {
@@ -724,19 +754,34 @@ struct Reader {
     logs: SyncSender<PlayLog>,
     skipped: Arc<AtomicU64>,
     wake: Waker,
+    wake_pending: Arc<AtomicBool>,
 }
 
 impl Reader {
+    /// Будит окно, если оно ещё не разбужено. Пока редактор не опросил каналы, остальные
+    /// сообщения ждут в очереди без новых пробуждений.
+    fn wake(&self) {
+        if !self.wake_pending.swap(true, Ordering::AcqRel) {
+            (self.wake)();
+        }
+    }
+
+    /// После закрытия редактором канал отключён: сообщение теряется и окно не будится.
     fn control(&self, message: Control) {
-        let _ = self.control.send(message);
-        (self.wake)();
+        if self.control.send(message).is_ok() {
+            self.wake();
+        }
     }
 
     fn log(&self, level: LogLevel, text: String) {
-        if self.logs.try_send(PlayLog { level, text }).is_err() {
-            self.skipped.fetch_add(1, Ordering::AcqRel);
+        match self.logs.try_send(PlayLog { level, text }) {
+            Ok(()) => self.wake(),
+            Err(TrySendError::Full(_)) => {
+                self.skipped.fetch_add(1, Ordering::AcqRel);
+                self.wake();
+            }
+            Err(TrySendError::Disconnected(_)) => {}
         }
-        (self.wake)();
     }
 
     fn closed(&self) {
@@ -815,20 +860,57 @@ fn dispatch_record(record: DecodedPlayerMessage, reader: &Reader) {
 }
 
 fn read_stderr(stderr: std::process::ChildStderr, reader: &Reader) {
-    let mut lines = BufReader::new(stderr);
-    let mut line = Vec::new();
+    read_bounded_lines(BufReader::new(stderr), |text| {
+        reader.log(LogLevel::Warn, text);
+    });
+    reader.closed();
+}
+
+/// Строки stderr с тем же лимитом, что у записей протокола: длинная строка без `\n` не растёт
+/// сверх `MAX_RECORD_BYTES`, её хвост отбрасывается до конца строки, а сама строка получает пометку.
+fn read_bounded_lines(mut reader: impl BufRead, mut on_line: impl FnMut(String)) {
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
     loop {
-        line.clear();
-        match lines.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                let text = String::from_utf8_lossy(&line);
-                let text = text.trim_end_matches(['\r', '\n']).to_owned();
-                reader.log(LogLevel::Warn, text);
+        let (consumed, ends_line) = {
+            let available = match reader.fill_buf() {
+                Ok([]) => break,
+                Ok(available) => available,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let (chunk, ends_line) = match available.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (&available[..index], true),
+                None => (available, false),
+            };
+            let room = MAX_RECORD_BYTES - line.len();
+            if chunk.len() > room {
+                line.extend_from_slice(&chunk[..room]);
+                truncated = true;
+            } else {
+                line.extend_from_slice(chunk);
             }
+            (chunk.len() + usize::from(ends_line), ends_line)
+        };
+        reader.consume(consumed);
+        if ends_line {
+            on_line(finish_line(&mut line, &mut truncated));
         }
     }
-    reader.closed();
+    if !line.is_empty() || truncated {
+        on_line(finish_line(&mut line, &mut truncated));
+    }
+}
+
+fn finish_line(line: &mut Vec<u8>, truncated: &mut bool) -> String {
+    let mut text = String::from_utf8_lossy(&line[..])
+        .trim_end_matches('\r')
+        .to_owned();
+    line.clear();
+    if std::mem::take(truncated) {
+        text.push_str(LINE_TRUNCATED_MARKER);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1091,20 +1173,8 @@ mod tests {
     }
 
     #[test]
-    fn journal_keeps_a_bounded_window_wakes_per_record_and_counts_what_it_drops() {
-        let (control, _control_rx) = mpsc::channel();
-        let (logs, log_rx) = mpsc::sync_channel(LOG_CAPACITY);
-        let skipped = Arc::new(AtomicU64::new(0));
-        let wakes = Arc::new(AtomicU64::new(0));
-        let counter = Arc::clone(&wakes);
-        let reader = Reader {
-            control,
-            logs,
-            skipped: Arc::clone(&skipped),
-            wake: Arc::new(move || {
-                counter.fetch_add(1, Ordering::AcqRel);
-            }),
-        };
+    fn journal_keeps_a_bounded_window_and_counts_what_it_drops() {
+        let (reader, _control_rx, log_rx, skipped) = test_reader();
         // Никто не читает журнал, поэтому всё сверх ёмкости считается пропущенным.
         let records = LOG_CAPACITY + 10;
         for index in 0..records {
@@ -1112,10 +1182,10 @@ mod tests {
         }
         assert_eq!(log_rx.try_iter().count(), LOG_CAPACITY);
         assert_eq!(skipped.load(Ordering::Acquire), 10);
-        assert_eq!(wakes.load(Ordering::Acquire), records as u64);
     }
 
     /// Читатель без процесса: сообщения и журнал видны в каналах, которые можно опросить.
+    /// Счётчик пробуждений возвращается вместе с читателем, чтобы тесты видели каждый wake.
     fn test_reader() -> (Reader, Receiver<Control>, Receiver<PlayLog>, Arc<AtomicU64>) {
         let (control, control_rx) = mpsc::channel();
         let (logs, log_rx) = mpsc::sync_channel(LOG_CAPACITY);
@@ -1125,8 +1195,81 @@ mod tests {
             logs,
             skipped: Arc::clone(&skipped),
             wake: Arc::new(|| {}),
+            wake_pending: Arc::new(AtomicBool::new(false)),
         };
         (reader, control_rx, log_rx, skipped)
+    }
+
+    /// Читатель, который считает пробуждения окна; `wake_pending` возвращается для имитации опроса.
+    fn counting_reader() -> (
+        Reader,
+        Receiver<Control>,
+        Receiver<PlayLog>,
+        Arc<AtomicU64>,
+        Arc<AtomicBool>,
+    ) {
+        let (control, control_rx) = mpsc::channel();
+        let (logs, log_rx) = mpsc::sync_channel(LOG_CAPACITY);
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&wakes);
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let reader = Reader {
+            control,
+            logs,
+            skipped: Arc::new(AtomicU64::new(0)),
+            wake: Arc::new(move || {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }),
+            wake_pending: Arc::clone(&wake_pending),
+        };
+        (reader, control_rx, log_rx, wakes, wake_pending)
+    }
+
+    #[test]
+    fn wakes_coalesce_until_the_editor_polls_the_channels() {
+        let (reader, _control_rx, log_rx, wakes, wake_pending) = counting_reader();
+        for index in 0..10 {
+            dispatch_record(DecodedPlayerMessage::Raw(format!("line {index}")), &reader);
+        }
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            1,
+            "one wake covers every record until the editor polls"
+        );
+        assert_eq!(log_rx.try_iter().count(), 10);
+
+        // Опрос сбрасывает флаг перед чтением каналов: следующее сообщение снова будит окно.
+        wake_pending.store(false, Ordering::Release);
+        dispatch_record(DecodedPlayerMessage::Raw("next".into()), &reader);
+        assert_eq!(wakes.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn readers_stop_waking_the_window_once_the_editor_dropped_its_channels() {
+        let (reader, control_rx, log_rx, wakes, _wake_pending) = counting_reader();
+        drop(control_rx);
+        drop(log_rx);
+        dispatch_record(DecodedPlayerMessage::Raw("late".into()), &reader);
+        reader.closed();
+        assert_eq!(wakes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn stderr_lines_are_capped_even_without_a_newline() {
+        let mut data = vec![b'x'; MAX_RECORD_BYTES * 3];
+        data.extend_from_slice(b"\nnext\r\ntail");
+        let mut lines = Vec::new();
+        read_bounded_lines(io::Cursor::new(data), |line| lines.push(line));
+        assert_eq!(
+            lines.len(),
+            3,
+            "{:?}",
+            lines.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert!(lines[0].len() <= MAX_RECORD_BYTES + LINE_TRUNCATED_MARKER.len());
+        assert!(lines[0].ends_with(LINE_TRUNCATED_MARKER));
+        assert_eq!(lines[1], "next");
+        assert_eq!(lines[2], "tail");
     }
 
     #[test]
@@ -1251,6 +1394,30 @@ mod tests {
     }
 
     #[test]
+    fn descendants_that_keep_the_output_open_are_killed_after_the_grace_period() {
+        let mut process = PlayProcess::spawn(
+            test_stub_launch("orphan", Vec::new()),
+            now(),
+            Arc::new(|| {}),
+        )
+        .expect("spawn orphan stub");
+        let mut events = drive_until(&mut process, |process, _| process.exited.is_some());
+        let exited_at = process.exited_at.expect("exit observed");
+
+        // Срок проверяется синтетическим временем: вывод открыт, пока не прошёл `READERS_GRACE`.
+        events.extend(process.poll(exited_at + READERS_GRACE - Duration::from_millis(1)));
+        assert!(process.killed.is_none(), "{events:?}");
+        assert!(!process.is_finished());
+
+        events.extend(process.poll(exited_at + READERS_GRACE));
+        assert!(process.killed.is_some());
+        assert!(process.is_finished());
+        let (level, message) = finished(&events).expect("finish message");
+        assert_eq!(level, LogLevel::Warn);
+        assert!(message.contains("завершён редактором"), "{message}");
+    }
+
+    #[test]
     fn temporary_files_are_removed_after_the_process_finished() {
         let dir = std::env::temp_dir().join(format!("rve-play-temp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1289,6 +1456,26 @@ mod tests {
         if mode == "exit3" {
             // Режим `exit3`: игрок выходит с кодом 3 сразу после hello, не читая команд.
             std::process::exit(3);
+        }
+        if mode == "orphan" {
+            // Режим `orphan`: потомок наследует stdout и stderr и держит их открытыми после выхода.
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "play_process::tests::play_process_stub",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "-q",
+                ])
+                .env(STUB_ENV, "sleeper")
+                .spawn()
+                .expect("spawn orphan");
+            write_record(&PlayerMessage::Log {
+                level: PlayerLogLevel::Info,
+                target: "stub".to_owned(),
+                text: format!("descendant {}", child.id()),
+            });
+            std::process::exit(0);
         }
         let mut stdin = io::stdin().lock();
         let mut line = String::new();
