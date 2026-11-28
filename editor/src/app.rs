@@ -1824,40 +1824,25 @@ impl EditorApp {
                 .as_ref()
                 .map(|generation| generation.path.clone())
         });
-        let mut temp_files = Vec::new();
-        let unsaved = self
+        // Снимок нужен только для несохранённого списка: сохранённый player читает с диска.
+        let snapshot = self
             .state
             .project_prefabs
             .as_ref()
-            .is_some_and(|list| list.is_dirty() && list.root() == root);
-        if unsaved {
-            match write_play_catalog(&root, self.state.project_prefabs.as_ref()) {
-                Ok(path) => temp_files.push(path),
-                Err(error) => {
-                    self.state.log.error(error);
-                    return;
-                }
-            }
-        }
-        let save_path = player_save_path(&root);
-        let launch = PlayerLaunch {
-            program,
-            args: play_process::player_args(
-                &root,
-                &save_path,
-                scripts.as_deref(),
-                temp_files.first().map(PathBuf::as_path),
-                &network_args,
-            ),
-            password,
-            temp_files: temp_files.clone(),
-            env: Vec::new(),
-        };
+            .filter(|list| list.is_dirty() && list.root() == root);
         let waker: Waker = match self.proxy.clone() {
             Some(proxy) => Arc::new(move || proxy.wake()),
             None => Arc::new(|| {}),
         };
-        match PlayProcess::spawn(launch, Instant::now(), waker) {
+        match spawn_play_process(
+            &root,
+            scripts.as_deref(),
+            snapshot,
+            program,
+            &network_args,
+            password,
+            waker,
+        ) {
             Ok(process) => {
                 self.state.play_process = Some(process);
                 self.state.play_cursor.reset();
@@ -1866,14 +1851,7 @@ impl EditorApp {
                     self.state.log.info(summary);
                 }
             }
-            Err(error) => {
-                for path in &temp_files {
-                    let _ = std::fs::remove_file(path);
-                }
-                self.state
-                    .log
-                    .error(format!("не удалось запустить rve-player: {error}"));
-            }
+            Err(error) => self.state.log.error(error),
         }
     }
 
@@ -1913,10 +1891,13 @@ impl EditorApp {
     }
 
     /// Выход или смена проекта во время Play-процесса: процесс останавливается, действие выполнится
-    /// после его выхода, поэтому окно редактора не закрывается раньше времени.
+    /// после его выхода, поэтому окно редактора не закрывается раньше времени. Отложенный выход не
+    /// перезаписывается: запрос на закрытие важнее смены проекта.
     fn defer_until_play_process_exits(&mut self, action: Action) {
         self.stop_play();
-        self.state.play_deferred = Some(action);
+        if self.state.play_deferred != Some(Action::Exit) {
+            self.state.play_deferred = Some(action);
+        }
     }
 
     /// Loads the explicit `--scripts` library used for Inspector schemas and Play.
@@ -2077,22 +2058,25 @@ impl EditorApp {
                         self.run_confirmed(Action::CreatePrefab(id));
                     }
                 }
+                // Выход и смена проекта во время Play-процесса ждут его завершения. Смена сцены
+                // отклоняется, как во встроенном Play: сцена не меняется под запущенной игрой.
+                action @ (Action::OpenProject | Action::OpenProjectAt(_) | Action::Exit)
+                    if self.state.play_process.is_some() =>
+                {
+                    self.defer_until_play_process_exits(action);
+                }
                 action @ (Action::NewScene
                 | Action::OpenScene(_)
                 | Action::OpenProject
                 | Action::OpenProjectAt(_)
                 | Action::Exit) => {
-                    if self.state.play_process.is_some() {
-                        self.defer_until_play_process_exits(action);
+                    if action == Action::Exit {
+                        self.stop_play();
+                    }
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
                     } else {
-                        if action == Action::Exit {
-                            self.stop_play();
-                        }
-                        if self.state.is_playing() {
-                            self.state.log.error("Сначала остановите Play-режим");
-                        } else {
-                            self.run_guarded(action);
-                        }
+                        self.run_guarded(action);
                     }
                 }
             }
@@ -2471,6 +2455,43 @@ fn submit_console_command(state: &mut EditorState, text: &str) {
     if let Err(error) = result {
         state.log.error(error.to_string());
     }
+}
+
+/// Запуск `rve-player --editor-ipc`. `snapshot` — несохранённый список префабов: он пишется во
+/// временный файл `--prefab-catalog`, который удаляется после выхода процесса или при сбое запуска.
+/// Библиотека скриптов сюда только передаётся путём; редактор её не загружает.
+fn spawn_play_process(
+    root: &Path,
+    scripts: Option<&Path>,
+    snapshot: Option<&ProjectPrefabs>,
+    program: PathBuf,
+    network_args: &[String],
+    password: Option<String>,
+    waker: Waker,
+) -> Result<PlayProcess, String> {
+    let mut temp_files = Vec::new();
+    if snapshot.is_some() {
+        temp_files.push(write_play_catalog(root, snapshot)?);
+    }
+    let launch = PlayerLaunch {
+        program,
+        args: play_process::player_args(
+            root,
+            &player_save_path(root),
+            scripts,
+            temp_files.first().map(PathBuf::as_path),
+            network_args,
+        ),
+        password,
+        temp_files: temp_files.clone(),
+        env: Vec::new(),
+    };
+    PlayProcess::spawn(launch, Instant::now(), waker).map_err(|error| {
+        for path in &temp_files {
+            let _ = std::fs::remove_file(path);
+        }
+        format!("не удалось запустить rve-player: {error}")
+    })
 }
 
 /// Снимок несохранённого списка тяжёлых префабов для `--prefab-catalog`. Файл живёт в каталоге
@@ -4211,5 +4232,89 @@ return S
                 .entries()
                 .any(|entry| { entry.level == LogLevel::Info && entry.message == "Play stopped" })
         );
+    }
+
+    #[test]
+    fn separate_play_process_rejects_scene_switches_and_defers_only_exit_and_project_changes() {
+        let mut app = EditorApp::new_for_mcp_tests_with_state(EditorState::new(None));
+        separate_play(&mut app, "exit");
+        app.state.action(Action::NewScene);
+        app.state
+            .action(Action::OpenScene(Some("scenes/main.rvescene".to_owned())));
+        app.run_actions();
+        assert!(app.state.play_deferred.is_none());
+        // Консоль не дублирует подряд идущее сообщение, поэтому проверяется наличие, а не число.
+        assert!(app.state.log.entries().any(|entry| {
+            entry.level == LogLevel::Error && entry.message == "Сначала остановите Play-режим"
+        }));
+
+        app.state.action(Action::OpenProject);
+        app.run_actions();
+        assert_eq!(app.state.play_deferred, Some(Action::OpenProject));
+
+        // Отложенный выход не перезаписывается последующей сменой проекта.
+        app.state.action(Action::Exit);
+        app.state
+            .action(Action::OpenProjectAt(PathBuf::from("/nonexistent/project")));
+        app.run_actions();
+        assert_eq!(app.state.play_deferred, Some(Action::Exit));
+
+        wait_for_play_process_exit(&mut app);
+        assert!(app.exit, "the kept exit closes the editor after Play stops");
+    }
+
+    fn play_snapshots(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn unsaved_prefab_snapshot_lives_until_the_player_exits_and_is_removed_on_a_failed_start() {
+        let root = std::env::temp_dir().join(format!("rve-play-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("prefabs.rveprefabs"), "").unwrap();
+        let list = ProjectPrefabs::open(&root);
+        let play_dir = root.join(".rve/editor/play");
+
+        // Бинарь не существует: снимок записан, но после сбоя запуска удалён.
+        let failed = spawn_play_process(
+            &root,
+            None,
+            Some(&list),
+            root.join("no-such-player"),
+            &[],
+            None,
+            Arc::new(|| {}),
+        );
+        assert!(failed.is_err());
+        assert!(play_snapshots(&play_dir).is_empty());
+
+        // Тестовый бинарь запускается как player: он выходит сразу, не разбирая аргументы. Путь
+        // библиотеки передаётся строкой и не открывается, поэтому её загрузка не запускается.
+        let mut process = spawn_play_process(
+            &root,
+            Some(Path::new("/nonexistent/lib.dylib")),
+            Some(&list),
+            std::env::current_exe().unwrap(),
+            &[],
+            None,
+            Arc::new(|| {}),
+        )
+        .expect("spawn test binary as a player");
+        assert_eq!(
+            play_snapshots(&play_dir).len(),
+            1,
+            "the snapshot exists while the process is alive"
+        );
+        let started = Instant::now();
+        while !process.is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(20), "no finish");
+            process.poll(Instant::now());
+            process.wait_event(Duration::from_millis(100));
+        }
+        assert!(play_snapshots(&play_dir).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
