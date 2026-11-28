@@ -700,17 +700,22 @@ impl PlayProcess {
 
     /// Потомки, которые остались после выхода `rve-player`. Процесс уже собран, поэтому обычный
     /// `kill` его не тронет; дерево убивается по группе, пока её идентификатор занят.
+    /// `killed` не меняется: итог строится по настоящему коду выхода игрока.
     fn kill_leftover_tree(&mut self, events: &mut Vec<PlayEvent>) {
         if self.killed.is_some() {
             return;
         }
-        if let Err(error) = self.tree.terminate() {
-            events.push(log(
+        match self.tree.terminate() {
+            Ok(()) => events.push(log(
+                LogLevel::Warn,
+                "потомки rve-player не завершились после его выхода и завершены редактором"
+                    .to_owned(),
+            )),
+            Err(error) => events.push(log(
                 LogLevel::Error,
                 format!("не удалось завершить дерево Play: {error}"),
-            ));
+            )),
         }
-        self.killed = Some("потомки rve-player не завершились после его выхода".to_owned());
     }
 
     fn remove_temp_files(&mut self) {
@@ -1409,12 +1414,34 @@ mod tests {
         assert!(process.killed.is_none(), "{events:?}");
         assert!(!process.is_finished());
 
+        let open = process.readers_open;
         events.extend(process.poll(exited_at + READERS_GRACE));
-        assert!(process.killed.is_some());
+        assert!(process.killed.is_none(), "{events:?}");
         assert!(process.is_finished());
         let (level, message) = finished(&events).expect("finish message");
-        assert_eq!(level, LogLevel::Warn);
-        assert!(message.contains("завершён редактором"), "{message}");
+        assert_eq!(level, LogLevel::Error);
+        assert!(message.contains("кодом 1"), "{message}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayEvent::Log { level: LogLevel::Warn, text } if text.contains("потомки rve-player")
+            )),
+            "{events:?}"
+        );
+
+        // Потомок действительно убит: оба оставшихся читателя получают EOF.
+        let mut closed = process
+            .pending
+            .iter()
+            .filter(|message| matches!(message, Control::ReaderClosed))
+            .count();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while closed < open {
+            assert!(Instant::now() < deadline, "descendant kept the output open");
+            if let Ok(Control::ReaderClosed) = process.control.recv_timeout(POLL_INTERVAL) {
+                closed += 1;
+            }
+        }
     }
 
     #[test]
@@ -1475,7 +1502,8 @@ mod tests {
                 target: "stub".to_owned(),
                 text: format!("descendant {}", child.id()),
             });
-            std::process::exit(0);
+            // Ненулевой код: итог после уборки потомков должен сохранить его.
+            std::process::exit(1);
         }
         let mut stdin = io::stdin().lock();
         let mut line = String::new();
