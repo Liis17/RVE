@@ -258,6 +258,25 @@ fn normalize_override_path(flag: &str, path: &Path) -> Result<PathBuf, String> {
     })
 }
 
+/// Каталог тяжёлых префабов и файл сохранения: флаги `--prefab-catalog` и `--save-path` заменяют
+/// значения раскладки проекта, без флага остаётся раскладка и значение по умолчанию.
+fn override_paths(
+    layout_catalog: &PrefabCatalogLocation,
+    prefab_catalog: Option<&Path>,
+    save_path: Option<&Path>,
+) -> Result<(PrefabCatalogLocation, Option<PathBuf>), String> {
+    let catalog = match prefab_catalog {
+        Some(path) => {
+            PrefabCatalogLocation::File(normalize_override_path("--prefab-catalog", path)?)
+        }
+        None => layout_catalog.clone(),
+    };
+    let save = save_path
+        .map(|path| normalize_override_path("--save-path", path))
+        .transpose()?;
+    Ok((catalog, save))
+}
+
 /// Общий путь запуска игры (`rve-player`) и выделенного сервера (`headless`). Окно, renderer, проверка
 /// Vulkan, иконка, экземпляр и звуковой вывод есть только у игры.
 fn run_from_args(
@@ -293,19 +312,13 @@ fn run_from_args(
             crash::release_report_dir(&exe_dir, cfg!(target_os = "macos")),
         ),
     };
-    let prefab_catalog_location = match args.prefab_catalog.as_deref() {
-        Some(path) => match normalize_override_path("--prefab-catalog", path) {
-            Ok(path) => PrefabCatalogLocation::File(path),
-            Err(error) => return fail(2, error),
-        },
-        None => layout.prefab_catalog.clone(),
-    };
-    let save_path_override = match args.save_path.as_deref() {
-        Some(path) => match normalize_override_path("--save-path", path) {
-            Ok(path) => Some(path),
-            Err(error) => return fail(2, error),
-        },
-        None => None,
+    let (prefab_catalog_location, save_path_override) = match override_paths(
+        &layout.prefab_catalog,
+        args.prefab_catalog.as_deref(),
+        args.save_path.as_deref(),
+    ) {
+        Ok(paths) => paths,
+        Err(error) => return fail(2, error),
     };
     let scripts_override = match args.scripts.as_deref() {
         Some(path) => match normalize_scripts_path(path) {
@@ -1118,10 +1131,11 @@ fn fail(code: u8, message: impl AsRef<str>) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_heavy_prefabs, load_prefab_catalog, load_project_settings, scripts_ready_result,
-        wait_scripts_ready, wait_scripts_ready_after_timeout, wait_scripts_ready_with_editor,
+        add_heavy_prefabs, load_prefab_catalog, load_project_settings, override_paths,
+        scripts_ready_result, wait_scripts_ready, wait_scripts_ready_after_timeout,
+        wait_scripts_ready_with_editor,
     };
-    use crate::layout::{PrefabCatalogLocation, ProjectSettingsLocation};
+    use crate::layout::{PrefabCatalogLocation, ProjectSettingsLocation, normalize_scripts_path};
     use crate::module_host::ModuleHost;
     use crate::pipeline::{RuntimeStatus, ScriptStartupError};
     use engine_physics::PhysicsSceneDesc;
@@ -1439,5 +1453,43 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, 1);
         assert!(message.contains("panic"));
+    }
+
+    #[test]
+    fn override_flags_replace_the_layout_paths_and_missing_files_are_loaded_later() {
+        let dir = std::env::temp_dir().join(format!("rve-override-paths-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("custom.rveprefabs");
+        let save = dir.join("save.toml");
+        fs::write(&catalog, b"").unwrap();
+        fs::write(&save, b"").unwrap();
+        let layout = PrefabCatalogLocation::File(dir.join("layout.rveprefabs"));
+
+        // Без флагов остаются значения раскладки; переопределения сохранения нет.
+        assert_eq!(
+            override_paths(&layout, None, None).unwrap(),
+            (layout.clone(), None)
+        );
+
+        // Оба флага заменяют раскладку и путь сохранения.
+        let (location, save_override) =
+            override_paths(&layout, Some(&catalog), Some(&save)).unwrap();
+        assert_eq!(
+            location,
+            PrefabCatalogLocation::File(normalize_scripts_path(&catalog).unwrap())
+        );
+        assert_eq!(save_override, Some(normalize_scripts_path(&save).unwrap()));
+
+        // Отсутствующий файл не ошибка выбора пути: путь становится абсолютным, а загрузка каталога
+        // или сохранения сообщит о нём при старте.
+        let missing = dir.join("missing.rveprefabs");
+        let (location, save_override) = override_paths(&layout, Some(&missing), None).unwrap();
+        assert_eq!(
+            location,
+            PrefabCatalogLocation::File(normalize_scripts_path(&missing).unwrap())
+        );
+        assert_eq!(save_override, None);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
