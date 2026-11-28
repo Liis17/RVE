@@ -10,6 +10,7 @@ use crate::materials::MaterialLibrary;
 use crate::play::PlaySession;
 use crate::play_cursor::PlayCursor;
 use crate::play_network::PlayNetworkForm;
+use crate::play_process::PlayProcess;
 use crate::previews::PreviewCache;
 use crate::profile::EditorProfile;
 use crate::project::OpenProject;
@@ -225,6 +226,12 @@ pub struct EditorState {
     pub smart_zoom: bool,
     pub gizmo_drag: Option<GizmoDrag>,
     pub play: Option<PlaySession>,
+    /// Play в отдельном процессе `rve-player`: процесс и журнал его сессии.
+    pub play_process: Option<PlayProcess>,
+    /// Следующий Play запускается отдельным процессом; копия настройки `play_in_process`.
+    pub play_in_process: bool,
+    /// Действие, отложенное до выхода Play-процесса: выход или смена проекта.
+    pub play_deferred: Option<Action>,
     /// The editor's gamepad backend, created by the first Play and kept across Play sessions.
     pub gamepads: Option<GilrsBackend>,
     pub scripts_path: Option<PathBuf>,
@@ -353,6 +360,9 @@ impl EditorState {
             smart_zoom: false,
             gizmo_drag: None,
             play: None,
+            play_process: None,
+            play_in_process: false,
+            play_deferred: None,
             gamepads: None,
             scripts_path,
             recent_projects: Vec::new(),
@@ -418,8 +428,9 @@ impl EditorState {
         }
     }
 
+    /// Идёт ли Play: встроенный или в отдельном процессе. Пока он идёт, правки запрещены.
     pub fn is_playing(&self) -> bool {
-        self.play.is_some()
+        self.play.is_some() || self.play_process.is_some()
     }
 
     pub fn advance_mcp_generation(&mut self) {

@@ -95,6 +95,8 @@ pub struct UserSettings {
     /// Раскладка панелей; `None` — раскладка по умолчанию.
     pub layout: Option<DockState<Tab>>,
     pub mcp: McpSettings,
+    /// Play в отдельном процессе `rve-player`; `false` — встроенный Play.
+    pub play_in_process: bool,
 }
 
 impl UserSettings {
@@ -181,6 +183,7 @@ impl SettingsStore {
             scroll_navigation: field(&value, "scroll_navigation", &mut problems)
                 .unwrap_or_default(),
             layout: field(&value, "layout", &mut problems),
+            play_in_process: field(&value, "play_in_process", &mut problems).unwrap_or_default(),
             mcp: field(&value, "mcp", &mut problems)
                 .map(|mut mcp: McpSettings| {
                     mcp.hash_known_token();
@@ -208,6 +211,7 @@ impl SettingsStore {
             "layout": settings.layout,
             "scroll_navigation": settings.scroll_navigation,
             "mcp": settings.mcp,
+            "play_in_process": settings.play_in_process,
         });
         let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
         write_private(&self.file, text.as_bytes())
@@ -297,6 +301,26 @@ mod tests {
 
     fn tabs(layout: &DockState<Tab>) -> Vec<Tab> {
         layout.iter_all_tabs().map(|(_, tab)| *tab).collect()
+    }
+
+    #[test]
+    fn play_in_process_is_off_for_old_files_and_survives_a_save() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let store = SettingsStore::in_dir(&dir.0);
+        std::fs::write(&store.file, r#"{"recent_projects": []}"#).unwrap();
+        let (old, message) = store.load();
+        assert!(!old.play_in_process);
+        assert!(message.is_none());
+
+        let enabled = UserSettings {
+            play_in_process: true,
+            ..UserSettings::default()
+        };
+        store.save(&enabled).unwrap();
+        let (reloaded, message) = store.load();
+        assert!(reloaded.play_in_process);
+        assert!(message.is_none());
     }
 
     #[test]

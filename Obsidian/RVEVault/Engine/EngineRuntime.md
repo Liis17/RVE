@@ -61,6 +61,18 @@ Dev-player с developer console циклически меняет поддерж
 
 Список тяжёлых префабов читается тем же способом: dev — `<project>/prefabs.rveprefabs` (нет файла — пустой список), release — `/rve/prefabs.toml` через `ResourceHandle` и обязателен. Ошибка чтения или формата даёт код 2; формат описан в [[Engine/EngineProject]].
 
+## Режим редактора
+
+`rve-player --editor-ipc` запускает игру как Play в отдельном процессе редактора ([[Engine/RveEditor#Play в отдельном процессе]]). Флаг требует `--project`. Вместе с ним допустимы `--save-path <file>` (файл сохранения сессии вместо пользовательского пути) и `--prefab-catalog <file>` (снимок списка тяжёлых префабов вместо `prefabs.rveprefabs` проекта). Повтор флага, пустой путь или отсутствие `--project` — код 2. Протокол описан в [[Engine/RvePlayIpc]].
+
+Порядок. После установки логгера и Vulkan-окружения `EditorIpc` запускает поток `rve-editor-ipc`, который читает stdin, и отправляет `hello`. Затем игрок ждёт `start` и только после него создаёт дочерние процессы (`rve-crash-monitor`), читает проект и запускает потоки. Пароль из `start` используется сетевым слоем вместо `RVE_NET_PASSWORD`; `--password-file` при этом приоритетнее (`password` в `engine/engine-runtime/src/net.rs`). Статус `loading` уходит после `start`, `running` — после успешной инициализации окна и запуска рендера, `stopping` — при начале закрытия.
+
+Журнал. В этом режиме логгер `engine-console` ставится с callback ([[Engine/EngineConsole]]): каждая строка Info/Warn/Error уходит сообщением `log`, а хвост на 200 строк и буфер консоли работают как обычно. Итоговый код процесса игрок сообщает сообщением `exit` перед возвратом.
+
+Остановка. Строка `stop` или EOF stdin (редактор завершился) выставляет флаг остановки и будит окно. Чтение stdin не прекращается после `stop`, поэтому EOF виден и после него. EOF запускает сторожевой поток `rve-editor-watchdog`: через 15 с процесс завершается кодом 1 независимо от окна и этапа (до окна, загрузки, init, cleanup, `modules.shutdown`). Пока скрипты не готовы, `stop` прерывает ожидание: interrupt, затем до `SCRIPTS_READY_GRACE` (2 с) ожидания ответа; без ответа поток отсоединяется без `join`, процесс выходит с кодом 0 без окна. В окне запрос идёт тем же путём, что закрытие окна (`close_requested`) с теми же сроками.
+
+Ограничения. Ожидание загрузки ресурсов до скриптов не прерывается `stop`; сторожевой поток выполняется только пока процесс жив. Редактор завершает дерево процессов по своему таймауту (см. [[Engine/RveEditor#Play в отдельном процессе]]); принудительный kill оставляет каталог `rve-crash-*` во временном каталоге, потому что монитор входит в то же дерево и не успевает удалить IPC-каталог. Не проверено на Windows и требует ручной проверки: синхронное чтение stdin-pipe в потоке `rve-editor-ipc` и вызов `GetFileType` при загрузке DLL.
+
 ## Потоки и протокол запуска
 
 Первой runtime-операцией после получения пути executable вызывается `unsafe engine_platform::prepare_vulkan_environment(release_root)`. Она выполняется до создания потоков. Затем создаётся `PendingActivation`, которая сохраняет ранний сигнал singleton activation до `WindowProxy`.
@@ -212,7 +224,8 @@ Scripts thread регистрирует каждый быстрый шаблон
 | Файл | Ответственность |
 |---|---|
 | `engine/engine-runtime/src/lib.rs` | `run_player`, layout startup, resources, project lock, hardware check и lifecycle модулей; передача project input settings scripts thread |
-| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames`, dev-only `--debug-view`, сетевые флаги `--host`/`--connect` и `--bind` для `rve-server`, usage |
+| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames`, dev-only `--debug-view`, сетевые флаги `--host`/`--connect` и `--bind` для `rve-server`, `--editor-ipc`, `--save-path`, `--prefab-catalog`, usage |
+| `engine/engine-runtime/src/editor_ipc.rs` | Протокол редакторского режима: hello, ожидание `start`, статусы, зеркало журнала, команда `stop` и EOF stdin, сторожевой поток после EOF |
 | `engine/engine-runtime/src/net.rs` | `prepare`, `ScriptNetSink`, `attach`, `tick` | Сетевой план из флагов и проекта, сетевой поток и мост на потоке скриптов |
 | `engine/engine-runtime/src/headless.rs` | `run_resource_responder`, `spawn_quit_listener` | Headless-путь `rve-server`: ответчик ресурсов и команда `quit` |
 | `engine/rve-server/src/main.rs` | — | Бинарник выделенного сервера, вызывает `run_server` |

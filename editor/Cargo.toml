@@ -1,6 +1,6 @@
 [package]
 name = "rve-editor"
-version = "0.42.0"
+version = "0.43.0"
 edition.workspace = true
 license.workspace = true
 
@@ -17,6 +17,7 @@ egui-winit.workspace = true
 egui_dock = { workspace = true, features = ["serde"] }
 winit.workspace = true
 engine-console = { path = "../engine/engine-console" }
+rve-play-ipc = { path = "../engine/rve-play-ipc" }
 engine-animation = { path = "../engine/engine-animation" }
 engine-core = { path = "../engine/engine-core" }
 engine-assets = { path = "../engine/engine-assets" }

@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "engine-console"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
 ]
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "crash-handler",
  "egui",
@@ -1192,6 +1192,7 @@ dependencies = [
  "png",
  "rfd",
  "rve-crash-monitor",
+ "rve-play-ipc",
  "rve-sdk",
  "sysinfo",
  "winit",
@@ -3364,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.42.0"
+version = "0.43.0"
 dependencies = [
  "base64",
  "blake3",
@@ -3399,6 +3400,7 @@ dependencies = [
  "png",
  "resvg",
  "rfd",
+ "rve-play-ipc",
  "rve-sdk",
  "serde",
  "serde_json",
@@ -3407,6 +3409,10 @@ dependencies = [
  "windows-sys 0.61.2",
  "winit",
 ]
+
+[[package]]
+name = "rve-play-ipc"
+version = "0.1.0"
 
 [[package]]
 name = "rve-player"

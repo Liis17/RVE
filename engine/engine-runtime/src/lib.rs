@@ -16,6 +16,7 @@ mod crash_dumps;
 mod cursor;
 #[cfg(any(feature = "dev-console", test))]
 mod dev_overlays;
+mod editor_ipc;
 mod game_ui;
 mod hardware;
 mod headless;
@@ -37,10 +38,11 @@ use cli::{PlayerArgs, SERVER_USAGE, USAGE};
 use console::{CommandCatalogSnapshot, ConsoleUiSlot};
 use crash::Role;
 use cursor::CursorControl;
+use editor_ipc::EditorIpc;
 use engine_assets::{Assets, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::ConsoleBuffer;
-use engine_console::install_logger;
+use engine_console::{install_logger, install_logger_with_output};
 use engine_files::VirtualPath;
 use engine_network::{NetworkEngine, NetworkHandle};
 use engine_physics::{
@@ -66,6 +68,7 @@ use pipeline::{
 };
 use prefabs::{RenderResourceRequest, start_prefab_loader};
 use profiling::StartupProfile;
+use rve_play_ipc::PlayerStatus;
 use scene::{PreparedScene, load_scene};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -76,6 +79,7 @@ use sysinfo::{CpuRefreshKind, System};
 
 const SCRIPTS_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SCRIPTS_READY_GRACE: Duration = Duration::from_secs(2);
+const EDITOR_STOP_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Runs an RVE game using the release layout or a loose-file development project.
 pub fn run_player() -> ExitCode {
@@ -83,7 +87,7 @@ pub fn run_player() -> ExitCode {
     if let Err(error) = engine_platform::ignore_console_interrupt() {
         eprintln!("Не удалось отключить Ctrl+C: {error}");
     }
-    let args = match PlayerArgs::parse_for_build(
+    let mut args = match PlayerArgs::parse_for_build(
         std::env::args_os().skip(1),
         cfg!(feature = "dev-console"),
     ) {
@@ -97,16 +101,27 @@ pub fn run_player() -> ExitCode {
     #[cfg(feature = "dev-console")]
     let console_buffer = Arc::new(Mutex::new(ConsoleBuffer::default()));
     #[cfg(feature = "dev-console")]
-    let _ = install_logger(Some(Arc::clone(&console_buffer)));
+    let _ = if args.editor_ipc {
+        install_logger_with_output(
+            Some(Arc::clone(&console_buffer)),
+            editor_ipc::write_log_line,
+        )
+    } else {
+        install_logger(Some(Arc::clone(&console_buffer)))
+    };
     #[cfg(not(feature = "dev-console"))]
-    let _ = install_logger(None);
+    let _ = if args.editor_ipc {
+        install_logger_with_output(None, editor_ipc::write_log_line)
+    } else {
+        install_logger(None)
+    };
     let exe_dir = match executable_dir() {
         Ok(exe_dir) => exe_dir,
         Err(error) => {
-            return fail(
+            return ExitCode::from(fail(
                 2,
                 format!("не удалось определить каталог исполняемого файла: {error}"),
-            );
+            ));
         }
     };
     crash::install(Role::Player, &exe_dir);
@@ -114,18 +129,51 @@ pub fn run_player() -> ExitCode {
     // SAFETY: this is the first runtime operation that can affect process-wide
     // Vulkan configuration, and no runtime, resource, or activation thread exists yet.
     unsafe { engine_platform::prepare_vulkan_environment(&release_root) };
+    let editor_ipc = if args.editor_ipc {
+        let ipc = match EditorIpc::start() {
+            Ok(ipc) => Arc::new(ipc),
+            Err(error) => {
+                return ExitCode::from(fail(
+                    2,
+                    format!("не удалось запустить editor IPC: {error}"),
+                ));
+            }
+        };
+        ipc.send_hello();
+        let Some(password) = ipc.wait_for_start() else {
+            ipc.send_exit(0);
+            return ExitCode::SUCCESS;
+        };
+        args.network.editor_password = password.filter(|password| !password.is_empty());
+        ipc.send_status(PlayerStatus::Loading);
+        Some(ipc)
+    } else {
+        None
+    };
     let activation = PendingActivation::default();
     #[cfg(feature = "dev-console")]
-    return run_from_args(
+    let exit_code = run_from_args(
         release_root,
         exe_dir,
         args,
         false,
         activation,
+        editor_ipc.clone(),
         console_buffer,
     );
     #[cfg(not(feature = "dev-console"))]
-    run_from_args(release_root, exe_dir, args, false, activation)
+    let exit_code = run_from_args(
+        release_root,
+        exe_dir,
+        args,
+        false,
+        activation,
+        editor_ipc.clone(),
+    );
+    if let Some(ipc) = editor_ipc {
+        ipc.send_exit(exit_code);
+    }
+    ExitCode::from(exit_code)
 }
 
 /// Runs a dedicated headless server (`rve-server`): no window, renderer, GPU probe or audio output.
@@ -148,10 +196,10 @@ pub fn run_server() -> ExitCode {
     let exe_dir = match executable_dir() {
         Ok(exe_dir) => exe_dir,
         Err(error) => {
-            return fail(
+            return ExitCode::from(fail(
                 2,
                 format!("не удалось определить каталог исполняемого файла: {error}"),
-            );
+            ));
         }
     };
     crash::install(Role::Server, &exe_dir);
@@ -159,22 +207,24 @@ pub fn run_server() -> ExitCode {
     #[cfg(feature = "dev-console")]
     let console_buffer = Arc::new(Mutex::new(ConsoleBuffer::default()));
     #[cfg(feature = "dev-console")]
-    return run_from_args(
+    return ExitCode::from(run_from_args(
         release_root,
         exe_dir,
         args,
         true,
         PendingActivation::default(),
+        None,
         console_buffer,
-    );
+    ));
     #[cfg(not(feature = "dev-console"))]
-    run_from_args(
+    ExitCode::from(run_from_args(
         release_root,
         exe_dir,
         args,
         true,
         PendingActivation::default(),
-    )
+        None,
+    ))
 }
 
 #[cfg(all(
@@ -199,6 +249,34 @@ fn executable_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "путь исполняемого файла не содержит родительский каталог".to_owned())
 }
 
+fn normalize_override_path(flag: &str, path: &Path) -> Result<PathBuf, String> {
+    normalize_scripts_path(path).map_err(|error| {
+        format!(
+            "не удалось разрешить путь {flag} {}: {error}",
+            path.display()
+        )
+    })
+}
+
+/// Каталог тяжёлых префабов и файл сохранения: флаги `--prefab-catalog` и `--save-path` заменяют
+/// значения раскладки проекта, без флага остаётся раскладка и значение по умолчанию.
+fn override_paths(
+    layout_catalog: &PrefabCatalogLocation,
+    prefab_catalog: Option<&Path>,
+    save_path: Option<&Path>,
+) -> Result<(PrefabCatalogLocation, Option<PathBuf>), String> {
+    let catalog = match prefab_catalog {
+        Some(path) => {
+            PrefabCatalogLocation::File(normalize_override_path("--prefab-catalog", path)?)
+        }
+        None => layout_catalog.clone(),
+    };
+    let save = save_path
+        .map(|path| normalize_override_path("--save-path", path))
+        .transpose()?;
+    Ok((catalog, save))
+}
+
 /// Общий путь запуска игры (`rve-player`) и выделенного сервера (`headless`). Окно, renderer, проверка
 /// Vulkan, иконка, экземпляр и звуковой вывод есть только у игры.
 fn run_from_args(
@@ -207,8 +285,9 @@ fn run_from_args(
     args: PlayerArgs,
     headless: bool,
     activation: PendingActivation,
+    editor_ipc: Option<Arc<EditorIpc>>,
     #[cfg(feature = "dev-console")] console_buffer: Arc<Mutex<ConsoleBuffer>>,
-) -> ExitCode {
+) -> u8 {
     let debug_view = args.debug_view.unwrap_or(DebugView::Lit);
     #[cfg(feature = "dev-console")]
     let command_catalog = Arc::new(Mutex::new(CommandCatalogSnapshot::default()));
@@ -232,6 +311,14 @@ fn run_from_args(
             Layout::release(&release_root),
             crash::release_report_dir(&exe_dir, cfg!(target_os = "macos")),
         ),
+    };
+    let (prefab_catalog_location, save_path_override) = match override_paths(
+        &layout.prefab_catalog,
+        args.prefab_catalog.as_deref(),
+        args.save_path.as_deref(),
+    ) {
+        Ok(paths) => paths,
+        Err(error) => return fail(2, error),
     };
     let scripts_override = match args.scripts.as_deref() {
         Some(path) => match normalize_scripts_path(path) {
@@ -272,7 +359,7 @@ fn run_from_args(
     };
     let role = if headless { Role::Server } else { Role::Player };
     let report_dir = crash::set_target(role, report_dir, &project.name);
-    let prefab_list = match load_prefab_catalog(&layout.prefab_catalog, &resource_handle) {
+    let prefab_list = match load_prefab_catalog(&prefab_catalog_location, &resource_handle) {
         Ok(list) => list,
         Err(error) => return fail(2, format!("ошибка списка префабов: {error}")),
     };
@@ -307,7 +394,7 @@ fn run_from_args(
                     log::error!("Ошибка завершения ресурсного сервиса: {error}");
                 }
                 drop(instance_lock.take());
-                return ExitCode::SUCCESS;
+                return 0;
             }
             InstanceOutcome::Failure { code, message } => {
                 if let Err(error) = resources.shutdown() {
@@ -351,7 +438,7 @@ fn run_from_args(
             log::error!("Ошибка завершения ресурсного сервиса: {error}");
         }
         drop(instance_lock.take());
-        return ExitCode::from(3);
+        return 3;
     }
 
     startup.record("hardware probe", phase_started.elapsed());
@@ -530,7 +617,8 @@ fn run_from_args(
             )),
             gpu_render: !headless,
             scene_name: name,
-            save_path: engine_platform::save_data_path(&project.name),
+            save_path: save_path_override
+                .or_else(|| engine_platform::save_data_path(&project.name)),
             save_schema,
             enabled_scenes: project
                 .scenes
@@ -586,13 +674,21 @@ fn run_from_args(
     startup.record("scripts start", phase_started.elapsed());
     phase_started = Instant::now();
     let mut scripts_ready_timed_out = false;
-    if let Err((code, message)) = wait_scripts_ready(
+    if let Err((code, message)) = wait_scripts_ready_with_editor(
         &script_thread.ready,
         &interrupt,
         SCRIPTS_READY_TIMEOUT,
         SCRIPTS_READY_GRACE,
         &mut scripts_ready_timed_out,
+        editor_ipc
+            .as_deref()
+            .map(|ipc| move || ipc.stop_requested()),
     ) {
+        if code == 0
+            && let Some(ipc) = &editor_ipc
+        {
+            ipc.send_status(PlayerStatus::Stopping);
+        }
         if scripts_ready_timed_out {
             modules.detach(SCRIPTS_THREAD);
         }
@@ -603,7 +699,23 @@ fn run_from_args(
             log::error!("Ошибка завершения ресурсного сервиса: {error}");
         }
         drop(instance_lock.take());
-        return fail(code, message);
+        return if code == 0 { 0 } else { fail(code, message) };
+    }
+
+    if editor_ipc.as_ref().is_some_and(|ipc| ipc.stop_requested()) {
+        if let Some(ipc) = &editor_ipc {
+            ipc.send_status(PlayerStatus::Stopping);
+        }
+        interrupt.interrupt();
+        let _ = script_tx.send(ScriptControl::Shutdown);
+        for error in modules.shutdown() {
+            log::error!("Ошибка остановки модуля: {error}");
+        }
+        if let Err(error) = resources.shutdown() {
+            log::error!("Ошибка завершения ресурсного сервиса: {error}");
+        }
+        drop(instance_lock.take());
+        return 0;
     }
 
     startup.record("scripts ready", phase_started.elapsed());
@@ -653,6 +765,7 @@ fn run_from_args(
                 script_stopped_rx: script_thread.stopped,
                 interrupt,
                 status: Arc::clone(&status),
+                editor_ipc: editor_ipc.clone(),
                 resource_stats: resource_handle.clone(),
                 startup,
                 input,
@@ -680,7 +793,7 @@ fn run_from_args(
         }
     }
     drop(instance_lock.take());
-    ExitCode::from(code)
+    code
 }
 
 /// Читает список тяжёлых префабов. Отсутствующий файл dev-проекта — пустой список; в release
@@ -803,6 +916,72 @@ fn wait_scripts_ready(
         || interrupt.interrupt(),
         timed_out,
     )
+}
+
+/// Stop редактора прерывает ожидание скриптов тем же путём, что и таймаут: сначала interrupt,
+/// затем `grace`. Без ответа за это время поток отсоединяется, как при таймауте.
+fn wait_scripts_ready_with_editor(
+    receiver: &std::sync::mpsc::Receiver<Result<(), ScriptStartupError>>,
+    interrupt: &ScriptInterruptHandle,
+    timeout: Duration,
+    grace: Duration,
+    timed_out: &mut bool,
+    stop_requested: Option<impl Fn() -> bool>,
+) -> Result<(), (u8, String)> {
+    let Some(stop_requested) = stop_requested else {
+        return wait_scripts_ready(receiver, interrupt, timeout, grace, timed_out);
+    };
+
+    let deadline = Instant::now() + timeout;
+    let mut grace_deadline = None;
+    loop {
+        if stop_requested() {
+            return Err(stop_scripts_ready_wait(
+                receiver, interrupt, grace, timed_out,
+            ));
+        }
+        let now = Instant::now();
+        let phase_deadline = grace_deadline.unwrap_or(deadline);
+        let wait = phase_deadline
+            .saturating_duration_since(now)
+            .min(EDITOR_STOP_CHECK_INTERVAL);
+        match receiver.recv_timeout(wait) {
+            Ok(result) => return scripts_ready_result(Ok(result)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return scripts_ready_result(Err(std::sync::mpsc::RecvError));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                match grace_deadline {
+                    Some(grace_deadline) if now >= grace_deadline => {
+                        *timed_out = true;
+                        return Err((
+                            1,
+                            format!("поток скриптов не подтвердил запуск за {timeout:?}"),
+                        ));
+                    }
+                    None if now >= deadline => {
+                        interrupt.interrupt();
+                        grace_deadline = Some(now + grace);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn stop_scripts_ready_wait(
+    receiver: &std::sync::mpsc::Receiver<Result<(), ScriptStartupError>>,
+    interrupt: &ScriptInterruptHandle,
+    grace: Duration,
+    timed_out: &mut bool,
+) -> (u8, String) {
+    interrupt.interrupt();
+    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = receiver.recv_timeout(grace) {
+        *timed_out = true;
+    }
+    (0, "Play остановлен редактором".to_owned())
 }
 
 fn wait_scripts_ready_after_timeout(
@@ -944,18 +1123,19 @@ fn run_headless(
     status.exit_code()
 }
 
-fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {
+fn fail(code: u8, message: impl AsRef<str>) -> u8 {
     log::error!("{}", message.as_ref());
-    ExitCode::from(code)
+    code
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        add_heavy_prefabs, load_prefab_catalog, load_project_settings, scripts_ready_result,
-        wait_scripts_ready, wait_scripts_ready_after_timeout,
+        add_heavy_prefabs, load_prefab_catalog, load_project_settings, override_paths,
+        scripts_ready_result, wait_scripts_ready, wait_scripts_ready_after_timeout,
+        wait_scripts_ready_with_editor,
     };
-    use crate::layout::{PrefabCatalogLocation, ProjectSettingsLocation};
+    use crate::layout::{PrefabCatalogLocation, ProjectSettingsLocation, normalize_scripts_path};
     use crate::module_host::ModuleHost;
     use crate::pipeline::{RuntimeStatus, ScriptStartupError};
     use engine_physics::PhysicsSceneDesc;
@@ -1141,6 +1321,46 @@ mod tests {
     }
 
     #[test]
+    fn editor_stop_during_script_wait_accepts_reply_within_grace() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        ready_tx.send(Ok(())).unwrap();
+        let interrupt = engine_script::ScriptInterruptHandle::new();
+        let mut timed_out = false;
+        let (code, message) = wait_scripts_ready_with_editor(
+            &ready_rx,
+            &interrupt,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            &mut timed_out,
+            Some(|| true),
+        )
+        .unwrap_err();
+        assert_eq!(code, 0);
+        assert!(message.contains("остановлен редактором"));
+        assert!(interrupt.is_interrupted());
+        assert!(!timed_out);
+    }
+
+    #[test]
+    fn editor_stop_without_script_reply_detaches_after_grace() {
+        let (_ready_tx, ready_rx) = mpsc::channel::<Result<(), ScriptStartupError>>();
+        let interrupt = engine_script::ScriptInterruptHandle::new();
+        let mut timed_out = false;
+        let (code, _) = wait_scripts_ready_with_editor(
+            &ready_rx,
+            &interrupt,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            &mut timed_out,
+            Some(|| true),
+        )
+        .unwrap_err();
+        assert_eq!(code, 0);
+        assert!(interrupt.is_interrupted());
+        assert!(timed_out, "scripts that ignore the stop must be detached");
+    }
+
+    #[test]
     fn script_ready_timeout_interrupts_and_reports_failure_after_grace() {
         let (_ready_tx, ready_rx) = mpsc::channel();
         let interrupt = engine_script::ScriptInterruptHandle::new();
@@ -1233,5 +1453,43 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, 1);
         assert!(message.contains("panic"));
+    }
+
+    #[test]
+    fn override_flags_replace_the_layout_paths_and_missing_files_are_loaded_later() {
+        let dir = std::env::temp_dir().join(format!("rve-override-paths-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("custom.rveprefabs");
+        let save = dir.join("save.toml");
+        fs::write(&catalog, b"").unwrap();
+        fs::write(&save, b"").unwrap();
+        let layout = PrefabCatalogLocation::File(dir.join("layout.rveprefabs"));
+
+        // Без флагов остаются значения раскладки; переопределения сохранения нет.
+        assert_eq!(
+            override_paths(&layout, None, None).unwrap(),
+            (layout.clone(), None)
+        );
+
+        // Оба флага заменяют раскладку и путь сохранения.
+        let (location, save_override) =
+            override_paths(&layout, Some(&catalog), Some(&save)).unwrap();
+        assert_eq!(
+            location,
+            PrefabCatalogLocation::File(normalize_scripts_path(&catalog).unwrap())
+        );
+        assert_eq!(save_override, Some(normalize_scripts_path(&save).unwrap()));
+
+        // Отсутствующий файл не ошибка выбора пути: путь становится абсолютным, а загрузка каталога
+        // или сохранения сообщит о нём при старте.
+        let missing = dir.join("missing.rveprefabs");
+        let (location, save_override) = override_paths(&layout, Some(&missing), None).unwrap();
+        assert_eq!(
+            location,
+            PrefabCatalogLocation::File(normalize_scripts_path(&missing).unwrap())
+        );
+        assert_eq!(save_override, None);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

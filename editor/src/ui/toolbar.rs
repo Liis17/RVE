@@ -388,6 +388,18 @@ fn snap_step<'a>(value: &'a mut f32, prefix: &str, suffix: &str) -> egui::DragVa
         .suffix(suffix)
 }
 
+/// Подпись фазы Play в отдельном процессе для тулбара.
+fn play_process_label(phase: crate::play_process::Phase) -> &'static str {
+    use crate::play_process::Phase;
+    match phase {
+        Phase::Launching | Phase::Loading => "rve-player: загрузка",
+        Phase::Running => "rve-player: запущен",
+        Phase::Stopping => "rve-player: остановка",
+        Phase::Killing => "rve-player: завершение",
+        Phase::Exited => "rve-player: выход",
+    }
+}
+
 /// Сетевой режим следующего Play и его параметры. Во время Play меню закрыто для изменений.
 fn show_play_network(ui: &mut egui::Ui, state: &mut EditorState, playing: bool) {
     let network = state
@@ -484,10 +496,22 @@ fn show_tools(ui: &mut egui::Ui, state: &mut EditorState) {
     if ui.selectable_label(can_stop, "Play").clicked() {
         state.action(if can_stop { Action::Stop } else { Action::Play });
     }
+    let _ = ui.add_enabled_ui(!can_stop, |ui| {
+        ui.toggle_value(&mut state.play_in_process, "Process")
+            .on_hover_text(
+                "Play в отдельном окне rve-player: зависший скрипт не блокирует редактор",
+            )
+    });
+    if let Some(process) = &state.play_process {
+        ui.label(play_process_label(process.phase()));
+    }
     show_play_network(ui, state, can_stop);
     let paused = state.play.as_ref().is_some_and(|play| play.is_paused());
     if ui
-        .add_enabled(playing, egui::Button::selectable(paused, "Pause"))
+        .add_enabled(
+            state.play.is_some(),
+            egui::Button::selectable(paused, "Pause"),
+        )
         .clicked()
         && let Some(play) = &mut state.play
     {

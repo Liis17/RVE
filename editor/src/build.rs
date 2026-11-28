@@ -273,20 +273,21 @@ pub fn cleanup_script_generations(project: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     job: windows_sys::Win32::Foundation::HANDLE,
 }
 
 #[cfg(unix)]
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     process_group: Option<libc::pid_t>,
 }
 
 #[cfg(not(any(unix, windows)))]
-struct ProcessTree;
+pub(crate) struct ProcessTree;
 
 impl ProcessTree {
-    fn prepare(command: &mut Command) -> std::io::Result<Self> {
+    /// Готовит команду так, чтобы её потомки попадали в дерево; вызывать до `spawn`.
+    pub(crate) fn prepare(command: &mut Command) -> std::io::Result<Self> {
         #[cfg(windows)]
         {
             let _ = command;
@@ -307,7 +308,8 @@ impl ProcessTree {
         }
     }
 
-    fn attach(&mut self, child: &Child) -> std::io::Result<()> {
+    /// Привязывает запущенного лидера к дереву; вызывать сразу после `spawn`.
+    pub(crate) fn attach(&mut self, child: &Child) -> std::io::Result<()> {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
@@ -332,7 +334,9 @@ impl ProcessTree {
         Ok(())
     }
 
-    fn terminate(&self) -> std::io::Result<()> {
+    /// Немедленно завершает всё дерево. Для unix вызывать, пока лидер не собран `wait`:
+    /// тогда идентификатор группы не может быть переиспользован.
+    pub(crate) fn terminate(&self) -> std::io::Result<()> {
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::JobObjects::TerminateJobObject;

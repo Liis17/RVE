@@ -16,6 +16,8 @@ Info/Warn/Error, source и text; generation меняется при измене
 `ConsoleLogger` отправляет Info в stdout, Warn/Error в stderr и, если задан sink,
 сохраняет запись в общем буфере. Установка process logger выполняется один раз.
 
+`install_logger_with_output` ставит тот же логгер, но вместо записи в stdout/stderr каждую строку Info/Warn/Error передаёт callback (`LogOutputCallback`); он вызывается в потоке, который написал лог. Sink и кольцо хвоста работают как прежде. Так `rve-player --editor-ipc` отправляет журнал редактору по протоколу [[Engine/RvePlayIpc]], а не в stdout.
+
 Независимо от sink логгер всегда держит кольцо из последних 200 строк Info/Warn/Error
 (`LOG_TAIL_CAPACITY`), не подавляя повторы, как буфер консоли, — хвост для отчётов о падении [[Engine/EngineRuntime]]. `log_tail()`
 возвращает копию и ждёт блокировку; `try_log_tail()` возвращает `None`, если хвост занят

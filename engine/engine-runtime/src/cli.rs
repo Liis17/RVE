@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Использование: rve-player [--project <dir>] [--scripts <path>] [--frames N] [--debug-view lit|wireframe|normals|overdraw|lod|cascades] [--host [--host-addr <addr:port>] | --connect <addr:port> (--server-fingerprint <hex> | --insecure-no-pin)] [--server-key <file>] [--password-file <file>]";
+pub(crate) const USAGE: &str = "Использование: rve-player [--project <dir>] [--scripts <path>] [--frames N] [--debug-view lit|wireframe|normals|overdraw|lod|cascades] [--host [--host-addr <addr:port>] | --connect <addr:port> (--server-fingerprint <hex> | --insecure-no-pin)] [--server-key <file>] [--password-file <file>] [--editor-ipc [--save-path <file>] [--prefab-catalog <file>]]";
 pub(crate) const SERVER_USAGE: &str = "Использование: rve-server [--project <dir>] [--scripts <path>] [--frames N] [--bind <addr:port>] [--server-key <file>] [--password-file <file>]";
 
 /// Сетевые флаги. Без `--host` и `--connect` процесс работает offline.
@@ -23,6 +23,8 @@ pub(crate) struct NetworkArgs {
     pub server_key: Option<PathBuf>,
     /// `--password-file`: файл пароля комнаты.
     pub password_file: Option<PathBuf>,
+    /// Пароль, переданный редактором после запуска процесса.
+    pub editor_password: Option<String>,
 }
 
 impl NetworkArgs {
@@ -70,6 +72,9 @@ pub(crate) struct PlayerArgs {
     pub scripts: Option<PathBuf>,
     pub frames: Option<u64>,
     pub debug_view: Option<DebugView>,
+    pub editor_ipc: bool,
+    pub save_path: Option<PathBuf>,
+    pub prefab_catalog: Option<PathBuf>,
     pub network: NetworkArgs,
 }
 
@@ -140,6 +145,20 @@ fn parse_args(
                     return Err("укажите путь после --scripts".to_owned());
                 }
                 parsed.scripts = Some(PathBuf::from(value));
+            }
+            Some("--editor-ipc") if !server => set_flag(&mut parsed.editor_ipc, "--editor-ipc")?,
+            Some("--save-path") if !server => {
+                if parsed.save_path.is_some() {
+                    return Err("параметр --save-path указан повторно".to_owned());
+                }
+                parsed.save_path = Some(PathBuf::from(path_after(&mut args, "--save-path")?));
+            }
+            Some("--prefab-catalog") if !server => {
+                if parsed.prefab_catalog.is_some() {
+                    return Err("параметр --prefab-catalog указан повторно".to_owned());
+                }
+                parsed.prefab_catalog =
+                    Some(PathBuf::from(path_after(&mut args, "--prefab-catalog")?));
             }
             Some("--debug-view") if !server => {
                 if parsed.debug_view.is_some() {
@@ -212,8 +231,21 @@ fn parse_args(
     if parsed.debug_view.is_some() && parsed.project.is_none() {
         return Err("--debug-view доступен только при запуске с --project".to_owned());
     }
+    if (parsed.editor_ipc || parsed.save_path.is_some() || parsed.prefab_catalog.is_some())
+        && parsed.project.is_none()
+    {
+        return Err("--editor-ipc, --save-path и --prefab-catalog требуют --project".to_owned());
+    }
     parsed.network.validate()?;
     Ok(parsed)
+}
+
+fn path_after(args: &mut impl Iterator<Item = OsString>, name: &str) -> Result<OsString, String> {
+    let value = value_after(args, name, "путь к файлу")?;
+    if value.is_empty() {
+        return Err(format!("укажите путь после {name}"));
+    }
+    Ok(value)
 }
 
 fn set_flag(flag: &mut bool, name: &str) -> Result<(), String> {
@@ -349,9 +381,55 @@ mod tests {
             vec!["--debug-view", "bad"],
             vec!["--debug-view", "lit", "--debug-view", "normals"],
             vec!["--debug-view", "lit"],
+            vec!["--editor-ipc"],
+            vec!["--editor-ipc", "--editor-ipc", "--project", "game"],
+            vec![
+                "--save-path",
+                "save.toml",
+                "--project",
+                "game",
+                "--save-path",
+                "other.toml",
+            ],
+            vec!["--save-path"],
+            vec!["--save-path", ""],
+            vec!["--save-path", "--project", "game"],
+            vec![
+                "--prefab-catalog",
+                "catalog.rveprefabs",
+                "--project",
+                "game",
+                "--prefab-catalog",
+                "other.rveprefabs",
+            ],
+            vec!["--prefab-catalog"],
+            vec!["--prefab-catalog", ""],
+            vec!["--prefab-catalog", "--project", "game"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }
+    }
+
+    #[test]
+    fn editor_ipc_and_file_overrides_require_project_and_parse_in_any_order() {
+        let parsed = parse(&[
+            "--editor-ipc",
+            "--save-path",
+            "save file.toml",
+            "--prefab-catalog",
+            "catalog.rveprefabs",
+            "--project",
+            "game",
+        ])
+        .unwrap();
+        assert!(parsed.editor_ipc);
+        assert_eq!(parsed.save_path, Some(PathBuf::from("save file.toml")));
+        assert_eq!(
+            parsed.prefab_catalog,
+            Some(PathBuf::from("catalog.rveprefabs"))
+        );
+        assert!(parse(&["--save-path", "save.toml", "--project", "game"]).is_ok());
+        assert!(parse(&["--prefab-catalog", "catalog", "--project", "game"]).is_ok());
     }
 
     #[test]
