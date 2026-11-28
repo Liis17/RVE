@@ -6,8 +6,7 @@ use crate::build::ProcessTree;
 use crate::console::LogLevel;
 use rve_play_ipc::{
     DecodedPlayerMessage, EditorMessage, PROTOCOL_VERSION, PlayerLogLevel, PlayerMessage,
-    PlayerStatus, PlayerStreamDecoder, ProtocolError, encode_editor_message,
-    is_supported_protocol_version,
+    PlayerStatus, PlayerStreamDecoder, encode_editor_message, is_supported_protocol_version,
 };
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -497,8 +496,10 @@ impl PlayProcess {
         if self.finished {
             return events;
         }
-        self.drain_control(now, &mut events);
+        // Выход наблюдается раньше сообщений: ошибка протокола, пришедшая после выхода, не должна
+        // подменять реальный код завершения.
         self.observe_exit(now);
+        self.drain_control(now, &mut events);
         let commands = self.machine.poll(now);
         self.apply(commands, &mut events);
         self.drain_logs(LOG_PER_POLL, &mut events);
@@ -625,6 +626,7 @@ impl PlayProcess {
     }
 
     fn kill(&mut self, reason: String, events: &mut Vec<PlayEvent>) {
+        self.observe_exit(Instant::now());
         if self.killed.is_some() || self.exited.is_some() {
             return;
         }
@@ -763,26 +765,26 @@ fn read_stdout(mut stdout: ChildStdout, reader: &Reader) {
     reader.closed();
 }
 
-fn dispatch_record(record: Result<DecodedPlayerMessage, ProtocolError>, reader: &Reader) {
+fn dispatch_record(record: DecodedPlayerMessage, reader: &Reader) {
     match record {
-        Ok(DecodedPlayerMessage::Raw(text)) => reader.log(LogLevel::Info, text),
-        Ok(DecodedPlayerMessage::Message(PlayerMessage::Hello {
+        DecodedPlayerMessage::Raw(text) => reader.log(LogLevel::Info, text),
+        DecodedPlayerMessage::Message(PlayerMessage::Hello {
             protocol_version,
             pid,
             runtime_version,
-        })) => reader.control(Control::Hello {
+        }) => reader.control(Control::Hello {
             protocol_version,
             pid,
             runtime_version,
         }),
-        Ok(DecodedPlayerMessage::Message(PlayerMessage::Status(status))) => {
+        DecodedPlayerMessage::Message(PlayerMessage::Status(status)) => {
             reader.control(Control::Status(status));
         }
-        Ok(DecodedPlayerMessage::Message(PlayerMessage::Log {
+        DecodedPlayerMessage::Message(PlayerMessage::Log {
             level,
             target,
             text,
-        })) => {
+        }) => {
             let level = match level {
                 PlayerLogLevel::Trace | PlayerLogLevel::Debug | PlayerLogLevel::Info => {
                     LogLevel::Info
@@ -798,9 +800,17 @@ fn dispatch_record(record: Result<DecodedPlayerMessage, ProtocolError>, reader: 
             reader.log(level, text);
         }
         // Итог процесса берётся из статуса выхода; сообщение `exit` нужно только для протокола.
-        Ok(DecodedPlayerMessage::Message(PlayerMessage::Exit { .. }))
-        | Ok(DecodedPlayerMessage::Unknown { .. }) => {}
-        Err(error) => reader.control(Control::ProtocolError(error.to_string())),
+        DecodedPlayerMessage::Message(PlayerMessage::Exit { .. })
+        | DecodedPlayerMessage::Unknown { .. } => {}
+        // Только `hello` определяет совместимость: без него редактор не знает, что за процесс
+        // перед ним. Остальные испорченные записи — предупреждение в журнале, процесс продолжает работу.
+        DecodedPlayerMessage::Malformed { kind, error } if kind == "hello" => {
+            reader.control(Control::ProtocolError(format!("hello: {error}")));
+        }
+        DecodedPlayerMessage::Malformed { kind, error } => reader.log(
+            LogLevel::Warn,
+            format!("повреждённая запись rve-player ({kind}): {error}"),
+        ),
     }
 }
 
@@ -1098,14 +1108,88 @@ mod tests {
         // Никто не читает журнал, поэтому всё сверх ёмкости считается пропущенным.
         let records = LOG_CAPACITY + 10;
         for index in 0..records {
-            dispatch_record(
-                Ok(DecodedPlayerMessage::Raw(format!("line {index}"))),
-                &reader,
-            );
+            dispatch_record(DecodedPlayerMessage::Raw(format!("line {index}")), &reader);
         }
         assert_eq!(log_rx.try_iter().count(), LOG_CAPACITY);
         assert_eq!(skipped.load(Ordering::Acquire), 10);
         assert_eq!(wakes.load(Ordering::Acquire), records as u64);
+    }
+
+    /// Читатель без процесса: сообщения и журнал видны в каналах, которые можно опросить.
+    fn test_reader() -> (Reader, Receiver<Control>, Receiver<PlayLog>, Arc<AtomicU64>) {
+        let (control, control_rx) = mpsc::channel();
+        let (logs, log_rx) = mpsc::sync_channel(LOG_CAPACITY);
+        let skipped = Arc::new(AtomicU64::new(0));
+        let reader = Reader {
+            control,
+            logs,
+            skipped: Arc::clone(&skipped),
+            wake: Arc::new(|| {}),
+        };
+        (reader, control_rx, log_rx, skipped)
+    }
+
+    #[test]
+    fn damaged_records_warn_and_only_a_damaged_hello_reaches_the_state_machine() {
+        use rve_play_ipc::ProtocolError;
+
+        let (reader, control, logs, _) = test_reader();
+        dispatch_record(
+            DecodedPlayerMessage::Malformed {
+                kind: "status".into(),
+                error: ProtocolError::InvalidValue("status"),
+            },
+            &reader,
+        );
+        dispatch_record(
+            DecodedPlayerMessage::Malformed {
+                kind: "log".into(),
+                error: ProtocolError::InvalidEscape,
+            },
+            &reader,
+        );
+        assert!(
+            control.try_recv().is_err(),
+            "damaged status and log must not reach the state machine"
+        );
+        let warnings: Vec<_> = logs.try_iter().collect();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().all(|record| record.level == LogLevel::Warn));
+        assert!(warnings[0].text.contains("status"), "{warnings:?}");
+
+        dispatch_record(
+            DecodedPlayerMessage::Malformed {
+                kind: "hello".into(),
+                error: ProtocolError::MissingField("process id"),
+            },
+            &reader,
+        );
+        assert_eq!(
+            control.try_recv().unwrap(),
+            Control::ProtocolError("hello: missing process id field".to_owned())
+        );
+    }
+
+    #[test]
+    fn protocol_error_after_the_player_exited_keeps_its_real_exit_code() {
+        let mut process = PlayProcess::spawn(
+            test_stub_launch("exit3", Vec::new()),
+            now(),
+            Arc::new(|| {}),
+        )
+        .expect("spawn test stub");
+        let mut events = drive_until(&mut process, |process, _| process.exited.is_some());
+        // Ошибка протокола приходит уже после выхода: она не должна стать причиной завершения.
+        process
+            .pending
+            .push_back(Control::ProtocolError("late".to_owned()));
+        events.extend(drive_until(&mut process, |process, _| {
+            process.is_finished()
+        }));
+        assert!(process.killed.is_none(), "exit code must not be masked");
+        let (level, message) = finished(&events).expect("finish message");
+        assert_eq!(level, LogLevel::Error);
+        assert!(message.contains("с кодом 3"), "{message}");
     }
 
     fn finished(events: &[PlayEvent]) -> Option<(LogLevel, String)> {
@@ -1202,6 +1286,10 @@ mod tests {
             pid: std::process::id(),
             runtime_version: "test".to_owned(),
         });
+        if mode == "exit3" {
+            // Режим `exit3`: игрок выходит с кодом 3 сразу после hello, не читая команд.
+            std::process::exit(3);
+        }
         let mut stdin = io::stdin().lock();
         let mut line = String::new();
         // Как `wait_for_start` у игрока: `stop` до `start` — штатный выход с кодом 0.

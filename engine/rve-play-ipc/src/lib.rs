@@ -30,6 +30,15 @@ impl PlayerStatus {
             Self::Stopping => "stopping",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "loading" => Self::Loading,
+            "running" => Self::Running,
+            "stopping" => Self::Stopping,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +59,17 @@ impl PlayerLogLevel {
             Self::Warn => "warn",
             Self::Error => "error",
         }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "trace" => Self::Trace,
+            "debug" => Self::Debug,
+            "info" => Self::Info,
+            "warn" => Self::Warn,
+            "error" => Self::Error,
+            _ => return None,
+        })
     }
 }
 
@@ -80,10 +100,17 @@ pub enum EditorMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodedPlayerMessage {
     Message(PlayerMessage),
+    /// Строка без маркера протокола: обычный вывод игры или сторонних библиотек.
     Raw(String),
-    /// An unrecognized message type. Consumers can ignore this for forward compatibility.
+    /// Неизвестный тип записи. Получатель может его пропустить ради совместимости вперёд.
     Unknown {
         kind: String,
+    },
+    /// Известный тип с испорченным, неизвестным или обрезанным полем. Решение о последствиях
+    /// принимает получатель: `hello` требует реакции, журнал достаточно показать предупреждением.
+    Malformed {
+        kind: String,
+        error: ProtocolError,
     },
 }
 
@@ -92,6 +119,7 @@ pub enum ProtocolError {
     MissingField(&'static str),
     InvalidValue(&'static str),
     InvalidEscape,
+    TooLong,
 }
 
 impl fmt::Display for ProtocolError {
@@ -100,6 +128,7 @@ impl fmt::Display for ProtocolError {
             Self::MissingField(field) => write!(f, "missing {field} field"),
             Self::InvalidValue(field) => write!(f, "invalid {field} field"),
             Self::InvalidEscape => f.write_str("invalid escape sequence"),
+            Self::TooLong => write!(f, "record longer than {MAX_RECORD_BYTES} bytes"),
         }
     }
 }
@@ -136,11 +165,26 @@ pub fn encode_player_message(message: &PlayerMessage) -> String {
 
 /// Decodes a complete stdout record, including the record separator when present.
 /// Lines without the protocol marker are returned as raw player output.
-pub fn decode_player_record(record: &str) -> Result<DecodedPlayerMessage, ProtocolError> {
+pub fn decode_player_record(record: &str) -> DecodedPlayerMessage {
     let record = record.strip_suffix('\r').unwrap_or(record);
     let Some(payload) = record.strip_prefix(PREFIX) else {
-        return Ok(DecodedPlayerMessage::Raw(record.to_owned()));
+        return DecodedPlayerMessage::Raw(record.to_owned());
     };
+    let kind = payload.split('\t').next().unwrap_or_default();
+    match decode_payload(payload) {
+        Ok(Some(message)) => DecodedPlayerMessage::Message(message),
+        Ok(None) => DecodedPlayerMessage::Unknown {
+            kind: kind.to_owned(),
+        },
+        Err(error) => DecodedPlayerMessage::Malformed {
+            kind: kind.to_owned(),
+            error,
+        },
+    }
+}
+
+/// `Ok(None)` — тип записи неизвестен; ошибка — известный тип с плохим полем.
+fn decode_payload(payload: &str) -> Result<Option<PlayerMessage>, ProtocolError> {
     let fields: Vec<_> = payload.split('\t').collect();
     let kind = fields.first().copied().unwrap_or_default();
     let get = |index: usize, name| {
@@ -159,21 +203,12 @@ pub fn decode_player_record(record: &str) -> Result<DecodedPlayerMessage, Protoc
                 .map_err(|_| ProtocolError::InvalidValue("process id"))?,
             runtime_version: unescape(get(3, "runtime version")?)?,
         },
-        "status" => PlayerMessage::Status(match get(1, "status")? {
-            "loading" => PlayerStatus::Loading,
-            "running" => PlayerStatus::Running,
-            "stopping" => PlayerStatus::Stopping,
-            _ => return Err(ProtocolError::InvalidValue("status")),
-        }),
+        "status" => PlayerMessage::Status(
+            PlayerStatus::parse(get(1, "status")?).ok_or(ProtocolError::InvalidValue("status"))?,
+        ),
         "log" => PlayerMessage::Log {
-            level: match get(1, "log level")? {
-                "trace" => PlayerLogLevel::Trace,
-                "debug" => PlayerLogLevel::Debug,
-                "info" => PlayerLogLevel::Info,
-                "warn" => PlayerLogLevel::Warn,
-                "error" => PlayerLogLevel::Error,
-                _ => return Err(ProtocolError::InvalidValue("log level")),
-            },
+            level: PlayerLogLevel::parse(get(1, "log level")?)
+                .ok_or(ProtocolError::InvalidValue("log level"))?,
             target: unescape(get(2, "log target")?)?,
             text: unescape(get(3, "log text")?)?,
         },
@@ -182,13 +217,9 @@ pub fn decode_player_record(record: &str) -> Result<DecodedPlayerMessage, Protoc
                 .parse()
                 .map_err(|_| ProtocolError::InvalidValue("exit code"))?,
         },
-        _ => {
-            return Ok(DecodedPlayerMessage::Unknown {
-                kind: kind.to_owned(),
-            });
-        }
+        _ => return Ok(None),
     };
-    Ok(DecodedPlayerMessage::Message(message))
+    Ok(Some(message))
 }
 
 pub fn encode_editor_message(message: &EditorMessage) -> String {
@@ -226,7 +257,7 @@ pub struct PlayerStreamDecoder {
 }
 
 impl PlayerStreamDecoder {
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<Result<DecodedPlayerMessage, ProtocolError>> {
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<DecodedPlayerMessage> {
         let mut records = Vec::new();
         for byte in bytes {
             match *byte {
@@ -241,7 +272,7 @@ impl PlayerStreamDecoder {
         records
     }
 
-    pub fn finish(&mut self) -> Vec<Result<DecodedPlayerMessage, ProtocolError>> {
+    pub fn finish(&mut self) -> Vec<DecodedPlayerMessage> {
         let mut records = Vec::new();
         self.emit(&mut records);
         records
@@ -255,23 +286,55 @@ impl PlayerStreamDecoder {
         }
     }
 
-    fn emit(&mut self, records: &mut Vec<Result<DecodedPlayerMessage, ProtocolError>>) {
+    fn emit(&mut self, records: &mut Vec<DecodedPlayerMessage>) {
         if self.buffer.is_empty() && !self.truncated {
             return;
         }
         let bytes = std::mem::take(&mut self.buffer);
-        if self.truncated {
-            let mut raw = String::from_utf8_lossy(&bytes).into_owned();
-            raw.push_str(TRUNCATED_MARKER);
-            records.push(Ok(DecodedPlayerMessage::Raw(raw)));
+        let truncated = std::mem::take(&mut self.truncated);
+        let record = if truncated {
+            decode_truncated(&bytes)
         } else {
-            let record = String::from_utf8_lossy(&bytes);
-            records.push(decode_player_record(&record));
-        }
-        self.truncated = false;
+            decode_player_record(&String::from_utf8_lossy(&bytes))
+        };
+        records.push(record);
     }
 }
 
+/// Запись длиннее лимита: журнал сохраняет уровень и target, текст получает пометку. Остальные
+/// обрезанные записи не имеют смысла по частям и отмечаются как испорченные.
+fn decode_truncated(bytes: &[u8]) -> DecodedPlayerMessage {
+    let text = String::from_utf8_lossy(bytes);
+    let Some(payload) = text.strip_prefix(PREFIX) else {
+        return DecodedPlayerMessage::Raw(format!("{text}{TRUNCATED_MARKER}"));
+    };
+    let kind = payload.split('\t').next().unwrap_or_default().to_owned();
+    match truncated_log(payload) {
+        Some(message) => DecodedPlayerMessage::Message(message),
+        None => DecodedPlayerMessage::Malformed {
+            kind,
+            error: ProtocolError::TooLong,
+        },
+    }
+}
+
+fn truncated_log(payload: &str) -> Option<PlayerMessage> {
+    let mut fields = payload.splitn(4, '\t');
+    if fields.next()? != "log" {
+        return None;
+    }
+    let level = PlayerLogLevel::parse(fields.next()?)?;
+    let target = unescape(fields.next()?).ok()?;
+    let text = unescape_truncated(fields.next()?);
+    Some(PlayerMessage::Log {
+        level,
+        target,
+        text: format!("{text}{TRUNCATED_MARKER}"),
+    })
+}
+
+/// Экранирование текста: `\t`, `\n`, `\r`, `\\` и `\x1e` (RS, разделитель записей). Значение
+/// никогда не содержит сырого RS, поэтому разбор потока по RS не ломается внутри поля.
 fn escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -280,6 +343,7 @@ fn escape(value: &str) -> String {
             '\t' => escaped.push_str("\\t"),
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
+            '\u{1e}' => escaped.push_str("\\x1e"),
             character => escaped.push(character),
         }
     }
@@ -299,10 +363,47 @@ fn unescape(value: &str) -> Result<String, ProtocolError> {
             Some('t') => output.push('\t'),
             Some('n') => output.push('\n'),
             Some('r') => output.push('\r'),
+            Some('x') if characters.as_str().starts_with("1e") => {
+                characters.next();
+                characters.next();
+                output.push('\u{1e}');
+            }
             _ => return Err(ProtocolError::InvalidEscape),
         }
     }
     Ok(output)
+}
+
+/// Разбор обрезанного текста: незавершённый хвост экранирования отбрасывается, остальное
+/// остаётся как есть, чтобы не терять видимую часть сообщения.
+fn unescape_truncated(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('\\') => output.push('\\'),
+            Some('t') => output.push('\t'),
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('x') if characters.as_str().starts_with("1e") => {
+                characters.next();
+                characters.next();
+                output.push('\u{1e}');
+            }
+            // Обрезка пришлась внутри `\x1e`: это хвост записи, дальше текста нет.
+            Some('x') if "1e".starts_with(characters.as_str()) => break,
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => {}
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -311,7 +412,7 @@ mod tests {
 
     fn round_trip(message: PlayerMessage) {
         let encoded = encode_player_message(&message);
-        let decoded = decode_player_record(encoded.trim_end()).unwrap();
+        let decoded = decode_player_record(encoded.trim_end());
         assert_eq!(decoded, DecodedPlayerMessage::Message(message));
     }
 
@@ -341,37 +442,64 @@ mod tests {
     fn player_messages_escape_controls_and_multiline_text() {
         let message = PlayerMessage::Log {
             level: PlayerLogLevel::Info,
-            target: "a\\b\tc\nd\re".into(),
-            text: "first line\nsecond\tthird\\fourth\rfifth".into(),
+            target: "a\\b\tc\nd\re\u{1e}f".into(),
+            text: "first line\nsecond\tthird\\fourth\rfifth\u{1e}sixth".into(),
         };
+        let encoded = encode_player_message(&message);
+        // Единственный сырой RS — маркер записи в начале; внутри полей его быть не должно.
+        assert_eq!(encoded.matches('\u{1e}').count(), 1);
         round_trip(message);
     }
 
     #[test]
     fn raw_unknown_and_malformed_records_are_distinguished() {
         assert_eq!(
-            decode_player_record("ordinary output").unwrap(),
+            decode_player_record("ordinary output"),
             DecodedPlayerMessage::Raw("ordinary output".into())
         );
         assert_eq!(
-            decode_player_record("\u{1e}@rve-play future\tfield").unwrap(),
+            decode_player_record("\u{1e}@rve-play future\tfield"),
             DecodedPlayerMessage::Unknown {
                 kind: "future".into()
             }
         );
         assert_eq!(
-            decode_player_record("\u{1e}@rve-play hello\t1").unwrap_err(),
-            ProtocolError::MissingField("process id")
+            decode_player_record("\u{1e}@rve-play hello\t1"),
+            DecodedPlayerMessage::Malformed {
+                kind: "hello".into(),
+                error: ProtocolError::MissingField("process id"),
+            }
         );
         assert_eq!(
-            decode_player_record("\u{1e}@rve-play log\tinfo\ttarget\tbad\\q").unwrap_err(),
-            ProtocolError::InvalidEscape
+            decode_player_record("\u{1e}@rve-play log\tinfo\ttarget\tbad\\q"),
+            DecodedPlayerMessage::Malformed {
+                kind: "log".into(),
+                error: ProtocolError::InvalidEscape,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_values_of_known_records_are_malformed_not_fatal_types() {
+        assert_eq!(
+            decode_player_record("\u{1e}@rve-play status\tpaused"),
+            DecodedPlayerMessage::Malformed {
+                kind: "status".into(),
+                error: ProtocolError::InvalidValue("status"),
+            }
+        );
+        assert_eq!(
+            decode_player_record("\u{1e}@rve-play log\tverbose\ttarget\ttext"),
+            DecodedPlayerMessage::Malformed {
+                kind: "log".into(),
+                error: ProtocolError::InvalidValue("log level"),
+            }
         );
     }
 
     #[test]
     fn hello_version_is_available_for_compatibility_checks() {
-        let decoded = decode_player_record("\u{1e}@rve-play hello\t2\t42\t0.40.0").unwrap();
+        let decoded = decode_player_record("\u{1e}@rve-play hello\t2\t42\t0.40.0");
         assert_eq!(
             decoded,
             DecodedPlayerMessage::Message(PlayerMessage::Hello {
@@ -396,12 +524,8 @@ mod tests {
         assert_eq!(
             messages,
             vec![
-                Ok(DecodedPlayerMessage::Raw(
-                    "raw output without newline".into()
-                )),
-                Ok(DecodedPlayerMessage::Message(PlayerMessage::Status(
-                    PlayerStatus::Loading
-                ))),
+                DecodedPlayerMessage::Raw("raw output without newline".into()),
+                DecodedPlayerMessage::Message(PlayerMessage::Status(PlayerStatus::Loading)),
             ]
         );
     }
@@ -413,11 +537,75 @@ mod tests {
         assert!(records.is_empty());
         let mut records = decoder.finish();
         assert_eq!(records.len(), 1);
-        let Some(Ok(DecodedPlayerMessage::Raw(raw))) = records.pop() else {
+        let Some(DecodedPlayerMessage::Raw(raw)) = records.pop() else {
             panic!("truncated record should be raw output");
         };
         assert_eq!(raw.len(), MAX_RECORD_BYTES + TRUNCATED_MARKER.len());
         assert!(raw.ends_with(TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn truncated_log_keeps_level_and_target_and_marks_only_the_text() {
+        let message = PlayerMessage::Log {
+            level: PlayerLogLevel::Error,
+            target: "engine::scripts".into(),
+            text: "a".repeat(MAX_RECORD_BYTES + 100),
+        };
+        let mut decoder = PlayerStreamDecoder::default();
+        let mut records = decoder.push(encode_player_message(&message).as_bytes());
+        records.extend(decoder.finish());
+        assert_eq!(records.len(), 1);
+        let Some(DecodedPlayerMessage::Message(PlayerMessage::Log {
+            level,
+            target,
+            text,
+        })) = records.pop()
+        else {
+            panic!("truncated log should keep its level and target");
+        };
+        assert_eq!(level, PlayerLogLevel::Error);
+        assert_eq!(target, "engine::scripts");
+        assert!(text.starts_with('a'));
+        assert!(text.ends_with(TRUNCATED_MARKER));
+        assert!(text.len() <= MAX_RECORD_BYTES + TRUNCATED_MARKER.len());
+    }
+
+    #[test]
+    fn truncated_log_drops_an_unfinished_escape_at_the_cut() {
+        assert_eq!(
+            truncated_log("log\tinfo\ttarget\tabc\\"),
+            Some(PlayerMessage::Log {
+                level: PlayerLogLevel::Info,
+                target: "target".into(),
+                text: format!("abc{TRUNCATED_MARKER}"),
+            })
+        );
+        assert_eq!(
+            truncated_log("log\tinfo\ttarget\tabc\\x1"),
+            Some(PlayerMessage::Log {
+                level: PlayerLogLevel::Info,
+                target: "target".into(),
+                text: format!("abc{TRUNCATED_MARKER}"),
+            })
+        );
+        assert!(truncated_log("log\tinf").is_none());
+        assert!(truncated_log("status\trunning").is_none());
+    }
+
+    #[test]
+    fn truncated_protocol_records_other_than_log_are_malformed() {
+        let mut decoder = PlayerStreamDecoder::default();
+        let mut bytes = b"\x1e@rve-play status\t".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_RECORD_BYTES));
+        let mut records = decoder.push(&bytes);
+        records.extend(decoder.finish());
+        assert_eq!(
+            records,
+            vec![DecodedPlayerMessage::Malformed {
+                kind: "status".into(),
+                error: ProtocolError::TooLong,
+            }]
+        );
     }
 
     #[test]
