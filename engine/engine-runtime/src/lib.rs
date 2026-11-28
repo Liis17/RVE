@@ -667,7 +667,9 @@ fn run_from_args(
         SCRIPTS_READY_TIMEOUT,
         SCRIPTS_READY_GRACE,
         &mut scripts_ready_timed_out,
-        editor_ipc.as_deref(),
+        editor_ipc
+            .as_deref()
+            .map(|ipc| move || ipc.stop_requested()),
     ) {
         if code == 0
             && let Some(ipc) = &editor_ipc
@@ -903,24 +905,27 @@ fn wait_scripts_ready(
     )
 }
 
+/// Stop редактора прерывает ожидание скриптов тем же путём, что и таймаут: сначала interrupt,
+/// затем `grace`. Без ответа за это время поток отсоединяется, как при таймауте.
 fn wait_scripts_ready_with_editor(
     receiver: &std::sync::mpsc::Receiver<Result<(), ScriptStartupError>>,
     interrupt: &ScriptInterruptHandle,
     timeout: Duration,
     grace: Duration,
     timed_out: &mut bool,
-    editor_ipc: Option<&EditorIpc>,
+    stop_requested: Option<impl Fn() -> bool>,
 ) -> Result<(), (u8, String)> {
-    let Some(editor_ipc) = editor_ipc else {
+    let Some(stop_requested) = stop_requested else {
         return wait_scripts_ready(receiver, interrupt, timeout, grace, timed_out);
     };
 
     let deadline = Instant::now() + timeout;
     let mut grace_deadline = None;
     loop {
-        if editor_ipc.stop_requested() {
-            interrupt.interrupt();
-            return Err((0, "Play остановлен редактором".to_owned()));
+        if stop_requested() {
+            return Err(stop_scripts_ready_wait(
+                receiver, interrupt, grace, timed_out,
+            ));
         }
         let now = Instant::now();
         let phase_deadline = grace_deadline.unwrap_or(deadline);
@@ -951,6 +956,19 @@ fn wait_scripts_ready_with_editor(
             }
         }
     }
+}
+
+fn stop_scripts_ready_wait(
+    receiver: &std::sync::mpsc::Receiver<Result<(), ScriptStartupError>>,
+    interrupt: &ScriptInterruptHandle,
+    grace: Duration,
+    timed_out: &mut bool,
+) -> (u8, String) {
+    interrupt.interrupt();
+    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = receiver.recv_timeout(grace) {
+        *timed_out = true;
+    }
+    (0, "Play остановлен редактором".to_owned())
 }
 
 fn wait_scripts_ready_after_timeout(
@@ -1101,7 +1119,7 @@ fn fail(code: u8, message: impl AsRef<str>) -> u8 {
 mod tests {
     use super::{
         add_heavy_prefabs, load_prefab_catalog, load_project_settings, scripts_ready_result,
-        wait_scripts_ready, wait_scripts_ready_after_timeout,
+        wait_scripts_ready, wait_scripts_ready_after_timeout, wait_scripts_ready_with_editor,
     };
     use crate::layout::{PrefabCatalogLocation, ProjectSettingsLocation};
     use crate::module_host::ModuleHost;
@@ -1286,6 +1304,46 @@ mod tests {
         assert_eq!(code, 2);
         assert!(message.contains("late load error"));
         assert!(!timed_out);
+    }
+
+    #[test]
+    fn editor_stop_during_script_wait_accepts_reply_within_grace() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        ready_tx.send(Ok(())).unwrap();
+        let interrupt = engine_script::ScriptInterruptHandle::new();
+        let mut timed_out = false;
+        let (code, message) = wait_scripts_ready_with_editor(
+            &ready_rx,
+            &interrupt,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            &mut timed_out,
+            Some(|| true),
+        )
+        .unwrap_err();
+        assert_eq!(code, 0);
+        assert!(message.contains("остановлен редактором"));
+        assert!(interrupt.is_interrupted());
+        assert!(!timed_out);
+    }
+
+    #[test]
+    fn editor_stop_without_script_reply_detaches_after_grace() {
+        let (_ready_tx, ready_rx) = mpsc::channel::<Result<(), ScriptStartupError>>();
+        let interrupt = engine_script::ScriptInterruptHandle::new();
+        let mut timed_out = false;
+        let (code, _) = wait_scripts_ready_with_editor(
+            &ready_rx,
+            &interrupt,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            &mut timed_out,
+            Some(|| true),
+        )
+        .unwrap_err();
+        assert_eq!(code, 0);
+        assert!(interrupt.is_interrupted());
+        assert!(timed_out, "scripts that ignore the stop must be detached");
     }
 
     #[test]

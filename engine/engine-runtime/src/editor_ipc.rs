@@ -4,11 +4,14 @@ use rve_play_ipc::{
     decode_editor_line, encode_player_message,
 };
 use std::io::{self, BufRead, Write};
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+/// Сколько живёт player после обрыва связи с редактором. Счётчик идёт в отдельном потоке и не
+/// зависит от окна, поэтому его не задерживают ни этап запуска, ни зависший `cleanup`.
 const PARENT_EXIT_GRACE: Duration = Duration::from_secs(15);
 
 enum StartSignal {
@@ -31,7 +34,11 @@ impl EditorIpc {
             .name("rve-editor-ipc".to_owned())
             .spawn(move || {
                 let stdin = io::stdin();
-                read_commands(stdin.lock(), &thread_stop, &start_sender);
+                read_commands(stdin.lock(), &thread_stop, &start_sender, || {
+                    arm_parent_gone_watchdog(PARENT_EXIT_GRACE, thread::sleep, |code| {
+                        process::exit(code)
+                    });
+                });
             })?;
         Ok(Self {
             pending_stop,
@@ -76,20 +83,11 @@ impl EditorIpc {
     pub(crate) fn stop_requested(&self) -> bool {
         self.pending_stop.stop_requested()
     }
-
-    pub(crate) fn emergency_deadline(&self) -> Option<Instant> {
-        self.pending_stop.emergency_deadline()
-    }
-
-    pub(crate) fn emergency_exit_due(&self, now: Instant) -> bool {
-        self.pending_stop.emergency_exit_due(now)
-    }
 }
 
 pub(crate) struct PendingStop {
     requested: AtomicBool,
     woken: AtomicBool,
-    emergency_deadline: Mutex<Option<Instant>>,
     waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -98,26 +96,17 @@ impl Default for PendingStop {
         Self {
             requested: AtomicBool::new(false),
             woken: AtomicBool::new(false),
-            emergency_deadline: Mutex::new(None),
             waker: Mutex::new(None),
         }
     }
 }
 
 impl PendingStop {
-    fn request_stop_at(&self, parent_gone: bool, now: Instant) -> bool {
-        if parent_gone {
-            let mut deadline = self
-                .emergency_deadline
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            deadline.get_or_insert(now + PARENT_EXIT_GRACE);
-        }
+    fn request_stop(&self) {
         let first_request = !self.requested.swap(true, Ordering::AcqRel);
         if first_request {
             self.wake_if_requested();
         }
-        first_request
     }
 
     fn attach_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
@@ -151,24 +140,15 @@ impl PendingStop {
     fn stop_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
-
-    fn emergency_deadline(&self) -> Option<Instant> {
-        *self
-            .emergency_deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn emergency_exit_due(&self, now: Instant) -> bool {
-        self.emergency_deadline()
-            .is_some_and(|deadline| now >= deadline)
-    }
 }
 
+/// Читает команды редактора до EOF. Stop не завершает чтение: EOF после него тоже взводит
+/// сторожевой таймер, иначе игра, которую редактор уже закрыл, может остаться висеть.
 fn read_commands(
     mut reader: impl BufRead,
     pending_stop: &PendingStop,
     start_sender: &mpsc::Sender<StartSignal>,
+    on_parent_gone: impl FnOnce(),
 ) {
     let mut line = Vec::new();
     let mut start_sent = false;
@@ -177,10 +157,11 @@ fn read_commands(
         match reader.read_until(b'\n', &mut line) {
             Ok(read) if read > 0 => {}
             _ => {
-                pending_stop.request_stop_at(true, Instant::now());
+                pending_stop.request_stop();
                 if !start_sent {
                     let _ = start_sender.send(StartSignal::ParentGone);
                 }
+                on_parent_gone();
                 return;
             }
         }
@@ -193,14 +174,33 @@ fn read_commands(
             }
             Ok(Some(EditorMessage::Start { .. })) => {}
             Ok(Some(EditorMessage::Stop)) => {
-                pending_stop.request_stop_at(false, Instant::now());
+                pending_stop.request_stop();
                 if !start_sent {
+                    start_sent = true;
                     let _ = start_sender.send(StartSignal::Stopped);
                 }
-                return;
             }
             Ok(None) | Err(_) => {}
         }
+    }
+}
+
+/// Запускает поток, который через `grace` завершает процесс с кодом 1. `wait` и `exit` подставляются
+/// тестами: им не нужны настоящие секунды и настоящий выход из процесса.
+fn arm_parent_gone_watchdog(
+    grace: Duration,
+    wait: impl FnOnce(Duration) + Send + 'static,
+    exit: impl FnOnce(i32) + Send + 'static,
+) {
+    let spawned = thread::Builder::new()
+        .name("rve-editor-watchdog".to_owned())
+        .spawn(move || {
+            wait(grace);
+            exit(1);
+        });
+    if spawned.is_err() {
+        // Без сторожевого потока игра может пережить редактор; завершаемся сразу.
+        process::exit(1);
     }
 }
 
@@ -226,20 +226,23 @@ fn write_message(message: &PlayerMessage) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingStop, StartSignal, read_commands};
+    use super::{
+        PARENT_EXIT_GRACE, PendingStop, StartSignal, arm_parent_gone_watchdog, read_commands,
+    };
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, mpsc};
-    use std::time::{Duration, Instant};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn start_stop_and_garbage_commands_are_handled_on_stdin() {
         let pending = PendingStop::default();
         let (sender, receiver) = mpsc::channel();
+        let mut armed = false;
         read_commands(
             Cursor::new(b"garbage\nstart\tpa\\nss\nstop\n"),
             &pending,
             &sender,
+            || armed = true,
         );
         assert!(matches!(
             receiver.recv().unwrap(),
@@ -247,46 +250,110 @@ mod tests {
         ));
         assert!(pending.stop_requested());
         assert!(receiver.try_recv().is_err());
+        assert!(armed);
 
         let pending = PendingStop::default();
         let (sender, receiver) = mpsc::channel();
-        read_commands(Cursor::new(b"bad\\escape\nstop\n"), &pending, &sender);
+        read_commands(
+            Cursor::new(b"bad\\escape\nstop\n"),
+            &pending,
+            &sender,
+            || {},
+        );
         assert!(matches!(receiver.recv().unwrap(), StartSignal::Stopped));
         assert!(pending.stop_requested());
     }
 
     #[test]
-    fn eof_before_and_after_start_requests_stop_and_sets_emergency_deadline() {
+    fn stop_does_not_end_reading_so_eof_after_stop_arms_the_watchdog() {
         let pending = PendingStop::default();
         let (sender, receiver) = mpsc::channel();
-        read_commands(Cursor::new(b""), &pending, &sender);
-        assert!(matches!(receiver.recv().unwrap(), StartSignal::ParentGone));
-        assert!(pending.stop_requested());
-        let deadline = pending.emergency_deadline().unwrap();
-        assert!(!pending.emergency_exit_due(deadline - Duration::from_millis(1)));
-        assert!(pending.emergency_exit_due(deadline));
-
-        let pending = PendingStop::default();
-        let (sender, receiver) = mpsc::channel();
-        read_commands(Cursor::new(b"start\n"), &pending, &sender);
+        let mut armed = false;
+        read_commands(Cursor::new(b"start\nstop\n"), &pending, &sender, || {
+            armed = true
+        });
         assert!(matches!(
             receiver.recv().unwrap(),
             StartSignal::Started(None)
         ));
         assert!(pending.stop_requested());
-        assert!(pending.emergency_deadline().is_some());
+        assert!(armed, "EOF after stop must reach the watchdog");
+    }
+
+    #[test]
+    fn stop_before_start_is_reported_and_eof_still_arms_the_watchdog() {
+        let pending = PendingStop::default();
+        let (sender, receiver) = mpsc::channel();
+        let mut armed = false;
+        read_commands(Cursor::new(b"stop\nstart\n"), &pending, &sender, || {
+            armed = true
+        });
+        assert!(matches!(receiver.recv().unwrap(), StartSignal::Stopped));
+        assert!(receiver.try_recv().is_err());
+        assert!(pending.stop_requested());
+        assert!(armed);
+    }
+
+    #[test]
+    fn eof_before_and_after_start_requests_stop_and_arms_the_watchdog() {
+        let pending = PendingStop::default();
+        let (sender, receiver) = mpsc::channel();
+        let mut armed = false;
+        read_commands(Cursor::new(b""), &pending, &sender, || armed = true);
+        assert!(matches!(receiver.recv().unwrap(), StartSignal::ParentGone));
+        assert!(pending.stop_requested());
+        assert!(armed);
+
+        let pending = PendingStop::default();
+        let (sender, receiver) = mpsc::channel();
+        let mut armed = false;
+        read_commands(Cursor::new(b"start\n"), &pending, &sender, || armed = true);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            StartSignal::Started(None)
+        ));
+        assert!(pending.stop_requested());
+        assert!(armed);
+    }
+
+    #[test]
+    fn watchdog_waits_for_grace_and_then_exits_with_failure_code() {
+        enum Event {
+            Waited(Duration),
+            Exit(i32),
+        }
+        let (events, received) = mpsc::channel();
+        let wait_events = events.clone();
+        let exit_events = events;
+        arm_parent_gone_watchdog(
+            PARENT_EXIT_GRACE,
+            move |duration| {
+                let _ = wait_events.send(Event::Waited(duration));
+            },
+            move |code| {
+                let _ = exit_events.send(Event::Exit(code));
+            },
+        );
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::Waited(duration) if duration == PARENT_EXIT_GRACE
+        ));
+        assert!(matches!(received.recv().unwrap(), Event::Exit(1)));
     }
 
     #[test]
     fn pending_stop_wakes_once_when_proxy_is_attached_before_or_after_stop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let before_attach = PendingStop::default();
         let before_count = Arc::new(AtomicUsize::new(0));
-        before_attach.request_stop_at(false, Instant::now());
+        before_attach.request_stop();
         let wake_count = Arc::clone(&before_count);
         before_attach.attach_waker(Arc::new(move || {
             wake_count.fetch_add(1, Ordering::Relaxed);
         }));
-        before_attach.request_stop_at(false, Instant::now());
+        before_attach.request_stop();
         assert_eq!(before_count.load(Ordering::Relaxed), 1);
 
         let after_attach = PendingStop::default();
@@ -295,8 +362,8 @@ mod tests {
         after_attach.attach_waker(Arc::new(move || {
             wake_count.fetch_add(1, Ordering::Relaxed);
         }));
-        after_attach.request_stop_at(false, Instant::now());
-        after_attach.request_stop_at(false, Instant::now());
+        after_attach.request_stop();
+        after_attach.request_stop();
         assert_eq!(after_count.load(Ordering::Relaxed), 1);
     }
 }

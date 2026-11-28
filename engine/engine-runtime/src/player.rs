@@ -817,10 +817,6 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn next_wakeup(&mut self) -> Option<Instant> {
-        let emergency = self
-            .editor_ipc
-            .as_ref()
-            .and_then(|ipc| ipc.emergency_deadline());
         #[cfg(feature = "dev-console")]
         if self.overlays.visible()
             && let Some(console_wakeup) = self.console_repaint_at
@@ -828,9 +824,9 @@ impl WindowHandler for PlayerWindow<'_> {
             let window = self
                 .close_deadline
                 .map_or(console_wakeup, |current| current.min(console_wakeup));
-            return earliest_deadline(Some(window), emergency);
+            return Some(window);
         }
-        earliest_deadline(self.close_deadline, emergency)
+        self.close_deadline
     }
 
     fn init(&mut self, window: Arc<Window>) -> bool {
@@ -980,14 +976,6 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn update(&mut self, window: &Window) -> bool {
-        if self
-            .editor_ipc
-            .as_ref()
-            .is_some_and(|ipc| ipc.emergency_exit_due(Instant::now()))
-        {
-            // Редактор не вернулся за дедлайн после обрыва связи: процесс не ждёт закрытия окна.
-            std::process::exit(1);
-        }
         let stop_requested = self
             .editor_ipc
             .as_ref()
@@ -1129,15 +1117,6 @@ fn editor_stop_begins_close(stop_requested: bool, closing: bool) -> bool {
     stop_requested && !closing
 }
 
-/// Ближайший из двух дедлайнов ожидания; `None` значит, что дедлайна нет.
-fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(first.min(second)),
-        (first, None) => first,
-        (None, second) => second,
-    }
-}
-
 fn close_timed_out(now: Instant, deadline: Option<Instant>, render_stopped: bool) -> bool {
     !render_stopped && deadline.is_some_and(|deadline| now >= deadline)
 }
@@ -1204,9 +1183,8 @@ mod debug_view_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeThreads, cleanup_threads, close_timed_out, earliest_deadline,
-        editor_stop_begins_close, wait_for_prefab_loader_or_detach, wait_for_render_or_detach,
-        wait_for_scripts_or_detach,
+        RuntimeThreads, cleanup_threads, close_timed_out, editor_stop_begins_close,
+        wait_for_prefab_loader_or_detach, wait_for_render_or_detach, wait_for_scripts_or_detach,
     };
     use crate::module_host::ModuleHost;
     use crate::pipeline::RuntimeStatus;
@@ -1233,16 +1211,6 @@ mod tests {
         assert!(!editor_stop_begins_close(false, false));
         assert!(editor_stop_begins_close(true, false));
         assert!(!editor_stop_begins_close(true, true));
-    }
-
-    #[test]
-    fn earliest_deadline_keeps_the_nearest_wakeup() {
-        let now = Instant::now();
-        let later = now + Duration::from_secs(5);
-        assert_eq!(earliest_deadline(Some(later), Some(now)), Some(now));
-        assert_eq!(earliest_deadline(None, Some(now)), Some(now));
-        assert_eq!(earliest_deadline(Some(now), None), Some(now));
-        assert_eq!(earliest_deadline(None, None), None);
     }
 
     #[derive(Default)]
